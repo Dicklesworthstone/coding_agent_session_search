@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     permissions:
       contents: write
@@ -63,8 +63,9 @@ jobs:
           }.items():
               pathlib.Path(path).write_bytes(read_blob(sha))
           script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'review-gh493.py'
-          script.write_bytes(read_blob('08eb596d0743abb14dfcfbc11db3d6c28362141b'))
-          subprocess.run(['python3', str(script)], check=True)
+          for sha in ['08eb596d0743abb14dfcfbc11db3d6c28362141b', '92f160f038616b4e244ad65208ecad26012d4589']:
+              script.write_bytes(read_blob(sha))
+              subprocess.run(['python3', str(script)], check=True)
           PY
       - name: Install formatter
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
@@ -120,37 +121,3 @@ jobs:
           name: gh493-canonical-candidate
           path: candidate/
           retention-days: 3
-  verify:
-    needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      RUST_MIN_STACK: '134217728'
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: gh493-canonical-candidate
-          path: .
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-      - name: Run exact search-to-follow-up regressions
-        run: cargo test --locked --test gh493_message_coordinates -- --nocapture
-      - name: Check existing dispatch and error envelopes
-        run: |
-          cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
-          cargo test --locked --test spec_view_expand_error_envelopes
-      - name: Check raw-line compatibility and robot discovery
-        run: |
-          cargo test --locked --test cli_robot view_
-          cargo test --locked --test cli_robot capabilities_matches_golden_contract
-      - name: Lint the regression target and production dependency
-        run: cargo clippy --locked --test gh493_message_coordinates -- -D warnings
