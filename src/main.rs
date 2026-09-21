@@ -2,6 +2,8 @@
 // `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
 #![cfg_attr(not(test), deny(unsafe_code))]
 
+mod logical_archive;
+
 fn env_requests_robot_output() -> bool {
     let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
         .ok()
@@ -256,6 +258,28 @@ fn main() -> anyhow::Result<()> {
     apply_default_fsqlite_read_witness_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_command_name(&raw_args) == Some("archive") {
+        // Explicit interchange stays outside ordinary search/maintenance setup.
+        let result = logical_archive::run(raw_args);
+        if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
+            tracing::warn!("logical archive bridge teardown exceeded its deadline");
+        }
+        return match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let payload = serde_json::json!({
+                    "error": {
+                        "code": 2,
+                        "kind": "logical-archive-error",
+                        "message": error.to_string(),
+                        "retryable": false
+                    }
+                });
+                eprintln!("{payload}");
+                std::process::exit(2);
+            }
+        };
+    }
     let parsed = match coding_agent_search::parse_cli(raw_args) {
         Ok(parsed) => parsed,
         Err(err) => handle_fatal_error(err),
