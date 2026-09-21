@@ -307,7 +307,6 @@ fn open(root: &Path, m: &SemanticGenerationManifestV1) -> SelectedSemanticGenera
 fn first_id(batch: &SelectedSemanticBatch) -> u64 {
     batch.batch().hits()[0].document.message_id
 }
-
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut files = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
@@ -533,13 +532,21 @@ fn replaced_bytes_cannot_borrow_the_selected_manifests_authority() -> TestResult
     let root = tempfile::tempdir()?;
     let m = fixture(root.path(), "gen-replaced", 1, Some(A), None);
     select(root.path(), &m, None);
-    let selected = load_current_semantic_generation(root.path(), Some(&m.corpus))?;
-    let path = &selected.artifact_paths[&SemanticArtifactRole::FastVector];
-    let owner = write_vector(path, &binding(SemanticArtifactRole::FastVector, 1), B);
+    // Capture the production vector-serving receipt BEFORE replacing its
+    // bytes. Revalidation after the replacement would bypass the admission
+    // boundary this regression is intended to protect.
+    let selected = crate::search::semantic_manifest::selection::SemanticSelectionMetadata::read(
+        root.path(),
+        Some(&m.corpus),
+    )?
+    .validate_vectors(root.path())?;
+    let path = selected.generation_dir.join(&m.artifacts[0].relative_path);
+    let owner = write_vector(&path, &binding(SemanticArtifactRole::FastVector, 1), B);
     assert_ne!(
         hex::encode(owner.witness().whole_image_sha256),
         m.artifacts[0].artifact_sha256
     );
+    let before_admission = snapshot(root.path());
     assert!(matches!(
         admit_tier(&selected, SemanticArtifactRole::FastVector),
         Err(SemanticSelectionError::ArtifactMismatch {
@@ -547,6 +554,7 @@ fn replaced_bytes_cannot_borrow_the_selected_manifests_authority() -> TestResult
             ..
         })
     ));
+    assert_eq!(snapshot(root.path()), before_admission);
     Ok(())
 }
 
@@ -1250,8 +1258,7 @@ fn native_filtered_underfill_and_huge_limits_use_exact_while_zero_skips_work() -
 }
 
 #[test]
-fn corrupt_declared_graph_blocks_new_selection_but_does_not_destroy_retained_results() -> TestResult
-{
+fn corrupt_graph_fails_strict_audit_but_preserves_fresh_exact_and_retained_ann() -> TestResult {
     let root = tempfile::tempdir()?;
     let mut m = fixture(root.path(), "gen-ann-corrupt", 1, Some(A), None);
     attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
@@ -1266,19 +1273,30 @@ fn corrupt_declared_graph_blocks_new_selection_but_does_not_destroy_retained_res
     *bytes.last_mut().unwrap() ^= 1;
     fs::write(&graph, bytes)?;
     let before = snapshot(root.path());
+    // Full disk audits must continue to reject corrupt selected graphs.
+    // Serving admission is deliberately different: vectors remain mandatory,
+    // while an optional graph failure falls back to the exact owner.
     assert!(matches!(
-        SelectedSemanticGeneration::open_current(
-            root.path(),
-            &m.corpus,
-            SemanticSelectionBudget::default()
-        ),
-        Err(SemanticSelectionError::Publication(
-            SemanticGenerationError::ArtifactDigestMismatch {
-                role: SemanticArtifactRole::FastAnn,
-                ..
-            }
-        ))
+        load_current_semantic_generation(root.path(), Some(&m.corpus)),
+        Err(SemanticGenerationError::ArtifactDigestMismatch {
+            role: SemanticArtifactRole::FastAnn,
+            ..
+        })
     ));
+    let fresh = SelectedSemanticGeneration::open_current(
+        root.path(),
+        &m.corpus,
+        SemanticSelectionBudget::default(),
+    )?;
+    let q = queries();
+    let exact_batch = fresh.activate(&q)?.search(1, None)?;
+    assert_engine(&exact_batch, SemanticShardEngine::Exact);
+    assert_eq!(first_id(&exact_batch), 1);
+    let fresh = fresh.with_ann(AnnAdmissionBudget::default())?;
+    let fallback = native_batch(&fresh);
+    assert_engine(&fallback, SemanticShardEngine::ExactFallback);
+    assert_eq!(fallback.batch().hits(), exact_batch.batch().hits());
+    assert_eq!(first_id(&fallback), 1);
     assert_engine(&native_batch(&reader), SemanticShardEngine::NativeAnn);
     assert_eq!(first_id(&native_batch(&reader)), 1);
     assert_eq!(snapshot(root.path()), before);

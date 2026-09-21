@@ -12,6 +12,7 @@ on:
       - 'src/indexer/semantic/**'
       - 'src/search/semantic_manifest.rs'
       - 'src/search/semantic_manifest/**'
+      - 'src/search/semantic_reader/publication/**'
       - 'src/bin/cass-semantic-reclaim.rs'
       - 'tests/semantic_artifact_reclaim_cli.rs'
       - 'scripts/check_dependency_features.py'
@@ -72,5 +73,7 @@ jobs:
           run_suite approval --lib indexer::semantic::artifacts::inspection::tests
           run_suite checkpoint --lib indexer::semantic::artifacts::checkpoint_tests
           run_suite storage --lib indexer::semantic::artifacts::storage_tests
+          run_suite authority --lib search::semantic_reader::publication::tests::replaced_bytes_cannot_borrow_the_selected_manifests_authority
+          run_suite optional-ann --lib search::semantic_reader::publication::tests::corrupt_graph_fails_strict_audit_but_preserves_fresh_exact_and_retained_ann
           run_suite command --bin cass-semantic-reclaim
           run_suite cli --test semantic_artifact_reclaim_cli
