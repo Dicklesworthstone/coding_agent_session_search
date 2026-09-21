@@ -172,6 +172,11 @@ where
     {
         return Ok(None);
     }
+    if let Err(error) = cache::refresh(
+        data_dir, &archive_before, &path, vector_stamp, artifact, last_offset,
+    ) {
+        tracing::debug!(%error, "unchanged backfill cache unavailable; next pass repeats read-only proof");
+    }
     sink.emit(
         SemanticProgressEvent::Complete,
         SemanticProgressFields {
@@ -254,3 +259,5 @@ impl ArchiveStamp {
 
 #[cfg(test)]
 mod tests;
+
+mod cache;

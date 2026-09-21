@@ -63,7 +63,7 @@ fn snapshot(data: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
             if path.is_dir() { pending.push(path); }
-            else { files.insert(path.clone(), fs::read(path)?); }
+            else if path != cache_path(data) { files.insert(path.clone(), fs::read(path)?); }
         }
     }
     Ok(files)
@@ -102,7 +102,9 @@ fn absent_corrupt_or_stale_cache_preserves_publication_ann_and_existing_and_fres
             assert_eq!(outcome.last_offset, 3);
             assert_eq!(manifest, ledger);
             assert!(manifest.hnsw.as_ref().unwrap().ready);
-            assert_eq!(snapshot(data)?, before, "no publication, cache, or graph rewrite");
+            assert_eq!(indexer.completed_backfill_fingerprint(&storage, data, &manifest,
+                plan.tier, &plan.model_revision)?, Some(plan.db_fingerprint.clone()));
+            assert_eq!(snapshot(data)?, before, "no publication or graph rewrite");
             assert_eq!(reader.search_top_k(&query, 8, None)?, hits);
             assert_eq!(VectorIndex::open_read_only(&live)?.search_top_k(&query, 8, None)?, hits);
         }
@@ -204,3 +206,5 @@ fn changed_archive_during_proof_refuses_before_publication_or_readiness_changes(
     assert_eq!(snapshot(data)?, before);
     Ok(())
 }
+
+mod identity;
