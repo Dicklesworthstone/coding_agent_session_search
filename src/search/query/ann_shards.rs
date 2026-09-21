@@ -13,12 +13,41 @@ pub(super) struct SemanticAnnShardSet {
     graphs: Vec<FsHnswIndex>,
 }
 
+/// Only errors after query/owner validation may degrade to exact retrieval.
+/// Keep completed native measurements, but never carry partial hits or raw
+/// backend diagnostics across the recovery boundary.
+#[derive(Debug)]
+struct NativeAnnSearchFailure {
+    shard: usize,
+    completed_stats: AnnSearchStats,
+}
+
+impl NativeAnnSearchFailure {
+    fn new(shard: usize, mut completed_stats: AnnSearchStats) -> Self {
+        // An incomplete native cohort has no meaningful recall estimate.
+        completed_stats.estimated_recall = 0.0;
+        Self {
+            shard,
+            completed_stats,
+        }
+    }
+}
+
+impl std::fmt::Display for NativeAnnSearchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "native ANN shard {} search failed", self.shard)
+    }
+}
+
+impl std::error::Error for NativeAnnSearchFailure {}
+
 impl SemanticAnnShardSet {
-    /// Recover a sparse native message page from the same complete exact cohort.
+    /// Recover native failure or underfill from the same complete exact cohort.
     /// Native top-k is selected before metadata filtering and message collapse;
     /// a full raw window therefore does not prove there are no more matching
     /// messages. Do not combine native and exact scores, or repair just one shard.
     /// The existing exact driver owns its bounded message-refill policy.
+    /// Invalid queries and mismatched context owners remain errors, not fallbacks.
     pub(super) fn search_with_exact_fallback(
         &self,
         context: &SemanticCandidateContext,
@@ -30,17 +59,30 @@ impl SemanticAnnShardSet {
         SemanticCandidateRetryState,
         Option<AnnSearchStats>,
     )> {
-        let (hits, retry, mut stats) =
-            self.search(&context.artifacts, embedding, fetch_limit, filter)?;
-        if hits.len() >= fetch_limit || !retry.has_more_candidates {
-            return Ok((hits, retry, stats));
-        }
-
-        let reason = if filter.is_some() {
-            AnnExactFallbackReason::FilteredCandidateUnderfill
-        } else {
-            AnnExactFallbackReason::MessageCandidateUnderfill
-        };
+        let (mut stats, native_messages, reason) =
+            match self.search(&context.artifacts, embedding, fetch_limit, filter) {
+                Ok((hits, retry, stats)) => {
+                    if hits.len() >= fetch_limit || !retry.has_more_candidates {
+                        return Ok((hits, retry, stats));
+                    }
+                    let reason = if filter.is_some() {
+                        AnnExactFallbackReason::FilteredCandidateUnderfill
+                    } else {
+                        AnnExactFallbackReason::MessageCandidateUnderfill
+                    };
+                    (stats, hits.len(), reason)
+                }
+                Err(error) => match error.downcast::<NativeAnnSearchFailure>() {
+                    Ok(failure) => (
+                        Some(failure.completed_stats),
+                        0,
+                        AnnExactFallbackReason::NativeSearchFailed,
+                    ),
+                    // Do not turn a caller/provenance error into an expensive
+                    // exact scan, or mistake it for a failed derived graph.
+                    Err(error) => return Err(error),
+                },
+            };
         let started = std::time::Instant::now();
         let (exact, exact_retry) =
             SearchClient::search_exact_semantic_indexes(context, embedding, fetch_limit, filter)?;
@@ -52,10 +94,10 @@ impl SemanticAnnShardSet {
         };
         tracing::debug!(
             ?reason,
-            native_messages = hits.len(),
+            native_messages,
             exact_messages = exact.len(),
             shards = context.artifacts.len(),
-            "native message underfill recovered through the retained exact cohort"
+            "native retrieval recovered through the retained exact cohort"
         );
         if let Some(stats) = stats.as_mut() {
             stats.is_approximate = false;
@@ -174,9 +216,9 @@ impl SemanticAnnShardSet {
             let source = self.artifacts[ordinal].index();
             let (hits, measured) = graph
                 .knn_search_with_stats_against(source, embedding, candidate, ef)
-                .map_err(|error| anyhow!("native ANN shard {ordinal} search failed: {error}"))?;
+                .map_err(|_| NativeAnnSearchFailure::new(ordinal, stats.clone()))?;
             if measured.dimension != dimension || hits.len() > candidate {
-                bail!("native ANN shard returned inconsistent candidate metadata");
+                return Err(NativeAnnSearchFailure::new(ordinal, stats).into());
             }
             // A failure above returns no partial success assembled from earlier
             // shards. No graph is skipped because it produced no filtered hits.
@@ -901,5 +943,142 @@ mod tests {
             error.reason,
             SemanticAnnUnavailableReason::SidecarOpenFailed
         ));
+    }
+
+    fn runtime_failure_cohort(
+        dir: &Path,
+        failed_shard: usize,
+    ) -> (SemanticCandidateContext, SemanticAnnShardSet) {
+        let context = recovery_context(Arc::new(vec![
+            selective_shard(dir, "runtime-a", 1, 0.6),
+            selective_shard(dir, "runtime-b", 2, 0.8),
+        ]));
+        let mut set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
+        let wrong = shard(dir, "runtime-wrong", &[(doc(999, 3), [1.0, 0.0])]);
+        // Real HNSW source-extent validation fails at query time. No mocked
+        // result, artifact mutation, or relaxed production admission is used.
+        set.graphs[failed_shard] =
+            open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
+        (context, set)
+    }
+
+    #[test]
+    fn runtime_failure_recovers_every_shard_and_reports_only_completed_native_work() {
+        for failed_shard in 0..2 {
+            let dir = tempfile::tempdir().unwrap();
+            let (context, set) = runtime_failure_cohort(dir.path(), failed_shard);
+            let filter = selected_source();
+            let before = snapshot(dir.path());
+            assert!(
+                set.search(&context.artifacts, &[1.0, 0.0], 2, Some(&filter))
+                    .is_err(),
+                "fixture must actually fail in the native backend"
+            );
+            let (expected, expected_retry) = SearchClient::search_exact_semantic_indexes(
+                &context,
+                &[1.0, 0.0],
+                2,
+                Some(&filter),
+            )
+            .unwrap();
+            let (hits, retry, stats) = set
+                .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&filter))
+                .unwrap();
+            let signature = |hits: &[VectorSearchResult]| {
+                hits.iter()
+                    .map(|hit| (hit.message_id, hit.chunk_idx, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&hits), vec![2, 1]);
+            assert_eq!(signature(&hits), signature(&expected));
+            assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
+            assert_eq!(
+                retry.exact_window_may_omit_competitor,
+                expected_retry.exact_window_may_omit_competitor
+            );
+            let stats = stats.unwrap();
+            assert!(!stats.is_approximate);
+            assert_eq!(stats.estimated_recall, 0.0);
+            assert_eq!(stats.index_size, failed_shard * 41);
+            assert_eq!(stats.k_requested, failed_shard * 2 * ANN_CANDIDATE_MULTIPLIER);
+            let receipt = stats.exact_fallback.as_ref().unwrap();
+            assert_eq!(receipt.reason, AnnExactFallbackReason::NativeSearchFailed);
+            assert_eq!(receipt.shard_count, 2);
+            assert_eq!(receipt.returned_messages, 2);
+            let json = serde_json::to_value(&stats).unwrap();
+            assert_eq!(json["exact_fallback"]["reason"], "native_search_failed");
+            assert_eq!(json["is_approximate"], false);
+            assert!(!json.to_string().contains("runtime-wrong"));
+            assert_eq!(snapshot(dir.path()), before);
+        }
+    }
+
+    #[test]
+    fn runtime_failure_never_widens_empty_scope_or_recovers_invalid_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let (context, set) = runtime_failure_cohort(dir.path(), 0);
+        let filter = SemanticFilter {
+            sources: Some(HashSet::new()),
+            ..selected_source()
+        };
+        let before = snapshot(dir.path());
+        let (hits, _, stats) = set
+            .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&filter))
+            .unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(stats.unwrap().exact_fallback.unwrap().returned_messages, 0);
+        for embedding in [
+            &[1.0][..],
+            &[f32::NAN, 0.0][..],
+            &[f32::INFINITY, 0.0][..],
+            &[][..],
+        ] {
+            let error = set
+                .search_with_exact_fallback(&context, embedding, 2, Some(&filter))
+                .unwrap_err();
+            assert!(error.to_string().contains("admitted dimension"));
+        }
+        let other = recovery_context(Arc::new(context.artifacts.as_ref().clone()));
+        for limit in [0, 2] {
+            let error = set
+                .search_with_exact_fallback(&other, &[1.0, 0.0], limit, None)
+                .unwrap_err();
+            assert!(error.to_string().contains("cohort does not match"));
+        }
+        let (hits, _, stats) = set
+            .search_with_exact_fallback(&context, &[], 0, None)
+            .unwrap();
+        assert!(hits.is_empty());
+        assert!(stats.is_none(), "zero target must not run either backend");
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn runtime_failure_recovery_uses_retained_readers_after_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let (context, set) = runtime_failure_cohort(dir.path(), 1);
+        for artifact in context.artifacts.iter() {
+            for path in [artifact.fsvi_path(), artifact.ann_path().unwrap()] {
+                std::fs::rename(
+                    path,
+                    path.with_extension(format!(
+                        "{}-retained",
+                        path.extension().unwrap().to_str().unwrap()
+                    )),
+                )
+                .unwrap();
+            }
+        }
+        let before = snapshot(dir.path());
+        let filter = selected_source();
+        let (hits, _, stats) = set
+            .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&filter))
+            .unwrap();
+        assert_eq!(ids(&hits), vec![2, 1]);
+        assert_eq!(
+            stats.unwrap().exact_fallback.unwrap().reason,
+            AnnExactFallbackReason::NativeSearchFailed
+        );
+        assert_eq!(snapshot(dir.path()), before);
     }
 }

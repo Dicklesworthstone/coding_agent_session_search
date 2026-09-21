@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 
-/// Why native candidates could not fill the requested message page.
+/// Why native retrieval was replaced by the complete exact cohort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnnExactFallbackReason {
@@ -16,9 +16,12 @@ pub enum AnnExactFallbackReason {
     FilteredCandidateUnderfill,
     /// Multiple chunks or duplicate messages occupied the native windows.
     MessageCandidateUnderfill,
+    /// A native shard query failed after owner and query validation. Native
+    /// counters cover completed shard calls only; failed-call work is unknown.
+    NativeSearchFailed,
 }
 
-/// Work done by the complete exact cohort after native candidate underfill.
+/// Work done by the complete exact cohort after native underfill or failure.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AnnExactFallbackStats {
     pub reason: AnnExactFallbackReason,
@@ -51,6 +54,7 @@ pub struct AnnSearchStats {
     ///
     /// Formula: min(1.0, 0.9 + 0.1 * log2(ef / k))
     /// This is an empirical estimate; actual recall depends on data distribution.
+    /// Zero after native failure: an incomplete cohort has no recall estimate.
     pub estimated_recall: f32,
     /// Whether the returned candidate ranking remains approximate. False when
     /// the complete retained exact cohort replaced the native candidates.
@@ -58,6 +62,8 @@ pub struct AnnSearchStats {
     /// Native counters above remain measurements of native work, not counts of
     /// exact results. This receipt identifies the separate recovery operation;
     /// `estimated_recall` remains the native heuristic, not an exact certificate.
+    /// For `native_search_failed`, counters include only completed shard calls;
+    /// they exclude the failed call and are not totals for the complete cohort.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact_fallback: Option<AnnExactFallbackStats>,
 }
