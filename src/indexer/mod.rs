@@ -1,5 +1,6 @@
 pub mod background_refresh;
 pub(crate) mod lexical_generation;
+mod lexical_publish;
 pub mod lexical_reconcile;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
@@ -24434,10 +24435,22 @@ fn rebuild_tantivy_from_db_with_options(
 
     log_prep_step("load_checkpoint_state", &mut prep_step_started);
 
-    if rebuild_state.completed
-        || (!options.defer_initial_content_fingerprint
-            && rebuild_state.processed_conversations >= total_conversations)
-    {
+    // GH #494: EOF is an ingest cursor, NOT a publication receipt. An
+    // interrupted/refused terminal publish leaves all rows committed in the
+    // scratch generation but completed=false. It must pass through finalization
+    // below, including the swap and completed checkpoint, even with no rows left.
+    // This also lets a genuinely empty archive publish its first readable index.
+    if rebuild_state.completed {
+        lexical_publish::Finalization::new(
+            &index_path,
+            &index_path,
+            rebuild_state.indexed_docs,
+            rebuild_state.processed_conversations,
+        )
+        .run("reuse_completed_generation", || {
+            crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
+            verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")
+        })?;
         storage.close_without_checkpoint().with_context(|| {
             format!(
                 "closing readonly database after confirming completed Tantivy rebuild without checkpoint: {}",
@@ -24462,6 +24475,17 @@ fn rebuild_tantivy_from_db_with_options(
         });
     }
 
+    if !options.defer_initial_content_fingerprint
+        && rebuild_state.processed_conversations >= total_conversations
+    {
+        tracing::info!(
+            processed_conversations = rebuild_state.processed_conversations,
+            total_conversations,
+            indexed_docs = rebuild_state.indexed_docs,
+            index_path = %index_path.display(),
+            "lexical rebuild cursor reached EOF but publication is incomplete; resuming finalization"
+        );
+    }
     let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
     let restart_from_zero =
         rebuild_state.processed_conversations == 0 && rebuild_state.pending.is_none();
@@ -25430,7 +25454,13 @@ fn rebuild_tantivy_from_db_with_options(
     // one. The merge is a Q1-preserving concat behind an atomic MANIFEST
     // publish, so a failure leaves the (valid, merely unmerged) generation in
     // place and is logged rather than failing a completed rebuild.
-    t_index.commit()?;
+    let publication = lexical_publish::Finalization::new(
+        &index_path,
+        &build_path,
+        indexed_docs,
+        processed_conversations,
+    );
+    publication.run("commit_candidate", || t_index.commit())?;
     if let Some(p) = &progress {
         p.tick_activity();
     }
@@ -25464,53 +25494,60 @@ fn rebuild_tantivy_from_db_with_options(
     // checkpoint carries must describe the generation that is actually
     // published — a stale fingerprint reads as "index changed underneath the
     // checkpoint" and forces the next run into another full rebuild.
-    commit_lexical_rebuild_progress(
-        &index_path,
-        &build_path,
-        &mut rebuild_state,
-        last_processed_conversation_id,
-        processed_conversations,
-        indexed_docs,
-        &latest_pipeline_runtime,
-        &mut t_index,
-        false,
-        perf_profile.as_mut(),
-    )?;
+    publication.run("checkpoint_after_fold", || {
+        commit_lexical_rebuild_progress(
+            &index_path,
+            &build_path,
+            &mut rebuild_state,
+            last_processed_conversation_id,
+            processed_conversations,
+            indexed_docs,
+            &latest_pipeline_runtime,
+            &mut t_index,
+            false,
+            perf_profile.as_mut(),
+        )
+    })?;
 
-    drop(t_index);
+    // Refuse an unreadable/hollow candidate before it can replace a usable
+    // live generation. Reopen and validate the actual live path again after swap.
+    publication.run("validate_candidate", || {
+        crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
+        verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
+    })?;
+    publication.run("release_writer", || {
+        drop(t_index);
+        Ok(())
+    })?;
     // Swap the freshly built index into the live path. Until this call the live
     // index is untouched, so a concurrent reader sees the OLD complete corpus
     // rather than a partially built one.
     if let Some(staged) = staged_build_path.as_ref() {
-        publish_staged_lexical_index(staged, &index_path).with_context(|| {
-            format!(
-                "publishing staged lexical rebuild into {}",
-                index_path.display()
-            )
+        publication.run("publish_staged_generation", || {
+            publish_staged_lexical_index(staged, &index_path)
         })?;
     }
-    crate::search::tantivy::validate_searchable_index_contract(&index_path).with_context(|| {
-        format!(
-            "validating lexical rebuild after commit: {}",
-            index_path.display()
-        )
+    publication.run("validate_published_generation", || {
+        crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
+        verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
     })?;
-    verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")?;
 
     // GH #440: indexed_docs omits hard-noise messages from the committed
     // prefix, so prefix docs + newly streamed rows is not an exact canonical
     // count after resume. Count once at completion while the readonly handle
     // is still open; fresh rebuilds already observed every canonical packet.
     let final_observed_messages = if resumed_from_checkpoint {
-        count_total_messages_exact(&storage)?
+        publication.run("count_canonical_messages", || count_total_messages_exact(&storage))?
     } else {
         observed_messages.max(indexed_docs)
     };
-    storage.close_without_checkpoint().with_context(|| {
-        format!(
-            "closing readonly database after Tantivy rebuild without checkpoint: {}",
-            db_path.display()
-        )
+    publication.run("close_canonical_reader", || {
+        storage.close_without_checkpoint().with_context(|| {
+            format!(
+                "closing readonly database after Tantivy rebuild without checkpoint: {}",
+                db_path.display()
+            )
+        })
     })?;
     let final_total_conversations = if options.defer_initial_content_fingerprint {
         processed_conversations
@@ -25543,21 +25580,25 @@ fn rebuild_tantivy_from_db_with_options(
     let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
     let publish_started = Instant::now();
     let equivalence_evidence = equivalence_accumulator.finalize();
-    let generation_manifest = persist_lexical_rebuild_generation_artifacts(
-        &index_path,
-        &rebuild_state.db.storage_fingerprint,
-        rebuild_state.processed_conversations,
-        final_total_conversations,
-        final_observed_messages,
-        indexed_docs,
-        &equivalence_evidence,
-    )?;
+    let generation_manifest = publication.run("persist_generation_manifest", || {
+        persist_lexical_rebuild_generation_artifacts(
+            &index_path,
+            &rebuild_state.db.storage_fingerprint,
+            rebuild_state.processed_conversations,
+            final_total_conversations,
+            final_observed_messages,
+            indexed_docs,
+            &equivalence_evidence,
+        )
+    })?;
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
-    rebuild_state.mark_completed(completed_lexical_rebuild_meta_fingerprint(
-        &rebuild_state,
-        &index_path,
-    )?);
-    persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+    let completed_fingerprint = publication.run("completed_generation_fingerprint", || {
+        completed_lexical_rebuild_meta_fingerprint(&rebuild_state, &index_path)
+    })?;
+    rebuild_state.mark_completed(completed_fingerprint);
+    publication.run("persist_completed_checkpoint", || {
+        persist_lexical_rebuild_state(&index_path, &rebuild_state)
+    })?;
 
     if let Some(p) = &progress {
         p.current
@@ -25586,7 +25627,9 @@ fn rebuild_tantivy_from_db_with_options(
             indexed_docs,
             equivalence_evidence: &equivalence_evidence,
         });
-    persist_lexical_refresh_ledger(&index_path, &refresh_ledger)?;
+    publication.run("persist_refresh_ledger", || {
+        persist_lexical_refresh_ledger(&index_path, &refresh_ledger)
+    })?;
     log_lexical_refresh_ledger_published(&refresh_ledger);
 
     Ok(LexicalRebuildOutcome {
@@ -37283,6 +37326,7 @@ pub mod persist {
 #[cfg(test)]
 mod tests {
     include!("gh473_tests.rs");
+    include!("gh494_tests.rs");
     use super::*;
     use crate::connectors::{
         Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
