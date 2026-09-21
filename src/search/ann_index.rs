@@ -19,6 +19,9 @@ pub enum AnnExactFallbackReason {
     /// A native shard query failed after owner and query validation. Native
     /// counters cover completed shard calls only; failed-call work is unknown.
     NativeSearchFailed,
+    /// Durable updates extend or supersede the main slab covered by HNSW.
+    /// A main-only native page cannot certify the complete retained snapshot.
+    WalDeltaRequiresExact,
 }
 
 /// Work done by the complete exact cohort after native underfill or failure.

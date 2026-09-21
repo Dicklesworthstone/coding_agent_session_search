@@ -1,0 +1,70 @@
+name: Retained semantic WAL regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/semantic-wal-regression.yml
+      - src/search/query.rs
+      - src/search/query/ann_shards.rs
+      - src/search/query/ann_shards/**
+      - src/search/vector_index.rs
+      - src/search/ann_index.rs
+      - scripts/verify_ann_shards.py
+      - scripts/verify_message_topk_fsvi.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cass-semantic-wal-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  native-components:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
+          path: fs-source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt
+      - name: Record source and compiler identities
+        run: git rev-parse HEAD && rustc --version && cargo --version
+      - name: Extract actual CASS methods and native FSVI/HNSW dependencies
+        run: python3 scripts/verify_ann_shards.py "$PWD" "$PWD/fs-source" "$RUNNER_TEMP/cass-ann-wal"
+      - name: Run actual retained-reader regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path "$RUNNER_TEMP/cass-ann-wal/Cargo.toml" --lib -- --list | tee "$RUNNER_TEMP/wal-test-list.txt"
+          grep -q 'ann_shards::wal_tests::a_full_native_page_cannot_hide_a_new_durable_wal_winner: test' "$RUNNER_TEMP/wal-test-list.txt"
+          cargo test --manifest-path "$RUNNER_TEMP/cass-ann-wal/Cargo.toml" --lib -- --nocapture | tee "$RUNNER_TEMP/wal-test-results.txt"
+      - name: Check changed Rust formatting independently
+        if: always()
+        run: rustfmt --edition 2024 --check src/search/ann_index.rs src/search/query/ann_shards.rs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-wal-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/wal-test-list.txt
+            ${{ runner.temp }}/wal-test-results.txt
+            ${{ runner.temp }}/cass-ann-wal/*receipt.json
+          retention-days: 3
