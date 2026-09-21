@@ -3,6 +3,7 @@
 
 mod codec;
 mod export;
+mod import;
 
 use std::path::PathBuf;
 
@@ -27,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Root {
-    /// Export or verify a bounded, versioned logical canonical archive.
+    /// Export, verify or restore a bounded, versioned logical canonical archive.
     Archive {
         #[command(subcommand)]
         command: Operation,
@@ -51,6 +52,19 @@ enum Operation {
     /// Verify framing, identities, counts and digest without opening a database.
     Verify {
         input: PathBuf,
+    },
+    /// Restore all canonical rows into a NEW database; never replace an archive.
+    Import {
+        input: PathBuf,
+        /// New database file, not a data directory or an existing live archive.
+        #[arg(long)]
+        output: PathBuf,
+        /// Require this exact source identity before creating a restore candidate.
+        #[arg(long)]
+        archive_id: String,
+        /// Acknowledge that full private session bodies will be restored.
+        #[arg(long)]
+        include_private: bool,
     },
 }
 
@@ -76,6 +90,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Operation::Verify { input } => {
             let (header, completion) = export::verify_file(&input)?;
             ("verify", header, completion)
+        }
+        Operation::Import { input, output, archive_id, include_private } => {
+            ensure!(include_private, "restoration writes private session data; pass --include-private to acknowledge this");
+            let (header, completion) = import::import_file(&input, &output, &archive_id)?;
+            ("import", header, completion)
         }
     };
     println!("{}", serde_json::json!({
