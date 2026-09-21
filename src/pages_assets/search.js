@@ -6,41 +6,41 @@
  */
 
 import {
-    searchConversations,
-    detectSearchMode,
-    getStatistics,
-    getRecentConversations,
-    getConversationsByAgent,
-    getConversationsByTimeRange,
-} from './database.js';
-import { parseRouteIdSegment } from './router.js';
-import { VirtualList } from './virtual-list.js';
+  detectSearchMode,
+  getConversationsByAgent,
+  getConversationsByTimeRange,
+  getRecentConversations,
+  getStatistics,
+  searchConversations,
+} from "./database.js";
+import { parseRouteIdSegment } from "./router.js";
+import { VirtualList } from "./virtual-list.js";
 
 // Search configuration
 const SEARCH_CONFIG = {
-    DEBOUNCE_MS: 300,
-    PAGE_SIZE: 50,
-    SNIPPET_LENGTH: 64,
-    TIME_FILTER_CUSTOM_VALUE: 'custom',
-    // Virtual list configuration
-    RESULT_CARD_HEIGHT: 88, // Fixed height per result card
-    VIRTUAL_LIST_OVERSCAN: 5, // Extra items to render above/below viewport
-    VIRTUAL_LIST_THRESHOLD: 20, // Use virtual list above this count
+  DEBOUNCE_MS: 300,
+  PAGE_SIZE: 50,
+  SNIPPET_LENGTH: 64,
+  TIME_FILTER_CUSTOM_VALUE: "custom",
+  // Virtual list configuration
+  RESULT_CARD_HEIGHT: 88, // Fixed height per result card
+  VIRTUAL_LIST_OVERSCAN: 5, // Extra items to render above/below viewport
+  VIRTUAL_LIST_THRESHOLD: 20, // Use virtual list above this count
 };
 
 function createEmptySearchFilters() {
-    return {
-        agent: null,
-        since: null,
-        until: null,
-        timePreset: null,
-    };
+  return {
+    agent: null,
+    since: null,
+    until: null,
+    timePreset: null,
+  };
 }
 
 // Module state
-let currentQuery = '';
+let currentQuery = "";
 let currentFilters = createEmptySearchFilters();
-let currentSearchMode = 'auto'; // 'auto', 'prose', or 'code'
+let currentSearchMode = "auto"; // 'auto', 'prose', or 'code'
 let currentResults = [];
 let currentPage = 0;
 let hasNextPage = false;
@@ -51,214 +51,225 @@ let virtualList = null; // Virtual list instance for large result sets
 let searchEpoch = 0;
 
 // DOM element references
-let elements = {
-    container: null,
-    searchInput: null,
-    searchModeToggle: null,
-    searchModeIndicator: null,
-    agentFilter: null,
-    timeFilter: null,
-    resultsContainer: null,
-    resultsList: null,
-    loadingIndicator: null,
-    resultCount: null,
-    noResults: null,
-    pagination: null,
-    previousPage: null,
-    nextPage: null,
-    pageStatus: null,
+const elements = {
+  container: null,
+  searchInput: null,
+  searchModeToggle: null,
+  searchModeIndicator: null,
+  agentFilter: null,
+  timeFilter: null,
+  resultsContainer: null,
+  resultsList: null,
+  loadingIndicator: null,
+  resultCount: null,
+  noResults: null,
+  pagination: null,
+  previousPage: null,
+  nextPage: null,
+  pageStatus: null,
 };
 
 function parseResultSelection(card) {
-    const conversationId = parseRouteIdSegment(card?.dataset?.conversationId || '');
-    if (conversationId === null) {
-        return null;
-    }
+  const conversationId = parseRouteIdSegment(card?.dataset?.conversationId || "");
+  if (conversationId === null) {
+    return null;
+  }
 
-    const rawMessageId = card?.dataset?.messageId || '';
-    if (!rawMessageId) {
-        return { conversationId, messageId: null };
-    }
+  const rawMessageId = card?.dataset?.messageId || "";
+  if (!rawMessageId) {
+    return { conversationId, messageId: null };
+  }
 
-    const messageId = parseRouteIdSegment(rawMessageId);
-    if (messageId === null) {
-        return null;
-    }
+  const messageId = parseRouteIdSegment(rawMessageId);
+  if (messageId === null) {
+    return null;
+  }
 
-    return { conversationId, messageId };
+  return { conversationId, messageId };
 }
 
 function parseResultIndex(card) {
-    const rawIndex = card?.dataset?.resultIndex ?? '';
-    if (!/^\d+$/.test(rawIndex)) {
-        return null;
-    }
+  const rawIndex = card?.dataset?.resultIndex ?? "";
+  if (!/^\d+$/.test(rawIndex)) {
+    return null;
+  }
 
-    const index = Number.parseInt(rawIndex, 10);
-    if (!Number.isSafeInteger(index) || index < 0 || index >= currentResults.length) {
-        return null;
-    }
+  const index = Number.parseInt(rawIndex, 10);
+  if (!Number.isSafeInteger(index) || index < 0 || index >= currentResults.length) {
+    return null;
+  }
 
-    return index;
+  return index;
 }
 
 function findRenderedResultCard(index) {
-    if (!elements.resultsList || !Number.isSafeInteger(index) || index < 0) {
-        return null;
-    }
+  if (!elements.resultsList || !Number.isSafeInteger(index) || index < 0) {
+    return null;
+  }
 
-    return elements.resultsList.querySelector(`.result-card[data-result-index="${index}"]`);
+  return elements.resultsList.querySelector(`.result-card[data-result-index="${index}"]`);
 }
 
-function focusResultCardAtIndex(index, align = 'start') {
-    if (!Number.isSafeInteger(index) || index < 0 || index >= currentResults.length) {
-        return false;
-    }
+function focusResultCardAtIndex(index, align = "start") {
+  if (!Number.isSafeInteger(index) || index < 0 || index >= currentResults.length) {
+    return false;
+  }
 
-    let card = findRenderedResultCard(index);
-    if (!card && virtualList) {
-        virtualList.scrollToIndex(index, align);
-        card = findRenderedResultCard(index);
-    }
+  let card = findRenderedResultCard(index);
+  if (!card && virtualList) {
+    virtualList.scrollToIndex(index, align);
+    card = findRenderedResultCard(index);
+  }
 
-    if (!card) {
-        return false;
-    }
+  if (!card) {
+    return false;
+  }
 
-    card.focus();
-    return true;
+  card.focus();
+  return true;
 }
 
 function parseTimestampFilterValue(value) {
-    if (value === undefined || value === null || value === '') {
-        return null;
-    }
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
 
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(numeric)) {
-        return null;
-    }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(numeric)) {
+    return null;
+  }
 
-    return numeric;
+  return numeric;
 }
 
 function calculateTimeFilterRange(value) {
-    const now = Date.now();
-    const day = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
 
-    switch (value) {
-        case 'today':
-            return { since: now - day, until: now, timePreset: value };
-        case 'week':
-            return { since: now - (7 * day), until: now, timePreset: value };
-        case 'month':
-            return { since: now - (30 * day), until: now, timePreset: value };
-        case 'year':
-            return { since: now - (365 * day), until: now, timePreset: value };
-        default:
-            return createEmptySearchFilters();
-    }
+  switch (value) {
+    case "today":
+      return { since: now - day, until: now, timePreset: value };
+    case "week":
+      return { since: now - 7 * day, until: now, timePreset: value };
+    case "month":
+      return { since: now - 30 * day, until: now, timePreset: value };
+    case "year":
+      return { since: now - 365 * day, until: now, timePreset: value };
+    default:
+      return createEmptySearchFilters();
+  }
 }
 
 function normalizeRouteFilters(routeSearch = {}) {
-    const agent = routeSearch.agent === undefined || routeSearch.agent === null || routeSearch.agent === ''
-        ? null
-        : String(routeSearch.agent);
-    const timePreset = typeof routeSearch.timePreset === 'string' && routeSearch.timePreset !== ''
-        ? routeSearch.timePreset
-        : typeof routeSearch.time === 'string' && routeSearch.time !== ''
-            ? routeSearch.time
-            : null;
+  const agent =
+    routeSearch.agent === undefined || routeSearch.agent === null || routeSearch.agent === ""
+      ? null
+      : String(routeSearch.agent);
+  const timePreset =
+    typeof routeSearch.timePreset === "string" && routeSearch.timePreset !== ""
+      ? routeSearch.timePreset
+      : typeof routeSearch.time === "string" && routeSearch.time !== ""
+        ? routeSearch.time
+        : null;
 
-    if (timePreset === 'today' || timePreset === 'week' || timePreset === 'month' || timePreset === 'year') {
-        return {
-            agent,
-            ...calculateTimeFilterRange(timePreset),
-        };
-    }
-
-    const since = parseTimestampFilterValue(routeSearch.since);
-    const until = parseTimestampFilterValue(routeSearch.until);
-    if (since !== null && until !== null && since > until) {
-        return {
-            ...createEmptySearchFilters(),
-            agent,
-        };
-    }
-
+  if (
+    timePreset === "today" ||
+    timePreset === "week" ||
+    timePreset === "month" ||
+    timePreset === "year"
+  ) {
     return {
-        agent,
-        since,
-        until,
-        timePreset: since !== null || until !== null ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,
+      agent,
+      ...calculateTimeFilterRange(timePreset),
     };
+  }
+
+  const since = parseTimestampFilterValue(routeSearch.since);
+  const until = parseTimestampFilterValue(routeSearch.until);
+  if (since !== null && until !== null && since > until) {
+    return {
+      ...createEmptySearchFilters(),
+      agent,
+    };
+  }
+
+  return {
+    agent,
+    since,
+    until,
+    timePreset: since !== null || until !== null ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,
+  };
 }
 
 function syncAgentFilterControl() {
-    if (!elements.agentFilter) {
-        return;
-    }
+  if (!elements.agentFilter) {
+    return;
+  }
 
-    const agent = currentFilters.agent;
-    if (!agent) {
-        elements.agentFilter.value = '';
-        return;
-    }
+  const agent = currentFilters.agent;
+  if (!agent) {
+    elements.agentFilter.value = "";
+    return;
+  }
 
-    const optionExists = Array.from(elements.agentFilter.options).some((option) => option.value === agent);
-    if (!optionExists) {
-        const option = document.createElement('option');
-        option.value = agent;
-        option.textContent = formatAgentName(agent);
-        elements.agentFilter.appendChild(option);
-    }
+  const optionExists = Array.from(elements.agentFilter.options).some(
+    (option) => option.value === agent,
+  );
+  if (!optionExists) {
+    const option = document.createElement("option");
+    option.value = agent;
+    option.textContent = formatAgentName(agent);
+    elements.agentFilter.appendChild(option);
+  }
 
-    elements.agentFilter.value = agent;
+  elements.agentFilter.value = agent;
 }
 
 function syncTimeFilterControl() {
-    if (!elements.timeFilter) {
-        return;
+  if (!elements.timeFilter) {
+    return;
+  }
+
+  const customValue = SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE;
+  let customOption = Array.from(elements.timeFilter.options).find(
+    (option) => option.value === customValue,
+  );
+
+  if (currentFilters.timePreset === customValue) {
+    if (!customOption) {
+      customOption = document.createElement("option");
+      customOption.value = customValue;
+      customOption.textContent = "Custom range";
+      elements.timeFilter.appendChild(customOption);
     }
+    elements.timeFilter.value = customValue;
+    return;
+  }
 
-    const customValue = SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE;
-    let customOption = Array.from(elements.timeFilter.options).find((option) => option.value === customValue);
+  if (customOption) {
+    customOption.remove();
+  }
 
-    if (currentFilters.timePreset === customValue) {
-        if (!customOption) {
-            customOption = document.createElement('option');
-            customOption.value = customValue;
-            customOption.textContent = 'Custom range';
-            elements.timeFilter.appendChild(customOption);
-        }
-        elements.timeFilter.value = customValue;
-        return;
-    }
-
-    if (customOption) {
-        customOption.remove();
-    }
-
-    elements.timeFilter.value = currentFilters.timePreset || '';
+  elements.timeFilter.value = currentFilters.timePreset || "";
 }
 
 function syncFilterControls() {
-    syncAgentFilterControl();
-    syncTimeFilterControl();
+  syncAgentFilterControl();
+  syncTimeFilterControl();
 }
 
 export function buildResultCardId(result, index = 0) {
-    const conversationId = String(result?.conversation_id ?? 'unknown');
-    const messageId = result?.message_id;
-    if (messageId !== undefined && messageId !== null && messageId !== '') {
-        return `result-${conversationId}-m-${messageId}`;
-    }
+  const conversationId = String(result?.conversation_id ?? "unknown");
+  const messageId = result?.message_id;
+  if (messageId !== undefined && messageId !== null && messageId !== "") {
+    return `result-${conversationId}-m-${messageId}`;
+  }
 
-    return `result-${conversationId}-r-${index}`;
+  return `result-${conversationId}-r-${index}`;
 }
 
 function isCurrentSearchEpoch(epoch) {
-    return epoch === searchEpoch;
+  return epoch === searchEpoch;
 }
 
 /**
@@ -267,27 +278,27 @@ function isCurrentSearchEpoch(epoch) {
  * @param {Function} onSelect - Callback when result is selected
  */
 export function initSearch(container, onSelect) {
-    elements.container = container;
-    onResultSelect = onSelect;
+  elements.container = container;
+  onResultSelect = onSelect;
 
-    // Render search UI
-    renderSearchUI();
+  // Render search UI
+  renderSearchUI();
 
-    // Cache element references
-    cacheElements();
+  // Cache element references
+  cacheElements();
 
-    // Set up event listeners
-    setupEventListeners();
+  // Set up event listeners
+  setupEventListeners();
 
-    // Populate filter options
-    populateFilters();
+  // Populate filter options
+  populateFilters();
 }
 
 /**
  * Render the search UI structure
  */
 function renderSearchUI() {
-    elements.container.innerHTML = `
+  elements.container.innerHTML = `
         <div class="search-container">
             <div class="search-box">
                 <input
@@ -362,182 +373,182 @@ function renderSearchUI() {
  * Cache DOM element references
  */
 function cacheElements() {
-    elements.searchInput = document.getElementById('search-input');
-    elements.searchModeToggle = document.getElementById('search-mode-toggle');
-    elements.searchModeIndicator = document.getElementById('search-mode-indicator');
-    elements.agentFilter = document.getElementById('agent-filter');
-    elements.timeFilter = document.getElementById('time-filter');
-    elements.resultsContainer = elements.container.querySelector('.search-results');
-    elements.resultsList = document.getElementById('results-list');
-    elements.loadingIndicator = document.getElementById('loading-indicator');
-    elements.resultCount = document.getElementById('result-count');
-    elements.noResults = document.getElementById('no-results');
-    elements.pagination = document.getElementById('search-pagination');
-    elements.previousPage = document.getElementById('search-previous-page');
-    elements.nextPage = document.getElementById('search-next-page');
-    elements.pageStatus = document.getElementById('search-page-status');
+  elements.searchInput = document.getElementById("search-input");
+  elements.searchModeToggle = document.getElementById("search-mode-toggle");
+  elements.searchModeIndicator = document.getElementById("search-mode-indicator");
+  elements.agentFilter = document.getElementById("agent-filter");
+  elements.timeFilter = document.getElementById("time-filter");
+  elements.resultsContainer = elements.container.querySelector(".search-results");
+  elements.resultsList = document.getElementById("results-list");
+  elements.loadingIndicator = document.getElementById("loading-indicator");
+  elements.resultCount = document.getElementById("result-count");
+  elements.noResults = document.getElementById("no-results");
+  elements.pagination = document.getElementById("search-pagination");
+  elements.previousPage = document.getElementById("search-previous-page");
+  elements.nextPage = document.getElementById("search-next-page");
+  elements.pageStatus = document.getElementById("search-page-status");
 }
 
 /**
  * Set up event listeners
  */
 function setupEventListeners() {
-    // Search input with debounce
-    elements.searchInput.addEventListener('input', (e) => {
-        // Invalidate immediately, not after the debounce: a pending page must
-        // not repaint stale/private results after a query edit or session lock.
-        invalidateSearchResults();
-        searchTimeout = setTimeout(() => {
-            handleSearch(e.target.value);
-        }, SEARCH_CONFIG.DEBOUNCE_MS);
-    });
+  // Search input with debounce
+  elements.searchInput.addEventListener("input", (e) => {
+    // Invalidate immediately, not after the debounce: a pending page must
+    // not repaint stale/private results after a query edit or session lock.
+    invalidateSearchResults();
+    searchTimeout = setTimeout(() => {
+      handleSearch(e.target.value);
+    }, SEARCH_CONFIG.DEBOUNCE_MS);
+  });
 
-    // Enter key in search
-    elements.searchInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            clearTimeout(searchTimeout);
-            handleSearch(e.target.value);
-        }
-    });
-
-    // Search button
-    const searchBtn = document.getElementById('search-btn');
-    searchBtn?.addEventListener('click', () => {
-        handleSearch(elements.searchInput.value);
-    });
-
-    // Agent filter
-    elements.agentFilter.addEventListener('change', (e) => {
-        currentFilters.agent = e.target.value || null;
-        handleSearch(elements.searchInput.value);
-    });
-
-    // Time filter
-    elements.timeFilter.addEventListener('change', (e) => {
-        updateTimeFilter(e.target.value);
-        handleSearch(elements.searchInput.value);
-    });
-
-    // Search mode toggle
-    if (elements.searchModeToggle) {
-        elements.searchModeToggle.addEventListener('click', (e) => {
-            const btn = e.target.closest('.search-mode-btn');
-            if (btn) {
-                const mode = btn.dataset.mode;
-                setSearchMode(mode);
-                handleSearch(elements.searchInput.value);
-            }
-        });
+  // Enter key in search
+  elements.searchInput.addEventListener("keypress", (e) => {
+    if (e.key === "Enter") {
+      clearTimeout(searchTimeout);
+      handleSearch(e.target.value);
     }
+  });
 
-    elements.previousPage.addEventListener('click', () => changeSearchPage(-1));
-    elements.nextPage.addEventListener('click', () => changeSearchPage(1));
+  // Search button
+  const searchBtn = document.getElementById("search-btn");
+  searchBtn?.addEventListener("click", () => {
+    handleSearch(elements.searchInput.value);
+  });
 
-    // Result click delegation (also handles virtual-list cards).
-    elements.resultsList.addEventListener('click', (e) => {
-        const resultCard = e.target.closest('.result-card');
-        if (resultCard) {
-            const selection = parseResultSelection(resultCard);
-            if (!selection) {
-                console.warn('[Search] Ignoring result with invalid conversation/message id');
-                return;
-            }
-            if (onResultSelect) {
-                onResultSelect(selection.conversationId, selection.messageId);
-            }
-        }
+  // Agent filter
+  elements.agentFilter.addEventListener("change", (e) => {
+    currentFilters.agent = e.target.value || null;
+    handleSearch(elements.searchInput.value);
+  });
+
+  // Time filter
+  elements.timeFilter.addEventListener("change", (e) => {
+    updateTimeFilter(e.target.value);
+    handleSearch(elements.searchInput.value);
+  });
+
+  // Search mode toggle
+  if (elements.searchModeToggle) {
+    elements.searchModeToggle.addEventListener("click", (e) => {
+      const btn = e.target.closest(".search-mode-btn");
+      if (btn) {
+        const mode = btn.dataset.mode;
+        setSearchMode(mode);
+        handleSearch(elements.searchInput.value);
+      }
     });
+  }
 
-    // Keyboard navigation for results list
-    elements.resultsList.addEventListener('keydown', (e) => {
-        const focused = document.activeElement;
-        const isResultCard = focused?.classList.contains('result-card');
+  elements.previousPage.addEventListener("click", () => changeSearchPage(-1));
+  elements.nextPage.addEventListener("click", () => changeSearchPage(1));
 
-        switch (e.key) {
-            case 'Enter':
-            case ' ':
-                if (isResultCard) {
-                    e.preventDefault();
-                    focused.click();
-                }
-                break;
+  // Result click delegation (also handles virtual-list cards).
+  elements.resultsList.addEventListener("click", (e) => {
+    const resultCard = e.target.closest(".result-card");
+    if (resultCard) {
+      const selection = parseResultSelection(resultCard);
+      if (!selection) {
+        console.warn("[Search] Ignoring result with invalid conversation/message id");
+        return;
+      }
+      if (onResultSelect) {
+        onResultSelect(selection.conversationId, selection.messageId);
+      }
+    }
+  });
 
-            case 'ArrowDown':
-                e.preventDefault();
-                if (isResultCard) {
-                    const currentIndex = parseResultIndex(focused);
-                    if (currentIndex !== null) {
-                        focusResultCardAtIndex(currentIndex + 1, 'end');
-                    }
-                } else {
-                    focusResultCardAtIndex(0, 'start');
-                }
-                break;
+  // Keyboard navigation for results list
+  elements.resultsList.addEventListener("keydown", (e) => {
+    const focused = document.activeElement;
+    const isResultCard = focused?.classList.contains("result-card");
 
-            case 'ArrowUp':
-                e.preventDefault();
-                if (isResultCard) {
-                    const currentIndex = parseResultIndex(focused);
-                    if (currentIndex === null) {
-                        break;
-                    }
-
-                    if (currentIndex === 0) {
-                        // Move focus back to search input
-                        elements.searchInput?.focus();
-                    } else {
-                        focusResultCardAtIndex(currentIndex - 1, 'start');
-                    }
-                }
-                break;
-
-            case 'Home':
-                if (isResultCard) {
-                    e.preventDefault();
-                    focusResultCardAtIndex(0, 'start');
-                }
-                break;
-
-            case 'End':
-                if (isResultCard) {
-                    e.preventDefault();
-                    focusResultCardAtIndex(currentResults.length - 1, 'end');
-                }
-                break;
+    switch (e.key) {
+      case "Enter":
+      case " ":
+        if (isResultCard) {
+          e.preventDefault();
+          focused.click();
         }
-    });
+        break;
 
-    // Allow arrow down from search input to results
-    elements.searchInput?.addEventListener('keydown', (e) => {
-        if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            focusResultCardAtIndex(0, 'start');
+      case "ArrowDown":
+        e.preventDefault();
+        if (isResultCard) {
+          const currentIndex = parseResultIndex(focused);
+          if (currentIndex !== null) {
+            focusResultCardAtIndex(currentIndex + 1, "end");
+          }
+        } else {
+          focusResultCardAtIndex(0, "start");
         }
-    });
+        break;
+
+      case "ArrowUp":
+        e.preventDefault();
+        if (isResultCard) {
+          const currentIndex = parseResultIndex(focused);
+          if (currentIndex === null) {
+            break;
+          }
+
+          if (currentIndex === 0) {
+            // Move focus back to search input
+            elements.searchInput?.focus();
+          } else {
+            focusResultCardAtIndex(currentIndex - 1, "start");
+          }
+        }
+        break;
+
+      case "Home":
+        if (isResultCard) {
+          e.preventDefault();
+          focusResultCardAtIndex(0, "start");
+        }
+        break;
+
+      case "End":
+        if (isResultCard) {
+          e.preventDefault();
+          focusResultCardAtIndex(currentResults.length - 1, "end");
+        }
+        break;
+    }
+  });
+
+  // Allow arrow down from search input to results
+  elements.searchInput?.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      focusResultCardAtIndex(0, "start");
+    }
+  });
 }
 
 /**
  * Populate filter dropdowns from database
  */
 async function populateFilters() {
-    try {
-        const stats = getStatistics();
+  try {
+    const stats = getStatistics();
 
-        // Populate agent filter
-        if (stats.agents && stats.agents.length > 0) {
-            stats.agents.forEach(agent => {
-                if (Array.from(elements.agentFilter.options).some((option) => option.value === agent)) {
-                    return;
-                }
-                const option = document.createElement('option');
-                option.value = agent;
-                option.textContent = formatAgentName(agent);
-                elements.agentFilter.appendChild(option);
-            });
+    // Populate agent filter
+    if (stats.agents && stats.agents.length > 0) {
+      stats.agents.forEach((agent) => {
+        if (Array.from(elements.agentFilter.options).some((option) => option.value === agent)) {
+          return;
         }
-    } catch (error) {
-        console.error('[Search] Failed to populate filters:', error);
+        const option = document.createElement("option");
+        option.value = agent;
+        option.textContent = formatAgentName(agent);
+        elements.agentFilter.appendChild(option);
+      });
     }
+  } catch (error) {
+    console.error("[Search] Failed to populate filters:", error);
+  }
 }
 
 /**
@@ -545,15 +556,15 @@ async function populateFilters() {
  * @param {'auto' | 'prose' | 'code'} mode - Search mode
  */
 function setSearchMode(mode) {
-    currentSearchMode = mode;
+  currentSearchMode = mode;
 
-    // Update button states
-    if (elements.searchModeToggle) {
-        const buttons = elements.searchModeToggle.querySelectorAll('.search-mode-btn');
-        buttons.forEach(btn => {
-            btn.classList.toggle('active', btn.dataset.mode === mode);
-        });
-    }
+  // Update button states
+  if (elements.searchModeToggle) {
+    const buttons = elements.searchModeToggle.querySelectorAll(".search-mode-btn");
+    buttons.forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.mode === mode);
+    });
+  }
 }
 
 /**
@@ -561,42 +572,38 @@ function setSearchMode(mode) {
  * @param {string} query - Current search query
  */
 function updateSearchModeIndicator(query) {
-    if (!elements.searchModeIndicator || !query) {
-        if (elements.searchModeIndicator) {
-            elements.searchModeIndicator.classList.add('hidden');
-        }
-        return;
+  if (!elements.searchModeIndicator || !query) {
+    if (elements.searchModeIndicator) {
+      elements.searchModeIndicator.classList.add("hidden");
     }
+    return;
+  }
 
-    let activeMode;
-    let modeLabel;
+  let activeMode;
+  let modeLabel;
 
-    if (currentSearchMode === 'auto') {
-        activeMode = detectSearchMode(query);
-        modeLabel = activeMode === 'code'
-            ? '🔍 Code search (detected)'
-            : '🔍 Prose search (detected)';
-    } else {
-        activeMode = currentSearchMode;
-        modeLabel = activeMode === 'code'
-            ? '🔍 Code search'
-            : '🔍 Prose search';
-    }
+  if (currentSearchMode === "auto") {
+    activeMode = detectSearchMode(query);
+    modeLabel = activeMode === "code" ? "🔍 Code search (detected)" : "🔍 Prose search (detected)";
+  } else {
+    activeMode = currentSearchMode;
+    modeLabel = activeMode === "code" ? "🔍 Code search" : "🔍 Prose search";
+  }
 
-    elements.searchModeIndicator.textContent = modeLabel;
-    elements.searchModeIndicator.classList.remove('hidden');
-    elements.searchModeIndicator.dataset.mode = activeMode;
+  elements.searchModeIndicator.textContent = modeLabel;
+  elements.searchModeIndicator.classList.remove("hidden");
+  elements.searchModeIndicator.dataset.mode = activeMode;
 }
 
 /**
  * Update time filter values
  */
 function updateTimeFilter(value) {
-    const nextFilters = calculateTimeFilterRange(value);
-    currentFilters.since = nextFilters.since;
-    currentFilters.until = nextFilters.until;
-    currentFilters.timePreset = nextFilters.timePreset;
-    syncTimeFilterControl();
+  const nextFilters = calculateTimeFilterRange(value);
+  currentFilters.since = nextFilters.since;
+  currentFilters.until = nextFilters.until;
+  currentFilters.timePreset = nextFilters.timePreset;
+  syncTimeFilterControl();
 }
 
 /**
@@ -604,38 +611,38 @@ function updateTimeFilter(value) {
  * Shared by query edits, route changes and the session-lock cleanup path.
  */
 function invalidateSearchResults() {
-    clearTimeout(searchTimeout);
-    searchTimeout = null;
-    searchEpoch += 1;
-    currentResults = [];
-    currentPage = 0;
-    hasNextPage = false;
-    isSearching = false;
-    destroyVirtualResultsView();
-    hideLoading();
-    hideNoResults();
-    if (elements.resultsList) {
-        elements.resultsList.innerHTML = '';
-        elements.resultsList.scrollTop = 0;
-    }
-    if (elements.resultCount) {
-        elements.resultCount.textContent = '';
-    }
-    const announcer = document.getElementById('search-announcer');
-    if (announcer) {
-        announcer.textContent = '';
-    }
-    updatePagination();
+  clearTimeout(searchTimeout);
+  searchTimeout = null;
+  searchEpoch += 1;
+  currentResults = [];
+  currentPage = 0;
+  hasNextPage = false;
+  isSearching = false;
+  destroyVirtualResultsView();
+  hideLoading();
+  hideNoResults();
+  if (elements.resultsList) {
+    elements.resultsList.innerHTML = "";
+    elements.resultsList.scrollTop = 0;
+  }
+  if (elements.resultCount) {
+    elements.resultCount.textContent = "";
+  }
+  const announcer = document.getElementById("search-announcer");
+  if (announcer) {
+    announcer.textContent = "";
+  }
+  updatePagination();
 }
 
 /**
  * Handle a new query, always starting from the first page.
  */
 async function handleSearch(query) {
-    invalidateSearchResults();
-    currentQuery = query.trim();
-    updateSearchModeIndicator(currentQuery);
-    await loadSearchPage(0);
+  invalidateSearchResults();
+  currentQuery = query.trim();
+  updateSearchModeIndicator(currentQuery);
+  await loadSearchPage(0);
 }
 
 /**
@@ -643,109 +650,115 @@ async function handleSearch(query) {
  * Filtering and ordering stay in SQL. Only the current page is retained.
  */
 function readSearchPage(page) {
-    const limit = SEARCH_CONFIG.PAGE_SIZE + 1;
-    const offset = page * SEARCH_CONFIG.PAGE_SIZE;
-    if (currentQuery) {
-        return searchConversations(currentQuery, {
-            limit,
-            offset,
-            agent: currentFilters.agent,
-            searchMode: currentSearchMode,
-            since: currentFilters.since,
-            until: currentFilters.until,
-        });
-    }
+  const limit = SEARCH_CONFIG.PAGE_SIZE + 1;
+  const offset = page * SEARCH_CONFIG.PAGE_SIZE;
+  if (currentQuery) {
+    return searchConversations(currentQuery, {
+      limit,
+      offset,
+      agent: currentFilters.agent,
+      searchMode: currentSearchMode,
+      since: currentFilters.since,
+      until: currentFilters.until,
+    });
+  }
 
-    let results;
-    if (currentFilters.agent) {
-        results = getConversationsByAgent(
-            currentFilters.agent, limit,
-            currentFilters.since, currentFilters.until, offset,
-        );
-    } else if (currentFilters.since !== null || currentFilters.until !== null) {
-        results = getConversationsByTimeRange(
-            currentFilters.since, currentFilters.until, limit, offset,
-        );
-    } else {
-        results = getRecentConversations(limit, offset);
-    }
+  let results;
+  if (currentFilters.agent) {
+    results = getConversationsByAgent(
+      currentFilters.agent,
+      limit,
+      currentFilters.since,
+      currentFilters.until,
+      offset,
+    );
+  } else if (currentFilters.since !== null || currentFilters.until !== null) {
+    results = getConversationsByTimeRange(
+      currentFilters.since,
+      currentFilters.until,
+      limit,
+      offset,
+    );
+  } else {
+    results = getRecentConversations(limit, offset);
+  }
 
-    return results.map(conv => ({
-        conversation_id: conv.id,
-        message_id: null,
-        agent: conv.agent,
-        workspace: conv.workspace,
-        title: conv.title || 'Untitled conversation',
-        started_at: conv.started_at,
-        snippet: null,
-        rank: 0,
-    }));
+  return results.map((conv) => ({
+    conversation_id: conv.id,
+    message_id: null,
+    agent: conv.agent,
+    workspace: conv.workspace,
+    title: conv.title || "Untitled conversation",
+    started_at: conv.started_at,
+    snippet: null,
+    rank: 0,
+  }));
 }
 
 async function loadSearchPage(page, focusResults = false) {
-    const epoch = ++searchEpoch;
-    isSearching = true;
-    showLoading();
-    updatePagination();
+  const epoch = ++searchEpoch;
+  isSearching = true;
+  showLoading();
+  updatePagination();
 
-    try {
-        // Yield before the synchronous SQLite query so loading feedback can
-        // paint and a newer query/lock can cancel this work before it starts.
-        await new Promise(resolve => setTimeout(resolve, 0));
-        if (!isCurrentSearchEpoch(epoch)) {
-            return;
-        }
-        const rows = readSearchPage(page);
-        currentPage = page;
-        hasNextPage = rows.length > SEARCH_CONFIG.PAGE_SIZE;
-        currentResults = rows.slice(0, SEARCH_CONFIG.PAGE_SIZE);
-        renderResults();
-        elements.resultsList.scrollTop = 0;
-        if (focusResults) {
-            focusResultCardAtIndex(0, 'start');
-        }
-    } catch (error) {
-        if (!isCurrentSearchEpoch(epoch)) {
-            return;
-        }
-        console.error('[Search] Search error:', error);
-        showError('Search failed. Please try again.');
-    } finally {
-        if (isCurrentSearchEpoch(epoch)) {
-            isSearching = false;
-            hideLoading();
-            updatePagination();
-        }
+  try {
+    // Yield before the synchronous SQLite query so loading feedback can
+    // paint and a newer query/lock can cancel this work before it starts.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (!isCurrentSearchEpoch(epoch)) {
+      return;
     }
+    const rows = readSearchPage(page);
+    currentPage = page;
+    hasNextPage = rows.length > SEARCH_CONFIG.PAGE_SIZE;
+    currentResults = rows.slice(0, SEARCH_CONFIG.PAGE_SIZE);
+    renderResults();
+    elements.resultsList.scrollTop = 0;
+    if (focusResults) {
+      focusResultCardAtIndex(0, "start");
+    }
+  } catch (error) {
+    if (!isCurrentSearchEpoch(epoch)) {
+      return;
+    }
+    console.error("[Search] Search error:", error);
+    showError("Search failed. Please try again.");
+  } finally {
+    if (isCurrentSearchEpoch(epoch)) {
+      isSearching = false;
+      hideLoading();
+      updatePagination();
+    }
+  }
 }
 
 async function changeSearchPage(direction) {
-    if (isSearching || (direction !== -1 && direction !== 1)) {
-        return;
-    }
-    if (elements.searchInput.value.trim() !== currentQuery) {
-        await handleSearch(elements.searchInput.value);
-        return;
-    }
-    if ((direction < 0 && currentPage === 0) || (direction > 0 && !hasNextPage)) {
-        return;
-    }
-    const page = currentPage + direction;
-    if (!Number.isSafeInteger(page * SEARCH_CONFIG.PAGE_SIZE)) {
-        return;
-    }
-    await loadSearchPage(page, true);
+  if (isSearching || (direction !== -1 && direction !== 1)) {
+    return;
+  }
+  if (elements.searchInput.value.trim() !== currentQuery) {
+    await handleSearch(elements.searchInput.value);
+    return;
+  }
+  if ((direction < 0 && currentPage === 0) || (direction > 0 && !hasNextPage)) {
+    return;
+  }
+  const page = currentPage + direction;
+  if (!Number.isSafeInteger(page * SEARCH_CONFIG.PAGE_SIZE)) {
+    return;
+  }
+  await loadSearchPage(page, true);
 }
 
 function updatePagination() {
-    if (!elements.pagination) {
-        return;
-    }
-    const visible = currentPage > 0 || hasNextPage;
-    elements.pagination.classList.toggle('hidden', !visible);
-    elements.previousPage.disabled = isSearching || currentPage === 0;
-    elements.nextPage.disabled = isSearching || !hasNextPage;
-    elements.pageStatus.textContent = visible ? `Page ${currentPage + 1}` : '';
+  if (!elements.pagination) {
+    return;
+  }
+  const visible = currentPage > 0 || hasNextPage;
+  elements.pagination.classList.toggle("hidden", !visible);
+  elements.previousPage.disabled = isSearching || currentPage === 0;
+  elements.nextPage.disabled = isSearching || !hasNextPage;
+  elements.pageStatus.textContent = visible ? `Page ${currentPage + 1}` : "";
 }
 
 // Note: FTS5 query formatting and escaping is now handled in database.js
@@ -757,21 +770,21 @@ function updatePagination() {
  * Uses virtual scrolling for large result sets (> VIRTUAL_LIST_THRESHOLD)
  */
 function renderResults() {
-    if (currentResults.length === 0) {
-        destroyVirtualResultsView();
-        showNoResults();
-        return;
-    }
+  if (currentResults.length === 0) {
+    destroyVirtualResultsView();
+    showNoResults();
+    return;
+  }
 
-    hideNoResults();
-    updateResultCount();
+  hideNoResults();
+  updateResultCount();
 
-    // Use virtual scrolling for large result sets
-    if (currentResults.length > SEARCH_CONFIG.VIRTUAL_LIST_THRESHOLD) {
-        renderVirtualResults();
-    } else {
-        renderDirectResults();
-    }
+  // Use virtual scrolling for large result sets
+  if (currentResults.length > SEARCH_CONFIG.VIRTUAL_LIST_THRESHOLD) {
+    renderVirtualResults();
+  } else {
+    renderDirectResults();
+  }
 }
 
 /**
@@ -779,25 +792,25 @@ function renderResults() {
  * @private
  */
 function renderVirtualResults() {
-    // Destroy previous virtual list if exists
-    destroyVirtualResultsView();
+  // Destroy previous virtual list if exists
+  destroyVirtualResultsView();
 
-    // Clear container and set up for virtual scrolling
-    elements.resultsList.innerHTML = '';
-    elements.resultsList.style.height = '100%';
-    elements.resultsList.style.minHeight = '400px';
-    elements.resultsList.style.maxHeight = 'calc(100vh - 300px)';
+  // Clear container and set up for virtual scrolling
+  elements.resultsList.innerHTML = "";
+  elements.resultsList.style.height = "100%";
+  elements.resultsList.style.minHeight = "400px";
+  elements.resultsList.style.maxHeight = "calc(100vh - 300px)";
 
-    // Create virtual list
-    virtualList = new VirtualList({
-        container: elements.resultsList,
-        itemHeight: SEARCH_CONFIG.RESULT_CARD_HEIGHT,
-        totalCount: currentResults.length,
-        renderItem: (index) => createResultCard(currentResults[index], index),
-        overscan: SEARCH_CONFIG.VIRTUAL_LIST_OVERSCAN,
-    });
+  // Create virtual list
+  virtualList = new VirtualList({
+    container: elements.resultsList,
+    itemHeight: SEARCH_CONFIG.RESULT_CARD_HEIGHT,
+    totalCount: currentResults.length,
+    renderItem: (index) => createResultCard(currentResults[index], index),
+    overscan: SEARCH_CONFIG.VIRTUAL_LIST_OVERSCAN,
+  });
 
-    console.debug(`[Search] Using virtual scrolling for ${currentResults.length} results`);
+  console.debug(`[Search] Using virtual scrolling for ${currentResults.length} results`);
 }
 
 /**
@@ -805,10 +818,10 @@ function renderVirtualResults() {
  * @private
  */
 function renderDirectResults() {
-    destroyVirtualResultsView();
+  destroyVirtualResultsView();
 
-    const html = currentResults.map((result, index) => createResultCardHtml(result, index)).join('');
-    elements.resultsList.innerHTML = html;
+  const html = currentResults.map((result, index) => createResultCardHtml(result, index)).join("");
+  elements.resultsList.innerHTML = html;
 }
 
 /**
@@ -816,14 +829,14 @@ function renderDirectResults() {
  * Escapes all content but preserves <mark> tags
  */
 function sanitizeSnippet(html) {
-    if (!html) return '';
+  if (!html) return "";
 
-    return html
-        .split(/(<\/?mark>)/g)
-        .map((segment) => (segment === '<mark>' || segment === '</mark>')
-            ? segment
-            : escapeHtml(segment))
-        .join('');
+  return html
+    .split(/(<\/?mark>)/g)
+    .map((segment) =>
+      segment === "<mark>" || segment === "</mark>" ? segment : escapeHtml(segment),
+    )
+    .join("");
 }
 
 /**
@@ -831,34 +844,38 @@ function sanitizeSnippet(html) {
  * @private
  */
 function createResultCard(result, index) {
-    const article = document.createElement('article');
-    article.className = 'result-card';
-    article.dataset.conversationId = result.conversation_id;
-    article.dataset.messageId = result.message_id || '';
-    article.dataset.resultIndex = String(index);
-    article.tabIndex = 0;
-    article.setAttribute('role', 'option');
-    article.setAttribute('aria-selected', 'false');
-    article.id = buildResultCardId(result, index);
-    article.setAttribute('aria-label', getResultAriaLabel(result));
+  const article = document.createElement("article");
+  article.className = "result-card";
+  article.dataset.conversationId = result.conversation_id;
+  article.dataset.messageId = result.message_id || "";
+  article.dataset.resultIndex = String(index);
+  article.tabIndex = 0;
+  article.setAttribute("role", "option");
+  article.setAttribute("aria-selected", "false");
+  article.id = buildResultCardId(result, index);
+  article.setAttribute("aria-label", getResultAriaLabel(result));
 
-    article.innerHTML = `
+  article.innerHTML = `
         <div class="result-header">
-            <span class="result-title">${escapeHtml(result.title || 'Untitled conversation')}</span>
+            <span class="result-title">${escapeHtml(result.title || "Untitled conversation")}</span>
             <span class="result-agent">${escapeHtml(formatAgentName(result.agent))}</span>
         </div>
-        ${result.snippet ? `
+        ${
+          result.snippet
+            ? `
             <div class="result-snippet">${sanitizeSnippet(result.snippet)}</div>
-        ` : ''}
+        `
+            : ""
+        }
         <div class="result-meta">
-            ${result.workspace ? `<span class="result-workspace">${escapeHtml(formatWorkspace(result.workspace))}</span>` : ''}
+            ${result.workspace ? `<span class="result-workspace">${escapeHtml(formatWorkspace(result.workspace))}</span>` : ""}
             <span class="result-time">${formatTime(result.started_at)}</span>
         </div>
     `;
 
-    // Clicks bubble to the results-list delegate. A second handler here would
-    // open the same conversation twice (including keyboard-triggered clicks).
-    return article;
+  // Clicks bubble to the results-list delegate. A second handler here would
+  // open the same conversation twice (including keyboard-triggered clicks).
+  return article;
 }
 
 /**
@@ -866,13 +883,13 @@ function createResultCard(result, index) {
  * @private
  */
 function createResultCardHtml(result, index) {
-    const ariaLabel = escapeHtml(getResultAriaLabel(result));
-    return `
+  const ariaLabel = escapeHtml(getResultAriaLabel(result));
+  return `
         <article
             class="result-card"
             id="${buildResultCardId(result, index)}"
             data-conversation-id="${result.conversation_id}"
-            data-message-id="${result.message_id || ''}"
+            data-message-id="${result.message_id || ""}"
             data-result-index="${index}"
             tabindex="0"
             role="option"
@@ -880,14 +897,18 @@ function createResultCardHtml(result, index) {
             aria-label="${ariaLabel}"
         >
             <div class="result-header">
-                <span class="result-title">${escapeHtml(result.title || 'Untitled conversation')}</span>
+                <span class="result-title">${escapeHtml(result.title || "Untitled conversation")}</span>
                 <span class="result-agent">${escapeHtml(formatAgentName(result.agent))}</span>
             </div>
-            ${result.snippet ? `
+            ${
+              result.snippet
+                ? `
                 <div class="result-snippet">${sanitizeSnippet(result.snippet)}</div>
-            ` : ''}
+            `
+                : ""
+            }
             <div class="result-meta">
-                ${result.workspace ? `<span class="result-workspace">${escapeHtml(formatWorkspace(result.workspace))}</span>` : ''}
+                ${result.workspace ? `<span class="result-workspace">${escapeHtml(formatWorkspace(result.workspace))}</span>` : ""}
                 <span class="result-time">${formatTime(result.started_at)}</span>
             </div>
         </article>
@@ -895,9 +916,9 @@ function createResultCardHtml(result, index) {
 }
 
 function getResultAriaLabel(result) {
-    const title = result.title || 'Untitled conversation';
-    const workspaceLabel = result.workspace ? `, ${formatWorkspace(result.workspace)}` : '';
-    return `${title}, ${formatAgentName(result.agent)}${workspaceLabel}, ${formatTime(result.started_at)}`;
+  const title = result.title || "Untitled conversation";
+  const workspaceLabel = result.workspace ? `, ${formatWorkspace(result.workspace)}` : "";
+  return `${title}, ${formatAgentName(result.agent)}${workspaceLabel}, ${formatTime(result.started_at)}`;
 }
 
 /**
@@ -905,50 +926,50 @@ function getResultAriaLabel(result) {
  * @private
  */
 function destroyVirtualList() {
-    if (virtualList) {
-        virtualList.destroy();
-        virtualList = null;
-    }
+  if (virtualList) {
+    virtualList.destroy();
+    virtualList = null;
+  }
 }
 
 function resetResultsListLayout() {
-    if (!elements.resultsList) {
-        return;
-    }
+  if (!elements.resultsList) {
+    return;
+  }
 
-    elements.resultsList.style.height = '';
-    elements.resultsList.style.minHeight = '';
-    elements.resultsList.style.maxHeight = '';
+  elements.resultsList.style.height = "";
+  elements.resultsList.style.minHeight = "";
+  elements.resultsList.style.maxHeight = "";
 }
 
 function destroyVirtualResultsView() {
-    destroyVirtualList();
-    resetResultsListLayout();
+  destroyVirtualList();
+  resetResultsListLayout();
 }
 
 /**
  * Update result count display and announce to screen readers
  */
 function updateResultCount() {
-    const count = currentResults.length;
-    const start = currentPage * SEARCH_CONFIG.PAGE_SIZE + 1;
-    const end = currentPage * SEARCH_CONFIG.PAGE_SIZE + count;
-    const context = currentQuery ? ` for "${currentQuery}"` : '';
+  const count = currentResults.length;
+  const start = currentPage * SEARCH_CONFIG.PAGE_SIZE + 1;
+  const end = currentPage * SEARCH_CONFIG.PAGE_SIZE + count;
+  const context = currentQuery ? ` for "${currentQuery}"` : "";
 
-    let message;
-    if (currentPage === 0 && !hasNextPage) {
-        const noun = currentQuery ? 'result' : 'recent conversation';
-        message = `${count} ${noun}${count !== 1 ? 's' : ''}${context}`;
-    } else {
-        const noun = currentQuery ? 'Results' : 'Conversations';
-        const extent = hasNextPage ? ' (more available)' : ` of ${end}`;
-        message = `${noun} ${start}–${end}${extent}${context}`;
-    }
+  let message;
+  if (currentPage === 0 && !hasNextPage) {
+    const noun = currentQuery ? "result" : "recent conversation";
+    message = `${count} ${noun}${count !== 1 ? "s" : ""}${context}`;
+  } else {
+    const noun = currentQuery ? "Results" : "Conversations";
+    const extent = hasNextPage ? " (more available)" : ` of ${end}`;
+    message = `${noun} ${start}–${end}${extent}${context}`;
+  }
 
-    elements.resultCount.textContent = message;
+  elements.resultCount.textContent = message;
 
-    // Announce to screen readers
-    announceToScreenReader(message, searchEpoch);
+  // Announce to screen readers
+  announceToScreenReader(message, searchEpoch);
 }
 
 /**
@@ -956,142 +977,142 @@ function updateResultCount() {
  * @param {string} message - Message to announce
  */
 function announceToScreenReader(message, epoch = searchEpoch) {
-    const announcer = document.getElementById('search-announcer');
-    if (announcer) {
-        // Clear and set to trigger announcement
-        announcer.textContent = '';
-        // Use setTimeout to ensure the clear is processed first
-        setTimeout(() => {
-            if (!isCurrentSearchEpoch(epoch)) {
-                return;
-            }
-            announcer.textContent = message;
-        }, 50);
-    }
+  const announcer = document.getElementById("search-announcer");
+  if (announcer) {
+    // Clear and set to trigger announcement
+    announcer.textContent = "";
+    // Use setTimeout to ensure the clear is processed first
+    setTimeout(() => {
+      if (!isCurrentSearchEpoch(epoch)) {
+        return;
+      }
+      announcer.textContent = message;
+    }, 50);
+  }
 }
 
 /**
  * Show loading indicator
  */
 function showLoading() {
-    elements.resultsContainer?.setAttribute('aria-busy', 'true');
-    elements.loadingIndicator.classList.remove('hidden');
-    elements.resultsList.classList.add('loading');
+  elements.resultsContainer?.setAttribute("aria-busy", "true");
+  elements.loadingIndicator.classList.remove("hidden");
+  elements.resultsList.classList.add("loading");
 }
 
 /**
  * Hide loading indicator
  */
 function hideLoading() {
-    elements.resultsContainer?.setAttribute('aria-busy', 'false');
-    elements.loadingIndicator.classList.add('hidden');
-    elements.resultsList.classList.remove('loading');
+  elements.resultsContainer?.setAttribute("aria-busy", "false");
+  elements.loadingIndicator.classList.add("hidden");
+  elements.resultsList.classList.remove("loading");
 }
 
 /**
  * Show no results message
  */
 function showNoResults() {
-    elements.noResults.classList.remove('hidden');
-    elements.resultsList.innerHTML = '';
-    elements.resultCount.textContent = '';
+  elements.noResults.classList.remove("hidden");
+  elements.resultsList.innerHTML = "";
+  elements.resultCount.textContent = "";
 }
 
 /**
  * Hide no results message
  */
 function hideNoResults() {
-    elements.noResults.classList.add('hidden');
+  elements.noResults.classList.add("hidden");
 }
 
 /**
  * Show error message
  */
 function showError(message) {
-    currentResults = [];
-    currentPage = 0;
-    hasNextPage = false;
-    updatePagination();
-    destroyVirtualResultsView();
-    hideNoResults();
-    elements.resultsList.innerHTML = `
+  currentResults = [];
+  currentPage = 0;
+  hasNextPage = false;
+  updatePagination();
+  destroyVirtualResultsView();
+  hideNoResults();
+  elements.resultsList.innerHTML = `
         <div class="search-error" role="alert">
             <span class="error-icon">⚠️</span>
             <p>${escapeHtml(message)}</p>
         </div>
     `;
-    elements.resultCount.textContent = '';
+  elements.resultCount.textContent = "";
 }
 
 /**
  * Format agent name for display
  */
 function formatAgentName(agent) {
-    if (agent === undefined || agent === null || agent === '') return 'Unknown';
-    const value = String(agent);
+  if (agent === undefined || agent === null || agent === "") return "Unknown";
+  const value = String(agent);
 
-    // Capitalize first letter
-    return value.charAt(0).toUpperCase() + value.slice(1);
+  // Capitalize first letter
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 /**
  * Format workspace path for display
  */
 function formatWorkspace(workspace) {
-    if (workspace === undefined || workspace === null || workspace === '') return '';
-    const value = String(workspace);
+  if (workspace === undefined || workspace === null || workspace === "") return "";
+  const value = String(workspace);
 
-    // Show last 2 path components
-    const parts = value.split('/').filter(Boolean);
-    if (parts.length <= 2) return value;
+  // Show last 2 path components
+  const parts = value.split("/").filter(Boolean);
+  if (parts.length <= 2) return value;
 
-    return '.../' + parts.slice(-2).join('/');
+  return ".../" + parts.slice(-2).join("/");
 }
 
 /**
  * Format timestamp for display
  */
 function formatTime(timestamp) {
-    if (!timestamp) return '';
+  if (!timestamp) return "";
 
-    const date = new Date(timestamp);
-    const now = new Date();
-    const diff = now - date;
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diff = now - date;
 
-    const minute = 60 * 1000;
-    const hour = 60 * minute;
-    const day = 24 * hour;
-    const week = 7 * day;
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  const week = 7 * day;
 
-    if (diff < hour) {
-        const mins = Math.floor(diff / minute);
-        return mins <= 1 ? 'Just now' : `${mins}m ago`;
-    }
-    if (diff < day) {
-        const hours = Math.floor(diff / hour);
-        return `${hours}h ago`;
-    }
-    if (diff < week) {
-        const days = Math.floor(diff / day);
-        return days === 1 ? 'Yesterday' : `${days}d ago`;
-    }
+  if (diff < hour) {
+    const mins = Math.floor(diff / minute);
+    return mins <= 1 ? "Just now" : `${mins}m ago`;
+  }
+  if (diff < day) {
+    const hours = Math.floor(diff / hour);
+    return `${hours}h ago`;
+  }
+  if (diff < week) {
+    const days = Math.floor(diff / day);
+    return days === 1 ? "Yesterday" : `${days}d ago`;
+  }
 
-    // Format as date
-    return date.toLocaleDateString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        year: date.getFullYear() !== now.getFullYear() ? 'numeric' : undefined,
-    });
+  // Format as date
+  return date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: date.getFullYear() !== now.getFullYear() ? "numeric" : undefined,
+  });
 }
 
 /**
  * Escape HTML special characters
  */
 function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+  if (!text) return "";
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
 }
 
 /**
@@ -1099,113 +1120,116 @@ function escapeHtml(text) {
  * Optionally triggers a search (default true).
  */
 export async function setSearchQuery(query, options = {}) {
-    const { runSearch = true, filters } = options;
-    if (filters !== undefined) {
-        await setSearchRoute({
-            query,
-            ...filters,
-        }, { runSearch });
-        return;
-    }
+  const { runSearch = true, filters } = options;
+  if (filters !== undefined) {
+    await setSearchRoute(
+      {
+        query,
+        ...filters,
+      },
+      { runSearch },
+    );
+    return;
+  }
 
-    if (!elements.searchInput) {
-        return;
-    }
+  if (!elements.searchInput) {
+    return;
+  }
 
-    const normalized = (query ?? '').toString();
-    elements.searchInput.value = normalized;
-    clearTimeout(searchTimeout);
+  const normalized = (query ?? "").toString();
+  elements.searchInput.value = normalized;
+  clearTimeout(searchTimeout);
 
-    if (runSearch) {
-        await handleSearch(normalized);
-    } else {
-        invalidateSearchResults();
-        currentQuery = normalized.trim();
-        updateSearchModeIndicator(currentQuery);
-    }
+  if (runSearch) {
+    await handleSearch(normalized);
+  } else {
+    invalidateSearchResults();
+    currentQuery = normalized.trim();
+    updateSearchModeIndicator(currentQuery);
+  }
 }
 
 export async function setSearchRoute(routeSearch = {}, options = {}) {
-    const { runSearch = true } = options;
-    if (!elements.searchInput) {
-        return;
-    }
+  const { runSearch = true } = options;
+  if (!elements.searchInput) {
+    return;
+  }
 
-    clearTimeout(searchTimeout);
-    currentFilters = normalizeRouteFilters(routeSearch);
-    syncFilterControls();
+  clearTimeout(searchTimeout);
+  currentFilters = normalizeRouteFilters(routeSearch);
+  syncFilterControls();
 
-    const normalizedQuery = (routeSearch.query ?? routeSearch.q ?? '').toString();
-    elements.searchInput.value = normalizedQuery;
+  const normalizedQuery = (routeSearch.query ?? routeSearch.q ?? "").toString();
+  elements.searchInput.value = normalizedQuery;
 
-    if (runSearch) {
-        await handleSearch(normalizedQuery);
-    } else {
-        invalidateSearchResults();
-        currentQuery = normalizedQuery.trim();
-        updateSearchModeIndicator(currentQuery);
-    }
+  if (runSearch) {
+    await handleSearch(normalizedQuery);
+  } else {
+    invalidateSearchResults();
+    currentQuery = normalizedQuery.trim();
+    updateSearchModeIndicator(currentQuery);
+  }
 }
 
 /**
  * Clear search and reset to initial state
  */
 export function clearSearch(options = {}) {
-    const { reloadRecent = true } = options;
+  const { reloadRecent = true } = options;
 
-    invalidateSearchResults();
-    currentQuery = '';
-    currentFilters = createEmptySearchFilters();
-    currentSearchMode = 'auto';
+  invalidateSearchResults();
+  currentQuery = "";
+  currentFilters = createEmptySearchFilters();
+  currentSearchMode = "auto";
 
-    if (elements.searchInput) {
-        elements.searchInput.value = '';
-    }
-    syncFilterControls();
-    if (elements.searchModeIndicator) {
-        elements.searchModeIndicator.classList.add('hidden');
-    }
-    const announcer = document.getElementById('search-announcer');
-    if (announcer) {
-        announcer.textContent = '';
-    }
+  if (elements.searchInput) {
+    elements.searchInput.value = "";
+  }
+  syncFilterControls();
+  if (elements.searchModeIndicator) {
+    elements.searchModeIndicator.classList.add("hidden");
+  }
+  const announcer = document.getElementById("search-announcer");
+  if (announcer) {
+    announcer.textContent = "";
+  }
 
-    // Reset search mode toggle
-    setSearchMode('auto');
+  // Reset search mode toggle
+  setSearchMode("auto");
 
-    if (reloadRecent) {
-        void handleSearch('');
-    } else {
-        hideNoResults();
-        if (elements.resultsList) {
-            elements.resultsList.innerHTML = '';
-        }
-        if (elements.resultCount) {
-            elements.resultCount.textContent = '';
-        }
+  if (reloadRecent) {
+    void handleSearch("");
+  } else {
+    hideNoResults();
+    if (elements.resultsList) {
+      elements.resultsList.innerHTML = "";
     }
+    if (elements.resultCount) {
+      elements.resultCount.textContent = "";
+    }
+  }
 }
 
 /**
  * Get current search state
  */
 export function getSearchState() {
-    return {
-        query: currentQuery,
-        filters: { ...currentFilters },
-        searchMode: currentSearchMode,
-        resultCount: currentResults.length,
-        page: currentPage + 1,
-        hasNextPage,
-        isSearching,
-    };
+  return {
+    query: currentQuery,
+    filters: { ...currentFilters },
+    searchMode: currentSearchMode,
+    resultCount: currentResults.length,
+    page: currentPage + 1,
+    hasNextPage,
+    isSearching,
+  };
 }
 
 // Export default
 export default {
-    initSearch,
-    clearSearch,
-    getSearchState,
-    setSearchQuery,
-    setSearchRoute,
+  initSearch,
+  clearSearch,
+  getSearchState,
+  setSearchQuery,
+  setSearchRoute,
 };

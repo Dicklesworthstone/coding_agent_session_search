@@ -25,7 +25,7 @@ const TARGETS = {
   scrollFpsMinimum: 55, // Allow 5 FPS variance
 
   // Total blocking time
-  totalBlockingTime: 300 // ms
+  totalBlockingTime: 300, // ms
 };
 
 function assertLighthouse(metrics) {
@@ -37,21 +37,15 @@ function assertLighthouse(metrics) {
   }
 
   if (metrics.performanceScore < TARGETS.lighthouseScore) {
-    failures.push(
-      `Performance score ${metrics.performanceScore} < ${TARGETS.lighthouseScore}`
-    );
+    failures.push(`Performance score ${metrics.performanceScore} < ${TARGETS.lighthouseScore}`);
   }
 
   if (metrics.fcp > TARGETS.firstContentfulPaint) {
-    failures.push(
-      `FCP ${metrics.fcp}ms > ${TARGETS.firstContentfulPaint}ms`
-    );
+    failures.push(`FCP ${metrics.fcp}ms > ${TARGETS.firstContentfulPaint}ms`);
   }
 
   if (metrics.tbt > TARGETS.totalBlockingTime) {
-    failures.push(
-      `Total Blocking Time ${metrics.tbt}ms > ${TARGETS.totalBlockingTime}ms`
-    );
+    failures.push(`Total Blocking Time ${metrics.tbt}ms > ${TARGETS.totalBlockingTime}ms`);
   }
 
   return {
@@ -62,8 +56,8 @@ function assertLighthouse(metrics) {
       fcp: metrics.fcp,
       lcp: metrics.lcp,
       tti: metrics.tti,
-      tbt: metrics.tbt
-    }
+      tbt: metrics.tbt,
+    },
   };
 }
 
@@ -71,7 +65,7 @@ function assertDecrypt(metrics, isMobile = false) {
   const failures = [];
 
   if (!metrics || metrics.total_ms === null) {
-    failures.push('Decryption timing not available');
+    failures.push("Decryption timing not available");
     return { pass: false, failures };
   }
 
@@ -84,7 +78,7 @@ function assertDecrypt(metrics, isMobile = false) {
 
   if (argonTime !== null && argonTime > target) {
     failures.push(
-      `Argon2 derivation ${argonTime}ms > ${target}ms (${isMobile ? 'mobile' : 'desktop'})`
+      `Argon2 derivation ${argonTime}ms > ${target}ms (${isMobile ? "mobile" : "desktop"})`,
     );
   }
 
@@ -98,8 +92,8 @@ function assertDecrypt(metrics, isMobile = false) {
     metrics: {
       argonTime,
       totalTime: metrics.total_ms,
-      target
-    }
+      target,
+    },
   };
 }
 
@@ -107,7 +101,7 @@ function assertSearch(results) {
   const failures = [];
 
   if (!results || !Array.isArray(results)) {
-    failures.push('Search results not available');
+    failures.push("Search results not available");
     return { pass: false, failures };
   }
 
@@ -115,16 +109,12 @@ function assertSearch(results) {
 
   if (slowQueries.length > 0) {
     for (const q of slowQueries) {
-      failures.push(
-        `Query "${q.query}" took ${q.elapsed_ms}ms > ${TARGETS.searchLatency}ms`
-      );
+      failures.push(`Query "${q.query}" took ${q.elapsed_ms}ms > ${TARGETS.searchLatency}ms`);
     }
   }
 
   const avgLatency =
-    results.length > 0
-      ? results.reduce((sum, r) => sum + r.elapsed_ms, 0) / results.length
-      : 0;
+    results.length > 0 ? results.reduce((sum, r) => sum + r.elapsed_ms, 0) / results.length : 0;
 
   return {
     pass: failures.length === 0,
@@ -132,8 +122,8 @@ function assertSearch(results) {
     metrics: {
       totalQueries: results.length,
       slowQueries: slowQueries.length,
-      avgLatency: Math.round(avgLatency * 100) / 100
-    }
+      avgLatency: Math.round(avgLatency * 100) / 100,
+    },
   };
 }
 
@@ -141,13 +131,13 @@ function assertMemory(metrics) {
   const failures = [];
 
   if (!metrics || metrics.leakBytes === null) {
-    failures.push('Memory metrics not available');
+    failures.push("Memory metrics not available");
     return { pass: false, failures };
   }
 
   if (metrics.leakBytes > TARGETS.memoryLeakThreshold) {
     failures.push(
-      `Memory leak detected: ${(metrics.leakBytes / (1024 * 1024)).toFixed(2)}MB > 10MB`
+      `Memory leak detected: ${(metrics.leakBytes / (1024 * 1024)).toFixed(2)}MB > 10MB`,
     );
   }
 
@@ -161,8 +151,8 @@ function assertMemory(metrics) {
         : null,
       afterMB: metrics.after.jsHeapBytes
         ? (metrics.after.jsHeapBytes / (1024 * 1024)).toFixed(2)
-        : null
-    }
+        : null,
+    },
   };
 }
 
@@ -170,20 +160,16 @@ function assertScroll(metrics) {
   const failures = [];
 
   if (!metrics || metrics.error) {
-    failures.push(`Scroll test error: ${metrics?.error || 'unknown'}`);
+    failures.push(`Scroll test error: ${metrics?.error || "unknown"}`);
     return { pass: false, failures };
   }
 
   if (metrics.effectiveFps < TARGETS.scrollFpsMinimum) {
-    failures.push(
-      `Scroll FPS ${metrics.effectiveFps} < ${TARGETS.scrollFpsMinimum} minimum`
-    );
+    failures.push(`Scroll FPS ${metrics.effectiveFps} < ${TARGETS.scrollFpsMinimum} minimum`);
   }
 
   if (metrics.verySlowFrames > 0) {
-    failures.push(
-      `${metrics.verySlowFrames} frames below 30fps during scroll`
-    );
+    failures.push(`${metrics.verySlowFrames} frames below 30fps during scroll`);
   }
 
   if (metrics.longTaskCount > 5) {
@@ -199,8 +185,8 @@ function assertScroll(metrics) {
       p95FrameTime: metrics.p95FrameTime,
       slowFrames: metrics.slowFrames,
       verySlowFrames: metrics.verySlowFrames,
-      longTasks: metrics.longTaskCount
-    }
+      longTasks: metrics.longTaskCount,
+    },
   };
 }
 
@@ -212,9 +198,7 @@ function assertAll(perfData) {
     decrypt: assertDecrypt(perfData.decrypt),
     search: assertSearch(perfData.search),
     memory: assertMemory(perfData.memory),
-    scroll: perfData.scroll
-      ? assertScroll(perfData.scroll)
-      : { pass: true, skipped: true }
+    scroll: perfData.scroll ? assertScroll(perfData.scroll) : { pass: true, skipped: true },
   };
 
   const allPassed = Object.values(results).every((r) => r.pass);
@@ -230,8 +214,8 @@ function assertAll(perfData) {
       total: Object.keys(results).length,
       passed: Object.values(results).filter((r) => r.pass).length,
       failed: Object.values(results).filter((r) => !r.pass && !r.skipped).length,
-      skipped: Object.values(results).filter((r) => r.skipped).length
-    }
+      skipped: Object.values(results).filter((r) => r.skipped).length,
+    },
   };
 }
 
@@ -242,5 +226,5 @@ module.exports = {
   assertSearch,
   assertMemory,
   assertScroll,
-  assertAll
+  assertAll,
 };

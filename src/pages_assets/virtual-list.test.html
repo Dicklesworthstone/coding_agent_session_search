@@ -127,7 +127,7 @@
     </div>
 
     <script type="module">
-        import { VirtualList, VariableHeightVirtualList } from './virtual-list.js';
+        import { VariableHeightVirtualList, VirtualList } from './virtual-list.js';
 
         // Make functions available globally for button onclick
         window.VirtualList = VirtualList;
@@ -138,7 +138,7 @@
         let test4List = null;
 
         // Test 1: Fixed Height Virtual List
-        window.runTest1 = function() {
+        window.runTest1 = () => {
             const container = document.getElementById('test1-container');
             const results = document.getElementById('test1-results');
             const metrics = document.getElementById('test1-metrics');
@@ -201,14 +201,14 @@
             results.innerHTML = output;
         };
 
-        window.scrollTest1 = function() {
+        window.scrollTest1 = () => {
             if (test1List) {
                 test1List.scrollToIndex(5000, 'center');
             }
         };
 
         // Test 2: Variable Height Virtual List
-        window.runTest2 = function() {
+        window.runTest2 = () => {
             const container = document.getElementById('test2-container');
             const results = document.getElementById('test2-results');
             const metrics = document.getElementById('test2-metrics');
@@ -275,14 +275,14 @@
             results.innerHTML = output;
         };
 
-        window.scrollTest2 = function() {
+        window.scrollTest2 = () => {
             if (test2List) {
                 test2List.scrollToIndex(500, 'center');
             }
         };
 
         // Test 3: Performance Benchmark
-        window.runPerformanceTest = function() {
+        window.runPerformanceTest = () => {
             const results = document.getElementById('test3-results');
             results.innerHTML = '<span class="info">Running performance benchmarks...</span>\n';
 
@@ -380,7 +380,7 @@
         };
 
         // Test 4: Stress Test
-        window.runStressTest = function() {
+        window.runStressTest = () => {
             const container = document.getElementById('test4-container');
             const results = document.getElementById('test4-results');
             const ITEM_COUNT = 100000;

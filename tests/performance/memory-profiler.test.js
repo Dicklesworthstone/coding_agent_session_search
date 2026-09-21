@@ -1,6 +1,6 @@
 async function runMemoryProfile(page, iterations) {
   const result = await page.evaluate(async (count) => {
-    const { queryAll } = await import('./database.js');
+    const { queryAll } = await import("./database.js");
     const readMem = () => {
       const jsHeap = performance && performance.memory ? performance.memory.usedJSHeapSize : null;
       return { jsHeapBytes: jsHeap };
@@ -14,7 +14,7 @@ async function runMemoryProfile(page, iterations) {
          FROM messages_fts
          JOIN messages m ON messages_fts.rowid = m.id
          WHERE messages_fts MATCH 'test'
-         LIMIT 10`
+         LIMIT 10`,
       );
     }
 
@@ -30,7 +30,7 @@ async function runMemoryProfile(page, iterations) {
       after,
       leakBytes,
       leakMB,
-      ok: leakBytes !== null ? leakBytes < 10 * 1024 * 1024 : null
+      ok: leakBytes !== null ? leakBytes < 10 * 1024 * 1024 : null,
     };
   }, iterations);
 
