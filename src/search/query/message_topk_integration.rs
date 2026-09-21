@@ -363,3 +363,104 @@ fn short_deduplicated_shard_cannot_certify_an_incorrect_global_ranking() {
     );
     assert!(!state.exact_window_may_omit_competitor);
 }
+
+#[test]
+fn adaptive_exact_messages_retrieve_a_large_page_from_chunk_dominated_fsvi() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("adaptive-long-messages.fsvi");
+    let records = (1..=240_u64)
+        .flat_map(|id| {
+            let score = 1.0 - id as f32 / 1024.0;
+            (0..=255).map(move |chunk| {
+                (doc(id, chunk, 3), [score, (1.0 - score * score).sqrt()])
+            })
+        })
+        .collect::<Vec<_>>();
+    let ctx = context(vec![artifact(&path, &records)]);
+    let before = std::fs::read(&path).unwrap();
+    let (_, initial_state) =
+        SearchClient::search_exact_semantic_indexes_initial_window(&ctx, &[1.0, 0.0], 50, None)
+            .unwrap();
+    assert!(initial_state.exact_window_may_omit_competitor);
+    let (hits, state) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 50, None).unwrap();
+    // The driver retains its 4x message allowance for downstream hydration.
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        (1..=200).collect::<Vec<_>>()
+    );
+    assert!(!state.exact_window_may_omit_competitor);
+    assert!(state.has_more_candidates);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn adaptive_exact_messages_preserve_session_and_metadata_scope_across_shards() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut artifacts = Vec::new();
+    let mut before = Vec::new();
+    let mut membership = HashSet::new();
+    for shard in 0..3_u64 {
+        let path = temp.path().join(format!("adaptive-scope-{shard}.fsvi"));
+        let mut records = Vec::new();
+        for offset in 1..=32_u64 {
+            let id = shard * 32 + offset;
+            let score = 1.0 - id as f32 / 512.0;
+            membership.insert(id);
+            for chunk in 0..=255 {
+                records.push((doc(id, chunk, 3), [score, (1.0 - score * score).sqrt()]));
+            }
+        }
+        // Both decoys rank above every real message. One is in the selected
+        // sessions but has the wrong source; the other is outside the sessions.
+        let wrong_source = 1_000 + shard;
+        membership.insert(wrong_source);
+        records.push((doc(wrong_source, 0, 4), [1.0, 0.0]));
+        records.push((doc(2_000 + shard, 0, 3), [1.0, 0.0]));
+        artifacts.push(artifact(&path, &records));
+        before.push((path.clone(), std::fs::read(&path).unwrap()));
+    }
+    let ctx = context(artifacts);
+    let metadata = SemanticFilter {
+        agents: Some(HashSet::from([1])),
+        workspaces: Some(HashSet::from([2])),
+        sources: Some(HashSet::from([3])),
+        roles: Some(HashSet::from([1])),
+        created_from: Some(100),
+        created_to: Some(100),
+    };
+    let filter = SessionScopedSemanticFilter {
+        metadata: &metadata,
+        message_ids: &membership,
+    };
+    let (hits, state) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 20, Some(&filter)).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        (1..=80).collect::<Vec<_>>()
+    );
+    assert!(!state.exact_window_may_omit_competitor);
+    for (path, bytes) in before {
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn adaptive_exact_messages_resolve_large_tie_cohorts_without_source_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("adaptive-dense-ties.fsvi");
+    let records = (1..=10_000_u64)
+        .rev()
+        .map(|id| (doc(id, 0, 3), [1.0, 0.0]))
+        .collect::<Vec<_>>();
+    let ctx = context(vec![artifact(&path, &records)]);
+    let before = std::fs::read(&path).unwrap();
+    let (hits, state) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 1, None).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert!(!state.exact_window_may_omit_competitor);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
