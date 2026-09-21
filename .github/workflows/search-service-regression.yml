@@ -1,0 +1,62 @@
+name: Persistent search service regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/search-service-regression.yml
+      - src/main.rs
+      - src/search_service.rs
+      - src/search_service/**
+      - src/search/**
+      - tests/search_service.rs
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cass-search-service-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Record source and compiler
+        run: git rev-parse HEAD && rustc --version && cargo --version
+      - name: Real reader and binary regressions
+        run: |
+          set -o pipefail
+          cargo test --locked --test search_service -- --test-threads=1 --nocapture 2>&1 | tee search-service-tests.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' search-service-tests.log
+      - name: Format gate
+        if: always()
+        run: rustfmt --edition 2024 --check --config skip_children=true src/search_service.rs src/search_service/*.rs tests/search_service.rs
+      - name: Clippy gate
+        if: always()
+        run: cargo clippy --locked --bin cass --test search_service -- -D warnings
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: search-service-${{ github.sha }}
+          path: search-service-tests.log
+          if-no-files-found: warn
+          retention-days: 7
