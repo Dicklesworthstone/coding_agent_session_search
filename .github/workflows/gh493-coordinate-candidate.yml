@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: gh493-canonical-candidate
+  group: gh493-canonical-candidate-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Load reviewed candidate blobs and apply checked CLI edits
+      - name: Prepare exact-source candidate without changing commits or refs
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -41,55 +41,49 @@ jobs:
                   payload = json.load(response)
               assert payload['encoding'] == 'base64'
               return base64.b64decode(payload['content'])
+          expected = {
+              'src/lib.rs': '0e57582b28128fb3dfa907a16480987f85eae1bb',
+              'src/search/query.rs': 'a4823148860945be9e8d84b344abffe9e6995683',
+              'tests/cli_robot.rs': '7ebd2ae976fc8e9a4318a619ae325cc3f6bbe9aa',
+              'tests/cli_dispatch_coverage.rs': 'e8869bdbf544345cf25a549cc35b7bd33e9478c7',
+              'tests/golden/robot/capabilities.json.golden': 'b90988cc01db0e5fd9ebee8d32a6b49f434fd6de',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if actual != sha:
+                  raise SystemExit(f'Refusing to overwrite concurrent changes: {path}')
+          for path in ['src/followup_coordinates.rs', 'tests/gh493_message_coordinates.rs']:
+              if pathlib.Path(path).exists():
+                  raise SystemExit(f'Refusing to overwrite existing candidate: {path}')
           for path, sha in {
-              'src/followup_coordinates.rs': 'ffad83b343af690d3c54f410e2e00ec7cfba2524',
-              'tests/gh493_message_coordinates.rs': '933f1436017c827809b612191db011164a2d9b2b',
+              'src/lib.rs': 'af673c4047476904411afb1726508cd46b88fa5b',
+              'src/search/query.rs': 'edab70e109120591fb01f1f67248283fc0452301',
+              'src/followup_coordinates.rs': '55a1e41301e16f6d5914ac7bc9f9d5199471880f',
+              'tests/gh493_message_coordinates.rs': 'ddfd83037ae7c2332464eb85dd2a30d996f1afaf',
           }.items():
-              target = pathlib.Path(path)
-              if target.exists():
-                  raise SystemExit(f'Refusing to overwrite an existing candidate path: {path}')
-              target.write_bytes(read_blob(sha))
-          script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'prepare-gh493.py'
-          source = read_blob('a36ea38137293ac49790a26a9dfac35a7173d1d4').decode()
-          # Other command enums also contain View variants. Constrain the
-          # checked edit to Commands rather than loosening its uniqueness guard.
-          start = source.index('def command_definition(')
-          end = source.index('\n\ndef wire_dispatch(', start)
-          source = source[:start] + '''def command_definition(text: str, name: str) -> tuple[int, int]:
-              enum_start = text.index("pub enum Commands {\\n")
-              enum_end = text.index("\\n}\\n", enum_start)
-              needle = f"    {name} {{\\n"
-              matches = list(re.finditer(rf"(?m)^    {name} \\{{\\n", text[enum_start:enum_end]))
-              if len(matches) != 1:
-                  raise RuntimeError(f"Expected one Commands::{name} definition, found {len(matches)}")
-              start = enum_start + matches[0].start()
-              end = text.index("\\n    },", start) + len("\\n    },")
-              if end > enum_end:
-                  raise RuntimeError("Command boundary escaped Commands")
-              return start, end
-          ''' + source[end:]
-          script.write_text(source)
+              pathlib.Path(path).write_bytes(read_blob(sha))
+          script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'review-gh493.py'
+          script.write_bytes(read_blob('08eb596d0743abb14dfcfbc11db3d6c28362141b'))
           subprocess.run(['python3', str(script)], check=True)
           PY
       - name: Install formatter
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           components: rustfmt
-      - name: Format and inspect only candidate files
+      - name: Format and inspect only changed Rust files
         shell: bash
         run: |
           set -euo pipefail
-          rustfmt --edition 2024 --config skip_children=true src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs
+          rustfmt --edition 2024 --config skip_children=true src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs
           git diff --check
           git diff --stat
           python3 - <<'PY'
           import subprocess
-          diff = subprocess.check_output(['git', 'diff', '--numstat', '--', 'src/lib.rs', 'src/search/query.rs'], text=True)
+          diff = subprocess.check_output(['git', 'diff', '--numstat', '--', 'src/lib.rs', 'src/search/query.rs', 'tests/cli_robot.rs', 'tests/cli_dispatch_coverage.rs'], text=True)
           changed = sum(int(value) for line in diff.splitlines() for value in line.split('\t')[:2])
           if changed > 600:
               raise SystemExit(f'Refusing broad unrelated formatting changes: {changed} lines')
           PY
-          git diff -- src/lib.rs src/search/query.rs
       - name: Publish candidate Git blobs only (never commits or refs)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,7 +93,7 @@ jobs:
           python3 - <<'PY'
           import json, os, pathlib, shutil, subprocess, urllib.request
           repo = os.environ['GITHUB_REPOSITORY']
-          files = ['src/lib.rs', 'src/search/query.rs', 'src/followup_coordinates.rs', 'tests/gh493_message_coordinates.rs']
+          files = ['src/lib.rs', 'src/search/query.rs', 'src/followup_coordinates.rs', 'tests/gh493_message_coordinates.rs', 'tests/cli_robot.rs', 'tests/cli_dispatch_coverage.rs', 'tests/golden/robot/capabilities.json.golden']
           manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': {}, 'candidate_blobs': {}}
           for path in files:
               original = subprocess.run(['git', 'rev-parse', f'HEAD:{path}'], text=True, capture_output=True)
@@ -118,7 +112,7 @@ jobs:
               shutil.copyfile(path, target)
           encoded = json.dumps(manifest, indent=2)
           pathlib.Path('candidate/manifest.json').write_text(encoded + '\n')
-          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', 'src/lib.rs', 'src/search/query.rs']))
+          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', *files]))
           print('GH493_CANDIDATE_MANIFEST\n' + encoded)
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -144,18 +138,19 @@ jobs:
         with:
           name: gh493-canonical-candidate
           path: .
-      - name: Clone sibling dependencies as in CI
-        shell: bash
-        run: |
-          set -euo pipefail
-          for repo in asupersync frankensqlite franken_agent_detection frankensearch; do
-            git clone --depth 1 "https://github.com/Dicklesworthstone/$repo.git" "../$repo"
-          done
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
       - name: Run exact search-to-follow-up regressions
         run: cargo test --locked --test gh493_message_coordinates -- --nocapture
+      - name: Check existing dispatch and error envelopes
+        run: |
+          cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
+          cargo test --locked --test spec_view_expand_error_envelopes
+      - name: Check raw-line compatibility and robot discovery
+        run: |
+          cargo test --locked --test cli_robot view_
+          cargo test --locked --test cli_robot capabilities_matches_golden_contract
       - name: Lint the regression target and production dependency
         run: cargo clippy --locked --test gh493_message_coordinates -- -D warnings
