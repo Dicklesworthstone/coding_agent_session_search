@@ -265,3 +265,67 @@ fn populated_canonical_archive_preserves_provider_messages_and_provenance() {
     reader.execute("ROLLBACK").unwrap();
     reader.close_without_checkpoint().unwrap();
 }
+
+#[test]
+fn candidate_sync_requires_an_existing_regular_file_without_changing_its_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing.db");
+    assert!(sync_candidate(&missing).is_err());
+    assert!(!missing.exists());
+    assert!(sync_candidate(root.path()).is_err());
+    let candidate = root.path().join("candidate.db");
+    let original = b"verified private bytes\0\x01\xff";
+    fs::write(&candidate, original).unwrap();
+    sync_candidate(&candidate).unwrap();
+    assert_eq!(fs::read(&candidate).unwrap(), original);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let link = root.path().join("linked.db");
+        symlink(&candidate, &link).unwrap();
+        assert!(sync_candidate(&link).is_err());
+        assert_eq!(fs::read(&candidate).unwrap(), original);
+    }
+}
+
+#[test]
+fn rejected_multi_batch_restore_publishes_nothing_and_can_be_retried() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let writer = Connection::open(export::path_text(&source).unwrap()).unwrap();
+    writer.execute("BEGIN IMMEDIATE").unwrap();
+    for row in 0..(MAX_BATCH_RECORDS * 2 + 17) {
+        writer.execute_with_params(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            &[
+                SqliteValue::Text(format!("restore_batch_{row:05}").into()),
+                SqliteValue::Text(format!("canonical row {row}").into()),
+            ],
+        ).unwrap();
+    }
+    writer.execute("COMMIT").unwrap();
+    writer.close().unwrap();
+    let valid = root.path().join("valid.jsonl");
+    let exported = export::export_file(&source, &valid, "restore-test".to_owned()).unwrap();
+    let source_before = fs::read(&source).unwrap();
+    let bytes = fs::read(&valid).unwrap();
+    let completion_start = bytes[..bytes.len() - 1]
+        .iter().rposition(|byte| *byte == b'\n').unwrap() + 1;
+    let interrupted = root.path().join("interrupted.jsonl");
+    fs::write(&interrupted, &bytes[..completion_start]).unwrap();
+    let destination = root.path().join("restored.db");
+    // More than two private batches can commit before the missing completion is
+    // discovered. No committed prefix is allowed to become the public database.
+    assert!(import_file(&interrupted, &destination, "restore-test").is_err());
+    assert!(!destination.exists());
+    assert_eq!(source_before, fs::read(&source).unwrap());
+    assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+        entry.unwrap().file_name().to_string_lossy().starts_with(".cass-restore-")
+    }));
+    // A failed attempt must not poison the destination lock or leave a sidecar
+    // that prevents a subsequent complete, independently verified restoration.
+    let retried = import_file(&valid, &destination, "restore-test").unwrap();
+    assert_eq!(retried, exported);
+    assert_eq!(source_before, fs::read(&source).unwrap());
+}

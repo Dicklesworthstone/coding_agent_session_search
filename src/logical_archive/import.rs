@@ -59,10 +59,23 @@ impl<R: BufRead> BufRead for Input<R> {
 /// Open one pinned regular file. Do not block on a FIFO, follow a link, or reopen
 /// the pathname between header admission and completion verification.
 pub(super) fn open_input(path: &Path) -> Result<File> {
-    let metadata = fs::symlink_metadata(path).context("cannot inspect logical archive input")?;
-    ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "logical archive input must be a regular, non-symlink file");
+    open_regular(path, false)
+}
+
+fn sync_candidate(path: &Path) -> Result<()> {
+    // Windows FlushFileBuffers requires GENERIC_WRITE. A read-only File::open
+    // can read back a valid candidate but cannot durably flush it there.
+    // Only our unpublished candidate reaches this writable path; verification
+    // and existing-destination comparisons keep their strictly read-only opens.
+    open_regular(path, true)?.sync_all()
+        .context("cannot sync the verified private restore candidate")
+}
+
+fn open_regular(path: &Path, writable: bool) -> Result<File> {
+    let metadata = fs::symlink_metadata(path).context("cannot inspect logical archive file")?;
+    ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "logical archive file must be a regular, non-symlink file");
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(true).write(writable);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -73,12 +86,12 @@ pub(super) fn open_input(path: &Path) -> Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     }
-    let file = options.open(path).context("cannot open logical archive input")?;
-    ensure!(file.metadata()?.is_file(), "logical archive input is not a regular file");
+    let file = options.open(path).context("cannot open logical archive file")?;
+    ensure!(file.metadata()?.is_file(), "logical archive file is not a regular file");
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        ensure!(file.metadata()?.file_attributes() & 0x400 == 0, "logical archive input is a reparse point");
+        ensure!(file.metadata()?.file_attributes() & 0x400 == 0, "logical archive file is a reparse point");
     }
     Ok(file)
 }
@@ -299,7 +312,7 @@ pub fn import_file_with_policy(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600))?;
     }
-    File::open(&candidate)?.sync_all()?;
+    sync_candidate(&candidate)?;
     require_new_destination(destination)?;
     // Same-filesystem hard-link publication is atomic and never replaces an
     // existing name (including symlinks). No rename/copy-over fallback is safe.
