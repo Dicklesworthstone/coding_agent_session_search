@@ -1,0 +1,56 @@
+name: Message coordinate regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/message-coordinate-regression.yml
+      - src/lib.rs
+      - src/message_coordinates.rs
+      - src/search/query.rs
+      - tests/message_coordinates.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cass-message-coordinates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Preserve exact source identity for regression investigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$RUNNER_TEMP/message-coordinates-source.txt"
+          git archive --format=tar HEAD src tests Cargo.toml Cargo.lock rust-toolchain.toml build.rs .cargo > "$RUNNER_TEMP/message-coordinates-source.tar"
+          sha256sum "$RUNNER_TEMP/message-coordinates-source.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: message-coordinates-source
+          path: |
+            ${{ runner.temp }}/message-coordinates-source.tar
+            ${{ runner.temp }}/message-coordinates-source.txt
+          retention-days: 3
+      - name: Record compiler identity
+        run: rustc --version && cargo --version
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run search-to-follow-up regressions
+        run: cargo test --locked --test message_coordinates -- --nocapture
