@@ -900,7 +900,9 @@ fn write_export_file(path: &Path, payload: &[u8]) -> Result<()> {
     #[cfg(unix)]
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .context("bookmark export was published, but directory durability could not be confirmed")?;
+        .context(
+            "bookmark export was published, but directory durability could not be confirmed",
+        )?;
     Ok(())
 }
 
@@ -1110,10 +1112,13 @@ mod tests {
     fn file_export_publishes_complete_private_bytes_in_new_directory() -> Result<()> {
         let dir = tempdir()?;
         let output = dir.path().join("nested/δ-export.json");
-        let payload = serde_json::to_vec_pretty(&[
-            Bookmark::new("Unicode δ", "/session.jsonl", "codex", "/workspace")
-                .with_note("private note\nsecond line"),
-        ])?;
+        let payload = serde_json::to_vec_pretty(&[Bookmark::new(
+            "Unicode δ",
+            "/session.jsonl",
+            "codex",
+            "/workspace",
+        )
+        .with_note("private note\nsecond line")])?;
         write_export_file(&output, &payload)?;
         assert_eq!(std::fs::read(&output)?, payload);
         let restored: Vec<Bookmark> = serde_json::from_slice(&std::fs::read(&output)?)?;

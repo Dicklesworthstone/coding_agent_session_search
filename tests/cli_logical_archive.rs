@@ -41,7 +41,12 @@ fn export(home: &Path, source: &Path, output: &Path) -> Value {
         command(home)
             .args(["archive", "export", "--db"])
             .arg(source)
-            .args(["--archive-id", "cli-archive", "--include-private", "--output"])
+            .args([
+                "--archive-id",
+                "cli-archive",
+                "--include-private",
+                "--output",
+            ])
             .arg(output)
             .output()
             .unwrap(),
@@ -52,7 +57,12 @@ fn import(home: &Path, input: &Path, output: &Path, identical: bool) -> Output {
     let mut cmd = command(home);
     cmd.args(["archive", "import"])
         .arg(input)
-        .args(["--archive-id", "cli-archive", "--include-private", "--output"])
+        .args([
+            "--archive-id",
+            "cli-archive",
+            "--include-private",
+            "--output",
+        ])
         .arg(output);
     if identical {
         cmd.arg("--if-identical");
@@ -73,14 +83,20 @@ fn real_binary_round_trip_and_repeat_import_have_truthful_json_receipts() {
     assert_eq!(imported["destination_status"], "created");
     assert_eq!(imported["content_sha256"], exported["content_sha256"]);
     assert_eq!(imported["tables"], exported["tables"]);
-    assert_eq!(imported["derived_search_assets"], "omitted_rebuild_required");
+    assert_eq!(
+        imported["derived_search_assets"],
+        "omitted_rebuild_required"
+    );
     let before = fs::read(&target).unwrap();
     let repeated = receipt(import(root.path(), &input, &target, true));
     assert_eq!(repeated["destination_status"], "unchanged");
     assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
     assert_eq!(before, fs::read(&target).unwrap());
     let after = root.path().join("restored.jsonl");
-    assert_eq!(export(root.path(), &target, &after)["content_sha256"], exported["content_sha256"]);
+    assert_eq!(
+        export(root.path(), &target, &after)["content_sha256"],
+        exported["content_sha256"]
+    );
     assert!(!root.path().join("unused-default").exists());
     assert!(!root.path().join("data/cass/models").exists());
 }
@@ -107,7 +123,8 @@ fn real_binary_requires_privacy_acknowledgement_and_never_overwrites_conflicts()
 
     receipt(import(root.path(), &input, &target, false));
     let writer = Connection::open(target.to_str().unwrap()).unwrap();
-    writer.execute("INSERT INTO meta (key, value) VALUES ('private_note', 'SECRET-DO-NOT-ECHO')")
+    writer
+        .execute("INSERT INTO meta (key, value) VALUES ('private_note', 'SECRET-DO-NOT-ECHO')")
         .unwrap();
     writer.close().unwrap();
     let before = fs::read(&target).unwrap();
@@ -171,7 +188,10 @@ fn real_binary_verify_refuses_a_fifo_without_waiting_for_a_writer() {
         .arg(&input)
         .output()
         .expect("verification must return a diagnostic, not time out");
-    assert!(output.status.code().is_some(), "verifier was killed instead of refusing input");
+    assert!(
+        output.status.code().is_some(),
+        "verifier was killed instead of refusing input"
+    );
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let error: Value = serde_json::from_slice(&output.stderr).expect("one JSON error");

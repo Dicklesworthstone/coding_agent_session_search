@@ -40,6 +40,7 @@ jobs:
           for file in src/bookmarks.rs src/logical_archive/export.rs src/logical_archive/export_tests.rs tests/cli_logical_archive.rs; do
             mkdir -p "$evidence/$(dirname "$file")"
             sha256sum "$file" >> "$evidence/input-sha256.txt"
+            rustfmt --edition 2024 --config skip_children=true --check "$file"
             rustfmt --edition 2024 --config skip_children=true --emit stdout "$file" > "$evidence/$file"
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

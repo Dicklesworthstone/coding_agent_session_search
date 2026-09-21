@@ -4,21 +4,26 @@ use std::path::PathBuf;
 
 fn fixture(path: &Path) {
     let connection = Connection::open(path.to_str().unwrap()).unwrap();
-    connection.execute_batch(
-        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    connection
+        .execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          INSERT INTO meta VALUES ('schema_version', '9');
          CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT, usage REAL, raw BLOB);
          INSERT INTO messages VALUES (7, 'private transcript', 1.25, X'0001FF');
          INSERT INTO messages VALUES (3, 'earlier', NULL, NULL);",
-    ).unwrap();
+        )
+        .unwrap();
     connection.close().unwrap();
 }
 
 fn contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    fs::read_dir(root).unwrap().map(|entry| {
-        let path = entry.unwrap().path();
-        (path.clone(), fs::read(path).unwrap())
-    }).collect()
+    fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (path.clone(), fs::read(path).unwrap())
+        })
+        .collect()
 }
 
 #[test]
@@ -37,7 +42,10 @@ fn export_preserves_every_source_file_and_verifies_published_bytes() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(output).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o077,
+            0
+        );
     }
 }
 
@@ -66,7 +74,9 @@ fn unknown_unkeyed_tables_are_not_silently_omitted() {
     let source = root.path().join("agent_search.db");
     fixture(&source);
     let connection = Connection::open(source.to_str().unwrap()).unwrap();
-    connection.execute("CREATE TABLE unknown_data (body TEXT)").unwrap();
+    connection
+        .execute("CREATE TABLE unknown_data (body TEXT)")
+        .unwrap();
     connection.close().unwrap();
     let output = root.path().join("archive.jsonl");
     assert!(export_file(&source, &output, "test".to_owned()).is_err());
@@ -90,7 +100,10 @@ fn fts5_shadow_names_are_exact_not_prefixes() {
         "other_fts_messages_data",
         "fts_messages2_data",
     ] {
-        assert!(!is_fts5_shadow_table(name, "fts_messages"), "omitted {name}");
+        assert!(
+            !is_fts5_shadow_table(name, "fts_messages"),
+            "omitted {name}"
+        );
     }
 }
 
@@ -213,7 +226,10 @@ fn unkeyed_fts_prefix_table_is_refused_not_silently_omitted() -> Result<()> {
     let output = destination.path().join("archive.jsonl");
     let error = export_file(&database, &output, "unkeyed-prefix".to_owned())
         .expect_err("unsupported authoritative data must refuse the whole export");
-    assert!(error.to_string().contains("fts_messages_notes"), "{error:#}");
+    assert!(
+        error.to_string().contains("fts_messages_notes"),
+        "{error:#}"
+    );
     assert!(!output.exists());
     assert_eq!(before, contents(source.path()));
     Ok(())
@@ -247,7 +263,11 @@ fn symlink_sources_and_destination_locks_are_refused() {
     symlink(&database, &linked).unwrap();
     assert!(open_source(&linked).is_err());
     let output = root.path().join("archive.jsonl");
-    symlink(&database, root.path().join(".archive.jsonl.logical-archive.lock")).unwrap();
+    symlink(
+        &database,
+        root.path().join(".archive.jsonl.logical-archive.lock"),
+    )
+    .unwrap();
     assert!(DestinationLock::acquire(&output).is_err());
 }
 
