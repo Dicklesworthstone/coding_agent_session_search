@@ -43,6 +43,8 @@ use tracing::{info, warn};
 use crate::indexer::background_refresh::background_index_args;
 use crate::indexer::responsiveness;
 
+mod outcomes;
+
 pub const DEFAULT_INTERVAL_MINS: u32 = 15;
 pub const DEFAULT_NIGHTLY_HOUR: u8 = 3;
 pub const DEFAULT_NIGHTLY_MINUTE: u8 = 0;
@@ -759,10 +761,11 @@ pub struct ScheduleState {
 }
 
 pub fn load_state(data_dir: &Path) -> ScheduleState {
-    std::fs::read_to_string(state_path(data_dir))
+    let state = std::fs::read_to_string(state_path(data_dir))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    outcomes::normalize_state(state)
 }
 
 fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
@@ -1002,9 +1005,10 @@ fn run_job_with_gate(
             }
         }
 
-        // 2. Index. Exit 7 (`index-busy`: a human or another job holds the
-        // index lock) is an expected outcome for a scheduled run, not a
-        // failure — the next timer firing simply tries again.
+        // 2. Index. Exit 7 is an expected lock-contention deferral, but no
+        // indexing completed. Preserve the non-success outcome so repeated
+        // contention cannot masquerade as refreshed history; the next timer
+        // firing still retries normally.
         let full = matches!(job, ScheduleJob::Nightly);
         // Retain the full source census: timestamp-only connectors can miss
         // restored historical files. The indexer may reconcile a verified
@@ -1028,6 +1032,7 @@ fn run_job_with_gate(
         );
         let index_busy = soften_busy_index_step(&mut index_step);
         steps.push(index_step);
+        let prerequisites_ok = steps.iter().all(|step| step.ok);
 
         // 3. Semantic backfill (nightly only). Two tiers: the fast (hash)
         // tier needs no model files; the quality (MiniLM) tier only runs
@@ -1044,6 +1049,11 @@ fn run_job_with_gate(
                 steps.push(skipped_step(
                     "semantic-backfill",
                     "index run was busy; leaving semantic backfill for the next night",
+                ));
+            } else if !prerequisites_ok {
+                steps.push(skipped_step(
+                    "semantic-backfill",
+                    "source sync or indexing failed; semantic backfill requires a successful run",
                 ));
             } else {
                 let (probe, model_installed) =
@@ -1172,13 +1182,14 @@ pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
     true
 }
 
-/// Convert an exit-7 (`index-busy`) index step into a skipped step: a
-/// scheduled run losing the lock race to a human `cass index` is routine.
+/// Annotate exit-7 (`index-busy`) as a deferred step without claiming that
+/// indexing succeeded. The next timer firing retries, but callers and saved
+/// receipts must distinguish that retryable deferral from completed work.
 pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
     if step.exit_code != Some(7) {
         return false;
     }
-    step.ok = true;
+    step.ok = false;
     step.skipped_reason =
         Some("another index run already holds the index lock; skipped this cycle".to_string());
     true
@@ -1246,6 +1257,7 @@ pub struct UnitStatus {
     pub installed: bool,
     /// Scheduler-reported state, when the platform tool answered.
     pub loaded: Option<bool>,
+    /// Last persisted run outcome, followed by explicitly labeled probe status.
     pub detail: Option<String>,
 }
 
@@ -1264,6 +1276,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
     let unit_dir = home_dir()
         .ok()
         .and_then(|home| unit_dir(platform, &home, xdg_config_home().as_deref()));
+    let state = load_state(data_dir);
     let mut units = Vec::new();
     if let Some(dir) = &unit_dir {
         let uid = current_uid();
@@ -1311,7 +1324,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
                 unit_files: files,
                 installed,
                 loaded,
-                detail,
+                detail: outcomes::unit_detail(job, &state, detail),
             });
         }
     }
@@ -1319,7 +1332,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
         platform,
         unit_dir,
         units,
-        state: load_state(data_dir),
+        state,
         auto_refresh: crate::indexer::background_refresh::load_state(data_dir),
         log_dir: schedule_dir(data_dir),
     }
@@ -1565,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_index_step_softens_to_skip() {
+    fn busy_index_step_is_deferred_without_claiming_success() {
         let step = |exit: Option<i32>, ok: bool| StepReport {
             name: "index".into(),
             argv: vec![],
@@ -1578,7 +1591,7 @@ mod tests {
         };
         let mut busy = step(Some(7), false);
         assert!(soften_busy_index_step(&mut busy));
-        assert!(busy.ok);
+        assert!(!busy.ok);
         assert!(busy.skipped_reason.is_some());
         let mut fine = step(Some(0), true);
         assert!(!soften_busy_index_step(&mut fine));
