@@ -1,4 +1,291 @@
-# Reality Check and Bridge Plan — refreshed 2026-09-04
+# Reality Check and Bridge Plan — refreshed 2026-09-21
+
+## Current assessment: 2026-09-21
+
+This assessment supersedes the current-state claims in the dated sections below.
+Those sections retain historical observations, failures and proposed targets;
+their dependency pins, workflow state, completion labels and timings are not
+current certification.
+
+**Verdict:** cass implements most of its broad feature set, but the dependable
+large-archive retrieval promise is not yet established. The immediate priority
+is preserving private history and returning the correct evidence within bounded
+resources, then delivering that behavior in tested release artifacts. More
+features or more closed beads cannot substitute for that result.
+
+### Scope and evidence boundaries
+
+Baseline: local `main` at `4cbcf1f8488faa7693a9b0bdac8e8138c95dffdf`, initially
+clean. AGENTS.md (1,329 lines) and README.md (3,564 lines) were read in full.
+Investigation traced selected production paths and tests across discovery,
+storage, indexing, lexical/semantic retrieval, packs, scheduling, sync, analytics,
+Pages, swarm observations and guided operations. Current contracts and the
+existing bridge plan were cross-checked; the roughly 23,000 lines of planning
+material were inventoried and selectively reviewed, not all reread line by line.
+This is a broad product assessment, not an exhaustive source/security audit.
+
+Keep four evidence classes distinct:
+
+1. **Current source:** reachable implementation at the baseline above. A test
+   present in source is not a fresh passing execution.
+2. **Fresh observation:** read-only installed CLI, GitHub release/workflow APIs,
+   Git history, tracker inventory and graph validation during this assessment.
+3. **Earlier or reported execution:** receipts and issue reproductions retain
+   their exact version, platform and corpus. They are acceptance obligations,
+   not automatically reproduced bugs on this HEAD.
+4. **Proposed acceptance:** behavior to demonstrate before closing the gap.
+
+No source archive was repaired, indexed or cleaned during this audit. No model
+was acquired and no new build was started. Earlier remote gates are described
+below without turning them into fresh audit results.
+
+### What has actually changed since the previous assessment
+
+- Latest public release is **v0.8.0**, published September 10, at
+  `96510ff5d06f678d25d5c786d058e4b6ea628827`; the checkout manifest says **0.9.0**.
+  Installed `cass --version` also reports 0.8.0. Linux x86_64/arm64, macOS arm64
+  and Windows x86_64 assets exist; no Intel macOS binary appears in that release.
+- Cargo.toml now selects FrankenSQLite **0.4.4**, Asupersync **0.5.0**,
+  Frankensearch **0.6.1** and FAD **0.3.0**. Published packages and exact pins do
+  not establish CASS runtime safety or repair an already damaged archive.
+- Native OpenClaw SQLite is enabled in the normal dependency feature list.
+  Codex source containment, exclusions, large-source admission and native
+  consumer tests have landed. Do not recreate those implementations because an
+  older issue still describes the released binary.
+- Semantic artifact retirement and fingerprint-approved offline scratch
+  recovery have landed, including real storage-backed test cases. Their full
+  correctness, resource bounds and release delivery remain separate questions.
+- Live Git/Beads/RCH/Agent Mail collectors exist. CASS swarm evidence now includes
+  passive lock observations and proof-metadata inspection; calling all of it
+  unwired is stale. Metadata inspection is not executable-proof certification.
+- General CI, Browser Tests and Release workflows remain manually disabled,
+  but many focused repository workflows are now active. The recent API sample
+  includes queued, cancelled, failed and successful runs on different SHAs.
+  Neither “all workflows disabled” nor “CI is green” describes this state.
+
+### Architecture and vision coverage
+
+The primary flow is provider discovery/normalization through FAD and CASS-owned
+connector seams, source capture and bounded ingestion, then the canonical
+FrankenSQLite archive. Quill lexical indexes, semantic vector/ANN generations
+and analytics rollups are derived assets. CLI and TUI consumers share search,
+hydration and readiness machinery; packs add selection, provenance, redaction
+and final output budgeting. Scheduler/daemon work launches child commands under
+the indexing lock. Source sync transports histories with provenance; it is not
+the proposed lossless logical-archive import/export contract.
+
+The main architectural risk is lifecycle composition: source admission,
+database opening, migration, generation ownership, inference, hydration and
+maintenance all contribute to a command's latency, memory and correctness.
+Optimizing an ANN lookup or lexical kernel alone cannot prove the full journey.
+
+| User promise | Current source and remaining gap | Existing or added coverage |
+|---|---|---|
+| Find histories across providers | Real FAD integration plus CASS-specific normalization. Native OpenClaw and Codex fixes landed; exclusions, large files and exact published-consumer behavior need qualification. | Provider beads; `.35`, `.37`, `.38`, `.40` |
+| Preserve authoritative history | Real storage, raw mirror, recovery plans and writer management. Reported archive damage and exact dependency/recovery qualification remain unresolved. | `scohn`, `.2`, `.3`, `.4`, `55wh0`, `hyydu` |
+| Finish indexing honestly | Streaming, source ledger, partial coverage and resume mechanisms exist. One rejected source must not starve later sources or yield false full success. | `.6`, `.7`, `.35`, `.40`, `irqgt`, `gk9ho` |
+| Search promptly at real scale | Real Quill lexical search, bounded fuel, filters and self-healing publication. Cold admission, narrow-filter costs, whole-process memory and useful deadlines remain acceptance gaps. | `.8`, `.9`, `.11`, `.32` |
+| Follow a result to the right evidence | Current reports show message ordinals confused with raw file lines, including plausible wrong content marked as the target. This threatens the central evidence contract. | New P0 `.43`; `.11`, `.20` |
+| Useful semantic/hybrid results | Native MiniLM inference, exact vector search, hybrid fallback and optional ANN are real. Producer identity, late passages, multilingual relevance, restart and scale still need full consumer proof. | `jyfuq.2`, `ds7uy`, `.33`, `mtt5q` |
+| Progressive two-tier refinement | The owner-backed progressive-reader capability is still constructed false in `src/search/vector_index.rs`; query routing checks it. This specific path remains unavailable. | `ds7uy.3`, `ds7uy.3.3` |
+| Safe semantic generation rollover | Retained-generation design and recovery mechanisms exist. Prior readable evidence must survive backfill, interruption and stale recovery plans without serving deleted/changed content. | `962e8`, `.41`, GH458 contract |
+| Stay fresh unobtrusively | OS schedules, detached refresh and bounded backfill exist. macOS priority starvation, busy-versus-fresh reporting and retained work need native qualification. Nightly reconciliation already exists in source. | `.24`, `.36`, GH471/GH472 work |
+| Reliable TUI at scale | FrankenTUI implementation is substantial. First frame, memory, responsiveness, terminal behavior and search relevance on large archives remain distinct acceptance obligations. | `.22`, GH395 |
+| Compact trustworthy handoffs | Packs are implemented, with citation checks, redaction and final serialized-budget work. The conformance matrix remains partial; its zero fully-certified totals do not mean there is no implementation. | `.20`, `.43` |
+| Accurate analytics | Fact/rollup queries and explicit no-data/true-zero/invalid-input outcomes exist. Provider completeness, source-kind classification and rebuild consistency still need full journey proof. | `.21`, `rril3` |
+| Multi-machine history | SSH/rsync/SFTP paths and scheduled due-source handling exist. Setup, provenance, transfer accounting and partial failure need end-to-end evidence. Logical archive round-trip is a separate unimplemented contract. | `.24`, `.34` |
+| Safe export and browser access | HTML/Pages encryption, verification and publication code exists. Browser unlock, privacy, failure recovery and native publication require actual lanes; browser workflow is disabled. | `.23`, `70o8f` |
+| Useful swarm and guided operations | Real bounded observers and some guided adapters exist. Observation-only adapters remain, and composed live acceptance is incomplete. | `.16`–`.19` |
+| Bounded storage and honest diagnostics | Quarantine/doctor/retention exist. Preview-ledger growth and semantic scratch retention expose lifecycle gaps; old precious evidence must remain protected. | `.39`, `.41`, recovery beads |
+| Safe concurrent writers | Reader pooling and a concurrent-writer API exist; ordinary production writes use BEGIN IMMEDIATE. Multi-writer capability is not a proven production performance benefit. | `.29` |
+| Install a version that delivers these promises | Releases and installers exist, but source fixes outpace published artifacts and complete native/browser gates are missing. | `.1`, `.25`, `55wh0`, `aegfi` |
+
+Suffixes `.N` in this section mean `coding_agent_session_search-2l1b0.N`.
+Other short IDs use the same project prefix.
+
+### Direct observations and unresolved validation
+
+The read-only installed-history query used lexical mode, workspace scope,
+`--no-maintenance`, a two-second command budget and a ten-second outer limit.
+It returned **exit 5 / maintenance-required** because the lexical rebuild
+checkpoint was incomplete. No results were delivered. The refusal is truthful
+and protects the archive; it does not satisfy useful retrieval. This establishes
+the state of this configured archive on installed 0.8.0, not universal failure
+or a new reproduction of b-tree corruption. The restriction was not relaxed to
+trigger repair merely to obtain a successful audit screenshot.
+
+Earlier on September 21, the GH364 remote gate produced `STAGE=fmt EXIT=1` and
+`STAGE=clippy EXIT=101`, then an RCH 1,800-second timeout. Tests, goldens and UBS
+had no terminal result. The source-stability check also failed after this
+agent appended a Bead during the run; the Rust file hash stayed unchanged.
+The corrected-timeout submission was refused for capacity before execution.
+These are neither a clean gate nor evidence that the proposed Quill regression
+test passed. Receipts: `/tmp/cass-rainyorchid-gh364-typed-errors-gate-1.log` and
+`/tmp/cass-rainyorchid-gh364-typed-errors-gate-2.log` (local session artifacts).
+Earlier selected swarm/service and release tests remain useful narrow evidence;
+unresolved strict UBS, excluded scopes and exact dependency reproducers still
+prevent a blanket release-clear statement.
+
+The public workflow sample likewise cannot certify this local HEAD: for example
+GH473 writer contention succeeded at `d002bfa7`, while semantic recovery failed
+at that SHA, and more recent coordinate/retrieval runs were queued or cancelled.
+The next verifier must inspect the complete terminal job and its source/artifact
+identity rather than transferring a green badge across revisions.
+
+### Coverage finding: would finishing the old backlog finish the product?
+
+**No, not as it stood at the start of this audit.** The inventory contained
+2,069 closed and 194 unfinished beads (111 in progress, 26 blocked, 57 open),
+while GitHub had 56 open issues. The ten reports below had no dedicated record
+in the open or closed Beads descriptions or exported JSONL, despite several
+having source fixes. The old v0.8.0 release task remained blocked even though
+that release exists. Task-state drift obscures both real progress and missing
+acceptance. A closure percentage is not a product completion percentage.
+
+| Report | New issue-specific bead | What was missing from the old graph |
+|---|---|---|
+| GH484 oversized source aborts later scan | `.35` | Source containment and top-level partial accounting through the real consumer |
+| GH485 launchd starvation | `.36` | Native throttled-vs-useful progress and freshness truth |
+| GH486 Codex exclusion gap | `.37` | Privacy boundary across scan, explicit source and raw mirror; release proof |
+| GH487 native OpenClaw feature omission | `.38` | Default published-consumer and WAL-only update qualification |
+| GH488 dry-run ledger growth | `.39` | Preview nonmutation and bounded ledger/storage accounting |
+| GH489 permanent large-source rejection | `.40` | Bounded large-source admission and stable/new partial-failure distinction |
+| GH490 semantic scratch amplification | `.41` | Durable retirement and fingerprint-approved killed-run recovery acceptance |
+| GH491 invalid ANN setup help | `.42` | Executable help/capability command contract |
+| GH493 wrong target evidence | `.43` | Canonical message identity across search, view/expand and packs |
+| GH483 bounded slow indexing | `.44` | Discoverable coupled resource controls and current-source skewed-corpus progress proof |
+
+Refinement also mapped GH475 explicitly into existing recipe task `.10`, retaining
+its distinction between executable downstream guidance and historical quotations.
+The final reference sweep found no open GitHub issue without an explicit tracker
+reference. This checks traceability, not adequacy or passing acceptance for all
+56 reports. The final inventory is 204 unfinished tasks: 111 in progress,
+26 blocked and 67 open; the 2,069 previously closed tasks were not bulk-changed.
+
+The broader missing capabilities already have coverage: progressive ownership,
+logical archive round-trip, composed live swarm/guided operations and complete
+release journeys. Do not create new epics for those. All new beads include
+reporter evidence, current-source distinctions, unit/error cases, real E2E
+acceptance, resource/provenance logging and publication handoff. Public issue
+comments remain a separate handoff; this audit does not claim they were sent.
+
+### Bridge plan and logical execution order
+
+1. **Establish safe evidence and a usable gate.** Existing owners continue the
+   strict gate and exact dependency-integrity qualification. Preserve original
+   failures and damaged archives. Obtain final-source, terminal RCH receipts;
+   do not replace unavailable runtime evidence with registry publication.
+2. **Close privacy and wrong-evidence boundaries first.** Qualify Codex exclusions
+   (`.37`) and establish exact message identity (`.43`). Investigate in parallel
+   with integrity work where paths/owners permit. A confidently wrong excerpt
+   is a higher product risk than a truthful refusal or a missing optional tier.
+3. **Complete lossless, bounded ingest and freshness.** `.35` precedes `.40`
+   acceptance; retain later good sources and completed work under oversized,
+   unreadable and changing inputs. Finish scale write/open costs and native
+   scheduler behavior (`.36`), without masking fresh failures as success.
+4. **Prove the full retrieval loop.** `.11` must include exact follow-up identity,
+   filters, restart, absent/stale assets and useful nonempty results at declared
+   corpus/platform budgets. Semantic work includes real model relevance,
+   independent quality candidates, retained-generation ownership, exact-oracle
+   ANN recall and `.41` storage bounds. Hash-only or file-presence checks are
+   insufficient for MiniLM or progressive claims.
+5. **Complete secondary journeys against the same truth.** Packs, analytics,
+   TUI, source sync, Pages and swarm/guide retain their existing tests and scope.
+   `.39` constrains previews; `.42` fixes executable operator instructions.
+   These can proceed independently of unrelated future optional features.
+6. **Qualify and ship exact artifacts.** `.25` records a capability-by-target
+   matrix with known omissions, native Windows/macOS behavior, installer/upgrade
+   paths and GitHub-only browser proof. A maintenance release may honestly omit
+   optional future capabilities; it cannot omit privacy, archive safety or
+   evidence correctness from a claim that those core paths are fixed.
+
+Every acceptance run must identify source, executed binary, published dependency
+graph, corpus/model/generation, platform, command, counts and terminal exit.
+Measure process-tree memory, disk growth and the full command lifecycle. Set
+budgets before running on a named corpus; historical universal millisecond/RSS
+targets below are not freshly certified SLOs. Performance comparisons require
+parity and valid interleaved A/A controls. Correctness results stand separately
+when performance has no verdict. Use `RUST_MIN_STACK=134217728`; older Bead
+boilerplate specifying 16 MiB is superseded by current AGENTS.md.
+
+### Ambition and refinement record for this refresh
+
+The frozen Phase 3a prompt was applied verbatim in the epic comment. Existing
+owned tasks were retained and ten uncovered issue-specific tasks added, including
+the additional GH483 gap found during refinement.
+Ambition passes and subsequent graph refinement are recorded here as substantive
+changes, not as claims that implementation or runtime qualification occurred.
+
+- **Ambition 1 — evidence fidelity:** require identity conservation from provider
+  source through archive, search, follow-up and pack; separately test identical
+  text at different positions, changed/pruned sources and nonlocal provenance.
+  `.43` becomes a prerequisite for full retrieval and pack conformance.
+- **Ambition 2 — lifecycle costs:** count overlapping generations, scratch/reuse
+  files, raw-mirror ledgers, models and child processes. `.39` and `.41` cover
+  disk/preview costs, and `.36` distinguishes polite scheduling from starvation.
+- **Ambition 3 — delivery and scope:** separate source fixed, qualified and shipped
+  states; require exact target receipts. Preserve optional feature breadth while
+  making privacy, source containment and evidence identity core release gates.
+
+The frozen Phase 5 prompt was applied verbatim in the epic comment. Five passes:
+
+1. **Coverage:** scan all 56 open GitHub reports against both unfinished and
+   closed descriptions/notes and exported JSONL. Add `.44` for GH483; extend
+   `.10` for GH475 instead of duplicating the recipe campaign. Preserve the
+   reporter's missing OOM attribution as missing evidence, and reuse GH426's
+   source resume ownership rather than inventing another checkpoint system.
+2. **Current-source accuracy:** inspect raw-mirror prune code and its dry-run
+   test. The test currently requires appended preview records in `pruned.jsonl`;
+   `.39` must deliberately change that contract, with output-only summaries and
+   preserved applied-action evidence. It is not merely an old-release report.
+3. **Dependency direction:** separate pre-publication candidate qualification
+   from post-publication installed-artifact verification. Otherwise requiring
+   a released asset in a task that blocks release creates a logical cycle even
+   when the tracker graph is acyclic. `.25` owns the latter step. Add real
+   blocking edges for identity, scan containment and macOS scheduling; keep
+   related ownership links nonblocking.
+4. **Adversarial acceptance:** add same-size replacement/stale approval,
+   symlink/path escape, newly active owner, zero-delta deletion, duplicate text,
+   remote/local path collision and redacted-content cases to `.41`/`.43`.
+   Require real consumer execution; do not substitute renderer-only fixtures.
+5. **Final consistency:** reread the ten new tasks and modified acceptance
+   notes, inspect dependency directions and check source/release/evidence labels.
+   No further change was needed in this scoped pass. Unknown defects and the
+   historical-plan review limit above remain; this is not a completeness proof.
+
+Validation: `br dep cycles --json` reports zero active cycles. `bv --robot-triage`
+loaded the current SQLite tracker with complete authority, no warnings/errors,
+and 204 unfinished tasks. Its top recommendations include archive integrity
+and Windows writer admission, consistent with the safety/release priorities;
+its numerical rank does not override ownership or substitute for diagnosis.
+All ten new tasks have an external issue reference, concrete tests and E2E
+acceptance. JSONL parses, no tracker records were deleted, and `git diff --check`
+passes. This audit changes documentation and Beads only; it does not supply a
+new Rust, native-platform or browser test pass.
+
+### Answers to the five questions
+
+1. **Working implementation:** real discovery, canonical storage, lexical and
+   single-tier semantic search, hybrid fallback, packs, TUI, analytics, sync,
+   scheduling, export, diagnostics and several live swarm/guided paths exist.
+   Recent source fixes materially improve containment and artifact ownership.
+2. **Incomplete or not established:** dependable large-archive operation,
+   exact evidence follow-up, exclusion/recovery/release qualification, progressive
+   ownership, full pack conformance, logical archive round-trip, composed live
+   operations and cross-platform/browser acceptance. Some are missing capability;
+   others are implemented paths without sufficient current evidence.
+3. **Blockers:** unresolved integrity and lifecycle failures, end-to-end resource
+   costs, unavailable/failed validation lanes, source-to-release lag and tracker/
+   documentation drift. No single dependency bump clears those boundaries.
+4. **Would the initial backlog close everything?** No: ten issue-specific gaps
+   and an unlinked downstream propagation request were missing, and stale tasks
+   could produce duplicated work instead of user-visible completion.
+5. **What now has coverage?** The identified gaps map to the revised existing
+   campaign and `.35`–`.44`, with concrete acceptance and ownership links. Completing
+   that graph with the specified evidence addresses the identified vision gaps;
+   merely closing it, or passing small fixtures, does not prove the vision.
+
+---
 
 ## Current assessment: 2026-09-04
 
