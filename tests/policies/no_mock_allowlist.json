@@ -24,17 +24,8 @@
       "note": "Creates test ResourceInfo struct for unit testing check_resources() and can_compile(). Complemented by real resource probe tests."
     }
   ],
-  "excluded_paths": [
-    "node_modules/",
-    "target/",
-    ".git/",
-    "tests/fixtures/",
-    "test-results/"
-  ],
-  "excluded_patterns": [
-    "mock-.*\\.jsonl$",
-    "mock-.*\\.html$"
-  ],
+  "excluded_paths": ["node_modules/", "target/", ".git/", "tests/fixtures/", "test-results/"],
+  "excluded_patterns": ["mock-.*\\.jsonl$", "mock-.*\\.html$"],
   "notes": [
     "Entries with permanent: true are allowed indefinitely (true OS/hardware boundaries or false positives)",
     "See docs/artifacts/no-mock-audit.md for full audit report",

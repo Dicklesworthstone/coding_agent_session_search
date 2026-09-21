@@ -18,7 +18,7 @@
       "author": null,
       "created_at": 1700000000000,
       "content": "Fix the authentication bug in login.rs",
-      "extra": {"tool_calls": []},
+      "extra": { "tool_calls": [] },
       "snippets": [
         {
           "file_path": "src/login.rs",
@@ -35,7 +35,7 @@
       "author": "claude-3-opus",
       "created_at": 1700000005000,
       "content": "I'll fix the authentication bug by adding input validation.",
-      "extra": {"model": "claude-3-opus"},
+      "extra": { "model": "claude-3-opus" },
       "snippets": []
     },
     {

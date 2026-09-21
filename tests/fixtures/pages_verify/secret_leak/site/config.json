@@ -13,9 +13,7 @@
     "chunk_count": 1,
     "total_compressed_size": 14,
     "total_plaintext_size": 100,
-    "files": [
-      "payload/chunk-00000.bin"
-    ]
+    "files": ["payload/chunk-00000.bin"]
   },
   "key_slots": [
     {
