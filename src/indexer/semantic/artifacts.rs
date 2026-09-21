@@ -21,6 +21,8 @@ mod inspection;
 
 #[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+mod storage_tests;
 
 pub use inspection::{
     BackfillArtifactCandidate, BackfillArtifactReclaimPlan, apply_backfill_artifact_plan,

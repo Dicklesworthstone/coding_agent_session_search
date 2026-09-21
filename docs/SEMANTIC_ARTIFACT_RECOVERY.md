@@ -129,6 +129,7 @@ indexes. They require no model download. Run them in a Rust-enabled checkout:
 cargo test --locked --lib indexer::semantic::artifacts::inspection::tests
 cargo test --locked --lib indexer::semantic::artifact_lifecycle_tests
 cargo test --locked --lib indexer::semantic::artifacts::checkpoint_tests
+cargo test --locked --lib indexer::semantic::artifacts::storage_tests
 cargo test --locked --bin cass-semantic-reclaim
 cargo test --locked --test semantic_artifact_reclaim_cli
 ```
@@ -139,3 +140,10 @@ changed scratch, symlink targets, live-index
 bytes and fresh search reopen, plus separate-process command execution with an
 invalid canonical database. These are qualification commands, not a claim that
 the full CASS dependency graph or platform matrix has passed.
+
+The storage-backed lifecycle suite also runs capped quality-tier passes with
+the deterministic hash producer against a real FrankenSQLite archive. It covers
+content-fingerprint rollover after ingest, appended turns in covered conversations,
+vector reuse, same-fingerprint resume, cleanup after a rejected reuse candidate,
+and the completed-cache fast path. This exercises the public cleanup wrapper,
+not only the inner embedding engine. It does not qualify native model quality.

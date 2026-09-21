@@ -71,5 +71,6 @@ jobs:
           run_suite lifecycle --lib indexer::semantic::artifact_lifecycle_tests
           run_suite approval --lib indexer::semantic::artifacts::inspection::tests
           run_suite checkpoint --lib indexer::semantic::artifacts::checkpoint_tests
+          run_suite storage --lib indexer::semantic::artifacts::storage_tests
           run_suite command --bin cass-semantic-reclaim
           run_suite cli --test semantic_artifact_reclaim_cli
