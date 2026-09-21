@@ -56,7 +56,9 @@ fn shard(
     if !updates.is_empty() {
         let mut source = FsVectorIndex::open_writer(&path).unwrap();
         for (id, vector) in updates {
-            source.append_batch(&[(id.clone(), vector.to_vec())]).unwrap();
+            source
+                .append_batch(&[(id.clone(), vector.to_vec())])
+                .unwrap();
         }
         assert!(source.wal_record_count() > 0);
     }
@@ -130,13 +132,20 @@ fn a_full_native_page_cannot_hide_a_new_durable_wal_winner() {
     let (actual, retry, stats) = set
         .search_with_exact_fallback(&ctx, &[1.0, 0.0], 1, None)
         .unwrap();
-    assert_eq!(actual.len(), 1, "native serving preserves the requested page");
+    assert_eq!(
+        actual.len(),
+        1,
+        "native serving preserves the requested page"
+    );
     assert_eq!(actual[0].message_id, 99);
     assert_eq!(signature(&actual), signature(&expected[..1]));
     assert!(retry.has_more_candidates);
     let stats = stats.unwrap();
     assert_eq!(stats.k_requested, 2, "the retained graph remains in use");
-    assert!(stats.exact_fallback.is_none(), "a small WAL is not a full scan");
+    assert!(
+        stats.exact_fallback.is_none(),
+        "a small WAL is not a full scan"
+    );
     assert_eq!(files(temp.path()), before);
 }
 
@@ -249,9 +258,7 @@ fn wal_recovery_never_reopens_renamed_sources_or_relaxes_request_validation() {
         set.search_with_exact_fallback(&other, &[1.0, 0.0], 2, None)
             .is_err()
     );
-    let (empty, _, stats) = set
-        .search_with_exact_fallback(&ctx, &[], 0, None)
-        .unwrap();
+    let (empty, _, stats) = set.search_with_exact_fallback(&ctx, &[], 0, None).unwrap();
     assert!(empty.is_empty());
     assert!(stats.is_none());
     assert_eq!(files(temp.path()), before);
@@ -426,12 +433,7 @@ fn oversized_cohort_wal_recovers_exactly_before_any_native_graph_call() {
         let base = (0..4)
             .map(|offset| (doc(50_000 + ordinal * 10 + offset, 3), [-1.0, 0.0]))
             .collect::<Vec<_>>();
-        let original = shard(
-            temp.path(),
-            &format!("budget-{ordinal}"),
-            &base,
-            &[],
-        );
+        let original = shard(temp.path(), &format!("budget-{ordinal}"), &base, &[]);
         let path = original.fsvi_path().to_path_buf();
         let ann = original.ann_path().unwrap().to_path_buf();
         drop(original);
@@ -473,7 +475,10 @@ fn oversized_cohort_wal_recovers_exactly_before_any_native_graph_call() {
         .unwrap();
     assert_eq!(signature(&hits), signature(&expected));
     assert_eq!(hits[0].message_id, 1);
-    assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
+    assert_eq!(
+        retry.has_more_candidates,
+        expected_retry.has_more_candidates
+    );
     let stats = stats.unwrap();
     assert_eq!(stats.k_requested, 0);
     assert_eq!(stats.k_returned, 0);
@@ -524,7 +529,11 @@ fn later_native_failure_discards_earlier_graph_and_delta_winners() {
         .search_with_exact_fallback(&ctx, &[1.0, 0.0], 1, None)
         .unwrap();
     assert_eq!(signature(&hits), signature(&expected));
-    assert_eq!(hits[0].message_id, 2, "the failed later shard must survive recovery");
+    assert_eq!(
+        hits[0].message_id,
+        2,
+        "the failed later shard must survive recovery"
+    );
     assert!(hits.iter().all(|hit| ![30, 31].contains(&hit.message_id)));
     let stats = stats.unwrap();
     assert_eq!(stats.k_requested, 1, "keep only completed native work");

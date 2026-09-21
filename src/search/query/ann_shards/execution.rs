@@ -256,8 +256,9 @@ impl SemanticAnnShardSet {
             let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
             for (doc_id, vector) in index.wal_records() {
                 shadowed.insert(doc_id);
-                let parsed = parse_semantic_doc_id(doc_id)
-                    .ok_or_else(|| anyhow!("retained WAL has an invalid semantic document identity"))?;
+                let parsed = parse_semantic_doc_id(doc_id).ok_or_else(|| {
+                    anyhow!("retained WAL has an invalid semantic document identity")
+                })?;
                 if filter.is_some_and(|filter| !filter.matches(doc_id, None)) {
                     continue;
                 }
