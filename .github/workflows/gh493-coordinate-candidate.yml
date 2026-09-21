@@ -50,7 +50,25 @@ jobs:
                   raise SystemExit(f'Refusing to overwrite an existing candidate path: {path}')
               target.write_bytes(read_blob(sha))
           script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'prepare-gh493.py'
-          script.write_bytes(read_blob('a36ea38137293ac49790a26a9dfac35a7173d1d4'))
+          source = read_blob('a36ea38137293ac49790a26a9dfac35a7173d1d4').decode()
+          # Other command enums also contain View variants. Constrain the
+          # checked edit to Commands rather than loosening its uniqueness guard.
+          start = source.index('def command_definition(')
+          end = source.index('\n\ndef wire_dispatch(', start)
+          source = source[:start] + '''def command_definition(text: str, name: str) -> tuple[int, int]:
+              enum_start = text.index("pub enum Commands {\\n")
+              enum_end = text.index("\\n}\\n", enum_start)
+              needle = f"    {name} {{\\n"
+              matches = list(re.finditer(rf"(?m)^    {name} \\{{\\n", text[enum_start:enum_end]))
+              if len(matches) != 1:
+                  raise RuntimeError(f"Expected one Commands::{name} definition, found {len(matches)}")
+              start = enum_start + matches[0].start()
+              end = text.index("\\n    },", start) + len("\\n    },")
+              if end > enum_end:
+                  raise RuntimeError("Command boundary escaped Commands")
+              return start, end
+          ''' + source[end:]
+          script.write_text(source)
           subprocess.run(['python3', str(script)], check=True)
           PY
       - name: Install formatter
@@ -100,6 +118,7 @@ jobs:
               shutil.copyfile(path, target)
           encoded = json.dumps(manifest, indent=2)
           pathlib.Path('candidate/manifest.json').write_text(encoded + '\n')
+          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', 'src/lib.rs', 'src/search/query.rs']))
           print('GH493_CANDIDATE_MANIFEST\n' + encoded)
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
