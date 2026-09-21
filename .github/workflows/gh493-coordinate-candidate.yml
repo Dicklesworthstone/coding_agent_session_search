@@ -1,0 +1,142 @@
+name: GH493 canonical anchor candidate
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/gh493-coordinate-candidate.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh493-canonical-candidate
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Load reviewed candidate blobs and apply checked CLI edits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          def read_blob(sha):
+              request = urllib.request.Request(
+                  f'https://api.github.com/repos/{repo}/git/blobs/{sha}',
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  payload = json.load(response)
+              assert payload['encoding'] == 'base64'
+              return base64.b64decode(payload['content'])
+          for path, sha in {
+              'src/followup_coordinates.rs': 'ffad83b343af690d3c54f410e2e00ec7cfba2524',
+              'tests/gh493_message_coordinates.rs': '933f1436017c827809b612191db011164a2d9b2b',
+          }.items():
+              target = pathlib.Path(path)
+              if target.exists():
+                  raise SystemExit(f'Refusing to overwrite an existing candidate path: {path}')
+              target.write_bytes(read_blob(sha))
+          script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'prepare-gh493.py'
+          script.write_bytes(read_blob('a36ea38137293ac49790a26a9dfac35a7173d1d4'))
+          subprocess.run(['python3', str(script)], check=True)
+          PY
+      - name: Install formatter
+        uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt
+      - name: Format and inspect only candidate files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs
+          git diff --check
+          git diff --stat
+          python3 - <<'PY'
+          import subprocess
+          diff = subprocess.check_output(['git', 'diff', '--numstat', '--', 'src/lib.rs', 'src/search/query.rs'], text=True)
+          changed = sum(int(value) for line in diff.splitlines() for value in line.split('\t')[:2])
+          if changed > 600:
+              raise SystemExit(f'Refusing broad unrelated formatting changes: {changed} lines')
+          PY
+          git diff -- src/lib.rs src/search/query.rs
+      - name: Publish candidate Git blobs only (never commits or refs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          files = ['src/lib.rs', 'src/search/query.rs', 'src/followup_coordinates.rs', 'tests/gh493_message_coordinates.rs']
+          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': {}, 'candidate_blobs': {}}
+          for path in files:
+              original = subprocess.run(['git', 'rev-parse', f'HEAD:{path}'], text=True, capture_output=True)
+              manifest['base_blobs'][path] = original.stdout.strip() if original.returncode == 0 else None
+              content = pathlib.Path(path).read_text()
+              request = urllib.request.Request(
+                  f'https://api.github.com/repos/{repo}/git/blobs',
+                  data=json.dumps({'content': content, 'encoding': 'utf-8'}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'},
+                  method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  manifest['candidate_blobs'][path] = json.load(response)['sha']
+              target = pathlib.Path('candidate') / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, target)
+          encoded = json.dumps(manifest, indent=2)
+          pathlib.Path('candidate/manifest.json').write_text(encoded + '\n')
+          print('GH493_CANDIDATE_MANIFEST\n' + encoded)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh493-canonical-candidate
+          path: candidate/
+          retention-days: 3
+  verify:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: gh493-canonical-candidate
+          path: .
+      - name: Clone sibling dependencies as in CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repo in asupersync frankensqlite franken_agent_detection frankensearch; do
+            git clone --depth 1 "https://github.com/Dicklesworthstone/$repo.git" "../$repo"
+          done
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Run exact search-to-follow-up regressions
+        run: cargo test --locked --test gh493_message_coordinates -- --nocapture
+      - name: Lint the regression target and production dependency
+        run: cargo clippy --locked --test gh493_message_coordinates -- -D warnings
