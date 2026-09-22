@@ -85,7 +85,9 @@ fn make_v20_source(root: &Path) -> PathBuf {
              UPDATE meta SET value = '20' WHERE key = 'schema_version';",
         )
         .expect("downgrade only the reviewed v21 index/schema authority");
-    connection.close().expect("durably close downgraded fixture");
+    connection
+        .close()
+        .expect("durably close downgraded fixture");
     source
 }
 
@@ -94,7 +96,12 @@ fn export_v20(home: &Path, source: &Path, backup: &Path) -> Value {
         command(home)
             .args(["archive", "export", "--db"])
             .arg(source)
-            .args(["--archive-id", "reviewed-v20", "--include-private", "--output"])
+            .args([
+                "--archive-id",
+                "reviewed-v20",
+                "--include-private",
+                "--output",
+            ])
             .arg(backup)
             .output()
             .expect("run archive export"),
@@ -125,7 +132,10 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
         .arg(&exact_destination)
         .output()
         .expect("run exact import");
-    assert!(!exact.status.success(), "exact schema import unexpectedly accepted v20");
+    assert!(
+        !exact.status.success(),
+        "exact schema import unexpectedly accepted v20"
+    );
     assert!(
         !exact_destination.exists(),
         "failed exact import must publish nothing"
@@ -149,8 +159,7 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
     );
     assert_eq!(created["destination_status"], "created", "{created}");
     assert_eq!(
-        created["schema_migration"]["mode"],
-        "reviewed_v20_to_v21",
+        created["schema_migration"]["mode"], "reviewed_v20_to_v21",
         "{created}"
     );
     assert_eq!(
@@ -164,8 +173,7 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
         "{created}"
     );
     assert_eq!(
-        created["schema_migration"]["source_rows_verified"],
-        true,
+        created["schema_migration"]["source_rows_verified"], true,
         "{created}"
     );
 
@@ -176,18 +184,14 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
     );
     let agent = storage
         .raw()
-        .query_row(
-            "SELECT slug, version FROM agents WHERE slug = 'reviewed-v20-agent'",
-        )
+        .query_row("SELECT slug, version FROM agents WHERE slug = 'reviewed-v20-agent'")
         .expect("read migrated agent");
     assert_eq!(
         agent.get_typed::<String>(0).expect("agent slug"),
         "reviewed-v20-agent"
     );
     assert_eq!(
-        agent
-            .get_typed::<Option<String>>(1)
-            .expect("agent version"),
+        agent.get_typed::<Option<String>>(1).expect("agent version"),
         Some("preserve-me".into())
     );
     drop(storage);
@@ -211,8 +215,7 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
     );
     assert_eq!(repeated["destination_status"], "unchanged", "{repeated}");
     assert_eq!(
-        repeated["schema_migration"]["mode"],
-        "reviewed_v20_to_v21",
+        repeated["schema_migration"]["mode"], "reviewed_v20_to_v21",
         "{repeated}"
     );
     assert_eq!(

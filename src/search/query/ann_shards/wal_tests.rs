@@ -509,7 +509,10 @@ fn oversized_cohort_wal_recovers_exactly_before_any_native_graph_call() {
     assert_eq!(stats.k_returned, 0);
     assert!(!stats.is_approximate);
     let receipt = stats.exact_fallback.unwrap();
-    assert_eq!(receipt.reason, AnnExactFallbackReason::WalDeltaRequiresExact);
+    assert_eq!(
+        receipt.reason,
+        AnnExactFallbackReason::WalDeltaRequiresExact
+    );
     assert_eq!(receipt.shard_count, 2);
     assert_eq!(receipt.returned_messages, hits.len());
     assert_eq!(files(temp.path()), before);
@@ -536,10 +539,8 @@ fn later_native_failure_discards_earlier_graph_and_delta_winners() {
         &[(doc(30, 3), [1.0, 0.0]), (doc(31, 3), [0.0, 1.0])],
         &[],
     );
-    let first_graph =
-        open_fs_semantic_ann_index(first.index(), first.ann_path().unwrap()).unwrap();
-    let wrong_graph =
-        open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
+    let first_graph = open_fs_semantic_ann_index(first.index(), first.ann_path().unwrap()).unwrap();
+    let wrong_graph = open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
     let ctx = context(vec![first, second]);
     // Exercise a failed private pairing using a real incompatible graph.
     // Production admission remains all-or-nothing; no backend is mocked.
@@ -555,8 +556,7 @@ fn later_native_failure_discards_earlier_graph_and_delta_winners() {
         .unwrap();
     assert_eq!(signature(&hits), signature(&expected));
     assert_eq!(
-        hits[0].message_id,
-        2,
+        hits[0].message_id, 2,
         "the failed later shard must survive recovery"
     );
     assert!(hits.iter().all(|hit| ![30, 31].contains(&hit.message_id)));

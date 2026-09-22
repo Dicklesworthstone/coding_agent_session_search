@@ -42,7 +42,8 @@ impl SemanticIndexer {
     where
         F: FnMut(usize, usize),
     {
-        self.inner.embed_messages_with_progress(messages, on_progress)
+        self.inner
+            .embed_messages_with_progress(messages, on_progress)
     }
 
     pub fn build_and_save_index<I>(
@@ -127,12 +128,7 @@ impl SemanticIndexer {
         tier: TierKind,
         model_revision: &str,
     ) -> Result<Option<String>> {
-        self.inner.completed_backfill_fingerprint(
-            storage,
-            data_dir,
-            manifest,
-            tier,
-            model_revision,
-        )
+        self.inner
+            .completed_backfill_fingerprint(storage, data_dir, manifest, tier, model_revision)
     }
 }

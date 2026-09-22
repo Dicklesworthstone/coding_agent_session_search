@@ -157,14 +157,21 @@ impl Refiner {
 }
 
 fn preview_text(hit: &Value) -> Result<String> {
-    let title = hit["title"].as_str().context("candidate title is missing")?;
-    let snippet = hit["snippet"].as_str().context("candidate snippet is missing")?;
+    let title = hit["title"]
+        .as_str()
+        .context("candidate title is missing")?;
+    let snippet = hit["snippet"]
+        .as_str()
+        .context("candidate snippet is missing")?;
     let bytes = title
         .len()
         .checked_add(snippet.len())
         .and_then(|n| n.checked_add(1))
         .context("candidate size overflow")?;
-    ensure!(bytes <= MAX_CANDIDATE_BYTES, "candidate preview is too large");
+    ensure!(
+        bytes <= MAX_CANDIDATE_BYTES,
+        "candidate preview is too large"
+    );
     ensure!(
         !title.trim().is_empty() || !snippet.trim().is_empty(),
         "candidate preview contains no text"
@@ -183,7 +190,10 @@ fn rank(mut hits: Vec<Value>, scores: Vec<f32>, limit: usize) -> Result<Vec<Valu
         (1..=MAX_CANDIDATES).contains(&limit),
         "invalid refined result limit"
     );
-    ensure!(scores.iter().all(|score| score.is_finite()), "non-finite reranking score");
+    ensure!(
+        scores.iter().all(|score| score.is_finite()),
+        "non-finite reranking score"
+    );
     for (index, (hit, score)) in hits.iter_mut().zip(&scores).enumerate() {
         let fields = hit.as_object_mut().context("candidate is not an object")?;
         fields.insert("lexical_rank".into(), json!(index + 1));
@@ -194,10 +204,16 @@ fn rank(mut hits: Vec<Value>, scores: Vec<f32>, limit: usize) -> Result<Vec<Valu
         if left == right {
             left_rank.cmp(right_rank)
         } else {
-            right.total_cmp(left).then_with(|| left_rank.cmp(right_rank))
+            right
+                .total_cmp(left)
+                .then_with(|| left_rank.cmp(right_rank))
         }
     });
-    Ok(ranked.into_iter().take(limit).map(|(_, (hit, _))| hit).collect())
+    Ok(ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, (hit, _))| hit)
+        .collect())
 }
 
 impl Session {
@@ -211,16 +227,27 @@ impl Session {
     ) -> Result<Value> {
         validate(query, lexical_query, &filters, candidate_limit, limit)
             .map_err(anyhow::Error::msg)?;
-        ensure!(self.refiner.enabled(), "refinement requires --reranker-model at startup");
+        ensure!(
+            self.refiner.enabled(),
+            "refinement requires --reranker-model at startup"
+        );
         // Run one bounded lexical window, under the existing request watchdog.
         // Inference never opens the global FSVI/HNSW generation or canonical DB.
         let lexical = self.search(lexical_query, filters, candidate_limit, 0)?;
-        let hits = lexical["hits"].as_array().context("lexical hits are missing")?;
-        ensure!(hits.len() <= candidate_limit, "lexical candidate budget exceeded");
+        let hits = lexical["hits"]
+            .as_array()
+            .context("lexical hits are missing")?;
+        ensure!(
+            hits.len() <= candidate_limit,
+            "lexical candidate budget exceeded"
+        );
         let count = hits.len();
         let (hits, metadata) = if hits.is_empty() {
             // Empty retrieval is not a reason to load a model or invent scores.
-            (Vec::new(), json!({"status": "no_candidates", "model": self.refiner.status()}))
+            (
+                Vec::new(),
+                json!({"status": "no_candidates", "model": self.refiner.status()}),
+            )
         } else {
             let documents = hits.iter().map(preview_text).collect::<Result<Vec<_>>>()?;
             let (scores, metadata) = self.refiner.score(query, &documents)?;

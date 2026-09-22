@@ -532,7 +532,10 @@ fn explicit_ann_budget_is_aggregate_and_checked_before_missing_sidecars() -> Tes
                 let graph_path = directory.join(&artifact.relative_path);
                 let (_, receipt) =
                     ValidatedNativeHnsw::load(Arc::clone(owner), &graph_path).unwrap();
-                Some(SemanticAnnExpectation { graph_path, receipt })
+                Some(SemanticAnnExpectation {
+                    graph_path,
+                    receipt,
+                })
             })
             .collect::<Vec<_>>()
     };

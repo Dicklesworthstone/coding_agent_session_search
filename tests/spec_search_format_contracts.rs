@@ -221,6 +221,39 @@ fn json_format_parses_as_a_single_json_document() -> TestResult {
 }
 
 #[test]
+fn completed_no_match_search_does_not_claim_a_timeout_on_stderr() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .args([
+            "--color=never",
+            "search",
+            NO_MATCH_QUERY,
+            "--robot",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "60000",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(output.status.success(), "no-match search failed")?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure(
+        payload["budget"]["timed_out"] == false,
+        "a completed search must not report a timeout",
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure(
+        !stderr.contains("budget.timed_out=true"),
+        format!("a genuine no-match must not carry the timeout note: {stderr}"),
+    )?;
+    Ok(())
+}
+
+#[test]
 fn timed_out_search_returns_before_slow_operation_and_names_shed_sections() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
@@ -268,6 +301,13 @@ fn timed_out_search_returns_before_slow_operation_and_names_shed_sections() -> T
     ensure(
         payload["hits"].as_array().is_some(),
         "search timeout did not return a valid partial hits array",
+    )?;
+    // GH #422 follow-on: an exit-0 empty result must not look like a clean
+    // no-match on the diagnostics stream.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure(
+        stderr.contains("budget.timed_out=true") && stderr.contains("not a no-match result"),
+        format!("timed-out search must say so on stderr: {stderr}"),
     )?;
     for section in [
         "search",

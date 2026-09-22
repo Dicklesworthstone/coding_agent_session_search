@@ -1,5 +1,5 @@
-use super::*;
 use super::super::protocol::Request;
+use super::*;
 use coding_agent_search::search::tantivy::TantivyIndex;
 use frankensearch::quill::cass::CassDocument;
 use std::path::Path;
@@ -100,14 +100,22 @@ fn refinement_decoder_refuses_ambiguous_operations_paths_and_pagination() {
         value_request[field] = value;
         assert!(serde_json::from_value::<Request>(value_request).is_err());
     }
-    let Request::Refine { candidate_limit, limit, .. } = request(refine_request()) else {
+    let Request::Refine {
+        candidate_limit,
+        limit,
+        ..
+    } = request(refine_request())
+    else {
         panic!("wrong operation");
     };
     assert_eq!(candidate_limit, 20);
     assert_eq!(limit, 5);
-    assert!(serde_json::from_str::<Request>(
-        r#"{"op":"refine","id":1,"query":"a","query":"b","lexical_query":"x"}"#
-    ).is_err());
+    assert!(
+        serde_json::from_str::<Request>(
+            r#"{"op":"refine","id":1,"query":"a","query":"b","lexical_query":"x"}"#
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -115,7 +123,10 @@ fn ranking_preserves_identity_and_lexical_scores_with_deterministic_ties() -> Re
     let original = (0..4).map(hit).collect::<Vec<_>>();
     let ranked = rank(original.clone(), vec![-1.0, 0.75, 0.75, 0.0], 3)?;
     assert_eq!(
-        ranked.iter().map(|hit| hit["lexical_rank"].as_u64().unwrap()).collect::<Vec<_>>(),
+        ranked
+            .iter()
+            .map(|hit| hit["lexical_rank"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         [2, 3, 4]
     );
     for (result, original_index) in ranked.iter().zip([1, 2, 3]) {
@@ -220,7 +231,10 @@ fn missing_model_fails_explicitly_without_breaking_the_retained_lexical_reader()
     for attempt in 1..=2 {
         let (reply, _) = session.handle(request(refine_request()));
         assert!(!reply.ok);
-        assert!(reply.result.is_none(), "do not turn lexical scores into reranking scores");
+        assert!(
+            reply.result.is_none(),
+            "do not turn lexical scores into reranking scores"
+        );
         assert_eq!(reply.error.unwrap().kind, "refinement_failed");
         assert_eq!(session.refiner.load_attempts, attempt);
         assert!(!session.refiner.loaded());
@@ -231,7 +245,11 @@ fn missing_model_fails_explicitly_without_breaking_the_retained_lexical_reader()
     assert!(reply.ok);
     assert_eq!(reply.result.unwrap()["count"], 2);
     assert_eq!(session.successful_opens, 1);
-    assert_eq!(std::fs::read_dir(model_dir)?.count(), 0, "no download or model repair");
+    assert_eq!(
+        std::fs::read_dir(model_dir)?.count(),
+        0,
+        "no download or model repair"
+    );
     Ok(())
 }
 
@@ -244,7 +262,11 @@ fn native_refinement_reuses_real_model_and_reader_without_global_semantic_assets
     let mut writer = TantivyIndex::open_or_create(&index)?;
     writer.add_prebuilt_documents_slice(&[
         document(41, "planet Mars is known as the red planet", "local"),
-        document(42, "planet themed cupcakes are served at the bakery", "work-laptop"),
+        document(
+            42,
+            "planet themed cupcakes are served at the bakery",
+            "work-laptop",
+        ),
     ])?;
     writer.commit()?;
     drop(writer);

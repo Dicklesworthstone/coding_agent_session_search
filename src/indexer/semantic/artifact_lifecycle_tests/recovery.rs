@@ -55,7 +55,9 @@ fn killed_process_releases_lease_and_next_backfill_recovers_its_scratch() -> Res
     let current = checkpoint(&indexer, data, &mut manifest)?;
     let current_bytes = fs::read(&current)?;
     let helper = concat!(module_path!(), "::interrupted_backfill_child");
-    let (_, filter) = helper.split_once("::").context("test module has no crate")?;
+    let (_, filter) = helper
+        .split_once("::")
+        .context("test module has no crate")?;
     let mut child = KillOnDrop(
         Command::new(std::env::current_exe()?)
             .arg("--exact")
@@ -100,7 +102,10 @@ fn killed_process_releases_lease_and_next_backfill_recovers_its_scratch() -> Res
     });
     assert!(error.is_err());
     assert_eq!(VectorIndex::open_read_only(&current)?.record_count(), 1);
-    assert_eq!(VectorIndex::open_read_only(&live.index_path)?.record_count(), 3);
+    assert_eq!(
+        VectorIndex::open_read_only(&live.index_path)?.record_count(),
+        3
+    );
     Ok(())
 }
 
@@ -132,7 +137,10 @@ fn shard_references_protect_staging_names_and_containing_reuse_directories() -> 
     let before = fs::read(&named_live)?;
     let ann_before = fs::read(&ann)?;
     let mut shards = SemanticShardManifest::load(data)?.unwrap();
-    shards.shards[0].index_path = named_live.strip_prefix(data)?.to_string_lossy().into_owned();
+    shards.shards[0].index_path = named_live
+        .strip_prefix(data)?
+        .to_string_lossy()
+        .into_owned();
     shards.shards[0].ann_index_path = Some(ann.strip_prefix(data)?.to_string_lossy().into_owned());
     shards.shards[0].ready = false;
     shards.shards[0].ann_ready = false;
@@ -223,7 +231,10 @@ fn recovery_does_not_follow_scratch_symlinks_or_delete_manifest_alias_targets() 
     assert!(!staging.exists() && !reuse.exists());
     assert_eq!(fs::read(&target)?, before);
     assert_eq!(VectorIndex::open_read_only(&alias)?.record_count(), 3);
-    assert_eq!(fs::read(outside.path().join("live"))?, b"external live data");
+    assert_eq!(
+        fs::read(outside.path().join("live"))?,
+        b"external live data"
+    );
     assert!(link.is_symlink() && file_link.is_symlink() && dangling.is_symlink());
     assert_eq!(fs::read(wal_path_for(&file_link))?, b"linked sidecar");
     Ok(())

@@ -426,9 +426,7 @@ mod tests {
         // shared allowance is 32 graph calls. Neither 8 nor 32 candidates
         // reaches the selected source behind 40 unrelated messages.
         let artifacts = (1..=17)
-            .map(|message| {
-                selective_shard(dir.path(), &format!("budget-{message}"), message, 0.8)
-            })
+            .map(|message| selective_shard(dir.path(), &format!("budget-{message}"), message, 0.8))
             .collect();
         let context = recovery_context(Arc::new(artifacts));
         let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
@@ -444,7 +442,10 @@ mod tests {
         // Exact recovery retains the hydration overfetch window, unlike the
         // bounded native page. Preserve the entire exact candidate cohort.
         assert_eq!(hits.len(), 8);
-        assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
+        assert_eq!(
+            retry.has_more_candidates,
+            expected_retry.has_more_candidates
+        );
         assert!(!retry.exact_window_may_omit_competitor);
         let stats = stats.unwrap();
         assert_eq!(stats.index_size, 17 * 41);
@@ -515,7 +516,10 @@ mod tests {
                 .search_with_exact_fallback(&context, &[1.0, 0.0], 1, None)
                 .unwrap();
             assert_eq!(ids(&hits), vec![1]);
-            assert!(retry.has_more_candidates, "two eligible messages were omitted");
+            assert!(
+                retry.has_more_candidates,
+                "two eligible messages were omitted"
+            );
             let stats = stats.unwrap();
             assert_eq!(stats.k_requested, 3, "one exhaustive native pass is enough");
             assert!(stats.exact_fallback.is_none());
@@ -940,7 +944,10 @@ mod tests {
             };
             assert_eq!(ids(&hits), vec![2, 1]);
             assert_eq!(signature(&hits), signature(&expected));
-            assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
+            assert_eq!(
+                retry.has_more_candidates,
+                expected_retry.has_more_candidates
+            );
             assert_eq!(
                 retry.exact_window_may_omit_competitor,
                 expected_retry.exact_window_may_omit_competitor
@@ -949,7 +956,10 @@ mod tests {
             assert!(!stats.is_approximate);
             assert_eq!(stats.estimated_recall, 0.0);
             assert_eq!(stats.index_size, failed_shard * 41);
-            assert_eq!(stats.k_requested, failed_shard * 2 * ANN_CANDIDATE_MULTIPLIER);
+            assert_eq!(
+                stats.k_requested,
+                failed_shard * 2 * ANN_CANDIDATE_MULTIPLIER
+            );
             let receipt = stats.exact_fallback.as_ref().unwrap();
             assert_eq!(receipt.reason, AnnExactFallbackReason::NativeSearchFailed);
             assert_eq!(receipt.shard_count, 2);

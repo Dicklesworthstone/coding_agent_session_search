@@ -16,6 +16,138 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_multi_connector", test_name)
 }
 
+/// GH #423: Codebuff and Freebuff share one Manicode store with no per-chat
+/// writer marker, so their history indexes under the `codebuff` lineage,
+/// attributed to the run state's project root. The records follow FAD's
+/// source-schema fixtures (public TypeScript persistence schema), not captured
+/// native app history.
+#[test]
+fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
+    use serde_json::{Value, json};
+    use std::time::{Duration, SystemTime};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let project = home.join(".config/manicode/projects/demo");
+    let chat = project.join("chats/2026-09-01T12-00-00.000Z");
+    std::fs::create_dir_all(&chat).unwrap();
+    let transcript = chat.join("chat-messages.json");
+    let write_transcript = |answer: &str, modified: SystemTime| {
+        let records = json!([
+            {"id":"user-native-1", "variant":"user", "content":"codebuffneedle how do I pin the toolchain",
+             "timestamp":"2026-09-01T12:00:00.000Z"},
+            {"id":"ai-native-2", "variant":"ai", "content": answer,
+             "timestamp":"2026-09-01T12:00:05.000Z"}
+        ]);
+        std::fs::write(&transcript, serde_json::to_vec(&records).unwrap()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    };
+    let start = SystemTime::now() - Duration::from_secs(3600);
+    write_transcript("pin it in rust-toolchain.toml", start);
+    std::fs::write(
+        chat.join("run-state.json"),
+        serde_json::to_vec(&json!({
+            "sessionState": {"fileContext": {"projectRoot": "/work/codebuff-demo", "cwd": "/work/codebuff-demo"}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Negative: JSON outside a chats/<id>/chat-messages.json slot is not history.
+    std::fs::write(
+        project.join("notes.json"),
+        br#"[{"id":"stray","variant":"user","content":"codebuffstray"}]"#,
+    )
+    .unwrap();
+
+    let command = || {
+        let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home)
+            .timeout(Duration::from_secs(180));
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command
+    };
+    let search = |needle: &str| -> Vec<Value> {
+        let output = command()
+            .args([
+                "search",
+                needle,
+                "--agent",
+                "codebuff",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--timeout",
+                "10000",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        result["hits"].as_array().cloned().unwrap_or_default()
+    };
+    let messages = || -> i64 {
+        let output = command()
+            .args(["stats", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&output).unwrap()["messages"]
+            .as_i64()
+            .unwrap()
+    };
+
+    command()
+        .args(["index", "--full", "--json"])
+        .assert()
+        .success();
+    let hits = search("codebuffneedle");
+    assert!(!hits.is_empty(), "codebuff history must be searchable");
+    for hit in &hits {
+        assert_eq!(hit["agent"], "codebuff", "{hit}");
+        assert_eq!(hit["workspace"], "/work/codebuff-demo", "{hit}");
+    }
+    assert!(
+        search("codebuffstray").is_empty(),
+        "stray JSON must not index"
+    );
+    assert_eq!(messages(), 2);
+
+    // An edited native message updates in place instead of duplicating.
+    write_transcript(
+        "revised codebuffrevision answer",
+        start + Duration::from_secs(600),
+    );
+    command().args(["index", "--json"]).assert().success();
+    assert_eq!(search("codebuffrevision").len(), 1);
+    assert_eq!(messages(), 2, "a native-ID edit must not append a message");
+}
+
 /// Generated rolling windows use the reporter-confirmed Grok Bot 0.44.0
 /// envelope and chat fields (GH447 comment 5592555144). They exercise CASS
 /// ingestion, not a live macOS application or complete cloud history.

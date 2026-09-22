@@ -23,7 +23,10 @@ fn table() -> Table {
 }
 
 fn archive(header: Header, values: Vec<Cell>) -> Vec<u8> {
-    let mut bytes = encode(&Record::Header { header: header.clone() }).unwrap();
+    let mut bytes = encode(&Record::Header {
+        header: header.clone(),
+    })
+    .unwrap();
     let mut validator = Validator::new(header).unwrap();
     bytes.extend(validator.push(&Record::Table { table: table() }).unwrap());
     bytes.extend(validator.push(&Record::Row { values }).unwrap());
@@ -33,7 +36,10 @@ fn archive(header: Header, values: Vec<Cell>) -> Vec<u8> {
 }
 
 fn valid() -> Vec<u8> {
-    archive(header(), vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())])
+    archive(
+        header(),
+        vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())],
+    )
 }
 
 #[test]
@@ -47,8 +53,10 @@ fn complete_archive_round_trips_and_preserves_unicode() {
     let mut reader = Cursor::new(bytes);
     read_record(&mut reader, 1).unwrap();
     read_record(&mut reader, 2).unwrap();
-    assert!(matches!(read_record(&mut reader, 3).unwrap(), Some(Record::Row { values })
-        if values == vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())]));
+    assert!(
+        matches!(read_record(&mut reader, 3).unwrap(), Some(Record::Row { values })
+        if values == vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())])
+    );
 }
 
 #[test]
@@ -62,33 +70,46 @@ fn digest_is_timestamp_independent_but_binds_identity_and_content() {
     let mut foreign = header();
     foreign.archive_id = "other".to_owned();
     assert_ne!(original, digest(archive(foreign, values)));
-    assert_ne!(original, digest(archive(header(), vec![Cell::Integer(7), Cell::Null])));
+    assert_ne!(
+        original,
+        digest(archive(header(), vec![Cell::Integer(7), Cell::Null]))
+    );
 }
 
 #[test]
 fn digest_is_independent_of_input_json_whitespace_and_key_order() {
     let original = valid();
-    let reordered = original.split_inclusive(|b| *b == b'\n').flat_map(|line| {
-        let value: serde_json::Value = serde_json::from_slice(line).unwrap();
-        let mut bytes = serde_json::to_vec(&value).unwrap();
-        bytes.push(b'\n');
-        bytes
-    }).collect::<Vec<_>>();
-    assert_eq!(verify(&mut Cursor::new(original)).unwrap(), verify(&mut Cursor::new(reordered)).unwrap());
+    let reordered = original
+        .split_inclusive(|b| *b == b'\n')
+        .flat_map(|line| {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            bytes.push(b'\n');
+            bytes
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verify(&mut Cursor::new(original)).unwrap(),
+        verify(&mut Cursor::new(reordered)).unwrap()
+    );
 }
 
 #[test]
 fn every_truncated_prefix_is_rejected() {
     let bytes = valid();
     for end in 0..bytes.len() {
-        assert!(verify(&mut Cursor::new(&bytes[..end])).is_err(), "accepted prefix {end}");
+        assert!(
+            verify(&mut Cursor::new(&bytes[..end])).is_err(),
+            "accepted prefix {end}"
+        );
     }
 }
 
 #[test]
 fn completion_counts_digest_and_trailing_records_are_checked() {
     for field in ["records", "tables", "content_sha256"] {
-        let mut records = valid().split_inclusive(|b| *b == b'\n')
+        let mut records = valid()
+            .split_inclusive(|b| *b == b'\n')
             .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         let completion = &mut records.last_mut().unwrap()["completion"];
@@ -97,11 +118,14 @@ fn completion_counts_digest_and_trailing_records_are_checked() {
             "tables" => completion[field]["messages"] = 2.into(),
             _ => completion[field] = "0".repeat(64).into(),
         }
-        let bytes = records.into_iter().flat_map(|record| {
-            let mut bytes = serde_json::to_vec(&record).unwrap();
-            bytes.push(b'\n');
-            bytes
-        }).collect::<Vec<_>>();
+        let bytes = records
+            .into_iter()
+            .flat_map(|record| {
+                let mut bytes = serde_json::to_vec(&record).unwrap();
+                bytes.push(b'\n');
+                bytes
+            })
+            .collect::<Vec<_>>();
         assert!(verify(&mut Cursor::new(bytes)).is_err());
     }
     let mut bytes = valid();
@@ -127,8 +151,18 @@ fn duplicate_and_out_of_order_identities_are_rejected() {
     for id in [6, 7] {
         let mut validator = Validator::new(header()).unwrap();
         validator.push(&Record::Table { table: table() }).unwrap();
-        validator.push(&Record::Row { values: vec![Cell::Integer(7), Cell::Null] }).unwrap();
-        assert!(validator.push(&Record::Row { values: vec![Cell::Integer(id), Cell::Null] }).is_err());
+        validator
+            .push(&Record::Row {
+                values: vec![Cell::Integer(7), Cell::Null],
+            })
+            .unwrap();
+        assert!(
+            validator
+                .push(&Record::Row {
+                    values: vec![Cell::Integer(id), Cell::Null]
+                })
+                .is_err()
+        );
     }
     let mut validator = Validator::new(header()).unwrap();
     validator.push(&Record::Table { table: table() }).unwrap();
@@ -137,26 +171,44 @@ fn duplicate_and_out_of_order_identities_are_rejected() {
 
 #[test]
 fn exact_record_boundary_includes_the_newline() {
-    let overhead = encode(&Record::Row { values: vec![Cell::Text(String::new())] }).unwrap().len();
-    let at_limit = Record::Row { values: vec![Cell::Text("x".repeat(MAX_RECORD_BYTES - overhead))] };
+    let overhead = encode(&Record::Row {
+        values: vec![Cell::Text(String::new())],
+    })
+    .unwrap()
+    .len();
+    let at_limit = Record::Row {
+        values: vec![Cell::Text("x".repeat(MAX_RECORD_BYTES - overhead))],
+    };
     let bytes = encode(&at_limit).unwrap();
     assert_eq!(bytes.len(), MAX_RECORD_BYTES);
-    assert_eq!(read_record(&mut Cursor::new(bytes), 1).unwrap(), Some(at_limit));
-    let over_limit = Record::Row { values: vec![Cell::Text("x".repeat(MAX_RECORD_BYTES - overhead + 1))] };
+    assert_eq!(
+        read_record(&mut Cursor::new(bytes), 1).unwrap(),
+        Some(at_limit)
+    );
+    let over_limit = Record::Row {
+        values: vec![Cell::Text("x".repeat(MAX_RECORD_BYTES - overhead + 1))],
+    };
     assert!(encode(&over_limit).is_err());
 }
 
 #[test]
 fn an_unterminated_oversized_stream_is_stopped_before_unbounded_reading() {
     let mut reader = BufReader::with_capacity(1024, std::io::repeat(b'x').take(u64::MAX));
-    assert!(read_record(&mut reader, 99).unwrap_err().to_string().contains("99"));
+    assert!(
+        read_record(&mut reader, 99)
+            .unwrap_err()
+            .to_string()
+            .contains("99")
+    );
 }
 
 #[test]
 fn malformed_errors_do_not_echo_private_bodies() {
     let secret = "PRIVATE_SESSION_SECRET";
     let bytes = format!("{{\"type\":\"{secret}\"}}\n");
-    let error = read_record(&mut Cursor::new(bytes), 12).unwrap_err().to_string();
+    let error = read_record(&mut Cursor::new(bytes), 12)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("12"));
     assert!(!error.contains(secret));
     assert!(read_record(&mut Cursor::new(b"\xff\n"), 1).is_err());
@@ -171,7 +223,12 @@ fn numeric_and_blob_encodings_are_lossless_and_strict() {
         let roundtrip: Cell = serde_json::from_slice(&serde_json::to_vec(&cell).unwrap()).unwrap();
         assert_eq!(cell, roundtrip);
     }
-    for invalid in ["NaN", "7ff0000000000000", "7ff8000000000000", "ABCDEF0000000000"] {
+    for invalid in [
+        "NaN",
+        "7ff0000000000000",
+        "7ff8000000000000",
+        "ABCDEF0000000000",
+    ] {
         assert!(Cell::Real(invalid.to_owned()).validate().is_err());
     }
     assert!(Cell::Blob("AAH/".to_owned()).validate().is_ok());
@@ -192,8 +249,20 @@ fn invalid_descriptors_and_row_shapes_fail_closed() {
     let mut validator = Validator::new(header()).unwrap();
     assert!(validator.push(&Record::Row { values: vec![] }).is_err());
     validator.push(&Record::Table { table: table() }).unwrap();
-    assert!(validator.push(&Record::Row { values: vec![Cell::Integer(1)] }).is_err());
-    assert!(validator.push(&Record::Row { values: vec![Cell::Null, Cell::Null] }).is_err());
+    assert!(
+        validator
+            .push(&Record::Row {
+                values: vec![Cell::Integer(1)]
+            })
+            .is_err()
+    );
+    assert!(
+        validator
+            .push(&Record::Row {
+                values: vec![Cell::Null, Cell::Null]
+            })
+            .is_err()
+    );
 }
 
 #[test]
@@ -201,7 +270,13 @@ fn digest_matches_independent_sha256_wire_fixture() {
     let mut fixture = header();
     fixture.archive_id = "oracle".to_owned();
     fixture.exported_at_ms = 0;
-    let bytes = archive(fixture, vec![Cell::Integer(7), Cell::Text("hello".to_owned())]);
+    let bytes = archive(
+        fixture,
+        vec![Cell::Integer(7), Cell::Text("hello".to_owned())],
+    );
     let (_, completion) = verify(&mut Cursor::new(bytes)).unwrap();
-    assert_eq!(completion.content_sha256, "9b661100473f2d708f17f7d77abf4f80261c77b4c9066f545545d9fc9ccf03d2");
+    assert_eq!(
+        completion.content_sha256,
+        "9b661100473f2d708f17f7d77abf4f80261c77b4c9066f545545d9fc9ccf03d2"
+    );
 }

@@ -43,7 +43,11 @@ fn snapshot(root: &Path) -> anyhow::Result<BTreeMap<PathBuf, Vec<u8>>> {
 
 fn run_child(root: &Path, mode: &str, exclusions: &str) -> anyhow::Result<()> {
     let output = Command::new(std::env::current_exe()?)
-        .args(["--exact", "raw_mirror::exclusions::tests::child", "--nocapture"])
+        .args([
+            "--exact",
+            "raw_mirror::exclusions::tests::child",
+            "--nocapture",
+        ])
         .current_dir(root)
         .env(CHILD_ROOT, root)
         .env(CHILD_MODE, mode)
@@ -91,7 +95,9 @@ fn file_and_directory_exclusions_preserve_prefix_siblings() -> anyhow::Result<()
     let value = format!(
         " , {} ,\r\n {} \n, ",
         root.path().join(".codex/sessions/private").display(),
-        root.path().join(".codex/archived_sessions/rollout-hidden.json").display(),
+        root.path()
+            .join(".codex/archived_sessions/rollout-hidden.json")
+            .display(),
     );
     run_child(root.path(), "mixed", &value)
 }
@@ -181,9 +187,13 @@ fn assert_excluded(data: &Path, source: &Path) -> anyhow::Result<()> {
     for provider in ["codex", "claude"] {
         let error = capture_source_file(input(data, source, provider)).unwrap_err();
         assert!(error.downcast_ref::<RawMirrorSourceExcluded>().is_some());
-        assert!(!error.to_string().contains(source.to_string_lossy().as_ref()));
-        let error = capture_source_file_with_chunk_policy(input(data, source, provider), 1, 7)
-            .unwrap_err();
+        assert!(
+            !error
+                .to_string()
+                .contains(source.to_string_lossy().as_ref())
+        );
+        let error =
+            capture_source_file_with_chunk_policy(input(data, source, provider), 1, 7).unwrap_err();
         assert!(error.downcast_ref::<RawMirrorSourceExcluded>().is_some());
     }
     Ok(())

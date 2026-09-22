@@ -75,12 +75,19 @@ fn run(storage: &FrankenStorage, data: &Path) -> Result<SemanticBackfillBatchOut
 
 fn vectors(path: &Path) -> Result<BTreeMap<String, Vec<u32>>> {
     let reader = VectorIndex::open_read_only(path)?;
-    ensure!(reader.wal_record_count() == 0, "reconciled fixture must be compacted");
+    ensure!(
+        reader.wal_record_count() == 0,
+        "reconciled fixture must be compacted"
+    );
     let mut result = BTreeMap::new();
     for record in 0..reader.record_count() {
         let prior = result.insert(
             reader.doc_id_at(record)?.to_owned(),
-            reader.vector_at_f32(record)?.iter().map(|value| value.to_bits()).collect(),
+            reader
+                .vector_at_f32(record)?
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
         );
         ensure!(prior.is_none(), "duplicate vector identity");
     }
@@ -93,13 +100,19 @@ fn assert_scratch(data: &Path, checkpoint: Option<&Path>) -> Result<()> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        assert!(!name.starts_with(".backfill-reuse-"), "reuse scratch leaked: {name}");
+        assert!(
+            !name.starts_with(".backfill-reuse-"),
+            "reuse scratch leaked: {name}"
+        );
         if name.starts_with(".staging-") {
             stages.insert(entry.path());
         }
     }
     let expected: BTreeSet<PathBuf> = checkpoint.into_iter().map(Path::to_path_buf).collect();
-    assert_eq!(stages, expected, "only the current compacted checkpoint may remain");
+    assert_eq!(
+        stages, expected,
+        "only the current compacted checkpoint may remain"
+    );
     assert!(plan_backfill_artifacts(data)?.candidates.is_empty());
     Ok(())
 }
@@ -149,14 +162,20 @@ fn capped_storage_rollover_reuses_vectors_retires_prior_checkpoints_and_preserve
     let (abandoned, reuse) = abandoned_snapshot(data, &live.index_path)?;
     let second = run(&storage, data)?;
     assert!(second.checkpoint_saved && !second.published);
-    assert_eq!(second.embedded_docs, 1, "only the appended turn spends this pass's cap");
+    assert_eq!(
+        second.embedded_docs, 1,
+        "only the appended turn spends this pass's cap"
+    );
     assert_ne!(first.index_path, second.index_path);
     assert!(!first.index_path.exists() && !wal_path_for(&first.index_path).exists());
     assert!(!abandoned.exists() && !reuse.exists());
     assert_scratch(data, Some(&second.index_path))?;
     let saved = SemanticManifest::load(data)?.context("durable manifest")?;
     assert_eq!(saved.checkpoint.as_ref().unwrap().docs_embedded, 3);
-    assert_eq!(checkpoint_path(data, saved.checkpoint.as_ref().unwrap()), second.index_path);
+    assert_eq!(
+        checkpoint_path(data, saved.checkpoint.as_ref().unwrap()),
+        second.index_path
+    );
 
     // With no further ingest, the next checkpoint reuses the current pathname.
     let third = run(&storage, data)?;
@@ -165,9 +184,15 @@ fn capped_storage_rollover_reuses_vectors_retires_prior_checkpoints_and_preserve
     assert_eq!(third.index_path, second.index_path);
     assert_scratch(data, Some(&third.index_path))?;
     assert_eq!(fs::read(&live.index_path)?, live_bytes);
-    assert_eq!(old_hits, format!("{:?}", reader.search_top_k(&query, 10, None)?));
+    assert_eq!(
+        old_hits,
+        format!("{:?}", reader.search_top_k(&query, 10, None)?)
+    );
     let reopened = VectorIndex::open_read_only(&live.index_path)?;
-    assert_eq!(old_hits, format!("{:?}", reopened.search_top_k(&query, 10, None)?));
+    assert_eq!(
+        old_hits,
+        format!("{:?}", reopened.search_top_k(&query, 10, None)?)
+    );
     drop(reopened);
     drop(reader);
 
@@ -179,11 +204,17 @@ fn capped_storage_rollover_reuses_vectors_retires_prior_checkpoints_and_preserve
     assert_scratch(data, None)?;
     let actual = vectors(&done.index_path)?;
     let expected: BTreeSet<String> = packet_embedding_inputs_from_storage(&storage)?
-        .iter().filter_map(semantic_doc_id_for_input).collect();
+        .iter()
+        .filter_map(semantic_doc_id_for_input)
+        .collect();
     assert_eq!(actual.keys().cloned().collect::<BTreeSet<_>>(), expected);
     assert_eq!(actual.len(), 5);
     for (id, bits) in original_vectors {
-        assert_eq!(actual.get(&id), Some(&bits), "a retained vector was re-encoded");
+        assert_eq!(
+            actual.get(&id),
+            Some(&bits),
+            "a retained vector was re-encoded"
+        );
     }
     let saved = SemanticManifest::load(data)?.unwrap();
     assert!(saved.checkpoint.is_none());
@@ -214,7 +245,11 @@ fn rejected_storage_candidate_releases_reuse_scratch_without_changing_checkpoint
     // then the real storage reconciliation rejects its private reuse snapshot.
     let replacement = data.join("incompatible.fsvi");
     let mut writer = VectorIndex::create_with_revision(
-        &replacement, "fnv1a-384", "incompatible-revision", 384, Quantization::F16,
+        &replacement,
+        "fnv1a-384",
+        "incompatible-revision",
+        384,
+        Quantization::F16,
     )?;
     for id in vectors(&checkpoint.index_path)?.keys() {
         writer.write_record(id, &[0.25_f32; 384])?;

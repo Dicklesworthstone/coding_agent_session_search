@@ -13,6 +13,34 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+/// GH #489: `CASS_EXCLUDE_PATHS` is comma/newline-delimited, but a PATH-style
+/// list (`/a/x:/b/y`) is an easy mistake. It is parsed as one nonexistent path
+/// that excludes nothing, so the sources the operator meant to skip are still
+/// scanned. Name the entries that look like that. An entry only qualifies when
+/// every colon-separated piece is itself an absolute or home-relative path and
+/// the whole entry does not exist, so Windows drive paths (`C:\x`) and real
+/// names containing `:` never warn.
+pub(crate) fn colon_separated_exclusion_warning(value: &str) -> Option<String> {
+    let suspicious: Vec<&str> = value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|entry| {
+            let mut pieces = entry.split(':');
+            let looks_like_list = entry.contains(':')
+                && pieces.all(|piece| piece.starts_with('/') || piece.starts_with("~/"));
+            looks_like_list && !Path::new(entry).exists()
+        })
+        .collect();
+    (!suspicious.is_empty()).then(|| {
+        format!(
+            "CASS_EXCLUDE_PATHS separates entries with commas or newlines, not colons; \
+             these entries do not exist and exclude nothing: {}. Use a comma, e.g. {}",
+            suspicious.join(", "),
+            suspicious[0].replace(':', ",")
+        )
+    })
+}
+
 pub(crate) struct ScanExclusions {
     paths: Vec<PathBuf>,
     cwd: Option<PathBuf>,
@@ -34,8 +62,7 @@ impl ScanExclusions {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.invalid
-            || (self.cwd.is_none() && self.paths.iter().any(|path| path.is_relative()))
+        if self.invalid || (self.cwd.is_none() && self.paths.iter().any(|path| path.is_relative()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -126,7 +153,10 @@ fn resolve_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
         match std::fs::canonicalize(ancestor) {
             Ok(parent) => {
                 let suffix = path.strip_prefix(ancestor).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid exclusion path ancestry")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid exclusion path ancestry",
+                    )
                 })?;
                 let mut resolved = PathBuf::new();
                 for component in parent.join(suffix).components() {
@@ -247,7 +277,10 @@ mod tests {
         let root = tempfile::tempdir()?;
         fs::create_dir_all(root.path().join("actual/child"))?;
         fs::create_dir_all(root.path().join("actual/private"))?;
-        fs::write(root.path().join("actual/private/source.jsonl"), "private fixture")?;
+        fs::write(
+            root.path().join("actual/private/source.jsonl"),
+            "private fixture",
+        )?;
         symlink(root.path().join("actual/child"), root.path().join("entry"))?;
         let exclusions = policy(root.path(), "actual/private");
         assert!(exclusions.excludes(&root.path().join("entry/../private/source.jsonl")));
@@ -274,6 +307,45 @@ mod tests {
         symlink(&private, &replacement)?;
         fs::rename(replacement, &alias)?;
         assert!(exclusions.excludes(&alias.join("source.jsonl")));
+        Ok(())
+    }
+
+    #[test]
+    fn colon_separated_exclusions_are_named_with_a_comma_suggestion() {
+        let warning = colon_separated_exclusion_warning(
+            "/data/old-codex/a.jsonl:/data/old-codex/b.jsonl,~/x:~/y",
+        )
+        .expect("PATH-style lists must warn");
+        assert!(warning.contains("/data/old-codex/a.jsonl:/data/old-codex/b.jsonl"));
+        assert!(warning.contains("~/x:~/y"));
+        assert!(warning.contains("/data/old-codex/a.jsonl,/data/old-codex/b.jsonl"));
+        // The parsed policy really does treat the colon list as one path.
+        assert_eq!(
+            ScanExclusions::parse_in("/a/x:/b/y", None).paths,
+            [PathBuf::from("/a/x:/b/y")]
+        );
+    }
+
+    #[test]
+    fn well_formed_and_drive_style_exclusions_do_not_warn() -> io::Result<()> {
+        assert_eq!(colon_separated_exclusion_warning(""), None);
+        assert_eq!(colon_separated_exclusion_warning("/a/x,/b/y\n~/z"), None);
+        // Windows drive paths and a relative piece are not colon-separated lists.
+        assert_eq!(
+            colon_separated_exclusion_warning(r"C:\Users\me\.codex"),
+            None
+        );
+        assert_eq!(colon_separated_exclusion_warning("/a/x:relative"), None);
+        // A real path whose name contains ':' exists, so it is not a mistake.
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir()?;
+            let odd = root.path().join("a:");
+            fs::create_dir(&odd)?;
+            let entry = format!("{}/b", odd.display());
+            fs::create_dir(&entry)?;
+            assert_eq!(colon_separated_exclusion_warning(&entry), None);
+        }
         Ok(())
     }
 }

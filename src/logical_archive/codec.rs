@@ -32,22 +32,40 @@ pub struct Header {
 impl Header {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.format == FORMAT, "unknown logical archive format");
-        ensure!(self.schema_version == VERSION, "unsupported logical archive version");
+        ensure!(
+            self.schema_version == VERSION,
+            "unsupported logical archive version"
+        );
         ensure!(
             !self.archive_id.is_empty()
                 && self.archive_id.len() <= 128
-                && self.archive_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+                && self
+                    .archive_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
             "archive identity must contain 1 to 128 ASCII letters, digits, hyphens or underscores"
         );
         ensure!(
             !self.storage_schema_version.is_empty()
                 && self.storage_schema_version.len() <= 16
-                && self.storage_schema_version.bytes().all(|b| b.is_ascii_digit()),
+                && self
+                    .storage_schema_version
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()),
             "invalid canonical storage schema version"
         );
-        ensure!(self.record_types == ["table", "row", "completion"], "unsupported record types");
-        ensure!(self.contains_private_data, "redacted archives are not lossless restoration inputs");
-        ensure!(self.omissions == ["derived_search_assets"], "unsupported archive omissions");
+        ensure!(
+            self.record_types == ["table", "row", "completion"],
+            "unsupported record types"
+        );
+        ensure!(
+            self.contains_private_data,
+            "redacted archives are not lossless restoration inputs"
+        );
+        ensure!(
+            self.omissions == ["derived_search_assets"],
+            "unsupported archive omissions"
+        );
         Ok(())
     }
 }
@@ -70,12 +88,21 @@ impl Table {
         );
         let mut columns = std::collections::BTreeSet::new();
         for column in &self.columns {
-            ensure!(identifier(column) && columns.insert(column), "invalid or duplicate logical column");
+            ensure!(
+                identifier(column) && columns.insert(column),
+                "invalid or duplicate logical column"
+            );
         }
-        ensure!(!self.primary_key.is_empty(), "logical tables require a declared primary key");
+        ensure!(
+            !self.primary_key.is_empty(),
+            "logical tables require a declared primary key"
+        );
         let mut keys = std::collections::BTreeSet::new();
         for &key in &self.primary_key {
-            ensure!(key < self.columns.len() && keys.insert(key), "invalid logical primary key");
+            ensure!(
+                key < self.columns.len() && keys.insert(key),
+                "invalid logical primary key"
+            );
         }
         Ok(())
     }
@@ -84,14 +111,21 @@ impl Table {
 pub fn identifier(value: &str) -> bool {
     let mut bytes = value.bytes();
     value.len() <= 128
-        && bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// REAL is an exact, lowercase IEEE-754 binary64 bit string; JSON's number
 /// rounding cannot change a restored value. Integers remain signed 64-bit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Cell {
     Null,
     Integer(i64),
@@ -104,13 +138,25 @@ impl Cell {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Real(bits) => {
-                ensure!(bits.len() == 16 && bits.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "invalid REAL encoding");
-                let bits = u64::from_str_radix(bits, 16).map_err(|_| anyhow!("invalid REAL encoding"))?;
-                ensure!(f64::from_bits(bits).is_finite(), "non-finite REAL is not portable");
+                ensure!(
+                    bits.len() == 16
+                        && bits
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "invalid REAL encoding"
+                );
+                let bits =
+                    u64::from_str_radix(bits, 16).map_err(|_| anyhow!("invalid REAL encoding"))?;
+                ensure!(
+                    f64::from_bits(bits).is_finite(),
+                    "non-finite REAL is not portable"
+                );
             }
             Self::Blob(encoded) => {
                 ensure!(encoded.len() <= MAX_RECORD_BYTES, "oversized BLOB encoding");
-                STANDARD.decode(encoded).map_err(|_| anyhow!("invalid BLOB encoding"))?;
+                STANDARD
+                    .decode(encoded)
+                    .map_err(|_| anyhow!("invalid BLOB encoding"))?;
             }
             _ => {}
         }
@@ -172,17 +218,26 @@ pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record
             Err(_) => bail!("cannot read logical archive at record {line}"),
         };
         if available.is_empty() {
-            ensure!(bytes.is_empty(), "unterminated logical archive record {line}");
+            ensure!(
+                bytes.is_empty(),
+                "unterminated logical archive record {line}"
+            );
             return Ok(None);
         }
         let newline = available.iter().position(|&byte| byte == b'\n');
         let take = newline.map_or(available.len(), |position| position + 1);
-        ensure!(take <= MAX_RECORD_BYTES.saturating_sub(bytes.len()), "logical archive record {line} exceeds 8 MiB");
+        ensure!(
+            take <= MAX_RECORD_BYTES.saturating_sub(bytes.len()),
+            "logical archive record {line} exceeds 8 MiB"
+        );
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
         if newline.is_some() {
             let record = serde_json::from_slice(&bytes).map_err(|error| {
-                anyhow!("malformed logical archive record {line}, column {}", error.column())
+                anyhow!(
+                    "malformed logical archive record {line}, column {}",
+                    error.column()
+                )
             })?;
             return Ok(Some(record));
         }
@@ -191,23 +246,33 @@ pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record
 
 fn key(values: &[Cell], table: &Table) -> Result<Vec<KeyCell>> {
     let mut bytes = 0usize;
-    table.primary_key.iter().map(|&index| {
-        let cell = match &values[index] {
-            Cell::Integer(value) => KeyCell::Integer(*value),
-            Cell::Text(value) => {
-                bytes = bytes.saturating_add(value.len());
-                ensure!(bytes <= MAX_KEY_BYTES, "logical primary key exceeds 64 KiB");
-                KeyCell::Text(value.clone())
-            }
-            Cell::Blob(value) => {
-                bytes = bytes.saturating_add(value.len());
-                ensure!(bytes <= MAX_KEY_BYTES, "logical primary key exceeds 64 KiB");
-                KeyCell::Blob(STANDARD.decode(value).map_err(|_| anyhow!("invalid BLOB key"))?)
-            }
-            Cell::Null | Cell::Real(_) => bail!("logical primary keys must be non-null integers, text or blobs"),
-        };
-        Ok(cell)
-    }).collect()
+    table
+        .primary_key
+        .iter()
+        .map(|&index| {
+            let cell = match &values[index] {
+                Cell::Integer(value) => KeyCell::Integer(*value),
+                Cell::Text(value) => {
+                    bytes = bytes.saturating_add(value.len());
+                    ensure!(bytes <= MAX_KEY_BYTES, "logical primary key exceeds 64 KiB");
+                    KeyCell::Text(value.clone())
+                }
+                Cell::Blob(value) => {
+                    bytes = bytes.saturating_add(value.len());
+                    ensure!(bytes <= MAX_KEY_BYTES, "logical primary key exceeds 64 KiB");
+                    KeyCell::Blob(
+                        STANDARD
+                            .decode(value)
+                            .map_err(|_| anyhow!("invalid BLOB key"))?,
+                    )
+                }
+                Cell::Null | Cell::Real(_) => {
+                    bail!("logical primary keys must be non-null integers, text or blobs")
+                }
+            };
+            Ok(cell)
+        })
+        .collect()
 }
 
 // SQLite's storage-class ordering for the supported primary-key types, with
@@ -240,7 +305,15 @@ impl Validator {
         let mut digest = Sha256::new();
         digest.update(b"cass.logical_archive.v1\0");
         digest.update(encode(&Record::Header { header: identity })?);
-        Ok(Self { header, current: None, last_key: None, counts: BTreeMap::new(), rows: 0, digest, completed: false })
+        Ok(Self {
+            header,
+            current: None,
+            last_key: None,
+            counts: BTreeMap::new(),
+            rows: 0,
+            digest,
+            completed: false,
+        })
     }
 
     pub fn push(&mut self, record: &Record) -> Result<Vec<u8>> {
@@ -249,26 +322,58 @@ impl Validator {
             Record::Header { .. } => bail!("duplicate archive header"),
             Record::Table { table } => {
                 table.validate()?;
-                ensure!(self.counts.len() < MAX_TABLES, "logical archive exceeds 256 tables");
-                ensure!(self.current.as_ref().is_none_or(|previous| previous.name < table.name), "logical tables must be unique and ordered");
+                ensure!(
+                    self.counts.len() < MAX_TABLES,
+                    "logical archive exceeds 256 tables"
+                );
+                ensure!(
+                    self.current
+                        .as_ref()
+                        .is_none_or(|previous| previous.name < table.name),
+                    "logical tables must be unique and ordered"
+                );
                 self.counts.insert(table.name.clone(), 0);
                 self.current = Some(table.clone());
                 self.last_key = None;
             }
             Record::Row { values } => {
-                let table = self.current.as_ref().ok_or_else(|| anyhow!("row precedes its table"))?;
-                ensure!(values.len() == table.columns.len(), "logical row has the wrong column count");
-                for cell in values { cell.validate()?; }
+                let table = self
+                    .current
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("row precedes its table"))?;
+                ensure!(
+                    values.len() == table.columns.len(),
+                    "logical row has the wrong column count"
+                );
+                for cell in values {
+                    cell.validate()?;
+                }
                 let next_key = key(values, table)?;
-                ensure!(self.last_key.as_ref().is_none_or(|previous| *previous < next_key), "duplicate or unordered logical record identity");
+                ensure!(
+                    self.last_key
+                        .as_ref()
+                        .is_none_or(|previous| *previous < next_key),
+                    "duplicate or unordered logical record identity"
+                );
                 self.last_key = Some(next_key);
-                self.rows = self.rows.checked_add(1).ok_or_else(|| anyhow!("logical record count overflow"))?;
-                let count = self.counts.get_mut(&table.name).expect("current table has a counter");
-                *count = count.checked_add(1).ok_or_else(|| anyhow!("logical table count overflow"))?;
+                self.rows = self
+                    .rows
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("logical record count overflow"))?;
+                let count = self
+                    .counts
+                    .get_mut(&table.name)
+                    .expect("current table has a counter");
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("logical table count overflow"))?;
             }
             Record::Completion { completion } => {
                 ensure!(self.current.is_some(), "logical archive contains no tables");
-                ensure!(*completion == self.completion(), "logical archive completion count or digest mismatch");
+                ensure!(
+                    *completion == self.completion(),
+                    "logical archive completion count or digest mismatch"
+                );
                 self.completed = true;
                 return encode(record);
             }
@@ -279,11 +384,18 @@ impl Validator {
     }
 
     pub fn completion(&self) -> Completion {
-        Completion { records: self.rows, tables: self.counts.clone(), content_sha256: hex::encode(self.digest.clone().finalize()) }
+        Completion {
+            records: self.rows,
+            tables: self.counts.clone(),
+            content_sha256: hex::encode(self.digest.clone().finalize()),
+        }
     }
 
     pub fn finish(self) -> Result<(Header, Completion)> {
-        ensure!(self.completed, "logical archive is incomplete: completion record missing");
+        ensure!(
+            self.completed,
+            "logical archive is incomplete: completion record missing"
+        );
         let completion = self.completion();
         Ok((self.header, completion))
     }
@@ -296,8 +408,12 @@ pub fn verify(reader: &mut impl BufRead) -> Result<(Header, Completion)> {
     let mut validator = Validator::new(header)?;
     let mut line = 2u64;
     while let Some(record) = read_record(reader, line)? {
-        validator.push(&record).map_err(|error| anyhow!("record {line}: {error}"))?;
-        line = line.checked_add(1).ok_or_else(|| anyhow!("logical record position overflow"))?;
+        validator
+            .push(&record)
+            .map_err(|error| anyhow!("record {line}: {error}"))?;
+        line = line
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("logical record position overflow"))?;
     }
     validator.finish()
 }

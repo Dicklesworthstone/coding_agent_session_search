@@ -80,6 +80,7 @@ use crate::search::vector_index::{
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
+use crate::storage::sqlite::incompatible_legacy_fts_shadow_ddl;
 #[cfg(test)]
 use crate::storage::sqlite::{DailyStatsRebuildResult, StatsAggregator, StatsDelta};
 use crate::storage::sqlite::{
@@ -2871,6 +2872,11 @@ fn preflight_fts_shadow_before_lexical_readers(db_path: &Path) -> Result<()> {
             bound_messages,
         } = storage.fts_shadow_viability()?
         {
+            // Already retired by an earlier run: nothing to drop, and
+            // rewriting the markers would only churn the archive's WAL.
+            if storage.fts_shadow_retirement_is_recorded()? {
+                return Ok(());
+            }
             let detail = crate::storage::sqlite::fts_shadow_not_viable_detail(
                 corpus_messages,
                 bound_messages,
@@ -9285,7 +9291,10 @@ fn lexical_rebuild_resume_content_path(
     let scratch = staged_lexical_rebuild_scratch_path(index_path);
     if state.effective_execution_mode() == LexicalRebuildExecutionMode::StagedSingleIndex {
         let metadata = fs::symlink_metadata(&scratch).with_context(|| {
-            format!("checkpoint's staged lexical generation is unavailable: {}", scratch.display())
+            format!(
+                "checkpoint's staged lexical generation is unavailable: {}",
+                scratch.display()
+            )
         })?;
         anyhow::ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -9315,7 +9324,10 @@ fn lexical_rebuild_bound_candidate_is_missing(
         Ok(_) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error).with_context(|| {
-            format!("inspecting checkpoint's staged lexical generation {}", scratch.display())
+            format!(
+                "inspecting checkpoint's staged lexical generation {}",
+                scratch.display()
+            )
         }),
     }
 }
@@ -9337,8 +9349,7 @@ fn legacy_lexical_resume_lost_its_generation(
     // an unrelated prior generation after staging was lost. Replay safely
     // rather than using that ambiguity as permission to skip canonical rows.
     let current = index_meta_fingerprint(index_path)?;
-    Ok(state.committed_meta_fingerprint.is_none()
-        || current != state.committed_meta_fingerprint)
+    Ok(state.committed_meta_fingerprint.is_none() || current != state.committed_meta_fingerprint)
 }
 
 fn retain_missing_lexical_candidate_checkpoint(
@@ -10009,6 +10020,206 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
     Ok(expected_docs)
 }
 
+/// GH #461: sidecar next to the rebuild checkpoint memoizing the
+/// noise-adjusted expected doc count for one canonical content identity.
+const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
+const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 1;
+/// Recount in full after this many consecutive append deltas. The identity
+/// (like the lexical checkpoint fingerprint it extends) cannot see an in-place
+/// content edit of an existing row; this bounds how long such an edit can skew
+/// the expectation.
+const EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS: u32 = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ExpectedLexicalDocsIdentity {
+    total_conversations: usize,
+    max_conversation_id: i64,
+    max_message_id: i64,
+    total_messages: usize,
+    content_cap_bytes: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExpectedLexicalDocsCache {
+    schema_version: u32,
+    db_path: String,
+    identity: ExpectedLexicalDocsIdentity,
+    expected_docs: usize,
+    delta_generations: u32,
+}
+
+fn count_exact(storage: &FrankenStorage, sql: &str, bound: i64) -> Result<usize> {
+    let count: i64 = storage
+        .raw()
+        .query_row_map(sql, &[ParamValue::from(bound)], |row| row.get_typed(0))
+        .with_context(|| format!("counting rows for the expected lexical docs delta: {sql}"))?;
+    Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
+}
+
+fn expected_lexical_docs_identity(
+    storage: &FrankenStorage,
+    total_messages: usize,
+) -> Result<ExpectedLexicalDocsIdentity> {
+    let max_message_id: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COALESCE(MAX(id), 0) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .context("reading the max message id for the expected lexical docs identity")?;
+    Ok(ExpectedLexicalDocsIdentity {
+        total_conversations: count_total_conversations_exact(storage)?,
+        max_conversation_id: max_conversation_id_exact(storage)?.unwrap_or(0),
+        max_message_id,
+        total_messages,
+        // The same effective cap fetch_messages_for_lexical_rebuild applies.
+        content_cap_bytes: crate::storage::sqlite::lexical_max_conversation_content_bytes()
+            .min(i32::MAX as usize),
+    })
+}
+
+/// Extend a memoized expectation by the rows appended since it was taken,
+/// or `None` when the archive changed in any way an append cannot explain.
+///
+/// Sound only for pure appends: no conversation or message was deleted (both
+/// totals grew by exactly the rows beyond the memoized maxima), the content
+/// cap is unchanged, and within every touched conversation each new message
+/// sorts after all previously retained ones. The per-conversation cap is
+/// cumulative in `idx` order, so under those conditions the old messages'
+/// truncation, and therefore their noise classification, is unchanged, and
+/// only the new messages need classifying, exactly as the full scan would.
+fn expected_live_lexical_doc_count_delta(
+    storage: &FrankenStorage,
+    cached: &ExpectedLexicalDocsCache,
+    current: &ExpectedLexicalDocsIdentity,
+) -> Result<Option<usize>> {
+    let old = &cached.identity;
+    if old.content_cap_bytes != current.content_cap_bytes
+        || current.max_message_id < old.max_message_id
+        || current.max_conversation_id < old.max_conversation_id
+        || current.total_conversations < old.total_conversations
+        || current.total_messages < old.total_messages
+    {
+        return Ok(None);
+    }
+    let new_conversations = count_exact(
+        storage,
+        "SELECT COUNT(*) FROM conversations WHERE id > ?1",
+        old.max_conversation_id,
+    )?;
+    let new_messages = count_exact(
+        storage,
+        "SELECT COUNT(*) FROM messages WHERE id > ?1",
+        old.max_message_id,
+    )?;
+    if old.total_conversations.checked_add(new_conversations) != Some(current.total_conversations)
+        || old.total_messages.checked_add(new_messages) != Some(current.total_messages)
+    {
+        return Ok(None);
+    }
+    // Live conversations only, like the full scan (orphaned rows are never indexed).
+    let touched: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT DISTINCT m.conversation_id FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id WHERE m.id > ?1",
+            &[ParamValue::from(old.max_message_id)],
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
+        )
+        .context("listing conversations touched since the expected lexical docs memo")?;
+    let mut expected_docs = cached.expected_docs;
+    for conversation_id in touched {
+        let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
+        let is_new = |message: &crate::model::types::Message| {
+            message.id.is_none_or(|id| id > old.max_message_id)
+        };
+        let retained_max_idx = messages
+            .iter()
+            .filter(|message| !is_new(message))
+            .map(|message| message.idx)
+            .max();
+        for message in messages.iter().filter(|message| is_new(message)) {
+            if retained_max_idx.is_some_and(|max_idx| message.idx <= max_idx) {
+                // Inserted before retained messages: the cumulative cap may
+                // now truncate those differently. Only a full count is exact.
+                return Ok(None);
+            }
+            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+                expected_docs = expected_docs.saturating_add(1);
+            }
+        }
+    }
+    Ok(Some(expected_docs))
+}
+
+/// [`expected_live_lexical_doc_count`] without re-reading the whole archive on
+/// every run (GH #461). The full per-conversation content scan ran at index
+/// startup and again at the post-run checkpoint refresh on any archive whose
+/// sink drops tool-acks or empty messages, i.e. on essentially every
+/// incremental run; a 16 MB incremental run read 9.4 GB. The count is served
+/// from the sidecar when the canonical identity is unchanged, extended by an
+/// append-only delta when possible, and otherwise recomputed in full.
+/// The sidecar is best effort: a missing, foreign or unreadable one only
+/// costs the full scan it replaces.
+fn expected_live_lexical_doc_count_cached(
+    storage: &FrankenStorage,
+    index_path: &Path,
+    db_path: &str,
+    total_messages: usize,
+) -> Result<usize> {
+    let current = expected_lexical_docs_identity(storage, total_messages)?;
+    let cache_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
+    let cached = fs::read(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsCache>(&raw).ok())
+        .filter(|cached| {
+            cached.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
+                && lexical_rebuild_db_paths_match(&cached.db_path, db_path)
+        });
+    let (expected_docs, delta_generations, source) = match cached {
+        Some(cached) if cached.identity == current => {
+            return Ok(cached.expected_docs);
+        }
+        Some(cached) if cached.delta_generations < EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS => {
+            match expected_live_lexical_doc_count_delta(storage, &cached, &current)? {
+                Some(expected) => (expected, cached.delta_generations + 1, "delta"),
+                None => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+            }
+        }
+        _ => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+    };
+    tracing::debug!(
+        expected_lexical_docs = expected_docs,
+        source,
+        delta_generations,
+        "expected lexical doc count recomputed"
+    );
+    if index_path.is_dir() {
+        let payload = ExpectedLexicalDocsCache {
+            schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+            db_path: db_path.to_string(),
+            identity: current,
+            expected_docs,
+            delta_generations,
+        };
+        let tmp_path = index_path.join(format!(
+            "{EXPECTED_LEXICAL_DOCS_CACHE_FILE}.{}.tmp",
+            std::process::id()
+        ));
+        let written = serde_json::to_vec(&payload)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| fs::write(&tmp_path, bytes))
+            .and_then(|()| fs::rename(&tmp_path, &cache_path));
+        if let Err(err) = written {
+            tracing::debug!(error = %err, "expected lexical docs cache write skipped");
+            let _ = fs::remove_file(&tmp_path);
+        }
+    }
+    Ok(expected_docs)
+}
+
 fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
     let max_conversation_id: i64 = storage
         .raw()
@@ -10279,6 +10490,9 @@ fn should_skip_unchanged_explicit_watch_once_paths(
 
     let triggers = classify_paths(paths.clone(), roots, true);
     if triggers.is_empty() {
+        // The run ends here without reindexing, so this is the only place
+        // that can say why nothing was indexed.
+        warn_unclaimed_explicit_watch_once_paths(paths, roots);
         return Ok(true);
     }
 
@@ -12021,7 +12235,12 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     let expected_docs = if observed_tantivy_docs == total_messages {
         total_messages
     } else {
-        expected_live_lexical_doc_count(storage)?
+        expected_live_lexical_doc_count_cached(
+            storage,
+            index_path,
+            &db_state.db_path,
+            total_messages,
+        )?
     };
     if observed_tantivy_docs != expected_docs {
         tracing::debug!(
@@ -15659,6 +15878,11 @@ fn run_index_inner(
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
+    if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS").ok().and_then(|value| {
+        crate::connectors::codex::path_policy::colon_separated_exclusion_warning(&value)
+    }) {
+        tracing::warn!("{warning}");
+    }
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
@@ -16805,7 +17029,12 @@ fn run_index_inner(
             // the scan stays watchdog-covered without a new taxonomy sub-phase.
             let expected_lexical_docs =
                 if observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages) {
-                    expected_live_lexical_doc_count(&storage)?
+                    expected_live_lexical_doc_count_cached(
+                        &storage,
+                        &index_path,
+                        &opts.db_path.to_string_lossy(),
+                        canonical_messages,
+                    )?
                 } else {
                     canonical_messages
                 };
@@ -20129,19 +20358,6 @@ fn archive_bundle_size_for_integrity_preflight(storage: &FrankenStorage) -> Opti
     // absent WAL/SHM as zero while preserving filename bytes.
     fs::metadata(&db_path).ok()?;
     Some(database_bundle_size_bytes(&db_path))
-}
-
-fn incompatible_legacy_fts_shadow_ddl(table: &str, ddl: &str) -> Option<String> {
-    let normalized = ddl
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    (!normalized.contains("withoutrowid")).then(|| {
-        format!(
-            "legacy {table} schema is not WITHOUT ROWID; this pre-fix FTS5 shadow shape can carry a stale implicit autoindex and must be rebuilt before full indexing"
-        )
-    })
 }
 
 /// Detect the exact legacy FTS5 shadow DDL behind GH #374 without walking the
@@ -24628,7 +24844,8 @@ fn rebuild_tantivy_from_db_with_options(
                 if lexical_rebuild_bound_candidate_is_missing(&index_path, &state)?
                     || legacy_lexical_resume_lost_its_generation(&index_path, &state)?
                 {
-                    let quarantine = retain_missing_lexical_candidate_checkpoint(&index_path, &state)?;
+                    let quarantine =
+                        retain_missing_lexical_candidate_checkpoint(&index_path, &state)?;
                     tracing::warn!(
                         checkpoint_path = %lexical_rebuild_state_path(&quarantine).display(),
                         missing_candidate = %staged_lexical_rebuild_scratch_path(&index_path).display(),
@@ -24689,7 +24906,11 @@ fn rebuild_tantivy_from_db_with_options(
         )
         .run("reuse_completed_generation", || {
             crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-            verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")?;
+            verify_published_lexical_doc_count(
+                &index_path,
+                rebuild_state.indexed_docs,
+                "completed",
+            )?;
             // A crash after the swap may leave the old generation parked.
             // Retain it without reopening the rebuild or swapping it back.
             recover_or_finalize_interrupted_lexical_publish_backup(&index_path)
@@ -24863,7 +25084,9 @@ fn rebuild_tantivy_from_db_with_options(
             let cause = format!("{error:#}");
             if staged_build_path.is_some() {
                 let quarantine = lexical_publish::quarantine_incomplete_candidate(&build_path)
-                    .with_context(|| format!("cannot retain unusable lexical candidate: {cause}"))?;
+                    .with_context(|| {
+                        format!("cannot retain unusable lexical candidate: {cause}")
+                    })?;
                 // Keep the exact cursor/accounting that could no longer be
                 // resumed alongside the untouched failed candidate files.
                 persist_lexical_rebuild_state(&quarantine, &rebuild_state)?;
@@ -24883,7 +25106,10 @@ fn rebuild_tantivy_from_db_with_options(
                 );
             }
             fs::create_dir(&scratch_path).with_context(|| {
-                format!("creating replacement lexical candidate {}", scratch_path.display())
+                format!(
+                    "creating replacement lexical candidate {}",
+                    scratch_path.display()
+                )
             })?;
             build_path = scratch_path.clone();
             staged_build_path = Some(scratch_path.clone());
@@ -25093,7 +25319,10 @@ fn rebuild_tantivy_from_db_with_options(
         // preflight) is not permission to erase the candidate. Leave it and its
         // checkpoint intact; a retry revalidates before initializing counters.
         let mut t_index = TantivyIndex::open_or_create(&build_path).with_context(|| {
-            format!("opening lexical rebuild writer {}; candidate retained", build_path.display())
+            format!(
+                "opening lexical rebuild writer {}; candidate retained",
+                build_path.display()
+            )
         })?;
         log_prep_step("open_tantivy", &mut prep_step_started);
 
@@ -25809,7 +26038,9 @@ fn rebuild_tantivy_from_db_with_options(
     // count after resume. Count once at completion while the readonly handle
     // is still open; fresh rebuilds already observed every canonical packet.
     let final_observed_messages = if resumed_from_checkpoint {
-        publication.run("count_canonical_messages", || count_total_messages_exact(&storage))?
+        publication.run("count_canonical_messages", || {
+            count_total_messages_exact(&storage)
+        })?
     } else {
         observed_messages.max(indexed_docs)
     };
@@ -28570,6 +28801,7 @@ impl ConnectorKind {
             "goose" => Some(Self::Goose),
             "crush" => Some(Self::Crush),
             "hermes" => Some(Self::Hermes),
+            "codebuff" => Some(Self::Codebuff),
             _ => None,
         }
     }
@@ -28607,6 +28839,7 @@ impl ConnectorKind {
             Self::Goose => "goose",
             Self::Crush => "crush",
             Self::Hermes => "hermes",
+            Self::Codebuff => "codebuff",
         }
     }
 
@@ -28645,6 +28878,7 @@ impl ConnectorKind {
             Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
+            Self::Codebuff => Box::new(franken_agent_detection::CodebuffConnector::new()),
         }
     }
 }
@@ -28986,13 +29220,14 @@ fn reindex_paths_with_semantic_delta(
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
-    let triggers = classify_paths(
-        paths,
-        roots,
-        opts.watch_once_paths
-            .as_ref()
-            .is_some_and(|paths| !paths.is_empty()),
-    );
+    let explicit = opts
+        .watch_once_paths
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty());
+    if explicit {
+        warn_unclaimed_explicit_watch_once_paths(&paths, roots);
+    }
+    let triggers = classify_paths(paths, roots, explicit);
     if triggers.is_empty() {
         return Ok(0);
     }
@@ -30033,6 +30268,9 @@ enum ConnectorKind {
     Crush,
     #[serde(rename = "hm", alias = "Hermes")]
     Hermes,
+    /// Shared Codebuff / Freebuff (Manicode) CLI history (GH #423).
+    #[serde(rename = "bf", alias = "Codebuff")]
+    Codebuff,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -30342,6 +30580,45 @@ fn explicit_watch_once_scan_path(
         path.to_path_buf()
     };
     std::fs::canonicalize(&scan_path).unwrap_or(scan_path)
+}
+
+/// GH #478: existing explicit `--watch-once` paths that no connector claims.
+/// Absent paths are excluded: the absent-path fast path deliberately treats
+/// them as a no-op (agent hooks name transcripts that may not exist yet).
+fn unclaimed_explicit_watch_once_paths(
+    paths: &[PathBuf],
+    roots: &[(ConnectorKind, ScanRoot)],
+) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| {
+            path.exists() && classify_paths(vec![(*path).clone()], roots, true).is_empty()
+        })
+        .cloned()
+        .collect()
+}
+
+/// A targeted `--watch-once` that indexes nothing looks exactly like one
+/// that indexed everything: exit 0, zero work. Name the paths that no
+/// connector claims so a backfill that did nothing is visible.
+fn warn_unclaimed_explicit_watch_once_paths(
+    paths: &[PathBuf],
+    roots: &[(ConnectorKind, ScanRoot)],
+) {
+    let unclaimed = unclaimed_explicit_watch_once_paths(paths, roots);
+    if unclaimed.is_empty() {
+        return;
+    }
+    let listed: Vec<String> = unclaimed
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    tracing::warn!(
+        unclaimed = unclaimed.len(),
+        requested = paths.len(),
+        paths = %listed.join(", "),
+        "watch-once: no enabled connector claims these existing paths, so nothing was indexed for them; check the path against `cass sources agents list --json` and the connector's session root"
+    );
 }
 
 fn classify_paths(
@@ -52994,6 +53271,186 @@ mod tests {
         );
     }
 
+    /// GH #495 follow-up: since an absent over-bound shadow counts as
+    /// `NotViable`, the startup preflight retires it on the first run. A later
+    /// run on the same, already retired archive must not rewrite the markers
+    /// (per-run meta writes move the WAL's physical identity and invalidate
+    /// the one-shot fingerprint cache), while a half-recorded retirement must
+    /// still be recorded again.
+    #[test]
+    fn gh495_preflight_leaves_an_already_retired_shadow_untouched() {
+        const CHILD: &str = "CASS_TEST_GH495_PREFLIGHT_CHILD";
+        if dotenvy::var(CHILD).is_err() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "indexer::tests::gh495_preflight_leaves_an_already_retired_shadow_untouched",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable;
+        const SENTINEL: &str = "sentinel retirement recorded by an earlier run";
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("gh495-preflight.db");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            seed_lexical_rebuild_fixture(&storage);
+            storage.close_without_checkpoint().unwrap();
+        }
+        let with_deferred = |f: &dyn Fn(&FrankenStorage)| {
+            let storage = FrankenStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
+            f(&storage);
+            storage.close_without_checkpoint().unwrap();
+        };
+        let markers = || {
+            let storage = FrankenStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
+            let markers = (
+                storage.fts_shadow_not_viable_marker().unwrap(),
+                storage.read_fallback_fts_repair_pending().unwrap(),
+            );
+            storage.close_without_checkpoint().unwrap();
+            markers
+        };
+
+        // First run retires the over-bound shadow and records both markers.
+        preflight_fts_shadow_before_lexical_readers(&db_path).unwrap();
+        let (marker, pending) = markers();
+        assert!(
+            marker
+                .as_deref()
+                .is_some_and(error_message_indicates_fts_shadow_not_viable),
+            "first preflight must record the retirement: {marker:?}"
+        );
+        assert!(pending.is_some());
+
+        // An already retired archive keeps its recorded state byte-for-byte.
+        with_deferred(&|storage| storage.drop_fts_shadow_as_not_viable(SENTINEL).unwrap());
+        preflight_fts_shadow_before_lexical_readers(&db_path).unwrap();
+        assert_eq!(markers().0.as_deref(), Some(SENTINEL));
+
+        // Negative: a half-recorded retirement is not current, so the next
+        // preflight records it again (a bare "skip when unregistered" fails).
+        with_deferred(&|storage| storage.record_fallback_fts_repair_pending(None).unwrap());
+        preflight_fts_shadow_before_lexical_readers(&db_path).unwrap();
+        let (marker, pending) = markers();
+        assert!(
+            marker.as_deref().is_some_and(|marker| marker != SENTINEL
+                && error_message_indicates_fts_shadow_not_viable(marker)),
+            "a half-recorded retirement must be recorded again: {marker:?}"
+        );
+        assert!(pending.is_some());
+    }
+
+    /// GH #461: the noise-adjusted expected doc count must not re-read the
+    /// whole archive on every run, yet it must stay exactly what the full scan
+    /// computes. An unchanged identity is served from the sidecar (a planted
+    /// sentinel proves no scan ran); appends extend it by a delta equal to the
+    /// full count; a deletion or an insertion before retained messages falls
+    /// back to a full recount (generation resets to 0).
+    #[test]
+    fn gh461_expected_lexical_docs_memo_serves_unchanged_and_extends_appends_exactly() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("gh461.db");
+        let index_path = dir.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        let db = db_path.to_string_lossy().into_owned();
+        let conversation_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT MIN(id) FROM conversations",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let insert = |conversation_id: i64, idx: i64, role: &str, content: &str| {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, ?3, ?4)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(idx),
+                        ParamValue::from(role.to_string()),
+                        ParamValue::from(content.to_string()),
+                    ],
+                )
+                .unwrap();
+        };
+        let cached = || {
+            expected_live_lexical_doc_count_cached(
+                &storage,
+                &index_path,
+                &db,
+                count_total_messages_exact(&storage).unwrap(),
+            )
+            .unwrap()
+        };
+        let sidecar_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
+        let sidecar = || {
+            serde_json::from_slice::<ExpectedLexicalDocsCache>(&fs::read(&sidecar_path).unwrap())
+                .unwrap()
+        };
+        let full = || expected_live_lexical_doc_count(&storage).unwrap();
+
+        // Empty content is hard noise, so the expectation is below the raw count.
+        insert(conversation_id, 50, "user", "   ");
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 0);
+        assert!(full() < count_total_messages_exact(&storage).unwrap());
+
+        // Unchanged identity: served from the sidecar without a scan.
+        let mut planted = sidecar();
+        planted.expected_docs = 999_999;
+        fs::write(&sidecar_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+        assert_eq!(cached(), 999_999, "an unchanged identity must not rescan");
+        planted.expected_docs = full();
+        fs::write(&sidecar_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        // Appends (after retained messages, plus a new noise row) extend exactly.
+        insert(conversation_id, 60, "assistant", "appended evidence");
+        insert(conversation_id, 61, "tool", "");
+        assert_eq!(cached(), full());
+        assert_eq!(
+            sidecar().delta_generations,
+            1,
+            "appends take the delta path"
+        );
+
+        // Negative: an insertion before retained messages cannot be a delta.
+        insert(conversation_id, 55, "user", "inserted mid-conversation");
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 0, "mid-insertion must recount");
+
+        // Negative: a deletion cannot be explained by appends.
+        insert(conversation_id, 70, "user", "one more append");
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 1);
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND idx = 60",
+                &[ParamValue::from(conversation_id)],
+            )
+            .unwrap();
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
+    }
+
     /// #439: the fallback-FTS shadow maintenance must report liveness per
     /// streamed page, otherwise the post-publish `--full` tail looks like a
     /// finalize wedge to the stall watchdog.
@@ -57483,6 +57940,35 @@ mod tests {
         assert_eq!(classified[0].1.path, canonical);
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
+    }
+
+    /// GH #478 follow-up: only existing paths that no connector claims are
+    /// reported. Claimed paths (by root or by provider hint) and absent paths
+    /// (the deliberate hook fast path) are not.
+    #[test]
+    fn unclaimed_explicit_watch_once_paths_names_only_existing_unclaimed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rooted = tmp.path().join("sessions-root/session.jsonl");
+        let hinted = tmp.path().join(".codex/sessions/2026/01/rollout-a.jsonl");
+        let unclaimed = tmp.path().join("notes/plain.jsonl");
+        for path in [&rooted, &hinted, &unclaimed] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"{}\n").unwrap();
+        }
+        let absent = tmp.path().join("notes/not-written-yet.jsonl");
+        let roots = vec![(
+            ConnectorKind::Claude,
+            ScanRoot::local(tmp.path().join("sessions-root")),
+        )];
+
+        assert_eq!(
+            unclaimed_explicit_watch_once_paths(
+                &[rooted.clone(), hinted.clone(), unclaimed.clone(), absent],
+                &roots
+            ),
+            vec![unclaimed]
+        );
+        assert!(unclaimed_explicit_watch_once_paths(&[rooted, hinted], &roots).is_empty());
     }
 
     #[cfg(unix)]

@@ -11,7 +11,7 @@ mod reimport;
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use coding_agent_search::search::archive_rebuild::ArchiveIndexPlan;
 
@@ -55,9 +55,7 @@ enum Operation {
         include_private: bool,
     },
     /// Verify framing, identities, counts and digest without opening a database.
-    Verify {
-        input: PathBuf,
-    },
+    Verify { input: PathBuf },
     /// Search verified backup message bodies without restoring a DB or index.
     Search {
         input: PathBuf,
@@ -121,6 +119,65 @@ enum Operation {
     },
 }
 
+/// A malformed or unacknowledged `cass archive` request (exit 2). Every other
+/// failure used to be reported as this class too, which told automation not
+/// to retry a transient I/O error and made a corrupt archive look like a typo.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ArchiveUsageError(String);
+
+/// The archive stream itself failed verification (exit 5): framing, identity,
+/// count or digest checks, as opposed to reading the file.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ArchiveIntegrityError(String);
+
+/// Another archive command held the destination lock past its wait (exit 7).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ArchiveBusyError(String);
+
+/// Tag a decode failure as an integrity failure unless it was I/O, which keeps
+/// its own class.
+fn integrity_unless_io(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+        error
+    } else {
+        // Outermost message only, as before: inner decode causes can quote
+        // archive values, and stderr must not echo private content.
+        ArchiveIntegrityError(error.to_string()).into()
+    }
+}
+
+fn require_private_acknowledgement(include_private: bool, message: &str) -> Result<()> {
+    if include_private {
+        Ok(())
+    } else {
+        Err(ArchiveUsageError(message.to_owned()).into())
+    }
+}
+
+/// Exit code, kebab-case error kind and retryability for a failed archive
+/// command: usage 2, integrity 5, busy 7, I/O 14 (retryable, like every other
+/// cass `io` kind), anything else 9. Classification is by error type, never by
+/// message text, so a path that happens to contain "usage" stays I/O.
+pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
+    let has = |matches: fn(&(dyn std::error::Error + 'static)) -> bool| error.chain().any(matches);
+    if has(|cause| cause.is::<ArchiveUsageError>()) {
+        return (2, "logical-archive-usage", false);
+    }
+    if has(|cause| cause.is::<ArchiveBusyError>()) {
+        return (7, "logical-archive-busy", true);
+    }
+    if has(|cause| cause.is::<std::io::Error>()) {
+        return (14, "logical-archive-io", true);
+    }
+    if has(|cause| cause.is::<ArchiveIntegrityError>()) {
+        return (5, "logical-archive-integrity", false);
+    }
+    (9, "logical-archive-error", false)
+}
+
 pub fn run(args: Vec<String>) -> Result<()> {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -133,7 +190,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             error.print()?;
             return Ok(());
         }
-        Err(error) => return Err(anyhow!(error.to_string())),
+        Err(error) => return Err(ArchiveUsageError(error.to_string()).into()),
     };
     let _ = cli.json;
     let Root::Archive { command } = cli.command;
@@ -146,10 +203,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
             archive_id,
             include_private,
         } => {
-            ensure!(
+            require_private_acknowledgement(
                 include_private,
-                "full-fidelity export contains private session data; pass --include-private to acknowledge this"
-            );
+                "full-fidelity export contains private session data; pass --include-private to acknowledge this",
+            )?;
             let source = cli
                 .db
                 .or_else(|| {
@@ -157,8 +214,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
                         .map(|directory| directory.join("agent_search.db"))
                 })
                 .ok_or_else(|| {
-                    anyhow!(
-                        "export requires an explicit --db or --data-dir (or CASS_DATA_DIR)"
+                    ArchiveUsageError(
+                        "export requires an explicit --db or --data-dir (or CASS_DATA_DIR)".into(),
                     )
                 })?;
             let (header, completion) = export::export_file(&source, &output, archive_id)?;
@@ -176,10 +233,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
             cursor,
             include_private,
         } => {
-            ensure!(
+            require_private_acknowledgement(
                 include_private,
-                "backup search emits private session excerpts; pass --include-private to acknowledge this"
-            );
+                "backup search emits private session excerpts; pass --include-private to acknowledge this",
+            )?;
             let result =
                 query::search(&input, &contains, limit, conversation_id, cursor.as_deref())?;
             println!("{result}");
@@ -192,10 +249,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
             context,
             include_private,
         } => {
-            ensure!(
+            require_private_acknowledgement(
                 include_private,
-                "backup view emits private session text; pass --include-private to acknowledge this"
-            );
+                "backup view emits private session text; pass --include-private to acknowledge this",
+            )?;
             let result = query::view(&input, message_id, context, &content_sha256)?;
             println!("{result}");
             return Ok(());
@@ -209,10 +266,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
             allow_compatible_schema,
             rebuild_index,
         } => {
-            ensure!(
+            require_private_acknowledgement(
                 include_private,
-                "restoration writes private session data; pass --include-private to acknowledge this"
-            );
+                "restoration writes private session data; pass --include-private to acknowledge this",
+            )?;
             let plan = rebuild_index
                 .then(|| ArchiveIndexPlan::prepare(&output, &input))
                 .transpose()?;
@@ -268,8 +325,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         receipt["schema_migration"] = serde_json::to_value(migration)?;
     }
     if let Some(rebuild) = lexical_rebuild {
-        receipt["derived_search_assets"] =
-            serde_json::json!("lexical_rebuilt_semantic_not_built");
+        receipt["derived_search_assets"] = serde_json::json!("lexical_rebuilt_semantic_not_built");
         receipt["lexical_rebuild"] = serde_json::to_value(rebuild)?;
     }
     println!("{receipt}");

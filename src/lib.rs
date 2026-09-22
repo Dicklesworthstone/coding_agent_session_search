@@ -26502,6 +26502,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "       kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,".to_string(),
             "       ambiguous-source, timeout, config, lock-busy, network, model, download, io).".to_string(),
             "       Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.".to_string(),
+            "       `cass archive`: 2 logical-archive-usage | 5 logical-archive-integrity | 7 logical-archive-busy (retryable) | 14 logical-archive-io (retryable) | 9 logical-archive-error.".to_string(),
             "       For doctor JSON, prefer `operation_outcome.kind` and `operation_outcome.exit_code_kind` for no-op/partial/blocked/refused/incomplete repair decisions.".to_string(),
         ],
         RobotTopic::Examples => vec![
@@ -28020,11 +28021,9 @@ fn search_existing_lexical_generation_is_usable(
     if !crate::search::tantivy::searchable_index_exists(index_path) {
         return Ok(false);
     }
-    Ok(
-        search_lexical_self_heal_diagnosis(index_path, db_path)?
-            .as_ref()
-            .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild()),
-    )
+    Ok(search_lexical_self_heal_diagnosis(index_path, db_path)?
+        .as_ref()
+        .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild()))
 }
 
 fn admit_search_lexical_repair(db_path: &Path, reason: &str) -> CliResult<()> {
@@ -28053,9 +28052,10 @@ fn verify_search_lexical_repair_publication(
     db_path: &Path,
     indexed_docs: usize,
 ) -> anyhow::Result<()> {
-    let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(index_path)?.ok_or_else(|| {
-        anyhow::anyhow!("lexical repair returned success without a published checkpoint")
-    })?;
+    let checkpoint =
+        crate::indexer::load_lexical_rebuild_checkpoint(index_path)?.ok_or_else(|| {
+            anyhow::anyhow!("lexical repair returned success without a published checkpoint")
+        })?;
     anyhow::ensure!(
         checkpoint.completed,
         "lexical repair returned success but publication is incomplete"
@@ -28067,7 +28067,10 @@ fn verify_search_lexical_repair_publication(
         checkpoint.indexed_docs
     );
     let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path).map_err(|error| {
-        anyhow::anyhow!("cannot verify repaired lexical publication: {}", error.message)
+        anyhow::anyhow!(
+            "cannot verify repaired lexical publication: {}",
+            error.message
+        )
     })?;
     if let Some(diagnosis) = diagnosis {
         // A concurrent canonical append may make a completed, readable
@@ -29811,7 +29814,21 @@ fn output_search_budget_partial(
             "semantic_refinement": false,
         });
     }
-    output_structured_value(payload, format)
+    // GH #422 follow-on: exit 0 with `hits: []` is the documented timeout
+    // contract, but with a quiet stderr a caller that checks only the exit
+    // status and the hit list reads it as "no history matches". Name the
+    // partial result on the diagnostics stream; stdout stays data-only.
+    let budget_ms = payload["budget"]["budget_ms"].as_u64().unwrap_or_default();
+    output_structured_value(payload, format)?;
+    eprintln!(
+        "note: search did not finish within its {budget_ms} ms budget; the empty hit list is \
+         incomplete, not a no-match result (budget.timed_out=true){}",
+        retry
+            .as_deref()
+            .map(|retry| format!("; retry: {retry}"))
+            .unwrap_or_default()
+    );
+    Ok(())
 }
 
 struct CliSearchSetup {
@@ -121302,7 +121319,7 @@ fn run_models_backfill(
         hint: None,
         retryable: true,
     })?;
-    let mut indexer = None;
+    let mut retained = RetainedBackfillModel::default();
     let mut attempted = 0u32;
     let mut completed = 0u32;
     let mut last_report = None;
@@ -121333,7 +121350,7 @@ fn run_models_backfill(
             options.scheduled,
             data_dir_override.clone(),
             db_override.clone(),
-            &mut indexer,
+            &mut retained,
         );
         match result {
             Ok(report) => {
@@ -121391,7 +121408,7 @@ fn run_models_backfill(
     };
     report["batches_attempted"] = attempted.into();
     report["batches_completed"] = completed.into();
-    report["model_initializations"] = u32::from(indexer.is_some()).into();
+    report["model_initializations"] = retained.initializations.into();
 
     if let Some(fmt) = structured_format {
         output_structured_value(report, fmt)?;
@@ -121433,6 +121450,15 @@ fn run_models_backfill(
     }
 }
 
+/// The one semantic model a bounded backfill keeps across its batches, and how
+/// many times it was actually constructed (GH #471: the receipt must show a
+/// per-batch reload, not merely that a model exists).
+#[derive(Default)]
+struct RetainedBackfillModel {
+    indexer: Option<crate::indexer::semantic::SemanticIndexer>,
+    initializations: u32,
+}
+
 fn run_models_backfill_batch(
     tier_raw: &str,
     embedder_override: Option<&str>,
@@ -121440,7 +121466,7 @@ fn run_models_backfill_batch(
     scheduled: bool,
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
-    retained_indexer: &mut Option<crate::indexer::semantic::SemanticIndexer>,
+    retained: &mut RetainedBackfillModel,
 ) -> CliResult<serde_json::Value> {
     use crate::indexer::semantic::{
         SemanticBackfillSchedulerSignals, SemanticBackfillStoragePlan, SemanticIndexer,
@@ -121558,21 +121584,32 @@ fn run_models_backfill_batch(
     // Refuse unavailable models before opening the archive: even a current-
     // schema storage open can change its shared-memory sidecar. Keep model
     // admission inside the maintenance lock so index-busy retains precedence.
+    let RetainedBackfillModel {
+        indexer: retained_indexer,
+        initializations: model_initializations,
+    } = retained;
     let indexer = match retained_indexer {
         Some(indexer) => indexer,
-        vacant => vacant.insert(
-            SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
-                hint: Some(if embedder_type == "fastembed" {
-                    "Run 'cass models install -y' or retry with --embedder hash".into()
-                } else {
-                    "Use --embedder hash or install the selected embedder model".into()
-                }),
-                retryable: embedder_type != "hash",
-            })?,
-        ),
+        vacant => vacant.insert({
+            let indexer =
+                SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
+                    code: 20,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: format!(
+                        "Failed to initialize semantic embedder '{embedder_type}': {e}"
+                    ),
+                    hint: Some(if embedder_type == "fastembed" {
+                        "Run 'cass models install -y' or retry with --embedder hash".into()
+                    } else {
+                        "Use --embedder hash or install the selected embedder model".into()
+                    }),
+                    retryable: embedder_type != "hash",
+                })?;
+            // GH #471: count real constructions, so a regression that reloads
+            // the model per batch reports it instead of a presence flag.
+            *model_initializations = model_initializations.saturating_add(1);
+            indexer
+        }),
     };
 
     let storage = crate::storage::sqlite::open_current_schema_storage_with_timeout(

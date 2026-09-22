@@ -56,11 +56,8 @@ impl SourceSnapshot {
         let mut file = &self.file;
         file.rewind().context("rewind admitted Codex source")?;
         let mut reader = BufReader::new(file.take(self.before.len()));
-        let consumed = super::super::augment_modern_codex_reader(
-            conversation,
-            progress_tick,
-            &mut reader,
-        )?;
+        let consumed =
+            super::super::augment_modern_codex_reader(conversation, progress_tick, &mut reader)?;
         if consumed != self.before.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

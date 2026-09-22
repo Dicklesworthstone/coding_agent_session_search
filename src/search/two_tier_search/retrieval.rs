@@ -11,7 +11,8 @@ use std::ops::Range;
 use std::time::Instant;
 
 use super::{
-    DaemonClient, FsVectorHit, ScoredResult, SearchPhase, TwoTierError, TwoTierIndex, TwoTierSearchIter,
+    DaemonClient, FsVectorHit, ScoredResult, SearchPhase, TwoTierError, TwoTierIndex,
+    TwoTierSearchIter,
 };
 
 const QUALITY_SCORE_BATCH_SIZE: usize = 256;
@@ -155,7 +156,9 @@ impl TwoTierIndex {
         for hit in &hits {
             let idx = hit.index as usize;
             let Some(doc_id) = self.doc_ids.get(idx) else {
-                return Err(index_error("fast backend returned an out-of-range document"));
+                return Err(index_error(
+                    "fast backend returned an out-of-range document",
+                ));
             };
             if !hit.score.is_finite()
                 || !seen.insert(idx)
@@ -270,15 +273,17 @@ impl<'a, D: DaemonClient> Iterator for TwoTierSearchIter<'a, D> {
                 if self.searcher.config.quality_only {
                     self.phase = 2;
                     let start = Instant::now();
-                    return Some(match self.searcher.search_quality_only(&self.query, self.k) {
-                        Ok(results) => SearchPhase::Refined {
-                            results,
-                            latency_ms: start.elapsed().as_millis() as u64,
+                    return Some(
+                        match self.searcher.search_quality_only(&self.query, self.k) {
+                            Ok(results) => SearchPhase::Refined {
+                                results,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                            },
+                            Err(error) => SearchPhase::RefinementFailed {
+                                error: error.to_string(),
+                            },
                         },
-                        Err(error) => SearchPhase::RefinementFailed {
-                            error: error.to_string(),
-                        },
-                    });
+                    );
                 }
                 let refine = !self.searcher.config.fast_only
                     && self.searcher.config.max_refinement_docs != 0
@@ -350,7 +355,9 @@ impl<'a, D: DaemonClient> Iterator for TwoTierSearchIter<'a, D> {
 mod tests {
     use super::*;
     use crate::search::embedder::{Embedder, EmbedderError};
-    use crate::search::two_tier_search::{DocumentId, TwoTierConfig, TwoTierEntry, TwoTierSearcher};
+    use crate::search::two_tier_search::{
+        DocumentId, TwoTierConfig, TwoTierEntry, TwoTierSearcher,
+    };
     use frankensearch::{DaemonError, ModelCategory};
     use half::f16;
     use std::sync::Arc;
@@ -484,7 +491,11 @@ mod tests {
         );
         let tied = fuse_ranked_results(&fast, &quality, 0.5, 5).unwrap();
         assert_eq!(tied.iter().map(|r| r.idx).collect::<Vec<_>>(), [2, 1]);
-        assert!(fuse_ranked_results(&fast, &quality, 0.5, 0).unwrap().is_empty());
+        assert!(
+            fuse_ranked_results(&fast, &quality, 0.5, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -499,9 +510,7 @@ mod tests {
         ] {
             assert!(fuse_ranked_results(&fast, &[], 0.7, 2).is_err());
         }
-        assert!(
-            fuse_ranked_results(&[hit(0, 1, 1.0)], &[hit(0, 2, 1.0)], 0.7, 2).is_err()
-        );
+        assert!(fuse_ranked_results(&[hit(0, 1, 1.0)], &[hit(0, 2, 1.0)], 0.7, 2).is_err());
     }
 
     // Synthetic providers prove orchestration, not native-model relevance.

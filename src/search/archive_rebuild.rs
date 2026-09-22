@@ -42,7 +42,9 @@ impl ArchiveIndexPlan {
     /// Existing destinations are still admitted only by the importer's policy.
     pub fn prepare(database: &Path, input: &Path) -> Result<Self> {
         ensure!(
-            database.file_name().is_some_and(|name| name == "agent_search.db"),
+            database
+                .file_name()
+                .is_some_and(|name| name == "agent_search.db"),
             "--rebuild-index requires --output <data-directory>/agent_search.db"
         );
         let parent = database
@@ -55,9 +57,16 @@ impl ArchiveIndexPlan {
             metadata.is_dir() && !metadata.file_type().is_symlink(),
             "indexed restore data directory must be a real directory, not a symlink"
         );
-        let data_dir = parent.canonicalize().context("resolve indexed restore directory")?;
-        ensure!(data_dir.to_str().is_some(), "indexed restore path must be UTF-8");
-        let input = input.canonicalize().context("resolve logical archive input")?;
+        let data_dir = parent
+            .canonicalize()
+            .context("resolve indexed restore directory")?;
+        ensure!(
+            data_dir.to_str().is_some(),
+            "indexed restore path must be UTF-8"
+        );
+        let input = input
+            .canonicalize()
+            .context("resolve logical archive input")?;
         ensure!(
             !input.starts_with(&data_dir),
             "keep the logical archive input outside the indexed restore data directory"
@@ -77,9 +86,13 @@ impl ArchiveIndexPlan {
 
     fn validate_index_layout(&self) -> Result<()> {
         let index = expected_index_dir(&self.data_dir);
-        let relative = index.strip_prefix(&self.data_dir)
+        let relative = index
+            .strip_prefix(&self.data_dir)
             .context("lexical index must be inside the recovered profile")?;
-        ensure!(!relative.as_os_str().is_empty(), "lexical index cannot replace its data directory");
+        ensure!(
+            !relative.as_os_str().is_empty(),
+            "lexical index cannot replace its data directory"
+        );
         let mut path = self.data_dir.clone();
         for component in relative.components() {
             ensure!(
@@ -117,13 +130,15 @@ impl ArchiveIndexPlan {
         );
         let storage = FrankenStorage::open_strict_readonly(&self.database)
             .context("admit restored canonical database without migration or repair")?;
-        storage.close_without_checkpoint()
+        storage
+            .close_without_checkpoint()
             .context("close recovered archive admission without checkpointing")?;
         let result = crate::indexer::repair_lexical_index_from_canonical_db_for_search(
             &self.database,
             &self.data_dir,
             None,
-        ).context("rebuild lexical search from the restored canonical archive")?;
+        )
+        .context("rebuild lexical search from the restored canonical archive")?;
         Ok(ArchiveIndexReceipt {
             data_dir: self.data_dir.clone(),
             index_path: expected_index_dir(&self.data_dir),
@@ -152,7 +167,10 @@ mod tests {
     fn indexed_restore_preflight_is_nonmutating_and_uses_the_output_profile() -> Result<()> {
         let (_root, input, data) = fixture()?;
         let plan = ArchiveIndexPlan::prepare(&data.join("agent_search.db"), &input)?;
-        assert_eq!(plan.database(), data.canonicalize()?.join("agent_search.db"));
+        assert_eq!(
+            plan.database(),
+            data.canonicalize()?.join("agent_search.db")
+        );
         assert_eq!(std::fs::read_dir(&data)?.count(), 0);
         assert_eq!(std::fs::read(&input)?, b"interchange input");
         Ok(())

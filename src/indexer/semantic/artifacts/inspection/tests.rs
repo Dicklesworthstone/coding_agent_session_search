@@ -9,20 +9,25 @@ use frankensearch::index::VectorIndex;
 fn publish(data: &Path) -> Result<PathBuf> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    Ok(indexer.run_backfill_batch(
-        &[EmbeddingInput::new(1, "compiler checkpoint recovery evidence")],
-        data,
-        &mut manifest,
-        SemanticBackfillBatchPlan {
-            tier: TierKind::Quality,
-            db_fingerprint: "content-v1:approval-live".into(),
-            model_revision: "hash".into(),
-            total_conversations: 1,
-            conversations_in_batch: 1,
-            last_offset: 1,
-            cursor_exhausted: true,
-        },
-    )?.index_path)
+    Ok(indexer
+        .run_backfill_batch(
+            &[EmbeddingInput::new(
+                1,
+                "compiler checkpoint recovery evidence",
+            )],
+            data,
+            &mut manifest,
+            SemanticBackfillBatchPlan {
+                tier: TierKind::Quality,
+                db_fingerprint: "content-v1:approval-live".into(),
+                model_revision: "hash".into(),
+                total_conversations: 1,
+                conversations_in_batch: 1,
+                last_offset: 1,
+                cursor_exhausted: true,
+            },
+        )?
+        .index_path)
 }
 
 fn scratch(data: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -48,10 +53,16 @@ fn preview_and_apply_agree_and_preserve_live_bytes_and_fresh_search() -> Result<
     let query = HashEmbedder::default().embed_sync("compiler checkpoint recovery evidence")?;
     let hits_before = format!("{:?}", reader.search_top_k(&query, 3, None)?);
     let plan = plan_backfill_artifacts(data)?;
-    assert_eq!((plan.reclaimable_files, plan.reclaimable_directories), (2, 1));
+    assert_eq!(
+        (plan.reclaimable_files, plan.reclaimable_directories),
+        (2, 1)
+    );
     assert_eq!(plan.reclaimable_bytes, 16 + 12 + 12);
     assert_eq!(plan.candidates.len(), 3);
-    assert_eq!(plan.plan_fingerprint, plan_backfill_artifacts(data)?.plan_fingerprint);
+    assert_eq!(
+        plan.plan_fingerprint,
+        plan_backfill_artifacts(data)?.plan_fingerprint
+    );
     assert_eq!(main_before, fs::read(&live)?);
     assert_eq!(metadata_before, fs::read(SemanticManifest::path(data))?);
     assert_eq!(fs::read(&staging)?, b"obsolete staging");
@@ -63,9 +74,15 @@ fn preview_and_apply_agree_and_preserve_live_bytes_and_fresh_search() -> Result<
     assert!(!staging.exists() && !wal_path_for(&staging).exists() && !reuse.exists());
     assert_eq!(main_before, fs::read(&live)?);
     assert_eq!(metadata_before, fs::read(SemanticManifest::path(data))?);
-    assert_eq!(hits_before, format!("{:?}", reader.search_top_k(&query, 3, None)?));
+    assert_eq!(
+        hits_before,
+        format!("{:?}", reader.search_top_k(&query, 3, None)?)
+    );
     let reopened = VectorIndex::open_read_only(&live)?;
-    assert_eq!(hits_before, format!("{:?}", reopened.search_top_k(&query, 3, None)?));
+    assert_eq!(
+        hits_before,
+        format!("{:?}", reopened.search_top_k(&query, 3, None)?)
+    );
     assert!(apply_backfill_artifact_plan(data, &plan.plan_fingerprint).is_err());
     assert!(plan_backfill_artifacts(data)?.candidates.is_empty());
     Ok(())
@@ -88,7 +105,13 @@ fn newly_referenced_staging_invalidates_approval_before_any_removal() -> Result<
     assert!(staging.is_file() && wal_path_for(&staging).is_file() && reuse.is_dir());
     assert_eq!(metadata_before, fs::read(SemanticManifest::path(data))?);
     let refreshed = plan_backfill_artifacts(data)?;
-    assert_eq!((refreshed.reclaimable_files, refreshed.reclaimable_directories), (0, 1));
+    assert_eq!(
+        (
+            refreshed.reclaimable_files,
+            refreshed.reclaimable_directories
+        ),
+        (0, 1)
+    );
     apply_backfill_artifact_plan(data, &refreshed.plan_fingerprint)?;
     assert!(staging.is_file() && wal_path_for(&staging).is_file());
     Ok(())
@@ -122,7 +145,11 @@ fn new_or_changed_scratch_invalidates_the_entire_plan() -> Result<()> {
         if nested {
             fs::write(reuse.join("candidate.fsvi"), b"new private data")?;
         } else {
-            fs::write(data.join(VECTOR_INDEX_DIR).join(".staging-fast-fnv1a-384-12345678.fsvi"), b"new")?;
+            fs::write(
+                data.join(VECTOR_INDEX_DIR)
+                    .join(".staging-fast-fnv1a-384-12345678.fsvi"),
+                b"new",
+            )?;
         }
         assert!(apply_backfill_artifact_plan(data, &plan.plan_fingerprint).is_err());
         assert!(staging.is_file() && wal_path_for(&staging).is_file() && reuse.is_dir());
@@ -139,7 +166,10 @@ fn restored_mtime_does_not_hide_a_same_length_scratch_rewrite() -> Result<()> {
     let modified = fs::metadata(&staging)?.modified()?;
     let plan = plan_backfill_artifacts(temp.path())?;
     fs::write(&staging, b"changed! staging")?;
-    File::options().write(true).open(&staging)?.set_modified(modified)?;
+    File::options()
+        .write(true)
+        .open(&staging)?
+        .set_modified(modified)?;
     assert!(apply_backfill_artifact_plan(temp.path(), &plan.plan_fingerprint).is_err());
     assert!(staging.is_file() && reuse.is_dir());
     Ok(())
@@ -202,14 +232,23 @@ fn missing_checkpoint_reports_blocked_and_keeps_fallback_artifacts() -> Result<(
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
     let outcome = indexer.run_backfill_batch(
-        &[EmbeddingInput::new(1, "resumable checkpoint")], data, &mut manifest,
+        &[EmbeddingInput::new(1, "resumable checkpoint")],
+        data,
+        &mut manifest,
         SemanticBackfillBatchPlan {
-            tier: TierKind::Quality, db_fingerprint: "content-v1:checkpoint".into(),
-            model_revision: "hash".into(), total_conversations: 2,
-            conversations_in_batch: 1, last_offset: 1, cursor_exhausted: false,
+            tier: TierKind::Quality,
+            db_fingerprint: "content-v1:checkpoint".into(),
+            model_revision: "hash".into(),
+            total_conversations: 2,
+            conversations_in_batch: 1,
+            last_offset: 1,
+            cursor_exhausted: false,
         },
     )?;
-    fs::rename(outcome.index_path, data.join(VECTOR_INDEX_DIR).join("fallback.fsvi"))?;
+    fs::rename(
+        outcome.index_path,
+        data.join(VECTOR_INDEX_DIR).join("fallback.fsvi"),
+    )?;
     let (staging, reuse) = scratch(data)?;
     let plan = plan_backfill_artifacts(data)?;
     assert!(plan.checkpoint_missing && plan.candidates.is_empty());
@@ -263,10 +302,14 @@ fn nested_links_are_not_followed_and_referenced_aliases_are_not_reclaimed() -> R
     let alias = data.join(VECTOR_INDEX_DIR).join("published-alias.fsvi");
     symlink(&staging, &alias)?;
     let mut manifest = SemanticManifest::load(data)?.unwrap();
-    manifest.quality_tier.as_mut().unwrap().index_path = alias.strip_prefix(data)?.to_string_lossy().into_owned();
+    manifest.quality_tier.as_mut().unwrap().index_path =
+        alias.strip_prefix(data)?.to_string_lossy().into_owned();
     manifest.save(data)?;
     let plan = plan_backfill_artifacts(data)?;
-    assert_eq!((plan.reclaimable_files, plan.reclaimable_directories), (0, 1));
+    assert_eq!(
+        (plan.reclaimable_files, plan.reclaimable_directories),
+        (0, 1)
+    );
     assert_eq!(plan.reclaimable_bytes, 12);
     apply_backfill_artifact_plan(data, &plan.plan_fingerprint)?;
     assert!(staging.is_file() && wal_path_for(&staging).is_file());
@@ -293,7 +336,9 @@ fn inventory_budget_and_nonregular_checkpoint_wal_fail_closed() -> Result<()> {
 fn automatic_recovery_still_supports_non_utf8_data_directories() -> Result<()> {
     use std::os::unix::ffi::OsStringExt;
     let temp = tempfile::tempdir()?;
-    let data = temp.path().join(std::ffi::OsString::from_vec(b"archive-\xff".to_vec()));
+    let data = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"archive-\xff".to_vec()));
     let live = publish(&data)?;
     let (staging, reuse) = scratch(&data)?;
     let report = reclaim_backfill_artifacts(&data)?;

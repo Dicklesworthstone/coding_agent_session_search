@@ -1,6 +1,6 @@
 //! Verify a precise endpoint message, not whichever conversation ranks first.
 
-use std::collections::HashSet;
+use crate::search::quill_bridge::{search_paginated, stored_i64, stored_text, stored_u64};
 use anyhow::{Result, ensure};
 use frankensearch::quill::QuillSearchIndex;
 use frankensearch::quill::cass::{
@@ -10,7 +10,7 @@ use frankensearch::quill::query::{
     BooleanClause, CassQueryFilters, CassQueryParser, Occur, Query, QueryValue,
 };
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
-use crate::search::quill_bridge::{search_paginated, stored_i64, stored_text, stored_u64};
+use std::collections::HashSet;
 
 const PAGE_SIZE: usize = 64;
 const MAX_CANDIDATES: usize = 4096;
@@ -44,14 +44,22 @@ fn verify_with_budget(
     // through the indexed source/agent/workspace keywords, then apply exactly
     // the same identity and stored-column checks as for a lexical canary.
     for (field, value) in [
-        (field::SOURCE_ID, QueryValue::Str(document.source_id.clone())),
+        (
+            field::SOURCE_ID,
+            QueryValue::Str(document.source_id.clone()),
+        ),
         (field::AGENT, QueryValue::Str(document.agent.clone())),
     ] {
-        clauses.push(BooleanClause::new(Occur::Must, Query::set(field, vec![value])));
+        clauses.push(BooleanClause::new(
+            Occur::Must,
+            Query::set(field, vec![value]),
+        ));
     }
     if let Some(workspace) = &document.workspace {
-        clauses.push(BooleanClause::new(Occur::Must,
-            Query::set(field::WORKSPACE, vec![QueryValue::Str(workspace.clone())])));
+        clauses.push(BooleanClause::new(
+            Occur::Must,
+            Query::set(field::WORKSPACE, vec![QueryValue::Str(workspace.clone())]),
+        ));
     }
     // Keep candidate discovery on text/keyword postings. The pinned Quill
     // numeric scorer uses the physical rather than live segment domain after
@@ -66,36 +74,58 @@ fn verify_with_budget(
     // columns below; bounded pagination prevents unrelated equal-score rows
     // from turning the first ranked page into a false absence verdict.
     let query = Query::boolean(clauses, None);
-    let identity = cass_document_identity(&document.source_id,
-        CassConversationKey::for_document(document.as_ref()), document.msg_idx);
+    let identity = cass_document_identity(
+        &document.source_id,
+        CassConversationKey::for_document(document.as_ref()),
+        document.msg_idx,
+    );
     let preview = CassDerivedColumns::derive(document.as_ref()).preview;
     let mut offset = 0;
     let mut seen = HashSet::new();
     loop {
-        ensure!(offset < max_candidates,
-            "lexical reconcile canary exhausted its candidate budget; checkpoint retained");
+        ensure!(
+            offset < max_candidates,
+            "lexical reconcile canary exhausted its candidate budget; checkpoint retained"
+        );
         let limit = PAGE_SIZE.min(max_candidates - offset);
         let page = search_paginated(reader, &query, limit, offset, false)?;
-        ensure!(page.hits.len() <= limit, "canary backend exceeded its page limit");
+        ensure!(
+            page.hits.len() <= limit,
+            "canary backend exceeded its page limit"
+        );
         for hit in &page.hits {
-            ensure!(hit.bm25_score.is_finite() && seen.insert(hit.global_docid),
-                "canary backend returned an invalid or repeated candidate");
-            if hit.document_id != identity { continue; }
+            ensure!(
+                hit.bm25_score.is_finite() && seen.insert(hit.global_docid),
+                "canary backend returned an invalid or repeated candidate"
+            );
+            if hit.document_id != identity {
+                continue;
+            }
             // A match elsewhere in the conversation cannot certify this exact
             // prefix/tail message. Stored-content preview is an endpoint check,
             // not a claim of a full engine content-witness comparison.
             return Ok(
-                stored_i64(reader, field::CONVERSATION_ID, hit.global_docid)? == document.conversation_id
-                && stored_text(reader, field::SOURCE_PATH, hit.global_docid)?.as_deref() == Some(document.source_path.as_str())
-                && stored_text(reader, field::SOURCE_ID, hit.global_docid)?.as_deref() == Some(document.source_id.as_str())
-                && stored_u64(reader, field::MSG_IDX, hit.global_docid)? == Some(document.msg_idx)
-                && stored_i64(reader, field::CREATED_AT, hit.global_docid)? == document.created_at
-                && stored_text(reader, field::AGENT, hit.global_docid)?.as_deref() == Some(document.agent.as_str())
-                && stored_text(reader, field::WORKSPACE, hit.global_docid)?.as_deref() == document.workspace.as_deref()
-                && stored_text(reader, field::PREVIEW, hit.global_docid)?.as_deref() == Some(preview.as_str())
+                stored_i64(reader, field::CONVERSATION_ID, hit.global_docid)?
+                    == document.conversation_id
+                    && stored_text(reader, field::SOURCE_PATH, hit.global_docid)?.as_deref()
+                        == Some(document.source_path.as_str())
+                    && stored_text(reader, field::SOURCE_ID, hit.global_docid)?.as_deref()
+                        == Some(document.source_id.as_str())
+                    && stored_u64(reader, field::MSG_IDX, hit.global_docid)?
+                        == Some(document.msg_idx)
+                    && stored_i64(reader, field::CREATED_AT, hit.global_docid)?
+                        == document.created_at
+                    && stored_text(reader, field::AGENT, hit.global_docid)?.as_deref()
+                        == Some(document.agent.as_str())
+                    && stored_text(reader, field::WORKSPACE, hit.global_docid)?.as_deref()
+                        == document.workspace.as_deref()
+                    && stored_text(reader, field::PREVIEW, hit.global_docid)?.as_deref()
+                        == Some(preview.as_str()),
             );
         }
-        if page.hits.len() < limit { return Ok(false); }
+        if page.hits.len() < limit {
+            return Ok(false);
+        }
         offset += page.hits.len();
     }
 }
@@ -107,10 +137,18 @@ mod tests {
 
     fn document(id: i64, path: &str, content: &str) -> CassDocument {
         CassDocument {
-            agent: "codex".into(), workspace: Some("/work".into()), workspace_original: None,
-            source_path: path.into(), msg_idx: 0, created_at: Some(1_700_000_000_000),
-            title: None, content: content.into(), source_id: "local".into(),
-            origin_kind: "local".into(), origin_host: None, conversation_id: Some(id),
+            agent: "codex".into(),
+            workspace: Some("/work".into()),
+            workspace_original: None,
+            source_path: path.into(),
+            msg_idx: 0,
+            created_at: Some(1_700_000_000_000),
+            title: None,
+            content: content.into(),
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: Some(id),
         }
     }
 
@@ -118,8 +156,14 @@ mod tests {
     fn buried_endpoint_is_found_without_accepting_a_different_source() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut index = TantivyIndex::open_or_create(&temp.path().join("index"))?;
-        let target = document(1000, "/target", &format!("common target {}", "padding ".repeat(512)));
-        let mut docs: Vec<_> = (1..=192).map(|id| document(id, &format!("/other/{id}"), "common")).collect();
+        let target = document(
+            1000,
+            "/target",
+            &format!("common target {}", "padding ".repeat(512)),
+        );
+        let mut docs: Vec<_> = (1..=192)
+            .map(|id| document(id, &format!("/other/{id}"), "common"))
+            .collect();
         docs.push(target.clone());
         index.add_prebuilt_documents_slice(&docs)?;
         index.commit()?;
@@ -127,13 +171,19 @@ mod tests {
         let parser = CassQueryParser::new(CASS_SEMANTIC_SCHEMA)?;
         let parsed = parser.parse("common", &CassQueryFilters::default());
         let old_page = search_paginated(&reader, &parsed.query, 25, 0, false)?;
-        let identity = cass_document_identity(&target.source_id,
-            CassConversationKey::for_document(target.as_ref()), target.msg_idx);
+        let identity = cass_document_identity(
+            &target.source_id,
+            CassConversationKey::for_document(target.as_ref()),
+            target.msg_idx,
+        );
         assert_eq!(old_page.hits.len(), 25);
-        assert!(old_page.hits.iter().all(|hit| hit.document_id != identity),
-            "fixture must reproduce the old top-25 blind spot");
+        assert!(
+            old_page.hits.iter().all(|hit| hit.document_id != identity),
+            "fixture must reproduce the old top-25 blind spot"
+        );
         assert!(verify(&reader, &target, Some("common"))?);
-        let mut foreign = target.clone(); foreign.source_path = "/wrong-source".into();
+        let mut foreign = target.clone();
+        foreign.source_path = "/wrong-source".into();
         assert!(!verify(&reader, &foreign, Some("common"))?);
         let error = verify_with_budget(&reader, &target, Some("common"), 64).unwrap_err();
         assert!(error.to_string().contains("candidate budget"));
@@ -145,7 +195,8 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let mut index = TantivyIndex::open_or_create(&temp.path().join("index"))?;
         let expected = document(42, "/same", "common prefix");
-        let mut suffix = expected.clone(); suffix.msg_idx = 1;
+        let mut suffix = expected.clone();
+        suffix.msg_idx = 1;
         index.add_prebuilt_documents_slice(&[suffix])?;
         index.commit()?;
         let reader = index.reader()?;
@@ -186,7 +237,10 @@ mod tests {
 
         // Replace one row in a sealed segment without compacting it. Then
         // replay the exact source twice, like production reconciliation.
-        for docs in [vec![replacement.clone()], vec![replacement.clone(), sibling.clone()]] {
+        for docs in [
+            vec![replacement.clone()],
+            vec![replacement.clone(), sibling.clone()],
+        ] {
             index.upsert_prebuilt_documents_slice(&docs)?;
             index.commit()?;
             assert_eq!(index.doc_count()?, 3);
@@ -253,7 +307,10 @@ mod tests {
         index.commit()?;
         let reader = index.reader()?;
         assert!(verify(&reader, &expected, None)?);
-        assert!(!verify(&before, &expected, None)?, "do not reopen the snapshot");
+        assert!(
+            !verify(&before, &expected, None)?,
+            "do not reopen the snapshot"
+        );
         let mut wrong_content = expected.clone();
         wrong_content.content = "1234 9999".into();
         let mut wrong_path = expected.clone();

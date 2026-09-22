@@ -6,7 +6,7 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use coding_agent_search::franken_sync::compat::{OpenFlags, RowExt, open_with_flags};
@@ -70,13 +70,18 @@ impl DestinationLock {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    ensure!(
-                        Instant::now() < deadline,
-                        "logical archive destination remained locked for five seconds"
-                    );
+                    if Instant::now() >= deadline {
+                        return Err(super::ArchiveBusyError(
+                            "logical archive destination remained locked for five seconds".into(),
+                        )
+                        .into());
+                    }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(_) => bail!("cannot acquire logical archive destination lock"),
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context("cannot acquire logical archive destination lock"));
+                }
             }
         }
     }
@@ -368,7 +373,8 @@ pub fn verify_file(path: &Path) -> Result<(Header, Completion)> {
     // Apply the same regular-file admission as import before any blocking read.
     // File::open alone can wait forever on a FIFO before framing limits apply.
     let input = super::import::open_input(path)?;
-    codec::verify(&mut BufReader::new(input))
+    // Only the decode is an integrity verdict; admission refusals above are not.
+    codec::verify(&mut BufReader::new(input)).map_err(super::integrity_unless_io)
 }
 
 #[cfg(test)]

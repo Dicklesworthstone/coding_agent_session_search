@@ -337,8 +337,7 @@ pub(crate) fn optional_ann_path_is_safe(root: &Path, path: &Path) -> bool {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
-                if metadata_is_link_or_reparse(&metadata)
-                    || (current != path && !metadata.is_dir())
+                if metadata_is_link_or_reparse(&metadata) || (current != path && !metadata.is_dir())
                 {
                     return false;
                 }

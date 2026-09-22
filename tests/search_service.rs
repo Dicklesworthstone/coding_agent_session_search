@@ -681,7 +681,8 @@ fn service_memory_configuration_and_initial_overage_fail_before_storage_access()
 }
 
 #[test]
-fn binary_refinement_opt_in_is_lazy_and_mcp_rejects_invalid_work_before_access() -> anyhow::Result<()> {
+fn binary_refinement_opt_in_is_lazy_and_mcp_rejects_invalid_work_before_access()
+-> anyhow::Result<()> {
     use std::io::Read;
 
     for enabled in [false, true] {
@@ -690,16 +691,25 @@ fn binary_refinement_opt_in_is_lazy_and_mcp_rejects_invalid_work_before_access()
         let model = temp.path().join("never-opened-model");
         let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
         command
-            .args(["serve", "--stdio", "--mcp", "--request-timeout-ms", "5000", "--index"])
+            .args([
+                "serve",
+                "--stdio",
+                "--mcp",
+                "--request-timeout-ms",
+                "5000",
+                "--index",
+            ])
             .arg(&index);
         if enabled {
             command.arg("--reranker-model").arg(&model);
         }
-        let mut child = DeadlineChild(command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?);
+        let mut child = DeadlineChild(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
         // Drain both pipes while the process runs: an expanded tool catalog
         // must not deadlock the test at an operating-system pipe capacity.
         let mut stdout = child.0.stdout.take().unwrap();
@@ -735,17 +745,27 @@ fn binary_refinement_opt_in_is_lazy_and_mcp_rejects_invalid_work_before_access()
         }
         let bytes = output.join().expect("stdout reader panicked")?;
         let stderr = diagnostics.join().expect("stderr reader panicked")?;
-        assert!(status.is_some_and(|status| status.success()), "{}", String::from_utf8_lossy(&stderr));
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
         let replies = std::str::from_utf8(&bytes)?
             .lines()
             .map(serde_json::from_str::<serde_json::Value>)
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(replies.len(), 4);
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), if enabled { 5 } else { 4 });
+        assert_eq!(
+            replies[1]["result"]["tools"].as_array().unwrap().len(),
+            if enabled { 5 } else { 4 }
+        );
         assert_eq!(replies[2]["id"], "refine");
         if enabled {
             assert_eq!(replies[2]["result"]["isError"], true);
-            assert_eq!(replies[2]["result"]["structuredContent"]["error"]["kind"], "invalid_request");
+            assert_eq!(
+                replies[2]["result"]["structuredContent"]["error"]["kind"],
+                "invalid_request"
+            );
         } else {
             assert_eq!(replies[2]["error"]["code"], -32602);
         }

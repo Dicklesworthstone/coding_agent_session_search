@@ -829,6 +829,27 @@ pub fn run_doctor_rebuild_canonical_fts(
                 )
             }
         })?;
+    // GH #438: an explicit repair of a shadow whose rows already match must
+    // still rewrite segments written by an older engine (frankensqlite#404);
+    // queryable rows do not prove a valid segment format. Optimize rewrites
+    // them with the current writer (a no-op on an already optimized index)
+    // and the FTS5 integrity-check then validates the result.
+    let segments_optimized = if matches!(repair, FtsConsistencyRepair::AlreadyHealthy { .. }) {
+        storage
+            .optimize_fts_messages_segments()
+            .and_then(|()| storage.validate_fts_messages_integrity())
+            .map_err(|e| {
+                storage_error(
+                    format!("rewriting existing FTS5 segments of a parity-healthy shadow: {e:#}"),
+                    Some(
+                        "Canonical rows are unchanged. Re-run the dry-run; if segment rewriting keeps failing, remove the derived shadow with `cass index --full` after preserving the database bundle.",
+                    ),
+                )
+            })?;
+        true
+    } else {
+        false
+    };
     let after = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
             format!("validating canonical/FTS5 parity after repair: {e:#}"),
@@ -863,6 +884,7 @@ pub fn run_doctor_rebuild_canonical_fts(
         "db_path": db_path.display().to_string(),
         "repair_kind": repair_kind,
         "inserted_rows": inserted_rows,
+        "segments_optimized": segments_optimized,
         "parity_before": fts_parity_json(&before),
         "parity_after": fts_parity_json(&after),
         "mutated_asset_class": "canonical_fts5_shadow",
@@ -874,7 +896,12 @@ pub fn run_doctor_rebuild_canonical_fts(
         print_json(&envelope)?;
     } else {
         println!(
-            "Canonical FTS5 repair complete ({repair_kind}, {inserted_rows} rows inserted, {} rows indexed) in {}",
+            "Canonical FTS5 repair complete ({repair_kind}{}, {inserted_rows} rows inserted, {} rows indexed) in {}",
+            if segments_optimized {
+                ", existing segments rewritten with the current writer"
+            } else {
+                ""
+            },
             after.indexable_messages,
             db_path.display()
         );
@@ -1359,6 +1386,86 @@ mod tests {
         assert_eq!(canonical.1, conversation_id);
         assert_eq!(canonical.2, "content 0");
         assert!(canonical.3.contains("canonical sentinel"));
+    }
+
+    /// GH #438: an explicit repair of a parity-healthy shadow must rewrite its
+    /// segments (stock validators reject segments written before
+    /// frankensqlite#404 even though reads work), not report "already
+    /// healthy" and leave them. Three catch-up passes leave several segments;
+    /// the repair must merge them into one without changing any search result.
+    #[test]
+    fn rebuild_canonical_fts_rewrites_segments_of_a_parity_healthy_shadow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let segment_count = |storage: &FrankenStorage| -> i64 {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(DISTINCT segid) FROM fts_messages_idx",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .expect("count FTS segments")
+        };
+        let matches = |storage: &FrankenStorage| -> i64 {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'content'",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .expect("match canonical content")
+        };
+        let before_matches = {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let conversation_id =
+                seed_conversation(&storage, agent_id, "fts-segments", "/orig/segments.jsonl");
+            for idx in 0..3 {
+                write_message(&storage, conversation_id, idx, r#"{"type":"user"}"#);
+                storage
+                    .ensure_search_fallback_fts_consistency()
+                    .expect("build or catch up the FTS shadow");
+            }
+            assert_eq!(
+                storage
+                    .inspect_search_fallback_fts_parity()
+                    .expect("inspect FTS")
+                    .status,
+                FtsShadowParityStatus::Healthy
+            );
+            assert!(
+                segment_count(&storage) >= 2,
+                "fixture must leave several segments to rewrite"
+            );
+            matches(&storage)
+        };
+
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            false,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("repair a parity-healthy shadow");
+
+        let storage = FrankenStorage::open(&db_path).expect("reopen db");
+        assert_eq!(
+            segment_count(&storage),
+            1,
+            "segments must be rewritten into one"
+        );
+        assert_eq!(
+            matches(&storage),
+            before_matches,
+            "search results must not change"
+        );
+        assert_eq!(before_matches, 3);
+        storage
+            .validate_fts_messages_integrity()
+            .expect("rewritten segments pass the FTS5 integrity-check");
     }
 
     #[test]

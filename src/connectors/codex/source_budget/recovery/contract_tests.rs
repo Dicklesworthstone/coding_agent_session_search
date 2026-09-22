@@ -193,21 +193,32 @@ fn reports_bound_samples_and_preserve_budget_only_schema() -> Result<()> {
 
 #[test]
 fn aggregation_keeps_each_formats_effective_limit_and_default_schema() -> Result<()> {
-    let limits = ScanLimits { jsonl_bytes: 512 * 1024 * 1024 };
+    let limits = ScanLimits {
+        jsonl_bytes: 512 * 1024 * 1024,
+    };
     let mut failures = Failures {
         budgets: limits.incomplete(),
         ..Failures::default()
     };
-    for (name, cap) in [("rollout-a.jsonl", limits.jsonl_bytes),
-        ("rollout-b.json", super::super::MAX_AUGMENT_ROLLOUT_BYTES)] {
+    for (name, cap) in [
+        ("rollout-a.jsonl", limits.jsonl_bytes),
+        ("rollout-b.json", super::super::MAX_AUGMENT_ROLLOUT_BYTES),
+    ] {
         let path = PathBuf::from(name);
-        let source = DiscoveredSourceFile::new("codex", &ScanRoot::local(path.clone()),
-            path, DiscoveredSourceRole::PrimarySessionLog, true);
+        let source = DiscoveredSourceFile::new(
+            "codex",
+            &ScanRoot::local(path.clone()),
+            path,
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        );
         let error = IncompleteScan {
             limit_bytes: cap,
             rejected_source_count: 1,
             rejected_sources: vec![RejectedSource {
-                source_path: name.into(), observed_bytes: cap + 1, limit_bytes: None,
+                source_path: name.into(),
+                observed_bytes: cap + 1,
+                limit_bytes: None,
             }],
             ..IncompleteScan::default()
         };
@@ -217,6 +228,9 @@ fn aggregation_keeps_each_formats_effective_limit_and_default_schema() -> Result
     let report = serde_json::to_value(error.downcast_ref::<IncompleteScan>().unwrap())?;
     assert_eq!(report["limit_bytes"], limits.jsonl_bytes);
     assert!(report["rejected_sources"][0].get("limit_bytes").is_none());
-    assert_eq!(report["rejected_sources"][1]["limit_bytes"], super::super::MAX_AUGMENT_ROLLOUT_BYTES);
+    assert_eq!(
+        report["rejected_sources"][1]["limit_bytes"],
+        super::super::MAX_AUGMENT_ROLLOUT_BYTES
+    );
     Ok(())
 }

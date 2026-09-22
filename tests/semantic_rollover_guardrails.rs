@@ -23,8 +23,7 @@ use coding_agent_search::search::vector_index::{
 
 const MINILM_ID: &str = "minilm-384";
 const MODEL_REVISION: &str = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf";
-const LEGACY_MINILM_REVISION: &str =
-    "native-minilm-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf";
+const LEGACY_MINILM_REVISION: &str = "native-minilm-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf";
 const CORPUS: &str = "content-v1:3:3:3";
 
 // These are ledger fixtures, not certificates that a native ANN graph or an
@@ -169,7 +168,12 @@ fn gh458_initial_build_progress_never_invents_a_published_tier() -> Result<()> {
     assert!(loaded.fast_tier.is_none());
     assert!(loaded.quality_tier.is_none());
     assert!(loaded.hnsw.is_none());
-    assert!(!loaded.checkpoint.context("checkpoint disappeared")?.is_complete());
+    assert!(
+        !loaded
+            .checkpoint
+            .context("checkpoint disappeared")?
+            .is_complete()
+    );
     Ok(())
 }
 
@@ -199,7 +203,12 @@ fn gh458_rebuild_contract_stays_strict_without_erasing_retained_fsvi() -> Result
             384,
             true,
         ),
-        ("different-embedder", MINILM_VECTOR_SPACE_REVISION, 384, true),
+        (
+            "different-embedder",
+            MINILM_VECTOR_SPACE_REVISION,
+            384,
+            true,
+        ),
         (MINILM_ID, MINILM_VECTOR_SPACE_REVISION, 128, true),
     ];
     for (header_embedder, revision, dimension, expected_rebuild) in cases {
@@ -211,7 +220,11 @@ fn gh458_rebuild_contract_stays_strict_without_erasing_retained_fsvi() -> Result
             expected_rebuild,
             "header={header_embedder}, revision={revision}, dimension={dimension}"
         );
-        assert_eq!(fs::read(&path)?, bytes, "rebuild inspection changed the FSVI");
+        assert_eq!(
+            fs::read(&path)?,
+            bytes,
+            "rebuild inspection changed the FSVI"
+        );
     }
     Ok(())
 }

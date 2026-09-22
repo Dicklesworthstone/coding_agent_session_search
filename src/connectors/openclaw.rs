@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use franken_agent_detection::connectors::file_modified_since;
 use franken_agent_detection::{
-    Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole,
-    NormalizedConversation, ScanContext, ScanRoot,
+    Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
+    ScanContext, ScanRoot,
 };
 
 #[derive(Default)]
@@ -127,12 +127,15 @@ impl Connector for OpenClawConnector {
             if source.role == DiscoveredSourceRole::SqliteDatabase {
                 let wal = wal_path(&source.source_path);
                 if wal.is_file() && paths.insert(wal.clone()) {
-                    sidecars.push(DiscoveredSourceFile {
-                        source_path: wal,
-                        role: DiscoveredSourceRole::MetadataSidecar,
-                        required_for_reconstruction: true,
-                        ..source.clone()
-                    }.with_fs_metadata());
+                    sidecars.push(
+                        DiscoveredSourceFile {
+                            source_path: wal,
+                            role: DiscoveredSourceRole::MetadataSidecar,
+                            required_for_reconstruction: true,
+                            ..source.clone()
+                        }
+                        .with_fs_metadata(),
+                    );
                 }
             }
         }
@@ -150,7 +153,9 @@ impl Connector for OpenClawConnector {
             let mut scoped = ctx.clone();
             scoped.since_ts = None;
             // Only the selected database is reopened, never adjacent stores.
-            let root = ctx.scan_roots.iter()
+            let root = ctx
+                .scan_roots
+                .iter()
                 .find(|root| source.source_path.starts_with(&root.path))
                 .cloned()
                 .unwrap_or_else(|| ScanRoot::local(source.source_path.clone()));
@@ -161,11 +166,16 @@ impl Connector for OpenClawConnector {
                 // fallback or any results already returned by the dependency.
                 continue;
             }
-            let native_ids: HashSet<_> = native.iter()
-                .filter_map(|c| c.external_id.as_deref()).collect();
-            let legacy_root = source.source_path.parent()
+            let native_ids: HashSet<_> = native
+                .iter()
+                .filter_map(|c| c.external_id.as_deref())
+                .collect();
+            let legacy_root = source
+                .source_path
+                .parent()
                 .filter(|parent| parent.file_name().is_some_and(|name| name == "agent"))
-                .and_then(Path::parent).map(|agent| agent.join("sessions"));
+                .and_then(Path::parent)
+                .map(|agent| agent.join("sessions"));
             // Prefer authoritative native history over migration leftovers,
             // including stale sessions that should not be re-emitted. Scope
             // suppression to this physical agent directory, not another mirror.
@@ -173,14 +183,23 @@ impl Connector for OpenClawConnector {
                 let same_store = conversation.source_path == source.source_path;
                 let legacy_copy = legacy_root.as_ref().is_some_and(|root| {
                     conversation.source_path.starts_with(root)
-                        && conversation.external_id.as_deref().is_some_and(|id| native_ids.contains(id))
+                        && conversation
+                            .external_id
+                            .as_deref()
+                            .is_some_and(|id| native_ids.contains(id))
                 });
                 !same_store && !legacy_copy
             });
             conversations.extend(native.into_iter().filter(|conversation| {
                 // Match FAD's session-level cutoff and clock-skew allowance.
                 // Keep every event of a selected session, not only new messages.
-                match (ctx.since_ts, conversation.metadata.get("last_event_at").and_then(|v| v.as_i64())) {
+                match (
+                    ctx.since_ts,
+                    conversation
+                        .metadata
+                        .get("last_event_at")
+                        .and_then(|v| v.as_i64()),
+                ) {
                     (Some(since), Some(last)) => last >= since.saturating_sub(1_000),
                     _ => true,
                 }
@@ -204,14 +223,21 @@ mod tests {
 
     fn insert(conn: &Connection, id: &str, seq: i64, at: i64, text: &str) -> Result<()> {
         let body = json!({"type":"message", "message":{"role":"user", "content":text}}).to_string();
-        conn.execute_compat("INSERT INTO transcript_events VALUES (?1, ?2, ?3, ?4)", &[
-            ParamValue::from(id), ParamValue::from(seq), ParamValue::from(body.as_str()), ParamValue::from(at),
-        ])?;
+        conn.execute_compat(
+            "INSERT INTO transcript_events VALUES (?1, ?2, ?3, ?4)",
+            &[
+                ParamValue::from(id),
+                ParamValue::from(seq),
+                ParamValue::from(body.as_str()),
+                ParamValue::from(at),
+            ],
+        )?;
         Ok(())
     }
 
     #[test]
-    fn incremental_wal_updates_preserve_prefixes_and_suppress_stale_migration_copies() -> Result<()> {
+    fn incremental_wal_updates_preserve_prefixes_and_suppress_stale_migration_copies() -> Result<()>
+    {
         let temp = tempfile::tempdir()?;
         let agent = temp.path().join(".openclaw/agents/main");
         fs::create_dir_all(agent.join("agent"))?;
@@ -227,41 +253,90 @@ mod tests {
         writer.execute("PRAGMA journal_mode = WAL")?;
         insert(&writer, "fresh", 1, NEW, "WAL append")?;
         writer.close_without_checkpoint()?;
-        fs::File::options().write(true).open(&database)?
+        fs::File::options()
+            .write(true)
+            .open(&database)?
             .set_modified(UNIX_EPOCH + Duration::from_millis(OLD as u64))?;
         let wal = wal_path(&database);
         assert!(fs::metadata(&wal)?.len() > 32);
         for name in ["fresh", "stale", "legacy-only"] {
             let body = json!({"type":"message", "message":{"role":"user", "content":format!("legacy {name}")}});
-            fs::write(agent.join("sessions").join(format!("{name}.jsonl")), format!("{body}\n"))?;
+            fs::write(
+                agent.join("sessions").join(format!("{name}.jsonl")),
+                format!("{body}\n"),
+            )?;
         }
-        let before = (fs::read(&database)?, fs::read(&wal)?, fs::metadata(&database)?.modified()?, fs::metadata(&wal)?.modified()?);
-        let ctx = ScanContext::with_roots(temp.path().join("cass"), vec![ScanRoot::local(temp.path().to_path_buf())], Some(NEW - 1_000));
-        assert!(!file_modified_since(&database, ctx.since_ts), "fixture must exercise the stale database gate");
+        let before = (
+            fs::read(&database)?,
+            fs::read(&wal)?,
+            fs::metadata(&database)?.modified()?,
+            fs::metadata(&wal)?.modified()?,
+        );
+        let ctx = ScanContext::with_roots(
+            temp.path().join("cass"),
+            vec![ScanRoot::local(temp.path().to_path_buf())],
+            Some(NEW - 1_000),
+        );
+        assert!(
+            !file_modified_since(&database, ctx.since_ts),
+            "fixture must exercise the stale database gate"
+        );
         let (_, factory) = crate::connectors::get_connector_factories()
-            .into_iter().find(|(name, _)| *name == "openclaw").unwrap();
+            .into_iter()
+            .find(|(name, _)| *name == "openclaw")
+            .unwrap();
         let connector = factory();
         let sources = connector.discover_source_files(&ctx)?;
-        assert!(sources.iter().any(|s| s.source_path == database && s.role == DiscoveredSourceRole::SqliteDatabase));
-        assert!(sources.iter().any(|s| s.source_path == wal && s.role == DiscoveredSourceRole::MetadataSidecar && s.required_for_reconstruction));
+        assert!(
+            sources.iter().any(
+                |s| s.source_path == database && s.role == DiscoveredSourceRole::SqliteDatabase
+            )
+        );
+        assert!(sources.iter().any(|s| s.source_path == wal
+            && s.role == DiscoveredSourceRole::MetadataSidecar
+            && s.required_for_reconstruction));
         let conversations = connector.scan(&ctx)?;
         assert_eq!(conversations.len(), 2);
-        let fresh = conversations.iter().find(|c| c.external_id.as_deref() == Some("main/fresh")).unwrap();
+        let fresh = conversations
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("main/fresh"))
+            .unwrap();
         assert_eq!(fresh.source_path, database);
         assert_eq!(fresh.messages.len(), 2);
         assert_eq!(fresh.messages[0].content, "original prefix");
         assert_eq!(fresh.messages[1].content, "WAL append");
-        assert!(conversations.iter().any(|c| c.external_id.as_deref() == Some("main/legacy-only")));
-        assert_eq!((fs::read(&database)?, fs::read(&wal)?, fs::metadata(&database)?.modified()?, fs::metadata(&wal)?.modified()?), before);
+        assert!(
+            conversations
+                .iter()
+                .any(|c| c.external_id.as_deref() == Some("main/legacy-only"))
+        );
+        assert_eq!(
+            (
+                fs::read(&database)?,
+                fs::read(&wal)?,
+                fs::metadata(&database)?.modified()?,
+                fs::metadata(&wal)?.modified()?
+            ),
+            before
+        );
         Ok(())
     }
 
     #[test]
     fn state_override_trims_and_expands_only_the_home_component() {
         let home = Path::new("profile");
-        assert_eq!(state_path("  ~/openclaw-state  ", Some(home)), Some(home.join("openclaw-state")));
-        assert_eq!(state_path("~other/state", Some(home)), Some(PathBuf::from("~other/state")));
-        assert_eq!(state_path(" custom/state ", None), Some(PathBuf::from("custom/state")));
+        assert_eq!(
+            state_path("  ~/openclaw-state  ", Some(home)),
+            Some(home.join("openclaw-state"))
+        );
+        assert_eq!(
+            state_path("~other/state", Some(home)),
+            Some(PathBuf::from("~other/state"))
+        );
+        assert_eq!(
+            state_path(" custom/state ", None),
+            Some(PathBuf::from("custom/state"))
+        );
         assert_eq!(state_path("  ", Some(home)), None);
     }
 
@@ -270,12 +345,21 @@ mod tests {
         fn original() -> Box<dyn Connector + Send> {
             Box::new(franken_agent_detection::CodexConnector::new())
         }
-        assert!(std::ptr::fn_addr_eq(with_wal_freshness("codex", original), original as fn() -> Box<dyn Connector + Send>));
+        assert!(std::ptr::fn_addr_eq(
+            with_wal_freshness("codex", original),
+            original as fn() -> Box<dyn Connector + Send>
+        ));
     }
 
     #[test]
     fn wal_sidecar_suffix_preserves_non_extension_path_identity() {
-        assert_eq!(wal_path(Path::new("agent/openclaw-agent.sqlite")), PathBuf::from("agent/openclaw-agent.sqlite-wal"));
-        assert_eq!(wal_path(Path::new("agent/history")), PathBuf::from("agent/history-wal"));
+        assert_eq!(
+            wal_path(Path::new("agent/openclaw-agent.sqlite")),
+            PathBuf::from("agent/openclaw-agent.sqlite-wal")
+        );
+        assert_eq!(
+            wal_path(Path::new("agent/history")),
+            PathBuf::from("agent/history-wal")
+        );
     }
 }

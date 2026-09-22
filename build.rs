@@ -158,6 +158,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // features are required even for --no-default-features CASS builds.
         expected_features: &[
             "chatgpt",
+            "codebuff",
             "connectors",
             "copilot-vscdb",
             "crush",

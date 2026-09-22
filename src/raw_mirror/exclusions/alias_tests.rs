@@ -19,7 +19,9 @@ const CHILD_TEST: &str = "raw_mirror::exclusions::alias_tests::child";
 fn fixture() -> anyhow::Result<tempfile::TempDir> {
     let root = tempfile::tempdir()?;
     for (directory, id) in [("private", 1), ("private-copy", 2)] {
-        let source = root.path().join(format!(".codex/sessions/{directory}/rollout-{id}.jsonl"));
+        let source = root
+            .path()
+            .join(format!(".codex/sessions/{directory}/rollout-{id}.jsonl"));
         fs::create_dir_all(source.parent().unwrap())?;
         fs::write(
             source,
@@ -64,19 +66,31 @@ fn run_child(root: &Path, mode: &str, exclusions: &OsStr) -> anyhow::Result<()> 
 #[test]
 fn relative_policy_blocks_absolute_discovery_and_capture() -> anyhow::Result<()> {
     let root = fixture()?;
-    run_child(root.path(), "absolute-source", OsStr::new(".codex/sessions/private"))
+    run_child(
+        root.path(),
+        "absolute-source",
+        OsStr::new(".codex/sessions/private"),
+    )
 }
 
 #[test]
 fn absolute_policy_blocks_relative_source_capture() -> anyhow::Result<()> {
     let root = fixture()?;
-    run_child(root.path(), "relative-source", root.path().join(".codex/sessions/private").as_os_str())
+    run_child(
+        root.path(),
+        "relative-source",
+        root.path().join(".codex/sessions/private").as_os_str(),
+    )
 }
 
 #[test]
 fn parent_components_do_not_admit_excluded_sources() -> anyhow::Result<()> {
     let root = fixture()?;
-    run_child(root.path(), "parent-source", OsStr::new(".codex/sessions/private"))
+    run_child(
+        root.path(),
+        "parent-source",
+        OsStr::new(".codex/sessions/private"),
+    )
 }
 
 #[cfg(unix)]
@@ -85,8 +99,15 @@ fn source_and_policy_symlinks_do_not_admit_excluded_sources() -> anyhow::Result<
     use std::os::unix::fs::symlink;
     for mode in ["source-alias", "policy-alias", "missing-alias"] {
         let root = fixture()?;
-        symlink(root.path().join(".codex/sessions/private"), root.path().join("alias"))?;
-        let excluded = if mode == "policy-alias" { "alias" } else { ".codex/sessions/private" };
+        symlink(
+            root.path().join(".codex/sessions/private"),
+            root.path().join("alias"),
+        )?;
+        let excluded = if mode == "policy-alias" {
+            "alias"
+        } else {
+            ".codex/sessions/private"
+        };
         run_child(root.path(), mode, OsStr::new(excluded))?;
     }
     Ok(())
@@ -97,7 +118,11 @@ fn source_and_policy_symlinks_do_not_admit_excluded_sources() -> anyhow::Result<
 fn non_unicode_policy_cannot_silently_disable_exclusions() -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let root = fixture()?;
-    run_child(root.path(), "invalid-policy", OsStr::from_bytes(b"private-\xff"))
+    run_child(
+        root.path(),
+        "invalid-policy",
+        OsStr::from_bytes(b"private-\xff"),
+    )
 }
 
 fn input<'a>(data: &'a Path, source: &'a Path, provider: &'a str) -> RawMirrorCaptureInput<'a> {
@@ -116,12 +141,19 @@ fn assert_excluded(data: &Path, source: &Path) -> anyhow::Result<()> {
     for provider in ["codex", "claude"] {
         let error = capture_source_file(input(data, source, provider)).unwrap_err();
         assert!(error.is::<RawMirrorSourceExcluded>(), "{error:#}");
-        assert!(!error.to_string().contains(source.to_string_lossy().as_ref()));
-        let error = capture_source_file_with_chunk_policy(input(data, source, provider), 1, 7)
-            .unwrap_err();
+        assert!(
+            !error
+                .to_string()
+                .contains(source.to_string_lossy().as_ref())
+        );
+        let error =
+            capture_source_file_with_chunk_policy(input(data, source, provider), 1, 7).unwrap_err();
         assert!(error.is::<RawMirrorSourceExcluded>(), "{error:#}");
     }
-    assert!(!data.exists(), "excluded capture must not initialize mirror storage");
+    assert!(
+        !data.exists(),
+        "excluded capture must not initialize mirror storage"
+    );
     Ok(())
 }
 

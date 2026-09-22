@@ -386,7 +386,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 26 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 32 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -419,6 +419,7 @@ Ingests history from 26 local agents, normalizing them into a unified `Conversat
 - **Antigravity (IDE + agy CLI)**: both stores are probed by default — the IDE's `~/.gemini/antigravity/` and the CLI's `~/.gemini/antigravity-cli/` — each holding `brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript) with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. IDE conversations are keyed `ide/<uuid>` so the two stores never collide; `CASS_ANTIGRAVITY_DATA_ROOT` replaces both with one explicit base. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
 - **OpenHands (OpenDevin)**: `~/.openhands/conversations/<id>/` — `base_state.json` metadata plus an `events/event-NNNNN-<uuid>.json` event stream (JSON)
 - **Grok Build (xAI `grok`)**: `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/` — `updates.jsonl` (authoritative ACP session-update stream) with `summary.json` metadata and `chat_history.jsonl` fallback (override the base dir with `GROK_HOME`). Resume with `grok --resume <session-id>`.
+- **Codebuff / Freebuff (`codebuff`)**: `~/.config/manicode/projects/<project>/chats/<chat-id>/chat-messages.json` with its `run-state.json` (override with `CASS_CODEBUFF_DATA_ROOT`). Both products write the same Manicode store and no chat records which binary wrote it, so their sessions share one lineage identity, `codebuff` (filter with `--agent codebuff`). Messages are reconciled by their native IDs, so an edited message updates in place instead of duplicating.
 
 Claude Code Desktop sidecars preserve title, workspace, model, and session IDs,
 but not necessarily the full conversation body. If Claude Code has culled an old
@@ -2575,7 +2576,7 @@ Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sql
 
 - **Immutable History**: When an agent adds a message to a conversation, we don't update the existing row. We insert the new message linked to the conversation ID.
 - **Deduplication**: Messages are keyed by `UNIQUE(conversation_id, idx)` and inserted with `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice; BLAKE3 content hashes are used only in memory as merge fingerprints.
-- **Versioning**: A `_schema_migrations` table and strict migration path (20 versioned migrations at HEAD; see *Database Schema Migrations*) ensure that upgrades are safe and atomic.
+- **Versioning**: A `_schema_migrations` table and strict migration path (21 versioned migrations at HEAD; see *Database Schema Migrations*) ensure that upgrades are safe and atomic.
 
 ---
 
@@ -2655,20 +2656,21 @@ This means corrupted lexical data is a repairable derivative-state problem. Oper
 
 ### Database Schema Migrations
 
-The SQLite database uses 20 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 20` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
+The SQLite database uses 21 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 21` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
 
 | Version | Migration | Version | Migration |
 |---------|-----------|---------|-----------|
-| 1 | `core_tables` | 11 | `message_metrics` |
-| 2 | `fts_messages` | 12 | `model_dimensions` |
-| 3 | `fts_messages_rebuild` | 13 | `plan_token_rollups` |
-| 4 | `sources` | 14 | `fts_contentless` |
-| 5 | `provenance_columns` | 15 | `conversation_tail_state_cache` |
-| 6 | `source_path_index` | 16 | `drop_redundant_message_conv_idx` |
-| 7 | `msgpack_columns` | 17 | `drop_message_created_idx` |
-| 8 | `daily_stats` | 18 | `conversation_tail_state_hot_table` |
-| 9 | `embedding_jobs` | 19 | `conversation_external_lookup` |
-| 10 | `token_analytics` | 20 | `conversation_external_tail_lookup` (current) |
+| 1 | `core_tables` | 12 | `model_dimensions` |
+| 2 | `fts_messages` | 13 | `plan_token_rollups` |
+| 3 | `fts_messages_rebuild` | 14 | `fts_contentless` |
+| 4 | `sources` | 15 | `conversation_tail_state_cache` |
+| 5 | `provenance_columns` | 16 | `drop_redundant_message_conv_idx` |
+| 6 | `source_path_index` | 17 | `drop_message_created_idx` |
+| 7 | `msgpack_columns` | 18 | `conversation_tail_state_hot_table` |
+| 8 | `daily_stats` | 19 | `conversation_external_lookup` |
+| 9 | `embedding_jobs` | 20 | `conversation_external_tail_lookup` |
+| 10 | `token_analytics` | 21 | `conversation_context_index` (current) |
+| 11 | `message_metrics` | | |
 
 **Migration Process**:
 1. On startup, `cass` checks `_schema_migrations` in the database (older databases that still record `schema_version` in the `meta` table are transitioned automatically)
@@ -3026,6 +3028,13 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `sources discover` | Auto-discover SSH hosts from `~/.ssh/config` |
 | `sources reingest` | Re-ingest an already-synced mirror into the canonical archive without re-running rsync |
 | `sources artifact-manifest` | Build or verify a lexical-artifact evidence manifest for remote exchange |
+
+Two more commands are dispatched before the main parser (so they are absent from `cass --help`, `introspect` and completions); use their own `--help`:
+
+| Command | Purpose |
+|---------|---------|
+| `serve --stdio [--mcp] (--data-dir DIR \| --index PATH)` | Persistent search service: reuses one read-only lexical index reader across a stream of newline-delimited JSON requests (or MCP with `--mcp`), with per-request deadlines (`--request-timeout-ms`), cross-process reader admission (`--admission-dir`, `--admission-slots`) and a resident-memory cap (`--max-resident-mib`). Search, status and startup never open the canonical database; `--db` opts in to canonical view requests. Lexical only (no semantic/HNSW serving). See `docs/SEARCH_SERVICE.md` |
+| `archive export\|verify\|search\|view\|import` | Bounded, versioned logical archive of the canonical rows: `export --output FILE --archive-id ID --include-private` streams a read-only snapshot to a new private JSONL file; `verify` checks framing, identities, counts and digest without a database; `search`/`view` read verified message bodies without restoring; `import` restores into a new database and never replaces an existing archive |
 
 ### Specialized Validation and Recording Tools
 
@@ -3488,7 +3497,7 @@ When intentionally updating one of these sibling crates, update the manifest pin
 
 ## 🧪 Developer Workflow
 
-We target the dated Rust nightly `nightly-2026-08-25` pinned by
+We target the dated Rust nightly `nightly-2026-08-31` pinned by
 `rust-toolchain.toml`. Agents should offload build, test, lint, and snapshot
 commands with `rch`.
 
@@ -3552,7 +3561,7 @@ opt-level = 3           # Maximum runtime optimization
 
 ### CI Pipeline & Artifacts
 
-The CI pipeline (`.github/workflows/ci.yml`) is defined to run on every PR and push to main. **Note:** every workflow defined in `.github/workflows/` is currently disabled (`gh workflow list --all` shows `disabled_manually` for all of them); until CI is re-enabled the same gates are run by agents through `rch`:
+The CI pipeline (`.github/workflows/ci.yml`) is defined to run on every PR and push to main. **Note:** the general workflows (CI, Release, Coverage, Benchmarks, Browser Tests, Fuzzing, Install Test, Fresh Clone Build) are currently disabled (`gh workflow list --all` shows `disabled_manually`); only narrow, issue-specific regression workflows run on push. Until CI is re-enabled the full gate (fmt, clippy, lib and integration tests, goldens, UBS) is run by agents through `rch` with `scripts/gate.sh`:
 
 | Job | Purpose | Artifacts |
 |-----|---------|-----------|

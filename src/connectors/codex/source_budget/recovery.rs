@@ -11,12 +11,12 @@ use std::io;
 use franken_agent_detection::ScanRoot;
 use serde::Serialize;
 
-use crate::connectors::codex::archives;
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, IncompleteScan, MAX_REJECTION_SAMPLES,
     NormalizedConversation, RejectedSource, Result, ScanAdmission, ScanContext, ScanExclusions,
     ScanLimits, SourceCompletion, SourceScanHooks, scan_with_admission,
 };
+use crate::connectors::codex::archives;
 
 #[derive(Debug, Serialize)]
 struct FailedSource {
@@ -192,9 +192,9 @@ fn scan_source(
     let consumer_failed = Cell::new(false);
     let visited = Cell::new(false);
     let scope_changed = Cell::new(false);
-    let directory_id = archives::session_id(ctx, source).map(Some).or_else(|| {
-        (source.scan_root != source.source_path).then(|| directory_session_id(source))
-    });
+    let directory_id = archives::session_id(ctx, source)
+        .map(Some)
+        .or_else(|| (source.scan_root != source.source_path).then(|| directory_session_id(source)));
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
