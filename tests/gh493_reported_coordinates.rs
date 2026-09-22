@@ -178,10 +178,9 @@ fn reported_129_and_541_targets_preserve_canonical_text_and_tool_role() {
     let source_before = std::fs::read(&fixture.path).unwrap();
     let db_before = std::fs::read(&fixture.db).unwrap();
     for command in ["expand", "view"] {
-        for (number, content, role) in [
-            (129, TOOL_TEXT, "tool"),
-            (541, ASSISTANT_TEXT, "assistant"),
-        ] {
+        for (number, content, role) in
+            [(129, TOOL_TEXT, "tool"), (541, ASSISTANT_TEXT, "assistant")]
+        {
             let result = rows(fixture.follow(command, number, 0), command);
             assert_eq!(result.len(), 1);
             let target = &result[0];

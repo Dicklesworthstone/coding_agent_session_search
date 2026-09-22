@@ -1,14 +1,31 @@
 # Sync Strategy
 
+## Implementation status — 2026-09-21
+
+The explicit `cass archive export`, `verify` and `import` frontend now has source
+implementations in `src/logical_archive/`. Restoration supports a new database
+with the exact current canonical schema, private bounded batches, persisted-row
+digest verification and no-clobber publication. `--if-identical` permits only a
+verified read-only no-op for an existing destination; differing content is a
+conflict, not a merge. See [the command and wire contract](../LOGICAL_ARCHIVE.md).
+
+This updates the implementation status, not the acceptance evidence below.
+Native final-source tests, interruption/platform qualification and measured
+large-archive resource bounds remain required; authored tests and a targeted CI
+workflow are not passing-test receipts. Cross-schema migration, merging,
+automatic search-asset rebuilding and ordinary root-command discovery are not
+supplied by these slices. Do not treat these source additions as closing
+`coding_agent_session_search-2l1b0.34`.
+
 ## Scope decision — 2026-09-17
 
-Logical JSONL archive export/import is **not implemented**. Preserve the
-format-independent portability goal as the open implementation task
+At this scope decision, logical JSONL archive export/import was not implemented.
+The format-independent portability goal was preserved as implementation task
 `coding_agent_session_search-2l1b0.34`; this document supplies its minimum
 contract. `coding_agent_session_search-2l1b0.27` decides scope only and cannot
 serve as evidence of a working round trip.
 
-Current capabilities have different boundaries:
+The other capabilities have different boundaries:
 
 | Route | What it covers | What it does not establish |
 |---|---|---|

@@ -527,8 +527,8 @@ pub enum Commands {
         /// Include extended metadata in robot output (`elapsed_ms`, `wildcard_fallback`, `cache_stats`)
         #[arg(long)]
         robot_meta: bool,
-        /// Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent`
-        /// or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`
+        /// Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent,source_id,conversation_id`
+        /// or 'summary' for `source_path,line_number,agent,title,score,source_id,conversation_id`. Example: --fields `source_path,line_number`
         #[arg(long, value_delimiter = ',')]
         fields: Option<Vec<String>>,
         /// Truncate content/snippet fields to max N characters (UTF-8 safe, adds '...' and _truncated indicator)
@@ -6468,8 +6468,7 @@ mod canonical_top_level_command_tests {
     #[test]
     fn ann_index_parse_error_explains_the_index_command() {
         for format in ["--json", "--robot"] {
-            let args = ["cass", "index", "--semantic", "--approximate", format]
-                .map(str::to_string);
+            let args = ["cass", "index", "--semantic", "--approximate", format].map(str::to_string);
             let error = Cli::try_parse_from(&args).expect_err("query-only flag rejected");
             let output = format_friendly_parse_error(error, &args, &args);
             let payload: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
@@ -7023,13 +7022,12 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         .flatten()
         .collect();
 
-    // Teaching notes go to stderr for humans AND robots: README promises that
-    // agents learn the canonical syntax from a stderr note, and stdout stays
-    // data-only in robot mode so the note can never corrupt a JSON payload.
-    // Only the robot-docs/--robot-help surfaces stay quiet, because their
-    // stderr is part of the documented docs stream.
-    if !all_notes.is_empty() && !is_doc_mode {
-        emit_correction_notes(&all_notes, is_robot_mode);
+    // Human teaching notes can precede execution. For robots, defer notes
+    // until success: on failure stderr must remain one structured error
+    // envelope, not plaintext followed by JSON. Successful recovery retains
+    // its documented teaching note without contaminating stdout.
+    if !all_notes.is_empty() && !is_doc_mode && !is_robot_mode {
+        emit_correction_notes(&all_notes, false);
     }
 
     let result = execute_cli(
@@ -7040,6 +7038,10 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         stderr_is_tty,
     )
     .await;
+
+    if result.is_ok() && !all_notes.is_empty() && !is_doc_mode && is_robot_mode {
+        emit_correction_notes(&all_notes, true);
+    }
 
     if let Some(path) = &cli.trace_file {
         let duration_ms = start_instant.elapsed().as_millis();
@@ -7124,8 +7126,8 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         .flatten()
         .collect();
 
-    if !all_notes.is_empty() {
-        emit_correction_notes(&all_notes, is_robot_mode);
+    if !all_notes.is_empty() && !is_robot_mode {
+        emit_correction_notes(&all_notes, false);
     }
 
     let result = match command.expect("fast command was matched above") {
@@ -7152,6 +7154,10 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         }
         _ => unreachable!("non-fast command passed the fast-command guard"),
     };
+
+    if result.is_ok() && !all_notes.is_empty() && is_robot_mode {
+        emit_correction_notes(&all_notes, true);
+    }
 
     if let Some(path) = &cli.trace_file {
         let duration_ms = start_instant.elapsed().as_millis();
@@ -27991,6 +27997,83 @@ fn repair_lexical_index_for_search_with_stall_watchdog(
     })?
 }
 
+// A lock race does not make the generation observed before the race safe.
+// Reuse only a freshly diagnosed readable generation, including intentionally
+// stale-but-readable ones; missing, foreign and incomplete generations cannot
+// become usable merely because another indexer acquired the lock.
+fn search_existing_lexical_generation_is_usable(
+    index_path: &Path,
+    db_path: &Path,
+) -> CliResult<bool> {
+    if !crate::search::tantivy::searchable_index_exists(index_path) {
+        return Ok(false);
+    }
+    Ok(
+        search_lexical_self_heal_diagnosis(index_path, db_path)?
+            .as_ref()
+            .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild()),
+    )
+}
+
+fn admit_search_lexical_repair(db_path: &Path, reason: &str) -> CliResult<()> {
+    crate::search::inline_repair::admit(
+        db_path,
+        crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes(),
+    )
+    .map(|_| ())
+    .map_err(|error| CliError {
+        code: 5,
+        kind: "maintenance-required",
+        message: format!(
+            "Automatic lexical repair was not started after detecting {reason}: {error:#}"
+        ),
+        hint: Some(
+            "Run `cass index --full --json` with the same --db and --data-dir as this search. \
+             Explicit full indexing is not subject to the search repair budget."
+                .to_owned(),
+        ),
+        retryable: true,
+    })
+}
+
+fn verify_search_lexical_repair_publication(
+    index_path: &Path,
+    db_path: &Path,
+    indexed_docs: usize,
+) -> anyhow::Result<()> {
+    let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(index_path)?.ok_or_else(|| {
+        anyhow::anyhow!("lexical repair returned success without a published checkpoint")
+    })?;
+    anyhow::ensure!(
+        checkpoint.completed,
+        "lexical repair returned success but publication is incomplete"
+    );
+    anyhow::ensure!(
+        checkpoint.indexed_docs == indexed_docs,
+        "lexical repair returned success with inconsistent publication counts \
+         (repaired_docs={indexed_docs}, checkpoint_docs={})",
+        checkpoint.indexed_docs
+    );
+    let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path).map_err(|error| {
+        anyhow::anyhow!("cannot verify repaired lexical publication: {}", error.message)
+    })?;
+    if let Some(diagnosis) = diagnosis {
+        // A concurrent canonical append may make a completed, readable
+        // publication stale. That is allowed; an incomplete/foreign/schema-
+        // incompatible generation is not. The checkpoint above is mandatory.
+        anyhow::ensure!(
+            diagnosis.existing_index_search_allowed,
+            "lexical repair returned success but its publication is unusable: {}",
+            diagnosis.reason
+        );
+    }
+    crate::indexer::verify_published_lexical_doc_count(
+        index_path,
+        indexed_docs,
+        "search repair completion",
+    )
+}
+
 fn ensure_lexical_assets_for_search(
     data_dir: &Path,
     db_path: &Path,
@@ -28044,6 +28127,13 @@ fn ensure_lexical_assets_for_search(
         return Ok(SearchLexicalSelfHeal::skipped());
     };
     let reason = diagnosis.reason;
+
+    // Admit maintenance before even trying a checkpoint refresh: refreshing an
+    // incomplete archive can reopen SQLite and perform substantial work. A
+    // readable stale generation still takes the existing fail-open path below.
+    if !diagnosis.existing_index_search_allowed {
+        admit_search_lexical_repair(db_path, &reason)?;
+    }
 
     if initial_index_exists && diagnosis.checkpoint_refresh_allowed {
         match crate::indexer::refresh_completed_lexical_rebuild_checkpoint_from_live_index(
@@ -28148,7 +28238,7 @@ fn ensure_lexical_assets_for_search(
                     anyhow::anyhow!(rendered),
                 ));
             }
-            if initial_index_exists {
+            if search_existing_lexical_generation_is_usable(index_path, db_path)? {
                 return Ok(SearchLexicalSelfHeal {
                     action: "concurrent-repair-searching-existing-index",
                     reason: Some(reason),
@@ -28162,7 +28252,10 @@ fn ensure_lexical_assets_for_search(
                 index_path,
                 search_active_rebuild_wait_duration(timeout_ms, started_at),
             );
-            if waited && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+            if !waited {
+                return Err(search_lock_busy_error(data_dir));
+            }
+            if search_existing_lexical_generation_is_usable(index_path, db_path)? {
                 return Ok(SearchLexicalSelfHeal {
                     action: "waited-for-concurrent-lexical-repair",
                     reason: Some(reason),
@@ -28170,10 +28263,16 @@ fn ensure_lexical_assets_for_search(
                 });
             }
 
+            // The database or WAL can grow while the other indexer holds the
+            // lock. A prior admission is not a permit for an unbounded retry.
+            admit_search_lexical_repair(db_path, &reason)?;
             repair_lexical_index_for_search_with_stall_watchdog(db_path, data_dir)
                 .map_err(|retry_err| search_lexical_repair_failed_error(&reason, retry_err))?
         }
     };
+
+    verify_search_lexical_repair_publication(index_path, db_path, repair.indexed_docs)
+        .map_err(|error| search_lexical_repair_failed_error(&reason, error))?;
 
     Ok(SearchLexicalSelfHeal {
         action: "rebuilt-from-canonical-db",
@@ -28184,6 +28283,8 @@ fn ensure_lexical_assets_for_search(
 
 #[cfg(test)]
 mod search_lexical_self_heal_tests {
+    include!("search/gh494_repair_tests.rs");
+
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
@@ -31644,10 +31745,10 @@ fn run_cli_search(
     if let Some(format) = effective_robot {
         let expanded_trust_fields = expand_field_presets(&fields);
         let minimal_trust_projection = expanded_trust_fields.as_ref().is_some_and(|fields| {
-            fields.len() == 3
-                && fields[0] == "source_path"
-                && fields[1] == "line_number"
-                && fields[2] == "agent"
+            fields
+                .iter()
+                .map(String::as_str)
+                .eq(SEARCH_MINIMAL_FIELDS.iter().copied())
         });
         let trust_projection_requested =
             robot_meta && !minimal_trust_projection && !display_result.hits.is_empty();
@@ -33495,23 +33596,38 @@ fn output_display_results(
     Ok(())
 }
 
+// Named presets retain the complete canonical follow-up anchor even when
+// message bodies are omitted. Custom field masks remain caller-controlled.
+const SEARCH_MINIMAL_FIELDS: &[&str] = &[
+    "source_path",
+    "line_number",
+    "agent",
+    "source_id",
+    "conversation_id",
+];
+const SEARCH_SUMMARY_FIELDS: &[&str] = &[
+    "source_path",
+    "line_number",
+    "agent",
+    "title",
+    "score",
+    "source_id",
+    "conversation_id",
+];
+
 /// Expand field presets and return the resolved field list
 fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
     fields.as_ref().map(|f| {
         f.iter()
             .flat_map(|field| match field.as_str() {
-                "minimal" => vec![
-                    "source_path".to_string(),
-                    "line_number".to_string(),
-                    "agent".to_string(),
-                ],
-                "summary" => vec![
-                    "source_path".to_string(),
-                    "line_number".to_string(),
-                    "agent".to_string(),
-                    "title".to_string(),
-                    "score".to_string(),
-                ],
+                "minimal" => SEARCH_MINIMAL_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect(),
+                "summary" => SEARCH_SUMMARY_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect(),
                 // Provenance preset (P3.4) - add source origin info to results
                 "provenance" => vec![
                     "source_id".to_string(),
@@ -34625,18 +34741,16 @@ fn output_robot_results(
         .as_ref()
         .is_none_or(|fields| fields.is_empty());
     let minimal_projection = resolved_fields.as_ref().is_some_and(|fields| {
-        fields.len() == 3
-            && fields[0] == "source_path"
-            && fields[1] == "line_number"
-            && fields[2] == "agent"
+        fields
+            .iter()
+            .map(String::as_str)
+            .eq(SEARCH_MINIMAL_FIELDS.iter().copied())
     });
     let summary_projection = resolved_fields.as_ref().is_some_and(|fields| {
-        fields.len() == 5
-            && fields[0] == "source_path"
-            && fields[1] == "line_number"
-            && fields[2] == "agent"
-            && fields[3] == "title"
-            && fields[4] == "score"
+        fields
+            .iter()
+            .map(String::as_str)
+            .eq(SEARCH_SUMMARY_FIELDS.iter().copied())
     });
     let needs_truncation = truncation_budgets.has_any_limit();
     let passthrough_all_fields = all_fields_requested;
@@ -34677,11 +34791,13 @@ fn output_robot_results(
                 S: Serializer,
             {
                 let hit = self.0;
-                let mut map = serializer.serialize_map(Some(5))?;
+                let mut map = serializer.serialize_map(Some(SEARCH_SUMMARY_FIELDS.len()))?;
                 map.serialize_entry("source_path", &hit.source_path)?;
                 map.serialize_entry("line_number", &hit.line_number)?;
+                map.serialize_entry("conversation_id", &hit.conversation_id)?;
                 map.serialize_entry("agent", &hit.agent)?;
                 map.serialize_entry("title", &hit.title)?;
+                map.serialize_entry("source_id", &normalized_robot_hit_source_id(hit))?;
                 let safe_score = safe_robot_score_value(hit.score);
                 map.serialize_entry("score", &safe_score)?;
                 map.end()
@@ -34898,6 +35014,8 @@ fn output_robot_results(
                     "source_path": hit.source_path.as_str(),
                     "line_number": hit.line_number,
                     "agent": hit.agent.as_str(),
+                    "source_id": normalized_robot_hit_source_id(hit),
+                    "conversation_id": hit.conversation_id,
                 })
             })
             .collect()
@@ -34906,7 +35024,7 @@ fn output_robot_results(
             .hits
             .iter()
             .map(|hit| {
-                let mut map = serde_json::Map::with_capacity(5);
+                let mut map = serde_json::Map::with_capacity(SEARCH_SUMMARY_FIELDS.len());
                 map.insert(
                     "source_path".to_string(),
                     serde_json::Value::String(hit.source_path.clone()),
@@ -34924,6 +35042,14 @@ fn output_robot_results(
                     serde_json::Value::String(hit.title.clone()),
                 );
                 map.insert("score".to_string(), safe_robot_score_value(hit.score));
+                map.insert(
+                    "source_id".to_string(),
+                    serde_json::Value::String(normalized_robot_hit_source_id(hit)),
+                );
+                map.insert(
+                    "conversation_id".to_string(),
+                    serde_json::to_value(hit.conversation_id).unwrap_or_default(),
+                );
                 serde_json::Value::Object(map)
             })
             .collect()
@@ -98152,7 +98278,7 @@ fn response_schema_search_hit() -> serde_json::Value {
             serde_json::json!({
                 "type": ["integer", "null"],
                 "minimum": 1,
-                "description": "Canonical archive conversation identity. Pass to view/expand --conversation-id with source_id and line_number."
+                "description": "Canonical conversation identity in the archive used by search. Pass with source_id, source_path and line_number to view/expand --message-index. Null means no canonical identity is available."
             }),
         ),
         (

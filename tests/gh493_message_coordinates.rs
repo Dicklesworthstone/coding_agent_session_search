@@ -554,3 +554,505 @@ fn malformed_archive_is_not_repaired_or_replaced_with_a_live_file() {
         assert!(!fixture.data.join("broken.db-shm").exists());
     }
 }
+
+#[test]
+fn physical_lines_never_fall_back_to_archive_when_source_is_missing() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    std::fs::rename(&fixture.path, fixture.path.with_extension("retained")).unwrap();
+    let before = std::fs::read(&fixture.db).unwrap();
+    for command in ["view", "expand"] {
+        for json in [false, true] {
+            let mut process = fixture.command(command);
+            process.arg(&fixture.path).args(["--line", "2", "-C", "0"]);
+            if json {
+                process.arg("--json");
+            }
+            let output = process.output().unwrap();
+            assert_eq!(output.status.code(), Some(3));
+            assert!(
+                output.stdout.is_empty(),
+                "an archive row became a physical target"
+            );
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostic.contains("--message-index"), "{diagnostic}");
+        }
+        assert_target(
+            &decode(fixture.follow(command, 8, &[])),
+            command,
+            8,
+            fixture.conversation_id,
+        );
+    }
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), before);
+}
+
+#[test]
+fn physical_read_error_cannot_turn_into_a_successful_archive_target() {
+    let fixture = Fixture::new(&[0, 1, 2]);
+    let broken = b"{\"content\":\"first physical record\"}\n\xff\n";
+    std::fs::write(&fixture.path, broken).unwrap();
+    let before = std::fs::read(&fixture.db).unwrap();
+    for command in ["view", "expand"] {
+        let output = fixture
+            .command(command)
+            .arg(&fixture.path)
+            .args(["--line", "2", "-C", "0", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(9));
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "file-read");
+        assert_target(
+            &decode(fixture.follow(command, 2, &[])),
+            command,
+            2,
+            fixture.conversation_id,
+        );
+    }
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), before);
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), broken);
+}
+
+#[test]
+fn indexed_non_jsonl_files_do_not_change_physical_coordinate_meaning() {
+    let mut fixture = Fixture::new(&[0, 1, 2]);
+    fixture.path = fixture.path.with_extension("json");
+    std::fs::write(
+        &fixture.path,
+        "[\n  {\"content\":\"physical second line\"}\n]\n",
+    )
+    .unwrap();
+    let storage = FrankenStorage::open(&fixture.db).unwrap();
+    storage
+        .raw()
+        .execute_compat(
+            "UPDATE conversations SET source_path = ?1 WHERE id = ?2",
+            coding_agent_search::franken_sync::params![
+                fixture.path.to_string_lossy().as_ref(),
+                fixture.conversation_id
+            ],
+        )
+        .unwrap();
+    drop(storage);
+    let before = std::fs::read(&fixture.db).unwrap();
+    let payload = decode(
+        fixture
+            .command("view")
+            .arg(&fixture.path)
+            .args(["--line", "2", "-C", "0", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(payload["coordinate_space"], "file_line");
+    assert_eq!(payload["content_source"], "file");
+    assert_eq!(payload["total_lines"], 3);
+    assert_eq!(
+        payload["lines"][0]["content"],
+        "  {\"content\":\"physical second line\"}"
+    );
+    assert_eq!(payload["lines"][0]["is_target"], true);
+    let refused = fixture
+        .command("expand")
+        .arg(&fixture.path)
+        .args(["--line", "2", "-C", "0", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(9));
+    assert!(refused.stdout.is_empty());
+    assert_target(
+        &decode(fixture.follow("expand", 2, &[])),
+        "expand",
+        2,
+        fixture.conversation_id,
+    );
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), before);
+}
+
+#[test]
+fn physical_targets_cannot_claim_remote_or_conversation_identity() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    // A real remote archive row shares the same path as a plausible local file.
+    let storage = FrankenStorage::open(&fixture.db).unwrap();
+    storage
+        .raw()
+        .execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at)
+             VALUES ('work-laptop', 'ssh', 'work-laptop', 1, 1)",
+        )
+        .unwrap();
+    storage
+        .raw()
+        .execute_compat(
+            "UPDATE conversations SET source_id = 'work-laptop', origin_host = 'work-laptop' WHERE id = ?1",
+            coding_agent_search::franken_sync::params![fixture.conversation_id],
+        )
+        .unwrap();
+    drop(storage);
+    let before = std::fs::read(&fixture.db).unwrap();
+    let source = std::fs::read(&fixture.path).unwrap();
+    for command in ["view", "expand"] {
+        for flags in [
+            vec!["--source".to_string(), "work-laptop".to_string()],
+            vec![
+                "--conversation-id".to_string(),
+                fixture.conversation_id.to_string(),
+            ],
+        ] {
+            let output = fixture
+                .command(command)
+                .arg(&fixture.path)
+                .args(["--line", "2", "-C", "0", "--json"])
+                .args(flags)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostic.contains("--message-index"), "{diagnostic}");
+        }
+        let payload = decode(fixture.follow(command, 8, &["--source", "work-laptop"]));
+        let rows = if command == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
+        assert_eq!(rows[0]["content"], "ANCHOR493TARGET");
+        assert_eq!(rows[0]["source_id"], "work-laptop");
+        assert_eq!(rows[0]["is_target"], true);
+    }
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), before);
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), source);
+}
+
+#[test]
+fn physical_context_keeps_file_numbers_while_expand_skips_non_records() {
+    let fixture = Fixture::new(&[0, 1]);
+    std::fs::write(
+        &fixture.path,
+        concat!(
+            "{\"content\":\"before\"}\n",
+            "\n",
+            "malformed\n",
+            "{\"content\":\"physical target\"}\n",
+            "\n",
+            "malformed\n",
+            "{\"content\":\"after\"}\n",
+            "\n",
+        ),
+    )
+    .unwrap();
+    for command in ["view", "expand"] {
+        let payload = decode(
+            fixture
+                .command(command)
+                .arg(&fixture.path)
+                .args(["--line", "4", "-C", "1", "--json"])
+                .output()
+                .unwrap(),
+        );
+        let rows = if command == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
+        let rows = rows.as_array().unwrap();
+        let numbers: Vec<_> = rows
+            .iter()
+            .map(|row| row["line"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            numbers,
+            if command == "view" {
+                vec![3, 4, 5]
+            } else {
+                vec![1, 4, 7]
+            }
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row["is_target"] == true).count(),
+            1
+        );
+        assert_eq!(rows[1]["line"], 4);
+        for row in rows {
+            assert_eq!(row["coordinate_space"], "file_line");
+            assert_eq!(row["content_source"], "file");
+            assert_eq!(row["file_line"], row["line"]);
+            assert!(row.get("message_index").is_none());
+            assert!(row.get("conversation_id").is_none());
+        }
+    }
+}
+
+#[test]
+fn unanchored_archive_browsing_remains_available_without_a_physical_target() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    std::fs::rename(&fixture.path, fixture.path.with_extension("retained")).unwrap();
+    let payload = decode(
+        fixture
+            .command("view")
+            .arg(&fixture.path)
+            .args([
+                "--conversation-id",
+                &fixture.conversation_id.to_string(),
+                "--source",
+                "local",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(payload["target_line"], Value::Null);
+    assert_eq!(payload["archive_only"], true);
+    let rows = payload["lines"].as_array().unwrap();
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .all(|row| row["highlighted"] != true && row["is_target"] != true)
+    );
+}
+
+#[test]
+fn search_hit_serialization_preserves_available_identity_without_inventing_one() {
+    use coding_agent_search::search::query::{MatchType, SearchHit};
+    let mut hit = SearchHit {
+        title: "identity".into(),
+        snippet: "anchor".into(),
+        content: "anchor".into(),
+        content_hash: 123,
+        conversation_id: Some(42),
+        score: 1.0,
+        source_path: "/shared/provider.db".into(),
+        agent: "codex".into(),
+        workspace: "/work".into(),
+        workspace_original: None,
+        created_at: None,
+        line_number: Some(8),
+        match_type: MatchType::Exact,
+        source_id: "local".into(),
+        origin_kind: "local".into(),
+        origin_host: None,
+    };
+    let value = serde_json::to_value(&hit).unwrap();
+    assert_eq!(value["conversation_id"], 42);
+    assert_eq!(value["line_number"], 8);
+    assert!(value.get("content_hash").is_none());
+    hit.conversation_id = None;
+    let value = serde_json::to_value(&hit).unwrap();
+    assert_eq!(value.get("conversation_id"), Some(&Value::Null));
+}
+
+#[test]
+fn shared_path_search_hits_round_trip_in_every_robot_projection() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    let storage = FrankenStorage::open(&fixture.db).unwrap();
+    let other = seed(&storage, &fixture.path, "codex", &[0, 7, 12]);
+    drop(storage);
+    assert_ne!(fixture.conversation_id, other);
+    for conversation_id in [fixture.conversation_id, other] {
+        let indexed = fixture
+            .command("index")
+            .arg("--data-dir")
+            .arg(&fixture.data)
+            .arg("--reconcile-conversation")
+            .arg(conversation_id.to_string())
+            .arg("--json")
+            .output()
+            .unwrap();
+        decode(indexed);
+    }
+    let db_before = std::fs::read(&fixture.db).unwrap();
+    let source_before = std::fs::read(&fixture.path).unwrap();
+    let expected: std::collections::BTreeSet<_> =
+        [fixture.conversation_id, other].into_iter().collect();
+    for format in ["json", "compact", "jsonl"] {
+        for fields in [
+            None,
+            Some("minimal"),
+            Some("summary"),
+            Some("all"),
+            Some("source_path,line_number,source_id,conversation_id"),
+        ] {
+            // Plain JSON exercises the handwritten fast serializers. Truncation
+            // forces the general projection; JSONL and compact use that path too.
+            for truncate in [false, true] {
+                let mut command = fixture.command("search");
+                command
+                    .args([
+                        "ANCHOR493TARGET",
+                        "--mode",
+                        "lexical",
+                        "--robot-format",
+                        format,
+                        "--limit",
+                        "5",
+                        "--no-maintenance",
+                    ])
+                    .arg("--data-dir")
+                    .arg(&fixture.data);
+                if let Some(fields) = fields {
+                    command.args(["--fields", fields]);
+                }
+                if truncate {
+                    command.args(["--max-content-length", "8"]);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "format={format} fields={fields:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let hits: Vec<Value> = if format == "jsonl" {
+                    String::from_utf8(output.stdout)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .filter(|value| value.get("source_path").is_some())
+                        .collect()
+                } else {
+                    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    payload["hits"].as_array().expect("search hits").clone()
+                };
+                assert_eq!(hits.len(), 2, "format={format} fields={fields:?}: {hits:?}");
+                let mut seen = std::collections::BTreeSet::new();
+                for hit in hits {
+                    let cid = hit["conversation_id"]
+                        .as_i64()
+                        .expect("canonical identity must survive output");
+                    assert!(
+                        seen.insert(cid),
+                        "shared paths must not collapse distinct conversations"
+                    );
+                    assert_eq!(hit["source_id"], "local");
+                    assert_eq!(hit["source_path"], fixture.path.to_string_lossy().as_ref());
+                    assert_eq!(hit["line_number"], 8);
+                    if fields == Some("minimal") {
+                        assert_eq!(hit.as_object().unwrap().len(), 5);
+                        assert!(hit.get("content").is_none());
+                    } else if fields == Some("summary") {
+                        assert_eq!(
+                            hit.as_object().unwrap().len(),
+                            7 + usize::from(hit.get("title_truncated").is_some())
+                        );
+                        assert!(hit.get("content").is_none());
+                    } else if fields == Some("source_path,line_number,source_id,conversation_id") {
+                        assert_eq!(hit.as_object().unwrap().len(), 4);
+                    }
+                    for subcommand in ["view", "expand"] {
+                        let payload = decode(fixture.follow(
+                            subcommand,
+                            8,
+                            &[
+                                "--source",
+                                hit["source_id"].as_str().unwrap(),
+                                "--conversation-id",
+                                &cid.to_string(),
+                            ],
+                        ));
+                        assert_target(&payload, subcommand, 8, cid);
+                    }
+                }
+                assert_eq!(seen, expected);
+            }
+        }
+    }
+    // Caller-selected masks may deliberately omit identity; do not silently
+    // expand them or invent a conversation id to make the follow-up succeed.
+    let payload = decode(
+        fixture
+            .command("search")
+            .args([
+                "ANCHOR493TARGET",
+                "--mode",
+                "lexical",
+                "--json",
+                "--fields",
+                "source_path,line_number",
+                "--limit",
+                "5",
+                "--no-maintenance",
+            ])
+            .arg("--data-dir")
+            .arg(&fixture.data)
+            .output()
+            .unwrap(),
+    );
+    let hits = payload["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    for hit in hits {
+        assert_eq!(hit.as_object().unwrap().len(), 2);
+    }
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), db_before);
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), source_before);
+}
+
+#[test]
+fn corrected_robot_failures_are_one_error_envelope_and_success_still_teaches() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    let formats: &[&[&str]] = &[
+        &["--json"],
+        &["--robot"],
+        &["--robot-format", "json"],
+        &["--robot-format", "compact"],
+        &["--robot-format", "jsonl"],
+        &["--format=json"],
+        &[], // Environment-selected structured output follows the same contract.
+    ];
+    for subcommand in ["view", "expand"] {
+        for flags in formats {
+            let mut command = fixture.command(subcommand);
+            command
+                .arg(format!("source_path={}", fixture.path.display()))
+                .args([
+                    "source_id=local",
+                    "conversation_id=999999",
+                    "line_number=8",
+                    "context=0",
+                ])
+                .args(*flags);
+            if flags.is_empty() {
+                command.env("CASS_OUTPUT_FORMAT", "json");
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty(), "failed recovery emitted a target");
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|err| {
+                panic!(
+                    "{subcommand} {flags:?}: {err}; stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            assert_eq!(error["error"]["kind"], "indexed-session-required");
+            assert_eq!(error["error"]["retryable"], false);
+            assert!(
+                error["error"]["hint"]
+                    .as_str()
+                    .is_some_and(|hint| hint.contains("same search hit"))
+            );
+        }
+        let output = fixture
+            .command(subcommand)
+            .arg(format!("source_path={}", fixture.path.display()))
+            .args(["source_id=local", "line_number=8", "context=0", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("note: auto-corrected:"),
+            "successful robot recovery still teaches the canonical syntax"
+        );
+        assert_target(&decode(output), subcommand, 8, fixture.conversation_id);
+
+        let human = fixture
+            .command(subcommand)
+            .arg(format!("source_path={}", fixture.path.display()))
+            .args(["line_number=8", "conversation_id=999999", "context=0"])
+            .output()
+            .unwrap();
+        assert!(!human.status.success());
+        assert!(
+            String::from_utf8_lossy(&human.stderr)
+                .contains("Note: Your command was auto-corrected:"),
+            "human diagnostics must retain their teaching note"
+        );
+    }
+}

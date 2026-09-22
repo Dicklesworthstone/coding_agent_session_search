@@ -532,9 +532,9 @@ fn replaced_bytes_cannot_borrow_the_selected_manifests_authority() -> TestResult
     let root = tempfile::tempdir()?;
     let m = fixture(root.path(), "gen-replaced", 1, Some(A), None);
     select(root.path(), &m, None);
-    // Capture the production vector selection BEFORE replacing its bytes.
-    // Preflight does not authenticate contents: admission must reject the
-    // replacement against the selected manifest's original digest.
+    // Capture the production vector-path preflight BEFORE replacing its
+    // bytes. Revalidation after the replacement would bypass the admission
+    // boundary this regression is intended to protect.
     let selected = crate::search::semantic_manifest::selection::SemanticSelectionMetadata::read(
         root.path(),
         Some(&m.corpus),

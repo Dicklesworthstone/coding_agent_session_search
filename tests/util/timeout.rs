@@ -176,6 +176,7 @@ pub fn spawn_with_timeout_or_diag(
                 kill_child_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
+                retire_harness_death_reaper(&mut reaper);
                 let _ = join_pipe_reader(stdout_reader, label, "stdout");
                 let _ = join_pipe_reader(stderr_reader, label, "stderr");
                 panic!("spawn_with_timeout_or_diag({label}): try_wait errored: {err}");
@@ -197,8 +198,10 @@ fn configure_child_process_group(_cmd: &mut Command) {}
 #[cfg(unix)]
 fn kill_child_process_group(pid: u32) {
     let process_group = format!("-{pid}");
+    // End option parsing explicitly: the negative operand is a process group,
+    // not another signal option. The same rule applies to the detached reaper.
     let _ = Command::new("/bin/kill")
-        .args(["-KILL", &process_group])
+        .args(["-KILL", "--", &process_group])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -226,7 +229,7 @@ fn spawn_death_reaper_for(watched_pid: u32, child_pid: u32) -> Option<std::proce
     // is the one still alive (the harness died). If the child is already
     // gone, do nothing — its pid could have been reused by an unrelated
     // process group.
-    const REAPER_SCRIPT: &str = "while kill -0 \"$1\" 2>/dev/null && kill -0 \"$2\" 2>/dev/null; do sleep 1; done; if kill -0 \"$2\" 2>/dev/null; then /bin/kill -KILL \"-$2\" 2>/dev/null; fi";
+    const REAPER_SCRIPT: &str = "while kill -0 \"$1\" 2>/dev/null && kill -0 \"$2\" 2>/dev/null; do sleep 1; done; if kill -0 \"$2\" 2>/dev/null; then /bin/kill -KILL -- \"-$2\" 2>/dev/null; fi";
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(REAPER_SCRIPT)
@@ -399,8 +402,16 @@ mod tests {
             .stderr(std::process::Stdio::null());
         sleeper.process_group(0);
         let mut child = sleeper.spawn().map_err(|e| format!("spawn sleeper: {e}"))?;
-        // A pid that cannot be alive: pid_max is at most 2^22 on Linux.
-        let dead_pid: u32 = 4_194_303;
+        // Observe a process we actually started and reaped. A guessed PID near
+        // a platform's maximum is not evidence that the process is absent.
+        let mut watched = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .map_err(|e| format!("spawn watched process: {e}"))?;
+        let dead_pid = watched.id();
+        watched
+            .wait()
+            .map_err(|e| format!("wait watched process: {e}"))?;
         let mut reaper = super::spawn_death_reaper_for(dead_pid, child.id())
             .ok_or_else(|| "spawn reaper".to_string())?;
         let started = std::time::Instant::now();
@@ -461,20 +472,55 @@ mod tests {
     /// cleanup: killing only the shell would leave `sleep` holding the
     /// stdout/stderr pipe FDs open, deadlocking the diagnostic join.
     #[test]
-    #[should_panic(expected = "exceeded timeout")]
     fn hung_child_triggers_timeout_panic_with_diagnostic() {
-        #[cfg(unix)]
-        let cmd = {
-            let mut cmd = Command::new("/bin/sh");
-            cmd.arg("-c").arg("sleep 30");
-            cmd
-        };
-        #[cfg(not(unix))]
-        let mut cmd = Command::new("/bin/sleep");
-        #[cfg(not(unix))]
-        cmd.arg("30");
-        let _ =
-            spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300));
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(|| {
+            #[cfg(unix)]
+            let cmd = {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg("sleep 30");
+                cmd
+            };
+            #[cfg(not(unix))]
+            let mut cmd = Command::new("/bin/sleep");
+            #[cfg(not(unix))]
+            cmd.arg("30");
+            spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300))
+        });
+        let panic = result.expect_err("a stalled child must time out");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("exceeded timeout"),
+            "unexpected panic: {message}"
+        );
+        // Previously should_panic accepted a 30-second pipe-drain stall after a
+        // 300ms timeout. Allow CI scheduling slack, but reject that false pass.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout cleanup outlived its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_child_does_not_leave_descendant_output_pipes_open() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 & printf ready; exit 0"]);
+        let started = Instant::now();
+        let output =
+            spawn_with_timeout_or_diag(cmd, "orphaned_pipes", None, Duration::from_secs(2));
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an exited leader left a descendant holding its pipes: {:?}",
+            started.elapsed()
+        );
     }
 
     /// Proves the diagnostic dump includes the data_dir listing when

@@ -1,0 +1,154 @@
+name: Logical archive recovery
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/logical_archive/**'
+      - 'src/bookmarks.rs'
+      - 'tests/bookmarks_cli.rs'
+      - 'src/main.rs'
+      - 'src/franken_sync.rs'
+      - 'src/search_service.rs'
+      - 'src/search_service/**'
+      - 'src/storage/**'
+      - 'tests/cli_logical_archive.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/logical-archive.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: logical-archive-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  format-reviewed-files:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check reviewed source and preserve native formatting diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/reviewed-format"
+          mkdir -p "$evidence"
+          git rev-parse HEAD > "$evidence/source.txt"
+          rustfmt --version > "$evidence/toolchain.txt"
+          status=0
+          for file in src/bookmarks.rs src/logical_archive/export.rs src/logical_archive/export_tests.rs src/logical_archive/import.rs tests/cli_logical_archive.rs; do
+            mkdir -p "$evidence/$(dirname "$file")"
+            sha256sum "$file" >> "$evidence/input-sha256.txt"
+            rustfmt --edition 2024 --config skip_children=true --emit stdout "$file" > "$evidence/$file"
+            rustfmt --edition 2024 --config skip_children=true --check "$file" || status=$?
+          done
+          exit "$status"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: reviewed-format-${{ github.sha }}
+          path: ${{ runner.temp }}/reviewed-format/
+          if-no-files-found: error
+          retention-days: 7
+  locked-cass:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record exact source and parse Rust modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/archive-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/archive-evidence/source.txt"
+          rustc --version | tee "$RUNNER_TEMP/archive-evidence/toolchain.txt"
+          sha256sum Cargo.lock | tee "$RUNNER_TEMP/archive-evidence/lockfile.txt"
+          # Parse without changing source or presenting formatting as runtime proof.
+          rustfmt --edition 2024 --emit stdout src/logical_archive/mod.rs src/bookmarks.rs tests/cli_logical_archive.rs > "$RUNNER_TEMP/archive-evidence/formatted-source.txt"
+      - name: Run locked production archive tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --bin cass logical_archive:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/archive-evidence/unit.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/unit.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 48:
+              raise SystemExit('Expected all 48 production archive regressions, including both publication crash boundaries')
+          PY
+      - name: Run the real binary round trip and failure contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test cli_logical_archive -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/archive-evidence/cli.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/cli.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 6:
+              raise SystemExit('Expected all six real-binary archive regressions, including restored source-less follow-ups')
+          PY
+          sha256sum target/debug/cass | tee "$RUNNER_TEMP/archive-evidence/binary.txt"
+      - name: Exercise canonical service reads through the public read-only engine
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/archive-evidence"
+          cargo test --locked --bin cass search_service::canonical:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/archive-evidence/canonical-service.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/canonical-service.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 15:
+              raise SystemExit('Expected all 15 canonical service tests, including engine read-only enforcement')
+          PY
+      - name: Run bookmark storage and no-clobber export regressions
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/archive-evidence"
+          cargo test --locked --lib bookmarks::tests:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/archive-evidence/bookmarks.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/bookmarks.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 20:
+              raise SystemExit('Expected all 20 bookmark regressions')
+          PY
+          cargo test --locked --test bookmarks_cli -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/archive-evidence/bookmarks-cli.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/bookmarks-cli.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) == 0:
+              raise SystemExit('Expected nonempty bookmark command regression results')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: logical-archive-${{ github.sha }}
+          path: ${{ runner.temp }}/archive-evidence/
+          if-no-files-found: warn
+          retention-days: 14

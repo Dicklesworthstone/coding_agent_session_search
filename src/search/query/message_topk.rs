@@ -14,6 +14,10 @@ use std::fmt;
 /// apparently complete but incorrectly ranked exact result.
 pub(super) const MAX_EXACT_MESSAGE_REFILLS: usize = 64;
 
+/// Automatic growth stops here; an already larger caller window is not shrunk.
+/// This bounds candidate storage, not vector ownership, RSS, or query duration.
+const MAX_ADAPTIVE_EXACT_WINDOW: usize = 16_384;
+
 pub(super) struct MessageTopK {
     pub(super) hits: Vec<VectorSearchResult>,
     pub(super) rounds: usize,
@@ -49,11 +53,14 @@ impl<E: fmt::Display> fmt::Display for RefillError<E> {
 /// set is necessary. Score ties within one message retain the first best chunk,
 /// just like the incumbent collapse operation.
 ///
-/// Memory is O(target + window), independent of archive/chunk count. The round
-/// cap bounds repeated backend calls, not the duration of an individual call.
+/// Start with `window` raw candidates. Only unresolved rounds grow the next
+/// request, doubling up to the larger of the initial window and the automatic
+/// growth cap. Candidate memory is O(target + max(window, growth cap)), not an
+/// archive-sized seen set. A short post-dedup batch is not proof of exhaustion.
+/// The round cap still bounds calls, not their duration or vector-owner RSS.
 pub(super) fn collect_exact_messages<E>(
     target: usize,
-    window: usize,
+    mut window: usize,
     max_rounds: usize,
     mut fetch: impl FnMut(&HashSet<u64>, Option<u64>, usize) -> Result<Vec<VectorSearchResult>, E>,
 ) -> Result<MessageTopK, RefillError<E>> {
@@ -66,6 +73,7 @@ pub(super) fn collect_exact_messages<E>(
     if window == 0 {
         return Err(RefillError::InvalidBatch("zero candidate window"));
     }
+    let max_window = window.max(MAX_ADAPTIVE_EXACT_WINDOW);
     let mut retained: Vec<VectorSearchResult> = Vec::new();
     let mut ceiling = None;
     for round in 0..max_rounds {
@@ -140,6 +148,9 @@ pub(super) fn collect_exact_messages<E>(
             }
             ceiling = Some(cutoff.message_id);
         }
+        // Amortize whole-vector scans for chunk-heavy messages and dense ties
+        // without relaxing scope, the exact ranking proof, or the call budget.
+        window = window.saturating_mul(2).min(max_window);
     }
     Err(RefillError::BudgetExhausted)
 }
@@ -404,5 +415,207 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn adaptive_chunk_dominance_reduces_scans_without_losing_exact_messages() {
+        let records = (1..=240_u64)
+            .flat_map(|id| (0..=255).map(move |chunk| hit(id, chunk, 1.0 - id as f32 / 1024.0)))
+            .collect::<Vec<_>>();
+        let mut windows = Vec::new();
+        let adaptive = collect_exact_messages(
+            200,
+            801,
+            MAX_EXACT_MESSAGE_REFILLS + 1,
+            |excluded, ceiling, window| {
+                assert!(excluded.len() <= 200);
+                windows.push(window);
+                Ok::<_, &str>(backend(&records, excluded, ceiling, window))
+            },
+        )
+        .unwrap();
+        // A backend may return fewer records than requested. Capping it at
+        // the original allowance models the former fixed-window scan cost.
+        let fixed = collect_exact_messages(
+            200,
+            801,
+            MAX_EXACT_MESSAGE_REFILLS + 1,
+            |excluded, ceiling, _| Ok::<_, &str>(backend(&records, excluded, ceiling, 801)),
+        )
+        .unwrap();
+        assert_eq!(ids(&adaptive), (1..=200).collect::<Vec<_>>());
+        assert_eq!(ids(&adaptive), ids(&fixed));
+        assert!(adaptive.rounds * 4 < fixed.rounds);
+        assert_eq!(windows[0], 801);
+        assert!(
+            windows
+                .iter()
+                .all(|window| *window <= MAX_ADAPTIVE_EXACT_WINDOW)
+        );
+        assert!(windows.windows(2).all(|pair| {
+            pair[1] == pair[0].saturating_mul(2).min(MAX_ADAPTIVE_EXACT_WINDOW)
+        }));
+        let actual = adaptive
+            .hits
+            .iter()
+            .map(|hit| (hit.message_id, hit.score.to_bits()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, oracle(&records, 200));
+    }
+
+    #[test]
+    fn adaptive_dense_ties_finish_within_the_unchanged_call_allowance() {
+        let records = (1..=10_000)
+            .rev()
+            .map(|id| hit(id, 0, 0.5))
+            .collect::<Vec<_>>();
+        let fixed = collect_exact_messages(
+            4,
+            17,
+            MAX_EXACT_MESSAGE_REFILLS + 1,
+            |excluded, ceiling, _| Ok::<_, &str>(backend(&records, excluded, ceiling, 17)),
+        );
+        assert!(matches!(fixed, Err(RefillError::BudgetExhausted)));
+        let adaptive = collect_exact_messages(
+            4,
+            17,
+            MAX_EXACT_MESSAGE_REFILLS + 1,
+            |excluded, ceiling, window| {
+                Ok::<_, &str>(backend(&records, excluded, ceiling, window))
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&adaptive), vec![1, 2, 3, 4]);
+        assert!(adaptive.rounds <= 12);
+    }
+
+    #[test]
+    fn adaptive_growth_is_capped_without_restarting_the_round_budget() {
+        let mut windows = Vec::new();
+        let result = collect_exact_messages(1, 1_024, 6, |excluded, ceiling, window| {
+            windows.push(window);
+            let id = 100 - windows.len() as u64;
+            assert!(!excluded.contains(&id));
+            assert!(ceiling.is_none_or(|ceiling| id < ceiling));
+            // A legal short post-dedup batch cannot prove scope exhaustion.
+            Ok::<_, &str>(vec![hit(id, 0, 0.5)])
+        });
+        assert!(matches!(result, Err(RefillError::BudgetExhausted)));
+        assert_eq!(windows, vec![1_024, 2_048, 4_096, 8_192, 16_384, 16_384]);
+    }
+
+    #[test]
+    fn adaptive_large_caller_windows_never_shrink_or_wrap() {
+        for initial in [
+            MAX_ADAPTIVE_EXACT_WINDOW + 1,
+            usize::MAX / 2 + 1,
+            usize::MAX,
+        ] {
+            let mut windows = Vec::new();
+            let result = collect_exact_messages(2, initial, 3, |_, _, window| {
+                windows.push(window);
+                Ok::<_, &str>(if windows.len() == 1 {
+                    vec![hit(1, 0, 1.0)]
+                } else {
+                    Vec::new()
+                })
+            })
+            .unwrap();
+            assert_eq!(windows, vec![initial, initial]);
+            assert_eq!(ids(&result), vec![1]);
+        }
+    }
+
+    #[test]
+    fn adaptive_proven_first_window_does_not_issue_a_larger_query() {
+        let records = [hit(1, 7, 0.9), hit(2, 8, 0.6), hit(3, 9, 0.3)];
+        let mut windows = Vec::new();
+        let result = collect_exact_messages(2, 3, 65, |excluded, ceiling, window| {
+            windows.push(window);
+            Ok::<_, &str>(backend(&records, excluded, ceiling, window))
+        })
+        .unwrap();
+        assert_eq!(windows, vec![3]);
+        assert_eq!(result.rounds, 1);
+        assert_eq!(ids(&result), vec![1, 2]);
+        assert_eq!(result.hits[0].chunk_idx, 7);
+    }
+
+    #[test]
+    fn adaptive_post_dedup_underfill_preserves_original_filters() {
+        let records = (1..=32)
+            .flat_map(|id| vec![hit(id, 0, 1.0 - id as f32 / 64.0); 100])
+            .collect::<Vec<_>>();
+        let selected = records
+            .iter()
+            .filter(|hit| hit.message_id % 3 == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = collect_exact_messages(8, 3, 65, |excluded, ceiling, window| {
+            // Original membership applies BEFORE top-k on every refill.
+            let mut batch = backend(&selected, excluded, ceiling, window);
+            let mut seen = HashSet::new();
+            batch.retain(|hit| seen.insert((hit.message_id, hit.chunk_idx)));
+            Ok::<_, &str>(batch)
+        })
+        .unwrap();
+        let actual = result
+            .hits
+            .iter()
+            .map(|hit| (hit.message_id, hit.score.to_bits()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, oracle(&selected, 8));
+        assert!(result.rounds > 1);
+    }
+
+    #[test]
+    fn adaptive_backend_errors_are_not_partial_successes() {
+        let mut calls = 0;
+        let result = collect_exact_messages(2, 1, 5, |_, _, _| {
+            calls += 1;
+            if calls == 1 {
+                Ok(vec![hit(1, 0, 1.0)])
+            } else {
+                Err("read failed")
+            }
+        });
+        assert!(matches!(result, Err(RefillError::Backend("read failed"))));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn adaptive_cap_does_not_authorize_oversized_initial_batches() {
+        let result = collect_exact_messages(2, 1, 5, |_, _, _| {
+            Ok::<_, &str>(vec![hit(1, 0, 1.0), hit(2, 0, 0.5)])
+        });
+        assert!(matches!(
+            result,
+            Err(RefillError::InvalidBatch(
+                "backend exceeded candidate limit"
+            ))
+        ));
+    }
+
+    #[test]
+    fn adaptive_capped_windows_still_refine_dense_tie_ids() {
+        let records = (1..=40_000)
+            .rev()
+            .map(|id| hit(id, 0, 0.5))
+            .collect::<Vec<_>>();
+        let mut calls = 0;
+        let result = collect_exact_messages(
+            4,
+            MAX_ADAPTIVE_EXACT_WINDOW,
+            MAX_EXACT_MESSAGE_REFILLS + 1,
+            |excluded, ceiling, window| {
+                calls += 1;
+                assert_eq!(window, MAX_ADAPTIVE_EXACT_WINDOW);
+                Ok::<_, &str>(backend(&records, excluded, ceiling, window))
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&result), vec![1, 2, 3, 4]);
+        assert_eq!(result.rounds, calls);
+        assert!(calls > 2);
     }
 }
