@@ -105,7 +105,8 @@ enum Operation {
         /// Acknowledge that full private session bodies will be restored.
         #[arg(long)]
         include_private: bool,
-        /// Accept an existing destination only after a read-only full-digest match.
+        /// Accept an existing destination only after a read-only full-digest or
+        /// compatible-projection match. This never grants overwrite permission.
         #[arg(long)]
         if_identical: bool,
         /// Permit a structurally compatible older archive to be replayed into
@@ -212,10 +213,6 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 include_private,
                 "restoration writes private session data; pass --include-private to acknowledge this"
             );
-            ensure!(
-                !(allow_compatible_schema && if_identical),
-                "--allow-compatible-schema currently requires a new destination; omit --if-identical"
-            );
             let plan = rebuild_index
                 .then(|| ArchiveIndexPlan::prepare(&output, &input))
                 .transpose()?;
@@ -223,7 +220,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 .as_ref()
                 .map_or(output.as_path(), ArchiveIndexPlan::database);
             let (header, completion, created) = if allow_compatible_schema {
-                let outcome = migrate::import_compatible(&input, output, &archive_id)?;
+                let outcome =
+                    migrate::import_compatible(&input, output, &archive_id, if_identical)?;
                 schema_migration = outcome.migration;
                 (outcome.header, outcome.completion, outcome.created)
             } else if if_identical {

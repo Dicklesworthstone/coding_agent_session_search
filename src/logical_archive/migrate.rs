@@ -11,6 +11,7 @@
 //! legacy `meta.schema_version` row stays current. Tables introduced after the
 //! archived schema keep initializer-owned seed state. All other archived rows are
 //! compared back from the persisted publication image before it can become visible.
+//! An existing destination is accepted only through the same read-only comparison.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -20,7 +21,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use coding_agent_search::franken_sync::compat::RowExt;
-use coding_agent_search::franken_sync::{Connection, FrankenError, SqliteValue};
+use coding_agent_search::franken_sync::{Connection, FileIdentity, FrankenError, SqliteValue};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
 
 use super::codec::{self, Cell, Completion, Header, Record, Table, Validator};
@@ -309,8 +310,6 @@ fn restore_older<R: BufRead>(
     connection.execute("PRAGMA foreign_keys = OFF")?;
     connection.execute("BEGIN IMMEDIATE")?;
     let triggers = suspend_triggers(connection)?;
-    // Clear only tables represented by the older archive. Tables introduced by
-    // the current schema retain initializer-owned seed state.
     clear_archived_data(connection, &inspected.tables)?;
 
     let mut statement = None;
@@ -462,6 +461,21 @@ fn sync_candidate(path: &Path) -> Result<()> {
         .open(path)?
         .sync_all()
         .context("cannot sync the verified migrated publication candidate")
+}
+
+fn identity(path: &Path) -> Result<FileIdentity> {
+    let file = super::import::open_input(path)?;
+    FileIdentity::from_file(&file)?
+        .ok_or_else(|| anyhow!("cannot prove the existing destination's file identity"))
+}
+
+fn require_same_file(connection: &Connection, path: &Path) -> Result<()> {
+    let actual = identity(path)?;
+    ensure!(
+        connection.file_identity()? == Some(actual),
+        "restore destination changed during compatible comparison; retry without replacing it"
+    );
+    Ok(())
 }
 
 struct ProjectionCursor<R> {
@@ -619,8 +633,16 @@ fn verify_persisted_projection(
     file: &mut File,
     candidate: &Path,
     inspected: &Inspected,
+    expected_identity: Option<FileIdentity>,
+    require_sidecar_free: bool,
 ) -> Result<()> {
     let reader = export::open_source(candidate)?;
+    if let Some(expected_identity) = expected_identity {
+        ensure!(
+            reader.file_identity()? == Some(expected_identity),
+            "restore destination changed before compatible comparison; nothing was replaced"
+        );
+    }
     super::import::verify_database(&reader)?;
     verify_current_schema_authority(&reader)?;
     compatible_tables(&reader, &inspected.tables)?;
@@ -666,16 +688,32 @@ fn verify_persisted_projection(
         "records follow the archive completion during persisted verification"
     );
 
+    if expected_identity.is_some() {
+        require_same_file(&reader, candidate)?;
+    }
     reader.execute("ROLLBACK")?;
     reader.close_without_checkpoint()?;
-    require_candidate_without_sidecars(candidate)?;
+    if require_sidecar_free {
+        require_candidate_without_sidecars(candidate)?;
+    }
     Ok(())
+}
+
+fn migration_receipt(inspected: &Inspected) -> Result<SchemaMigrationReceipt> {
+    Ok(SchemaMigrationReceipt {
+        mode: "compatible_additive",
+        from_storage_schema_version: inspected.header.storage_schema_version.clone(),
+        to_storage_schema_version: target_version()?.to_string(),
+        schema_authority: "current_binary_initializer",
+        source_rows_verified: true,
+    })
 }
 
 pub fn import_compatible(
     input_path: &Path,
     destination: &Path,
     expected_archive_id: &str,
+    if_identical: bool,
 ) -> Result<MigrationOutcome> {
     let mut file = super::import::open_input(input_path)?;
     let inspected = inspect(&mut file, expected_archive_id)?;
@@ -687,7 +725,7 @@ pub fn import_compatible(
             input_path,
             destination,
             expected_archive_id,
-            false,
+            if_identical,
         )?;
         return Ok(MigrationOutcome {
             header,
@@ -702,6 +740,26 @@ pub fn import_compatible(
     );
 
     let _lock = DestinationLock::acquire(destination)?;
+    if if_identical && fs::symlink_metadata(destination).is_ok() {
+        let admitted = identity(destination)?;
+        verify_persisted_projection(
+            &mut file,
+            destination,
+            &inspected,
+            Some(admitted),
+            false,
+        )
+        .context(
+            "restore conflict: existing canonical data is not the verified compatible migration; nothing was replaced",
+        )?;
+        return Ok(MigrationOutcome {
+            header: inspected.header.clone(),
+            completion: inspected.completion.clone(),
+            created: false,
+            migration: Some(migration_receipt(&inspected)?),
+        });
+    }
+
     require_new_destination(destination)?;
     let staging = tempfile::Builder::new()
         .prefix(".cass-migrate-")
@@ -729,7 +787,7 @@ pub fn import_compatible(
     materialize_candidate(&connection, &candidate)?;
     connection.close()?;
 
-    verify_persisted_projection(&mut file, &candidate, &inspected)?;
+    verify_persisted_projection(&mut file, &candidate, &inspected, None, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -746,13 +804,7 @@ pub fn import_compatible(
         header: inspected.header.clone(),
         completion: inspected.completion.clone(),
         created: true,
-        migration: Some(SchemaMigrationReceipt {
-            mode: "compatible_additive",
-            from_storage_schema_version: inspected.header.storage_schema_version,
-            to_storage_schema_version: target.to_string(),
-            schema_authority: "current_binary_initializer",
-            source_rows_verified: true,
-        }),
+        migration: Some(migration_receipt(&inspected)?),
     })
 }
 
@@ -761,7 +813,24 @@ mod tests {
     use super::*;
     use coding_agent_search::model::types::{Agent, AgentKind};
     use coding_agent_search::storage::sqlite::SqliteStorage;
+    use std::collections::BTreeMap;
     use std::io::Write;
+
+    fn database_files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                let path = PathBuf::from(name);
+                match fs::read(&path) {
+                    Ok(bytes) => Some((path, bytes)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("cannot inspect migrated fixture: {error}"),
+                }
+            })
+            .collect()
+    }
 
     fn older_archive(
         root: &Path,
@@ -854,7 +923,7 @@ mod tests {
                 export::quoted(&table.name)?
             );
             let mut failure = None;
-            connection.query_with_params_for_each(&sql, &[], |row| {
+            let streamed = connection.query_with_params_for_each(&sql, &[], |row| {
                 let result = (|| -> Result<()> {
                     let mut cells = export::cells(row.values())?;
                     if table.name == META_TABLE {
@@ -883,10 +952,11 @@ mod tests {
                     ));
                 }
                 Ok(())
-            })?;
+            });
             if let Some(error) = failure {
                 return Err(error);
             }
+            streamed?;
         }
         let completion = validator.completion();
         output.write_all(&validator.push(&Record::Completion { completion })?)?;
@@ -902,7 +972,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let (input, from) = older_archive(root.path(), false)?;
         let destination = root.path().join("restored.db");
-        let outcome = import_compatible(&input, &destination, "older-compatible")?;
+        let outcome = import_compatible(&input, &destination, "older-compatible", false)?;
         let receipt = outcome.migration.context("migration receipt missing")?;
         assert_eq!(receipt.from_storage_schema_version, from);
         assert_eq!(
@@ -923,11 +993,45 @@ mod tests {
     }
 
     #[test]
+    fn repeated_compatible_import_is_read_only_and_reports_unchanged() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (input, _) = older_archive(root.path(), false)?;
+        let destination = root.path().join("restored.db");
+        let created = import_compatible(&input, &destination, "older-compatible", false)?;
+        assert!(created.created);
+        let before = database_files(&destination);
+        let repeated = import_compatible(&input, &destination, "older-compatible", true)?;
+        assert!(!repeated.created);
+        assert!(repeated.migration.is_some());
+        assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_migrated_destination_is_a_conflict_not_an_overwrite() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (input, _) = older_archive(root.path(), false)?;
+        let destination = root.path().join("restored.db");
+        import_compatible(&input, &destination, "older-compatible", false)?;
+        let writer = Connection::open(export::path_text(&destination)?)?;
+        writer.execute(
+            "INSERT INTO meta (key, value) VALUES ('operator_note', 'keep migrated note')",
+        )?;
+        writer.close()?;
+        let before = database_files(&destination);
+        assert!(import_compatible(&input, &destination, "older-compatible", true).is_err());
+        assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
     fn missing_current_required_column_fails_without_publication() -> Result<()> {
         let root = tempfile::tempdir()?;
         let (input, _) = older_archive(root.path(), true)?;
         let destination = root.path().join("restored.db");
-        assert!(import_compatible(&input, &destination, "older-compatible").is_err());
+        assert!(
+            import_compatible(&input, &destination, "older-compatible", false).is_err()
+        );
         assert!(!destination.exists());
         Ok(())
     }
@@ -947,7 +1051,9 @@ mod tests {
         let text = fs::read_to_string(&input)?;
         fs::write(&input, text.replacen(&current, &future, 1))?;
         let destination = root.path().join("restored.db");
-        assert!(import_compatible(&input, &destination, "older-compatible").is_err());
+        assert!(
+            import_compatible(&input, &destination, "older-compatible", false).is_err()
+        );
         assert!(!destination.exists());
         Ok(())
     }
