@@ -762,39 +762,50 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         // the first file. If the process crashes or a later result append
         // fails, the audit still contains a durable intent record for every
         // target that may have been touched.
-        let mut audit = if report.entries.is_empty() {
-            None
-        } else {
+        if !report.entries.is_empty() {
             let (audit_path, mut audit_file) = open_prune_audit_log(&root)?;
-            append_prune_audit_records(&mut audit_file, &audit_path, &report, "intent")?;
             report.audit_log_path = Some(audit_path.display().to_string());
-            Some((audit_path, audit_file))
-        };
-
-        for entry in &mut report.entries {
-            let path = root.join(&entry.path);
-            let removed = remove_prune_entry_file(&root, entry)
-                .with_context(|| format!("applying raw mirror prune for {}", path.display()))?;
-            entry.applied = removed;
-            if removed {
-                if entry.kind == "manifest" {
-                    report.applied_manifest_count = report.applied_manifest_count.saturating_add(1);
-                } else if entry.kind == "blob" {
-                    report.applied_blob_count = report.applied_blob_count.saturating_add(1);
-                }
-                report.applied_reclaim_bytes = report
-                    .applied_reclaim_bytes
-                    .saturating_add(entry.size_bytes);
-            }
-        }
-        if let Some((audit_path, audit_file)) = audit.as_mut() {
-            append_prune_audit_records(audit_file, audit_path, &report, "result")?;
+            apply_prune_entries(&root, &mut report, &audit_path, &mut audit_file)?;
         }
     }
     // A preview returns its plan to the caller without writing one audit row
     // per candidate. Only applied operations need durable intent/result records;
     // repeated previews must not grow the archive they are meant to inspect.
     Ok(report)
+}
+
+fn apply_prune_entries(
+    root: &Path,
+    report: &mut RawMirrorPruneReport,
+    audit_path: &Path,
+    audit_file: &mut File,
+) -> Result<()> {
+    append_prune_audit_records(audit_file, audit_path, &report.entries, "intent")?;
+    for entry in &mut report.entries {
+        let path = root.join(&entry.path);
+        let removed = remove_prune_entry_file(root, entry)
+            .with_context(|| format!("applying raw mirror prune for {}", path.display()))?;
+        entry.applied = removed;
+        if removed {
+            if entry.kind == "manifest" {
+                report.applied_manifest_count = report.applied_manifest_count.saturating_add(1);
+            } else if entry.kind == "blob" {
+                report.applied_blob_count = report.applied_blob_count.saturating_add(1);
+            }
+            report.applied_reclaim_bytes = report
+                .applied_reclaim_bytes
+                .saturating_add(entry.size_bytes);
+        }
+        // Persist the completed prefix before advancing. A later validation or
+        // removal error must not erase evidence of earlier successful removals.
+        append_prune_audit_records(
+            audit_file,
+            audit_path,
+            std::slice::from_ref(entry),
+            "result",
+        )?;
+    }
+    Ok(())
 }
 
 fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
@@ -1168,7 +1179,7 @@ fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<b
     }
 
     fs::remove_file(&path).with_context(|| format!("remove raw mirror file {}", path.display()))?;
-    sync_parent(&path)?;
+    sync_parent_unconditionally(&path)?;
     Ok(true)
 }
 
@@ -1206,15 +1217,15 @@ fn open_prune_audit_log(root: &Path) -> Result<(PathBuf, File)> {
 fn append_prune_audit_records(
     file: &mut File,
     audit_path: &Path,
-    report: &RawMirrorPruneReport,
+    entries: &[RawMirrorPruneEntry],
     phase: &str,
 ) -> Result<()> {
     let now = now_ms();
-    for entry in &report.entries {
+    for entry in entries {
         let record = json!({
             "schema_version": 1,
             "recorded_at_ms": now,
-            "mode": report.mode,
+            "mode": "apply",
             "phase": phase,
             "kind": entry.kind,
             "path": entry.path,
@@ -1227,10 +1238,11 @@ fn append_prune_audit_records(
         writeln!(file, "{record}")
             .with_context(|| format!("write raw mirror prune audit {}", audit_path.display()))?;
     }
-    sync_open_file_if_required(file, || {
-        format!("sync raw mirror prune audit {}", audit_path.display())
-    })?;
-    sync_parent(audit_path)?;
+    // Unlike optional capture durability, this journal authorizes deletion.
+    // Never advance past an intent/result whose sync failed or was disabled.
+    file.sync_all()
+        .with_context(|| format!("sync raw mirror prune audit {}", audit_path.display()))?;
+    sync_parent_unconditionally(audit_path)?;
     Ok(())
 }
 
@@ -3438,11 +3450,15 @@ fn sync_file(path: &Path) -> Result<()> {
         .with_context(|| format!("sync raw mirror file {}", path.display()))
 }
 
-#[cfg(not(windows))]
 fn sync_parent(path: &Path) -> Result<()> {
     if !raw_mirror_fsync_enabled() {
         return Ok(());
     }
+    sync_parent_unconditionally(path)
+}
+
+#[cfg(not(windows))]
+fn sync_parent_unconditionally(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -3452,7 +3468,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_parent(_path: &Path) -> Result<()> {
+fn sync_parent_unconditionally(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -4877,6 +4893,102 @@ mod tests {
         assert!(manifest_path.exists());
         assert!(blob_path.exists());
         assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    #[test]
+    fn prune_partial_apply_preserves_completed_results_and_retry_does_not_repeat_them() -> Result<()>
+    {
+        let temp = tempfile::TempDir::new()?;
+        let data_dir = temp.path().join("cass-data");
+        let root = ensure_raw_mirror_root(&data_dir)?;
+        for bytes in [b"first blob", b"other blob"] {
+            let digest = blake3::hash(bytes).to_hex().to_string();
+            let relative = raw_mirror_blob_relative_path(&digest).context("valid digest")?;
+            let path = root.join(relative);
+            ensure_private_dir_descendant(&root, path.parent().context("blob parent")?)?;
+            fs::write(path, bytes)?;
+        }
+        let mut report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                ..RawMirrorPruneOptions::default()
+            },
+        )?;
+        assert_eq!(report.entries.len(), 2);
+        let first = root.join(&report.entries[0].path);
+        let second = root.join(&report.entries[1].path);
+        let original = fs::read(&second)?;
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        // Exercise the production apply loop with actual post-plan byte drift,
+        // without replacing the filesystem or deletion/audit implementation.
+        fs::write(&second, &changed)?;
+        let (audit_path, mut audit_file) = open_prune_audit_log(&root)?;
+        let error = apply_prune_entries(&root, &mut report, &audit_path, &mut audit_file)
+            .expect_err("the second blob changed after planning");
+        assert!(format!("{error:#}").contains("revalidating raw mirror blob"));
+        assert!(!first.exists());
+        assert_eq!(fs::read(&second)?, changed);
+        assert_eq!(report.applied_blob_count, 1);
+        let partial_audit = fs::read_to_string(&audit_path)?;
+        let records = partial_audit
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            records.len(),
+            3,
+            "two intents and the completed first result"
+        );
+        assert!(
+            records[..2]
+                .iter()
+                .all(|row| { row["phase"] == "intent" && row["applied"] == false })
+        );
+        assert_eq!(records[2]["phase"], "result");
+        assert_eq!(records[2]["path"], report.entries[0].path);
+        assert_eq!(records[2]["applied"], true);
+        drop(audit_file);
+
+        fs::write(&second, original)?;
+        let retry = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )?;
+        assert_eq!(retry.applied_blob_count, 1);
+        assert!(!second.exists());
+        let completed_audit = fs::read_to_string(&audit_path)?;
+        let results = completed_audit
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(results.len(), 5);
+        for entry in &report.entries {
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|row| row["phase"] == "result" && row["path"] == entry.path)
+                    .count(),
+                1,
+                "retry must not repeat a completed removal"
+            );
+        }
+        let empty_retry = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )?;
+        assert_eq!(empty_retry.applied_blob_count, 0);
+        assert_eq!(fs::read_to_string(audit_path)?, completed_audit);
+        Ok(())
     }
 
     #[test]

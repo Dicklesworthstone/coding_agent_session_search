@@ -673,6 +673,11 @@ holds down blobs referenced by captures from the last 7 days by default, writes
 complete intent/result records to `raw-mirror/v1/pruned.jsonl` for non-empty
 applied plans, and refuses apply mode
 while an index/watch job is active.
+Applied pruning syncs the audit independently of the optional capture setting
+`CASS_RAW_MIRROR_FSYNC`. Each completed result is recorded before the next
+removal; a later failure preserves those earlier results. An abrupt crash
+between a removal and its result record can still leave an intent without a
+confirmed result.
 
 Use `--provider opencode` and/or `--source-path '*/opencode.db'` with an age
 or size rule to target one source without retiring unrelated captures.
