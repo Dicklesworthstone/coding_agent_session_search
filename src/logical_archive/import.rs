@@ -243,7 +243,7 @@ fn restore<R: BufRead>(
         export::schema_version(connection)? == header.storage_schema_version,
         "logical archive storage schema differs from this binary; cross-schema migration is not supported"
     );
-    let mut validator = Validator::new(header)?;
+    let mut validator = Validator::new(header).map_err(super::integrity_unless_io)?;
     connection.execute("PRAGMA foreign_keys = OFF")?;
     ensure!(
         connection
@@ -272,9 +272,10 @@ fn restore<R: BufRead>(
             batch_records = 0;
             batch_bytes = 0;
         }
+        // Archive-side checks are integrity verdicts; SQLite failures below are not.
         validator
             .push(&record)
-            .map_err(|error| anyhow!("record {line}: {error}"))?;
+            .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         match record {
             Record::Table { table } => {
                 ensure!(
@@ -287,14 +288,19 @@ fn restore<R: BufRead>(
                 table_count += 1;
             }
             Record::Row { values: cells } => {
-                let insert = statement
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("record {line}: row precedes its table"))?;
-                insert.execute_with_params(&values(cells)?)
+                let insert = statement.as_ref().ok_or_else(|| {
+                    super::integrity(format!("record {line}: row precedes its table"))
+                })?;
+                let row = values(cells).map_err(super::integrity_unless_io)?;
+                insert.execute_with_params(&row)
                     .map_err(|_| anyhow!("record {line}: canonical row insertion failed; no destination was published"))?;
             }
             Record::Completion { .. } => {}
-            Record::Header { .. } => bail!("record {line}: duplicate archive header"),
+            Record::Header { .. } => {
+                return Err(super::integrity(format!(
+                    "record {line}: duplicate archive header"
+                )));
+            }
         }
         batch_records += 1;
         batch_bytes += input.record_bytes;
@@ -302,7 +308,7 @@ fn restore<R: BufRead>(
             .checked_add(1)
             .ok_or_else(|| anyhow!("logical record position overflow"))?;
     }
-    let result = validator.finish()?;
+    let result = validator.finish().map_err(super::integrity_unless_io)?;
     ensure!(
         table_count == expected.len(),
         "logical archive omits canonical tables required by this binary"
@@ -363,9 +369,9 @@ pub fn import_file_with_policy(
 ) -> Result<(Header, Completion, bool)> {
     let mut input = Input::new(BufReader::new(open_input(input)?));
     let Some(Record::Header { header }) = input.record(1)? else {
-        bail!("logical archive must begin with a header");
+        return Err(super::integrity("logical archive must begin with a header"));
     };
-    header.validate()?;
+    header.validate().map_err(super::integrity_unless_io)?;
     ensure!(
         header.archive_id == expected_archive_id,
         "logical archive identity does not match --archive-id"

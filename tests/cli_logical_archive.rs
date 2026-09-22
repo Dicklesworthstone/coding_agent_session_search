@@ -332,7 +332,7 @@ fn real_binary_failure_classes_have_distinct_exit_codes_and_kinds() {
 
     // Success: a clean round trip.
     let input = home.join("history.jsonl");
-    export(home, &source, &input);
+    let exported = export(home, &source, &input);
     receipt(
         command(home)
             .args(["archive", "verify"])
@@ -349,10 +349,68 @@ fn real_binary_failure_classes_have_distinct_exit_codes_and_kinds() {
     bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
     let corrupt = home.join("corrupt.jsonl");
     fs::write(&corrupt, bytes).unwrap();
+    let integrity = (5, "logical-archive-integrity".to_owned(), false);
     assert_eq!(
         failure(&["verify".as_ref(), corrupt.as_os_str()]),
-        (5, "logical-archive-integrity".to_owned(), false)
+        integrity
     );
+
+    // Bead gdwzy: every reader of the same bytes reaches the same verdict, and
+    // import publishes nothing.
+    let restored = home.join("restored.db");
+    assert_eq!(
+        failure(&[
+            "import".as_ref(),
+            corrupt.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            restored.as_os_str(),
+        ]),
+        integrity
+    );
+    assert!(!restored.exists());
+    assert_eq!(
+        failure(&[
+            "search".as_ref(),
+            corrupt.as_os_str(),
+            "--contains".as_ref(),
+            "anything".as_ref(),
+            "--include-private".as_ref(),
+        ]),
+        integrity
+    );
+    let digest = exported["content_sha256"].as_str().unwrap();
+    assert_eq!(
+        failure(&[
+            "view".as_ref(),
+            corrupt.as_os_str(),
+            "--message-id".as_ref(),
+            "1".as_ref(),
+            "--content-sha256".as_ref(),
+            digest.as_ref(),
+            "--include-private".as_ref(),
+        ]),
+        integrity
+    );
+    // Negative: refusing an existing destination is not a corruption verdict,
+    // even for a valid archive.
+    let occupied = home.join("occupied.db");
+    fs::write(&occupied, b"already here").unwrap();
+    assert_eq!(
+        failure(&[
+            "import".as_ref(),
+            input.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            occupied.as_os_str(),
+        ]),
+        (9, "logical-archive-error".to_owned(), false)
+    );
+    assert_eq!(fs::read(&occupied).unwrap(), b"already here");
 
     // I/O: the input does not exist. This is not an integrity verdict.
     let io = (14, "logical-archive-io".to_owned(), true);

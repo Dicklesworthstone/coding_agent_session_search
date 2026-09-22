@@ -215,29 +215,35 @@ pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record
         let available = match reader.fill_buf() {
             Ok(available) => available,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => bail!("cannot read logical archive at record {line}"),
+            // Keep the I/O cause: a failed read is not a verdict on the archive.
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("cannot read logical archive at record {line}")));
+            }
         };
         if available.is_empty() {
-            ensure!(
-                bytes.is_empty(),
-                "unterminated logical archive record {line}"
-            );
+            if !bytes.is_empty() {
+                return Err(super::integrity(format!(
+                    "unterminated logical archive record {line}"
+                )));
+            }
             return Ok(None);
         }
         let newline = available.iter().position(|&byte| byte == b'\n');
         let take = newline.map_or(available.len(), |position| position + 1);
-        ensure!(
-            take <= MAX_RECORD_BYTES.saturating_sub(bytes.len()),
-            "logical archive record {line} exceeds 8 MiB"
-        );
+        if take > MAX_RECORD_BYTES.saturating_sub(bytes.len()) {
+            return Err(super::integrity(format!(
+                "logical archive record {line} exceeds 8 MiB"
+            )));
+        }
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
         if newline.is_some() {
             let record = serde_json::from_slice(&bytes).map_err(|error| {
-                anyhow!(
+                super::integrity(format!(
                     "malformed logical archive record {line}, column {}",
                     error.column()
-                )
+                ))
             })?;
             return Ok(Some(record));
         }
@@ -401,21 +407,22 @@ impl Validator {
     }
 }
 
+/// Decode-only: every failure other than I/O is an integrity verdict.
 pub fn verify(reader: &mut impl BufRead) -> Result<(Header, Completion)> {
     let Some(Record::Header { header }) = read_record(reader, 1)? else {
-        bail!("logical archive must begin with a header");
+        return Err(super::integrity("logical archive must begin with a header"));
     };
-    let mut validator = Validator::new(header)?;
+    let mut validator = Validator::new(header).map_err(super::integrity_unless_io)?;
     let mut line = 2u64;
     while let Some(record) = read_record(reader, line)? {
         validator
             .push(&record)
-            .map_err(|error| anyhow!("record {line}: {error}"))?;
+            .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         line = line
             .checked_add(1)
             .ok_or_else(|| anyhow!("logical record position overflow"))?;
     }
-    validator.finish()
+    validator.finish().map_err(super::integrity_unless_io)
 }
 
 #[cfg(test)]

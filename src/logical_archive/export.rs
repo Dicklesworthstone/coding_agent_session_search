@@ -373,8 +373,7 @@ pub fn verify_file(path: &Path) -> Result<(Header, Completion)> {
     // Apply the same regular-file admission as import before any blocking read.
     // File::open alone can wait forever on a FIFO before framing limits apply.
     let input = super::import::open_input(path)?;
-    // Only the decode is an integrity verdict; admission refusals above are not.
-    codec::verify(&mut BufReader::new(input)).map_err(super::integrity_unless_io)
+    codec::verify(&mut BufReader::new(input))
 }
 
 #[cfg(test)]

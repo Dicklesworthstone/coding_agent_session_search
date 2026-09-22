@@ -158,9 +158,9 @@ fn scan(
     mut visit: impl FnMut(&Rows, &[Cell]) -> Result<()>,
 ) -> Result<(Header, Completion)> {
     let Some(Record::Header { header }) = codec::read_record(input, 1)? else {
-        bail!("logical archive must begin with a header");
+        return Err(super::integrity("logical archive must begin with a header"));
     };
-    let mut validator = Validator::new(header)?;
+    let mut validator = Validator::new(header).map_err(super::integrity_unless_io)?;
     let mut current = Rows::Other;
     let mut messages = false;
     let mut conversations = false;
@@ -168,7 +168,8 @@ fn scan(
     while let Some(record) = codec::read_record(input, line)? {
         validator
             .push(&record)
-            .with_context(|| format!("logical evidence record {line}"))?;
+            .with_context(|| format!("logical evidence record {line}"))
+            .map_err(super::integrity_unless_io)?;
         match &record {
             Record::Table { table } => {
                 current = Rows::for_table(table)?;
@@ -183,7 +184,7 @@ fn scan(
             .checked_add(1)
             .context("logical record position overflow")?;
     }
-    let verified = validator.finish()?;
+    let verified = validator.finish().map_err(super::integrity_unless_io)?;
     ensure!(
         messages && conversations,
         "logical backup lacks the messages/conversations evidence schema"

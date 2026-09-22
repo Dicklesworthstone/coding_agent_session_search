@@ -137,8 +137,14 @@ pub struct ArchiveIntegrityError(String);
 #[error("{0}")]
 pub struct ArchiveBusyError(String);
 
+/// An integrity failure detected while decoding, with no underlying cause.
+fn integrity(message: impl std::fmt::Display) -> anyhow::Error {
+    ArchiveIntegrityError(message.to_string()).into()
+}
+
 /// Tag a decode failure as an integrity failure unless it was I/O, which keeps
-/// its own class.
+/// its own class. Only reader-side decoding may use this: the same validator
+/// also checks records being encoded, where a failure is not corruption.
 fn integrity_unless_io(error: anyhow::Error) -> anyhow::Error {
     if error.chain().any(|cause| cause.is::<std::io::Error>()) {
         error

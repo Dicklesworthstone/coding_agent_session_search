@@ -34,17 +34,17 @@ pub(super) fn verify_existing(
 ) -> Result<(Header, Completion)> {
     // Verify all input, including EOF and the completion digest, before even
     // opening the existing database. A matching header or prefix is no proof.
-    let mut validator = Validator::new(header)?;
+    let mut validator = Validator::new(header).map_err(super::integrity_unless_io)?;
     let mut line = 2u64;
     while let Some(record) = codec::read_record(input, line)? {
         validator
             .push(&record)
-            .map_err(|error| anyhow!("record {line}: {error}"))?;
+            .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         line = line
             .checked_add(1)
             .ok_or_else(|| anyhow!("logical record position overflow"))?;
     }
-    let expected = validator.finish()?;
+    let expected = validator.finish().map_err(super::integrity_unless_io)?;
     let admitted = identity(destination)?;
     let reader = export::open_source(destination)?;
     ensure!(

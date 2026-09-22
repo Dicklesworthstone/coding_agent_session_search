@@ -119,14 +119,14 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
     file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(file);
     let Some(Record::Header { header }) = codec::read_record(&mut reader, 1)? else {
-        bail!("logical archive must begin with a header");
+        return Err(super::integrity("logical archive must begin with a header"));
     };
-    header.validate()?;
+    header.validate().map_err(super::integrity_unless_io)?;
     ensure!(
         header.archive_id == expected_archive_id,
         "logical archive identity does not match --archive-id"
     );
-    let mut validator = Validator::new(header.clone())?;
+    let mut validator = Validator::new(header.clone()).map_err(super::integrity_unless_io)?;
     let mut tables = Vec::new();
     let mut line = 2_u64;
     while let Some(record) = codec::read_record(&mut reader, line)? {
@@ -135,12 +135,12 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
         }
         validator
             .push(&record)
-            .map_err(|error| anyhow!("record {line}: {error}"))?;
+            .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         line = line
             .checked_add(1)
             .ok_or_else(|| anyhow!("logical record position overflow"))?;
     }
-    let (verified_header, completion) = validator.finish()?;
+    let (verified_header, completion) = validator.finish().map_err(super::integrity_unless_io)?;
     ensure!(
         verified_header == header,
         "logical archive header changed during verification"
@@ -281,13 +281,13 @@ fn restore_v20<R: BufRead>(
     verify_current_schema_authority(connection)?;
 
     let Some(Record::Header { header }) = input.record(1)? else {
-        bail!("logical archive must begin with a header");
+        return Err(super::integrity("logical archive must begin with a header"));
     };
     ensure!(
         header == inspected.header,
         "logical archive changed between validation and replay"
     );
-    let mut validator = Validator::new(header)?;
+    let mut validator = Validator::new(header).map_err(super::integrity_unless_io)?;
     connection.execute("PRAGMA foreign_keys = OFF")?;
     connection.execute("BEGIN IMMEDIATE")?;
     let triggers = suspend_triggers(connection)?;
@@ -312,7 +312,7 @@ fn restore_v20<R: BufRead>(
         }
         validator
             .push(&record)
-            .map_err(|error| anyhow!("record {line}: {error}"))?;
+            .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         match record {
             Record::Table { table } => {
                 ensure!(
@@ -357,7 +357,7 @@ fn restore_v20<R: BufRead>(
             .ok_or_else(|| anyhow!("logical record position overflow"))?;
     }
 
-    let (header, completion) = validator.finish()?;
+    let (header, completion) = validator.finish().map_err(super::integrity_unless_io)?;
     ensure!(
         (header, completion) == (inspected.header.clone(), inspected.completion.clone()),
         "logical archive changed during reviewed migration replay"
