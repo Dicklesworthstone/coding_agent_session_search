@@ -7,6 +7,411 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
+// Rebased onto cass.pack.v2: keep its one-based selectors and every previously
+// landed regression while checking the remaining session-identity boundaries.
+mod pack_identity_regressions {
+    use super::*;
+    use coding_agent_search::search::pack_planner::{
+        PackCandidate, PackFreshnessPolicy, PackOmittedReason, PackPlanRequest, PackPlannerLimits,
+        PackRenderFormat, PackRenderRequest, PlannedAnswerPack, plan_answer_pack,
+        render_answer_pack_value_without_trust_correlation,
+        render_answer_pack_without_trust_correlation,
+    };
+    use coding_agent_search::search::query::{MatchType, SearchHit};
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    fn hit(conversation_id: Option<i64>, number: Option<usize>, content_hash: u64) -> SearchHit {
+        SearchHit {
+            title: "pack identity".into(),
+            snippet: format!("distinct evidence {content_hash}"),
+            content: format!("distinct evidence {content_hash}"),
+            content_hash,
+            conversation_id,
+            score: 1.0,
+            source_path: "/shared/provider.db".into(),
+            agent: "codex".into(),
+            workspace: "/work".into(),
+            workspace_original: None,
+            created_at: Some(1_000_000),
+            line_number: number,
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+        }
+    }
+
+    fn candidate(hit: &SearchHit) -> PackCandidate {
+        PackCandidate::from_search_hit(hit, 1, 0)
+    }
+
+    fn plan(candidates: Vec<PackCandidate>, max_sessions: usize) -> PlannedAnswerPack {
+        plan_answer_pack(PackPlanRequest {
+            now_ms: 1_000_000,
+            candidates,
+            limits: PackPlannerLimits {
+                max_sessions,
+                ..PackPlannerLimits::default()
+            },
+            freshness_policy: PackFreshnessPolicy::AllowStale,
+            ..PackPlanRequest::default()
+        })
+        .unwrap()
+    }
+
+    fn evidence_id(candidate: PackCandidate) -> String {
+        let pack = plan(vec![candidate], 1);
+        assert_eq!(pack.evidence.len(), 1);
+        pack.evidence[0].id.clone()
+    }
+
+    #[test]
+    fn pack_session_limits_distinguish_conversations_in_one_provider_file() {
+        let first = candidate(&hit(Some(42), Some(8), 1));
+        let second = candidate(&hit(Some(43), Some(8), 2));
+        let mut candidates = vec![first.clone(), second.clone()];
+        let full = plan(candidates.clone(), 2);
+        assert_eq!(full.selected_evidence_count, 2);
+        assert_eq!(full.selected_session_count, 2);
+        assert_ne!(first.candidate_id, second.candidate_id);
+        candidates.reverse();
+        assert_eq!(plan(candidates, 2), full, "input order is not identity");
+
+        let limited = plan(vec![first.clone(), second], 1);
+        assert_eq!(limited.selected_evidence_count, 1);
+        assert_eq!(limited.selected_session_count, 1);
+        assert_eq!(limited.omitted.len(), 1);
+        assert_eq!(
+            limited.omitted[0].reason,
+            PackOmittedReason::MaxSessionsReached
+        );
+
+        let same_session = candidate(&hit(Some(42), Some(13), 3));
+        let pack = plan(vec![first, same_session], 1);
+        assert_eq!(pack.selected_evidence_count, 2);
+        assert_eq!(pack.selected_session_count, 1);
+    }
+
+    #[test]
+    fn pack_overlap_is_scoped_to_source_and_conversation_but_content_dedup_remains() {
+        let mut first = candidate(&hit(Some(42), Some(8), 1));
+        first.line_start = Some(10);
+        first.line_end = Some(12);
+        let mut remote_hit = hit(Some(42), Some(8), 2);
+        remote_hit.source_id = "remote-host".into();
+        remote_hit.origin_kind = "ssh".into();
+        let mut remote = candidate(&remote_hit);
+        remote.line_start = first.line_start;
+        remote.line_end = first.line_end;
+        let mut sibling = candidate(&hit(Some(43), Some(8), 3));
+        sibling.line_start = first.line_start;
+        sibling.line_end = first.line_end;
+        let pack = plan(vec![first.clone(), remote, sibling], 3);
+        assert_eq!(pack.selected_evidence_count, 3);
+        assert_eq!(pack.selected_session_count, 3);
+
+        let mut same_session = candidate(&hit(Some(42), Some(13), 4));
+        same_session.line_start = Some(12);
+        same_session.line_end = Some(14);
+        let overlapping = plan(vec![first.clone(), same_session], 3);
+        assert_eq!(overlapping.selected_evidence_count, 1);
+        assert_eq!(
+            overlapping.omitted[0].reason,
+            PackOmittedReason::DuplicateContent
+        );
+
+        // Exact content dedup is a separate policy, not a session-identity test.
+        let identical_content = candidate(&hit(Some(99), Some(100), 1));
+        let duplicate = plan(vec![first, identical_content], 3);
+        assert_eq!(duplicate.selected_evidence_count, 1);
+        assert_eq!(
+            duplicate.omitted[0].reason,
+            PackOmittedReason::DuplicateContent
+        );
+    }
+
+    #[test]
+    fn pack_content_dedup_chooses_a_stable_known_canonical_anchor_under_ties() {
+        let first = candidate(&hit(Some(42), Some(8), 1));
+        let second = candidate(&hit(Some(43), Some(8), 1));
+        let forward = plan(vec![first.clone(), second.clone()], 2);
+        let reverse = plan(vec![second, first.clone()], 2);
+        assert_eq!(
+            forward, reverse,
+            "text ties must not pick input-order-dependent citations"
+        );
+        assert_eq!(forward.evidence[0].candidate.conversation_id, Some(42));
+        let unknown = candidate(&hit(None, Some(8), 1));
+        for candidates in [vec![unknown.clone(), first.clone()], vec![first, unknown]] {
+            let selected = plan(candidates, 2);
+            assert_eq!(selected.evidence[0].candidate.conversation_id, Some(42));
+        }
+    }
+
+    #[test]
+    fn pack_ids_bind_canonical_coordinates_and_frame_untrusted_strings() {
+        let base = hit(Some(42), Some(8), 7);
+        let mut variants = vec![base.clone()];
+        for conversation in [None, Some(0), Some(43)] {
+            let mut variant = base.clone();
+            variant.conversation_id = conversation;
+            variants.push(variant);
+        }
+        for number in [None, Some(1), Some(13)] {
+            let mut variant = base.clone();
+            variant.line_number = number;
+            variants.push(variant);
+        }
+        let mut other_agent = base.clone();
+        other_agent.agent = "claude_code".into();
+        variants.push(other_agent);
+        for (source, path) in [("a:b", "c"), ("a", "b:c"), ("a\nb", "c"), ("a", "b\nc")] {
+            let mut variant = base.clone();
+            variant.source_id = source.into();
+            variant.source_path = path.into();
+            variants.push(variant);
+        }
+        let mut candidates = HashSet::new();
+        let mut evidence = HashSet::new();
+        for variant in variants {
+            let item = candidate(&variant);
+            assert!(
+                candidates.insert(item.candidate_id.clone()),
+                "candidate identity aliased"
+            );
+            let id = evidence_id(item);
+            assert!(evidence.insert(id.clone()), "citation identity aliased");
+            assert_eq!(evidence_id(candidate(&variant)), id);
+            assert!(id.starts_with("ev_"));
+            assert_eq!(id.len(), 55);
+        }
+        let first = candidate(&hit(Some(42), Some(1), 7));
+        let unknown = candidate(&hit(Some(42), None, 7));
+        assert_eq!(first.message_index, Some(1));
+        assert_eq!(unknown.message_index, None);
+        assert_ne!(evidence_id(first), evidence_id(unknown));
+
+        let mut span = candidate(&base);
+        let absent = evidence_id(span.clone());
+        span.line_start = Some(0);
+        span.line_end = Some(0);
+        assert_ne!(evidence_id(span.clone()), absent);
+        let first = evidence_id(span.clone());
+        span.conversation_id = Some(43);
+        assert_ne!(evidence_id(span), first);
+    }
+
+    #[test]
+    fn pack_redacted_paths_do_not_collapse_session_counts_or_leak_private_keys() {
+        // Unknown IDs make path preservation essential: distinct known IDs would
+        // mask the redacted-path collision in the old source-summary code.
+        for conversations in [[None, None], [Some(42), Some(43)]] {
+            let mut one = hit(conversations[0], Some(8), 1);
+            one.source_path = "/home/alice/history.jsonl".into();
+            let mut two = hit(conversations[1], Some(8), 2);
+            two.source_path = "/home/bob/history.jsonl".into();
+            let pack = plan(vec![candidate(&one), candidate(&two)], 2);
+            let mut render = PackRenderRequest::default();
+            let value = render_answer_pack_value_without_trust_correlation(&pack, &render).unwrap();
+            assert_eq!(value["schema_version"], "cass.pack.v2");
+            assert_eq!(value["realized"]["selected_session_count"], 2);
+            assert_eq!(value["pack"]["source_summary"][0]["session_count"], 2);
+            assert_eq!(
+                value["evidence"][0]["citation"]["source_path"],
+                value["evidence"][1]["citation"]["source_path"]
+            );
+            let encoded = value.to_string();
+            for private in ["/home/alice", "/home/bob", "session_key"] {
+                assert!(
+                    !encoded.contains(private),
+                    "private accounting leaked: {private}"
+                );
+            }
+            render.format = PackRenderFormat::Markdown;
+            let markdown = render_answer_pack_without_trust_correlation(&pack, &render).unwrap();
+            assert!(markdown.contains("message_index=8 (1-based)"));
+            if conversations[0].is_some() {
+                assert!(markdown.contains("conversation_id=42"));
+                assert!(markdown.contains("conversation_id=43"));
+            }
+            assert!(!markdown.contains("/home/alice"));
+            assert!(!markdown.contains("/home/bob"));
+            assert!(value["evidence"].as_array().unwrap().iter().all(|item| {
+                item["citation"]["message_index"] == 8
+                    && item["citation"]["message_index_base"] == 1
+                    && item["citation"]["line_start"].is_null()
+            }));
+        }
+    }
+
+    #[test]
+    fn pack_unknown_conversations_keep_provider_identity_without_inventing_a_number() {
+        let one = hit(None, Some(8), 1);
+        let mut two = hit(None, Some(13), 2);
+        two.agent = "claude_code".into();
+        let pack = plan(vec![candidate(&one), candidate(&two)], 2);
+        assert_eq!(pack.selected_session_count, 2);
+        let render = PackRenderRequest {
+            format: PackRenderFormat::Markdown,
+            ..PackRenderRequest::default()
+        };
+        let markdown = render_answer_pack_without_trust_correlation(&pack, &render).unwrap();
+        assert!(!markdown.contains("conversation_id="));
+        let value = render_answer_pack_value_without_trust_correlation(&pack, &render).unwrap();
+        assert_eq!(value["pack"]["source_summary"][0]["session_count"], 2);
+        assert!(
+            value["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| { item["citation"]["conversation_id"].is_null() })
+        );
+    }
+
+    fn bounded_output(command: Command) -> Output {
+        assert_cmd::Command::from_std(command)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn actual_pack_shared_path_limits_and_citations_round_trip_to_their_own_messages() {
+        let fixture = Fixture::new(&[0, 7, 12]);
+        let storage = FrankenStorage::open(&fixture.db).unwrap();
+        let other = seed(&storage, &fixture.path, "codex", &[0, 7, 12]);
+        let agents = storage
+            .raw()
+            .query_map_collect(
+                "SELECT agent_id FROM conversations WHERE id = ?1",
+                coding_agent_search::franken_sync::params![fixture.conversation_id],
+                |row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "UPDATE conversations SET agent_id = ?1 WHERE id = ?2",
+                coding_agent_search::franken_sync::params![agents[0], other],
+            )
+            .unwrap();
+        let expected = [
+            (
+                fixture.conversation_id,
+                "PACK493IDENTITY alpha conversation evidence",
+            ),
+            (other, "PACK493IDENTITY beta conversation evidence"),
+        ];
+        for (conversation_id, content) in expected {
+            storage
+                .raw()
+                .execute_compat(
+                    "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND idx = 7",
+                    coding_agent_search::franken_sync::params![content, conversation_id],
+                )
+                .unwrap();
+        }
+        drop(storage);
+        let retained_source = fixture._root.path().join("retained-source.jsonl");
+        std::fs::rename(&fixture.path, &retained_source).unwrap();
+        for (conversation_id, _) in expected {
+            let mut index = fixture.command("index");
+            index
+                .arg("--data-dir")
+                .arg(&fixture.data)
+                .arg("--reconcile-conversation")
+                .arg(conversation_id.to_string())
+                .arg("--json");
+            decode(bounded_output(index));
+        }
+        let db_before = std::fs::read(&fixture.db).unwrap();
+        let source_before = std::fs::read(&retained_source).unwrap();
+        for max_sessions in [1_usize, 2] {
+            let mut command = fixture.command("pack");
+            command
+                .args([
+                    "PACK493IDENTITY",
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--no-maintenance",
+                    "--freshness-policy",
+                    "allow-stale",
+                    "--require-evidence",
+                    "--max-sessions",
+                    &max_sessions.to_string(),
+                    "--max-evidence",
+                    "4",
+                    "--max-tokens",
+                    "12000",
+                    "--timeout",
+                    "20000",
+                ])
+                .arg("--data-dir")
+                .arg(&fixture.data);
+            let payload = decode(bounded_output(command));
+            assert_eq!(payload["schema_version"], "cass.pack.v2");
+            let evidence = payload["evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), max_sessions, "{payload}");
+            assert_eq!(payload["realized"]["selected_session_count"], max_sessions);
+            assert_eq!(
+                payload["pack"]["source_summary"][0]["session_count"],
+                max_sessions
+            );
+            let mut identities = HashSet::new();
+            let mut ids = HashSet::new();
+            for item in evidence {
+                let citation = &item["citation"];
+                let conversation = citation["conversation_id"].as_i64().unwrap();
+                assert!(identities.insert(conversation));
+                assert!(ids.insert(item["id"].as_str().unwrap()));
+                assert_eq!(citation["message_index"], 8);
+                assert_eq!(citation["message_index_base"], 1);
+                assert!(citation["line_start"].is_null());
+                assert_eq!(citation["verified"], false);
+                let content = expected
+                    .iter()
+                    .find(|(id, _)| *id == conversation)
+                    .unwrap()
+                    .1;
+                assert_eq!(item["excerpt"], content);
+                for followup in ["view", "expand"] {
+                    let mut command = fixture.command(followup);
+                    let number = citation["message_index"].as_u64().unwrap().to_string();
+                    command
+                        .arg(citation["source_path"].as_str().unwrap())
+                        .args([
+                            "--source",
+                            citation["source_id"].as_str().unwrap(),
+                            "--conversation-id",
+                            &conversation.to_string(),
+                            "--message-index",
+                            &number,
+                            "-C",
+                            "0",
+                            "--json",
+                        ]);
+                    let payload = decode(bounded_output(command));
+                    let rows = if followup == "view" {
+                        &payload["lines"]
+                    } else {
+                        &payload
+                    };
+                    assert_eq!(rows.as_array().unwrap().len(), 1);
+                    assert_eq!(rows[0]["conversation_id"], conversation);
+                    assert_eq!(rows[0]["message_index"], 8);
+                    assert_eq!(rows[0]["is_target"], true);
+                    assert_eq!(rows[0]["content"], content);
+                }
+            }
+        }
+        assert!(!fixture.path.exists());
+        assert_eq!(std::fs::read(&fixture.db).unwrap(), db_before);
+        assert_eq!(std::fs::read(retained_source).unwrap(), source_before);
+    }
+}
+
 struct Fixture {
     _root: TempDir,
     db: PathBuf,

@@ -151,9 +151,13 @@ stored `messages.idx + 1`, not a dense vector position or a physical file line.
 Unknown indices remain null. Explicit field masks may omit required identity
 fields; consumers must not invent the missing components.
 
-Session limits, diversity and source summaries distinguish conversations by
-source, source path and conversation ID, including multiple sessions in a single
-provider database. Without a conversation ID, only path-level identity is known.
+Session limits, diversity, output-budget recounting and source summaries
+distinguish conversations by source, source path, provider and conversation ID,
+including multiple sessions in a single provider database. Without a conversation
+ID, only source/path/provider identity is known; no conversation ID is invented.
+Display redaction never becomes an internal identity key: two private paths
+redacted to the same label still contribute their distinct sessions to the source
+summary. The private accounting key is not serialized.
 
 ```json
 {
@@ -247,11 +251,13 @@ base32 alphabet (`A-Z`, `2-7`), without `=` padding. Each ID is `ev_` followed
 by 52 characters; the final character's unused bits are zero. Published IDs
 bind to the citation core after source verification, including unverified
 fallbacks. Version 2 hashes a domain-separated, length-prefixed encoding of
-source identity and path, optional conversation/message identity, physical span,
-and span hash. Missing and zero coordinates are distinct; embedded delimiters
+source identity and path, provider, content hash, optional conversation/message
+identity, physical span, and span hash. Missing and zero coordinates are distinct; embedded delimiters
 cannot alias neighboring fields. Evidence and candidate IDs change with this
 version. Content-based duplicate suppression within a pack is unchanged, while
-physical-span overlap suppression never crosses source identity.
+physical-span overlap suppression never crosses source/provider/conversation
+identity. Otherwise tied candidates prefer a known conversation ID to a missing
+ID and use canonical coordinates and provider as deterministic tie-breakers.
 
 ## Pack Object Schema
 

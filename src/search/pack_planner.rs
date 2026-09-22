@@ -306,9 +306,25 @@ impl PackCandidate {
         candidate
     }
 
-    fn session_key(&self) -> (&str, &str, Option<i64>) {
-        (&self.source_id, &self.source_path, self.conversation_id)
+    fn session_key(&self) -> PackSessionKey {
+        PackSessionKey {
+            source_id: self.source_id.clone(),
+            source_path: self.source_path.clone(),
+            agent: self.agent.clone(),
+            conversation_id: self.conversation_id,
+        }
     }
+}
+
+/// Keep archive identity separate from display redaction. A provider database
+/// can hold multiple conversations at one path; unknown conversation IDs must
+/// not erase the provider identity we do have.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PackSessionKey {
+    source_id: String,
+    source_path: String,
+    agent: String,
+    conversation_id: Option<i64>,
 }
 
 fn match_type_robot_name(match_type: MatchType) -> &'static str {
@@ -723,6 +739,8 @@ struct RenderedEvidence {
     redactions: Vec<RenderedRedaction>,
     #[serde(skip)]
     source_readiness: PackSourceReadiness,
+    #[serde(skip)]
+    session_key: PackSessionKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -798,7 +816,7 @@ struct RenderedPrivacy {
 #[derive(Debug, Default)]
 struct SourceAccumulator {
     origin_kind: String,
-    sessions: BTreeSet<(String, Option<i64>)>,
+    sessions: BTreeSet<PackSessionKey>,
     evidence_count: usize,
     newest_evidence_at_ms: Option<i64>,
     healthy: bool,
@@ -879,10 +897,10 @@ struct ScoredCandidate {
 #[derive(Debug, Default)]
 struct SelectedState {
     source_ids: HashSet<String>,
-    sessions: HashSet<(String, String, Option<i64>)>,
+    sessions: HashSet<PackSessionKey>,
     span_hashes: HashSet<String>,
     content_hashes: HashSet<String>,
-    ranges: Vec<(String, String, Option<usize>, Option<usize>)>,
+    ranges: Vec<(PackSessionKey, Option<usize>, Option<usize>)>,
 }
 
 pub fn plan_answer_pack(
@@ -1044,11 +1062,8 @@ pub fn plan_answer_pack(
         }
 
         let session_key = candidate.session_key();
-        if !selected_state.sessions.contains(&(
-            session_key.0.to_string(),
-            session_key.1.to_string(),
-            session_key.2,
-        )) && selected_state.sessions.len() >= request.limits.max_sessions
+        if !selected_state.sessions.contains(&session_key)
+            && selected_state.sessions.len() >= request.limits.max_sessions
         {
             omitted.push(omitted_candidate(
                 candidate,
@@ -1062,23 +1077,16 @@ pub fn plan_answer_pack(
         selected_state
             .source_ids
             .insert(candidate.source_id.clone());
-        selected_state.sessions.insert((
-            candidate.source_id.clone(),
-            candidate.source_path.clone(),
-            candidate.conversation_id,
-        ));
+        selected_state.sessions.insert(session_key.clone());
         selected_state
             .span_hashes
             .insert(candidate.span_hash.clone());
         selected_state
             .content_hashes
             .insert(candidate.content_hash.clone());
-        selected_state.ranges.push((
-            candidate.source_id.clone(),
-            candidate.source_path.clone(),
-            candidate.line_start,
-            candidate.line_end,
-        ));
+        selected_state
+            .ranges
+            .push((session_key, candidate.line_start, candidate.line_end));
 
         selected.push(PlannedPackEvidence {
             id: evidence_id(candidate),
@@ -1267,19 +1275,15 @@ fn hard_omission_reason(
     if is_stale_under_strict_policy(candidate, request) {
         return Some(PackOmittedReason::StaleUnderStrictPolicy);
     }
+    let session_key = candidate.session_key();
     if selected_state.span_hashes.contains(&candidate.span_hash)
         || selected_state
             .content_hashes
             .contains(&candidate.content_hash)
-        || selected_state
-            .ranges
-            .iter()
-            .any(|(source_id, source_path, start, end)| {
-                // ubs:ignore — compares public citation paths, never secret material.
-                source_id == &candidate.source_id
-                    && source_path == &candidate.source_path
-                    && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-            })
+        || selected_state.ranges.iter().any(|(session, start, end)| {
+            session == &session_key
+                && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
+        })
     {
         return Some(PackOmittedReason::DuplicateContent);
     }
@@ -1449,11 +1453,7 @@ fn freshness_score(candidate: &PackCandidate, request: &PackPlanRequest) -> f64 
 }
 
 fn source_diversity_score(candidate: &PackCandidate, selected_state: &SelectedState) -> f64 {
-    let session_key = (
-        candidate.source_id.clone(),
-        candidate.source_path.clone(),
-        candidate.conversation_id,
-    );
+    let session_key = candidate.session_key();
     if selected_state.sessions.contains(&session_key) {
         0.0
     } else if selected_state.source_ids.contains(&candidate.source_id) {
@@ -1513,16 +1513,11 @@ fn duplicate_penalty(candidate: &PackCandidate, selected_state: &SelectedState) 
     {
         return 0.5;
     }
-    if selected_state
-        .ranges
-        .iter()
-        .any(|(source_id, source_path, start, end)| {
-            // ubs:ignore — compares public citation paths, never secret material.
-            source_id == &candidate.source_id
-                && source_path == &candidate.source_path
-                && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-        })
-    {
+    let session_key = candidate.session_key();
+    if selected_state.ranges.iter().any(|(session, start, end)| {
+        session == &session_key
+            && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
+    }) {
         return 0.25;
     }
     0.0
@@ -1570,10 +1565,17 @@ fn candidate_ordering(
         .then_with(|| left_candidate.source_id.cmp(&right_candidate.source_id))
         .then_with(|| left_candidate.source_path.cmp(&right_candidate.source_path))
         .then_with(|| {
-            left_candidate
-                .conversation_id
-                .cmp(&right_candidate.conversation_id)
+            match (
+                left_candidate.conversation_id,
+                right_candidate.conversation_id,
+            ) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
         })
+        .then_with(|| left_candidate.agent.cmp(&right_candidate.agent))
         .then_with(|| {
             compare_optional_usize_low_first(
                 left_candidate.message_index,
@@ -1646,7 +1648,12 @@ fn evidence_id(candidate: &PackCandidate) -> String {
     // newlines/colons cannot move data into a neighboring identity component.
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"cass.pack.evidence.v2\0");
-    for text in [&candidate.source_id, &candidate.source_path] {
+    for text in [
+        &candidate.source_id,
+        &candidate.source_path,
+        &candidate.agent,
+        &candidate.content_hash,
+    ] {
         hasher.update(&(text.len() as u64).to_le_bytes());
         hasher.update(text.as_bytes());
     }
@@ -2360,6 +2367,7 @@ fn rendered_evidence(
             .collect(),
         redactions,
         source_readiness: candidate.source_readiness,
+        session_key: candidate.session_key(),
     }
 }
 
@@ -2444,10 +2452,7 @@ fn rendered_source_summary(evidence: &[RenderedEvidence]) -> Vec<RenderedSourceS
             healthy: true,
             ..SourceAccumulator::default()
         });
-        entry.sessions.insert((
-            item.citation.source_path.clone(),
-            item.citation.conversation_id,
-        ));
+        entry.sessions.insert(item.session_key.clone());
         entry.evidence_count += 1;
         entry.newest_evidence_at_ms =
             newer_timestamp(entry.newest_evidence_at_ms, item.citation.created_at_ms);
