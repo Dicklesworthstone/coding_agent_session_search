@@ -10019,6 +10019,206 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
     Ok(expected_docs)
 }
 
+/// GH #461: sidecar next to the rebuild checkpoint memoizing the
+/// noise-adjusted expected doc count for one canonical content identity.
+const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
+const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 1;
+/// Recount in full after this many consecutive append deltas. The identity
+/// (like the lexical checkpoint fingerprint it extends) cannot see an in-place
+/// content edit of an existing row; this bounds how long such an edit can skew
+/// the expectation.
+const EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS: u32 = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ExpectedLexicalDocsIdentity {
+    total_conversations: usize,
+    max_conversation_id: i64,
+    max_message_id: i64,
+    total_messages: usize,
+    content_cap_bytes: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExpectedLexicalDocsCache {
+    schema_version: u32,
+    db_path: String,
+    identity: ExpectedLexicalDocsIdentity,
+    expected_docs: usize,
+    delta_generations: u32,
+}
+
+fn count_exact(storage: &FrankenStorage, sql: &str, bound: i64) -> Result<usize> {
+    let count: i64 = storage
+        .raw()
+        .query_row_map(sql, &[ParamValue::from(bound)], |row| row.get_typed(0))
+        .with_context(|| format!("counting rows for the expected lexical docs delta: {sql}"))?;
+    Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
+}
+
+fn expected_lexical_docs_identity(
+    storage: &FrankenStorage,
+    total_messages: usize,
+) -> Result<ExpectedLexicalDocsIdentity> {
+    let max_message_id: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COALESCE(MAX(id), 0) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .context("reading the max message id for the expected lexical docs identity")?;
+    Ok(ExpectedLexicalDocsIdentity {
+        total_conversations: count_total_conversations_exact(storage)?,
+        max_conversation_id: max_conversation_id_exact(storage)?.unwrap_or(0),
+        max_message_id,
+        total_messages,
+        // The same effective cap fetch_messages_for_lexical_rebuild applies.
+        content_cap_bytes: crate::storage::sqlite::lexical_max_conversation_content_bytes()
+            .min(i32::MAX as usize),
+    })
+}
+
+/// Extend a memoized expectation by the rows appended since it was taken,
+/// or `None` when the archive changed in any way an append cannot explain.
+///
+/// Sound only for pure appends: no conversation or message was deleted (both
+/// totals grew by exactly the rows beyond the memoized maxima), the content
+/// cap is unchanged, and within every touched conversation each new message
+/// sorts after all previously retained ones. The per-conversation cap is
+/// cumulative in `idx` order, so under those conditions the old messages'
+/// truncation, and therefore their noise classification, is unchanged, and
+/// only the new messages need classifying, exactly as the full scan would.
+fn expected_live_lexical_doc_count_delta(
+    storage: &FrankenStorage,
+    cached: &ExpectedLexicalDocsCache,
+    current: &ExpectedLexicalDocsIdentity,
+) -> Result<Option<usize>> {
+    let old = &cached.identity;
+    if old.content_cap_bytes != current.content_cap_bytes
+        || current.max_message_id < old.max_message_id
+        || current.max_conversation_id < old.max_conversation_id
+        || current.total_conversations < old.total_conversations
+        || current.total_messages < old.total_messages
+    {
+        return Ok(None);
+    }
+    let new_conversations = count_exact(
+        storage,
+        "SELECT COUNT(*) FROM conversations WHERE id > ?1",
+        old.max_conversation_id,
+    )?;
+    let new_messages = count_exact(
+        storage,
+        "SELECT COUNT(*) FROM messages WHERE id > ?1",
+        old.max_message_id,
+    )?;
+    if old.total_conversations.checked_add(new_conversations) != Some(current.total_conversations)
+        || old.total_messages.checked_add(new_messages) != Some(current.total_messages)
+    {
+        return Ok(None);
+    }
+    // Live conversations only, like the full scan (orphaned rows are never indexed).
+    let touched: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT DISTINCT m.conversation_id FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id WHERE m.id > ?1",
+            &[ParamValue::from(old.max_message_id)],
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
+        )
+        .context("listing conversations touched since the expected lexical docs memo")?;
+    let mut expected_docs = cached.expected_docs;
+    for conversation_id in touched {
+        let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
+        let is_new = |message: &crate::model::types::Message| {
+            message.id.is_none_or(|id| id > old.max_message_id)
+        };
+        let retained_max_idx = messages
+            .iter()
+            .filter(|message| !is_new(message))
+            .map(|message| message.idx)
+            .max();
+        for message in messages.iter().filter(|message| is_new(message)) {
+            if retained_max_idx.is_some_and(|max_idx| message.idx <= max_idx) {
+                // Inserted before retained messages: the cumulative cap may
+                // now truncate those differently. Only a full count is exact.
+                return Ok(None);
+            }
+            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+                expected_docs = expected_docs.saturating_add(1);
+            }
+        }
+    }
+    Ok(Some(expected_docs))
+}
+
+/// [`expected_live_lexical_doc_count`] without re-reading the whole archive on
+/// every run (GH #461). The full per-conversation content scan ran at index
+/// startup and again at the post-run checkpoint refresh on any archive whose
+/// sink drops tool-acks or empty messages, i.e. on essentially every
+/// incremental run; a 16 MB incremental run read 9.4 GB. The count is served
+/// from the sidecar when the canonical identity is unchanged, extended by an
+/// append-only delta when possible, and otherwise recomputed in full.
+/// The sidecar is best effort: a missing, foreign or unreadable one only
+/// costs the full scan it replaces.
+fn expected_live_lexical_doc_count_cached(
+    storage: &FrankenStorage,
+    index_path: &Path,
+    db_path: &str,
+    total_messages: usize,
+) -> Result<usize> {
+    let current = expected_lexical_docs_identity(storage, total_messages)?;
+    let cache_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
+    let cached = fs::read(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsCache>(&raw).ok())
+        .filter(|cached| {
+            cached.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
+                && lexical_rebuild_db_paths_match(&cached.db_path, db_path)
+        });
+    let (expected_docs, delta_generations, source) = match cached {
+        Some(cached) if cached.identity == current => {
+            return Ok(cached.expected_docs);
+        }
+        Some(cached) if cached.delta_generations < EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS => {
+            match expected_live_lexical_doc_count_delta(storage, &cached, &current)? {
+                Some(expected) => (expected, cached.delta_generations + 1, "delta"),
+                None => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+            }
+        }
+        _ => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+    };
+    tracing::debug!(
+        expected_lexical_docs = expected_docs,
+        source,
+        delta_generations,
+        "expected lexical doc count recomputed"
+    );
+    if index_path.is_dir() {
+        let payload = ExpectedLexicalDocsCache {
+            schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+            db_path: db_path.to_string(),
+            identity: current,
+            expected_docs,
+            delta_generations,
+        };
+        let tmp_path = index_path.join(format!(
+            "{EXPECTED_LEXICAL_DOCS_CACHE_FILE}.{}.tmp",
+            std::process::id()
+        ));
+        let written = serde_json::to_vec(&payload)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| fs::write(&tmp_path, bytes))
+            .and_then(|()| fs::rename(&tmp_path, &cache_path));
+        if let Err(err) = written {
+            tracing::debug!(error = %err, "expected lexical docs cache write skipped");
+            let _ = fs::remove_file(&tmp_path);
+        }
+    }
+    Ok(expected_docs)
+}
+
 fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
     let max_conversation_id: i64 = storage
         .raw()
@@ -12031,7 +12231,12 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     let expected_docs = if observed_tantivy_docs == total_messages {
         total_messages
     } else {
-        expected_live_lexical_doc_count(storage)?
+        expected_live_lexical_doc_count_cached(
+            storage,
+            index_path,
+            &db_state.db_path,
+            total_messages,
+        )?
     };
     if observed_tantivy_docs != expected_docs {
         tracing::debug!(
@@ -16820,7 +17025,12 @@ fn run_index_inner(
             // the scan stays watchdog-covered without a new taxonomy sub-phase.
             let expected_lexical_docs =
                 if observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages) {
-                    expected_live_lexical_doc_count(&storage)?
+                    expected_live_lexical_doc_count_cached(
+                        &storage,
+                        &index_path,
+                        &opts.db_path.to_string_lossy(),
+                        canonical_messages,
+                    )?
                 } else {
                     canonical_messages
                 };
@@ -53105,6 +53315,103 @@ mod tests {
             "a half-recorded retirement must be recorded again: {marker:?}"
         );
         assert!(pending.is_some());
+    }
+
+    /// GH #461: the noise-adjusted expected doc count must not re-read the
+    /// whole archive on every run, yet it must stay exactly what the full scan
+    /// computes. An unchanged identity is served from the sidecar (a planted
+    /// sentinel proves no scan ran); appends extend it by a delta equal to the
+    /// full count; a deletion or an insertion before retained messages falls
+    /// back to a full recount (generation resets to 0).
+    #[test]
+    fn gh461_expected_lexical_docs_memo_serves_unchanged_and_extends_appends_exactly() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("gh461.db");
+        let index_path = dir.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        let db = db_path.to_string_lossy().into_owned();
+        let conversation_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT MIN(id) FROM conversations",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let insert = |conversation_id: i64, idx: i64, role: &str, content: &str| {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, ?3, ?4)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(idx),
+                        ParamValue::from(role.to_string()),
+                        ParamValue::from(content.to_string()),
+                    ],
+                )
+                .unwrap();
+        };
+        let cached = || {
+            expected_live_lexical_doc_count_cached(
+                &storage,
+                &index_path,
+                &db,
+                count_total_messages_exact(&storage).unwrap(),
+            )
+            .unwrap()
+        };
+        let sidecar_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
+        let sidecar = || {
+            serde_json::from_slice::<ExpectedLexicalDocsCache>(&fs::read(&sidecar_path).unwrap())
+                .unwrap()
+        };
+        let full = || expected_live_lexical_doc_count(&storage).unwrap();
+
+        // Empty content is hard noise, so the expectation is below the raw count.
+        insert(conversation_id, 50, "user", "   ");
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 0);
+        assert!(full() < count_total_messages_exact(&storage).unwrap());
+
+        // Unchanged identity: served from the sidecar without a scan.
+        let mut planted = sidecar();
+        planted.expected_docs = 999_999;
+        fs::write(&sidecar_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+        assert_eq!(cached(), 999_999, "an unchanged identity must not rescan");
+        planted.expected_docs = full();
+        fs::write(&sidecar_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        // Appends (after retained messages, plus a new noise row) extend exactly.
+        insert(conversation_id, 60, "assistant", "appended evidence");
+        insert(conversation_id, 61, "tool", "");
+        assert_eq!(cached(), full());
+        assert_eq!(
+            sidecar().delta_generations,
+            1,
+            "appends take the delta path"
+        );
+
+        // Negative: an insertion before retained messages cannot be a delta.
+        insert(conversation_id, 55, "user", "inserted mid-conversation");
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 0, "mid-insertion must recount");
+
+        // Negative: a deletion cannot be explained by appends.
+        insert(conversation_id, 70, "user", "one more append");
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 1);
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND idx = 60",
+                &[ParamValue::from(conversation_id)],
+            )
+            .unwrap();
+        assert_eq!(cached(), full());
+        assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
     }
 
     /// #439: the fallback-FTS shadow maintenance must report liveness per
