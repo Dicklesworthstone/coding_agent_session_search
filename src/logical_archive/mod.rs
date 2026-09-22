@@ -69,6 +69,9 @@ enum Operation {
         /// Restrict matching to this exact positive canonical conversation ID.
         #[arg(long)]
         conversation_id: Option<i64>,
+        /// Continue with next_cursor from the same backup and query/filter.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Acknowledge that result excerpts contain private session content.
         #[arg(long)]
         include_private: bool,
@@ -137,9 +140,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let (header, completion) = export::verify_file(&input)?;
             ("verify", header, completion)
         }
-        Operation::Search { input, contains, limit, conversation_id, include_private } => {
+        Operation::Search { input, contains, limit, conversation_id, cursor, include_private } => {
             ensure!(include_private, "backup search emits private session excerpts; pass --include-private to acknowledge this");
-            let result = query::search(&input, &contains, limit, conversation_id)?;
+            let result = query::search(&input, &contains, limit, conversation_id, cursor.as_deref())?;
             println!("{result}");
             return Ok(());
         }

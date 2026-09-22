@@ -10,8 +10,11 @@ use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Serialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::codec::{self, Cell, Completion, Header, Record, Table, Validator};
 
@@ -22,6 +25,40 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const SNIPPET_CHARS: usize = 256;
 const MAX_CONTEXT: usize = 20;
 const MAX_VIEW_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_CURSOR_BYTES: usize = 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchCursor {
+    version: u32,
+    content_sha256: String,
+    criteria_sha256: String,
+    after_message_id: i64,
+}
+
+impl SearchCursor {
+    fn criteria(contains: &str, conversation_id: Option<i64>) -> Result<String> {
+        let bytes = serde_json::to_vec(&("cass.logical_query.v1", contains, conversation_id))?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    fn decode(encoded: &str, contains: &str, conversation_id: Option<i64>) -> Result<Self> {
+        ensure!(!encoded.is_empty() && encoded.len() <= MAX_CURSOR_BYTES, "invalid logical search cursor size");
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| anyhow!("invalid logical search cursor encoding"))?;
+        let cursor: Self = serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid logical search cursor"))?;
+        ensure!(cursor.version == 1 && cursor.after_message_id > 0, "unsupported logical search cursor");
+        validate_digest(&cursor.content_sha256)?;
+        ensure!(cursor.criteria_sha256 == Self::criteria(contains, conversation_id)?,
+            "logical search cursor belongs to a different query or conversation filter");
+        Ok(cursor)
+    }
+
+    fn encode(self) -> Result<String> {
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&self)?);
+        ensure!(encoded.len() <= MAX_CURSOR_BYTES, "logical search cursor exceeds its budget");
+        Ok(encoded)
+    }
+}
 
 fn column(table: &Table, name: &str) -> Result<usize> {
     table.columns.iter().position(|item| item == name)
@@ -215,20 +252,35 @@ pub fn search(
     contains: &str,
     limit: usize,
     conversation_id: Option<i64>,
+    cursor: Option<&str>,
 ) -> Result<Value> {
     validate_search(contains, limit, conversation_id)?;
+    // Decode before opening the input, including the bounded cursor payload.
+    let cursor = cursor.map(|value| SearchCursor::decode(value, contains, conversation_id)).transpose()?;
     let mut input = BufReader::new(super::import::open_input(path)?);
-    search_stream(&mut input, contains, limit, conversation_id)
+    search_page(&mut input, contains, limit, conversation_id, cursor)
 }
 
+#[cfg(test)]
 fn search_stream(
     input: &mut (impl BufRead + Seek),
     contains: &str,
     limit: usize,
     conversation_id: Option<i64>,
 ) -> Result<Value> {
+    search_page(input, contains, limit, conversation_id, None)
+}
+
+fn search_page(
+    input: &mut (impl BufRead + Seek),
+    contains: &str,
+    limit: usize,
+    conversation_id: Option<i64>,
+    cursor: Option<SearchCursor>,
+) -> Result<Value> {
     validate_search(contains, limit, conversation_id)?;
     let mut total = 0_u64;
+    let mut remaining = 0_u64;
     let mut retained = Vec::new();
     let verified = scan(input, |rows, values| {
         if let Rows::Messages(columns) = rows {
@@ -240,6 +292,8 @@ fn search_stream(
             if conversation_id.is_some_and(|expected| expected != conversation) { return Ok(()); }
             let Some(at) = content.find(contains) else { return Ok(()); };
             total = total.checked_add(1).context("logical match count overflow")?;
+            if cursor.as_ref().is_some_and(|cursor| id <= cursor.after_message_id) { return Ok(()); }
+            remaining = remaining.checked_add(1).context("logical match count overflow")?;
             if retained.len() == limit { return Ok(()); }
             let role = text(values, columns.role)?;
             ensure!(role.len() <= 128, "selected message role exceeds 128 bytes");
@@ -252,8 +306,20 @@ fn search_stream(
         }
         Ok(())
     })?;
+    if let Some(cursor) = cursor {
+        ensure!(cursor.content_sha256 == verified.1.content_sha256,
+            "logical backup changed since the cursor was issued; restart the search");
+    }
     let selected = retained.iter().map(|hit| hit.conversation_id).collect();
     let conversations = resolve_conversations(input, &selected, &verified)?;
+    let has_more = remaining > retained.len() as u64;
+    let next_cursor = if has_more {
+        Some(SearchCursor {
+            version: 1, content_sha256: verified.1.content_sha256.clone(),
+            criteria_sha256: SearchCursor::criteria(contains, conversation_id)?,
+            after_message_id: retained.last().context("missing logical continuation anchor")?.message_id,
+        }.encode()?)
+    } else { None };
     let mut hits = Vec::with_capacity(retained.len());
     for hit in retained {
         let conversation = conversations.get(&hit.conversation_id)
@@ -268,7 +334,8 @@ fn search_stream(
         "archive_id": verified.0.archive_id, "content_sha256": verified.1.content_sha256,
         "integrity_verified": true, "database_integrity_checked": false,
         "match_mode": "literal_case_sensitive", "order": "message_id",
-        "matches": total, "limit": limit, "has_more": total > hits.len() as u64, "hits": hits,
+        "matches": total, "matches_after_cursor": remaining,
+        "limit": limit, "has_more": has_more, "next_cursor": next_cursor, "hits": hits,
         "coordinate_space": "message_index", "content_source": "logical_archive",
         "preview_only": true, "contains_private_data": true,
         "database_opened": false, "provider_files_opened": false,
@@ -298,6 +365,10 @@ impl Anchor {
 fn validate_view(message_id: i64, context: usize, digest: &str) -> Result<()> {
     ensure!(message_id > 0, "--message-id must be positive");
     ensure!(context <= MAX_CONTEXT, "--context must be between 0 and 20");
+    validate_digest(digest)
+}
+
+fn validate_digest(digest: &str) -> Result<()> {
     ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "--content-sha256 requires the 64 lowercase hex digits from archive search or verify");
     Ok(())
@@ -528,7 +599,7 @@ mod tests {
     fn malformed_limits_fail_before_opening_any_input() {
         let missing = Path::new("/nonexistent/query-fixture.jsonl");
         for (needle, limit, conversation) in [("", 1, None), ("x", 0, None), ("x", 101, None), ("x", 1, Some(0))] {
-            assert!(search(missing, needle, limit, conversation).is_err());
+            assert!(search(missing, needle, limit, conversation, None).is_err());
         }
     }
 
@@ -651,5 +722,43 @@ mod tests {
         }
         assert_eq!(before.first_key_value().unwrap().0, &9980);
         assert_eq!(after.last_key_value().unwrap().0, &19);
+    }
+
+    #[test]
+    fn backup_cursors_exhaust_matches_without_duplicates_or_false_more_pages() {
+        let bytes = wire(records());
+        let first = search_page(&mut Cursor::new(&bytes), "needle", 1, None, None).unwrap();
+        let cursor = SearchCursor::decode(first["next_cursor"].as_str().unwrap(), "needle", None).unwrap();
+        let second = search_page(&mut Cursor::new(&bytes), "needle", 2, None, Some(cursor)).unwrap();
+        assert_eq!(first["hits"][0]["message_id"], 1);
+        assert_eq!(second["matches"], 3);
+        assert_eq!(second["matches_after_cursor"], 2);
+        assert_eq!(second["hits"][0]["message_id"], 2);
+        assert_eq!(second["hits"][1]["message_id"], 4);
+        assert_eq!(second["has_more"], false);
+        assert!(second["next_cursor"].is_null());
+        assert_eq!(first["content_sha256"], second["content_sha256"]);
+        let end = SearchCursor { version: 1, content_sha256: first["content_sha256"].as_str().unwrap().into(),
+            criteria_sha256: SearchCursor::criteria("needle", None).unwrap(), after_message_id: i64::MAX };
+        let exhausted = search_page(&mut Cursor::new(&bytes), "needle", 1, None, Some(end)).unwrap();
+        assert_eq!(exhausted["matches_after_cursor"], 0);
+        assert_eq!(exhausted["has_more"], false);
+    }
+
+    #[test]
+    fn cursors_reject_changed_criteria_snapshots_and_oversized_payloads() {
+        let bytes = wire(records());
+        let first = search_stream(&mut Cursor::new(&bytes), "needle", 1, None).unwrap();
+        let token = first["next_cursor"].as_str().unwrap();
+        assert!(SearchCursor::decode(token, "Needle", None).is_err());
+        assert!(SearchCursor::decode(token, "needle", Some(1)).is_err());
+        let mut rows = records();
+        rows[7] = message(4, 2, 1000, "changed snapshot needle");
+        let cursor = SearchCursor::decode(token, "needle", None).unwrap();
+        assert!(search_page(&mut Cursor::new(wire(rows)), "needle", 1, None, Some(cursor)).is_err());
+        let oversize = "x".repeat(MAX_CURSOR_BYTES + 1);
+        for invalid in ["", "{}", oversize.as_str()] {
+            assert!(search(Path::new("/nonexistent/backup"), "needle", 1, None, Some(invalid)).is_err());
+        }
     }
 }

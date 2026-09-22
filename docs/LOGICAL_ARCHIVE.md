@@ -34,6 +34,87 @@ lock files prevent competing processes from locking different inodes. These
 controls do not impose a wall-clock deadline on database opening or scanning.
 Offline verification rejects special files and symlinks before reading JSONL.
 
+## Search and read a backup without restoring it
+
+When only a logical backup is available, `archive search` searches complete
+stored message bodies without opening SQLite, building an index, or accessing
+provider paths. The input is a `cass.logical_archive` JSONL file, not a raw
+provider transcript or ordinary search-result JSONL:
+
+```sh
+cass archive search /private/backups/history.jsonl \
+  --contains "authentication" --limit 25 --include-private
+```
+
+Matching is **case-sensitive literal substring matching**. There is no stemming,
+regex, Boolean syntax, relevance ranking, model inference, or search-index
+truncation. `--contains` accepts 1..1024 UTF-8 bytes; `--limit` accepts 1..100
+matches, ordered by canonical message ID. `--conversation-id` optionally scopes
+the search to one exact positive ID. Each hit includes source ID/path,
+conversation ID, message ID, one-based stored message index, and a preview of at
+most 256 characters around the first match. Preview and match offsets are UTF-8
+**byte** offsets in the full stored body; a preview is not a complete message.
+
+The response counts all matching messages in `matches`, even after filling the
+page. When `has_more` is true, pass `next_cursor` as `--cursor` with the same
+substring and conversation filter. Page size may change. `matches_after_cursor`
+counts the remaining matching messages, including the returned page. Cursors
+bind the archive content digest and search criteria: a different snapshot or
+query is refused rather than silently mixing pages. The final page has a null
+`next_cursor`. Cursors are bounded, versioned continuation data, not credentials
+or signatures. Do not modify them or share private results indiscriminately.
+
+Follow a hit with `archive view`. Supply its exact `message_id` and the response's
+`content_sha256`; the digest is mandatory so the same numeric ID in a replacement
+backup cannot silently identify a different message. This example captures and
+uses both values without shell interpolation of private content:
+
+```python
+import json
+import subprocess
+
+backup = "/private/backups/history.jsonl"
+page = json.loads(subprocess.check_output([
+    "cass", "archive", "search", backup,
+    "--contains", "authentication", "--limit", "1", "--include-private",
+]))
+if page["hits"]:
+    subprocess.run([
+        "cass", "archive", "view", backup,
+        "--message-id", str(page["hits"][0]["message_id"]),
+        "--content-sha256", page["content_sha256"],
+        "--context", "2", "--include-private",
+    ], check=True)
+```
+
+View returns complete message **text and role**, plus source/conversation/message
+identity; it does not expand arbitrary provider metadata or execute stored tool
+calls. Context is 0..20 actual messages on either side, default 2, sorted by stored
+message index. Sparse indices and wire row order are not mistaken for message
+adjacency. `more_before` and `more_after` report omitted neighbours. Complete
+text across the selected window must fit 64 KiB, counting UTF-8 and embedded
+NUL bytes. Oversized windows fail with no partial success; reduce context or
+restore the archive for larger bodies. Requested bodies are never shortened.
+
+Search verifies two complete passes through one admitted regular-file handle:
+match selection and bounded source-identity resolution. View verifies three:
+exact target, bounded neighbour selection, and complete-body hydration. Headers
+and digests must agree across every pass, and no results are emitted until the
+final completion validates. Corruption outside the displayed window still
+fails. Selected orphan relationships or ambiguous view coordinates fail rather
+than falling back to a similarly named session on another machine.
+
+These are sequential scans, not indexed lookups: work grows with backup size
+and each page scans again. Retained application state is bounded by one 8 MiB
+wire record plus the page/context limits, with a 2 MiB encoded-response ceiling.
+This is not a measured whole-process RSS or wall-clock guarantee. No model,
+database, profile, index or provider file is created or opened by these commands.
+They report `content_source: "logical_archive"`, not canonical-database access.
+`integrity_verified` means the complete wire checksum/count/order contract
+passed; `database_integrity_checked: false` explicitly excludes a whole-database
+foreign-key or physical integrity audit. The checksum is not source authenticity.
+Both commands require `--include-private` before displaying session content.
+
 ## Restore into a new canonical database
 
 Import requires `--archive-id` to match the input header and `--include-private`
@@ -294,8 +375,15 @@ workflow jobs successfully: 48 archive regressions, six archive CLI regressions,
 15 canonical-service regressions, 20 bookmark tests and nine bookmark-CLI tests
 passed. This supersedes the earlier partial run `35672185382` at `d504e6e` and
 covers prepared replay, source-less follow-up and both process-kill boundaries.
-It does **not** qualify the later opt-in indexed-recovery implementation.
-The latter needs its own exact-source native result. No large-archive RSS,
-cross-platform, power-loss, Clippy/UBS or full-release qualification follows from
-these fixture results. The targeted workflow records immutable source, lockfile
-and binary identities and rejects empty test-filter success.
+That run did **not** qualify the later opt-in indexed-recovery implementation.
+
+Subsequent Linux run `35687395247` at `695c5449` passed every native test stage:
+56 archive tests, 14 archive CLI tests, five indexed-recovery admission tests,
+29 canonical-service tests, 20 bookmark tests and nine bookmark-CLI tests.
+It includes the corrected indexed-recovery search-to-view journey and direct
+backup search. Its separate formatting job failed, so the whole workflow was
+not green. Full-message backup views and cursor pagination were added afterward
+and need their own exact-source execution results. These fixture results do not
+establish large-archive RSS, cross-platform, power-loss, Clippy/UBS or full-release
+qualification. The targeted workflow records immutable source, lockfile and
+binary identities and rejects empty test-filter success.

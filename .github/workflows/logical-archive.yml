@@ -95,8 +95,8 @@ jobs:
           from pathlib import Path
           text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/unit.log').read_text()
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 62:
-              raise SystemExit('Expected all 62 archive regressions, including verified backup search and complete views')
+          if not counts or max(map(int, counts)) < 64:
+              raise SystemExit('Expected all 64 archive regressions, including snapshot-bound paging and complete views')
           PY
       - name: Run the real binary round trip and failure contracts
         shell: bash
@@ -108,8 +108,8 @@ jobs:
           from pathlib import Path
           text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/cli.log').read_text()
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 16:
-              raise SystemExit('Expected all sixteen real-binary archive regressions, including backup-only search-to-view')
+          if not counts or max(map(int, counts)) < 17:
+              raise SystemExit('Expected all seventeen real-binary archive regressions, including backup paging and search-to-view')
           PY
           sha256sum target/debug/cass | tee "$RUNNER_TEMP/archive-evidence/binary.txt"
       - name: Exercise canonical-only indexed restore admission

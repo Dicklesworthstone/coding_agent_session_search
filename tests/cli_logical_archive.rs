@@ -768,3 +768,36 @@ fn backup_view_refuses_wrong_snapshots_missing_ids_and_private_output_without_co
     }
     assert!(!root.path().join("unused-default").exists());
 }
+
+#[test]
+fn backup_cursor_pages_all_matches_and_rejects_reuse_with_different_criteria() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let mut cursor: Option<String> = None;
+    let mut ids = std::collections::BTreeSet::new();
+    for page in 0..4 {
+        let mut cmd = command(root.path());
+        cmd.args(["archive", "search"]).arg(&input)
+            .args(["--contains", "PORTABLENEEDLE", "--include-private", "--limit", "1"]);
+        if let Some(cursor) = &cursor { cmd.args(["--cursor", cursor]); }
+        let result = receipt(cmd.output().unwrap());
+        assert_eq!(result["content_sha256"], exported["content_sha256"]);
+        assert_eq!(result["matches"], 4);
+        assert_eq!(result["matches_after_cursor"], 4 - page);
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(ids.insert(hits[0]["message_id"].as_i64().unwrap()));
+        cursor = result["next_cursor"].as_str().map(str::to_owned);
+        assert_eq!(cursor.is_some(), page < 3);
+        if let Some(cursor) = &cursor {
+            let refused = command(root.path()).args(["archive", "search"]).arg(&input)
+                .args(["--contains", "different query", "--include-private", "--cursor", cursor])
+                .output().unwrap();
+            assert!(!refused.status.success());
+            assert!(refused.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("different query"));
+        }
+    }
+    assert_eq!(ids.len(), 4);
+    assert!(!root.path().join("unused-default").exists());
+}
