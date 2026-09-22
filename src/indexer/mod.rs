@@ -53208,6 +53208,10 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         ensure_fts_schema(&storage);
         seed_lexical_rebuild_fixture(&storage);
+        // `ensure_fts_schema` creates the legacy internal-content shadow, which
+        // is residue since GH #495, not a healthy shadow. Converge it through
+        // the production repair so this test's precondition actually holds.
+        storage.ensure_search_fallback_fts_consistency().unwrap();
 
         let repair =
             repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None, None)

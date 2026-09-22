@@ -1230,7 +1230,12 @@ mod tests {
         };
         let mut conversation = conversation_at(&path);
         let error = augment_modern_codex_messages(&mut conversation, Some(&tick)).unwrap_err();
-        assert!(error.to_string().contains("100 MiB read budget"));
+        let message = error.to_string();
+        assert!(message.contains("admitted read budget"), "{message}");
+        assert!(
+            message.contains(&format!("({} bytes)", MAX_AUGMENT_ROLLOUT_BYTES + 1)),
+            "{message}"
+        );
         assert_eq!(ticks.load(Ordering::Relaxed), 0);
         assert!(conversation.messages.is_empty());
         assert_eq!(
