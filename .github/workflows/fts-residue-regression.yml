@@ -1,0 +1,56 @@
+name: Fallback FTS residue regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/storage/sqlite.rs'
+      - 'src/storage/fts_residue_tests.rs'
+      - 'src/doctor_recover.rs'
+      - 'src/indexer/mod.rs'
+      - '.github/workflows/fts-residue-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fts-residue-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve exact repair sources for failure diagnosis
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-repair-sources
+          retention-days: 3
+          include-hidden-files: true
+          path: |
+            src/storage/
+            src/doctor_recover.rs
+            src/indexer/mod.rs
+            src/lib.rs
+            src/franken_sync.rs
+            src/model/types.rs
+            Cargo.toml
+            Cargo.lock
+            rust-toolchain.toml
+            .cargo/config.toml
+            .beads/issues.jsonl
+            AGENTS.md
+            scripts/gate.sh
+            .github/workflows/ci.yml
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Run fallback FTS repair regressions
+        run: cargo test --locked --lib fts -- --test-threads=1
