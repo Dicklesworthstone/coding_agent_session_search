@@ -4,6 +4,9 @@ on:
     branches: [main]
     paths:
       - 'src/logical_archive/**'
+      - 'src/search/archive_rebuild.rs'
+      - 'src/search/mod.rs'
+      - 'src/indexer/**'
       - 'src/bookmarks.rs'
       - 'tests/bookmarks_cli.rs'
       - 'src/main.rs'
@@ -38,9 +41,12 @@ jobs:
           evidence="$RUNNER_TEMP/reviewed-format"
           mkdir -p "$evidence"
           git rev-parse HEAD > "$evidence/source.txt"
+          # Preserve the exact recovery dependencies and tracker contract for
+          # source review, including modules too large for the Contents API.
+          git archive --format=tar.gz HEAD AGENTS.md .beads/issues.jsonl docs/planning/RUST_CLI_TOOLS_BEST_PRACTICES_GUIDE.md docs/planning/REALITY_CHECK_AND_BRIDGE_PLAN_2026-09-01.md src/storage/sqlite.rs src/indexer/mod.rs src/search/archive_rebuild.rs src/search/mod.rs src/logical_archive/mod.rs tests/cli_logical_archive.rs > "$evidence/canonical-rebuild-source.tar.gz"
           rustfmt --version > "$evidence/toolchain.txt"
           status=0
-          for file in src/bookmarks.rs src/logical_archive/export.rs src/logical_archive/export_tests.rs src/logical_archive/import.rs tests/cli_logical_archive.rs; do
+          for file in src/bookmarks.rs src/logical_archive/mod.rs src/logical_archive/export.rs src/logical_archive/export_tests.rs src/logical_archive/import.rs src/search/archive_rebuild.rs tests/cli_logical_archive.rs; do
             mkdir -p "$evidence/$(dirname "$file")"
             sha256sum "$file" >> "$evidence/input-sha256.txt"
             rustfmt --edition 2024 --config skip_children=true --emit stdout "$file" > "$evidence/$file"
@@ -102,10 +108,24 @@ jobs:
           from pathlib import Path
           text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/cli.log').read_text()
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 6:
-              raise SystemExit('Expected all six real-binary archive regressions, including restored source-less follow-ups')
+          if not counts or max(map(int, counts)) < 10:
+              raise SystemExit('Expected all ten real-binary archive regressions, including indexed recovery and failed-rebuild retry')
           PY
           sha256sum target/debug/cass | tee "$RUNNER_TEMP/archive-evidence/binary.txt"
+      - name: Exercise canonical-only indexed restore admission
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib search::archive_rebuild:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/archive-evidence/indexed-admission.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/indexed-admission.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 5:
+              raise SystemExit('Expected all five indexed restore admission tests')
+          PY
       - name: Exercise canonical service reads through the public read-only engine
         if: ${{ always() && !cancelled() }}
         shell: bash

@@ -22,6 +22,7 @@
 //! - **[`pack_planner`]**: Deterministic answer-pack evidence selection core.
 
 pub mod ann_index;
+pub mod archive_rebuild;
 pub mod asset_state;
 pub(crate) mod bounded_discovery;
 pub mod canonicalize;
