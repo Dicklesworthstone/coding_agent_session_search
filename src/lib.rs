@@ -30782,10 +30782,6 @@ fn run_cli_search(
         eprintln!("Warning: tier flags currently only affect --mode semantic.");
     }
 
-    let semantic_requested = matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    );
     let mut semantic_setup_timed_out = false;
     if semantic_requested && let Some(budget) = search_budget.as_ref() {
         let worker_client = Arc::clone(&client);
