@@ -1,6 +1,191 @@
-# Reality Check and Bridge Plan — refreshed 2026-09-22
+# Reality Check and Bridge Plan — refreshed 2026-09-22 (evening execution pass)
 
-## Current assessment: 2026-09-22
+## Current assessment: 2026-09-22 evening (execution pass, SageSnow)
+
+This section supersedes current-state statements below. The midday assessment
+that follows remains the record of the audit; this pass executed against it and
+re-measured. Source baseline `407fdbc0`. The first thirteen commits (`721fa438..0c2cab13`) reached `origin/main` through another agent's merge `4b611d7c`; the rest were rebased onto it.
+
+**Verdict:** the core product works end to end on current source. A clean
+synthetic run on a HEAD binary (five real-format providers plus a generated
+Claude corpus, 406 conversations / 8,019 messages) indexed in 13.7 s, answered
+one-shot lexical searches in 39–45 ms wall (18 ms engine), filtered exactly by
+workspace and agent, viewed/expanded/packed hits, picked up an appended message
+after a 2.5 s incremental run, reported hybrid-without-model truthfully as a
+lexical fallback, and doctor called it healthy. What users are missing is not
+features but **shipping**: 626 commits sit on `main` after v0.8.0 (a
+`release(v0.9.0)` commit `4391672a` exists, untagged), and about two thirds of
+the open GitHub issues are fixed on `main` but unreleased. The remaining red is
+concentrated in a few places: large-archive memory (GH #320), incremental ANN
+(GH #460), the native-ANN WAL admission tests owned by `ds7uy.3.3`, the strict
+UBS gate, and a search-timeout contract conflict that today's branch merges
+brought onto `main` (`vy4ic`, needs an owner decision).
+
+### What was verified directly (not inferred)
+
+1. **Gate harness defect, fixed (`721fa438`).** `scripts/gate.sh` hashed the
+   tracked `tests/.beads/*` fixtures, which rch's global `.beads/` transfer
+   exclude never sends, so source identity passed on a worker with stale
+   leftovers (hz2) and failed on a clean one (hz3) for the same tree, before any
+   stage ran. No build or test reads those files.
+2. **`main` did not pass `cargo fmt --check`.** 62 files landed unformatted
+   (also the red stage of three push workflows). Fixed style-only with the
+   pinned rustfmt (`a766a833`); the fmt stage is green since.
+3. **A regression from today's #495 landing, reproduced on real binaries.** On
+   an archive whose shadow uses the legacy 7-column DDL, the HEAD binary's
+   `cass sources agents exclude codex --robot-format json` exited 5
+   (`archive-fts-rebuild`) after already purging rows; released v0.8.0 exits 0
+   and leaves the canonical `content=''` registration. Cause: residue
+   classification made `rebuild_fts_via_frankensqlite` bail for every direct
+   caller (exclude purge, reset, forget, dedup). Fixed in `530e3124`.
+4. **Released-binary acceptance for two long-held issues.** Using the published
+   v0.7.1 and v0.8.0 tarballs (checksums verified; the installed `cass` is
+   byte-identical to the v0.8.0 asset): GH #459's repair journey (v0.7.1 writes
+   the slug-decoded workspace, v0.8.0 `index --full` repairs it exactly; lexical
+   and hash-semantic `--workspace` both correct; counts conserved; idempotent;
+   transcript untouched) and GH #449's local Devin store (main chain indexed
+   with its working directory; abandoned branch and hidden session excluded;
+   source DB unchanged). Both issues are closed with that evidence.
+5. **Triage of all 50 open issues** by five read-only investigators, each claim
+   checked against HEAD code, `git merge-base --is-ancestor <sha> v0.8.0`, and
+   the pinned registry sources. Several maintainer comments were stale or wrong
+   (GH #489's cap is cass's own, not FAD's; GH #483's "#413 fix not in 0.8.0"
+   is false; GH #426/#496 "scan resume still open" is stale; GH #467's pin note
+   predates the adopted fixed frankensearch; GH #470/#471/#472 "no
+   implementation" predate their commits).
+6. **The #495 fix, on a release build of this pass (`6dd37b8d`).** The same
+   legacy-DDL archive now purges 2 conversations / 6 messages for
+   `sources agents exclude codex`, rebuilds lexical, and exits 0.
+7. **`sources agents exclude` misreported an unreadable archive** (same build):
+   an 8 KB non-SQLite `agent_search.db` gave exit 0 and "No already archived
+   data for that agent was present", with the file untouched. Fixed as `dndyv`.
+8. **`cli_robot` is not hermetic on a fresh checkout** (`uxz8y`, a regression of
+   the closed `xwi3f`): ~51 tests read `tests/fixtures/search_demo_data` in
+   place, the fixture has no `v9-quill` index, so the first searches rebuild it
+   inside the checkout and parallel tests hit `index-busy` (8 failures on a
+   fresh worker path). v0.8.0 rebuilds the fixture the same way; warm workers
+   hide it.
+
+### Gate receipts (`scripts/gate.sh`, rch, pinned worktrees)
+
+| HEAD | Receipt | Green | Red, and why |
+|---|---|---|---|
+| `0c2cab13` | `/data/tmp/cass-gate.ix6Y8E` | fmt, clippy, `cli_logical_archive`, `spec_search_format_contracts`, both connector-completeness binaries, goldens (regen + verify) | Codebuff e2e (test bug, fixed `81b04511`); `cli_robot` 8 `index-busy` + 1 codebuff golden (fixed `206acf7a`, `81b04511`); UBS |
+| `dc950c40` (full) | `/data/tmp/cass-gate.UespkV` | clippy; `cli_logical_archive` 18, Codebuff e2e, connector completeness, `cli_robot` 313, `e2e_sources` 117, `e2e_semantic_backfill_robot` 15, `e2e_jsonl_schema_test`, goldens | fmt (merge whitespace, fixed `4bc2d40e`); lib hit the 2,400 s cap at 2,134 of 7,871 tests on a contended worker (3 failures: 2 stale tests fixed in `0a1be788`, 1 FSVI v2 tombstone test handed to `962e8`); `spec_search_format_contracts` (contract conflict `vy4ic`, plus a no-match run that passes on a release build); `cli_schedule` (120 s test cap under load; a release build finishes in ~3 s); `e2e_cli_flows` view/expand and `e2e_lexical_fail_open` pack ID (tests predate the #493 identity changes, owner `2l1b0.43`); UBS |
+| `4bc2d40e` (fresh path) | `/data/tmp/cass-gate.7zL9ky` | fmt, clippy, `cli_robot` 314, goldens | `e2e_lexical_fail_open` pack ID (as above); UBS |
+| `0a1be788` (touched modules) | `/data/tmp/cass-gate.CW5VG9` | fmt, clippy, lib 560 passed / 0 failed | UBS |
+
+Two process findings: the full lib suite no longer fits the gate's 2,400 s lib
+cap at `-j6` on a shared worker, so full-suite receipts need a longer cap or a
+quieter worker; and today's merge of July/August branches (`4b611d7c` line)
+brought in a second budget contract (`vy4ic`) and left five e2e tests
+disagreeing with code that had since changed.
+
+### Issue status after this pass (50 open at start)
+
+| Class | Issues |
+|---|---|
+| Closed with evidence | #459, #449 (released-binary acceptance), #413, #390, #329, #395 (fixed in shipped releases, reporters invited to reopen), #489 (validated by the reporter on `main`), #422 (fixed in v0.8.0; `692998f1` adds the timeout stderr note) |
+| Fixed on `main`, unreleased (close at release) | #462, #477, #476, #379, #494, #473, #474, #426, #466, #463, #480, #469, #471, #472, #478, #468, #465, #464, #447, #415, #388, #423 |
+| Partial: this pass closed the named gap, other acceptance remains | #495 (direct-caller regression), #497 (legacy `content=''` residue, `032464af`), #374 (rowid shadow residue loop), #438 (explicit repair now rewrites old segments), #381 (Windows self-updater), #461 (per-run full content scan), #496/#483 (cgroup-blind budgets) |
+| Still open on cass | #320 (indexing peak memory; profile first), #460 (incremental HNSW append, L), #470 (passage gaps above 4,080 chars), #452 (semantic serving in `cass serve`), #349 (in-place v14 migration), #382 (ARM64 MiniLM needs a native run on the adopted pin) |
+| Upstream | #391 (frankensqlite#397) |
+| Owner judgment / reporter info | #481 (GPU/external embeddings under the attested-producer model), #450 (repair opt-in/throttle policy), #475 (downstream skill recipes live outside this repo), #443 (retest on v0.8.0), #467 (needs one darwin-arm64 run) |
+
+### Work landed in this pass
+
+| Commit | Change | Bead |
+|---|---|---|
+| `721fa438` | gate identity excludes rch-untransferred `.beads` fixtures | `2l1b0.1` |
+| `a766a833` | rustfmt 62 unformatted files (style only) | — |
+| `612bd808` | Windows self-update passes URLs to the script block via `-EncodedCommand` (every Windows `cass upgrade` failed) | `6gmrz` (new) |
+| `530e3124` | direct `rebuild_fts` callers converge residue; preflight stops re-retiring an already retired shadow each run; colon-separated `CASS_EXCLUDE_PATHS` warns | `2l1b0.45`, `2l1b0.40` |
+| `692998f1` | timed-out robot search says so on stderr | `u3vho` |
+| `8139d95a` | expected lexical doc count memoized with an append-only delta (was a full content scan, twice per incremental run) | `3zq55` |
+| `4e1248e9` | memory budgets clamp to the cgroup (v2/v1), including the Tantivy writer heap | `2l1b0.46` |
+| `818d3c0b` | explicit `--watch-once` names existing paths no connector claims | `931di` |
+| `b28acf31` | explicit FTS repair of a parity-healthy shadow runs FTS5 optimize + integrity-check | `2l1b0.3` |
+| `6fe5524e` | rowid-shadow registrations classified as residue (the `content=''`-only family landed concurrently as `032464af`) | `2l1b0.47`, `zp0fp` |
+| `87f3886f` | README/AGENTS: schema 21, toolchain date, workflow state, `serve`/`archive` | `2l1b0.26` |
+| `4a427f3d` | backfill receipts count real model constructions | `ofnlv` |
+| `d21aece3` | Codebuff / Freebuff connector wired (FAD 0.3.0 `codebuff`) | `2l1b0.12` |
+| `7ce02589`, `1dadad6b` | compile and clippy fixes for the above, caught by the gate | `2l1b0.45`, `ofnlv` |
+| `0c2cab13` | `cass archive` failures classified by error type: usage 2, integrity 5, busy 7, I/O 14 (was: every failure exit 2) | `ukg62` (new) |
+| `0c298788` | PowerShell real-shell test names each interpreter by a literal (two UBS criticals it had introduced) | `6gmrz` |
+| `819d985e` | `sources agents exclude` no longer says "no archived data" when the archive is missing or cannot be opened (reproduced on the release binary) | `dndyv` (new) |
+| `72572068` | archive import/search/view report corruption as integrity (5); a failed read mid-archive stays I/O (14) instead of looking like corruption | `gdwzy` (new) |
+| `81b04511` | Codebuff e2e test stamps its edit after the previous run (the backdated edit was correctly skipped by incremental discovery; verified on the release binary) and gains a stale-text negative; codebuff added to three robot goldens | `2l1b0.12` |
+| `206acf7a` | `cli_robot` observers read one pre-warmed private copy of the demo fixture; a guard test forbids pointing commands at the checkout | `uxz8y` (new) |
+| `4bc2d40e` | rustfmt of a merge-introduced blank line (fmt was red on `main`) | — |
+| `0a1be788` | two lib tests whose premises other changes made stale (legacy-DDL "healthy" fixture; Codex budget message) | `2l1b0.45`, `2l1b0.40` |
+| `00a7403a` | a spec test's failure message shows the observed budget object | `u3vho` |
+
+Beads closed on cited evidence: `sxhgy`, `2l1b0.14`, `eayhf`, `ukg62`,
+`gdwzy`, `dndyv`, `ljf90`, `0dbkt`, `ubq10`, `test-env-api-isolation-qu81y.1`.
+New beads fixed in this pass: `6gmrz` (Windows updater; a native Windows run
+remains), `ukg62` (`cass archive` mapped every failure to exit 2), `gdwzy`
+(archive readers other than `verify`), `dndyv` (misleading exclude purge
+message), `uxz8y` (fixed; its runtime fixture-hash check remains open). New
+open beads: `5v57k` (strict UBS qualification; now blocks the release bead
+`yrjna`) and `vy4ic` (explicit semantic budget exhaustion: exit 10 per
+`ds7uy.4.1` vs exit 0 per README and the spec test).
+
+### The strict UBS gate is now the main thing holding bug beads open
+
+A read-only audit of 58 stale `in_progress` bug beads (idle 1–8 weeks) found
+about 30 whose fix and named regression tests are present on `main`. Most of
+them record the same closure condition in their owners' notes: combined RCH
+fmt/clippy/tests **and strict UBS**. Strict UBS is red across the repository
+for pre-existing findings (a local `ubs --ci` over just eight files touched
+here reports 13 critical and 1,310 warnings, mostly `unwrap` in tests and
+test-only `panic!`). Those beads were deliberately left open: closing them on
+test evidence alone would override their stated gate. The honest next step is
+a UBS qualification pass (triage by rule, fix real findings, record reviewed
+suppressions per the documented policy), not per-bead closure (`5v57k`, now
+blocking the release bead `yrjna`). Four beads whose stated gate was only the
+RCH runtime receipt (`ljf90`, `0dbkt`, `ubq10`, `test-env-api-isolation-qu81y.1`)
+are closed with the receipts above. Audit verdicts that did not survive a
+re-read of the bead: `wjpv5` (document-count gating is not the equivalence
+proof its analysis requires), `kz23l` (requires strict-UBS receipts),
+`hh4jf` (its view/expand probe now fails against the #493 output), `962e8`,
+`cooow`, `jfkqh`, `fyepq` (real gaps), `lgpqg`, `uc7nz`, `kupq4` (no
+implementing commit).
+
+### Answers to the five reality-check questions
+
+1. **What works:** discovery for 32 connectors, canonical FrankenSQLite
+   storage, Quill lexical search with filters and pagination, view/expand/pack
+   with exact identities, incremental indexing, robot contracts and error
+   envelopes, doctor/triage/health surfaces, released-binary repair journeys,
+   the persistent `serve` lexical service and the logical `archive` commands.
+2. **Not working or unproven:** large-archive memory at 1M+ messages (#320,
+   #496 now cgroup-bounded but not profiled), native ANN over retained WAL
+   updates (`ds7uy.3.3`: a WAL replacement tombstones main-file rows, and
+   frankensearch's `FsHnswIndex::try_load_native` then refuses the unchanged
+   graph; the fix is a tombstone-tolerant graph binding upstream, then a pin
+   bump), incremental HNSW (#460), progressive two-tier
+   (inactive by design), ARM64 native MiniLM on the fixed pin (unrun), strict
+   UBS, and anything that requires a release to reach users.
+3. **What blocks:** a release, and in front of it the strict UBS gate. The
+   code for most user reports exists; the owner decision to cut v0.9.0 (with
+   the release gates in `yrjna`/`2l1b0.25`: full lib + integration + goldens
+   green, strict UBS qualification, per-target builds, a darwin-arm64 semantic
+   run, a native Windows upgrade run) is the step that turns it into user
+   value. UBS qualification is also the step that lets the code-complete bug
+   beads close honestly (see above).
+4. **Would the open beads close the gap?** Mostly: every open issue now maps to
+   a bead, and the remaining cass-side gaps are tracked (`2l1b0.44/.46`, `of9i7`,
+   `2l1b0.33`, `2l1b0.9`, `qpdtd`, `dl6ye`, `ds7uy.3.3`). Not by themselves: 113
+   beads sit `in_progress` under agents idle for 1–8 weeks, which hides which
+   work is live, and release acceptance is scattered across several epics.
+5. **Vision goals with no bead before this pass:** the Windows self-updater
+   failure (`6gmrz`, fixed), `cass archive` exit-code conflation (`ukg62`,
+   fixed), the misleading exclude purge message (`dndyv`, fixed), `cli_robot`
+   hermeticity (`uxz8y`), the conflicting search-timeout contracts (`vy4ic`),
+   strict UBS qualification as a tracked task (`5v57k`), the gate identity
+   defect (fixed), and the fmt-red `main` (fixed twice).
+
+## Midday assessment: 2026-09-22
 
 This section supersedes current-state statements below. Earlier sections retain
 their dated evidence; neither their completion labels nor their measurements
