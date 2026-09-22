@@ -6,12 +6,12 @@
 //! Neither lane starts models, writers, automatic refresh, or detached children.
 //! Frame/page bounds do not cap reader RSS or interrupt a native engine call.
 
-#[path = "search_service/protocol.rs"]
-mod protocol;
-#[path = "search_service/mcp.rs"]
-mod mcp;
 #[path = "search_service/canonical.rs"]
 mod canonical;
+#[path = "search_service/mcp.rs"]
+mod mcp;
+#[path = "search_service/protocol.rs"]
+mod protocol;
 #[cfg(test)]
 #[path = "search_service/tests.rs"]
 mod tests;
@@ -23,7 +23,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use coding_agent_search::search::query::{FieldMask, SearchClient, SearchClientOptions, SearchFilters};
+use coding_agent_search::search::query::{
+    FieldMask, SearchClient, SearchClientOptions, SearchFilters,
+};
 use coding_agent_search::sources::provenance::SourceFilter;
 use serde_json::{Value, json};
 
@@ -90,19 +92,27 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
             };
         }
     };
-    let ServiceCommand::Serve { index, data_dir, stdio: _, mcp, db } = cli.command;
+    let ServiceCommand::Serve {
+        index,
+        data_dir,
+        stdio: _,
+        mcp,
+        db,
+    } = cli.command;
     let index = match (index, data_dir) {
         (Some(index), None) => index,
         (None, Some(data_dir)) => {
             coding_agent_search::search::tantivy::expected_index_dir(&data_dir)
         }
-        _ => return Err(coding_agent_search::CliError {
-            code: 2,
-            kind: "argument_parsing",
-            message: "serve requires exactly one of --index or --data-dir".into(),
-            hint: None,
-            retryable: false,
-        }),
+        _ => {
+            return Err(coding_agent_search::CliError {
+                code: 2,
+                kind: "argument_parsing",
+                message: "serve requires exactly one of --index or --data-dir".into(),
+                hint: None,
+                retryable: false,
+            });
+        }
     };
     let index = if index.is_absolute() {
         index
@@ -110,10 +120,16 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         std::env::current_dir().map_err(cli_io_error)?.join(index)
     };
     let mut session = Session::new(index);
-    session.archive = db.map(|path| {
-        if path.is_absolute() { Ok(path) }
-        else { std::env::current_dir().map(|cwd| cwd.join(path)) }
-    }).transpose().map_err(cli_io_error)?;
+    session.archive = db
+        .map(|path| {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(path))
+            }
+        })
+        .transpose()
+        .map_err(cli_io_error)?;
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     if mcp {
@@ -210,7 +226,10 @@ impl Session {
         let open_started = Instant::now();
         self.ensure_loaded()?;
         let setup_ms = open_started.elapsed().as_millis();
-        let client = self.client.as_ref().context("search reader is unavailable")?;
+        let client = self
+            .client
+            .as_ref()
+            .context("search reader is unavailable")?;
         let started = Instant::now();
         // Only engine-owned filters are exposed. In particular session_paths
         // and the synthetic 'remote' group currently trigger a potentially
@@ -219,7 +238,9 @@ impl Session {
         let filters = SearchFilters {
             agents: filters.agents.into_iter().collect(),
             workspaces: filters.workspaces.into_iter().collect(),
-            source_filter: filters.source_id.map_or(SourceFilter::All, SourceFilter::SourceId),
+            source_filter: filters
+                .source_id
+                .map_or(SourceFilter::All, SourceFilter::SourceId),
             created_from: filters.created_from,
             created_to: filters.created_to,
             session_paths: HashSet::new(),
@@ -234,17 +255,29 @@ impl Session {
             offset,
             FieldMask::new(false, true, true, false),
         )?;
-        ensure!(hits.len() <= limit + 1, "search backend exceeded the requested page");
+        ensure!(
+            hits.len() <= limit + 1,
+            "search backend exceeded the requested page"
+        );
         let has_next = hits.len() > limit;
         let next_offset = offset.checked_add(limit).filter(|next| {
-            has_next && next.checked_add(limit).and_then(|n| n.checked_add(1))
-                .is_some_and(|n| n <= protocol::MAX_WINDOW)
+            has_next
+                && next
+                    .checked_add(limit)
+                    .and_then(|n| n.checked_add(1))
+                    .is_some_and(|n| n <= protocol::MAX_WINDOW)
         });
         hits.truncate(limit);
         let mut summaries = Vec::with_capacity(hits.len());
         for hit in hits {
-            ensure!(hit.score.is_finite(), "search backend returned a non-finite score");
-            ensure!(hit.line_number != Some(0), "search backend returned an invalid message ordinal");
+            ensure!(
+                hit.score.is_finite(),
+                "search backend returned a non-finite score"
+            );
+            ensure!(
+                hit.line_number != Some(0),
+                "search backend returned an invalid message ordinal"
+            );
             for value in [
                 Some(hit.source_path.as_str()),
                 Some(hit.source_id.as_str()),
@@ -253,9 +286,14 @@ impl Session {
                 Some(hit.origin_kind.as_str()),
                 hit.origin_host.as_deref(),
                 hit.workspace_original.as_deref(),
-            ].into_iter().flatten() {
-                ensure!(value.len() <= MAX_IDENTITY_BYTES,
-                    "search identity exceeds the service's 4096-byte bound; identities are never truncated");
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ensure!(
+                    value.len() <= MAX_IDENTITY_BYTES,
+                    "search identity exceeds the service's 4096-byte bound; identities are never truncated"
+                );
             }
             summaries.push(json!({
                 "title": prefix(&hit.title, 256),
@@ -295,25 +333,46 @@ impl Session {
 
     fn handle(&mut self, request: Request) -> (Reply, bool) {
         match request {
-            Request::View { id, source_path, source_id, conversation_id, message_index, context } => {
+            Request::View {
+                id,
+                source_path,
+                source_id,
+                conversation_id,
+                message_index,
+                context,
+            } => {
                 let request = canonical::View {
-                    source_path: &source_path, source_id: &source_id,
-                    conversation_id, message_index, context,
+                    source_path: &source_path,
+                    source_id: &source_id,
+                    conversation_id,
+                    message_index,
+                    context,
                 };
                 if let Err(message) = request.validate() {
                     return (Reply::failure(Some(id), "invalid_request", message), false);
                 }
                 let Some(db) = &self.archive else {
-                    return (Reply::failure(Some(id), "canonical_access_disabled",
-                        "canonical view requires an explicit --db at service startup; search remains index-only"), false);
+                    return (
+                        Reply::failure(
+                            Some(id),
+                            "canonical_access_disabled",
+                            "canonical view requires an explicit --db at service startup; search remains index-only",
+                        ),
+                        false,
+                    );
                 };
                 self.canonical_read_attempts = self.canonical_read_attempts.saturating_add(1);
                 let reply = match canonical::read(db, &request) {
                     Ok(result) => {
-                        self.canonical_reads_completed = self.canonical_reads_completed.saturating_add(1);
+                        self.canonical_reads_completed =
+                            self.canonical_reads_completed.saturating_add(1);
                         Reply::success(id, result)
                     }
-                    Err(error) => Reply::failure(Some(id), canonical::error_kind(&error), format!("{error:#}")),
+                    Err(error) => Reply::failure(
+                        Some(id),
+                        canonical::error_kind(&error),
+                        format!("{error:#}"),
+                    ),
                 };
                 (reply, false)
             }
@@ -328,15 +387,26 @@ impl Session {
                 drop(self.client.take());
                 let started = Instant::now();
                 let reply = match self.ensure_loaded() {
-                    Ok(()) => Reply::success(id, json!({
-                        "setup_ms": started.elapsed().as_millis(),
-                        "snapshot": self.status(),
-                    })),
-                    Err(error) => Reply::failure(Some(id), "index_unavailable", format!("{error:#}")),
+                    Ok(()) => Reply::success(
+                        id,
+                        json!({
+                            "setup_ms": started.elapsed().as_millis(),
+                            "snapshot": self.status(),
+                        }),
+                    ),
+                    Err(error) => {
+                        Reply::failure(Some(id), "index_unavailable", format!("{error:#}"))
+                    }
                 };
                 (reply, false)
             }
-            Request::Search { id, query, limit, offset, filters } => {
+            Request::Search {
+                id,
+                query,
+                limit,
+                offset,
+                filters,
+            } => {
                 // Invalid work must not load an index or allocate from caller k.
                 if let Err(message) = protocol::validate_search(&query, limit, offset, &filters) {
                     return (Reply::failure(Some(id), "invalid_request", message), false);
@@ -365,7 +435,10 @@ fn open_snapshot(index: &Path) -> Result<SearchClient> {
 }
 
 fn prefix(value: &str, maximum_chars: usize) -> &str {
-    value.char_indices().nth(maximum_chars).map_or(value, |(at, _)| &value[..at])
+    value
+        .char_indices()
+        .nth(maximum_chars)
+        .map_or(value, |(at, _)| &value[..at])
 }
 
 fn serve_io(
@@ -377,11 +450,14 @@ fn serve_io(
         let bytes = match protocol::read_frame(input)? {
             Frame::End => return Ok(()),
             Frame::TooLarge => {
-                protocol::write_reply(output, &Reply::failure(
-                    None,
-                    "request_too_large",
-                    "request exceeds 64 KiB; this session is closing without processing the remainder",
-                ))?;
+                protocol::write_reply(
+                    output,
+                    &Reply::failure(
+                        None,
+                        "request_too_large",
+                        "request exceeds 64 KiB; this session is closing without processing the remainder",
+                    ),
+                )?;
                 return Ok(());
             }
             Frame::Line(bytes) => bytes,
@@ -389,9 +465,10 @@ fn serve_io(
         let request = match serde_json::from_slice::<Request>(&bytes) {
             Ok(request) => request,
             Err(error) => {
-                protocol::write_reply(output, &Reply::failure(
-                    None, "invalid_request", error.to_string(),
-                ))?;
+                protocol::write_reply(
+                    output,
+                    &Reply::failure(None, "invalid_request", error.to_string()),
+                )?;
                 continue;
             }
         };

@@ -42,8 +42,15 @@ impl View<'_> {
         if self.conversation_id <= 0 {
             return Err("conversation_id must be a positive canonical database ID");
         }
-        if self.message_index.checked_sub(1).and_then(|idx| i64::try_from(idx).ok()).is_none() {
-            return Err("message_index must be a one-based canonical index representable by the archive");
+        if self
+            .message_index
+            .checked_sub(1)
+            .and_then(|idx| i64::try_from(idx).ok())
+            .is_none()
+        {
+            return Err(
+                "message_index must be a one-based canonical index representable by the archive",
+            );
         }
         if self.context > MAX_CONTEXT {
             return Err("context must be between 0 and 20 actual messages on each side");
@@ -54,15 +61,21 @@ impl View<'_> {
 
 #[derive(Debug, thiserror::Error)]
 enum Refusal {
-    #[error("the requested canonical conversation or message no longer exists; no neighbour was substituted")]
+    #[error(
+        "the requested canonical conversation or message no longer exists; no neighbour was substituted"
+    )]
     NotFound,
     #[error("source_path or source_id does not exactly match the requested canonical conversation")]
     IdentityMismatch,
     #[error("canonical message coordinates are ambiguous or invalid; no message was selected")]
     InvalidCoordinates,
-    #[error("the complete canonical window exceeds 64 KiB of message content; narrow context or use the explicit CLI follow-up")]
+    #[error(
+        "the complete canonical window exceeds 64 KiB of message content; narrow context or use the explicit CLI follow-up"
+    )]
     PayloadTooLarge,
-    #[error("canonical lookup exceeded its cooperative 3-second budget; no partial window was returned")]
+    #[error(
+        "canonical lookup exceeded its cooperative 3-second budget; no partial window was returned"
+    )]
     Deadline,
 }
 
@@ -91,12 +104,21 @@ struct Snapshot<'a> {
 
 impl<'a> Snapshot<'a> {
     fn begin(storage: &'a FrankenStorage) -> Result<Self> {
-        storage.raw().execute("BEGIN DEFERRED").context("begin canonical read snapshot")?;
-        Ok(Self { storage, active: true })
+        storage
+            .raw()
+            .execute("BEGIN DEFERRED")
+            .context("begin canonical read snapshot")?;
+        Ok(Self {
+            storage,
+            active: true,
+        })
     }
 
     fn release(mut self) -> Result<()> {
-        self.storage.raw().execute("ROLLBACK").context("release canonical read snapshot")?;
+        self.storage
+            .raw()
+            .execute("ROLLBACK")
+            .context("release canonical read snapshot")?;
         self.active = false;
         Ok(())
     }
@@ -104,7 +126,9 @@ impl<'a> Snapshot<'a> {
 
 impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
-        if self.active && let Err(error) = self.storage.raw().execute("ROLLBACK") {
+        if self.active
+            && let Err(error) = self.storage.raw().execute("ROLLBACK")
+        {
             tracing::warn!(%error, "failed to release canonical service read snapshot");
         }
     }
@@ -123,8 +147,12 @@ pub(super) fn read(db: &Path, request: &View<'_>) -> Result<Value> {
     request.validate().map_err(anyhow::Error::msg)?;
     let started = Instant::now();
     let metadata = std::fs::symlink_metadata(db).context("inspect configured canonical archive")?;
-    ensure!(metadata.file_type().is_file(), "configured canonical archive must be a regular file, not a symlink");
-    let storage = FrankenStorage::open_strict_readonly(db).context("open configured archive strictly read-only")?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "configured canonical archive must be a regular file, not a symlink"
+    );
+    let storage = FrankenStorage::open_strict_readonly(db)
+        .context("open configured archive strictly read-only")?;
     check_budget(started)?;
     let snapshot = Snapshot::begin(&storage)?;
     let result = read_snapshot(&storage, request, started);
@@ -143,24 +171,41 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
     check_budget(started)?;
     // A fixed primary-key lookup cannot resolve an identically named session
     // in another source. Compare literal path/source BEFORE any body read.
-    let identities = storage.raw().query_map_collect(
-        "SELECT source_path, source_id FROM conversations WHERE id = ?1 LIMIT 2",
-        params![request.conversation_id],
-        |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
-    ).context("read canonical conversation identity")?;
-    let Some((path, source)) = identities.first() else { return Err(Refusal::NotFound.into()); };
-    if identities.len() != 1 { return Err(Refusal::InvalidCoordinates.into()); }
+    let identities = storage
+        .raw()
+        .query_map_collect(
+            "SELECT source_path, source_id FROM conversations WHERE id = ?1 LIMIT 2",
+            params![request.conversation_id],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+        )
+        .context("read canonical conversation identity")?;
+    let Some((path, source)) = identities.first() else {
+        return Err(Refusal::NotFound.into());
+    };
+    if identities.len() != 1 {
+        return Err(Refusal::InvalidCoordinates.into());
+    }
     if path != request.source_path || source != request.source_id {
         return Err(Refusal::IdentityMismatch.into());
     }
     let idx = i64::try_from(request.message_index - 1)?;
     check_budget(started)?;
-    let targets = storage.raw().query_map_collect(
-        "SELECT id, idx FROM messages WHERE conversation_id = ?1 AND idx = ?2 LIMIT 2",
-        params![request.conversation_id, idx],
-        |row| Ok(Anchor { id: row.get_typed(0)?, idx: row.get_typed(1)? }),
-    ).context("select exact canonical message")?;
-    let Some(target) = targets.first().copied() else { return Err(Refusal::NotFound.into()); };
+    let targets = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id, idx FROM messages WHERE conversation_id = ?1 AND idx = ?2 LIMIT 2",
+            params![request.conversation_id, idx],
+            |row| {
+                Ok(Anchor {
+                    id: row.get_typed(0)?,
+                    idx: row.get_typed(1)?,
+                })
+            },
+        )
+        .context("select exact canonical message")?;
+    let Some(target) = targets.first().copied() else {
+        return Err(Refusal::NotFound.into());
+    };
     if targets.len() != 1 || target.id <= 0 || target.idx != idx {
         return Err(Refusal::InvalidCoordinates.into());
     }
@@ -178,7 +223,9 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
             |row| Ok(Anchor { id: row.get_typed(0)?, idx: row.get_typed(1)? }),
         ).context("select preceding canonical message IDs")?;
         if before.len() > request.context + 1
-            || before.iter().any(|anchor| anchor.id <= 0 || anchor.idx < 0 || anchor.idx >= idx)
+            || before
+                .iter()
+                .any(|anchor| anchor.id <= 0 || anchor.idx < 0 || anchor.idx >= idx)
             || before.windows(2).any(|pair| pair[0].idx <= pair[1].idx)
         {
             return Err(Refusal::InvalidCoordinates.into());
@@ -195,7 +242,9 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
             |row| Ok(Anchor { id: row.get_typed(0)?, idx: row.get_typed(1)? }),
         ).context("select following canonical message IDs")?;
         if after.len() > request.context + 1
-            || after.iter().any(|anchor| anchor.id <= 0 || anchor.idx <= idx)
+            || after
+                .iter()
+                .any(|anchor| anchor.id <= 0 || anchor.idx <= idx)
             || after.windows(2).any(|pair| pair[0].idx >= pair[1].idx)
         {
             return Err(Refusal::InvalidCoordinates.into());
@@ -206,8 +255,13 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
     } else {
         anchors.push(target);
     }
-    ensure!(anchors.len() <= 2 * request.context + 1, "canonical metadata exceeded the requested window");
-    if anchors.iter().any(|anchor| anchor.id <= 0 || anchor.idx < 0)
+    ensure!(
+        anchors.len() <= 2 * request.context + 1,
+        "canonical metadata exceeded the requested window"
+    );
+    if anchors
+        .iter()
+        .any(|anchor| anchor.id <= 0 || anchor.idx < 0)
         || anchors.windows(2).any(|pair| pair[0].idx >= pair[1].idx)
     {
         return Err(Refusal::InvalidCoordinates.into());
@@ -232,16 +286,35 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
                 row.get_typed::<Option<String>>(4)?, row.get_typed::<Option<String>>(5)?,
             )),
         ).context("hydrate bounded canonical message")?;
-        ensure!(rows.len() == 1, "canonical message identity changed within the read snapshot");
-        let (id, index, kind, length, content, role) = rows.into_iter().next().context("missing canonical body")?;
-        ensure!(id == anchor.id && index == anchor.idx, "canonical hydration returned a different message");
-        ensure!(kind == "text", "canonical message content must be text, not {kind}");
+        ensure!(
+            rows.len() == 1,
+            "canonical message identity changed within the read snapshot"
+        );
+        let (id, index, kind, length, content, role) =
+            rows.into_iter().next().context("missing canonical body")?;
+        ensure!(
+            id == anchor.id && index == anchor.idx,
+            "canonical hydration returned a different message"
+        );
+        ensure!(
+            kind == "text",
+            "canonical message content must be text, not {kind}"
+        );
         let length = usize::try_from(length.context("canonical content has no byte length")?)?;
-        if length > MAX_CONTENT_BYTES - content_bytes { return Err(Refusal::PayloadTooLarge.into()); }
+        if length > MAX_CONTENT_BYTES - content_bytes {
+            return Err(Refusal::PayloadTooLarge.into());
+        }
         let content = content.context("canonical content was refused by the bounded projection")?;
-        ensure!(content.len() == length, "canonical byte length differs from its complete content");
+        ensure!(
+            content.len() == length,
+            "canonical byte length differs from its complete content"
+        );
         let role = role.context("canonical role must be text of at most 128 bytes")?;
-        let role = if role.eq_ignore_ascii_case("agent") { "assistant".to_string() } else { role };
+        let role = if role.eq_ignore_ascii_case("agent") {
+            "assistant".to_string()
+        } else {
+            role
+        };
         content_bytes += length;
         messages.push(json!({
             "message_id": id, "message_index": (index as u64) + 1,

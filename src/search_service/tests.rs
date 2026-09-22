@@ -1,7 +1,7 @@
 use super::*;
-use std::io::Cursor;
 use coding_agent_search::search::tantivy::TantivyIndex;
 use frankensearch::quill::cass::CassDocument;
+use std::io::Cursor;
 
 fn request(value: Value) -> Request {
     serde_json::from_value(value).unwrap()
@@ -88,9 +88,17 @@ fn protocol_rejects_unsupported_work_instead_of_silently_downgrading() {
         json!({"op":"search", "id":1, "query":"x", "limit":-1}),
         json!({"op":"index", "id":1}),
     ] {
-        assert!(serde_json::from_value::<Request>(value.clone()).is_err(), "{value}");
+        assert!(
+            serde_json::from_value::<Request>(value.clone()).is_err(),
+            "{value}"
+        );
     }
-    assert!(serde_json::from_str::<Request>(r#"{"op":"search","id":1,"query":"x","limit":1,"limit":2}"#).is_err());
+    assert!(
+        serde_json::from_str::<Request>(
+            r#"{"op":"search","id":1,"query":"x","limit":1,"limit":2}"#
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -100,8 +108,10 @@ fn framed_exchange_is_lazy_recovers_after_bad_json_and_stops_on_shutdown() -> Re
     let mut input = Cursor::new(b"not json\n{\"op\":\"status\",\"id\":2}\r\n{\"op\":\"shutdown\",\"id\":3}\n{\"op\":\"search\",\"id\":4,\"query\":\"never\"}\n");
     let mut output = Vec::new();
     serve_io(&mut session, &mut input, &mut output)?;
-    let replies: Vec<Value> = std::str::from_utf8(&output)?.lines()
-        .map(serde_json::from_str).collect::<Result<_, _>>()?;
+    let replies: Vec<Value> = std::str::from_utf8(&output)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
     assert_eq!(replies.len(), 3);
     assert_eq!(replies[0]["ok"], false);
     assert!(replies[0]["id"].is_null());
@@ -114,7 +124,9 @@ fn framed_exchange_is_lazy_recovers_after_bad_json_and_stops_on_shutdown() -> Re
 #[test]
 fn frame_and_response_limits_never_publish_partial_successes() -> Result<()> {
     let mut exact = Cursor::new([vec![b' '; protocol::MAX_REQUEST_BYTES], b"\n".to_vec()].concat());
-    assert!(matches!(protocol::read_frame(&mut exact)?, Frame::Line(line) if line.len() == protocol::MAX_REQUEST_BYTES));
+    assert!(
+        matches!(protocol::read_frame(&mut exact)?, Frame::Line(line) if line.len() == protocol::MAX_REQUEST_BYTES)
+    );
     let oversized = vec![b'x'; protocol::MAX_REQUEST_BYTES + 1];
     let mut session = Session::new(PathBuf::from("never-opened"));
     let mut output = Vec::new();
@@ -125,7 +137,10 @@ fn frame_and_response_limits_never_publish_partial_successes() -> Result<()> {
 
     output.clear();
     // Escaping also counts toward the wire limit, not only the string length.
-    let huge = Reply::success(42, json!({"path":"\u{0001}".repeat(protocol::MAX_RESPONSE_BYTES / 4)}));
+    let huge = Reply::success(
+        42,
+        json!({"path":"\u{0001}".repeat(protocol::MAX_RESPONSE_BYTES / 4)}),
+    );
     protocol::write_reply(&mut output, &huge)?;
     assert!(output.len() < 1024);
     let reply: Value = serde_json::from_slice(&output)?;
@@ -141,7 +156,15 @@ fn selected_archive_is_explicit_and_stdio_is_opt_in() {
     for argv in [
         vec!["cass", "serve", "--stdio"],
         vec!["cass", "serve", "--index", "x"],
-        vec!["cass", "serve", "--stdio", "--index", "x", "--data-dir", "y"],
+        vec![
+            "cass",
+            "serve",
+            "--stdio",
+            "--index",
+            "x",
+            "--data-dir",
+            "y",
+        ],
     ] {
         assert!(ServiceCli::try_parse_from(argv).is_err());
     }
@@ -153,10 +176,13 @@ fn selected_archive_is_explicit_and_stdio_is_opt_in() {
 fn repeated_queries_reuse_one_real_reader_and_preserve_canonical_followup_identity() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("index");
-    let writer = index(&path, &[
-        document(41, "needle original", "local"),
-        document(42, "needle remote", "work-laptop"),
-    ])?;
+    let writer = index(
+        &path,
+        &[
+            document(41, "needle original", "local"),
+            document(42, "needle remote", "work-laptop"),
+        ],
+    )?;
     drop(writer);
     // A corrupt adjacent database must be irrelevant to this index-only path.
     std::fs::write(temp.path().join("agent_search.db"), b"not a database")?;
@@ -171,8 +197,10 @@ fn repeated_queries_reuse_one_real_reader_and_preserve_canonical_followup_identi
     assert_eq!(first["hits"], second["hits"]);
     assert_eq!(second["count"], 2);
     assert!(second["hits"].as_array().unwrap().iter().all(|hit| {
-        hit["message_index"] == 8 && hit["conversation_id"].is_i64()
-            && hit.get("content").is_none() && hit["source_path"] == "/history/same.jsonl"
+        hit["message_index"] == 8
+            && hit["conversation_id"].is_i64()
+            && hit.get("content").is_none()
+            && hit["source_path"] == "/history/same.jsonl"
     }));
     let (scoped, _) = session.handle(request(json!({
         "op":"search", "id":3, "query":"needle", "filters":{"source_id":"work-laptop"}
@@ -223,11 +251,17 @@ fn failed_reload_releases_the_old_reader_and_recovery_never_serves_it_as_current
     assert!(!reply.ok);
     assert_eq!(session.status()["loaded"], false);
     assert!(session.status()["reader_epoch"].is_null());
-    assert!(!path.exists(), "read-only reload must not recreate an index");
+    assert!(
+        !path.exists(),
+        "read-only reload must not recreate an index"
+    );
     std::fs::rename(moved, &path)?;
     let (reply, _) = session.handle(Request::Reload { id: 3 });
     assert!(reply.ok, "{reply:?}");
-    assert_eq!(search(&mut session, 4, "needle")["snapshot"]["reader_epoch"], 2);
+    assert_eq!(
+        search(&mut session, 4, "needle")["snapshot"]["reader_epoch"],
+        2
+    );
     Ok(())
 }
 
@@ -235,9 +269,16 @@ fn failed_reload_releases_the_old_reader_and_recovery_never_serves_it_as_current
 fn pagination_never_claims_exhaustion_without_proof() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("index");
-    let _writer = index(&path, &(1..=4).map(|id| document(id, "needle searchable context", "local")).collect::<Vec<_>>())?;
+    let _writer = index(
+        &path,
+        &(1..=4)
+            .map(|id| document(id, "needle searchable context", "local"))
+            .collect::<Vec<_>>(),
+    )?;
     let mut session = Session::new(path);
-    let (reply, _) = session.handle(request(json!({"op":"search", "id":1, "query":"needle", "limit":2})));
+    let (reply, _) = session.handle(request(
+        json!({"op":"search", "id":1, "query":"needle", "limit":2}),
+    ));
     assert!(reply.ok, "{reply:?}");
     let page = reply.result.unwrap();
     assert_eq!(page["count"], 2);
@@ -261,7 +302,9 @@ fn previews_are_truncated_on_unicode_boundaries() {
 fn page_window_boundary_does_not_emit_an_unusable_continuation() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("index");
-    let docs = (1..=1030).map(|id| document(id, "needle searchable context", "local")).collect::<Vec<_>>();
+    let docs = (1..=1030)
+        .map(|id| document(id, "needle searchable context", "local"))
+        .collect::<Vec<_>>();
     let writer = index(&path, &docs)?;
     drop(writer);
     let mut session = Session::new(path);

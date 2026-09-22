@@ -1,5 +1,5 @@
-use super::*;
 use super::super::{Session, protocol::Request};
+use super::*;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use std::path::PathBuf;
 
@@ -31,32 +31,70 @@ impl Fixture {
         let db = root.path().join("archive.db");
         let storage = FrankenStorage::open(&db)?;
         let agent = storage.ensure_agent(&Agent {
-            id: None, slug: "codex".into(), name: "Codex".into(),
-            version: None, kind: AgentKind::Cli,
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
         })?;
-        let outcome = storage.insert_conversation_tree(agent, None, &Conversation {
-            id: None, agent_slug: "codex".into(), workspace: None,
-            external_id: Some("canonical-service".into()), title: Some("Canonical service".into()),
-            source_path: PathBuf::from("/absent/shared.sqlite"),
-            started_at: None, ended_at: None, approx_tokens: None, metadata_json: json!({}),
-            source_id: "local".into(), origin_host: None,
-            messages: [0, 7, 12, 99, 1000].into_iter().map(|idx| Message {
-                id: None, idx, role: MessageRole::Agent, author: None, created_at: None,
-                content: format!("canonical content {idx}"), extra_json: json!({}), snippets: Vec::new(),
-            }).collect(),
-        })?;
+        let outcome = storage.insert_conversation_tree(
+            agent,
+            None,
+            &Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("canonical-service".into()),
+                title: Some("Canonical service".into()),
+                source_path: PathBuf::from("/absent/shared.sqlite"),
+                started_at: None,
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: json!({}),
+                source_id: "local".into(),
+                origin_host: None,
+                messages: [0, 7, 12, 99, 1000]
+                    .into_iter()
+                    .map(|idx| Message {
+                        id: None,
+                        idx,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: None,
+                        content: format!("canonical content {idx}"),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+            },
+        )?;
         drop(storage);
-        Ok(Self { root, db, conversation: outcome.conversation_id })
+        Ok(Self {
+            root,
+            db,
+            conversation: outcome.conversation_id,
+        })
     }
 
     fn view(&self, context: usize) -> View<'_> {
-        View { source_path: "/absent/shared.sqlite", source_id: "local",
-            conversation_id: self.conversation, message_index: 13, context }
+        View {
+            source_path: "/absent/shared.sqlite",
+            source_id: "local",
+            conversation_id: self.conversation,
+            message_index: 13,
+            context,
+        }
     }
 
     fn request(&self, id: u64, context: usize) -> Request {
-        Request::View { id, source_path: "/absent/shared.sqlite".into(), source_id: "local".into(),
-            conversation_id: self.conversation, message_index: 13, context }
+        Request::View {
+            id,
+            source_path: "/absent/shared.sqlite".into(),
+            source_id: "local".into(),
+            conversation_id: self.conversation,
+            message_index: 13,
+            context,
+        }
     }
 
     fn content(&self, idx: i64, content: &str) -> Result<()> {
@@ -84,7 +122,10 @@ fn canonical_service_requires_opt_in_and_refuses_invalid_work_before_access() ->
         let (reply, _) = session.handle(serde_json::from_value(value.clone())?);
         assert_eq!(reply.error.unwrap().kind, "invalid_request");
         value["db"] = json!(fixture.db);
-        assert!(serde_json::from_value::<Request>(value).is_err(), "per-request DB authority is forbidden");
+        assert!(
+            serde_json::from_value::<Request>(value).is_err(),
+            "per-request DB authority is forbidden"
+        );
     }
     assert_eq!(session.status()["canonical_read_attempts"], 0);
     assert_eq!(session.open_attempts, 0);
@@ -98,9 +139,18 @@ fn sparse_context_is_real_messages_with_exact_identity_and_no_raw_access() -> Re
     let before = archive_image(&fixture.db)?;
     let payload = read(&fixture.db, &fixture.view(1))?;
     let messages = payload["messages"].as_array().unwrap();
-    assert_eq!(messages.iter().map(|m| m["message_index"].as_u64().unwrap()).collect::<Vec<_>>(), [8, 13, 100]);
+    assert_eq!(
+        messages
+            .iter()
+            .map(|m| m["message_index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [8, 13, 100]
+    );
     assert_eq!(messages[1]["content"], "canonical content 12");
-    assert_eq!(messages.iter().filter(|m| m["is_target"] == true).count(), 1);
+    assert_eq!(
+        messages.iter().filter(|m| m["is_target"] == true).count(),
+        1
+    );
     assert_eq!(payload["source_path"], "/absent/shared.sqlite");
     assert_eq!(payload["source_id"], "local");
     assert_eq!(payload["conversation_id"], fixture.conversation);
@@ -116,13 +166,22 @@ fn missing_coordinates_never_substitute_neighbours_or_other_sources() -> Result<
     let fixture = Fixture::new()?;
     let mut view = fixture.view(1);
     view.message_index = 12;
-    assert_eq!(error_kind(&read(&fixture.db, &view).unwrap_err()), "canonical_not_found");
+    assert_eq!(
+        error_kind(&read(&fixture.db, &view).unwrap_err()),
+        "canonical_not_found"
+    );
     view.message_index = 13;
     view.source_id = "work-laptop";
-    assert_eq!(error_kind(&read(&fixture.db, &view).unwrap_err()), "canonical_identity_mismatch");
+    assert_eq!(
+        error_kind(&read(&fixture.db, &view).unwrap_err()),
+        "canonical_identity_mismatch"
+    );
     view.source_id = "local";
     view.source_path = "/absent/SHARED.sqlite";
-    assert_eq!(error_kind(&read(&fixture.db, &view).unwrap_err()), "canonical_identity_mismatch");
+    assert_eq!(
+        error_kind(&read(&fixture.db, &view).unwrap_err()),
+        "canonical_identity_mismatch"
+    );
     Ok(())
 }
 
@@ -136,7 +195,13 @@ fn excluded_malformed_payloads_are_not_decoded_but_requested_ones_fail() -> Resu
             params![vec![255_u8], fixture.conversation],
         )?;
     }
-    assert_eq!(read(&fixture.db, &fixture.view(1))?["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        read(&fixture.db, &fixture.view(1))?["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
     let failure = read(&fixture.db, &fixture.view(2)).unwrap_err();
     assert!(format!("{failure:#}").contains("canonical role must be text"));
     // The rejected read's rollback must not leave a transaction or reader alive.
@@ -153,10 +218,19 @@ fn content_budget_counts_utf8_and_embedded_nuls_without_partial_success() -> Res
     let payload = read(&fixture.db, &fixture.view(0))?;
     assert_eq!(payload["messages"][0]["content"], exact);
     assert_eq!(payload["content_bytes"], MAX_CONTENT_BYTES);
-    assert!(payload["more_before"].is_null(), "context-zero does not probe neighbours");
-    assert_eq!(error_kind(&read(&fixture.db, &fixture.view(1)).unwrap_err()), "canonical_payload_too_large");
+    assert!(
+        payload["more_before"].is_null(),
+        "context-zero does not probe neighbours"
+    );
+    assert_eq!(
+        error_kind(&read(&fixture.db, &fixture.view(1)).unwrap_err()),
+        "canonical_payload_too_large"
+    );
     fixture.content(12, &"x".repeat(MAX_CONTENT_BYTES + 1))?;
-    assert_eq!(error_kind(&read(&fixture.db, &fixture.view(0)).unwrap_err()), "canonical_payload_too_large");
+    assert_eq!(
+        error_kind(&read(&fixture.db, &fixture.view(0)).unwrap_err()),
+        "canonical_payload_too_large"
+    );
     fixture.content(12, "readable after refusal")?;
     assert!(read(&fixture.db, &fixture.view(0)).is_ok());
     Ok(())
@@ -172,7 +246,10 @@ fn canonical_views_do_not_load_or_relabel_the_lexical_snapshot() -> Result<()> {
     fixture.content(12, "new canonical content after writer commit")?;
     let (second, _) = session.handle(fixture.request(2, 0));
     assert!(second.ok, "{second:?}");
-    assert_eq!(second.result.unwrap()["messages"][0]["content"], "new canonical content after writer commit");
+    assert_eq!(
+        second.result.unwrap()["messages"][0]["content"],
+        "new canonical content after writer commit"
+    );
     assert_eq!(session.open_attempts, 0);
     assert_eq!(session.status()["canonical_read_attempts"], 2);
     assert_eq!(session.status()["canonical_reads_completed"], 2);
@@ -185,7 +262,13 @@ fn canonical_views_do_not_load_or_relabel_the_lexical_snapshot() -> Result<()> {
 fn corrupt_or_missing_archive_fails_without_creating_or_repairing_it() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("archive.db");
-    let request = View { source_path: "/source", source_id: "local", conversation_id: 1, message_index: 1, context: 0 };
+    let request = View {
+        source_path: "/source",
+        source_id: "local",
+        conversation_id: 1,
+        message_index: 1,
+        context: 0,
+    };
     assert!(read(&path, &request).is_err());
     assert!(!path.exists());
     std::fs::write(&path, b"not an archive")?;
@@ -208,7 +291,12 @@ fn symlink_archive_is_not_admitted() -> Result<()> {
 fn expired_budget_is_an_explicit_refusal_before_snapshot_queries() -> Result<()> {
     let fixture = Fixture::new()?;
     let storage = FrankenStorage::open_strict_readonly(&fixture.db)?;
-    let error = read_snapshot(&storage, &fixture.view(0), Instant::now() - Duration::from_secs(4)).unwrap_err();
+    let error = read_snapshot(
+        &storage,
+        &fixture.view(0),
+        Instant::now() - Duration::from_secs(4),
+    )
+    .unwrap_err();
     assert_eq!(error_kind(&error), "canonical_deadline");
     Ok(())
 }
@@ -222,10 +310,18 @@ fn mcp_exchange(session: &mut Session, requests: &[Value]) -> Result<Vec<Value>>
         json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
     ];
     frames.extend_from_slice(requests);
-    let input = frames.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+    let input = frames
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     let mut output = Vec::new();
     super::super::mcp::serve_io(session, &mut std::io::Cursor::new(input), &mut output)?;
-    std::str::from_utf8(&output)?.lines().map(|line| serde_json::from_str(line).map_err(Into::into)).collect()
+    std::str::from_utf8(&output)?
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .collect()
 }
 
 fn mcp_view(fixture: &Fixture, id: Value) -> Value {
@@ -250,12 +346,21 @@ fn mcp_catalog_and_dispatch_require_explicit_canonical_permission() -> Result<()
     let replies = mcp_exchange(&mut session, &[list])?;
     let tools = replies[1]["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 4);
-    let view = tools.iter().find(|tool| tool["name"] == "cass_view").unwrap();
+    let view = tools
+        .iter()
+        .find(|tool| tool["name"] == "cass_view")
+        .unwrap();
     assert_eq!(view["annotations"]["readOnlyHint"], true);
     assert_eq!(view["inputSchema"]["additionalProperties"], false);
     assert_eq!(view["inputSchema"]["required"].as_array().unwrap().len(), 4);
-    assert_eq!(view["inputSchema"]["properties"]["context"]["maximum"], MAX_CONTEXT);
-    assert_eq!(session.canonical_read_attempts, 0, "discovery must not open the archive");
+    assert_eq!(
+        view["inputSchema"]["properties"]["context"]["maximum"],
+        MAX_CONTEXT
+    );
+    assert_eq!(
+        session.canonical_read_attempts, 0,
+        "discovery must not open the archive"
+    );
     Ok(())
 }
 
@@ -271,9 +376,13 @@ fn mcp_view_round_trip_preserves_full_evidence_and_rpc_identity() -> Result<()> 
     assert_eq!(reply["id"], "view-δ");
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     let data = &reply["result"]["structuredContent"];
-    let text: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())?;
+    let text: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())?;
     assert_eq!(&text, data);
-    assert_eq!(data["messages"][1]["content"], "full evidence: quotes \" and NUL \0 and Unicode δ😀");
+    assert_eq!(
+        data["messages"][1]["content"],
+        "full evidence: quotes \" and NUL \0 and Unicode δ😀"
+    );
     assert!(data["matches_lexical_snapshot"].is_null());
     assert_eq!(session.open_attempts, 0);
     assert_eq!(session.canonical_reads_completed, 1);
@@ -293,10 +402,17 @@ fn mcp_view_rejects_path_escalation_and_fire_and_forget_database_reads() -> Resu
     let mut invalid = mcp_view(&fixture, json!(3));
     invalid["params"]["arguments"]["context"] = json!(MAX_CONTEXT + 1);
     let replies = mcp_exchange(&mut session, &[notification, escalation, invalid])?;
-    assert_eq!(replies.len(), 3, "tool notifications must receive no response");
+    assert_eq!(
+        replies.len(),
+        3,
+        "tool notifications must receive no response"
+    );
     assert_eq!(replies[1]["error"]["code"], -32602);
     assert_eq!(replies[2]["result"]["isError"], true);
-    assert_eq!(replies[2]["result"]["structuredContent"]["error"]["kind"], "invalid_request");
+    assert_eq!(
+        replies[2]["result"]["structuredContent"]["error"]["kind"],
+        "invalid_request"
+    );
     assert_eq!(session.canonical_read_attempts, 0);
     Ok(())
 }
@@ -311,8 +427,15 @@ fn mcp_oversized_canonical_body_is_a_tool_error_not_partial_evidence() -> Result
     let reply = &replies[1];
     assert_eq!(reply["id"], -17);
     assert_eq!(reply["result"]["isError"], true);
-    assert_eq!(reply["result"]["structuredContent"]["error"]["kind"], "canonical_payload_too_large");
-    assert!(reply["result"]["structuredContent"].get("messages").is_none());
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["kind"],
+        "canonical_payload_too_large"
+    );
+    assert!(
+        reply["result"]["structuredContent"]
+            .get("messages")
+            .is_none()
+    );
     assert_eq!(session.canonical_reads_completed, 0);
     Ok(())
 }
@@ -335,7 +458,10 @@ fn retained_read_transaction_cannot_mix_identity_with_a_newer_body() -> Result<(
     snapshot.release()?;
     drop(storage);
     let new = read(&fixture.db, &fixture.view(0))?;
-    assert_eq!(new["messages"][0]["content"], "new body from concurrent writer");
+    assert_eq!(
+        new["messages"][0]["content"],
+        "new body from concurrent writer"
+    );
     assert_eq!(archive_image(&fixture.db)?, before);
     Ok(())
 }

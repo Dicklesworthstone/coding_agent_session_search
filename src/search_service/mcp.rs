@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
-use super::protocol::{self, Frame, Reply, Request};
 use super::Session;
+use super::protocol::{self, Frame, Reply, Request};
 
 const CURRENT_VERSION: &str = "2025-11-25";
 const SUPPORTED_VERSIONS: [&str; 2] = [CURRENT_VERSION, "2025-06-18"];
@@ -36,7 +36,9 @@ fn request_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value
     if id.is_string() || id.is_i64() || id.is_u64() {
         Ok(Some(id))
     } else {
-        Err(serde::de::Error::custom("MCP IDs must be strings or integers, not null"))
+        Err(serde::de::Error::custom(
+            "MCP IDs must be strings or integers, not null",
+        ))
     }
 }
 
@@ -79,7 +81,11 @@ struct Adapter {
 
 impl Default for Adapter {
     fn default() -> Self {
-        Self { lifecycle: Lifecycle::New, window_started: Instant::now(), calls: 0 }
+        Self {
+            lifecycle: Lifecycle::New,
+            window_started: Instant::now(),
+            calls: 0,
+        }
     }
 }
 
@@ -115,7 +121,9 @@ fn without_meta(mut params: Map<String, Value>) -> Result<Map<String, Value>, &'
             return Err("_meta must be an object");
         };
         if meta.contains_key("io.modelcontextprotocol/protocolVersion") {
-            return Err("this endpoint supports initialization-based MCP 2025-11-25 and 2025-06-18; use initialize");
+            return Err(
+                "this endpoint supports initialization-based MCP 2025-11-25 and 2025-06-18; use initialize",
+            );
         }
     }
     Ok(params)
@@ -123,9 +131,18 @@ fn without_meta(mut params: Map<String, Value>) -> Result<Map<String, Value>, &'
 
 impl Adapter {
     fn handle(&mut self, session: &mut Session, request: RpcRequest) -> Option<Value> {
-        let RpcRequest { jsonrpc, method, id, params } = request;
+        let RpcRequest {
+            jsonrpc,
+            method,
+            id,
+            params,
+        } = request;
         if jsonrpc != "2.0" {
-            return Some(failure(id.unwrap_or(Value::Null), -32600, "jsonrpc must be 2.0"));
+            return Some(failure(
+                id.unwrap_or(Value::Null),
+                -32600,
+                "jsonrpc must be 2.0",
+            ));
         }
         // Unknown notifications are ignored. In particular, a tools/call without
         // an ID never executes search/reload as a fire-and-forget operation.
@@ -140,7 +157,10 @@ impl Adapter {
         };
         // Version-era discovery must fail deterministically even before the
         // legacy handshake, allowing current dual-era clients to negotiate.
-        if !matches!(method.as_str(), "initialize" | "ping" | "tools/list" | "tools/call") {
+        if !matches!(
+            method.as_str(),
+            "initialize" | "ping" | "tools/list" | "tools/call"
+        ) {
             return Some(failure(id, -32601, "method not supported"));
         }
         let params = match without_meta(params) {
@@ -149,7 +169,11 @@ impl Adapter {
         };
         if method == "initialize" {
             if self.lifecycle != Lifecycle::New {
-                return Some(failure(id, -32600, "already initialized; restart the process to renegotiate"));
+                return Some(failure(
+                    id,
+                    -32600,
+                    "already initialized; restart the process to renegotiate",
+                ));
             }
             let initialization = match serde_json::from_value::<Initialize>(Value::Object(params)) {
                 Ok(value) => value,
@@ -159,23 +183,31 @@ impl Adapter {
                 || initialization.client_info.version.trim().is_empty()
                 || initialization.protocol_version.trim().is_empty()
             {
-                return Some(failure(id, -32602, "protocolVersion and clientInfo name/version must be nonempty"));
+                return Some(failure(
+                    id,
+                    -32602,
+                    "protocolVersion and clientInfo name/version must be nonempty",
+                ));
             }
             // No client capabilities are invoked, and no capability grants
             // additional filesystem or query authority.
             let _ = initialization.capabilities;
-            let version = if SUPPORTED_VERSIONS.contains(&initialization.protocol_version.as_str()) {
+            let version = if SUPPORTED_VERSIONS.contains(&initialization.protocol_version.as_str())
+            {
                 initialization.protocol_version.as_str()
             } else {
                 CURRENT_VERSION
             };
             self.lifecycle = Lifecycle::Initializing;
-            return Some(success(id, json!({
-                "protocolVersion": version,
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "cass-search", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": INSTRUCTIONS,
-            })));
+            return Some(success(
+                id,
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": {"name": "cass-search", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": INSTRUCTIONS,
+                }),
+            ));
         }
         if method == "ping" {
             return Some(if params.is_empty() {
@@ -185,13 +217,21 @@ impl Adapter {
             });
         }
         if self.lifecycle != Lifecycle::Ready {
-            return Some(failure(id, -32600, "send initialize and notifications/initialized before using tools"));
+            return Some(failure(
+                id,
+                -32600,
+                "send initialize and notifications/initialized before using tools",
+            ));
         }
         if method == "tools/list" {
             return Some(if params.is_empty() {
                 success(id, json!({"tools": tools_for_session(session)}))
             } else {
-                failure(id, -32602, "the complete tool catalog is returned in one page; no cursor is supported")
+                failure(
+                    id,
+                    -32602,
+                    "the complete tool catalog is returned in one page; no cursor is supported",
+                )
             });
         }
         let call = match serde_json::from_value::<ToolCall>(Value::Object(params)) {
@@ -207,7 +247,11 @@ impl Adapter {
         };
         let mut arguments = call.arguments;
         if arguments.contains_key("op") || arguments.contains_key("id") {
-            return Some(failure(id, -32602, "tool arguments cannot select protocol operations or IDs"));
+            return Some(failure(
+                id,
+                -32602,
+                "tool arguments cannot select protocol operations or IDs",
+            ));
         }
         arguments.insert("op".into(), op.into());
         arguments.insert("id".into(), 0.into());
@@ -223,22 +267,33 @@ impl Adapter {
             self.calls = 0;
         }
         let reply = if self.calls >= MAX_TOOL_CALLS_PER_MINUTE {
-            Reply::failure(None, "rate_limited", "at most 120 tool calls per minute per process; retry after the current minute window")
+            Reply::failure(
+                None,
+                "rate_limited",
+                "at most 120 tool calls per minute per process; retry after the current minute window",
+            )
         } else {
             self.calls += 1;
             session.handle(request).0
         };
         Some(match tool_result(reply) {
             Ok(result) => success(id, result),
-            Err(_) => failure(id, -32603, "tool result exceeds the encoded response budget; request fewer hits"),
+            Err(_) => failure(
+                id,
+                -32603,
+                "tool result exceeds the encoded response budget; request fewer hits",
+            ),
         })
     }
 }
 
 fn tools() -> Vec<Value> {
-    let identity = json!({"type": "string", "minLength": 1, "maxLength": protocol::MAX_IDENTITY_BYTES});
-    let filter_list = json!({"type": "array", "maxItems": protocol::MAX_FILTERS, "items": identity});
-    let annotations = json!({"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false});
+    let identity =
+        json!({"type": "string", "minLength": 1, "maxLength": protocol::MAX_IDENTITY_BYTES});
+    let filter_list =
+        json!({"type": "array", "maxItems": protocol::MAX_FILTERS, "items": identity});
+    let annotations =
+        json!({"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false});
     vec![
         json!({
             "name": "cass_search",
@@ -278,7 +333,8 @@ fn tools_for_session(session: &Session) -> Vec<Value> {
     // Startup configuration is immutable for the lifetime of a production
     // session; this catalog does not require list-changed notifications.
     if session.archive.is_some() {
-        let identity = json!({"type": "string", "minLength": 1, "maxLength": protocol::MAX_IDENTITY_BYTES});
+        let identity =
+            json!({"type": "string", "minLength": 1, "maxLength": protocol::MAX_IDENTITY_BYTES});
         catalog.push(json!({
             "name": "cass_view",
             "description": "Read a complete canonical message with optional nearby messages. Copy all four coordinates from one search hit. Reads only the fixed startup --db; source_path is an identity, never a file to open. Context counts actual messages, including sparse indices. At most 20 messages on each side and 64 KiB of total UTF-8 body data; larger windows fail without truncation. This new archive read snapshot is not proof of lexical-index freshness.",
@@ -321,7 +377,14 @@ pub(super) fn serve_io(
         let bytes = match protocol::read_frame(input)? {
             Frame::End => return Ok(()),
             Frame::TooLarge => {
-                write_response(output, &failure(Value::Null, -32600, "request exceeds 64 KiB; closing session"))?;
+                write_response(
+                    output,
+                    &failure(
+                        Value::Null,
+                        -32600,
+                        "request exceeds 64 KiB; closing session",
+                    ),
+                )?;
                 return Ok(());
             }
             Frame::Line(bytes) => bytes,
@@ -331,7 +394,11 @@ pub(super) fn serve_io(
         let response = match serde_json::from_slice::<RpcRequest>(&bytes) {
             Ok(request) => adapter.handle(session, request),
             Err(error) => {
-                let code = if error.is_syntax() || error.is_eof() { -32700 } else { -32600 };
+                let code = if error.is_syntax() || error.is_eof() {
+                    -32700
+                } else {
+                    -32600
+                };
                 Some(failure(Value::Null, code, error.to_string()))
             }
         };

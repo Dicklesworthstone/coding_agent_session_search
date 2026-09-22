@@ -187,7 +187,9 @@ impl Write for LimitedBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         // Reserve one byte for the line terminator, including escaped JSON bytes.
         if bytes.len() > (MAX_RESPONSE_BYTES - 1) - self.0.len() {
-            return Err(io::Error::other("search service response exceeds its byte limit"));
+            return Err(io::Error::other(
+                "search service response exceeds its byte limit",
+            ));
         }
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
