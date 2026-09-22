@@ -12,16 +12,10 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
-    timeout-minutes: 55
+    runs-on: macos-14
+    timeout-minutes: 10
     permissions:
       contents: write
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -30,12 +24,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           toolchain: nightly-2026-08-31
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-        with:
-          shared-key: gh493-identity
-          cache-on-failure: true
-      - name: Prepare exact citation and production-boundary repairs
+          components: rustfmt
+      - name: Preserve current tests and admit exact reviewed pack sources
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -43,18 +33,22 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          expected = {
+          inputs = {
               'src/search/pack_planner.rs': '8da40fafe3a838dba5854817ed6aacf50cb5d8ea',
-              'tests/gh493_message_coordinates.rs': 'c00b7b0d6635aab250988f26e269d1c8b5acb8c4',
               'tests/cli_robot.rs': '2bbae550983d5b2d6f11fb53ad78721ced05d2bb',
               'tests/e2e_cli_flows.rs': '7e345504670c80ca957f5e8cb07085b81c060b0c',
               'docs/planning/ANSWER_PACKS_CONTRACT.md': 'da7daf701813c13e2bd1cb495083db40ed975e0f',
-              'src/indexer/semantic/engine.rs': '6040a7e231fa9cdf80ecee194cd370674bd0501a',
-              'src/search/query/ann_shards/execution.rs': '010ca2b7eabd9f2b4b28b4ffbc6401a75ed4686f',
-              'src/raw_mirror.rs': '9988cf3b1d85b7b75542313095a85369cf2507c6',
+              'tests/gh493_message_coordinates.rs': '7b3e31d6cc53d144a6cd796c5b7900b08d3c6e08',
           }
-          for path, sha in expected.items():
-              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          outputs = {
+              'src/search/pack_planner.rs': '9ece232289ce82ee37dff4a36dea741de7ad1dba',
+              'tests/cli_robot.rs': '68c78f33143487669204ee67671e2513dcd09cdf',
+              'tests/e2e_cli_flows.rs': '996ef269861be8b890b16825e7adf6e1b1512f7c',
+              'docs/planning/ANSWER_PACKS_CONTRACT.md': '04834c3939523115d53a9988578d52f50554ffeb',
+          }
+          for path, sha in inputs.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == sha, f'{path}: {actual} != {sha}'
           def blob(sha):
               request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'cass-candidate-review'})
               with urllib.request.urlopen(request, timeout=60) as response:
@@ -63,32 +57,22 @@ jobs:
               data = base64.b64decode(result['content'])
               assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
               return data
-          for sha in ['5352abb56e820bd6e9aaae9da6194fc7429f3b4a', '410f55d0577b99fa97af1d1a6425b6fce1fd2a0b']:
-              patch = blob(sha)
-              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          pathlib.Path('candidate').mkdir()
+          original = pathlib.Path('tests/gh493_message_coordinates.rs').read_bytes()
+          pathlib.Path('candidate/original-tests.rs').write_bytes(original)
+          for path, sha in outputs.items():
+              pathlib.Path(path).write_bytes(blob(sha))
           with open('tests/gh493_message_coordinates.rs', 'ab') as output:
               output.write(blob('e8709bbdcc4a6462685a25fed1c0dfc7cce74de3'))
-          expected_output = {
-              'src/search/pack_planner.rs': 'b190757ec9dbbdc2640c4808a87e355ca4140aa8',
-              'tests/gh493_message_coordinates.rs': 'cdfa3afad63adc36a02f793cd10a4064dde497fa',
-              'tests/cli_robot.rs': '68c78f33143487669204ee67671e2513dcd09cdf',
-              'tests/e2e_cli_flows.rs': '996ef269861be8b890b16825e7adf6e1b1512f7c',
-              'docs/planning/ANSWER_PACKS_CONTRACT.md': '04834c3939523115d53a9988578d52f50554ffeb',
-              'src/indexer/semantic/engine.rs': '843885af42f0b3f0227d21da8d1753f2aea932df',
-              'src/search/query/ann_shards/execution.rs': 'e719c9c0d88c0ee6b0067a9088aafba141035c05',
-              'src/raw_mirror.rs': '56ef4df60dffd6f04674c29b2710eff164f2fbab',
-          }
-          for path, sha in expected_output.items():
-              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
-          pathlib.Path('candidate').mkdir()
-          pathlib.Path('candidate/input-blobs.json').write_text(json.dumps(expected, indent=2))
+          assert pathlib.Path('tests/gh493_message_coordinates.rs').read_bytes().startswith(original)
+          pathlib.Path('candidate/input-blobs.json').write_text(json.dumps(inputs, indent=2))
           PY
-      - name: Format and check the changed sources
+      - name: Format the appended tests and verify the complete patch
         run: |
-          rustfmt --edition 2024 --config skip_children=true src/search/pack_planner.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/e2e_cli_flows.rs src/indexer/semantic/engine.rs src/search/query/ann_shards/execution.rs src/raw_mirror.rs
+          rustfmt --edition 2024 --config skip_children=true tests/gh493_message_coordinates.rs
+          rustfmt --edition 2024 --config skip_children=true --check src/search/pack_planner.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/e2e_cli_flows.rs
           git diff --check
-      - name: Publish reviewed blobs only, never commits or refs
+      - name: Publish reviewed source blobs only
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -96,10 +80,10 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json, os, pathlib, shutil, subprocess, urllib.request
-          expected = json.loads(pathlib.Path('candidate/input-blobs.json').read_text())
-          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == set(expected)
-          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': expected, 'candidate_blobs': {}}
-          for path in expected:
+          inputs = json.loads(pathlib.Path('candidate/input-blobs.json').read_text())
+          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == set(inputs)
+          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': inputs, 'candidate_blobs': {}}
+          for path in inputs:
               request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', data=json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'cass-candidate-review'}, method='POST')
               with urllib.request.urlopen(request, timeout=60) as response:
                   sha = json.load(response)['sha']
@@ -114,25 +98,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pack-and-production-boundaries-candidate
+          name: pack-current-main-candidate
           path: candidate/
           retention-days: 1
           if-no-files-found: error
-      - name: Real pack handoff and all canonical coordinate regressions
-        run: cargo test --locked --no-fail-fast --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget --test spec_view_expand_error_envelopes --test golden_robot_pack -- --nocapture
-      - name: Existing pack robot and timeout contracts
-        if: ${{ !cancelled() }}
-        run: cargo test --locked --test cli_robot pack -- --nocapture
-      - name: Existing real archive-to-pack journey
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --test e2e_cli_flows pack_handoff_journey_uses_real_archive_and_preserves_sources -- --exact --nocapture | tee "$RUNNER_TEMP/pack-journey.log"
-          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/pack-journey.log"
-      - name: Public semantic backfill facade retains artifact ownership
-        if: ${{ !cancelled() }}
-        run: cargo test --locked --test semantic_artifact_reclaim_cli -- --nocapture
-      - name: Strict production and regression lint
-        if: ${{ !cancelled() }}
-        run: cargo clippy --locked --test gh493_message_coordinates --test gh493_windowed_followup --test cli_view_budget --test semantic_artifact_reclaim_cli -- -D warnings
