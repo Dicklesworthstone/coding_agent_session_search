@@ -12,7 +12,7 @@ permissions:
 # workflow in the explicit source commit after inspecting the exported blobs.
 concurrency:
   group: gh494-independent-publication-preparation
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   publication-regressions:
@@ -64,6 +64,10 @@ jobs:
           test "$(git hash-object "$RUNNER_TEMP/authority.patch")" = f9c8137c32cfce05740c057f1be40dba81c14ff9
           git apply --check --whitespace=error "$RUNNER_TEMP/authority.patch"
           git apply --whitespace=error "$RUNNER_TEMP/authority.patch"
+          gh api -H 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0' "repos/$GITHUB_REPOSITORY/git/blobs/3c2b3a4848f4b035cad0e5da8336026fda6b3467" --jq .content | base64 --decode > "$RUNNER_TEMP/fixtures.patch"
+          test "$(git hash-object "$RUNNER_TEMP/fixtures.patch")" = 3c2b3a4848f4b035cad0e5da8336026fda6b3467
+          git apply --check --whitespace=error "$RUNNER_TEMP/fixtures.patch"
+          git apply --whitespace=error "$RUNNER_TEMP/fixtures.patch"
           rustfmt --edition 2024 --config skip_children=true src/indexer/gh494_tests.rs src/search/gh494_repair_tests.rs tests/gh494_publish_resume.rs
           rustfmt --edition 2024 --config skip_children=true --check src/indexer/gh494_tests.rs src/search/gh494_repair_tests.rs tests/gh494_publish_resume.rs
           rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/indexer.parsed.rs"
@@ -82,7 +86,7 @@ jobs:
           python3 - <<'PY'
           import base64, hashlib, json, os, pathlib, subprocess
           paths = ['src/indexer/gh494_tests.rs', 'src/indexer/mod.rs', 'src/lib.rs', 'src/search/gh494_repair_tests.rs', 'tests/gh494_publish_resume.rs']
-          report = {'base_commit': os.environ['GITHUB_SHA'], 'patch_blob': '12dbd5e0ac9327e3e65e2ad16611b5ae19498c83', 'blobs': {}}
+          report = {'base_commit': os.environ['GITHUB_SHA'], 'patch_blobs': ['12dbd5e0ac9327e3e65e2ad16611b5ae19498c83', '3c2b3a4848f4b035cad0e5da8336026fda6b3467'], 'blobs': {}}
           for path in paths:
               data = pathlib.Path(path).read_bytes()
               expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
@@ -113,6 +117,12 @@ jobs:
             grep -F "$name ... ok" "$RUNNER_TEMP/gh494-authority/library.log"
           done
           echo 'STAGE=production-publication-authority-and-recovery EXIT=0'
+      - name: Retain the full search self-heal and strict-admission controls
+        if: ${{ !cancelled() && steps.library.outcome == 'success' }}
+        shell: bash
+        run: |
+          cargo test --locked --lib search_lexical_self_heal_tests:: -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-authority/self-heal.log"
+          echo 'STAGE=search-self-heal-and-strict-admission EXIT=0'
       - name: Execute real CLI publication and search availability regressions
         if: ${{ !cancelled() && steps.library.outcome == 'success' }}
         shell: bash
