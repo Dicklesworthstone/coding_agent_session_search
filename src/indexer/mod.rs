@@ -8917,23 +8917,13 @@ fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
     crate::search::tantivy::searchable_index_fingerprint(index_path)
 }
 
-fn completed_lexical_rebuild_meta_fingerprint(
-    state: &LexicalRebuildState,
-    index_path: &Path,
-) -> Result<Option<String>> {
-    match &state.committed_meta_fingerprint {
-        Some(fingerprint) => Ok(Some(fingerprint.clone())),
-        None => index_meta_fingerprint(index_path),
-    }
-}
-
 /// GH #457: the post-publish proof that a rebuild's generation serves exactly
 /// the documents it counted. A count that cannot be observed — no manifest
 /// landed, or no reader can open what did — is a FAILED proof, never a
 /// skipped one: the previous `if let Some(observed)` shape verified nothing
 /// in exactly the cases that matter, so a generation whose MANIFEST never
 /// landed could still be certified by a completed checkpoint.
-fn verify_published_lexical_doc_count(
+pub(crate) fn verify_published_lexical_doc_count(
     index_path: &Path,
     indexed_docs: usize,
     publish_mode: &str,
@@ -9172,7 +9162,18 @@ fn reconcile_pending_lexical_commit(
         return Ok(state);
     };
 
-    let current_meta_fingerprint = index_meta_fingerprint(index_path)?;
+    // The checkpoint lives beside the old live generation, but a staged
+    // rebuild commits into its scratch sibling. Comparing the pending commit
+    // with the unrelated live MANIFEST can promote rows that never committed,
+    // or roll back a commit that did. Recovery must observe the same content
+    // directory that commit_lexical_rebuild_progress fingerprinted.
+    let scratch_path = staged_lexical_rebuild_scratch_path(index_path);
+    let content_path = if state.is_incomplete() && scratch_path.is_dir() {
+        scratch_path.as_path()
+    } else {
+        index_path
+    };
+    let current_meta_fingerprint = index_meta_fingerprint(content_path)?;
     if pending_commit_landed(
         pending.base_meta_fingerprint.as_deref(),
         current_meta_fingerprint.as_deref(),
@@ -24449,7 +24450,10 @@ fn rebuild_tantivy_from_db_with_options(
         )
         .run("reuse_completed_generation", || {
             crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-            verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")
+            verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")?;
+            // A crash after the swap may leave the old generation parked.
+            // Retain it without reopening the rebuild or swapping it back.
+            recover_or_finalize_interrupted_lexical_publish_backup(&index_path)
         })?;
         storage.close_without_checkpoint().with_context(|| {
             format!(
@@ -24486,8 +24490,7 @@ fn rebuild_tantivy_from_db_with_options(
             "lexical rebuild cursor reached EOF but publication is incomplete; resuming finalization"
         );
     }
-    let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
-    let restart_from_zero =
+    let mut restart_from_zero =
         rebuild_state.processed_conversations == 0 && rebuild_state.pending.is_none();
 
     // Plan staged shards BEFORE deciding whether to pre-wipe the live index.
@@ -24540,7 +24543,7 @@ fn rebuild_tantivy_from_db_with_options(
     // rebuild restart from zero — the exact failure #380 reports.
     let scratch_path = staged_lexical_rebuild_scratch_path(&index_path);
     let scratch_exists = scratch_path.is_dir();
-    let staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
+    let mut staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
         // Fresh staged build: discard any scratch left by an abandoned run.
         if let Err(err) = fs::remove_dir_all(&scratch_path)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -24580,7 +24583,7 @@ fn rebuild_tantivy_from_db_with_options(
     };
     // Where the index CONTENT is built. Equals the live path for an ordinary
     // in-place incremental run; the scratch path for a staged full rebuild.
-    let build_path = staged_build_path
+    let mut build_path = staged_build_path
         .clone()
         .unwrap_or_else(|| index_path.clone());
     if restart_from_zero && will_use_atomic_staged_publish {
@@ -24596,6 +24599,60 @@ fn rebuild_tantivy_from_db_with_options(
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
     }
 
+    // GH #494: a saved cursor is only usable while its committed prefix still
+    // exists. Check BEFORE open_or_create: a missing MANIFEST creates an empty
+    // writer, and a schema mismatch can wipe the candidate. Neither may keep
+    // the old counters/cursor. Do this before constructing producer/controller
+    // state so a restart uses one coherent zero-based pipeline, not a new
+    // checkpoint with the previous run's accounting still captured in locals.
+    if !restart_from_zero && !will_use_atomic_staged_publish {
+        let resume_check = (|| -> Result<()> {
+            crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
+            let live_docs = crate::search::tantivy::searchable_index_live_doc_count(&build_path)
+                .context("resumed lexical candidate has no observable document count")?;
+            anyhow::ensure!(
+                u128::from(live_docs) >= rebuild_state.indexed_docs as u128,
+                "resumed lexical candidate contains {live_docs} documents, but its checkpoint \
+                 requires {} committed documents",
+                rebuild_state.indexed_docs
+            );
+            Ok(())
+        })();
+        if let Err(error) = resume_check {
+            let cause = format!("{error:#}");
+            if staged_build_path.is_some() {
+                let quarantine = lexical_publish::quarantine_incomplete_candidate(&build_path)
+                    .with_context(|| format!("cannot retain unusable lexical candidate: {cause}"))?;
+                // Keep the exact cursor/accounting that could no longer be
+                // resumed alongside the untouched failed candidate files.
+                persist_lexical_rebuild_state(&quarantine, &rebuild_state)?;
+                tracing::warn!(
+                    error = %cause,
+                    quarantine_path = %quarantine.display(),
+                    "retained unusable staged lexical candidate; restarting canonical replay"
+                );
+            } else {
+                // An older checkpoint can refer to in-place work, or staging
+                // can have disappeared. Never wipe or move the prior live tree
+                // just to restart: build its replacement off-live instead.
+                tracing::warn!(
+                    error = %cause,
+                    index_path = %index_path.display(),
+                    "lexical resume prefix is unusable; preserving live tree and restarting off-live"
+                );
+            }
+            fs::create_dir(&scratch_path).with_context(|| {
+                format!("creating replacement lexical candidate {}", scratch_path.display())
+            })?;
+            build_path = scratch_path.clone();
+            staged_build_path = Some(scratch_path.clone());
+            rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+            restart_from_zero = true;
+        }
+        log_prep_step("validate_resume_prefix", &mut prep_step_started);
+    }
+
+    let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
     log_prep_step("restart_from_zero_reset", &mut prep_step_started);
     let batch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);
     let initial_batch_conversation_limit =
@@ -24784,35 +24841,12 @@ fn rebuild_tantivy_from_db_with_options(
     }
 
     let mut t_index = match (|| -> Result<TantivyIndex> {
-        let mut t_index = match TantivyIndex::open_or_create(&build_path) {
-            Ok(index) => index,
-            Err(err)
-                if rebuild_state.processed_conversations > 0 || rebuild_state.pending.is_some() =>
-            {
-                tracing::warn!(
-                    path = %index_path.display(),
-                    error = %err,
-                    "partial lexical index could not be reopened; restarting lexical rebuild from zero"
-                );
-                if let Err(remove_err) = fs::remove_dir_all(&build_path)
-                    && remove_err.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(remove_err).with_context(|| {
-                        format!("removing unreadable index {}", index_path.display())
-                    });
-                }
-                fs::create_dir_all(&build_path).with_context(|| {
-                    format!(
-                        "recreating lexical index directory after open failure {}",
-                        index_path.display()
-                    )
-                })?;
-                rebuild_state =
-                    LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-                TantivyIndex::open_or_create(&build_path)?
-            }
-            Err(err) => return Err(err),
-        };
+        // A remaining writer-open error (locks, permissions, or a race after
+        // preflight) is not permission to erase the candidate. Leave it and its
+        // checkpoint intact; a retry revalidates before initializing counters.
+        let mut t_index = TantivyIndex::open_or_create(&build_path).with_context(|| {
+            format!("opening lexical rebuild writer {}; candidate retained", build_path.display())
+        })?;
         log_prep_step("open_tantivy", &mut prep_step_started);
 
         // GH #446: the sink side of the pipeline (accumulate / commit /
@@ -25509,27 +25543,17 @@ fn rebuild_tantivy_from_db_with_options(
         )
     })?;
 
+    // Release the bulk writer before opening a fresh validation reader. Large
+    // archives must not retain both writer and reader working sets here.
+    publication.run("release_writer", || {
+        drop(t_index);
+        Ok(())
+    })?;
     // Refuse an unreadable/hollow candidate before it can replace a usable
     // live generation. Reopen and validate the actual live path again after swap.
     publication.run("validate_candidate", || {
         crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
         verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
-    })?;
-    publication.run("release_writer", || {
-        drop(t_index);
-        Ok(())
-    })?;
-    // Swap the freshly built index into the live path. Until this call the live
-    // index is untouched, so a concurrent reader sees the OLD complete corpus
-    // rather than a partially built one.
-    if let Some(staged) = staged_build_path.as_ref() {
-        publication.run("publish_staged_generation", || {
-            publish_staged_lexical_index(staged, &index_path)
-        })?;
-    }
-    publication.run("validate_published_generation", || {
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-        verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
     })?;
 
     // GH #440: indexed_docs omits hard-noise messages from the committed
@@ -25572,17 +25596,19 @@ fn rebuild_tantivy_from_db_with_options(
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
-    // GH #457: the generation manifest is durable BEFORE the checkpoint is
-    // marked completed (the staged path's ordering). A crash between the two
-    // used to leave `completed: true` over a generation with no manifest, so
-    // every readiness surface reported ready with nothing to read the doc
-    // count from.
+    // GH #494: prepare the complete generation in its CONTENT directory before
+    // swapping. Keeping the completed checkpoint only on the old live path
+    // loses it during the swap; a crash then exposes new documents without
+    // their publication receipt and every search can start rebuilding again.
+    // GH #457 still requires the manifest BEFORE the completed checkpoint.
+    // Before publication, the old live checkpoint remains incomplete and can
+    // resume the candidate if any certification or rename operation fails.
     let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
     let publish_started = Instant::now();
     let equivalence_evidence = equivalence_accumulator.finalize();
     let generation_manifest = publication.run("persist_generation_manifest", || {
         persist_lexical_rebuild_generation_artifacts(
-            &index_path,
+            &build_path,
             &rebuild_state.db.storage_fingerprint,
             rebuild_state.processed_conversations,
             final_total_conversations,
@@ -25591,14 +25617,33 @@ fn rebuild_tantivy_from_db_with_options(
             &equivalence_evidence,
         )
     })?;
-    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
     let completed_fingerprint = publication.run("completed_generation_fingerprint", || {
-        completed_lexical_rebuild_meta_fingerprint(&rebuild_state, &index_path)
+        // Bind the receipt to the immutable generation after writer release,
+        // not a cached fingerprint taken before the writer was dropped.
+        index_meta_fingerprint(&build_path)
     })?;
     rebuild_state.mark_completed(completed_fingerprint);
     publication.run("persist_completed_checkpoint", || {
-        persist_lexical_rebuild_state(&index_path, &rebuild_state)
+        persist_lexical_rebuild_state(&build_path, &rebuild_state)
     })?;
+    publication.run("sync_certified_candidate", || {
+        sync_parent_directory(&lexical_rebuild_state_path(&build_path))
+    })?;
+
+    // The atomic swap now publishes documents, generation manifest, and the
+    // completed checkpoint together. A post-swap failure is still reported,
+    // but a subsequent invocation can validate/reuse the generation instead
+    // of discarding its ingestion progress or adopting the prior-live scratch.
+    if let Some(staged) = staged_build_path.as_ref() {
+        publication.run("publish_staged_generation", || {
+            publish_staged_lexical_index(staged, &index_path)
+        })?;
+    }
+    publication.run("validate_published_generation", || {
+        crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
+        verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
+    })?;
+    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
     if let Some(p) = &progress {
         p.current

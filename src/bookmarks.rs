@@ -488,7 +488,8 @@ pub enum BookmarksCommand {
     },
     /// Export all bookmarks as JSON (to a file, or stdout when no `--output`).
     Export {
-        /// Destination file; parent directories are created as needed.
+        /// New destination file; existing files and links are never replaced.
+        /// Parent directories are created as needed.
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
         /// Emit a single JSON document instead of human-readable lines.
@@ -791,16 +792,11 @@ fn execute(command: &BookmarksCommand, out: &mut dyn Write) -> BookmarkCliResult
                     let payload = serde_json::to_string_pretty(&bookmarks).map_err(|e| {
                         BookmarkCliError::io("serializing bookmarks", e.to_string())
                     })?;
-                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        std::fs::create_dir_all(parent).map_err(|e| {
-                            BookmarkCliError::io(
-                                &format!("creating export directory {}", parent.display()),
-                                e,
-                            )
-                        })?;
-                    }
-                    std::fs::write(path, payload).map_err(|e| {
-                        BookmarkCliError::io(&format!("writing {}", path.display()), e)
+                    write_export_file(path, payload.as_bytes()).map_err(|e| {
+                        BookmarkCliError::io(
+                            &format!("exporting bookmarks to {}", path.display()),
+                            format!("{e:#}"),
+                        )
                     })?;
                     let shown = path.display().to_string();
                     if json {
@@ -875,6 +871,39 @@ fn execute(command: &BookmarksCommand, out: &mut dyn Write) -> BookmarkCliResult
             Ok(BOOKMARKS_EXIT_OK)
         }
     }
+}
+
+/// Publish complete private bytes without ever opening the destination for
+/// writing. A preflight exists() check would race other exporters and miss
+/// dangling symlinks; no-clobber publication is the authority for both cases.
+fn write_export_file(path: &Path, payload: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).context("creating bookmark export directory")?;
+    // Stage beside the destination so publication does not cross filesystems.
+    // NamedTempFile creates owner-only files on Unix, including while writing.
+    let mut staged =
+        tempfile::NamedTempFile::new_in(parent).context("creating private bookmark export")?;
+    staged
+        .write_all(payload)
+        .context("writing private bookmark export")?;
+    staged
+        .as_file()
+        .sync_all()
+        .context("syncing private bookmark export")?;
+    staged
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .context("publishing bookmark export without overwriting; choose a new --output path")?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context(
+            "bookmark export was published, but directory durability could not be confirmed",
+        )?;
+    Ok(())
 }
 
 fn open_store(db_path: &Path) -> BookmarkCliResult<BookmarkStore> {
@@ -1059,6 +1088,183 @@ mod tests {
             vec![expected_path],
             "query {query:?} should match exactly one source path"
         );
+    }
+
+    #[test]
+    fn file_export_preserves_existing_bytes_and_error_cause() -> Result<()> {
+        let dir = tempdir()?;
+        let output = dir.path().join("existing.json");
+        std::fs::write(&output, b"previous private export")?;
+        let error = write_export_file(&output, b"replacement").expect_err("must not overwrite");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("I/O cause")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(error.to_string().contains("choose a new --output path"));
+        assert_eq!(std::fs::read(&output)?, b"previous private export");
+        Ok(())
+    }
+
+    #[test]
+    fn file_export_publishes_complete_private_bytes_in_new_directory() -> Result<()> {
+        let dir = tempdir()?;
+        let output = dir.path().join("nested/δ-export.json");
+        let payload = serde_json::to_vec_pretty(&[Bookmark::new(
+            "Unicode δ",
+            "/session.jsonl",
+            "codex",
+            "/workspace",
+        )
+        .with_note("private note\nsecond line")])?;
+        write_export_file(&output, &payload)?;
+        assert_eq!(std::fs::read(&output)?, payload);
+        let restored: Vec<Bookmark> = serde_json::from_slice(&std::fs::read(&output)?)?;
+        assert_eq!(restored[0].note, "private note\nsecond line");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&output)?.permissions().mode() & 0o077, 0);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_export_refuses_live_and_dangling_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir()?;
+        let target = dir.path().join("private.db");
+        std::fs::write(&target, b"database bytes")?;
+        let missing = dir.path().join("missing.db");
+        for (name, target) in [("live.json", &target), ("dangling.json", &missing)] {
+            let output = dir.path().join(name);
+            symlink(target, &output)?;
+            assert!(write_export_file(&output, b"not a database").is_err());
+            assert_eq!(std::fs::read_link(&output)?, *target);
+            assert!(std::fs::symlink_metadata(&output)?.file_type().is_symlink());
+        }
+        assert_eq!(std::fs::read(&target)?, b"database bytes");
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn file_export_refuses_hardlinks_and_directories() -> Result<()> {
+        let dir = tempdir()?;
+        let target = dir.path().join("private.db");
+        std::fs::write(&target, b"database bytes")?;
+        let linked = dir.path().join("alias.json");
+        std::fs::hard_link(&target, &linked)?;
+        assert!(write_export_file(&linked, b"replacement").is_err());
+        assert_eq!(std::fs::read(&target)?, b"database bytes");
+        assert_eq!(std::fs::read(&linked)?, b"database bytes");
+        assert!(write_export_file(dir.path(), b"replacement").is_err());
+        assert!(dir.path().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn file_export_competing_writers_publish_exactly_one_complete_payload() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+        let dir = tempdir()?;
+        let output = dir.path().join("race.json");
+        let barrier = Arc::new(Barrier::new(2));
+        let writers = [b'a', b'b'].map(|marker| {
+            let output = output.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let payload = vec![marker; 65_536];
+                barrier.wait();
+                (marker, write_export_file(&output, &payload))
+            })
+        });
+        let mut winner = None;
+        for writer in writers {
+            let (marker, result) = writer.join().expect("export thread");
+            match result {
+                Ok(()) => assert!(winner.replace(marker).is_none(), "only one winner"),
+                Err(error) => assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("I/O cause")
+                        .kind(),
+                    std::io::ErrorKind::AlreadyExists
+                ),
+            }
+        }
+        assert_eq!(
+            std::fs::read(output)?,
+            vec![winner.expect("one winner"); 65_536]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_file_export_cannot_overwrite_its_bookmark_database() -> Result<()> {
+        let dir = tempdir()?;
+        let database = bookmarks_path_in(dir.path());
+        let store = BookmarkStore::open(&database)?;
+        let id = store.add(&Bookmark::new("Keep me", "/saved.jsonl", "codex", "/ws"))?;
+        drop(store);
+        let args = BookmarksArgs {
+            command: BookmarksCommand::Export {
+                output: Some(database.clone()),
+                json: true,
+                data_dir: Some(dir.path().to_path_buf()),
+            },
+        };
+        let mut stdout = Vec::new();
+        assert_eq!(
+            run_bookmarks_command_to(args, &mut stdout)?,
+            BOOKMARKS_EXIT_IO
+        );
+        assert!(stdout.is_empty(), "a refused export has no success receipt");
+        let store = BookmarkStore::open(&database)?;
+        assert_eq!(store.count()?, 1);
+        assert_eq!(store.get(id)?.expect("retained bookmark").title, "Keep me");
+        Ok(())
+    }
+
+    #[test]
+    fn command_file_export_round_trips_and_refuses_repeated_destination() -> Result<()> {
+        let dir = tempdir()?;
+        let store = BookmarkStore::open(&bookmarks_path_in(dir.path()))?;
+        store.add(&Bookmark::new("Keep me", "/saved.jsonl", "codex", "/ws"))?;
+        drop(store);
+        for json in [false, true] {
+            let output = dir.path().join(format!("export-{json}.json"));
+            let args = BookmarksArgs {
+                command: BookmarksCommand::Export {
+                    output: Some(output.clone()),
+                    json,
+                    data_dir: Some(dir.path().to_path_buf()),
+                },
+            };
+            let mut stdout = Vec::new();
+            assert_eq!(
+                run_bookmarks_command_to(args.clone(), &mut stdout)?,
+                BOOKMARKS_EXIT_OK
+            );
+            if json {
+                let receipt: serde_json::Value = serde_json::from_slice(&stdout)?;
+                assert_eq!(receipt["count"], 1);
+                assert_eq!(receipt["success"], true);
+            }
+            let bytes = std::fs::read(&output)?;
+            let restored: Vec<Bookmark> = serde_json::from_slice(&bytes)?;
+            assert_eq!(restored[0].title, "Keep me");
+            stdout.clear();
+            assert_eq!(
+                run_bookmarks_command_to(args, &mut stdout)?,
+                BOOKMARKS_EXIT_IO
+            );
+            assert!(stdout.is_empty());
+            assert_eq!(std::fs::read(&output)?, bytes);
+        }
+        Ok(())
     }
 
     #[test]

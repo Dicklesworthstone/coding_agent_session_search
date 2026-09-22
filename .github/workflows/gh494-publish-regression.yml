@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - 'src/indexer/**'
+      - 'src/lib.rs'
+      - 'src/search/inline_repair.rs'
+      - 'src/search/gh494_repair_tests.rs'
+      - 'src/search/semantic_reader/publication/tests.rs'
       - 'src/search/tantivy.rs'
       - 'src/search/quill_bridge.rs'
       - 'tests/gh494_publish_resume.rs'
@@ -16,7 +20,7 @@ on:
   workflow_dispatch:
 
 # The reviewed edit is now on main. This workflow only reads and tests code;
-# it cannot commit, push, or replay the one-time source transformation.
+# it cannot commit, push, or replay a source transformation.
 permissions:
   contents: read
 
@@ -37,6 +41,18 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+      - name: Preserve the exact tracked publication source
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/gh494-results"
+          git rev-parse HEAD > "$RUNNER_TEMP/gh494-results/source-commit.txt"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/gh494-results/publication-source.tar.gz" HEAD AGENTS.md Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo src/indexer src/search src/storage src/lib.rs tests/gh494_publish_resume.rs tests/util .github/workflows/gh494-publish-regression.yml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh494-publication-source-${{ github.sha }}
+          path: ${{ runner.temp }}/gh494-results/
+          if-no-files-found: error
+          retention-days: 7
       - name: Read the repository's dated toolchain
         id: toolchain
         shell: bash
@@ -48,6 +64,7 @@ jobs:
               print(f'name={name}', file=output)
           PY
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        id: rust
         with:
           toolchain: ${{ steps.toolchain.outputs.name }}
           components: rustfmt, clippy
@@ -55,7 +72,6 @@ jobs:
       - name: Record exact source and compiler
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/gh494-results"
           {
             git rev-parse HEAD
             git hash-object src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs tests/gh494_publish_resume.rs
@@ -63,8 +79,10 @@ jobs:
             cargo --version
           } | tee "$RUNNER_TEMP/gh494-results/source-and-compiler.txt"
           rustfmt --edition 2024 --check src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
+          rustfmt --edition 2024 --check src/search/inline_repair.rs src/search/gh494_repair_tests.rs
           rustfmt --edition 2024 --config skip_children=true --check tests/gh494_publish_resume.rs
       - name: Execute the exact diagnostic helper independently of the monolithic test build
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         shell: bash
         run: |
           python3 - <<'PY'
@@ -76,12 +94,15 @@ jobs:
           manifest = '[package]\nname = "gh494-phase-harness"\nversion = "0.0.0"\nedition = "2024"\n[dependencies]\n'
           manifest += ''.join(f'{name} = "={version}"\n' for name, version in deps.items())
           (root / 'Cargo.toml').write_text(manifest)
-          (root / 'src/lib.rs').write_text('mod lexical_publish;\n')
+          (root / 'src/lib.rs').write_text('mod lexical_publish;\nmod inline_repair;\n')
           shutil.copyfile('src/indexer/lexical_publish.rs', root / 'src/lexical_publish.rs')
+          shutil.copyfile('src/search/inline_repair.rs', root / 'src/inline_repair.rs')
           print('Exact diagnostic-helper dependency versions:', deps)
           PY
           cargo test --manifest-path "$RUNNER_TEMP/gh494-phase-harness/Cargo.toml" gh494_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/diagnostics.log"
       - name: Require all three real rebuild regressions to be present
+        id: rebuild-list
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         shell: bash
         run: |
           cargo test --locked --lib gh494_ -- --list 2>&1 | tee "$RUNNER_TEMP/gh494-results/test-list.log"
@@ -93,14 +114,17 @@ jobs:
             grep -F "$name: test" "$RUNNER_TEMP/gh494-results/test-list.log"
           done
       - name: Execute publication refusal, EOF retry, empty archive, and completion validation
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
         shell: bash
         run: |
           cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/rebuild-regressions.log"
       - name: Execute CLI EOF resume and repeated read-only searches
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
         shell: bash
         run: |
           cargo test --locked --test gh494_publish_resume -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/cli-resume-regressions.log"
       - name: Retain hollow-generation and publication rollback coverage
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
         shell: bash
         run: |
           cargo test --locked --lib hollow -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh494-results/hollow.log"

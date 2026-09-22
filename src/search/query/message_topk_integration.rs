@@ -371,9 +371,7 @@ fn adaptive_exact_messages_retrieve_a_large_page_from_chunk_dominated_fsvi() {
     let records = (1..=240_u64)
         .flat_map(|id| {
             let score = 1.0 - id as f32 / 1024.0;
-            (0..=255).map(move |chunk| {
-                (doc(id, chunk, 3), [score, (1.0 - score * score).sqrt()])
-            })
+            (0..=255).map(move |chunk| (doc(id, chunk, 3), [score, (1.0 - score * score).sqrt()]))
         })
         .collect::<Vec<_>>();
     let ctx = context(vec![artifact(&path, &records)]);
@@ -463,4 +461,261 @@ fn adaptive_exact_messages_resolve_large_tie_cohorts_without_source_mutation() {
     );
     assert!(!state.exact_window_may_omit_competitor);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+// These fixtures exercise the shared exact driver, independently of the native
+// ANN delta lane. Reopen after durable append so the owner retains the WAL view.
+fn retained_wal_artifact(
+    path: &Path,
+    main: &[(String, [f32; 2])],
+    updates: &[(String, [f32; 2])],
+) -> SemanticIndexArtifact {
+    drop(artifact(path, main));
+    let original_main = std::fs::read(path).unwrap();
+    if !updates.is_empty() {
+        let mut writer = FsVectorIndex::open_writer(path).unwrap();
+        let updates = updates
+            .iter()
+            .map(|(id, vector)| (id.clone(), vector.to_vec()))
+            .collect::<Vec<_>>();
+        writer.append_batch(&updates).unwrap();
+        assert!(writer.wal_record_count() > 0);
+    }
+    assert_eq!(std::fs::read(path).unwrap(), original_main);
+    SemanticIndexArtifact::open(path, None).unwrap()
+}
+
+fn retained_query_files(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+// Exhaust the retained view before grouping messages. Do not reproduce the
+// driver's candidate-capacity policy as the oracle for that same policy.
+fn exhaustive_retained_messages(
+    ctx: &SemanticCandidateContext,
+    embedding: &[f32],
+    limit: usize,
+    filter: Option<&dyn FsSearchFilter>,
+) -> Vec<(u64, u32)> {
+    let mut best = HashMap::<u64, f32>::new();
+    for artifact in ctx.artifacts.iter() {
+        let index = artifact.index();
+        let count = index
+            .record_count()
+            .saturating_add(index.wal_record_count());
+        for hit in index.search_top_k(embedding, count, filter).unwrap() {
+            let identity = parse_semantic_doc_id(&hit.doc_id).unwrap();
+            best.entry(identity.message_id)
+                .and_modify(|score| {
+                    if hit.score.total_cmp(score).is_gt() {
+                        *score = hit.score;
+                    }
+                })
+                .or_insert(hit.score);
+        }
+    }
+    let mut hits = best.into_iter().collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    hits.truncate(limit.saturating_mul(4));
+    hits.into_iter()
+        .map(|(id, score)| (id, score.to_bits()))
+        .collect()
+}
+
+fn retained_message_scores(hits: &[VectorSearchResult]) -> Vec<(u64, u32)> {
+    hits.iter()
+        .map(|hit| (hit.message_id, hit.score.to_bits()))
+        .collect()
+}
+
+#[test]
+fn wal_growth_beyond_main_extent_keeps_full_exact_page_and_pagination() {
+    let temp = tempfile::tempdir().unwrap();
+    let updates = (2..=65_u64)
+        .map(|id| {
+            let score = 1.0 - id as f32 / 128.0;
+            (doc(id, 0, 3), [score, (1.0 - score * score).sqrt()])
+        })
+        .collect::<Vec<_>>();
+    let ctx = context(vec![retained_wal_artifact(
+        &temp.path().join("wal-growth.fsvi"),
+        &[(doc(1, 0, 3), [-1.0, 0.0])],
+        &updates,
+    )]);
+    assert_eq!(ctx.artifacts[0].index().record_count(), 1);
+    assert_eq!(ctx.artifacts[0].index().wal_record_count(), 64);
+    let before = retained_query_files(temp.path());
+    let (hits, retry) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 2, None).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        (2..=9).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        retained_message_scores(&hits),
+        exhaustive_retained_messages(&ctx, &[1.0, 0.0], 2, None)
+    );
+    assert!(retry.has_more_candidates);
+    assert!(!retry.exact_window_may_omit_competitor);
+    assert_eq!(retained_query_files(temp.path()), before);
+}
+
+#[test]
+fn wal_only_sources_participate_in_single_and_multi_shard_exact_search() {
+    let temp = tempfile::tempdir().unwrap();
+    let wal = retained_wal_artifact(
+        &temp.path().join("wal-only.fsvi"),
+        &[],
+        &[(doc(7, 0, 3), [1.0, 0.0]), (doc(8, 0, 3), [0.8, 0.6])],
+    );
+    assert_eq!(wal.index().record_count(), 0);
+    assert_eq!(wal.index().wal_record_count(), 2);
+    let main = artifact(
+        &temp.path().join("main.fsvi"),
+        &[(doc(1, 0, 3), [0.6, 0.8])],
+    );
+    let before = retained_query_files(temp.path());
+    for (ctx, expected) in [
+        (context(vec![wal.clone()]), vec![7, 8]),
+        (context(vec![main, wal]), vec![7, 8, 1]),
+    ] {
+        let (hits, retry) =
+            SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 3, None).unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!retry.has_more_candidates);
+        assert!(!retry.exact_window_may_omit_competitor);
+    }
+    assert_eq!(retained_query_files(temp.path()), before);
+}
+
+#[test]
+fn wal_chunk_dominance_preserves_session_and_metadata_filters_during_exact_refills() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut updates = (0..=255_u8)
+        .map(|chunk| (doc(2, chunk, 3), [1.0, 0.0]))
+        .collect::<Vec<_>>();
+    updates.extend([
+        (doc(3, 0, 3), [0.8, 0.6]),
+        (doc(4, 0, 4), [0.9, 0.4358899]),
+        (doc(5, 0, 3), [0.9, 0.4358899]),
+        (doc(6, 0, 3), [0.7, 0.71414286]),
+    ]);
+    let ctx = context(vec![retained_wal_artifact(
+        &temp.path().join("chunked-wal.fsvi"),
+        &[(doc(1, 0, 3), [0.6, 0.8])],
+        &updates,
+    )]);
+    let metadata = SemanticFilter {
+        agents: Some(HashSet::from([1])),
+        workspaces: Some(HashSet::from([2])),
+        sources: Some(HashSet::from([3])),
+        roles: Some(HashSet::from([1])),
+        created_from: Some(100),
+        created_to: Some(100),
+    };
+    let membership = HashSet::from([1, 2, 3, 4, 6]);
+    let filter = SessionScopedSemanticFilter {
+        metadata: &metadata,
+        message_ids: &membership,
+    };
+    let before = retained_query_files(temp.path());
+    let (initial, initial_retry) = SearchClient::search_exact_semantic_indexes_initial_window(
+        &ctx,
+        &[1.0, 0.0],
+        3,
+        Some(&filter),
+    )
+    .unwrap();
+    assert_eq!(initial.len(), 1);
+    assert!(initial_retry.exact_window_may_omit_competitor);
+    let (hits, retry) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 3, Some(&filter)).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![2, 3, 6, 1]
+    );
+    assert_eq!(
+        retained_message_scores(&hits),
+        exhaustive_retained_messages(&ctx, &[1.0, 0.0], 3, Some(&filter))
+    );
+    assert!(!retry.exact_window_may_omit_competitor);
+    assert_eq!(retained_query_files(temp.path()), before);
+}
+
+#[test]
+fn exact_merge_reports_global_truncation_even_when_each_shard_is_exhausted() {
+    let temp = tempfile::tempdir().unwrap();
+    let artifacts = (1..=5_u64)
+        .map(|id| {
+            let score = 1.0 - id as f32 / 16.0;
+            artifact(
+                &temp.path().join(format!("exhausted-{id}.fsvi")),
+                &[(doc(id, 0, 3), [score, (1.0 - score * score).sqrt()])],
+            )
+        })
+        .collect();
+    let ctx = context(artifacts);
+    let before = retained_query_files(temp.path());
+    let (initial, initial_retry) =
+        SearchClient::search_exact_semantic_indexes_initial_window(&ctx, &[1.0, 0.0], 1, None)
+            .unwrap();
+    assert!(initial_retry.has_more_candidates);
+    assert!(!initial_retry.exact_window_may_omit_competitor);
+    let (hits, retry) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 1, None).unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(ranked(&hits), ranked(&initial));
+    assert!(retry.has_more_candidates);
+    assert_eq!(retained_query_files(temp.path()), before);
+}
+
+#[test]
+fn wal_exact_large_requests_preserve_all_live_messages_not_raw_replacements() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = context(vec![retained_wal_artifact(
+        &temp.path().join("complete-view.fsvi"),
+        &[(doc(1, 0, 3), [1.0, 0.0])],
+        &[
+            (doc(1, 0, 3), [0.0, 1.0]),
+            (doc(2, 0, 3), [0.9, 0.4358899]),
+            (doc(3, 0, 3), [0.8, 0.6]),
+            (doc(4, 0, 3), [0.6, 0.8]),
+        ],
+    )]);
+    let before = retained_query_files(temp.path());
+    for limit in [8, usize::MAX] {
+        let (hits, retry) =
+            SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], limit, None).unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+            vec![2, 3, 4, 1]
+        );
+        assert_eq!(hits.last().unwrap().score, 0.0);
+        assert!(!retry.has_more_candidates);
+        assert_eq!(
+            retained_message_scores(&hits),
+            exhaustive_retained_messages(&ctx, &[1.0, 0.0], limit, None)
+        );
+    }
+    assert_eq!(retained_query_files(temp.path()), before);
 }

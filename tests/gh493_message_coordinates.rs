@@ -973,3 +973,74 @@ fn shared_path_search_hits_round_trip_in_every_robot_projection() {
     assert_eq!(std::fs::read(&fixture.db).unwrap(), db_before);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), source_before);
 }
+
+#[test]
+fn corrected_robot_failures_are_one_error_envelope_and_success_still_teaches() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    let formats: &[&[&str]] = &[
+        &["--json"],
+        &["--robot"],
+        &["--robot-format", "json"],
+        &["--robot-format", "compact"],
+        &["--robot-format", "jsonl"],
+        &["--format=json"],
+        &[], // Environment-selected structured output follows the same contract.
+    ];
+    for subcommand in ["view", "expand"] {
+        for flags in formats {
+            let mut command = fixture.command(subcommand);
+            command
+                .arg(format!("source_path={}", fixture.path.display()))
+                .args([
+                    "source_id=local",
+                    "conversation_id=999999",
+                    "line_number=8",
+                    "context=0",
+                ])
+                .args(*flags);
+            if flags.is_empty() {
+                command.env("CASS_OUTPUT_FORMAT", "json");
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty(), "failed recovery emitted a target");
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|err| {
+                panic!(
+                    "{subcommand} {flags:?}: {err}; stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            assert_eq!(error["error"]["kind"], "indexed-session-required");
+            assert_eq!(error["error"]["retryable"], false);
+            assert!(
+                error["error"]["hint"]
+                    .as_str()
+                    .is_some_and(|hint| hint.contains("same search hit"))
+            );
+        }
+        let output = fixture
+            .command(subcommand)
+            .arg(format!("source_path={}", fixture.path.display()))
+            .args(["source_id=local", "line_number=8", "context=0", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("note: auto-corrected:"),
+            "successful robot recovery still teaches the canonical syntax"
+        );
+        assert_target(&decode(output), subcommand, 8, fixture.conversation_id);
+
+        let human = fixture
+            .command(subcommand)
+            .arg(format!("source_path={}", fixture.path.display()))
+            .args(["line_number=8", "conversation_id=999999", "context=0"])
+            .output()
+            .unwrap();
+        assert!(!human.status.success());
+        assert!(
+            String::from_utf8_lossy(&human.stderr)
+                .contains("Note: Your command was auto-corrected:"),
+            "human diagnostics must retain their teaching note"
+        );
+    }
+}

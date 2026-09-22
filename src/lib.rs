@@ -7000,13 +7000,12 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         .flatten()
         .collect();
 
-    // Teaching notes go to stderr for humans AND robots: README promises that
-    // agents learn the canonical syntax from a stderr note, and stdout stays
-    // data-only in robot mode so the note can never corrupt a JSON payload.
-    // Only the robot-docs/--robot-help surfaces stay quiet, because their
-    // stderr is part of the documented docs stream.
-    if !all_notes.is_empty() && !is_doc_mode {
-        emit_correction_notes(&all_notes, is_robot_mode);
+    // Human teaching notes can precede execution. For robots, defer notes
+    // until success: on failure stderr must remain one structured error
+    // envelope, not plaintext followed by JSON. Successful recovery retains
+    // its documented teaching note without contaminating stdout.
+    if !all_notes.is_empty() && !is_doc_mode && !is_robot_mode {
+        emit_correction_notes(&all_notes, false);
     }
 
     let result = execute_cli(
@@ -7017,6 +7016,10 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         stderr_is_tty,
     )
     .await;
+
+    if result.is_ok() && !all_notes.is_empty() && !is_doc_mode && is_robot_mode {
+        emit_correction_notes(&all_notes, true);
+    }
 
     if let Some(path) = &cli.trace_file {
         let duration_ms = start_instant.elapsed().as_millis();
@@ -7101,8 +7104,8 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         .flatten()
         .collect();
 
-    if !all_notes.is_empty() {
-        emit_correction_notes(&all_notes, is_robot_mode);
+    if !all_notes.is_empty() && !is_robot_mode {
+        emit_correction_notes(&all_notes, false);
     }
 
     let result = match command.expect("fast command was matched above") {
@@ -7129,6 +7132,10 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         }
         _ => unreachable!("non-fast command passed the fast-command guard"),
     };
+
+    if result.is_ok() && !all_notes.is_empty() && is_robot_mode {
+        emit_correction_notes(&all_notes, true);
+    }
 
     if let Some(path) = &cli.trace_file {
         let duration_ms = start_instant.elapsed().as_millis();
@@ -27968,6 +27975,83 @@ fn repair_lexical_index_for_search_with_stall_watchdog(
     })?
 }
 
+// A lock race does not make the generation observed before the race safe.
+// Reuse only a freshly diagnosed readable generation, including intentionally
+// stale-but-readable ones; missing, foreign and incomplete generations cannot
+// become usable merely because another indexer acquired the lock.
+fn search_existing_lexical_generation_is_usable(
+    index_path: &Path,
+    db_path: &Path,
+) -> CliResult<bool> {
+    if !crate::search::tantivy::searchable_index_exists(index_path) {
+        return Ok(false);
+    }
+    Ok(
+        search_lexical_self_heal_diagnosis(index_path, db_path)?
+            .as_ref()
+            .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild()),
+    )
+}
+
+fn admit_search_lexical_repair(db_path: &Path, reason: &str) -> CliResult<()> {
+    crate::search::inline_repair::admit(
+        db_path,
+        crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes(),
+    )
+    .map(|_| ())
+    .map_err(|error| CliError {
+        code: 5,
+        kind: "maintenance-required",
+        message: format!(
+            "Automatic lexical repair was not started after detecting {reason}: {error:#}"
+        ),
+        hint: Some(
+            "Run `cass index --full --json` with the same --db and --data-dir as this search. \
+             Explicit full indexing is not subject to the search repair budget."
+                .to_owned(),
+        ),
+        retryable: true,
+    })
+}
+
+fn verify_search_lexical_repair_publication(
+    index_path: &Path,
+    db_path: &Path,
+    indexed_docs: usize,
+) -> anyhow::Result<()> {
+    let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(index_path)?.ok_or_else(|| {
+        anyhow::anyhow!("lexical repair returned success without a published checkpoint")
+    })?;
+    anyhow::ensure!(
+        checkpoint.completed,
+        "lexical repair returned success but publication is incomplete"
+    );
+    anyhow::ensure!(
+        checkpoint.indexed_docs == indexed_docs,
+        "lexical repair returned success with inconsistent publication counts \
+         (repaired_docs={indexed_docs}, checkpoint_docs={})",
+        checkpoint.indexed_docs
+    );
+    let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path).map_err(|error| {
+        anyhow::anyhow!("cannot verify repaired lexical publication: {}", error.message)
+    })?;
+    if let Some(diagnosis) = diagnosis {
+        // A concurrent canonical append may make a completed, readable
+        // publication stale. That is allowed; an incomplete/foreign/schema-
+        // incompatible generation is not. The checkpoint above is mandatory.
+        anyhow::ensure!(
+            diagnosis.existing_index_search_allowed,
+            "lexical repair returned success but its publication is unusable: {}",
+            diagnosis.reason
+        );
+    }
+    crate::indexer::verify_published_lexical_doc_count(
+        index_path,
+        indexed_docs,
+        "search repair completion",
+    )
+}
+
 fn ensure_lexical_assets_for_search(
     data_dir: &Path,
     db_path: &Path,
@@ -28021,6 +28105,13 @@ fn ensure_lexical_assets_for_search(
         return Ok(SearchLexicalSelfHeal::skipped());
     };
     let reason = diagnosis.reason;
+
+    // Admit maintenance before even trying a checkpoint refresh: refreshing an
+    // incomplete archive can reopen SQLite and perform substantial work. A
+    // readable stale generation still takes the existing fail-open path below.
+    if !diagnosis.existing_index_search_allowed {
+        admit_search_lexical_repair(db_path, &reason)?;
+    }
 
     if initial_index_exists && diagnosis.checkpoint_refresh_allowed {
         match crate::indexer::refresh_completed_lexical_rebuild_checkpoint_from_live_index(
@@ -28125,7 +28216,7 @@ fn ensure_lexical_assets_for_search(
                     anyhow::anyhow!(rendered),
                 ));
             }
-            if initial_index_exists {
+            if search_existing_lexical_generation_is_usable(index_path, db_path)? {
                 return Ok(SearchLexicalSelfHeal {
                     action: "concurrent-repair-searching-existing-index",
                     reason: Some(reason),
@@ -28139,7 +28230,10 @@ fn ensure_lexical_assets_for_search(
                 index_path,
                 search_active_rebuild_wait_duration(timeout_ms, started_at),
             );
-            if waited && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+            if !waited {
+                return Err(search_lock_busy_error(data_dir));
+            }
+            if search_existing_lexical_generation_is_usable(index_path, db_path)? {
                 return Ok(SearchLexicalSelfHeal {
                     action: "waited-for-concurrent-lexical-repair",
                     reason: Some(reason),
@@ -28147,10 +28241,16 @@ fn ensure_lexical_assets_for_search(
                 });
             }
 
+            // The database or WAL can grow while the other indexer holds the
+            // lock. A prior admission is not a permit for an unbounded retry.
+            admit_search_lexical_repair(db_path, &reason)?;
             repair_lexical_index_for_search_with_stall_watchdog(db_path, data_dir)
                 .map_err(|retry_err| search_lexical_repair_failed_error(&reason, retry_err))?
         }
     };
+
+    verify_search_lexical_repair_publication(index_path, db_path, repair.indexed_docs)
+        .map_err(|error| search_lexical_repair_failed_error(&reason, error))?;
 
     Ok(SearchLexicalSelfHeal {
         action: "rebuilt-from-canonical-db",
@@ -28161,6 +28261,8 @@ fn ensure_lexical_assets_for_search(
 
 #[cfg(test)]
 mod search_lexical_self_heal_tests {
+    include!("search/gh494_repair_tests.rs");
+
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};

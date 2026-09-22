@@ -165,7 +165,10 @@ fn assert_certified_and_searches_are_read_only(home: &Path, data_dir: &Path, ind
                 .contains("rebuilding from canonical database before running query"),
             "search must not enter inline rebuild"
         );
-        assert_eq!(std::fs::read(index.join("MANIFEST")).unwrap(), manifest_before);
+        assert_eq!(
+            std::fs::read(index.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
         assert_eq!(
             std::fs::read(index.join(CHECKPOINT)).unwrap(),
             checkpoint_before
@@ -196,5 +199,185 @@ fn gh494_live_eof_checkpoint_finishes_certification_instead_of_returning_early()
     let (tmp, data_dir, index) = fixture();
     plant_eof_checkpoint(&index);
     assert_index_success(&full_index(tmp.path(), &data_dir));
+    assert_certified_and_searches_are_read_only(tmp.path(), &data_dir, &index);
+}
+
+#[test]
+fn gh494_search_budget_refuses_inline_work_but_explicit_full_index_recovers() {
+    let (tmp, data_dir, index) = fixture();
+    plant_eof_checkpoint(&index);
+    let checkpoint_before = std::fs::read(index.join(CHECKPOINT)).unwrap();
+    let generation_before = std::fs::read(index.join(GENERATION)).unwrap();
+    let manifest_before = std::fs::read(index.join("MANIFEST")).unwrap();
+    for robot in [false, true] {
+        let mut command = cass(tmp.path());
+        command
+            .env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "0",
+            )
+            .timeout(Duration::from_secs(30))
+            .args(["search", PROBE, "--mode", "lexical", "--data-dir"])
+            .arg(&data_dir);
+        if robot {
+            command.arg("--json");
+        }
+        let output = command.output().expect("bounded search refusal");
+        assert!(!output.status.success(), "a refused repair cannot succeed");
+        let rendered = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for expected in ["was not started", "archive_bytes=", "maximum_bytes=0"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("rebuilding from canonical database before running query"),
+            "refusal must precede inline rebuild: {rendered}"
+        );
+        assert_eq!(
+            std::fs::read(index.join(CHECKPOINT)).unwrap(),
+            checkpoint_before
+        );
+        assert_eq!(
+            std::fs::read(index.join(GENERATION)).unwrap(),
+            generation_before
+        );
+        assert_eq!(
+            std::fs::read(index.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
+    }
+    let output = cass(tmp.path())
+        .env(
+            "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+            "0",
+        )
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("explicit full indexing remains available");
+    assert_index_success(&output);
+    assert_certified_and_searches_are_read_only(tmp.path(), &data_dir, &index);
+}
+
+#[test]
+fn gh494_readable_generation_remains_searchable_with_a_zero_repair_budget() {
+    let (tmp, data_dir, index) = fixture();
+    let checkpoint_before = std::fs::read(index.join(CHECKPOINT)).unwrap();
+    let generation_before = std::fs::read(index.join(GENERATION)).unwrap();
+    for _ in 0..2 {
+        let output = cass(tmp.path())
+            .env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "0",
+            )
+            .args([
+                "search",
+                PROBE,
+                "--json",
+                "--mode",
+                "lexical",
+                "--limit",
+                "100",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .expect("query a readable generation without maintenance");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["hits"].as_array().unwrap().len(), SESSIONS * 2);
+        assert_eq!(
+            std::fs::read(index.join(CHECKPOINT)).unwrap(),
+            checkpoint_before
+        );
+        assert_eq!(
+            std::fs::read(index.join(GENERATION)).unwrap(),
+            generation_before
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn gh494_killed_after_atomic_swap_remains_searchable_without_inline_rebuild() {
+    use std::fs::File;
+    use std::process::{Child, Stdio};
+    use std::time::Instant;
+
+    // A failed assertion must not strand the deliberately parked indexer.
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let (tmp, data_dir, index) = fixture();
+    let staged = stage_published_index(&index);
+    plant_eof_checkpoint(&index);
+    let sentinel = tmp.path().join("swap-committed.json");
+    let log_path = tmp.path().join("killed-indexer.log");
+    let stdout = File::create(&log_path).unwrap();
+    let stderr = stdout.try_clone().unwrap();
+    // Use the existing production crash-window seam, not a fabricated
+    // checkpoint: the child parks after the real exchange and sidecar park.
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(tmp.path())
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("HOME", tmp.path())
+        .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+        .env("CODEX_HOME", tmp.path().join(".codex"))
+        .env(
+            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
+            &sentinel,
+        )
+        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "120000")
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .unwrap();
+    let mut child = KillOnDrop(child);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !sentinel.is_file() {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!(
+                "indexer exited before the atomic-swap crash window: {status}\n{}",
+                std::fs::read_to_string(&log_path).unwrap()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "indexer did not reach the atomic-swap crash window\n{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let receipt = read_json(&sentinel);
+    assert_eq!(receipt["stage"], "linux_swap_committed_prior_live_parked");
+    assert_eq!(receipt["pid"], child.0.id());
+    assert!(!staged.exists());
+    assert!(index.join("gh494-candidate-marker").is_file());
+
+    // Kill before publish_staged_lexical_index returns to its caller. No
+    // post-publish checkpoint write or destructor can rescue the fixture.
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
     assert_certified_and_searches_are_read_only(tmp.path(), &data_dir, &index);
 }

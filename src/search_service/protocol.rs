@@ -34,6 +34,15 @@ pub(super) struct Filters {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
+    View {
+        id: u64,
+        source_path: String,
+        source_id: String,
+        conversation_id: i64,
+        message_index: u64,
+        #[serde(default)]
+        context: usize,
+    },
     Search {
         id: u64,
         query: String,
@@ -178,7 +187,9 @@ impl Write for LimitedBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         // Reserve one byte for the line terminator, including escaped JSON bytes.
         if bytes.len() > (MAX_RESPONSE_BYTES - 1) - self.0.len() {
-            return Err(io::Error::other("search service response exceeds its byte limit"));
+            return Err(io::Error::other(
+                "search service response exceeds its byte limit",
+            ));
         }
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
