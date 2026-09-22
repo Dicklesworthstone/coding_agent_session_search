@@ -1,13 +1,147 @@
 name: GH493 canonical anchor candidate
 
-# The reviewed candidate is now production code. Keep this manual entry point
-# as a read-only alias for the permanent regression suite, not a blob publisher.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh493-coordinate-candidate.yml
 
 permissions:
   contents: read
 
 jobs:
-  verify:
-    uses: ./.github/workflows/message-coordinate-regression.yml
+  prepare:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+        with:
+          shared-key: gh493-identity
+          cache-on-failure: true
+      - name: Admit the exact manually reviewed patch
+        id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          inputs = {
+              'docs/planning/ANSWER_PACKS_CONTRACT.md': '80365f0fb6a5d264df883795af25856262330c8d',
+              'src/search/pack_planner.rs': '79ef01262315e24eae0cd8c11ef3e9af1f931d08',
+              'src/search/query/ann_shards/execution.rs': '010ca2b7eabd9f2b4b28b4ffbc6401a75ed4686f',
+              'tests/gh493_message_coordinates.rs': '8f77251c4ec172fc471050e6b759c5ada8720612',
+          }
+          outputs = {
+              'docs/planning/ANSWER_PACKS_CONTRACT.md': 'a510cbf651328e90cba6c69fae8eaac85bcd3e3f',
+              'src/search/pack_planner.rs': 'ce87c5a4abbeb79b9836afb9d42e0299e6d9f98f',
+              'src/search/query/ann_shards/execution.rs': '2b6290aafc6bfec5899d472b59518798291850b1',
+              'tests/gh493_message_coordinates.rs': 'bca33523413cef0aa3b7d3046cc30e0c867a870b',
+          }
+          for path, sha in inputs.items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          sha = '3b8a42c80270764830d6b283086a0c028ac61921'
+          request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'cass-candidate-review'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              blob = json.load(response)
+          assert blob['encoding'] == 'base64'
+          patch = base64.b64decode(blob['content'])
+          assert hashlib.sha1(b'blob ' + str(len(patch)).encode() + b'\0' + patch).hexdigest() == sha
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          for path, sha in outputs.items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          pathlib.Path('candidate').mkdir()
+          pathlib.Path('candidate/input-blobs.json').write_text(json.dumps(inputs, indent=2))
+          PY
+      - name: Format only the reviewed changed sources
+        id: format
+        run: |
+          rustfmt --edition 2024 --config skip_children=true src/search/pack_planner.rs src/search/query/ann_shards/execution.rs tests/gh493_message_coordinates.rs
+          git diff --check
+      - name: Publish reviewed source blobs only, never commits or refs
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess, urllib.request
+          inputs = json.loads(pathlib.Path('candidate/input-blobs.json').read_text())
+          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == set(inputs)
+          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': inputs, 'candidate_blobs': {}}
+          for path in inputs:
+              request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', data=json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'cass-candidate-review'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  sha = json.load(response)['sha']
+              assert sha == subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              manifest['candidate_blobs'][path] = sha
+              destination = pathlib.Path('candidate') / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, destination)
+          pathlib.Path('candidate/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff']))
+          print(json.dumps(manifest, indent=2))
+          PY
+          git rev-parse HEAD > candidate/source-commit.txt
+          rustc --version > candidate/compiler.txt
+          sha256sum Cargo.lock > candidate/lockfile.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pack-verified-span-candidate
+          path: candidate/
+          retention-days: 1
+          if-no-files-found: error
+      - name: Canonical, physical, pack and deadline regressions
+        id: regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-fail-fast --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget --test lexical_reconcile_canary --test golden_robot_pack --test spec_field_mask_contract -- --nocapture 2>&1 | tee candidate/regressions.log
+      - name: Native planner and physical citation unit tests
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib search::pack_planner::tests -- --nocapture 2>&1 | tee candidate/planner-unit.log
+      - name: Preserve pack aliases and real archive handoff
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test cli_robot pack -- --nocapture 2>&1 | tee candidate/pack-cli.log
+          cargo test --locked --test e2e_cli_flows pack_handoff_journey_uses_real_archive_and_preserves_sources -- --exact --nocapture 2>&1 | tee candidate/archive-handoff.log
+          grep -F 'test result: ok. 1 passed;' candidate/archive-handoff.log
+      - name: Strict native production and regression lint
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test lexical_reconcile_canary -- -D warnings 2>&1 | tee candidate/clippy.log
+      - name: Retain all completed qualification evidence
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pack-verified-span-validation
+          path: candidate/
+          retention-days: 1
+          if-no-files-found: error
