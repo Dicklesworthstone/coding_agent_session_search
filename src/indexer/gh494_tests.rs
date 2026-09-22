@@ -1,6 +1,201 @@
 // Included by indexer::tests; exercises the production rebuild and real
 // filesystem fault seam, not a model of the state machine.
 
+fn gh494_restart_damaged_candidate(damage: &str) {
+    #[cfg(windows)]
+    const DISK_FULL: i32 = 112;
+    #[cfg(not(windows))]
+    const DISK_FULL: i32 = libc::ENOSPC;
+
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("db.sqlite");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    ensure_fts_schema(&storage);
+    seed_lexical_rebuild_fixture(&storage);
+    drop(storage);
+    rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    let index_path = index_dir(&data_dir).unwrap();
+    let old_live_manifest = fs::read(index_path.join("MANIFEST")).unwrap();
+    let mut checkpoint = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert_eq!(checkpoint.indexed_docs, 4);
+    assert_eq!(checkpoint.processed_conversations, 2);
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    fs::create_dir(&scratch).unwrap();
+    if damage == "short-prefix" {
+        let mut empty = TantivyIndex::open_or_create(&scratch).unwrap();
+        empty.commit().unwrap();
+        drop(empty);
+    } else {
+        for entry in walkdir::WalkDir::new(&index_path).min_depth(1) {
+            let entry = entry.unwrap();
+            let target = scratch.join(entry.path().strip_prefix(&index_path).unwrap());
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(target).unwrap();
+            } else {
+                assert!(entry.file_type().is_file());
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    match damage {
+        "corrupt-manifest" => {
+            fs::write(scratch.join("MANIFEST"), b"invalid quill manifest").unwrap();
+        }
+        "missing-manifest" => {
+            fs::rename(
+                scratch.join("MANIFEST"),
+                scratch.join("MANIFEST.before-loss"),
+            )
+            .unwrap();
+        }
+        "schema-mismatch" => {
+            fs::write(
+                scratch.join("schema_hash.json"),
+                b"old incompatible contract",
+            )
+            .unwrap();
+        }
+        "short-prefix" => {}
+        other => panic!("unknown damage fixture: {other}"),
+    }
+    fs::write(scratch.join("failure-evidence"), damage).unwrap();
+    let evidence_before: BTreeMap<_, _> = walkdir::WalkDir::new(&scratch)
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            (
+                entry.path().strip_prefix(&scratch).unwrap().to_path_buf(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    checkpoint.completed = false;
+    checkpoint.pending = None;
+    persist_lexical_rebuild_state(&index_path, &checkpoint).unwrap();
+
+    // Stop at the real swap after recovery, so we can inspect BOTH the preserved
+    // prior live publication and the newly rebuilt, certified candidate.
+    #[cfg(target_os = "linux")]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+        DISK_FULL,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+        DISK_FULL,
+    );
+    let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
+        .err()
+        .expect("real swap fault must be reached after a complete replay");
+    drop(fault);
+    assert!(
+        error.to_string().contains("publish_staged_generation"),
+        "{error:#}"
+    );
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(DISK_FULL)
+    );
+    assert_eq!(
+        fs::read(index_path.join("MANIFEST")).unwrap(),
+        old_live_manifest
+    );
+    let candidate = load_lexical_rebuild_state(&scratch).unwrap().unwrap();
+    assert!(candidate.completed);
+    assert_eq!(
+        candidate.processed_conversations, 2,
+        "old counters must not survive reset"
+    );
+    assert_eq!(
+        candidate.indexed_docs, 4,
+        "replayed docs must not be double-counted"
+    );
+    verify_published_lexical_doc_count(&scratch, 4, "gh494 restarted candidate").unwrap();
+
+    let quarantines: Vec<_> = fs::read_dir(index_path.parent().unwrap())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lexical-rebuild-quarantine-")
+        })
+        .collect();
+    assert_eq!(
+        quarantines.len(),
+        1,
+        "exactly the failed candidate must be retained"
+    );
+    let quarantine = quarantines[0].path();
+    for (path, before) in evidence_before {
+        assert_eq!(
+            fs::read(quarantine.join("index").join(path)).unwrap(),
+            before
+        );
+    }
+    assert_eq!(
+        load_lexical_rebuild_state(&quarantine).unwrap().unwrap(),
+        checkpoint
+    );
+    // Even an old quarantine must never be classified as disposable staging.
+    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(
+        &data_dir,
+        SystemTime::now() + Duration::from_secs(86_400),
+    );
+    assert!(quarantine.join("index/failure-evidence").is_file());
+
+    let resumed = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    assert_eq!(resumed.observed_conversations, 2);
+    assert_eq!(resumed.observed_messages, Some(4));
+    assert_eq!(resumed.indexed_docs, 4);
+    let completed = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert!(completed.completed);
+    assert_eq!(completed.processed_conversations, 2);
+    verify_published_lexical_doc_count(&index_path, 4, "gh494 recovered publication").unwrap();
+    let generation = fs::read(index_path.join("lexical-generation-manifest.json")).unwrap();
+    assert!(
+        !rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
+            .unwrap()
+            .exact_checkpoint_persisted
+    );
+    assert_eq!(
+        fs::read(index_path.join("lexical-generation-manifest.json")).unwrap(),
+        generation
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_corrupt_candidate_restarts_with_zero_counters_and_retains_evidence() {
+    gh494_restart_damaged_candidate("corrupt-manifest");
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_missing_candidate_manifest_replays_the_committed_prefix() {
+    gh494_restart_damaged_candidate("missing-manifest");
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_candidate_schema_mismatch_is_quarantined_before_writer_open() {
+    gh494_restart_damaged_candidate("schema-mismatch");
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_readable_but_short_candidate_cannot_reuse_the_eof_cursor() {
+    gh494_restart_damaged_candidate("short-prefix");
+}
+
 #[test]
 #[serial_test::serial]
 fn gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success() {

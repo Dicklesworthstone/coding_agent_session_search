@@ -24490,8 +24490,7 @@ fn rebuild_tantivy_from_db_with_options(
             "lexical rebuild cursor reached EOF but publication is incomplete; resuming finalization"
         );
     }
-    let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
-    let restart_from_zero =
+    let mut restart_from_zero =
         rebuild_state.processed_conversations == 0 && rebuild_state.pending.is_none();
 
     // Plan staged shards BEFORE deciding whether to pre-wipe the live index.
@@ -24544,7 +24543,7 @@ fn rebuild_tantivy_from_db_with_options(
     // rebuild restart from zero — the exact failure #380 reports.
     let scratch_path = staged_lexical_rebuild_scratch_path(&index_path);
     let scratch_exists = scratch_path.is_dir();
-    let staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
+    let mut staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
         // Fresh staged build: discard any scratch left by an abandoned run.
         if let Err(err) = fs::remove_dir_all(&scratch_path)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -24584,7 +24583,7 @@ fn rebuild_tantivy_from_db_with_options(
     };
     // Where the index CONTENT is built. Equals the live path for an ordinary
     // in-place incremental run; the scratch path for a staged full rebuild.
-    let build_path = staged_build_path
+    let mut build_path = staged_build_path
         .clone()
         .unwrap_or_else(|| index_path.clone());
     if restart_from_zero && will_use_atomic_staged_publish {
@@ -24600,6 +24599,60 @@ fn rebuild_tantivy_from_db_with_options(
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
     }
 
+    // GH #494: a saved cursor is only usable while its committed prefix still
+    // exists. Check BEFORE open_or_create: a missing MANIFEST creates an empty
+    // writer, and a schema mismatch can wipe the candidate. Neither may keep
+    // the old counters/cursor. Do this before constructing producer/controller
+    // state so a restart uses one coherent zero-based pipeline, not a new
+    // checkpoint with the previous run's accounting still captured in locals.
+    if !restart_from_zero && !will_use_atomic_staged_publish {
+        let resume_check = (|| -> Result<()> {
+            crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
+            let live_docs = crate::search::tantivy::searchable_index_live_doc_count(&build_path)
+                .context("resumed lexical candidate has no observable document count")?;
+            anyhow::ensure!(
+                u128::from(live_docs) >= rebuild_state.indexed_docs as u128,
+                "resumed lexical candidate contains {live_docs} documents, but its checkpoint \
+                 requires {} committed documents",
+                rebuild_state.indexed_docs
+            );
+            Ok(())
+        })();
+        if let Err(error) = resume_check {
+            let cause = format!("{error:#}");
+            if staged_build_path.is_some() {
+                let quarantine = lexical_publish::quarantine_incomplete_candidate(&build_path)
+                    .with_context(|| format!("cannot retain unusable lexical candidate: {cause}"))?;
+                // Keep the exact cursor/accounting that could no longer be
+                // resumed alongside the untouched failed candidate files.
+                persist_lexical_rebuild_state(&quarantine, &rebuild_state)?;
+                tracing::warn!(
+                    error = %cause,
+                    quarantine_path = %quarantine.display(),
+                    "retained unusable staged lexical candidate; restarting canonical replay"
+                );
+            } else {
+                // An older checkpoint can refer to in-place work, or staging
+                // can have disappeared. Never wipe or move the prior live tree
+                // just to restart: build its replacement off-live instead.
+                tracing::warn!(
+                    error = %cause,
+                    index_path = %index_path.display(),
+                    "lexical resume prefix is unusable; preserving live tree and restarting off-live"
+                );
+            }
+            fs::create_dir(&scratch_path).with_context(|| {
+                format!("creating replacement lexical candidate {}", scratch_path.display())
+            })?;
+            build_path = scratch_path.clone();
+            staged_build_path = Some(scratch_path.clone());
+            rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+            restart_from_zero = true;
+        }
+        log_prep_step("validate_resume_prefix", &mut prep_step_started);
+    }
+
+    let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
     log_prep_step("restart_from_zero_reset", &mut prep_step_started);
     let batch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);
     let initial_batch_conversation_limit =
@@ -24788,35 +24841,12 @@ fn rebuild_tantivy_from_db_with_options(
     }
 
     let mut t_index = match (|| -> Result<TantivyIndex> {
-        let mut t_index = match TantivyIndex::open_or_create(&build_path) {
-            Ok(index) => index,
-            Err(err)
-                if rebuild_state.processed_conversations > 0 || rebuild_state.pending.is_some() =>
-            {
-                tracing::warn!(
-                    path = %index_path.display(),
-                    error = %err,
-                    "partial lexical index could not be reopened; restarting lexical rebuild from zero"
-                );
-                if let Err(remove_err) = fs::remove_dir_all(&build_path)
-                    && remove_err.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(remove_err).with_context(|| {
-                        format!("removing unreadable index {}", index_path.display())
-                    });
-                }
-                fs::create_dir_all(&build_path).with_context(|| {
-                    format!(
-                        "recreating lexical index directory after open failure {}",
-                        index_path.display()
-                    )
-                })?;
-                rebuild_state =
-                    LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-                TantivyIndex::open_or_create(&build_path)?
-            }
-            Err(err) => return Err(err),
-        };
+        // A remaining writer-open error (locks, permissions, or a race after
+        // preflight) is not permission to erase the candidate. Leave it and its
+        // checkpoint intact; a retry revalidates before initializing counters.
+        let mut t_index = TantivyIndex::open_or_create(&build_path).with_context(|| {
+            format!("opening lexical rebuild writer {}; candidate retained", build_path.display())
+        })?;
         log_prep_step("open_tantivy", &mut prep_step_started);
 
         // GH #446: the sink side of the pipeline (accumulate / commit /

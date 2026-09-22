@@ -1,34 +1,59 @@
-name: Prepare reviewed candidate recovery
+name: Lexical publication regression
 
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/gh494-publish-regression.yml']
+    paths:
+      - 'src/indexer/**'
+      - 'src/lib.rs'
+      - 'src/search/inline_repair.rs'
+      - 'src/search/gh494_repair_tests.rs'
+      - 'src/search/semantic_reader/publication/tests.rs'
+      - 'src/search/tantivy.rs'
+      - 'src/search/quill_bridge.rs'
+      - 'tests/gh494_publish_resume.rs'
+      - 'tests/util/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/gh494-publish-regression.yml'
+  workflow_dispatch:
 
-# One hash-bound manual patch set. Only immutable blobs are stored here;
-# the reviewed source commit restores the read-only regression workflow.
+# The reviewed edit is now on main. This workflow only reads and tests code;
+# it cannot commit, push, or replay a source transformation.
 permissions:
   contents: read
 
 concurrency:
-  group: gh494-candidate-restart-preparation
-  cancel-in-progress: false
+  group: gh494-regressions-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  prepare:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
+  publication-regressions:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
+    timeout-minutes: 60
     env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
       RUST_MIN_STACK: '134217728'
-      CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
-      - name: Read pinned toolchain
+      - name: Preserve the exact tracked publication source
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/gh494-results"
+          git rev-parse HEAD > "$RUNNER_TEMP/gh494-results/source-commit.txt"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/gh494-results/publication-source.tar.gz" HEAD AGENTS.md Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo src/indexer src/search src/storage src/lib.rs tests/gh494_publish_resume.rs tests/util .github/workflows/gh494-publish-regression.yml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh494-publication-source-${{ github.sha }}
+          path: ${{ runner.temp }}/gh494-results/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Read the repository's dated toolchain
         id: toolchain
         shell: bash
         run: |
@@ -39,82 +64,76 @@ jobs:
               print(f'name={name}', file=output)
           PY
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        id: rust
         with:
           toolchain: ${{ steps.toolchain.outputs.name }}
           components: rustfmt, clippy
-      - name: Apply only the reviewed recovery patches
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Record exact source and compiler
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/gh494-restart-prepared"
-          test "$(git hash-object src/indexer/mod.rs)" = 7c344d32ce77c2a6117d6240fa57eca41fd021e6
-          test "$(git hash-object src/indexer/lexical_publish.rs)" = c7e6aeb6db760e88b1aa08875162745fbdb51f4b
-          test "$(git hash-object src/indexer/gh494_tests.rs)" = aa0feb9e92c188fe166ed248e71202f238d9d7a5
-          for sha in f684a3deed600d5b5c6433743da116a6b3cb2f7a 10fb30d69d0cf03f901d461d06210db72a38b890 ac93c9e39a7e56baeeb763682b4ec0c194bfacb2; do
-            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$sha" --jq .content | base64 --decode > "$RUNNER_TEMP/$sha.patch"
-            test "$(git hash-object "$RUNNER_TEMP/$sha.patch")" = "$sha"
-            git apply --check --whitespace=error "$RUNNER_TEMP/$sha.patch"
-            git apply --whitespace=error "$RUNNER_TEMP/$sha.patch"
-          done
-          rustfmt --edition 2024 --config skip_children=true src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
-          rustfmt --edition 2024 --config skip_children=true --check src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/indexer.parsed.rs"
-          git diff --check
-          printf '%s\n' src/indexer/gh494_tests.rs src/indexer/lexical_publish.rs src/indexer/mod.rs > "$RUNNER_TEMP/expected-paths"
-          git diff --name-only | sort | diff - "$RUNNER_TEMP/expected-paths"
-          git diff --binary > "$RUNNER_TEMP/gh494-restart-prepared/reviewed.patch"
-          { git rev-parse HEAD; rustc --version --verbose; cargo --version; } > "$RUNNER_TEMP/gh494-restart-prepared/source-and-compiler.txt"
-          echo 'STAGE=reviewed-recovery-patches-and-parse EXIT=0'
-      - name: Execute the exact quarantine, diagnostic and admission helpers
+          {
+            git rev-parse HEAD
+            git hash-object src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs tests/gh494_publish_resume.rs
+            rustc --version --verbose
+            cargo --version
+          } | tee "$RUNNER_TEMP/gh494-results/source-and-compiler.txt"
+          rustfmt --edition 2024 --check src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
+          rustfmt --edition 2024 --check src/search/inline_repair.rs src/search/gh494_repair_tests.rs
+          rustfmt --edition 2024 --config skip_children=true --check tests/gh494_publish_resume.rs
+      - name: Execute the exact diagnostic helper independently of the monolithic test build
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         shell: bash
         run: |
           python3 - <<'PY'
           import os, pathlib, shutil, tomllib
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gh494-restart-harness'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gh494-phase-harness'
           (root / 'src').mkdir(parents=True)
           packages = tomllib.loads(pathlib.Path('Cargo.lock').read_text())['package']
           deps = {name: next(p['version'] for p in packages if p['name'] == name) for name in ('anyhow', 'tracing', 'serde_json', 'tempfile')}
-          manifest = '[package]\nname = "gh494-restart-harness"\nversion = "0.0.0"\nedition = "2024"\n[dependencies]\n'
+          manifest = '[package]\nname = "gh494-phase-harness"\nversion = "0.0.0"\nedition = "2024"\n[dependencies]\n'
           manifest += ''.join(f'{name} = "={version}"\n' for name, version in deps.items())
           (root / 'Cargo.toml').write_text(manifest)
           (root / 'src/lib.rs').write_text('mod lexical_publish;\nmod inline_repair;\n')
           shutil.copyfile('src/indexer/lexical_publish.rs', root / 'src/lexical_publish.rs')
           shutil.copyfile('src/search/inline_repair.rs', root / 'src/inline_repair.rs')
+          print('Exact diagnostic-helper dependency versions:', deps)
           PY
-          cargo test --manifest-path "$RUNNER_TEMP/gh494-restart-harness/Cargo.toml" gh494_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-restart-prepared/helpers.log"
-          grep -F 'test result: ok. 19 passed; 0 failed;' "$RUNNER_TEMP/gh494-restart-prepared/helpers.log"
-          cargo clippy --manifest-path "$RUNNER_TEMP/gh494-restart-harness/Cargo.toml" --tests -- -D warnings 2>&1 | tee "$RUNNER_TEMP/gh494-restart-prepared/helpers-clippy.log"
-          echo 'STAGE=exact-helpers-19-tests-and-clippy EXIT=0'
-      - name: Store reviewed immutable blobs without committing or updating refs
+          cargo test --manifest-path "$RUNNER_TEMP/gh494-phase-harness/Cargo.toml" gh494_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/diagnostics.log"
+      - name: Require all three real rebuild regressions to be present
+        id: rebuild-list
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess
-          paths = ['src/indexer/mod.rs', 'src/indexer/lexical_publish.rs', 'src/indexer/gh494_tests.rs']
-          report = {'base_commit': os.environ['GITHUB_SHA'], 'blobs': {}}
-          for path in paths:
-              data = pathlib.Path(path).read_bytes()
-              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
-              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs", '--input', '-'], input=payload, text=True, capture_output=True, check=True)
-              sha = json.loads(response.stdout)['sha']
-              assert sha == expected, (path, sha, expected)
-              before = subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip()
-              report['blobs'][path] = {'before_sha': before, 'sha': sha}
-          text = json.dumps(report, indent=2) + '\n'
-          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'gh494-restart-prepared/blobs.json').write_text(text)
-          print(text)
-          PY
-          tar -czf "$RUNNER_TEMP/gh494-restart-prepared/candidate-source.tar.gz" src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
-      - name: Preserve exact source and validation receipts
+          cargo test --locked --lib gh494_ -- --list 2>&1 | tee "$RUNNER_TEMP/gh494-results/test-list.log"
+          for name in \
+            gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success \
+            gh494_zero_conversations_still_publish_a_readable_completed_generation \
+            gh494_completed_marker_cannot_hide_a_live_document_count_mismatch
+          do
+            grep -F "$name: test" "$RUNNER_TEMP/gh494-results/test-list.log"
+          done
+      - name: Execute publication refusal, EOF retry, empty archive, and completion validation
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
+        shell: bash
+        run: |
+          cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/rebuild-regressions.log"
+      - name: Execute CLI EOF resume and repeated read-only searches
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
+        shell: bash
+        run: |
+          cargo test --locked --test gh494_publish_resume -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/cli-resume-regressions.log"
+      - name: Retain hollow-generation and publication rollback coverage
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
+        shell: bash
+        run: |
+          cargo test --locked --lib hollow -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh494-results/hollow.log"
+          cargo test --locked --lib publish_staged_lexical_index -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh494-results/publication-rollback.log"
+      - name: Preserve validation receipts, including failures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: gh494-candidate-recovery-prepared-${{ github.sha }}
-          path: ${{ runner.temp }}/gh494-restart-prepared/
+          name: gh494-publication-results-${{ github.sha }}
+          path: ${{ runner.temp }}/gh494-results/
           if-no-files-found: warn
           retention-days: 14

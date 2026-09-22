@@ -11,6 +11,47 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const LAST_FAILURE_FILE: &str = ".lexical-rebuild-last-failure.json";
 
+/// Retain a failed off-live candidate before replaying from zero. The caller
+/// holds the index-run lock and must never pass the currently served directory.
+/// Quarantine names are deliberately outside the orphan-staging GC allowlist.
+pub(super) fn quarantine_incomplete_candidate(candidate: &Path) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(candidate).with_context(|| {
+        format!(
+            "inspecting failed lexical candidate {}",
+            candidate.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "refusing to quarantine a non-directory or symlink candidate: {}",
+        candidate.display()
+    );
+    let parent = candidate
+        .parent()
+        .context("lexical candidate has no parent")?;
+    // Keep BEFORE the rename: unwinding after any subsequent I/O failure must
+    // never let a TempDir destructor delete the only retained failure evidence.
+    let quarantine = tempfile::Builder::new()
+        .prefix(".lexical-rebuild-quarantine-")
+        .tempdir_in(parent)
+        .context("reserving a lexical rebuild quarantine directory")?
+        .keep();
+    std::fs::rename(candidate, quarantine.join("index")).with_context(|| {
+        format!(
+            "retaining failed lexical candidate {} in {}",
+            candidate.display(),
+            quarantine.display()
+        )
+    })?;
+    #[cfg(unix)]
+    for directory in [quarantine.as_path(), parent] {
+        std::fs::File::open(directory)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("syncing lexical quarantine {}", directory.display()))?;
+    }
+    Ok(quarantine)
+}
+
 pub(super) struct Finalization<'a> {
     live: &'a Path,
     candidate: &'a Path,
@@ -148,6 +189,75 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::io;
+
+    #[test]
+    fn gh494_quarantine_retains_candidate_bytes_and_never_replaces_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = tmp.path().join("candidate");
+        let live = tmp.path().join("live");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(candidate.join("MANIFEST"), b"damaged evidence").unwrap();
+        std::fs::write(live.join("MANIFEST"), b"prior publication").unwrap();
+        let first = quarantine_incomplete_candidate(&candidate).unwrap();
+        assert_eq!(
+            std::fs::read(first.join("index/MANIFEST")).unwrap(),
+            b"damaged evidence"
+        );
+        assert!(!candidate.exists());
+        assert_eq!(
+            std::fs::read(live.join("MANIFEST")).unwrap(),
+            b"prior publication"
+        );
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("MANIFEST"), b"next failure").unwrap();
+        let second = quarantine_incomplete_candidate(&candidate).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read(first.join("index/MANIFEST")).unwrap(),
+            b"damaged evidence"
+        );
+        assert_eq!(
+            std::fs::read(second.join("index/MANIFEST")).unwrap(),
+            b"next failure"
+        );
+    }
+
+    #[test]
+    fn gh494_quarantine_refuses_missing_or_non_directory_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = tmp.path().join("candidate");
+        let error = quarantine_incomplete_candidate(&candidate).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        std::fs::write(&candidate, b"not a directory").unwrap();
+        assert!(quarantine_incomplete_candidate(&candidate).is_err());
+        assert_eq!(std::fs::read(candidate).unwrap(), b"not a directory");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh494_quarantine_refuses_a_candidate_symlink_without_following_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let candidate = tmp.path().join("candidate");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("evidence"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &candidate).unwrap();
+        assert!(quarantine_incomplete_candidate(&candidate).is_err());
+        assert!(
+            std::fs::symlink_metadata(candidate)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(target.join("evidence")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
 
     fn read_report(live: &Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(live.join(LAST_FAILURE_FILE)).unwrap()).unwrap()
