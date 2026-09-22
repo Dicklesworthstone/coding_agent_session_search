@@ -243,7 +243,10 @@ fn completed_no_match_search_does_not_claim_a_timeout_on_stderr() -> TestResult 
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     ensure(
         payload["budget"]["timed_out"] == false,
-        "a completed search must not report a timeout",
+        format!(
+            "a completed search must report budget.timed_out=false: budget={}",
+            payload["budget"]
+        ),
     )?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     ensure(
