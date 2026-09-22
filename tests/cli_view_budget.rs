@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 mod util;
 use util::cass_bin;
 
+// Exercise the exact bounded scanner, including cancellation in mid-record.
+#[path = "../src/followup_coordinates/stream.rs"]
+mod stream;
+
 struct ViewRun {
     json: Value,
     status: ExitStatus,
@@ -196,4 +200,176 @@ fn stalled_view_projection_is_bounded_and_preserves_compact_retry_format() {
         "retry must preserve compact encoding: {retry}"
     );
     assert_eq!(payload["budget"]["budget_ms"], VIEW_BUDGET_MS);
+}
+
+fn physical_command(root: &std::path::Path, path: &std::path::Path, subcommand: &str) -> Command {
+    let mut command = Command::new(cass_bin());
+    command
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_VIEW_BUDGET_MS", "60000")
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .env_remove("CASS_TEST_VIEW_SLOW_MS")
+        .env_remove("CASS_TEST_VIEW_PROJECTION_SLOW_MS")
+        .args(["--color=never", subcommand])
+        .arg(path)
+        .arg("--json")
+        .timeout(Duration::from_secs(10));
+    command
+}
+
+#[test]
+fn physical_view_skips_oversized_unselected_lines_and_counts_the_tail() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("large.txt");
+    let mut source = std::fs::File::create(&path).unwrap();
+    let chunk = [b'x'; 8192];
+    for _ in 0..(stream::MAX_RECORD_BYTES / chunk.len() + 1) {
+        source.write_all(&chunk).unwrap();
+    }
+    source.write_all(b"\ntarget\r\n").unwrap();
+    for _ in 0..(stream::MAX_RECORD_BYTES / chunk.len() + 1) {
+        source.write_all(&chunk).unwrap();
+    }
+    source.write_all(b"\ntail").unwrap();
+    drop(source);
+    let before = std::fs::metadata(&path).unwrap().len();
+    let output = physical_command(root.path(), &path, "view")
+        .args(["--line", "2", "-C", "0"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["total_lines"], 4);
+    assert_eq!(payload["lines"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["lines"][0]["content"], "target");
+    assert_eq!(payload["lines"][0]["file_line"], 2);
+    assert_eq!(payload["lines"][0]["is_target"], true);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
+fn requested_oversized_physical_record_fails_without_emitting_a_target() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("large.jsonl");
+    let content = format!(
+        "{{\"content\":\"{}\"}}\n",
+        "x".repeat(stream::MAX_RECORD_BYTES)
+    );
+    std::fs::write(&path, content.as_bytes()).unwrap();
+    for subcommand in ["view", "expand"] {
+        let output = physical_command(root.path(), &path, subcommand)
+            .args(["--line", "1", "-C", "0"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "followup-resource-limit");
+        assert_eq!(error["error"]["retryable"], false);
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+}
+
+#[test]
+fn physical_window_count_is_bounded_without_rejecting_large_context_on_small_files() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("many.jsonl");
+    for subcommand in ["view", "expand"] {
+        std::fs::write(&path, b"{\"content\":\"one\"}\n").unwrap();
+        let context = usize::MAX.to_string();
+        let output = physical_command(root.path(), &path, subcommand)
+            .args(["--line", "1", "-C", &context])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rows = if subcommand == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+
+        std::fs::write(
+            &path,
+            "{\"content\":\"one\"}\n".repeat(stream::MAX_WINDOW_RECORDS + 1),
+        )
+        .unwrap();
+        let output = physical_command(root.path(), &path, subcommand)
+            .args(["--line", "1", "-C", &context])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "followup-resource-limit");
+    }
+}
+
+#[test]
+fn discarded_tail_still_reports_invalid_utf8_instead_of_certifying_a_full_view() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("invalid.txt");
+    std::fs::write(&path, b"target\n\xff\n").unwrap();
+    let output = physical_command(root.path(), &path, "view")
+        .args(["--line", "1", "-C", "0"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "file-read");
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_is_refused_without_waiting_for_a_writer_but_regular_symlinks_work() {
+    let root = tempfile::tempdir().unwrap();
+    let fifo = root.path().join("blocked.jsonl");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for subcommand in ["view", "expand"] {
+        let output = physical_command(root.path(), &fifo, subcommand)
+            .args(["--line", "1", "-C", "0"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "file-read");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not a regular file")
+        );
+    }
+    let regular = root.path().join("regular.jsonl");
+    std::fs::write(&regular, b"{\"content\":\"valid\"}\n").unwrap();
+    let link = root.path().join("link.jsonl");
+    std::os::unix::fs::symlink(&regular, &link).unwrap();
+    for subcommand in ["view", "expand"] {
+        physical_command(root.path(), &link, subcommand)
+            .args(["--line", "1", "-C", "0"])
+            .assert()
+            .success();
+    }
 }
