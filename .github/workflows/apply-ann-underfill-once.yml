@@ -30,7 +30,7 @@ jobs:
           from pathlib import Path
           repo = 'Dicklesworthstone/coding_agent_session_search'
           parents = {
-              'src/search/semantic_reader/publication.rs': ('8a372f053c811825c51cffc2dcc5d8ace5ccc2ab', '24b95a5893c0c467c9c276a216a2ef1d25f29571'),
+              'src/search/semantic_reader/publication.rs': ('8a372f053c811825c51cffc2dcc5d8ace5ccc2ab', '24b95a509c7724eb877bb67e3799412324ec6943'),
               'src/search/semantic_reader/publication/tests.rs': ('8d606b52626b30091d30244a267d03ad6c311de9', '2e788d0ca59341267a99905bf5d0e4ba1a67c4d2'),
           }
           additions = {
