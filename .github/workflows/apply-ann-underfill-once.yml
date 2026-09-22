@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: macos-14
     timeout-minutes: 10
     permissions:
       contents: write
@@ -34,7 +34,7 @@ jobs:
               'src/search/semantic_reader/publication/tests.rs': ('8d606b52626b30091d30244a267d03ad6c311de9', '2e788d0ca59341267a99905bf5d0e4ba1a67c4d2'),
           }
           additions = {
-              'src/search/semantic_reader/publication/text.rs': 'dabb8a13b6a1cafc02d504425fd5af60cfd709b4',
+              'src/search/semantic_reader/publication/text.rs': 'd604353f64df83bfc1fddb3f0ae176601091100c',
               'src/search/semantic_reader/publication/tests/text.rs': '307b56b54b2a1c8f3c8956e8111c280c0ee2d383',
               'docs/SEMANTIC_TEXT_READER.md': '088192ee74f4dfddc0be56aac92b079e4d7753a2',
           }
