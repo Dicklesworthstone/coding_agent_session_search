@@ -14263,6 +14263,20 @@ impl FrankenStorage {
         validate_fts_messages_integrity_for_connection(&self.conn)
     }
 
+    /// GH #438: rewrite the `fts_messages` segments with the current writer.
+    /// fsqlite's FTS5 'optimize' merges every segment into one freshly written
+    /// segment, which is the in-place migration for segments written before
+    /// frankensqlite#404 (the format stock SQLite's validators reject even
+    /// though reads work). On an already optimized modern index it is a no-op
+    /// decided before any hydration. Parity cannot change: only derived
+    /// segment storage is rewritten.
+    pub(crate) fn optimize_fts_messages_segments(&self) -> Result<()> {
+        self.conn
+            .execute("INSERT INTO fts_messages(fts_messages) VALUES('optimize')")
+            .with_context(|| "rewriting fts_messages segments with FTS5 optimize")?;
+        Ok(())
+    }
+
     pub(crate) fn fallback_fts_is_known_healthy_for_archive_fingerprint(
         &self,
         archive_fingerprint: &str,
