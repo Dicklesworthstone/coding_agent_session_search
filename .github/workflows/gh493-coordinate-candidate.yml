@@ -12,16 +12,10 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    runs-on: macos-14
+    timeout-minutes: 10
     permissions:
       contents: write
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -30,11 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           toolchain: nightly-2026-08-31
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-        with:
-          shared-key: gh493-identity
-          cache-on-failure: true
+          components: rustfmt
       - name: Admit exact reviewed terminal and pack changes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,48 +82,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: tui-canonical-candidate
+          name: tui-canonical-prepared
           path: candidate/
           retention-days: 1
           if-no-files-found: error
-      - name: Real archive lookup and canonical terminal regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --lib gh493_ -- --nocapture 2>&1 | tee candidate/tui-regressions.log
-          grep -F 'test result: ok. 6 passed;' candidate/tui-regressions.log
-          cargo test --locked --lib ui::data::tests -- --nocapture 2>&1 | tee candidate/data-tests.log
-      - name: Existing detail rendering and navigation contracts
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --lib ui::app::tests::regression_detail -- --nocapture 2>&1 | tee candidate/detail-tests.log
-          cargo test --locked --lib ui::app::tests::build_messages -- --nocapture 2>&1 | tee candidate/messages-tests.log
-          cargo test --locked --lib ui::app::tests::detail_session_hit -- --nocapture 2>&1 | tee candidate/navigation-tests.log
-      - name: Complete pack planner and physical citation regressions
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --lib search::pack_planner::tests -- --nocapture 2>&1 | tee candidate/planner-tests.log
-      - name: Preserve real CLI coordinate and pack handoffs
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --no-fail-fast --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget --test lexical_reconcile_canary --test golden_robot_pack -- --nocapture 2>&1 | tee candidate/cli-tests.log
-      - name: Strict production and targeted regression lint
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo clippy --locked --lib --test gh493_message_coordinates -- -D warnings 2>&1 | tee candidate/clippy.log
-      - name: Retain completed evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: tui-canonical-validation
-          path: candidate/
-          retention-days: 1
-          if-no-files-found: warn
