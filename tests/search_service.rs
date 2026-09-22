@@ -161,3 +161,67 @@ fn cass_serve_mcp_dispatches_real_negotiation_without_archive_access() -> anyhow
     assert!(!absent.exists());
     Ok(())
 }
+
+#[test]
+fn cass_serve_reads_explicit_canonical_archive_without_opening_an_index() -> anyhow::Result<()> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::{Value, json};
+
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("archive.db");
+    let storage = FrankenStorage::open(&db)?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None, slug: "codex".into(), name: "Codex".into(),
+        version: None, kind: AgentKind::Cli,
+    })?;
+    let outcome = storage.insert_conversation_tree(agent, None, &Conversation {
+        id: None, agent_slug: "codex".into(), workspace: None,
+        external_id: Some("binary-canonical-service".into()), title: None,
+        source_path: "/absent/source.jsonl".into(), started_at: None,
+        ended_at: None, approx_tokens: None, metadata_json: json!({}),
+        source_id: "local".into(), origin_host: None,
+        messages: vec![Message {
+            id: None, idx: 12, role: MessageRole::Agent, author: None,
+            created_at: None, content: "complete canonical evidence δ".into(),
+            extra_json: json!({}), snippets: Vec::new(),
+        }],
+    })?;
+    drop(storage);
+    let before = std::fs::read(&db)?;
+    for enabled in [false, true] {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command.args(["serve", "--stdio", "--index"]).arg(temp.path().join("absent-index"));
+        if enabled { command.arg("--db").arg(&db); }
+        let mut child = command.current_dir(temp.path())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "{}", json!({"op":"view", "id":1,
+            "source_path":"/absent/source.jsonl", "source_id":"local",
+            "conversation_id":outcome.conversation_id, "message_index":13}))?;
+        writeln!(input, "{}", json!({"op":"status", "id":2}))?;
+        drop(input);
+        if child.wait_timeout(Duration::from_secs(20))?.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("canonical service failed to terminate after EOF");
+        }
+        let output = child.wait_with_output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let replies: Vec<Value> = std::str::from_utf8(&output.stdout)?.lines()
+            .map(serde_json::from_str).collect::<Result<_, _>>()?;
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["ok"], enabled, "{}", replies[0]);
+        if enabled {
+            assert_eq!(replies[0]["result"]["messages"][0]["content"], "complete canonical evidence δ");
+            assert_eq!(replies[0]["result"]["messages"][0]["message_index"], 13);
+        } else {
+            assert_eq!(replies[0]["error"]["kind"], "canonical_access_disabled");
+        }
+        assert_eq!(replies[1]["result"]["open_attempts"], 0);
+        assert_eq!(replies[1]["result"]["canonical_read_attempts"], u64::from(enabled));
+        assert!(!temp.path().join("absent-index").exists());
+        assert_eq!(std::fs::read(&db)?, before);
+    }
+    Ok(())
+}

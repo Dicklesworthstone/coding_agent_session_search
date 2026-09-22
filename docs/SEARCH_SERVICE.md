@@ -45,7 +45,7 @@ Responses explicitly report `snapshot_policy: "pinned_until_reload"` and
 `freshness: "not_checked"`. Status means only whether this process has a loaded
 reader, not whether the archive is complete, current, or healthy.
 
-This service returns **index previews**, not canonical message bodies. It
+Search returns **index previews**, not canonical message bodies. It
 never supplies a database path to `SearchClient`, loads semantic models,
 rebuilds indexes, initiates automatic refresh, or downloads assets. Keep
 indexing in a separately managed maintenance process. To validate or inspect
@@ -53,6 +53,8 @@ a hit against the canonical archive, retain its `source_id`,
 `conversation_id`, and `message_index` for the ordinary CASS follow-up commands.
 `message_index` is one-based canonical message addressing, **not a raw file
 line number**. Identity fields are never shortened to fit an output budget.
+For complete bounded bodies in the same service, opt in to `view` using the
+fixed `--db` configuration described below. No archive is inferred from `--data-dir`.
 
 ## Wire protocol, version 1
 
@@ -62,7 +64,7 @@ processed sequentially, so backpressure does not create an in-process request
 queue. Without `--mcp`, this is a CASS JSON-lines protocol, not JSON-RPC.
 The MCP adapter described below uses the same reader and bounds.
 
-Every request requires an unsigned 64-bit `id`. Four operations are supported:
+Every request requires an unsigned 64-bit `id`. Four operations are always available:
 
 ```json
 {"op":"status","id":1}
@@ -80,7 +82,8 @@ omit that field. Empty agent/workspace lists mean unrestricted.
 
 Unsupported fields and operations are errors, never silently ignored. There
 is no `mode`, semantic fallback, session-path filter, arbitrary per-request
-index path, full-content request, or maintenance operation. In particular,
+index path, full-content search, or maintenance operation. Canonical `view` is
+separately enabled by `--db`. In particular,
 post-filter routes that can expand to corpus-sized candidate windows are not
 exposed as bounded service filters.
 
@@ -206,8 +209,9 @@ use this adapter. Protocol behavior follows the versioned MCP lifecycle and
 stdio specifications, not an assumption that every version uses initialization.
 
 The stable catalog exposes `cass_search`, `cass_status`, and `cass_reload`.
+With an explicit startup `--db`, it also exposes the read-only `cass_view` tool.
 `cass_search` arguments are the JSON-lines search fields **without** `op` or
-`id`; the other tools accept an empty object. The JSON-RPC ID is preserved
+`id`; status and reload accept an empty object. The JSON-RPC ID is preserved
 exactly, including string and signed-integer IDs. There is no arbitrary file
 reader, SQL tool, shell command, indexing tool, or semantic-mode substitution.
 Tool results include both `structuredContent` and its JSON representation in
@@ -236,3 +240,74 @@ Specifications: https://modelcontextprotocol.io/specification/2025-11-25/basic/l
 and https://modelcontextprotocol.io/specification/2025-11-25/server/tools.
 The era-fallback contract is documented at
 https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning.
+
+
+## Canonical evidence follow-up (explicit opt-in)
+
+Enable complete message reads from one fixed archive, independently of the
+retained lexical reader:
+
+```sh
+cass serve --stdio --mcp --data-dir /path/to/cass-data --db /path/to/cass-data/agent_search.db
+```
+
+The `--db` option grants access only to that configured canonical archive.
+Starting the process, initialization, discovery, status and lexical searches
+still do not open it. No database path is accepted inside a request. Omitting
+`--db` keeps the original index-only capability: `cass_view` is absent from the
+MCP catalog and cannot be invoked by guessing its name. JSON-lines `view` then
+returns `canonical_access_disabled`.
+
+Without `--mcp`, send:
+
+```json
+{"op":"view","id":5,"source_path":"/history/session.jsonl","source_id":"local","conversation_id":42,"message_index":13,"context":1}
+```
+
+With MCP, call `cass_view` using the same arguments without `op` or `id`.
+Copy **all four coordinates** from one search hit. They are not interchangeable:
+`source_path` and `source_id` must match the stored conversation exactly,
+`conversation_id` must be positive, and `message_index` is the one-based
+canonical ordinal. No source alias, path normalization, raw-file fallback or
+neighbour substitution is attempted. The named source file need not exist;
+its path is compared as identity data and is never opened.
+
+`context` defaults to zero and accepts 0–20 actual messages on each side.
+Sparse indices are preserved: for indices 8, 13 and 100, a view of 13 with
+context 1 returns those three messages, not the arithmetic range 12–14.
+The target must exist exactly. Identity checks, metadata selection and body
+hydration share one explicit read transaction through the production strict
+FrankenSQLite reader; requested malformed content or ambiguous coordinates
+fail the entire operation. Database files that are symlinks are rejected at
+admission. This preliminary path check is not an atomic filesystem path pin.
+
+A view returns root source/conversation coordinates, `messages` with exact
+`message_id`, `message_index`, `role`, complete `content`, and `is_target`, plus
+`content_bytes` and `more_before` / `more_after`. The latter fields are null
+when context is zero because no neighbour probe occurs. There is no
+whole-conversation count or archive-integrity claim.
+
+The complete window is limited to **64 KiB of UTF-8 message-body bytes**.
+Byte-length guards run inside SQL before oversized content is transferred to
+the service, and count embedded NULs and multibyte characters. Content is
+never shortened to manufacture success. Oversized windows return
+`canonical_payload_too_large`; reduce context or use the explicit CLI follow-up
+for a larger individual message. The existing 1 MiB encoded response limit
+still applies, including both MCP result representations and JSON escaping.
+Other typed errors distinguish missing targets, identity mismatches, invalid
+coordinates and elapsed cooperative budgets; storage failures retain context.
+
+Each view opens a **new canonical read snapshot**, releases its transaction and
+closes its reader before the next request. It does not replace or relabel the
+retained lexical reader. Results state
+`snapshot_policy: "one_archive_read_transaction_per_view"`,
+`matches_lexical_snapshot: null`, and `lexical_freshness: "not_checked"`.
+A successful view is not proof that the earlier search preview is current.
+Status exposes capability and attempted/completed read counters without
+probing either storage path.
+
+The 3-second lookup budget is cooperative: checked between admission and SQL
+operations, with no partial result on expiry. It does **not** interrupt an
+individual engine call, bound engine-internal allocation, or replace the
+host's process-level deadline. No maintenance, recovery write, model loading,
+raw transcript read, arbitrary SQL or new filesystem authority is provided.

@@ -9,6 +9,22 @@ struct Fixture {
     conversation: i64,
 }
 
+fn archive_image(db: &Path) -> Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
+    let mut image = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = PathBuf::from(name);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        image.push((path, bytes));
+    }
+    Ok(image)
+}
+
 impl Fixture {
     fn new() -> Result<Self> {
         let root = tempfile::tempdir()?;
@@ -79,7 +95,7 @@ fn canonical_service_requires_opt_in_and_refuses_invalid_work_before_access() ->
 #[test]
 fn sparse_context_is_real_messages_with_exact_identity_and_no_raw_access() -> Result<()> {
     let fixture = Fixture::new()?;
-    let before = std::fs::read(&fixture.db)?;
+    let before = archive_image(&fixture.db)?;
     let payload = read(&fixture.db, &fixture.view(1))?;
     let messages = payload["messages"].as_array().unwrap();
     assert_eq!(messages.iter().map(|m| m["message_index"].as_u64().unwrap()).collect::<Vec<_>>(), [8, 13, 100]);
@@ -91,7 +107,7 @@ fn sparse_context_is_real_messages_with_exact_identity_and_no_raw_access() -> Re
     assert_eq!(payload["more_before"], true);
     assert_eq!(payload["more_after"], true);
     assert!(payload["matches_lexical_snapshot"].is_null());
-    assert_eq!(std::fs::read(&fixture.db)?, before);
+    assert_eq!(archive_image(&fixture.db)?, before);
     Ok(())
 }
 
@@ -194,5 +210,132 @@ fn expired_budget_is_an_explicit_refusal_before_snapshot_queries() -> Result<()>
     let storage = FrankenStorage::open_strict_readonly(&fixture.db)?;
     let error = read_snapshot(&storage, &fixture.view(0), Instant::now() - Duration::from_secs(4)).unwrap_err();
     assert_eq!(error_kind(&error), "canonical_deadline");
+    Ok(())
+}
+
+fn mcp_exchange(session: &mut Session, requests: &[Value]) -> Result<Vec<Value>> {
+    let mut frames = vec![
+        json!({"jsonrpc":"2.0", "id":"init", "method":"initialize", "params":{
+            "protocolVersion":"2025-11-25", "capabilities":{},
+            "clientInfo":{"name":"canonical-regression", "version":"1"}
+        }}),
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+    ];
+    frames.extend_from_slice(requests);
+    let input = frames.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+    let mut output = Vec::new();
+    super::super::mcp::serve_io(session, &mut std::io::Cursor::new(input), &mut output)?;
+    std::str::from_utf8(&output)?.lines().map(|line| serde_json::from_str(line).map_err(Into::into)).collect()
+}
+
+fn mcp_view(fixture: &Fixture, id: Value) -> Value {
+    json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
+        "name":"cass_view", "arguments":{
+            "source_path":"/absent/shared.sqlite", "source_id":"local",
+            "conversation_id":fixture.conversation, "message_index":13, "context":1
+        }
+    }})
+}
+
+#[test]
+fn mcp_catalog_and_dispatch_require_explicit_canonical_permission() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    let list = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+    let replies = mcp_exchange(&mut session, &[list.clone(), mcp_view(&fixture, json!(2))])?;
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(replies[2]["error"]["code"], -32602);
+    assert_eq!(session.canonical_read_attempts, 0);
+    session.archive = Some(fixture.db.clone());
+    let replies = mcp_exchange(&mut session, &[list])?;
+    let tools = replies[1]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 4);
+    let view = tools.iter().find(|tool| tool["name"] == "cass_view").unwrap();
+    assert_eq!(view["annotations"]["readOnlyHint"], true);
+    assert_eq!(view["inputSchema"]["additionalProperties"], false);
+    assert_eq!(view["inputSchema"]["required"].as_array().unwrap().len(), 4);
+    assert_eq!(view["inputSchema"]["properties"]["context"]["maximum"], MAX_CONTEXT);
+    assert_eq!(session.canonical_read_attempts, 0, "discovery must not open the archive");
+    Ok(())
+}
+
+#[test]
+fn mcp_view_round_trip_preserves_full_evidence_and_rpc_identity() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.content(12, "full evidence: quotes \" and NUL \0 and Unicode δ😀")?;
+    let before = archive_image(&fixture.db)?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let replies = mcp_exchange(&mut session, &[mcp_view(&fixture, json!("view-δ"))])?;
+    let reply = &replies[1];
+    assert_eq!(reply["id"], "view-δ");
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let data = &reply["result"]["structuredContent"];
+    let text: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())?;
+    assert_eq!(&text, data);
+    assert_eq!(data["messages"][1]["content"], "full evidence: quotes \" and NUL \0 and Unicode δ😀");
+    assert!(data["matches_lexical_snapshot"].is_null());
+    assert_eq!(session.open_attempts, 0);
+    assert_eq!(session.canonical_reads_completed, 1);
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn mcp_view_rejects_path_escalation_and_fire_and_forget_database_reads() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let mut notification = mcp_view(&fixture, json!(1));
+    notification.as_object_mut().unwrap().remove("id");
+    let mut escalation = mcp_view(&fixture, json!(2));
+    escalation["params"]["arguments"]["db"] = json!("/different/archive.db");
+    let mut invalid = mcp_view(&fixture, json!(3));
+    invalid["params"]["arguments"]["context"] = json!(MAX_CONTEXT + 1);
+    let replies = mcp_exchange(&mut session, &[notification, escalation, invalid])?;
+    assert_eq!(replies.len(), 3, "tool notifications must receive no response");
+    assert_eq!(replies[1]["error"]["code"], -32602);
+    assert_eq!(replies[2]["result"]["isError"], true);
+    assert_eq!(replies[2]["result"]["structuredContent"]["error"]["kind"], "invalid_request");
+    assert_eq!(session.canonical_read_attempts, 0);
+    Ok(())
+}
+
+#[test]
+fn mcp_oversized_canonical_body_is_a_tool_error_not_partial_evidence() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.content(12, &"x".repeat(MAX_CONTENT_BYTES + 1))?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let replies = mcp_exchange(&mut session, &[mcp_view(&fixture, json!(-17))])?;
+    let reply = &replies[1];
+    assert_eq!(reply["id"], -17);
+    assert_eq!(reply["result"]["isError"], true);
+    assert_eq!(reply["result"]["structuredContent"]["error"]["kind"], "canonical_payload_too_large");
+    assert!(reply["result"]["structuredContent"].get("messages").is_none());
+    assert_eq!(session.canonical_reads_completed, 0);
+    Ok(())
+}
+
+#[test]
+fn retained_read_transaction_cannot_mix_identity_with_a_newer_body() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let storage = FrankenStorage::open_strict_readonly(&fixture.db)?;
+    let snapshot = Snapshot::begin(&storage)?;
+    let pinned = storage.raw().query_map_collect(
+        "SELECT id FROM conversations WHERE id = ?1",
+        params![fixture.conversation],
+        |row| row.get_typed::<i64>(0),
+    )?;
+    assert_eq!(pinned, vec![fixture.conversation]);
+    fixture.content(12, "new body from concurrent writer")?;
+    let before = archive_image(&fixture.db)?;
+    let old = read_snapshot(&storage, &fixture.view(0), Instant::now())?;
+    assert_eq!(old["messages"][0]["content"], "canonical content 12");
+    snapshot.release()?;
+    drop(storage);
+    let new = read(&fixture.db, &fixture.view(0))?;
+    assert_eq!(new["messages"][0]["content"], "new body from concurrent writer");
+    assert_eq!(archive_image(&fixture.db)?, before);
     Ok(())
 }
