@@ -128,20 +128,18 @@ impl SemanticAnnShardSet {
                                 hits.into_iter().map(|hit| (hit.message_id, hit)).collect();
                             native_window = next_window;
                         }
-                        Err(error) => match error.downcast::<NativeAnnSearchFailure>() {
-                            Ok(failure) => {
-                                // Keep completed work, but discard ALL native
-                                // and delta hits before exact cohort recovery.
-                                match stats.as_mut() {
-                                    Some(total) => {
-                                        accumulate_native_stats(total, &failure.completed_stats);
-                                    }
-                                    None => stats = Some(failure.completed_stats),
+                        Err(error) => {
+                            let failure = error.downcast::<NativeAnnSearchFailure>()?;
+                            // Keep completed work, but discard ALL native
+                            // and delta hits before exact cohort recovery.
+                            match stats.as_mut() {
+                                Some(total) => {
+                                    accumulate_native_stats(total, &failure.completed_stats);
                                 }
-                                break (0, AnnExactFallbackReason::NativeSearchFailed);
+                                None => stats = Some(failure.completed_stats),
                             }
-                            Err(error) => return Err(error),
-                        },
+                            break (0, AnnExactFallbackReason::NativeSearchFailed);
+                        }
                     }
                 },
                 Err(error) if error.is::<PendingWalDelta>() => {
@@ -185,6 +183,7 @@ impl SemanticAnnShardSet {
     /// is a backend heuristic, not a measured guarantee for the fused page.
     /// Delta work is separately traced; it never makes approximate main-slab
     /// retrieval exact. Additional state is O(k + bounded delta), not O(archive).
+    #[cfg(test)]
     pub(in super::super) fn search(
         &self,
         artifacts: &Arc<Vec<SemanticIndexArtifact>>,
