@@ -124,10 +124,9 @@ fn assert_discovery_failure(config: &str, ledger: Option<&str>, reason: &str) {
             Some(expected) => assert_eq!(fs::read_to_string(ledger_path).unwrap(), expected),
             None => assert!(!ledger_path.exists()),
         }
-        let state: Value = serde_json::from_slice(
-            &fs::read(fixture.data.join("schedule/state.json")).unwrap(),
-        )
-        .unwrap();
+        let state: Value =
+            serde_json::from_slice(&fs::read(fixture.data.join("schedule/state.json")).unwrap())
+                .unwrap();
         assert_eq!(state[format!("last_{job}")]["ok"], false);
     }
     let history = fs::read_to_string(fixture.data.join("schedule/runs.jsonl")).unwrap();
@@ -169,7 +168,12 @@ fn both_forced_jobs_respect_a_cross_process_lease_and_preserve_owner_receipts() 
     let lock = File::create_new(schedule.join("run.lock")).unwrap();
     lock.try_lock().unwrap();
     for job in ["incremental", "nightly"] {
-        let report = refused(&fixture.run(job), job, "schedule-admission", "schedule_busy");
+        let report = refused(
+            &fixture.run(job),
+            job,
+            "schedule-admission",
+            "schedule_busy",
+        );
         assert_eq!(report["steps"][0]["result"]["status"], "deferred");
         assert_eq!(report["steps"][0]["result"]["persisted"], false);
         fixture.assert_archive_unchanged();

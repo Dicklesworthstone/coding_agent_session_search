@@ -50,8 +50,10 @@ impl SemanticIndexer {
         run: F,
     ) -> Result<SemanticBackfillBatchOutcome>
     where
-        F: FnOnce(&engine::SemanticIndexer, &mut SemanticManifest)
-            -> Result<SemanticBackfillBatchOutcome>,
+        F: FnOnce(
+            &engine::SemanticIndexer,
+            &mut SemanticManifest,
+        ) -> Result<SemanticBackfillBatchOutcome>,
     {
         let artifacts = artifacts::BackfillArtifacts::begin(data_dir, manifest)?;
         let result = run(&self.inner, manifest);
@@ -93,7 +95,12 @@ impl SemanticIndexer {
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
             engine.run_backfill_batch_with_sink(
-                messages, data_dir, manifest, plan, last_message_id, sink,
+                messages,
+                data_dir,
+                manifest,
+                plan,
+                last_message_id,
+                sink,
             )
         })
     }
@@ -124,9 +131,9 @@ impl SemanticIndexer {
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
             #[cfg(unix)]
-            if let Some(outcome) = unchanged::try_retain_completed(
-                engine, storage, data_dir, manifest, &plan, sink,
-            )? {
+            if let Some(outcome) =
+                unchanged::try_retain_completed(engine, storage, data_dir, manifest, &plan, sink)?
+            {
                 return Ok(outcome);
             }
             engine.run_backfill_from_storage_with_sink(storage, data_dir, manifest, plan, sink)
@@ -143,12 +150,13 @@ impl SemanticIndexer {
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
             #[cfg(unix)]
-            if let Some(outcome) = unchanged::try_retain_completed(
-                engine, storage, data_dir, manifest, &plan, sink,
-            )? {
+            if let Some(outcome) =
+                unchanged::try_retain_completed(engine, storage, data_dir, manifest, &plan, sink)?
+            {
                 return Ok(outcome);
             }
-            engine.run_capped_backfill_from_storage_with_sink(storage, data_dir, manifest, plan, sink)
+            engine
+                .run_capped_backfill_from_storage_with_sink(storage, data_dir, manifest, plan, sink)
         })
     }
 }

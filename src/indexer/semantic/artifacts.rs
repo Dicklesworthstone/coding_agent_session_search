@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 
 use crate::search::semantic_manifest::selection::SemanticSelectionMetadata;
 use crate::search::semantic_manifest::{
-    BuildCheckpoint, MANIFEST_FORMAT_VERSION, SemanticCurrentPointerV1, SemanticGenerationManifestV1,
-    SemanticManifest, SemanticShardManifest,
+    BuildCheckpoint, MANIFEST_FORMAT_VERSION, SemanticCurrentPointerV1,
+    SemanticGenerationManifestV1, SemanticManifest, SemanticShardManifest,
 };
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 
@@ -22,9 +22,9 @@ mod inspection;
 #[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
-mod storage_tests;
-#[cfg(test)]
 mod lease_tests;
+#[cfg(test)]
+mod storage_tests;
 
 pub use inspection::{
     BackfillArtifactCandidate, BackfillArtifactReclaimPlan, apply_backfill_artifact_plan,
@@ -60,7 +60,9 @@ pub fn reclaim_backfill_artifacts(data_dir: &Path) -> Result<BackfillArtifactRec
 /// longer current. Reload the durable manifest AND recompute the batch before
 /// retrying; silently replacing the input could skip or replay selected rows.
 #[derive(Debug, thiserror::Error)]
-#[error("semantic backfill manifest changed; reload the durable manifest and recompute the batch before retrying")]
+#[error(
+    "semantic backfill manifest changed; reload the durable manifest and recompute the batch before retrying"
+)]
 pub struct BackfillManifestChanged;
 
 pub(super) struct BackfillArtifacts {
@@ -235,10 +237,7 @@ impl BackfillArtifacts {
                         candidates.insert(path);
                     }
                 }
-            } else if kind.is_dir()
-                && reuse_name(name)
-                && !protected.contains(&path)
-            {
+            } else if kind.is_dir() && reuse_name(name) && !protected.contains(&path) {
                 candidates.insert(path);
             }
             // Symlinks are never candidates, including dangling ones.
@@ -261,7 +260,10 @@ impl BackfillArtifacts {
         })
     }
 
-    fn remove_candidates(&self, candidates: BTreeSet<PathBuf>) -> Result<BackfillArtifactReclaimReport> {
+    fn remove_candidates(
+        &self,
+        candidates: BTreeSet<PathBuf>,
+    ) -> Result<BackfillArtifactReclaimReport> {
         let root = self.data_dir.join(VECTOR_INDEX_DIR);
         let mut report = BackfillArtifactReclaimReport::default();
         for path in candidates {
@@ -270,7 +272,10 @@ impl BackfillArtifacts {
                 let directory = metadata.is_dir();
                 // A staging file swapped for a directory must never turn a
                 // planned unlink into a recursive deletion (or vice versa).
-                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
                 ensure!(
                     path.parent() == Some(root.as_path())
                         && !is_link_or_reparse(&metadata)
@@ -530,7 +535,7 @@ impl RecoveryMetadata {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.observe(path, None);
                 return Ok(None);
-            },
+            }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
         };
         ensure!(
@@ -552,8 +557,9 @@ impl RecoveryMetadata {
             bytes.len() as u64 <= MAX_MANIFEST_BYTES,
             "manifest grew during recovery"
         );
-        let value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid {}; refusing artifact reclamation", path.display()))?;
+        let value = serde_json::from_slice(&bytes).with_context(|| {
+            format!("invalid {}; refusing artifact reclamation", path.display())
+        })?;
         // After a killed process, visibility of rename alone is not durability.
         // Pin the selected metadata and directory before deleting superseded data.
         self.observe(path, Some(&bytes));
@@ -582,10 +588,9 @@ fn protect_selected_generation(
         selected.pointer == pointer,
         "semantic selection changed during recovery; refusing reclamation"
     );
-    let manifest = metadata.read::<SemanticGenerationManifestV1>(
-        &selected.generation_dir.join("manifest.json"),
-    )?
-    .context("selected generation manifest missing; refusing artifact reclamation")?;
+    let manifest = metadata
+        .read::<SemanticGenerationManifestV1>(&selected.generation_dir.join("manifest.json"))?
+        .context("selected generation manifest missing; refusing artifact reclamation")?;
     ensure!(
         selected.manifest == manifest,
         "semantic manifest changed during recovery; refusing reclamation"
@@ -645,7 +650,8 @@ fn validate_reclaim_checkpoint(path: &Path, checkpoint: &BuildCheckpoint) -> Res
     // cover the durable checkpoint's acknowledged count before retiring a
     // fallback. Extra records are allowed: a killed writer may have durably
     // appended its next batch without advancing the checkpoint yet.
-    let available = u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+    let available = u64::try_from(index.record_count())
+        .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(index.wal_record_count()).unwrap_or(u64::MAX));
     ensure!(
         available >= checkpoint.docs_embedded,
@@ -664,7 +670,10 @@ fn open_checkpoint_file(path: &Path) -> Result<Option<File>> {
         Err(error) => return Err(error).context("inspect checkpoint before reclamation"),
     }
     let file = File::open(path).context("open checkpoint before reclamation")?;
-    ensure!(file.metadata()?.is_file(), "checkpoint/WAL type changed during recovery");
+    ensure!(
+        file.metadata()?.is_file(),
+        "checkpoint/WAL type changed during recovery"
+    );
     Ok(Some(file))
 }
 

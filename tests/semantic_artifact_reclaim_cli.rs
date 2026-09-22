@@ -15,15 +15,26 @@ use serde_json::Value;
 fn fixture(data: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    let live = indexer.run_backfill_batch(
-        &[EmbeddingInput::new(1, "live compiler checkpoint")], data, &mut manifest,
-        SemanticBackfillBatchPlan {
-            tier: TierKind::Quality, db_fingerprint: "content-v1:cli-live".into(),
-            model_revision: "hash".into(), total_conversations: 1,
-            conversations_in_batch: 1, last_offset: 1, cursor_exhausted: true,
-        },
-    )?.index_path;
-    fs::write(data.join("agent_search.db"), b"not a database; recovery must not open it")?;
+    let live = indexer
+        .run_backfill_batch(
+            &[EmbeddingInput::new(1, "live compiler checkpoint")],
+            data,
+            &mut manifest,
+            SemanticBackfillBatchPlan {
+                tier: TierKind::Quality,
+                db_fingerprint: "content-v1:cli-live".into(),
+                model_revision: "hash".into(),
+                total_conversations: 1,
+                conversations_in_batch: 1,
+                last_offset: 1,
+                cursor_exhausted: true,
+            },
+        )?
+        .index_path;
+    fs::write(
+        data.join("agent_search.db"),
+        b"not a database; recovery must not open it",
+    )?;
     let staging = data.join("vector_index/.staging-quality-minilm-384-deadbeef.fsvi");
     let reuse = data.join("vector_index/.backfill-reuse-Killed123");
     fs::write(&staging, b"old")?;
@@ -35,12 +46,20 @@ fn fixture(data: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
 
 fn command(data: &Path, extra: &[&str]) -> Result<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_cass-semantic-reclaim"))
-        .arg("--data-dir").arg(data).arg("--json").args(extra).output()?)
+        .arg("--data-dir")
+        .arg(data)
+        .arg("--json")
+        .args(extra)
+        .output()?)
 }
 
 fn preview(data: &Path) -> Result<Value> {
     let output = command(data, &[])?;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
     Ok(serde_json::from_slice(&output.stdout)?)
 }
@@ -63,7 +82,11 @@ fn cli_preview_apply_preserves_live_index_and_never_opens_database() -> Result<(
     assert!(explicit.status.success());
     assert_eq!(plan, serde_json::from_slice::<Value>(&explicit.stdout)?);
     let applied = command(&data, &["--apply", "--plan-fingerprint", fingerprint])?;
-    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
     let report: Value = serde_json::from_slice(&applied.stdout)?;
     assert_eq!(report["operation"], "apply");
     assert_eq!(report["status"], "complete");
@@ -84,7 +107,10 @@ fn stale_approval_and_live_writer_fail_without_deleting_any_candidate() -> Resul
     let plan = preview(data)?;
     let fingerprint = plan["plan"]["plan_fingerprint"].as_str().unwrap();
     for name in ["index-run.lock", "semantic-backfill-artifacts.lock"] {
-        let lock = OpenOptions::new().read(true).write(true).open(data.join(name))?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data.join(name))?;
         fs2::FileExt::try_lock_exclusive(&lock)?;
         let busy = command(data, &["--apply", "--plan-fingerprint", fingerprint])?;
         assert_eq!(busy.status.code(), Some(1));
@@ -97,8 +123,12 @@ fn stale_approval_and_live_writer_fail_without_deleting_any_candidate() -> Resul
     let stale = command(data, &["--apply", "--plan-fingerprint", fingerprint])?;
     assert_eq!(stale.status.code(), Some(1));
     assert!(stale.stdout.is_empty());
-    assert!(serde_json::from_slice::<Value>(&stale.stderr)?["error"]["message"]
-        .as_str().unwrap().contains("plan changed"));
+    assert!(
+        serde_json::from_slice::<Value>(&stale.stderr)?["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("plan changed")
+    );
     assert!(live.is_file() && staging.is_file() && reuse.is_dir());
     Ok(())
 }
@@ -107,11 +137,18 @@ fn stale_approval_and_live_writer_fail_without_deleting_any_candidate() -> Resul
 fn usage_errors_and_help_do_not_create_an_archive() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let absent = temp.path().join("absent");
-    for args in [&["--apply"][..], &["--plan-fingerprint", "invalid"], &["--force"]] {
+    for args in [
+        &["--apply"][..],
+        &["--plan-fingerprint", "invalid"],
+        &["--force"],
+    ] {
         let output = command(&absent, args)?;
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
-        assert_eq!(serde_json::from_slice::<Value>(&output.stderr)?["error"]["kind"], "usage");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr)?["error"]["kind"],
+            "usage"
+        );
         assert!(!absent.exists());
     }
     let help = command(&absent, &["--help"])?;
@@ -130,8 +167,12 @@ fn corrupt_authority_is_reported_not_overwritten_or_ignored() -> Result<()> {
     let output = command(data, &[])?;
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(serde_json::from_slice::<Value>(&output.stderr)?["error"]["message"]
-        .as_str().unwrap().contains("invalid"));
+    assert!(
+        serde_json::from_slice::<Value>(&output.stderr)?["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid")
+    );
     assert_eq!(fs::read(SemanticManifest::path(data))?, b"{torn manifest");
     assert!(live.is_file() && staging.is_file() && reuse.is_dir());
     Ok(())
@@ -145,11 +186,17 @@ fn dangling_checkpoint_is_a_blocked_preview_not_a_successful_empty_plan() -> Res
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::load(data)?.unwrap();
     let saved = indexer.run_backfill_batch(
-        &[EmbeddingInput::new(2, "next resumable checkpoint")], data, &mut manifest,
+        &[EmbeddingInput::new(2, "next resumable checkpoint")],
+        data,
+        &mut manifest,
         SemanticBackfillBatchPlan {
-            tier: TierKind::Quality, db_fingerprint: "content-v1:cli-next".into(),
-            model_revision: "hash".into(), total_conversations: 2,
-            conversations_in_batch: 1, last_offset: 1, cursor_exhausted: false,
+            tier: TierKind::Quality,
+            db_fingerprint: "content-v1:cli-next".into(),
+            model_revision: "hash".into(),
+            total_conversations: 2,
+            conversations_in_batch: 1,
+            last_offset: 1,
+            cursor_exhausted: false,
         },
     )?;
     // Keep the file as recovery evidence, but remove it from the recorded name.

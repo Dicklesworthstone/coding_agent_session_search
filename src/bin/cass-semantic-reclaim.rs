@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, error::ErrorKind};
 use coding_agent_search::indexer::semantic::{
-    BackfillArtifactReclaimPlan, BackfillArtifactReclaimReport,
-    apply_backfill_artifact_plan, plan_backfill_artifacts,
+    BackfillArtifactReclaimPlan, BackfillArtifactReclaimReport, apply_backfill_artifact_plan,
+    plan_backfill_artifacts,
 };
 use serde::Serialize;
 
@@ -41,7 +41,9 @@ struct Args {
 
 fn fingerprint(value: &str) -> std::result::Result<String, String> {
     if value.len() == 64
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         Ok(value.to_owned())
     } else {
@@ -69,7 +71,10 @@ impl Outcome {
         match self {
             Self::Preview { plan, .. } if plan.checkpoint_missing => 3,
             Self::Apply { report, .. }
-                if report.checkpoint_missing || !report.failed_paths.is_empty() => 3,
+                if report.checkpoint_missing || !report.failed_paths.is_empty() =>
+            {
+                3
+            }
             _ => 0,
         }
     }
@@ -83,21 +88,44 @@ impl Outcome {
                 Self::Preview { plan, .. } => {
                     writeln!(output, "Archive: {}", plan.data_dir.display())?;
                     if plan.checkpoint_missing {
-                        writeln!(output, "BLOCKED: resumable checkpoint is missing; all fallback artifacts retained.")?;
+                        writeln!(
+                            output,
+                            "BLOCKED: resumable checkpoint is missing; all fallback artifacts retained."
+                        )?;
                     } else {
-                        writeln!(output, "Reclaimable: {} logical bytes in {} files and {} reuse directories",
-                            plan.reclaimable_bytes, plan.reclaimable_files, plan.reclaimable_directories)?;
+                        writeln!(
+                            output,
+                            "Reclaimable: {} logical bytes in {} files and {} reuse directories",
+                            plan.reclaimable_bytes,
+                            plan.reclaimable_files,
+                            plan.reclaimable_directories
+                        )?;
                         for candidate in &plan.candidates {
-                            writeln!(output, "  {} bytes  {}", candidate.size_bytes, candidate.path.display())?;
+                            writeln!(
+                                output,
+                                "  {} bytes  {}",
+                                candidate.size_bytes,
+                                candidate.path.display()
+                            )?;
                         }
                         writeln!(output, "Plan fingerprint: {}", plan.plan_fingerprint)?;
-                        writeln!(output, "No artifacts removed. To apply, repeat with the same --data-dir and:")?;
-                        writeln!(output, "  --apply --plan-fingerprint {}", plan.plan_fingerprint)?;
+                        writeln!(
+                            output,
+                            "No artifacts removed. To apply, repeat with the same --data-dir and:"
+                        )?;
+                        writeln!(
+                            output,
+                            "  --apply --plan-fingerprint {}",
+                            plan.plan_fingerprint
+                        )?;
                     }
                 }
                 Self::Apply { report, .. } => {
-                    writeln!(output, "Reclaimed: {} logical bytes in {} files and {} reuse directories",
-                        report.reclaimed_bytes, report.removed_files, report.removed_directories)?;
+                    writeln!(
+                        output,
+                        "Reclaimed: {} logical bytes in {} files and {} reuse directories",
+                        report.reclaimed_bytes, report.removed_files, report.removed_directories
+                    )?;
                     for path in &report.failed_paths {
                         writeln!(output, "  Could not completely remove: {}", path.display())?;
                     }
@@ -113,26 +141,44 @@ fn run(args: &Args) -> Result<Outcome> {
     match (args.apply, args.dry_run) {
         (true, true) => bail!("apply and dry-run are mutually exclusive"),
         (true, false) => {
-            let expected = args.plan_fingerprint.as_deref().context("apply requires a plan fingerprint")?;
+            let expected = args
+                .plan_fingerprint
+                .as_deref()
+                .context("apply requires a plan fingerprint")?;
             let report = apply_backfill_artifact_plan(&args.data_dir, expected)?;
             let status = if report.failed_paths.is_empty() && !report.checkpoint_missing {
                 "complete"
             } else {
                 "partial"
             };
-            Ok(Outcome::Apply { schema_version: 1, status, report })
+            Ok(Outcome::Apply {
+                schema_version: 1,
+                status,
+                report,
+            })
         }
         (false, _) => {
             let plan = plan_backfill_artifacts(&args.data_dir)?;
-            let status = if plan.checkpoint_missing { "blocked" } else { "ready" };
-            Ok(Outcome::Preview { schema_version: 1, status, plan })
+            let status = if plan.checkpoint_missing {
+                "blocked"
+            } else {
+                "ready"
+            };
+            Ok(Outcome::Preview {
+                schema_version: 1,
+                status,
+                plan,
+            })
         }
     }
 }
 
 fn report_error(json: bool, kind: &str, message: &str) {
     if json {
-        eprintln!("{}", serde_json::json!({"error": {"kind": kind, "message": message}}));
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {"kind": kind, "message": message}})
+        );
     } else {
         eprintln!("{message}");
     }
@@ -140,10 +186,17 @@ fn report_error(json: bool, kind: &str, message: &str) {
 
 fn main() -> ExitCode {
     let raw: Vec<_> = std::env::args_os().collect();
-    let json = raw.iter().any(|value| value.as_os_str() == std::ffi::OsStr::new("--json"));
+    let json = raw
+        .iter()
+        .any(|value| value.as_os_str() == std::ffi::OsStr::new("--json"));
     let args = match Args::try_parse_from(raw) {
         Ok(args) => args,
-        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
             return ExitCode::from(if error.print().is_ok() { 0 } else { 1 });
         }
         Err(error) => {
@@ -156,7 +209,11 @@ fn main() -> ExitCode {
             // A failed output write must not falsely claim that apply did not
             // run: deletion may already have completed before a broken pipe.
             if let Err(error) = outcome.write(args.json, &mut io::stdout().lock()) {
-                report_error(args.json, "output_failed", &format!("operation finished, but result output failed: {error:#}"));
+                report_error(
+                    args.json,
+                    "output_failed",
+                    &format!("operation finished, but result output failed: {error:#}"),
+                );
                 return ExitCode::from(1);
             }
             ExitCode::from(outcome.code())
@@ -186,8 +243,11 @@ mod tests {
             assert!(Args::try_parse_from(base.iter().copied().chain(suffix)).is_err());
         }
         let args = Args::try_parse_from(base.iter().copied().chain([
-            "--apply", "--plan-fingerprint", valid.as_str(),
-        ])).unwrap();
+            "--apply",
+            "--plan-fingerprint",
+            valid.as_str(),
+        ]))
+        .unwrap();
         assert!(args.apply);
         assert!(!Args::try_parse_from(base).unwrap().apply);
     }
@@ -195,7 +255,8 @@ mod tests {
     #[test]
     fn partial_cleanup_and_missing_checkpoint_are_not_success_exit_codes() {
         let partial = Outcome::Apply {
-            schema_version: 1, status: "partial",
+            schema_version: 1,
+            status: "partial",
             report: BackfillArtifactReclaimReport {
                 failed_paths: vec![PathBuf::from("retained")],
                 ..Default::default()

@@ -84,7 +84,11 @@ mod tests {
     fn missing_configuration_and_first_run_history_are_distinct_valid_cases() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("sources.toml");
-        assert!(due_sources_at(&config, directory.path(), 100).unwrap().is_empty());
+        assert!(
+            due_sources_at(&config, directory.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
         assert!(!config.exists());
         std::fs::write(&config, AUTOMATIC).unwrap();
         let due = due_sources_at(&config, directory.path(), 100).unwrap();
@@ -146,7 +150,11 @@ mod tests {
         let config = directory.path().join("sources.toml");
         std::fs::write(&config, AUTOMATIC.replace("hourly", "manual")).unwrap();
         std::fs::write(directory.path().join("sync_status.json"), "not json").unwrap();
-        assert!(due_sources_at(&config, directory.path(), 100).unwrap().is_empty());
+        assert!(
+            due_sources_at(&config, directory.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -159,6 +167,11 @@ mod tests {
             due_sources_at(&config, directory.path(), 100).unwrap_err(),
             SourceScheduleError::Configuration
         );
-        assert!(std::fs::symlink_metadata(config).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(config)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

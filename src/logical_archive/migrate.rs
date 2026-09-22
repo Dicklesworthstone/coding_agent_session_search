@@ -152,7 +152,10 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
     })
 }
 
-fn require_reviewed_table_layout(connection: &Connection, archived: &[Table]) -> Result<Vec<Table>> {
+fn require_reviewed_table_layout(
+    connection: &Connection,
+    archived: &[Table],
+) -> Result<Vec<Table>> {
     let current = export::tables(connection)?;
     ensure!(
         archived == current,
@@ -170,8 +173,7 @@ fn values(cells: Vec<Cell>) -> Result<Vec<SqliteValue>> {
                 Cell::Null => SqliteValue::Null,
                 Cell::Integer(value) => SqliteValue::Integer(value),
                 Cell::Real(bits) => SqliteValue::Float(f64::from_bits(
-                    u64::from_str_radix(&bits, 16)
-                        .map_err(|_| anyhow!("invalid REAL encoding"))?,
+                    u64::from_str_radix(&bits, 16).map_err(|_| anyhow!("invalid REAL encoding"))?,
                 )),
                 Cell::Text(value) => SqliteValue::Text(value.into()),
                 Cell::Blob(value) => SqliteValue::Blob(
@@ -942,8 +944,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
         let destination = root.path().join("restored.db");
-        let outcome =
-            import_compatible(&input, &destination, "reviewed-migration", false)?;
+        let outcome = import_compatible(&input, &destination, "reviewed-migration", false)?;
         let receipt = outcome.migration.context("migration receipt missing")?;
         assert_eq!(receipt.mode, "reviewed_v20_to_v21");
         assert_eq!(
@@ -957,7 +958,10 @@ mod tests {
         assert!(receipt.source_rows_verified);
 
         let storage = SqliteStorage::open_readonly(&destination)?;
-        assert_eq!(u32::try_from(storage.schema_version()?)?, REVIEWED_TARGET_VERSION);
+        assert_eq!(
+            u32::try_from(storage.schema_version()?)?,
+            REVIEWED_TARGET_VERSION
+        );
         let row = storage
             .raw()
             .query_row("SELECT slug, version FROM agents WHERE slug = 'migration-fixture'")?;
@@ -971,12 +975,10 @@ mod tests {
         let root = tempfile::tempdir()?;
         let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
         let destination = root.path().join("restored.db");
-        let created =
-            import_compatible(&input, &destination, "reviewed-migration", false)?;
+        let created = import_compatible(&input, &destination, "reviewed-migration", false)?;
         assert!(created.created);
         let before = database_files(&destination);
-        let repeated =
-            import_compatible(&input, &destination, "reviewed-migration", true)?;
+        let repeated = import_compatible(&input, &destination, "reviewed-migration", true)?;
         assert!(!repeated.created);
         assert!(repeated.migration.is_some());
         assert_eq!(before, database_files(&destination));
@@ -995,9 +997,7 @@ mod tests {
         )?;
         writer.close()?;
         let before = database_files(&destination);
-        assert!(
-            import_compatible(&input, &destination, "reviewed-migration", true).is_err()
-        );
+        assert!(import_compatible(&input, &destination, "reviewed-migration", true).is_err());
         assert_eq!(before, database_files(&destination));
         Ok(())
     }
@@ -1007,9 +1007,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, true)?;
         let destination = root.path().join("restored.db");
-        assert!(
-            import_compatible(&input, &destination, "reviewed-migration", false).is_err()
-        );
+        assert!(import_compatible(&input, &destination, "reviewed-migration", false).is_err());
         assert!(!destination.exists());
         Ok(())
     }
@@ -1019,9 +1017,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION - 1, false)?;
         let destination = root.path().join("restored.db");
-        assert!(
-            import_compatible(&input, &destination, "reviewed-migration", false).is_err()
-        );
+        assert!(import_compatible(&input, &destination, "reviewed-migration", false).is_err());
         assert!(!destination.exists());
         Ok(())
     }
@@ -1031,9 +1027,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let input = versioned_archive(root.path(), REVIEWED_TARGET_VERSION + 1, false)?;
         let destination = root.path().join("restored.db");
-        assert!(
-            import_compatible(&input, &destination, "reviewed-migration", false).is_err()
-        );
+        assert!(import_compatible(&input, &destination, "reviewed-migration", false).is_err());
         assert!(!destination.exists());
         Ok(())
     }

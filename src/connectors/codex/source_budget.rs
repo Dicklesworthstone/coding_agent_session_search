@@ -80,7 +80,10 @@ impl ScanLimits {
         // FAD 0.3.0 selects its streaming parser only for lowercase jsonl.
         // Its other branch uses read_capped; raising that ceiling here would
         // silently certify skipped legacy data as successfully consumed.
-        if path.extension().is_some_and(|extension| extension == "jsonl") {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
             self.jsonl_bytes
         } else {
             self.jsonl_bytes.min(MAX_AUGMENT_ROLLOUT_BYTES)

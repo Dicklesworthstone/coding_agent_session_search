@@ -52,9 +52,9 @@ pub fn apply_backfill_artifact_plan(
 ) -> Result<BackfillArtifactReclaimReport> {
     ensure!(
         expected_fingerprint.len() == 64
-            && expected_fingerprint.bytes().all(|byte| {
-                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-            }),
+            && expected_fingerprint
+                .bytes()
+                .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) }),
         "invalid semantic recovery plan fingerprint; no artifacts removed"
     );
     let (_index_lock, artifacts) = maintenance_locks(data_dir)?;
@@ -71,12 +71,17 @@ pub fn apply_backfill_artifact_plan(
 }
 
 fn maintenance_locks(data_dir: &Path) -> Result<(File, BackfillArtifacts)> {
-    let data_dir = data_dir.canonicalize().context("recovery requires an existing data directory")?;
+    let data_dir = data_dir
+        .canonicalize()
+        .context("recovery requires an existing data directory")?;
     ensure!(data_dir.is_dir(), "recovery data path is not a directory");
     let root = data_dir.join(VECTOR_INDEX_DIR);
-    let metadata = fs::symlink_metadata(&root).context("recovery requires an existing vector_index")?;
-    ensure!(metadata.is_dir() && !is_link_or_reparse(&metadata),
-        "recovery requires a real vector_index directory");
+    let metadata =
+        fs::symlink_metadata(&root).context("recovery requires an existing vector_index")?;
+    ensure!(
+        metadata.is_dir() && !is_link_or_reparse(&metadata),
+        "recovery requires a real vector_index directory"
+    );
     let index_lock = lock_file(&data_dir.join("index-run.lock"))
         .context("cannot inspect/reclaim semantic artifacts while an index writer is active")?;
     let artifacts = BackfillArtifacts::lock(&data_dir)?;
@@ -90,8 +95,15 @@ fn capture_plan(
     let discovery = artifacts.discover(None, None, durable)?;
     let mut witness = blake3::Hasher::new();
     witness.update(b"cass-backfill-reclaim-plan-v1\0");
-    bind(&mut witness, &(PLAN_VERSION, &artifacts.data_dir, &discovery.metadata_fingerprint,
-        discovery.checkpoint_missing))?;
+    bind(
+        &mut witness,
+        &(
+            PLAN_VERSION,
+            &artifacts.data_dir,
+            &discovery.metadata_fingerprint,
+            discovery.checkpoint_missing,
+        ),
+    )?;
     let root = artifacts.data_dir.join(VECTOR_INDEX_DIR);
     bind(&mut witness, &stamp(&root)?)?;
     let mut budget = MAX_INSPECTION_ENTRIES;
@@ -115,7 +127,9 @@ fn capture_plan(
         let candidate = snapshot(&artifacts.data_dir, path, &mut budget)?;
         plan.reclaimable_files += u64::from(!candidate.directory);
         plan.reclaimable_directories += u64::from(candidate.directory);
-        plan.reclaimable_bytes = plan.reclaimable_bytes.checked_add(candidate.size_bytes)
+        plan.reclaimable_bytes = plan
+            .reclaimable_bytes
+            .checked_add(candidate.size_bytes)
             .context("semantic recovery byte count overflow")?;
         plan.candidates.push(candidate);
     }
@@ -150,7 +164,10 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
     } else if metadata.is_dir() {
         "directory"
     } else {
-        bail!("unsupported filesystem entry {}; refusing recovery", path.display());
+        bail!(
+            "unsupported filesystem entry {}; refusing recovery",
+            path.display()
+        );
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -160,15 +177,28 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
         modified: metadata.modified()?,
         created: metadata.created().ok(),
         #[cfg(unix)]
-        unix_identity: (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec(),
-            metadata.mode(), metadata.nlink()),
-        link_target: if kind == "symlink" { Some(fs::read_link(path)?) } else { None },
+        unix_identity: (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mode(),
+            metadata.nlink(),
+        ),
+        link_target: if kind == "symlink" {
+            Some(fs::read_link(path)?)
+        } else {
+            None
+        },
     }))
 }
 
 fn snapshot(data_dir: &Path, path: &Path, budget: &mut usize) -> Result<BackfillArtifactCandidate> {
     let first = stamp(path)?.context("recovery candidate disappeared")?;
-    ensure!(matches!(first.kind, "file" | "directory"), "candidate became a link");
+    ensure!(
+        matches!(first.kind, "file" | "directory"),
+        "candidate became a link"
+    );
     let mut candidate = BackfillArtifactCandidate {
         path: path.strip_prefix(data_dir)?.to_path_buf(),
         directory: first.kind == "directory",
@@ -185,13 +215,17 @@ fn snapshot(data_dir: &Path, path: &Path, budget: &mut usize) -> Result<Backfill
         bind(&mut witness, &(next.strip_prefix(data_dir)?, &observed))?;
         candidate.entry_count += 1;
         if observed.kind == "file" {
-            candidate.size_bytes = candidate.size_bytes.checked_add(observed.len)
+            candidate.size_bytes = candidate
+                .size_bytes
+                .checked_add(observed.len)
                 .context("semantic scratch byte count overflow")?;
         } else if observed.kind == "directory" {
             let mut children = Vec::new();
             for entry in fs::read_dir(&next)? {
-                ensure!(children.len() + pending.len() < *budget,
-                    "semantic recovery inventory exceeds its entry budget");
+                ensure!(
+                    children.len() + pending.len() < *budget,
+                    "semantic recovery inventory exceeds its entry budget"
+                );
                 children.push(entry?.path());
             }
             children.sort();
@@ -204,7 +238,9 @@ fn snapshot(data_dir: &Path, path: &Path, budget: &mut usize) -> Result<Backfill
 }
 
 fn consume(budget: &mut usize) -> Result<()> {
-    *budget = budget.checked_sub(1).context("semantic recovery inventory exceeds its entry budget")?;
+    *budget = budget
+        .checked_sub(1)
+        .context("semantic recovery inventory exceeds its entry budget")?;
     Ok(())
 }
 

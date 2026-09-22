@@ -28019,11 +28019,9 @@ fn search_existing_lexical_generation_is_usable(
     if !crate::search::tantivy::searchable_index_exists(index_path) {
         return Ok(false);
     }
-    Ok(
-        search_lexical_self_heal_diagnosis(index_path, db_path)?
-            .as_ref()
-            .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild()),
-    )
+    Ok(search_lexical_self_heal_diagnosis(index_path, db_path)?
+        .as_ref()
+        .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild()))
 }
 
 fn admit_search_lexical_repair(db_path: &Path, reason: &str) -> CliResult<()> {
@@ -28052,9 +28050,10 @@ fn verify_search_lexical_repair_publication(
     db_path: &Path,
     indexed_docs: usize,
 ) -> anyhow::Result<()> {
-    let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(index_path)?.ok_or_else(|| {
-        anyhow::anyhow!("lexical repair returned success without a published checkpoint")
-    })?;
+    let checkpoint =
+        crate::indexer::load_lexical_rebuild_checkpoint(index_path)?.ok_or_else(|| {
+            anyhow::anyhow!("lexical repair returned success without a published checkpoint")
+        })?;
     anyhow::ensure!(
         checkpoint.completed,
         "lexical repair returned success but publication is incomplete"
@@ -28066,7 +28065,10 @@ fn verify_search_lexical_repair_publication(
         checkpoint.indexed_docs
     );
     let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path).map_err(|error| {
-        anyhow::anyhow!("cannot verify repaired lexical publication: {}", error.message)
+        anyhow::anyhow!(
+            "cannot verify repaired lexical publication: {}",
+            error.message
+        )
     })?;
     if let Some(diagnosis) = diagnosis {
         // A concurrent canonical append may make a completed, readable

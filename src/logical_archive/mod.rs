@@ -55,9 +55,7 @@ enum Operation {
         include_private: bool,
     },
     /// Verify framing, identities, counts and digest without opening a database.
-    Verify {
-        input: PathBuf,
-    },
+    Verify { input: PathBuf },
     /// Search verified backup message bodies without restoring a DB or index.
     Search {
         input: PathBuf,
@@ -157,9 +155,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
                         .map(|directory| directory.join("agent_search.db"))
                 })
                 .ok_or_else(|| {
-                    anyhow!(
-                        "export requires an explicit --db or --data-dir (or CASS_DATA_DIR)"
-                    )
+                    anyhow!("export requires an explicit --db or --data-dir (or CASS_DATA_DIR)")
                 })?;
             let (header, completion) = export::export_file(&source, &output, archive_id)?;
             ("export", header, completion)
@@ -268,8 +264,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         receipt["schema_migration"] = serde_json::to_value(migration)?;
     }
     if let Some(rebuild) = lexical_rebuild {
-        receipt["derived_search_assets"] =
-            serde_json::json!("lexical_rebuilt_semantic_not_built");
+        receipt["derived_search_assets"] = serde_json::json!("lexical_rebuilt_semantic_not_built");
         receipt["lexical_rebuild"] = serde_json::to_value(rebuild)?;
     }
     println!("{receipt}");

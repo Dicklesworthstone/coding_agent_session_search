@@ -21,18 +21,31 @@ fn plan(fingerprint: &str, complete: bool) -> SemanticBackfillBatchPlan {
 }
 
 fn rows(id: u64) -> Vec<EmbeddingInput> {
-    vec![EmbeddingInput::new(id, format!("compiler recovery evidence {id}"))]
+    vec![EmbeddingInput::new(
+        id,
+        format!("compiler recovery evidence {id}"),
+    )]
 }
 
 fn setup(data: &Path) -> Result<(SemanticIndexer, SemanticManifest, PathBuf, PathBuf)> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    let live = indexer.run_backfill_batch(
-        &rows(10), data, &mut manifest, plan("content-v1:published", true),
-    )?.index_path;
-    let checkpoint = indexer.run_backfill_batch(
-        &rows(1), data, &mut manifest, plan("content-v1:checkpoint", false),
-    )?.index_path;
+    let live = indexer
+        .run_backfill_batch(
+            &rows(10),
+            data,
+            &mut manifest,
+            plan("content-v1:published", true),
+        )?
+        .index_path;
+    let checkpoint = indexer
+        .run_backfill_batch(
+            &rows(1),
+            data,
+            &mut manifest,
+            plan("content-v1:checkpoint", false),
+        )?
+        .index_path;
     Ok((indexer, manifest, live, checkpoint))
 }
 
@@ -46,10 +59,13 @@ fn fallback_files(data: &Path, checkpoint: &Path) -> Result<Vec<(PathBuf, Vec<u8
     fs::create_dir(&reuse)?;
     let candidate = reuse.join("candidate.fsvi");
     fs::copy(checkpoint, &candidate)?;
-    [fallback, wal, candidate].into_iter().map(|path| {
-        let bytes = fs::read(&path)?;
-        Ok((path, bytes))
-    }).collect()
+    [fallback, wal, candidate]
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path)?;
+            Ok((path, bytes))
+        })
+        .collect()
 }
 
 fn assert_preserved(files: &[(PathBuf, Vec<u8>)]) -> Result<()> {
@@ -60,7 +76,8 @@ fn assert_preserved(files: &[(PathBuf, Vec<u8>)]) -> Result<()> {
 }
 
 #[test]
-fn truncated_checkpoint_preserves_fallbacks_live_bytes_and_search_on_every_entry_point() -> Result<()> {
+fn truncated_checkpoint_preserves_fallbacks_live_bytes_and_search_on_every_entry_point()
+-> Result<()> {
     for len in [0, 1, 16] {
         let temp = tempfile::tempdir()?;
         let data = temp.path();
@@ -80,9 +97,16 @@ fn truncated_checkpoint_preserves_fallbacks_live_bytes_and_search_on_every_entry
         assert!(plan_backfill_artifacts(data).is_err());
         assert!(apply_backfill_artifact_plan(data, &approval.plan_fingerprint).is_err());
         // This public call must stop before embedding or creating a replacement.
-        assert!(indexer.run_backfill_batch(
-            &rows(2), data, &mut manifest, plan("content-v1:next", false),
-        ).is_err());
+        assert!(
+            indexer
+                .run_backfill_batch(
+                    &rows(2),
+                    data,
+                    &mut manifest,
+                    plan("content-v1:next", false),
+                )
+                .is_err()
+        );
 
         assert_preserved(&files)?;
         assert_eq!(fs::read(&checkpoint)?, &saved[..len]);
@@ -90,7 +114,10 @@ fn truncated_checkpoint_preserves_fallbacks_live_bytes_and_search_on_every_entry
         assert_eq!(fs::read(&live)?, before_live);
         assert_eq!(hits, format!("{:?}", reader.search_top_k(&query, 3, None)?));
         let reopened = VectorIndex::open_read_only(&live)?;
-        assert_eq!(hits, format!("{:?}", reopened.search_top_k(&query, 3, None)?));
+        assert_eq!(
+            hits,
+            format!("{:?}", reopened.search_top_k(&query, 3, None)?)
+        );
     }
     Ok(())
 }
@@ -105,12 +132,19 @@ fn valid_fsvi_from_a_different_producer_cannot_authorize_reclamation() -> Result
     let before_manifest = fs::read(SemanticManifest::path(data))?;
     let foreign = data.join("foreign.fsvi");
     let mut writer = VectorIndex::create_with_revision(
-        &foreign, "other-producer", "test-v1", 384, Quantization::F16,
+        &foreign,
+        "other-producer",
+        "test-v1",
+        384,
+        Quantization::F16,
     )?;
     writer.write_record("foreign-document", &[0.25_f32; 384])?;
     writer.finish()?;
     fs::copy(&foreign, &checkpoint)?;
-    assert_eq!(VectorIndex::open_read_only(&checkpoint)?.embedder_id(), "other-producer");
+    assert_eq!(
+        VectorIndex::open_read_only(&checkpoint)?.embedder_id(),
+        "other-producer"
+    );
 
     let error = reclaim_backfill_artifacts(data).unwrap_err();
     assert!(format!("{error:#}").contains("expected fnv1a-384"));
@@ -138,12 +172,17 @@ fn restoring_checkpoint_allows_a_new_approval_without_rewriting_live_data() -> R
     // orphan as a replacement or invents a new checkpoint on the user's behalf.
     fs::write(&checkpoint, &saved)?;
     let approval = plan_backfill_artifacts(data)?;
-    assert_eq!((approval.reclaimable_files, approval.reclaimable_directories), (2, 1));
+    assert_eq!(
+        (approval.reclaimable_files, approval.reclaimable_directories),
+        (2, 1)
+    );
     let report = apply_backfill_artifact_plan(data, &approval.plan_fingerprint)?;
     assert_eq!((report.removed_files, report.removed_directories), (2, 1));
     assert!(report.failed_paths.is_empty());
     assert_eq!(report.reclaimed_bytes, approval.reclaimable_bytes);
-    for (path, _) in files { assert!(!path.exists()); }
+    for (path, _) in files {
+        assert!(!path.exists());
+    }
     assert_eq!(fs::read(&live)?, before_live);
     assert_eq!(fs::read(&checkpoint)?, saved);
     assert_eq!(fs::read(SemanticManifest::path(data))?, before_manifest);
@@ -157,12 +196,20 @@ fn setup_wal(data: &Path) -> Result<(PathBuf, PathBuf, Vec<u8>)> {
     // Keep one appended record below the default 10% compaction ratio, so
     // this verifies a WAL-backed checkpoint rather than an already compacted one.
     let base: Vec<_> = (1..=128).flat_map(rows).collect();
-    let checkpoint = indexer.run_backfill_batch(
-        &base, data, &mut manifest, plan("content-v1:wal-checkpoint", false),
-    )?.index_path;
+    let checkpoint = indexer
+        .run_backfill_batch(
+            &base,
+            data,
+            &mut manifest,
+            plan("content-v1:wal-checkpoint", false),
+        )?
+        .index_path;
     let before_append = fs::read(SemanticManifest::path(data))?;
     indexer.run_backfill_batch(
-        &rows(129), data, &mut manifest, plan("content-v1:wal-checkpoint", false),
+        &rows(129),
+        data,
+        &mut manifest,
+        plan("content-v1:wal-checkpoint", false),
     )?;
     assert_eq!(manifest.checkpoint.as_ref().unwrap().docs_embedded, 129);
     Ok((live, checkpoint, before_append))
@@ -174,13 +221,26 @@ fn healthy_checkpoint_with_appended_wal_survives_preview_and_apply_byte_for_byte
     let data = temp.path();
     let (live, checkpoint, _) = setup_wal(data)?;
     let wal = wal_path_for(&checkpoint);
-    assert!(wal.is_file(), "fixture must exercise a real appended FSVI WAL");
-    let before = [(checkpoint.clone(), fs::read(&checkpoint)?), (wal.clone(), fs::read(&wal)?),
+    assert!(
+        wal.is_file(),
+        "fixture must exercise a real appended FSVI WAL"
+    );
+    let before = [
+        (checkpoint.clone(), fs::read(&checkpoint)?),
+        (wal.clone(), fs::read(&wal)?),
         (live.clone(), fs::read(&live)?),
-        (SemanticManifest::path(data), fs::read(SemanticManifest::path(data))?)];
+        (
+            SemanticManifest::path(data),
+            fs::read(SemanticManifest::path(data))?,
+        ),
+    ];
     let reader = VectorIndex::open_read_only(&checkpoint)?;
     let query = HashEmbedder::default().embed_sync("compiler recovery evidence")?;
-    assert_eq!(reader.wal_record_count(), 1, "fixture must retain the appended WAL record");
+    assert_eq!(
+        reader.wal_record_count(),
+        1,
+        "fixture must retain the appended WAL record"
+    );
     let results = reader.search_top_k(&query, 200, None)?;
     assert_eq!(results.len(), 129);
     let hits = format!("{results:?}");
@@ -190,14 +250,20 @@ fn healthy_checkpoint_with_appended_wal_survives_preview_and_apply_byte_for_byte
     assert_preserved(&before)?;
     apply_backfill_artifact_plan(data, &approval.plan_fingerprint)?;
     assert_preserved(&before)?;
-    for (path, _) in files { assert!(!path.exists()); }
+    for (path, _) in files {
+        assert!(!path.exists());
+    }
     let reopened = VectorIndex::open_read_only(&checkpoint)?;
-    assert_eq!(hits, format!("{:?}", reopened.search_top_k(&query, 200, None)?));
+    assert_eq!(
+        hits,
+        format!("{:?}", reopened.search_top_k(&query, 200, None)?)
+    );
     Ok(())
 }
 
 #[test]
-fn missing_or_torn_acknowledged_wal_retains_fallbacks_instead_of_trusting_the_main_header() -> Result<()> {
+fn missing_or_torn_acknowledged_wal_retains_fallbacks_instead_of_trusting_the_main_header()
+-> Result<()> {
     for missing in [true, false] {
         let temp = tempfile::tempdir()?;
         let data = temp.path();
@@ -205,9 +271,14 @@ fn missing_or_torn_acknowledged_wal_retains_fallbacks_instead_of_trusting_the_ma
         let wal = wal_path_for(&checkpoint);
         let wal_bytes = fs::read(&wal)?;
         let files = fallback_files(data, &checkpoint)?;
-        let before = [(checkpoint.clone(), fs::read(&checkpoint)?),
+        let before = [
+            (checkpoint.clone(), fs::read(&checkpoint)?),
             (live.clone(), fs::read(&live)?),
-            (SemanticManifest::path(data), fs::read(SemanticManifest::path(data))?)];
+            (
+                SemanticManifest::path(data),
+                fs::read(SemanticManifest::path(data))?,
+            ),
+        ];
         let approval = plan_backfill_artifacts(data)?;
         if missing {
             fs::rename(&wal, data.join("retained-original.wal"))?;
@@ -221,8 +292,14 @@ fn missing_or_torn_acknowledged_wal_retains_fallbacks_instead_of_trusting_the_ma
         assert!(apply_backfill_artifact_plan(data, &approval.plan_fingerprint).is_err());
         assert_preserved(&files)?;
         assert_preserved(&before)?;
-        assert_eq!(fs::read(&wal).ok(), damaged_wal, "inspection must not repair the WAL");
-        if missing { assert_eq!(fs::read(data.join("retained-original.wal"))?, wal_bytes); }
+        assert_eq!(
+            fs::read(&wal).ok(),
+            damaged_wal,
+            "inspection must not repair the WAL"
+        );
+        if missing {
+            assert_eq!(fs::read(data.join("retained-original.wal"))?, wal_bytes);
+        }
     }
     Ok(())
 }
@@ -234,15 +311,28 @@ fn appended_records_beyond_the_last_durable_checkpoint_remain_recoverable() -> R
     let (live, checkpoint, before_append) = setup_wal(data)?;
     // Simulate the crash cut after a WAL append but before checkpoint advance.
     fs::write(SemanticManifest::path(data), &before_append)?;
-    assert_eq!(SemanticManifest::load(data)?.unwrap().checkpoint.unwrap().docs_embedded, 128);
+    assert_eq!(
+        SemanticManifest::load(data)?
+            .unwrap()
+            .checkpoint
+            .unwrap()
+            .docs_embedded,
+        128
+    );
     let wal = wal_path_for(&checkpoint);
-    let before = [(checkpoint.clone(), fs::read(&checkpoint)?), (wal.clone(), fs::read(&wal)?),
-        (live.clone(), fs::read(&live)?), (SemanticManifest::path(data), before_append)];
+    let before = [
+        (checkpoint.clone(), fs::read(&checkpoint)?),
+        (wal.clone(), fs::read(&wal)?),
+        (live.clone(), fs::read(&live)?),
+        (SemanticManifest::path(data), before_append),
+    ];
     let files = fallback_files(data, &checkpoint)?;
     let approval = plan_backfill_artifacts(data)?;
     apply_backfill_artifact_plan(data, &approval.plan_fingerprint)?;
     assert_preserved(&before)?;
-    for (path, _) in files { assert!(!path.exists()); }
+    for (path, _) in files {
+        assert!(!path.exists());
+    }
     let reader = VectorIndex::open_read_only(&checkpoint)?;
     assert_eq!(reader.wal_record_count(), 1);
     let query = HashEmbedder::default().embed_sync("compiler recovery evidence")?;

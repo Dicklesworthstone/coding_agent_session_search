@@ -43,31 +43,57 @@ impl SearchCursor {
     }
 
     fn decode(encoded: &str, contains: &str, conversation_id: Option<i64>) -> Result<Self> {
-        ensure!(!encoded.is_empty() && encoded.len() <= MAX_CURSOR_BYTES, "invalid logical search cursor size");
-        let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| anyhow!("invalid logical search cursor encoding"))?;
-        let cursor: Self = serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid logical search cursor"))?;
-        ensure!(cursor.version == 1 && cursor.after_message_id > 0, "unsupported logical search cursor");
+        ensure!(
+            !encoded.is_empty() && encoded.len() <= MAX_CURSOR_BYTES,
+            "invalid logical search cursor size"
+        );
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| anyhow!("invalid logical search cursor encoding"))?;
+        let cursor: Self =
+            serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid logical search cursor"))?;
+        ensure!(
+            cursor.version == 1 && cursor.after_message_id > 0,
+            "unsupported logical search cursor"
+        );
         validate_digest(&cursor.content_sha256)?;
-        ensure!(cursor.criteria_sha256 == Self::criteria(contains, conversation_id)?,
-            "logical search cursor belongs to a different query or conversation filter");
+        ensure!(
+            cursor.criteria_sha256 == Self::criteria(contains, conversation_id)?,
+            "logical search cursor belongs to a different query or conversation filter"
+        );
         Ok(cursor)
     }
 
     fn encode(self) -> Result<String> {
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&self)?);
-        ensure!(encoded.len() <= MAX_CURSOR_BYTES, "logical search cursor exceeds its budget");
+        ensure!(
+            encoded.len() <= MAX_CURSOR_BYTES,
+            "logical search cursor exceeds its budget"
+        );
         Ok(encoded)
     }
 }
 
 fn column(table: &Table, name: &str) -> Result<usize> {
-    table.columns.iter().position(|item| item == name)
-        .ok_or_else(|| anyhow!("logical backup is missing a required {}.{name} column", table.name))
+    table
+        .columns
+        .iter()
+        .position(|item| item == name)
+        .ok_or_else(|| {
+            anyhow!(
+                "logical backup is missing a required {}.{name} column",
+                table.name
+            )
+        })
 }
 
 fn id_key(table: &Table) -> Result<usize> {
     let id = column(table, "id")?;
-    ensure!(table.primary_key == [id], "logical backup requires {}.id as its sole primary key", table.name);
+    ensure!(
+        table.primary_key == [id],
+        "logical backup requires {}.id as its sole primary key",
+        table.name
+    );
     Ok(id)
 }
 
@@ -140,7 +166,9 @@ fn scan(
     let mut conversations = false;
     let mut line = 2_u64;
     while let Some(record) = codec::read_record(input, line)? {
-        validator.push(&record).with_context(|| format!("logical evidence record {line}"))?;
+        validator
+            .push(&record)
+            .with_context(|| format!("logical evidence record {line}"))?;
         match &record {
             Record::Table { table } => {
                 current = Rows::for_table(table)?;
@@ -151,10 +179,15 @@ fn scan(
                 .with_context(|| format!("logical evidence record {line}"))?,
             Record::Header { .. } | Record::Completion { .. } => {}
         }
-        line = line.checked_add(1).context("logical record position overflow")?;
+        line = line
+            .checked_add(1)
+            .context("logical record position overflow")?;
     }
     let verified = validator.finish()?;
-    ensure!(messages && conversations, "logical backup lacks the messages/conversations evidence schema");
+    ensure!(
+        messages && conversations,
+        "logical backup lacks the messages/conversations evidence schema"
+    );
     Ok(verified)
 }
 
@@ -181,12 +214,16 @@ fn conversation_identity(values: &[Cell], columns: &ConversationColumns) -> Resu
     let source_id = text(values, columns.source_id)?;
     let source_path = text(values, columns.source_path)?;
     ensure!(
-        !source_id.is_empty() && !source_path.is_empty()
+        !source_id.is_empty()
+            && !source_path.is_empty()
             && source_id.len() <= MAX_IDENTITY_BYTES
             && source_path.len() <= MAX_IDENTITY_BYTES,
         "selected conversation identity must contain 1..4096 bytes; identities are never truncated"
     );
-    Ok(Conversation { source_id: source_id.to_owned(), source_path: source_path.to_owned() })
+    Ok(Conversation {
+        source_id: source_id.to_owned(),
+        source_path: source_path.to_owned(),
+    })
 }
 
 fn resolve_conversations(
@@ -194,7 +231,9 @@ fn resolve_conversations(
     selected: &BTreeSet<i64>,
     expected: &(Header, Completion),
 ) -> Result<BTreeMap<i64, Conversation>> {
-    input.rewind().context("cannot rewind the admitted logical backup")?;
+    input
+        .rewind()
+        .context("cannot rewind the admitted logical backup")?;
     let mut found = BTreeMap::new();
     let verified = scan(input, |rows, values| {
         if let Rows::Conversations(columns) = rows {
@@ -205,22 +244,44 @@ fn resolve_conversations(
         }
         Ok(())
     })?;
-    ensure!(&verified == expected, "logical backup changed between evidence selection and identity resolution");
-    ensure!(found.len() == selected.len(), "selected message refers to a missing canonical conversation");
+    ensure!(
+        &verified == expected,
+        "logical backup changed between evidence selection and identity resolution"
+    );
+    ensure!(
+        found.len() == selected.len(),
+        "selected message refers to a missing canonical conversation"
+    );
     Ok(found)
 }
 
 fn excerpt(content: &str, at: usize) -> (String, usize, usize) {
-    let start = content[..at].char_indices().rev().take(80).last().map_or(at, |(i, _)| i);
-    let end = content[start..].char_indices().nth(SNIPPET_CHARS)
+    let start = content[..at]
+        .char_indices()
+        .rev()
+        .take(80)
+        .last()
+        .map_or(at, |(i, _)| i);
+    let end = content[start..]
+        .char_indices()
+        .nth(SNIPPET_CHARS)
         .map_or(content.len(), |(i, _)| start + i);
     (content[start..end].to_owned(), start, end)
 }
 
 fn validate_search(contains: &str, limit: usize, conversation_id: Option<i64>) -> Result<()> {
-    ensure!(!contains.is_empty() && contains.len() <= MAX_QUERY_BYTES, "--contains requires 1..1024 UTF-8 bytes");
-    ensure!((1..=MAX_HITS).contains(&limit), "--limit must be between 1 and 100");
-    ensure!(conversation_id.is_none_or(|id| id > 0), "--conversation-id must be positive");
+    ensure!(
+        !contains.is_empty() && contains.len() <= MAX_QUERY_BYTES,
+        "--contains requires 1..1024 UTF-8 bytes"
+    );
+    ensure!(
+        (1..=MAX_HITS).contains(&limit),
+        "--limit must be between 1 and 100"
+    );
+    ensure!(
+        conversation_id.is_none_or(|id| id > 0),
+        "--conversation-id must be positive"
+    );
     Ok(())
 }
 
@@ -236,7 +297,9 @@ impl Write for ResponseBudget {
         self.0 -= bytes.len();
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn bounded_response(value: Value) -> Result<Value> {
@@ -256,7 +319,9 @@ pub fn search(
 ) -> Result<Value> {
     validate_search(contains, limit, conversation_id)?;
     // Decode before opening the input, including the bounded cursor payload.
-    let cursor = cursor.map(|value| SearchCursor::decode(value, contains, conversation_id)).transpose()?;
+    let cursor = cursor
+        .map(|value| SearchCursor::decode(value, contains, conversation_id))
+        .transpose()?;
     let mut input = BufReader::new(super::import::open_input(path)?);
     search_page(&mut input, contains, limit, conversation_id, cursor)
 }
@@ -287,42 +352,79 @@ fn search_page(
             let id = integer(values, columns.id)?;
             let conversation = integer(values, columns.conversation)?;
             let idx = integer(values, columns.idx)?;
-            ensure!(id > 0 && conversation > 0 && idx >= 0, "logical message identities or coordinates are invalid");
+            ensure!(
+                id > 0 && conversation > 0 && idx >= 0,
+                "logical message identities or coordinates are invalid"
+            );
             let content = text(values, columns.content)?;
-            if conversation_id.is_some_and(|expected| expected != conversation) { return Ok(()); }
-            let Some(at) = content.find(contains) else { return Ok(()); };
-            total = total.checked_add(1).context("logical match count overflow")?;
-            if cursor.as_ref().is_some_and(|cursor| id <= cursor.after_message_id) { return Ok(()); }
-            remaining = remaining.checked_add(1).context("logical match count overflow")?;
-            if retained.len() == limit { return Ok(()); }
+            if conversation_id.is_some_and(|expected| expected != conversation) {
+                return Ok(());
+            }
+            let Some(at) = content.find(contains) else {
+                return Ok(());
+            };
+            total = total
+                .checked_add(1)
+                .context("logical match count overflow")?;
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| id <= cursor.after_message_id)
+            {
+                return Ok(());
+            }
+            remaining = remaining
+                .checked_add(1)
+                .context("logical match count overflow")?;
+            if retained.len() == limit {
+                return Ok(());
+            }
             let role = text(values, columns.role)?;
             ensure!(role.len() <= 128, "selected message role exceeds 128 bytes");
             let (snippet, start, end) = excerpt(content, at);
             retained.push(MessageMatch {
-                message_id: id, conversation_id: conversation, message_index: idx as u64 + 1,
-                role: role.to_owned(), snippet, snippet_start_byte: start, snippet_end_byte: end,
-                content_bytes: content.len(), match_start_byte: at, match_end_byte: at + contains.len(),
+                message_id: id,
+                conversation_id: conversation,
+                message_index: idx as u64 + 1,
+                role: role.to_owned(),
+                snippet,
+                snippet_start_byte: start,
+                snippet_end_byte: end,
+                content_bytes: content.len(),
+                match_start_byte: at,
+                match_end_byte: at + contains.len(),
             });
         }
         Ok(())
     })?;
     if let Some(cursor) = cursor {
-        ensure!(cursor.content_sha256 == verified.1.content_sha256,
-            "logical backup changed since the cursor was issued; restart the search");
+        ensure!(
+            cursor.content_sha256 == verified.1.content_sha256,
+            "logical backup changed since the cursor was issued; restart the search"
+        );
     }
     let selected = retained.iter().map(|hit| hit.conversation_id).collect();
     let conversations = resolve_conversations(input, &selected, &verified)?;
     let has_more = remaining > retained.len() as u64;
     let next_cursor = if has_more {
-        Some(SearchCursor {
-            version: 1, content_sha256: verified.1.content_sha256.clone(),
-            criteria_sha256: SearchCursor::criteria(contains, conversation_id)?,
-            after_message_id: retained.last().context("missing logical continuation anchor")?.message_id,
-        }.encode()?)
-    } else { None };
+        Some(
+            SearchCursor {
+                version: 1,
+                content_sha256: verified.1.content_sha256.clone(),
+                criteria_sha256: SearchCursor::criteria(contains, conversation_id)?,
+                after_message_id: retained
+                    .last()
+                    .context("missing logical continuation anchor")?
+                    .message_id,
+            }
+            .encode()?,
+        )
+    } else {
+        None
+    };
     let mut hits = Vec::with_capacity(retained.len());
     for hit in retained {
-        let conversation = conversations.get(&hit.conversation_id)
+        let conversation = conversations
+            .get(&hit.conversation_id)
             .context("selected conversation disappeared from bounded evidence")?;
         let mut value = serde_json::to_value(hit)?;
         value["source_id"] = json!(conversation.source_id);
@@ -356,8 +458,10 @@ impl Anchor {
             conversation: integer(values, columns.conversation)?,
             idx: integer(values, columns.idx)?,
         };
-        ensure!(anchor.id > 0 && anchor.conversation > 0 && anchor.idx >= 0,
-            "logical message identities or coordinates are invalid");
+        ensure!(
+            anchor.id > 0 && anchor.conversation > 0 && anchor.idx >= 0,
+            "logical message identities or coordinates are invalid"
+        );
         Ok(anchor)
     }
 }
@@ -369,8 +473,13 @@ fn validate_view(message_id: i64, context: usize, digest: &str) -> Result<()> {
 }
 
 fn validate_digest(digest: &str) -> Result<()> {
-    ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "--content-sha256 requires the 64 lowercase hex digits from archive search or verify");
+    ensure!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "--content-sha256 requires the 64 lowercase hex digits from archive search or verify"
+    );
     Ok(())
 }
 
@@ -383,10 +492,17 @@ fn retain_neighbour(
     context: usize,
     preceding: bool,
 ) -> Result<()> {
-    ensure!(!selected.contains_key(&anchor.idx), "selected conversation contains duplicate message coordinates");
+    ensure!(
+        !selected.contains_key(&anchor.idx),
+        "selected conversation contains duplicate message coordinates"
+    );
     selected.insert(anchor.idx, anchor);
     if selected.len() > context {
-        if preceding { selected.pop_first(); } else { selected.pop_last(); }
+        if preceding {
+            selected.pop_first();
+        } else {
+            selected.pop_last();
+        }
     }
     Ok(())
 }
@@ -415,11 +531,17 @@ fn view_stream(
         }
         Ok(())
     })?;
-    ensure!(verified.1.content_sha256 == digest,
-        "logical backup does not match --content-sha256; rerun search instead of reusing a different snapshot's message ID");
-    let target = target.context("message ID not found in the verified logical backup; no neighbour was substituted")?;
+    ensure!(
+        verified.1.content_sha256 == digest,
+        "logical backup does not match --content-sha256; rerun search instead of reusing a different snapshot's message ID"
+    );
+    let target = target.context(
+        "message ID not found in the verified logical backup; no neighbour was substituted",
+    )?;
 
-    input.rewind().context("cannot rewind the admitted logical backup")?;
+    input
+        .rewind()
+        .context("cannot rewind the admitted logical backup")?;
     let mut before = BTreeMap::new();
     let mut after = BTreeMap::new();
     let mut before_count = 0_u64;
@@ -430,17 +552,25 @@ fn view_stream(
             Rows::Conversations(columns) if integer(values, columns.id)? == target.conversation => {
                 conversation = Some(conversation_identity(values, columns)?);
             }
-            Rows::Messages(columns) if integer(values, columns.conversation)? == target.conversation => {
+            Rows::Messages(columns)
+                if integer(values, columns.conversation)? == target.conversation =>
+            {
                 let anchor = Anchor::read(values, columns)?;
                 match anchor.idx.cmp(&target.idx) {
-                    std::cmp::Ordering::Equal => ensure!(anchor == target,
-                        "selected conversation contains duplicate target coordinates"),
+                    std::cmp::Ordering::Equal => ensure!(
+                        anchor == target,
+                        "selected conversation contains duplicate target coordinates"
+                    ),
                     std::cmp::Ordering::Less => {
-                        before_count = before_count.checked_add(1).context("neighbour count overflow")?;
+                        before_count = before_count
+                            .checked_add(1)
+                            .context("neighbour count overflow")?;
                         retain_neighbour(&mut before, anchor, context, true)?;
                     }
                     std::cmp::Ordering::Greater => {
-                        after_count = after_count.checked_add(1).context("neighbour count overflow")?;
+                        after_count = after_count
+                            .checked_add(1)
+                            .context("neighbour count overflow")?;
                         retain_neighbour(&mut after, anchor, context, false)?;
                     }
                 }
@@ -449,16 +579,28 @@ fn view_stream(
         }
         Ok(())
     })?;
-    ensure!(second == verified, "logical backup changed during context selection");
-    let conversation = conversation.context("selected message refers to a missing canonical conversation")?;
+    ensure!(
+        second == verified,
+        "logical backup changed during context selection"
+    );
+    let conversation =
+        conversation.context("selected message refers to a missing canonical conversation")?;
     let more_before = before_count > before.len() as u64;
     let more_after = after_count > after.len() as u64;
-    let anchors: BTreeMap<i64, Anchor> = before.into_values()
-        .chain(std::iter::once(target)).chain(after.into_values())
-        .map(|anchor| (anchor.id, anchor)).collect();
-    ensure!(anchors.len() <= 2 * context + 1, "logical context exceeded its selection budget");
+    let anchors: BTreeMap<i64, Anchor> = before
+        .into_values()
+        .chain(std::iter::once(target))
+        .chain(after.into_values())
+        .map(|anchor| (anchor.id, anchor))
+        .collect();
+    ensure!(
+        anchors.len() <= 2 * context + 1,
+        "logical context exceeded its selection budget"
+    );
 
-    input.rewind().context("cannot rewind the admitted logical backup")?;
+    input
+        .rewind()
+        .context("cannot rewind the admitted logical backup")?;
     let mut messages = BTreeMap::new();
     let mut content_bytes = 0_usize;
     let third = scan(input, |rows, values| {
@@ -466,23 +608,37 @@ fn view_stream(
             let id = integer(values, columns.id)?;
             if let Some(expected) = anchors.get(&id) {
                 let actual = Anchor::read(values, columns)?;
-                ensure!(&actual == expected, "logical message coordinates changed during body hydration");
+                ensure!(
+                    &actual == expected,
+                    "logical message coordinates changed during body hydration"
+                );
                 let content = text(values, columns.content)?;
-                ensure!(content.len() <= MAX_VIEW_CONTENT_BYTES - content_bytes,
-                    "complete logical message window exceeds 64 KiB; reduce context or restore the backup for larger bodies");
+                ensure!(
+                    content.len() <= MAX_VIEW_CONTENT_BYTES - content_bytes,
+                    "complete logical message window exceeds 64 KiB; reduce context or restore the backup for larger bodies"
+                );
                 let role = text(values, columns.role)?;
                 ensure!(role.len() <= 128, "selected message role exceeds 128 bytes");
                 content_bytes += content.len();
-                messages.insert(actual.idx, json!({
-                    "message_id": id, "message_index": actual.idx as u64 + 1,
-                    "content": content, "role": role, "is_target": id == target.id,
-                }));
+                messages.insert(
+                    actual.idx,
+                    json!({
+                        "message_id": id, "message_index": actual.idx as u64 + 1,
+                        "content": content, "role": role, "is_target": id == target.id,
+                    }),
+                );
             }
         }
         Ok(())
     })?;
-    ensure!(third == verified, "logical backup changed during body hydration");
-    ensure!(messages.len() == anchors.len(), "selected logical messages are missing or ambiguous");
+    ensure!(
+        third == verified,
+        "logical backup changed during body hydration"
+    );
+    ensure!(
+        messages.len() == anchors.len(),
+        "selected logical messages are missing or ambiguous"
+    );
     bounded_response(json!({
         "operation": "view", "format": codec::FORMAT, "schema_version": codec::VERSION,
         "archive_id": verified.0.archive_id, "content_sha256": verified.1.content_sha256,
@@ -504,18 +660,35 @@ mod tests {
     use std::io::Cursor;
 
     fn table(name: &str, names: &[&str]) -> Record {
-        Record::Table { table: Table {
-            name: name.into(), columns: names.iter().map(|s| (*s).into()).collect(), primary_key: vec![0],
-        }}
+        Record::Table {
+            table: Table {
+                name: name.into(),
+                columns: names.iter().map(|s| (*s).into()).collect(),
+                primary_key: vec![0],
+            },
+        }
     }
 
     fn conversation(id: i64, source: &str, path: &str) -> Record {
-        Record::Row { values: vec![Cell::Integer(id), Cell::Text(source.into()), Cell::Text(path.into())] }
+        Record::Row {
+            values: vec![
+                Cell::Integer(id),
+                Cell::Text(source.into()),
+                Cell::Text(path.into()),
+            ],
+        }
     }
 
     fn message(id: i64, conversation: i64, idx: i64, body: &str) -> Record {
-        Record::Row { values: vec![Cell::Integer(id), Cell::Integer(conversation), Cell::Integer(idx),
-            Cell::Text(body.into()), Cell::Text("user".into())] }
+        Record::Row {
+            values: vec![
+                Cell::Integer(id),
+                Cell::Integer(conversation),
+                Cell::Integer(idx),
+                Cell::Text(body.into()),
+                Cell::Text("user".into()),
+            ],
+        }
     }
 
     fn records() -> Vec<Record> {
@@ -523,21 +696,42 @@ mod tests {
             table("conversations", &["id", "source_id", "source_path"]),
             conversation(1, "remote-a", "/absent/same.jsonl"),
             conversation(2, "remote-b", "/absent/same.jsonl"),
-            table("messages", &["id", "conversation_id", "idx", "content", "role"]),
-            message(1, 1, 0, "needle alpha"), message(2, 2, 7, "δ\0 needle beta"),
-            message(3, 1, 99, "Needle differs"), message(4, 2, 1000, "needle gamma"),
+            table(
+                "messages",
+                &["id", "conversation_id", "idx", "content", "role"],
+            ),
+            message(1, 1, 0, "needle alpha"),
+            message(2, 2, 7, "δ\0 needle beta"),
+            message(3, 1, 99, "Needle differs"),
+            message(4, 2, 1000, "needle gamma"),
         ]
     }
 
     fn wire(records: Vec<Record>) -> Vec<u8> {
-        let header = Header { format: codec::FORMAT.into(), schema_version: codec::VERSION,
-            archive_id: "query-fixture".into(), exported_at_ms: 1, storage_schema_version: "17".into(),
+        let header = Header {
+            format: codec::FORMAT.into(),
+            schema_version: codec::VERSION,
+            archive_id: "query-fixture".into(),
+            exported_at_ms: 1,
+            storage_schema_version: "17".into(),
             record_types: vec!["table".into(), "row".into(), "completion".into()],
-            contains_private_data: true, omissions: vec!["derived_search_assets".into()] };
-        let mut bytes = codec::encode(&Record::Header { header: header.clone() }).unwrap();
+            contains_private_data: true,
+            omissions: vec!["derived_search_assets".into()],
+        };
+        let mut bytes = codec::encode(&Record::Header {
+            header: header.clone(),
+        })
+        .unwrap();
         let mut validator = Validator::new(header).unwrap();
-        for record in records { bytes.extend(validator.push(&record).unwrap()); }
-        bytes.extend(codec::encode(&Record::Completion { completion: validator.completion() }).unwrap());
+        for record in records {
+            bytes.extend(validator.push(&record).unwrap());
+        }
+        bytes.extend(
+            codec::encode(&Record::Completion {
+                completion: validator.completion(),
+            })
+            .unwrap(),
+        );
         bytes
     }
 
@@ -563,11 +757,17 @@ mod tests {
     #[test]
     fn no_page_can_escape_completion_tamper_or_trailing_record_validation() {
         let valid = wire(records());
-        let last = valid[..valid.len() - 1].iter().rposition(|b| *b == b'\n').unwrap() + 1;
+        let last = valid[..valid.len() - 1]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .unwrap()
+            + 1;
         for cut in [last, valid.len() - 1] {
             assert!(search_stream(&mut Cursor::new(&valid[..cut]), "needle", 1, None).is_err());
         }
-        let tampered = String::from_utf8(valid.clone()).unwrap().replace("needle gamma", "needle delta");
+        let tampered = String::from_utf8(valid.clone())
+            .unwrap()
+            .replace("needle gamma", "needle delta");
         assert!(search_stream(&mut Cursor::new(tampered), "needle", 1, None).is_err());
         let mut trailing = valid;
         trailing.extend(b"{}\n");
@@ -580,7 +780,9 @@ mod tests {
         rows.push(message(5, 999, 0, "orphan"));
         assert!(search_stream(&mut Cursor::new(wire(rows)), "orphan", 1, None).is_err());
         let mut rows = records();
-        if let Record::Table { table } = &mut rows[3] { table.columns[3] = "unknown".into(); }
+        if let Record::Table { table } = &mut rows[3] {
+            table.columns[3] = "unknown".into();
+        }
         assert!(search_stream(&mut Cursor::new(wire(rows)), "needle", 1, None).is_err());
         let data = wire(vec![table("unrelated", &["id"])]);
         assert!(search_stream(&mut Cursor::new(data), "needle", 1, None).is_err());
@@ -589,8 +791,15 @@ mod tests {
     #[test]
     fn descriptors_control_column_positions_not_a_fixed_schema_ordinal() {
         let mut rows = records();
-        if let Record::Table { table } = &mut rows[3] { table.columns.swap(0, 3); table.primary_key = vec![3]; }
-        for row in &mut rows[4..] { if let Record::Row { values } = row { values.swap(0, 3); } }
+        if let Record::Table { table } = &mut rows[3] {
+            table.columns.swap(0, 3);
+            table.primary_key = vec![3];
+        }
+        for row in &mut rows[4..] {
+            if let Record::Row { values } = row {
+                values.swap(0, 3);
+            }
+        }
         let result = search_stream(&mut Cursor::new(wire(rows)), "needle", 2, None).unwrap();
         assert_eq!(result["hits"][1]["message_id"], 2);
     }
@@ -598,7 +807,12 @@ mod tests {
     #[test]
     fn malformed_limits_fail_before_opening_any_input() {
         let missing = Path::new("/nonexistent/query-fixture.jsonl");
-        for (needle, limit, conversation) in [("", 1, None), ("x", 0, None), ("x", 101, None), ("x", 1, Some(0))] {
+        for (needle, limit, conversation) in [
+            ("", 1, None),
+            ("x", 0, None),
+            ("x", 101, None),
+            ("x", 1, Some(0)),
+        ] {
             assert!(search(missing, needle, limit, conversation, None).is_err());
         }
     }
@@ -632,7 +846,12 @@ mod tests {
 
     fn view_fixture(bytes: &[u8], id: i64, context: usize) -> Result<Value> {
         let (_, completion) = scan(&mut Cursor::new(bytes), |_, _| Ok(()))?;
-        view_stream(&mut Cursor::new(bytes), id, context, &completion.content_sha256)
+        view_stream(
+            &mut Cursor::new(bytes),
+            id,
+            context,
+            &completion.content_sha256,
+        )
     }
 
     #[test]
@@ -642,10 +861,25 @@ mod tests {
         rows.push(message(6, 2, 90, "closest after"));
         let result = view_fixture(&wire(rows), 2, 1).unwrap();
         let messages = result["messages"].as_array().unwrap();
-        assert_eq!(messages.iter().map(|m| m["message_id"].as_i64().unwrap()).collect::<Vec<_>>(), [5, 2, 6]);
-        assert_eq!(messages.iter().map(|m| m["message_index"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 8, 91]);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["message_id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [5, 2, 6]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["message_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [3, 8, 91]
+        );
         assert_eq!(messages[1]["content"], "δ\0 needle beta");
-        assert_eq!(messages.iter().filter(|m| m["is_target"] == true).count(), 1);
+        assert_eq!(
+            messages.iter().filter(|m| m["is_target"] == true).count(),
+            1
+        );
         assert_eq!(result["source_id"], "remote-b");
         assert_eq!(result["source_path"], "/absent/same.jsonl");
         assert_eq!(result["more_before"], false);
@@ -663,8 +897,20 @@ mod tests {
         let mut rows = records();
         rows[5] = message(2, 2, 7, "different body at the same message ID");
         assert!(view_stream(&mut Cursor::new(wire(rows)), 2, 0, &original.content_sha256).is_err());
-        assert!(view_stream(&mut Cursor::new(&bytes[..bytes.len() - 1]), 2, 0, &original.content_sha256).is_err());
-        for (id, context, digest) in [(0, 0, original.content_sha256.as_str()), (2, 21, original.content_sha256.as_str()), (2, 0, "wrong")] {
+        assert!(
+            view_stream(
+                &mut Cursor::new(&bytes[..bytes.len() - 1]),
+                2,
+                0,
+                &original.content_sha256
+            )
+            .is_err()
+        );
+        for (id, context, digest) in [
+            (0, 0, original.content_sha256.as_str()),
+            (2, 21, original.content_sha256.as_str()),
+            (2, 0, "wrong"),
+        ] {
             assert!(view(Path::new("/missing-backup"), id, context, digest).is_err());
         }
     }
@@ -693,7 +939,10 @@ mod tests {
         rows.push(message(5, 2, 8, "the actually closest neighbour"));
         let result = view_fixture(&wire(rows), 2, 1).unwrap();
         assert_eq!(result["messages"].as_array().unwrap().len(), 2);
-        assert_eq!(result["messages"][1]["content"], "the actually closest neighbour");
+        assert_eq!(
+            result["messages"][1]["content"],
+            "the actually closest neighbour"
+        );
         assert_eq!(result["more_after"], true);
     }
 
@@ -715,7 +964,11 @@ mod tests {
         let mut before = BTreeMap::new();
         let mut after = BTreeMap::new();
         for idx in (0..10_000).rev() {
-            let anchor = Anchor { id: idx + 1, conversation: 1, idx };
+            let anchor = Anchor {
+                id: idx + 1,
+                conversation: 1,
+                idx,
+            };
             retain_neighbour(&mut before, anchor, MAX_CONTEXT, true).unwrap();
             retain_neighbour(&mut after, anchor, MAX_CONTEXT, false).unwrap();
             assert!(before.len() <= MAX_CONTEXT && after.len() <= MAX_CONTEXT);
@@ -728,8 +981,10 @@ mod tests {
     fn backup_cursors_exhaust_matches_without_duplicates_or_false_more_pages() {
         let bytes = wire(records());
         let first = search_page(&mut Cursor::new(&bytes), "needle", 1, None, None).unwrap();
-        let cursor = SearchCursor::decode(first["next_cursor"].as_str().unwrap(), "needle", None).unwrap();
-        let second = search_page(&mut Cursor::new(&bytes), "needle", 2, None, Some(cursor)).unwrap();
+        let cursor =
+            SearchCursor::decode(first["next_cursor"].as_str().unwrap(), "needle", None).unwrap();
+        let second =
+            search_page(&mut Cursor::new(&bytes), "needle", 2, None, Some(cursor)).unwrap();
         assert_eq!(first["hits"][0]["message_id"], 1);
         assert_eq!(second["matches"], 3);
         assert_eq!(second["matches_after_cursor"], 2);
@@ -738,9 +993,14 @@ mod tests {
         assert_eq!(second["has_more"], false);
         assert!(second["next_cursor"].is_null());
         assert_eq!(first["content_sha256"], second["content_sha256"]);
-        let end = SearchCursor { version: 1, content_sha256: first["content_sha256"].as_str().unwrap().into(),
-            criteria_sha256: SearchCursor::criteria("needle", None).unwrap(), after_message_id: i64::MAX };
-        let exhausted = search_page(&mut Cursor::new(&bytes), "needle", 1, None, Some(end)).unwrap();
+        let end = SearchCursor {
+            version: 1,
+            content_sha256: first["content_sha256"].as_str().unwrap().into(),
+            criteria_sha256: SearchCursor::criteria("needle", None).unwrap(),
+            after_message_id: i64::MAX,
+        };
+        let exhausted =
+            search_page(&mut Cursor::new(&bytes), "needle", 1, None, Some(end)).unwrap();
         assert_eq!(exhausted["matches_after_cursor"], 0);
         assert_eq!(exhausted["has_more"], false);
     }
@@ -755,10 +1015,28 @@ mod tests {
         let mut rows = records();
         rows[7] = message(4, 2, 1000, "changed snapshot needle");
         let cursor = SearchCursor::decode(token, "needle", None).unwrap();
-        assert!(search_page(&mut Cursor::new(wire(rows)), "needle", 1, None, Some(cursor)).is_err());
+        assert!(
+            search_page(
+                &mut Cursor::new(wire(rows)),
+                "needle",
+                1,
+                None,
+                Some(cursor)
+            )
+            .is_err()
+        );
         let oversize = "x".repeat(MAX_CURSOR_BYTES + 1);
         for invalid in ["", "{}", oversize.as_str()] {
-            assert!(search(Path::new("/nonexistent/backup"), "needle", 1, None, Some(invalid)).is_err());
+            assert!(
+                search(
+                    Path::new("/nonexistent/backup"),
+                    "needle",
+                    1,
+                    None,
+                    Some(invalid)
+                )
+                .is_err()
+            );
         }
     }
 }

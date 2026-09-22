@@ -30,8 +30,8 @@ use crate::search::asset_state::SearchMaintenanceMode;
 use crate::search::tantivy::{TantivyIndex, expected_index_dir};
 use crate::storage::sqlite::FrankenStorage;
 
-mod checkpoint;
 mod canary;
+mod checkpoint;
 
 const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024;
 
@@ -96,11 +96,16 @@ fn load_checkpoint(path: &Path) -> Result<Option<LexicalReconcileCheckpoint>> {
                 .with_context(|| format!("reading reconcile checkpoint {}", path.display()));
         }
     };
-    anyhow::ensure!(file.metadata()?.is_file(), "reconcile checkpoint is not a regular file");
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "reconcile checkpoint is not a regular file"
+    );
     let mut raw = Vec::new();
     file.take(CHECKPOINT_MAX_BYTES + 1).read_to_end(&mut raw)?;
-    anyhow::ensure!(raw.len() as u64 <= CHECKPOINT_MAX_BYTES,
-        "reconcile checkpoint exceeds its 64 KiB budget; checkpoint retained");
+    anyhow::ensure!(
+        raw.len() as u64 <= CHECKPOINT_MAX_BYTES,
+        "reconcile checkpoint exceeds its 64 KiB budget; checkpoint retained"
+    );
     serde_json::from_slice(&raw)
         .map(Some)
         .with_context(|| format!("parsing reconcile checkpoint {}", path.display()))
@@ -134,7 +139,10 @@ pub(crate) fn run_lexical_conversation_reconcile(
     db_path: &Path,
     conversation_id: i64,
 ) -> Result<LexicalReconcileReport> {
-    anyhow::ensure!(conversation_id > 0, "reconcile conversation id must be positive");
+    anyhow::ensure!(
+        conversation_id > 0,
+        "reconcile conversation id must be positive"
+    );
     let _run_lock = super::acquire_index_run_lock(data_dir, db_path, SearchMaintenanceMode::Index)?;
 
     let storage = FrankenStorage::open_readonly(db_path)
@@ -198,19 +206,22 @@ pub(crate) fn run_lexical_conversation_reconcile(
     let checkpoint_path = lexical_reconcile_checkpoint_path(&index_path, conversation_id);
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("creating index directory {}", index_path.display()))?;
-    let checkpoint = checkpoint::resume(LexicalReconcileCheckpoint {
-        version: checkpoint::VERSION,
-        conversation_id,
-        source_id: row.source_id.clone(),
-        source_path: row.source_path.to_string_lossy().to_string(),
-        message_count,
-        max_message_idx,
-        content_bytes,
-        expected_docs: docs.len(),
-        projection_blake3: Some(checkpoint::projection_fingerprint(&docs)),
-        started_at_ms: FrankenStorage::now_millis(),
-        attempt: 1,
-    }, load_checkpoint(&checkpoint_path)?)?;
+    let checkpoint = checkpoint::resume(
+        LexicalReconcileCheckpoint {
+            version: checkpoint::VERSION,
+            conversation_id,
+            source_id: row.source_id.clone(),
+            source_path: row.source_path.to_string_lossy().to_string(),
+            message_count,
+            max_message_idx,
+            content_bytes,
+            expected_docs: docs.len(),
+            projection_blake3: Some(checkpoint::projection_fingerprint(&docs)),
+            started_at_ms: FrankenStorage::now_millis(),
+            attempt: 1,
+        },
+        load_checkpoint(&checkpoint_path)?,
+    )?;
     let attempt = checkpoint.attempt;
     super::write_json_pretty_atomically(&checkpoint_path, &checkpoint)?;
 

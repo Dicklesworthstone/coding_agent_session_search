@@ -107,7 +107,10 @@ fn same_bytes_in_a_replacement_file_do_not_satisfy_the_open_file_identity() {
     assert!(selected.verify(root.path()).is_err());
     // The failed handoff neither changes nor deletes either file.
     assert_eq!(fs::read(&path).unwrap(), b"data");
-    assert_eq!(fs::read(root.path().join("retained.fsvi")).unwrap(), b"data");
+    assert_eq!(
+        fs::read(root.path().join("retained.fsvi")).unwrap(),
+        b"data"
+    );
 }
 
 #[cfg(unix)]

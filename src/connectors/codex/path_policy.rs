@@ -34,8 +34,7 @@ impl ScanExclusions {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.invalid
-            || (self.cwd.is_none() && self.paths.iter().any(|path| path.is_relative()))
+        if self.invalid || (self.cwd.is_none() && self.paths.iter().any(|path| path.is_relative()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -126,7 +125,10 @@ fn resolve_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
         match std::fs::canonicalize(ancestor) {
             Ok(parent) => {
                 let suffix = path.strip_prefix(ancestor).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid exclusion path ancestry")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid exclusion path ancestry",
+                    )
                 })?;
                 let mut resolved = PathBuf::new();
                 for component in parent.join(suffix).components() {
@@ -247,7 +249,10 @@ mod tests {
         let root = tempfile::tempdir()?;
         fs::create_dir_all(root.path().join("actual/child"))?;
         fs::create_dir_all(root.path().join("actual/private"))?;
-        fs::write(root.path().join("actual/private/source.jsonl"), "private fixture")?;
+        fs::write(
+            root.path().join("actual/private/source.jsonl"),
+            "private fixture",
+        )?;
         symlink(root.path().join("actual/child"), root.path().join("entry"))?;
         let exclusions = policy(root.path(), "actual/private");
         assert!(exclusions.excludes(&root.path().join("entry/../private/source.jsonl")));

@@ -14,9 +14,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::{IncompleteScan, RejectedSource};
 #[cfg(test)]
 use super::MAX_AUGMENT_ROLLOUT_BYTES;
+use super::{IncompleteScan, RejectedSource};
 
 #[cfg(test)]
 pub(super) fn validate(

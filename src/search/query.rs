@@ -5026,12 +5026,17 @@ impl SearchClient {
         let mut best_by_message = HashMap::<u64, VectorSearchResult>::new();
         for artifact in context.artifacts.iter() {
             let index = artifact.index();
-            let physical_count = index.record_count().saturating_add(index.wal_record_count());
+            let physical_count = index
+                .record_count()
+                .saturating_add(index.wal_record_count());
             let target = return_limit.min(physical_count);
             // Retain the existing message-overfetch allowance for hydration.
             // Bound each raw window independently of the total archive size;
             // the extra lookahead proves strict score cutoffs without a refill.
-            let window = target.saturating_mul(4).saturating_add(1).min(physical_count);
+            let window = target
+                .saturating_mul(4)
+                .saturating_add(1)
+                .min(physical_count);
             let selection = message_topk::collect_exact_messages(
                 target,
                 window,
@@ -5113,7 +5118,9 @@ impl SearchClient {
             // The retained query view includes WAL additions and replacements.
             // Main rows plus retained WAL rows bound physical candidates, not
             // distinct live messages; only the backend resolves replacements.
-            let record_count = index.record_count().saturating_add(index.wal_record_count());
+            let record_count = index
+                .record_count()
+                .saturating_add(index.wal_record_count());
             let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
             let fs_hits = index
                 .search_top_k(embedding, candidate_limit, fs_filter)
@@ -5154,7 +5161,9 @@ impl SearchClient {
         for artifact in context.artifacts.iter() {
             let index = artifact.index();
             // A main-empty shard can still have searchable durable WAL rows.
-            let shard_record_count = index.record_count().saturating_add(index.wal_record_count());
+            let shard_record_count = index
+                .record_count()
+                .saturating_add(index.wal_record_count());
             // Search chunks, then collapse by message. A message can have many
             // high-scoring chunks, so per-shard top-k chunks alone is not a
             // proof of per-message top-k. Use a bounded overfetch window and

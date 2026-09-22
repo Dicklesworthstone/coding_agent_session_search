@@ -62,7 +62,11 @@ pub(super) fn refresh(
         archive: FilePairV1 {
             path: &archive.path,
             main: FileStampV1::from_observation(&archive.main)?,
-            wal: archive.wal.as_ref().map(FileStampV1::from_observation).transpose()?,
+            wal: archive
+                .wal
+                .as_ref()
+                .map(FileStampV1::from_observation)
+                .transpose()?,
         },
         vectors: FilePairV1 {
             path: &vector_path,
@@ -78,10 +82,15 @@ pub(super) fn refresh(
     // after the proof. A concurrent change then invalidates the receipt at
     // the engine's next read instead of borrowing our earlier content proof.
     let bytes = serde_json::to_vec(&cache)?;
-    ensure!(bytes.len() <= 64 * 1024, "completed receipt exceeds the engine's read budget");
+    ensure!(
+        bytes.len() <= 64 * 1024,
+        "completed receipt exceeds the engine's read budget"
+    );
     let root = data_dir.join(crate::search::vector_index::VECTOR_INDEX_DIR);
     let path = root.join(format!(
-        ".completed-backfill-{}-{}.json", artifact.tier.as_str(), artifact.embedder_id,
+        ".completed-backfill-{}-{}.json",
+        artifact.tier.as_str(),
+        artifact.embedder_id,
     ));
     let mut staged = tempfile::NamedTempFile::new_in(&root)?;
     use std::io::Write;

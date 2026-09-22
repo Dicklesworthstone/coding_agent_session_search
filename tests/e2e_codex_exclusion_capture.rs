@@ -19,9 +19,15 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
-        let hidden = home.path().join(".codex/sessions/private/rollout-hidden.jsonl");
-        let archived = home.path().join(".codex/archived_sessions/rollout-archived.json");
-        let public = home.path().join(".codex/sessions/public/rollout-public.jsonl");
+        let hidden = home
+            .path()
+            .join(".codex/sessions/private/rollout-hidden.jsonl");
+        let archived = home
+            .path()
+            .join(".codex/archived_sessions/rollout-archived.json");
+        let public = home
+            .path()
+            .join(".codex/sessions/public/rollout-public.jsonl");
         for (path, text) in [
             (&hidden, "cassprivateproof9z"),
             (&archived, "cassarchiveproof8z"),
@@ -41,10 +47,17 @@ impl Fixture {
                 .write(true)
                 .open(path)
                 .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1000)))
+                .set_times(
+                    fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1000)),
+                )
                 .unwrap();
         }
-        Self { home, hidden, archived, public }
+        Self {
+            home,
+            hidden,
+            archived,
+            public,
+        }
     }
 
     fn command(&self, streaming: &str, exclusions: &str) -> Command {
@@ -96,8 +109,8 @@ impl Fixture {
     }
 
     fn assert_sources(&self, expected: &[&Path]) {
-        let storage = SqliteStorage::open_readonly(&self.home.path().join("data/agent_search.db"))
-            .unwrap();
+        let storage =
+            SqliteStorage::open_readonly(&self.home.path().join("data/agent_search.db")).unwrap();
         let rows = storage.list_conversations(100, 0).unwrap();
         let mut actual: Vec<_> = rows.iter().map(|row| row.source_path.as_path()).collect();
         actual.sort();
@@ -111,7 +124,14 @@ impl Fixture {
 
     fn assert_hits(&self, token: &str, expected: usize) {
         let output = assert_cmd::Command::from_std(self.command("1", ""))
-            .args(["search", token, "--mode", "lexical", "--json", "--no-maintenance"])
+            .args([
+                "search",
+                token,
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+            ])
             .timeout(Duration::from_secs(30))
             .assert()
             .success()
@@ -119,7 +139,11 @@ impl Fixture {
             .stdout
             .clone();
         let result: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(result["hits"].as_array().unwrap().len(), expected, "{result}");
+        assert_eq!(
+            result["hits"].as_array().unwrap().len(),
+            expected,
+            "{result}"
+        );
     }
 }
 
@@ -133,7 +157,10 @@ fn all_excluded_inventory_never_falls_back_to_raw_copy_in_either_ingest_mode() {
         fixture.index(streaming, home.join(".codex").to_str().unwrap(), true);
         fixture.assert_sources(&[]);
         assert!(!home.join("data/raw-mirror").exists());
-        for (path, original) in [&fixture.hidden, &fixture.archived, &fixture.public].into_iter().zip(before) {
+        for (path, original) in [&fixture.hidden, &fixture.archived, &fixture.public]
+            .into_iter()
+            .zip(before)
+        {
             assert_eq!(fs::read(path).unwrap(), original);
         }
     }

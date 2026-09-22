@@ -452,9 +452,11 @@ mod tests {
                 .iter()
                 .all(|window| *window <= MAX_ADAPTIVE_EXACT_WINDOW)
         );
-        assert!(windows.windows(2).all(|pair| {
-            pair[1] == pair[0].saturating_mul(2).min(MAX_ADAPTIVE_EXACT_WINDOW)
-        }));
+        assert!(
+            windows.windows(2).all(|pair| {
+                pair[1] == pair[0].saturating_mul(2).min(MAX_ADAPTIVE_EXACT_WINDOW)
+            })
+        );
         let actual = adaptive
             .hits
             .iter()
@@ -480,9 +482,7 @@ mod tests {
             4,
             17,
             MAX_EXACT_MESSAGE_REFILLS + 1,
-            |excluded, ceiling, window| {
-                Ok::<_, &str>(backend(&records, excluded, ceiling, window))
-            },
+            |excluded, ceiling, window| Ok::<_, &str>(backend(&records, excluded, ceiling, window)),
         )
         .unwrap();
         assert_eq!(ids(&adaptive), vec![1, 2, 3, 4]);

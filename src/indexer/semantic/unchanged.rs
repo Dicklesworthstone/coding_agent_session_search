@@ -36,7 +36,13 @@ pub(super) fn try_retain_completed(
     // Keep the existing constant-time cache-hit path; do not turn every
     // scheduled no-op into a full canonical scan.
     if engine
-        .completed_backfill_fingerprint(storage, data_dir, manifest, plan.tier, &plan.model_revision)?
+        .completed_backfill_fingerprint(
+            storage,
+            data_dir,
+            manifest,
+            plan.tier,
+            &plan.model_revision,
+        )?
         .as_deref()
         == Some(plan.db_fingerprint.as_str())
     {
@@ -70,7 +76,9 @@ where
         TierKind::Fast => manifest.fast_tier.as_ref(),
         TierKind::Quality => manifest.quality_tier.as_ref(),
     };
-    let Some(artifact) = artifact else { return Ok(None) };
+    let Some(artifact) = artifact else {
+        return Ok(None);
+    };
     let path = vector_index_path(data_dir, engine.embedder_id());
     if !artifact.ready
         || artifact.tier != plan.tier
@@ -84,11 +92,15 @@ where
     {
         return Ok(None);
     }
-    let Some(archive_before) = ArchiveStamp::capture(storage)? else { return Ok(None) };
+    let Some(archive_before) = ArchiveStamp::capture(storage)? else {
+        return Ok(None);
+    };
     let manifest_path = SemanticManifest::path(data_dir);
     let manifest_before = stamp(&manifest_path)?;
     let vector_before = stamp(&path)?;
-    let Some(vector_stamp) = &vector_before else { return Ok(None) };
+    let Some(vector_stamp) = &vector_before else {
+        return Ok(None);
+    };
     if !vector_stamp.regular || vector_stamp.len != artifact.size_bytes {
         return Ok(None);
     }
@@ -101,7 +113,8 @@ where
     let index = VectorIndex::open_read_only(&path)
         .context("inspect completed semantic vectors without modifying them")?;
     if index.embedder_id() != engine.embedder_id()
-        || Some(index.embedder_revision()) != engine::expected_vector_space_revision(engine.embedder_id())
+        || Some(index.embedder_revision())
+            != engine::expected_vector_space_revision(engine.embedder_id())
         || index.dimension() != artifact.dimension
         || index.quantization() != Quantization::F16
         || u64::try_from(index.record_count()).ok() != Some(artifact.doc_count)
@@ -139,11 +152,14 @@ where
             // A duplicate canonical ID also fails: it was already removed.
             changed |= !remaining.remove(id.as_str());
             if visited.is_multiple_of(1024) {
-                sink.emit(SemanticProgressEvent::PacketReplayProgress, SemanticProgressFields {
-                    rows_processed: Some(visited),
-                    rows_total: Some(artifact.doc_count),
-                    ..Default::default()
-                });
+                sink.emit(
+                    SemanticProgressEvent::PacketReplayProgress,
+                    SemanticProgressFields {
+                        rows_processed: Some(visited),
+                        rows_total: Some(artifact.doc_count),
+                        ..Default::default()
+                    },
+                );
             }
         }
         Ok(())
@@ -167,13 +183,19 @@ where
             && stamp(&pointer_path)?.is_none(),
         "archive or semantic artifacts changed during unchanged proof; reload and retry"
     );
-    if changed || !remaining.is_empty()
+    if changed
+        || !remaining.is_empty()
         || u64::try_from(conversations).ok() != Some(artifact.conversation_count)
     {
         return Ok(None);
     }
     if let Err(error) = cache::refresh(
-        data_dir, &archive_before, &path, vector_stamp, artifact, last_offset,
+        data_dir,
+        &archive_before,
+        &path,
+        vector_stamp,
+        artifact,
+        last_offset,
     ) {
         tracing::debug!(%error, "unchanged backfill cache unavailable; next pass repeats read-only proof");
     }
@@ -238,13 +260,19 @@ impl ArchiveStamp {
             return Ok(None);
         }
         let path = storage.database_path()?.canonicalize()?;
-        let Some(identity) = storage.raw().file_identity()? else { return Ok(None) };
+        let Some(identity) = storage.raw().file_identity()? else {
+            return Ok(None);
+        };
         let file = File::open(&path)?;
         if crate::franken_sync::FileIdentity::from_file(&file)? != Some(identity) {
             return Ok(None);
         }
-        let Some(main) = stamp(&path)? else { return Ok(None) };
-        let wal = stamp(&crate::storage::sqlite::database_sidecar_path(&path, "-wal"))?;
+        let Some(main) = stamp(&path)? else {
+            return Ok(None);
+        };
+        let wal = stamp(&crate::storage::sqlite::database_sidecar_path(
+            &path, "-wal",
+        ))?;
         if !main.regular || wal.as_ref().is_some_and(|wal| !wal.regular) {
             return Ok(None);
         }

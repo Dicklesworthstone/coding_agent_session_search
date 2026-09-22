@@ -8,7 +8,10 @@ fn header() -> Header {
         archive_id: "restore-test".to_owned(),
         exported_at_ms: 17,
         storage_schema_version: "9".to_owned(),
-        record_types: ["table", "row", "completion"].into_iter().map(str::to_owned).collect(),
+        record_types: ["table", "row", "completion"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
     }
@@ -42,47 +45,80 @@ fn replay(connection: &Connection, bytes: &[u8]) -> Result<(Header, Completion)>
 #[test]
 fn typed_rows_and_child_before_parent_relationships_round_trip() {
     let source = fixture();
-    source.execute_batch(
-        "INSERT INTO parents VALUES (42, 'private δ text');
+    source
+        .execute_batch(
+            "INSERT INTO parents VALUES (42, 'private δ text');
          INSERT INTO children VALUES (7, 42, X'0001FF', -1.25);",
-    ).unwrap();
+        )
+        .unwrap();
     let bytes = encoded(&source);
     let target = fixture();
     let receipt = replay(&target, &bytes).unwrap();
     let after = encoded(&target);
     assert_eq!(receipt.1, codec::verify(&mut Cursor::new(after)).unwrap().1);
-    let child = target.query_row("SELECT parent_id, payload, number FROM children WHERE id = 7").unwrap();
+    let child = target
+        .query_row("SELECT parent_id, payload, number FROM children WHERE id = 7")
+        .unwrap();
     assert_eq!(child.get_typed::<i64>(0).unwrap(), 42);
     assert_eq!(child.get_typed::<Vec<u8>>(1).unwrap(), vec![0, 1, 255]);
-    assert_eq!(child.get_typed::<f64>(2).unwrap().to_bits(), (-1.25_f64).to_bits());
+    assert_eq!(
+        child.get_typed::<f64>(2).unwrap().to_bits(),
+        (-1.25_f64).to_bits()
+    );
 }
 
 #[test]
 fn initializer_triggers_are_suspended_and_restored_not_replayed() {
     let source = fixture();
-    source.execute("INSERT INTO parents VALUES (1, 'source')").unwrap();
+    source
+        .execute("INSERT INTO parents VALUES (1, 'source')")
+        .unwrap();
     let target = fixture();
-    target.execute_batch(
-        "CREATE TRIGGER add_shadow_parent AFTER INSERT ON parents WHEN NEW.id < 100
+    target
+        .execute_batch(
+            "CREATE TRIGGER add_shadow_parent AFTER INSERT ON parents WHEN NEW.id < 100
          BEGIN INSERT INTO parents VALUES (NEW.id + 100, 'trigger'); END;",
-    ).unwrap();
+        )
+        .unwrap();
     replay(&target, &encoded(&source)).unwrap();
-    assert_eq!(target.query_row("SELECT COUNT(*) FROM parents").unwrap().get_typed::<i64>(0).unwrap(), 1);
-    target.execute("INSERT INTO parents VALUES (2, 'later write')").unwrap();
-    assert_eq!(target.query_row("SELECT name FROM parents WHERE id = 102").unwrap().get_typed::<String>(0).unwrap(), "trigger");
+    assert_eq!(
+        target
+            .query_row("SELECT COUNT(*) FROM parents")
+            .unwrap()
+            .get_typed::<i64>(0)
+            .unwrap(),
+        1
+    );
+    target
+        .execute("INSERT INTO parents VALUES (2, 'later write')")
+        .unwrap();
+    assert_eq!(
+        target
+            .query_row("SELECT name FROM parents WHERE id = 102")
+            .unwrap()
+            .get_typed::<String>(0)
+            .unwrap(),
+        "trigger"
+    );
 }
 
 #[test]
 fn missing_or_changed_schema_is_not_accepted_by_version_alone() {
     let source = fixture();
-    source.execute("CREATE TABLE extra (id INTEGER PRIMARY KEY)").unwrap();
+    source
+        .execute("CREATE TABLE extra (id INTEGER PRIMARY KEY)")
+        .unwrap();
     assert!(replay(&fixture(), &encoded(&source)).is_err());
     let source = fixture();
     let target = fixture();
-    target.execute("CREATE TABLE extra (id INTEGER PRIMARY KEY)").unwrap();
+    target
+        .execute("CREATE TABLE extra (id INTEGER PRIMARY KEY)")
+        .unwrap();
     assert!(replay(&target, &encoded(&source)).is_err());
     let source = fixture();
-    source.execute("ALTER TABLE children ADD COLUMN secret TEXT").unwrap();
+    source
+        .execute("ALTER TABLE children ADD COLUMN secret TEXT")
+        .unwrap();
     assert!(replay(&fixture(), &encoded(&source)).is_err());
 }
 
@@ -90,7 +126,9 @@ fn missing_or_changed_schema_is_not_accepted_by_version_alone() {
 fn broken_relationship_is_rejected_even_with_a_valid_digest() {
     let source = fixture();
     source.execute("PRAGMA foreign_keys = OFF").unwrap();
-    source.execute("INSERT INTO children VALUES (1, 999, NULL, NULL)").unwrap();
+    source
+        .execute("INSERT INTO children VALUES (1, 999, NULL, NULL)")
+        .unwrap();
     let bytes = encoded(&source);
     assert!(codec::verify(&mut Cursor::new(&bytes)).is_ok());
     assert!(replay(&fixture(), &bytes).is_err());
@@ -113,26 +151,43 @@ fn input_accounting_includes_whitespace_and_resets_between_records() {
 fn replay_spans_bounded_batches_without_losing_rows() {
     let source = fixture();
     for id in 0..(MAX_BATCH_RECORDS * 3 + 1) {
-        source.execute_with_params(
-            "INSERT INTO parents VALUES (?, ?)",
-            &[SqliteValue::Integer(id as i64), SqliteValue::Text(format!("row-{id}").into())],
-        ).unwrap();
+        source
+            .execute_with_params(
+                "INSERT INTO parents VALUES (?, ?)",
+                &[
+                    SqliteValue::Integer(id as i64),
+                    SqliteValue::Text(format!("row-{id}").into()),
+                ],
+            )
+            .unwrap();
     }
     let bytes = encoded(&source);
     let target = fixture();
     let receipt = replay(&target, &bytes).unwrap();
-    assert_eq!(receipt.1.tables["parents"], (MAX_BATCH_RECORDS * 3 + 1) as u64);
-    assert_eq!(receipt.1, codec::verify(&mut Cursor::new(encoded(&target))).unwrap().1);
+    assert_eq!(
+        receipt.1.tables["parents"],
+        (MAX_BATCH_RECORDS * 3 + 1) as u64
+    );
+    assert_eq!(
+        receipt.1,
+        codec::verify(&mut Cursor::new(encoded(&target))).unwrap().1
+    );
 }
 
 #[test]
 fn cell_conversion_preserves_binary_and_integer_extremes() {
     let cells = vec![
-        Cell::Null, Cell::Integer(i64::MIN), Cell::Integer(i64::MAX),
+        Cell::Null,
+        Cell::Integer(i64::MIN),
+        Cell::Integer(i64::MAX),
         Cell::Real(format!("{:016x}", (-0.0_f64).to_bits())),
-        Cell::Text("quotes '\" ; \0 δ".to_owned()), Cell::Blob("AAH/".to_owned()),
+        Cell::Text("quotes '\" ; \0 δ".to_owned()),
+        Cell::Blob("AAH/".to_owned()),
     ];
-    assert_eq!(export::cells(&values(cells.clone()).unwrap()).unwrap(), cells);
+    assert_eq!(
+        export::cells(&values(cells.clone()).unwrap()).unwrap(),
+        cells
+    );
     assert!(values(vec![Cell::Real("7ff0000000000000".to_owned())]).is_err());
     assert!(values(vec![Cell::Blob("!!".to_owned())]).is_err());
 }
@@ -152,11 +207,19 @@ fn complete_canonical_file_round_trip_preserves_source_and_published_digest() {
     assert_eq!(source_before, fs::read(&source).unwrap());
     assert_eq!(input_before, fs::read(&archive).unwrap());
     let after = root.path().join("restored.jsonl");
-    assert_eq!(exported.1, export::export_file(&target, &after, "restore-test".to_owned()).unwrap().1);
+    assert_eq!(
+        exported.1,
+        export::export_file(&target, &after, "restore-test".to_owned())
+            .unwrap()
+            .1
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o077,
+            0
+        );
     }
 }
 
@@ -173,7 +236,9 @@ fn existing_database_or_orphan_sidecar_is_never_replaced() {
         fs::write(&occupied, b"existing authority").unwrap();
         assert!(import_file(&archive, &destination, "restore-test").is_err());
         assert_eq!(fs::read(&occupied).unwrap(), b"existing authority");
-        if !suffix.is_empty() { assert!(!destination.exists()); }
+        if !suffix.is_empty() {
+            assert!(!destination.exists());
+        }
     }
 }
 
@@ -185,13 +250,26 @@ fn invalid_streams_never_publish_a_database() {
     let archive = root.path().join("valid.jsonl");
     export::export_file(&source, &archive, "restore-test".to_owned()).unwrap();
     let valid = fs::read(&archive).unwrap();
-    let completion_start = valid[..valid.len() - 1].iter().rposition(|byte| *byte == b'\n').unwrap() + 1;
+    let completion_start = valid[..valid.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .unwrap()
+        + 1;
     let mut extra_record = valid.clone();
     extra_record.extend_from_slice(b"{}\n");
     let mut bad_digest = valid.clone();
     let end = bad_digest.len() - 5;
     bad_digest[end] = if bad_digest[end] == b'0' { b'1' } else { b'0' };
-    for (index, bytes) in [vec![], valid[..completion_start].to_vec(), valid[..valid.len() - 1].to_vec(), extra_record, bad_digest].into_iter().enumerate() {
+    for (index, bytes) in [
+        vec![],
+        valid[..completion_start].to_vec(),
+        valid[..valid.len() - 1].to_vec(),
+        extra_record,
+        bad_digest,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let input = root.path().join(format!("bad-{index}.jsonl"));
         let output = root.path().join(format!("bad-{index}.db"));
         fs::write(&input, bytes).unwrap();
@@ -227,25 +305,42 @@ fn populated_canonical_archive_preserves_provider_messages_and_provenance() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source.db");
     let storage = SqliteStorage::open(&source).unwrap();
-    let agent_id = storage.ensure_agent(&Agent {
-        id: None, slug: "claude_code".to_owned(), name: "Claude Code".to_owned(),
-        version: None, kind: AgentKind::Cli,
-    }).unwrap();
+    let agent_id = storage
+        .ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".to_owned(),
+            name: "Claude Code".to_owned(),
+            version: None,
+            kind: AgentKind::Cli,
+        })
+        .unwrap();
     let conversation = Conversation {
-        id: None, agent_slug: "claude_code".to_owned(), workspace: None,
+        id: None,
+        agent_slug: "claude_code".to_owned(),
+        workspace: None,
         external_id: Some("remote-session-identity".to_owned()),
         title: Some("Private portable session".to_owned()),
         source_path: PathBuf::from("/vanished/remote/session.jsonl"),
-        started_at: Some(1_733_000_000_000), ended_at: None, approx_tokens: None,
+        started_at: Some(1_733_000_000_000),
+        ended_at: None,
+        approx_tokens: None,
         metadata_json: serde_json::json!({"portable": true}),
         messages: vec![Message {
-            id: None, idx: 0, role: MessageRole::User, author: Some("operator".to_owned()),
-            created_at: Some(1_733_000_000_000), content: "private δ message\nline two".to_owned(),
-            extra_json: serde_json::json!({"usage": {"input_tokens": 17}}), snippets: Vec::new(),
+            id: None,
+            idx: 0,
+            role: MessageRole::User,
+            author: Some("operator".to_owned()),
+            created_at: Some(1_733_000_000_000),
+            content: "private δ message\nline two".to_owned(),
+            extra_json: serde_json::json!({"usage": {"input_tokens": 17}}),
+            snippets: Vec::new(),
         }],
-        source_id: "remote-host".to_owned(), origin_host: Some("remote-host".to_owned()),
+        source_id: "remote-host".to_owned(),
+        origin_host: Some("remote-host".to_owned()),
     };
-    storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+    storage
+        .insert_conversation_tree(agent_id, None, &conversation)
+        .unwrap();
     drop(storage);
     let archive = root.path().join("history.jsonl");
     let before = export::export_file(&source, &archive, "restore-test".to_owned()).unwrap();
@@ -254,14 +349,22 @@ fn populated_canonical_archive_preserves_provider_messages_and_provenance() {
     let after = import_file(&archive, &target, "restore-test").unwrap();
     assert_eq!(before, after);
     let reader = export::open_source(&target).unwrap();
-    let row = reader.query_row(
-        "SELECT c.external_id, c.source_id, c.origin_host, m.content
+    let row = reader
+        .query_row(
+            "SELECT c.external_id, c.source_id, c.origin_host, m.content
          FROM conversations c JOIN messages m ON m.conversation_id = c.id",
-    ).unwrap();
-    assert_eq!(row.get_typed::<String>(0).unwrap(), "remote-session-identity");
+        )
+        .unwrap();
+    assert_eq!(
+        row.get_typed::<String>(0).unwrap(),
+        "remote-session-identity"
+    );
     assert_eq!(row.get_typed::<String>(1).unwrap(), "remote-host");
     assert_eq!(row.get_typed::<String>(2).unwrap(), "remote-host");
-    assert_eq!(row.get_typed::<String>(3).unwrap(), "private δ message\nline two");
+    assert_eq!(
+        row.get_typed::<String>(3).unwrap(),
+        "private δ message\nline two"
+    );
     reader.execute("ROLLBACK").unwrap();
     reader.close_without_checkpoint().unwrap();
 }
@@ -296,13 +399,15 @@ fn rejected_multi_batch_restore_publishes_nothing_and_can_be_retried() {
     let writer = Connection::open(export::path_text(&source).unwrap()).unwrap();
     writer.execute("BEGIN IMMEDIATE").unwrap();
     for row in 0..(MAX_BATCH_RECORDS * 2 + 17) {
-        writer.execute_with_params(
-            "INSERT INTO meta (key, value) VALUES (?, ?)",
-            &[
-                SqliteValue::Text(format!("restore_batch_{row:05}").into()),
-                SqliteValue::Text(format!("canonical row {row}").into()),
-            ],
-        ).unwrap();
+        writer
+            .execute_with_params(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::Text(format!("restore_batch_{row:05}").into()),
+                    SqliteValue::Text(format!("canonical row {row}").into()),
+                ],
+            )
+            .unwrap();
     }
     writer.execute("COMMIT").unwrap();
     writer.close().unwrap();
@@ -311,7 +416,10 @@ fn rejected_multi_batch_restore_publishes_nothing_and_can_be_retried() {
     let source_before = fs::read(&source).unwrap();
     let bytes = fs::read(&valid).unwrap();
     let completion_start = bytes[..bytes.len() - 1]
-        .iter().rposition(|byte| *byte == b'\n').unwrap() + 1;
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .unwrap()
+        + 1;
     let interrupted = root.path().join("interrupted.jsonl");
     fs::write(&interrupted, &bytes[..completion_start]).unwrap();
     let destination = root.path().join("restored.db");
@@ -321,7 +429,11 @@ fn rejected_multi_batch_restore_publishes_nothing_and_can_be_retried() {
     assert!(!destination.exists());
     assert_eq!(source_before, fs::read(&source).unwrap());
     assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
-        entry.unwrap().file_name().to_string_lossy().starts_with(".cass-restore-")
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".cass-restore-")
     }));
     // A failed attempt must not poison the destination lock or leave a sidecar
     // that prevents a subsequent complete, independently verified restoration.

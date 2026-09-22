@@ -9285,7 +9285,10 @@ fn lexical_rebuild_resume_content_path(
     let scratch = staged_lexical_rebuild_scratch_path(index_path);
     if state.effective_execution_mode() == LexicalRebuildExecutionMode::StagedSingleIndex {
         let metadata = fs::symlink_metadata(&scratch).with_context(|| {
-            format!("checkpoint's staged lexical generation is unavailable: {}", scratch.display())
+            format!(
+                "checkpoint's staged lexical generation is unavailable: {}",
+                scratch.display()
+            )
         })?;
         anyhow::ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -9315,7 +9318,10 @@ fn lexical_rebuild_bound_candidate_is_missing(
         Ok(_) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error).with_context(|| {
-            format!("inspecting checkpoint's staged lexical generation {}", scratch.display())
+            format!(
+                "inspecting checkpoint's staged lexical generation {}",
+                scratch.display()
+            )
         }),
     }
 }
@@ -9337,8 +9343,7 @@ fn legacy_lexical_resume_lost_its_generation(
     // an unrelated prior generation after staging was lost. Replay safely
     // rather than using that ambiguity as permission to skip canonical rows.
     let current = index_meta_fingerprint(index_path)?;
-    Ok(state.committed_meta_fingerprint.is_none()
-        || current != state.committed_meta_fingerprint)
+    Ok(state.committed_meta_fingerprint.is_none() || current != state.committed_meta_fingerprint)
 }
 
 fn retain_missing_lexical_candidate_checkpoint(
@@ -24628,7 +24633,8 @@ fn rebuild_tantivy_from_db_with_options(
                 if lexical_rebuild_bound_candidate_is_missing(&index_path, &state)?
                     || legacy_lexical_resume_lost_its_generation(&index_path, &state)?
                 {
-                    let quarantine = retain_missing_lexical_candidate_checkpoint(&index_path, &state)?;
+                    let quarantine =
+                        retain_missing_lexical_candidate_checkpoint(&index_path, &state)?;
                     tracing::warn!(
                         checkpoint_path = %lexical_rebuild_state_path(&quarantine).display(),
                         missing_candidate = %staged_lexical_rebuild_scratch_path(&index_path).display(),
@@ -24689,7 +24695,11 @@ fn rebuild_tantivy_from_db_with_options(
         )
         .run("reuse_completed_generation", || {
             crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-            verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")?;
+            verify_published_lexical_doc_count(
+                &index_path,
+                rebuild_state.indexed_docs,
+                "completed",
+            )?;
             // A crash after the swap may leave the old generation parked.
             // Retain it without reopening the rebuild or swapping it back.
             recover_or_finalize_interrupted_lexical_publish_backup(&index_path)
@@ -24863,7 +24873,9 @@ fn rebuild_tantivy_from_db_with_options(
             let cause = format!("{error:#}");
             if staged_build_path.is_some() {
                 let quarantine = lexical_publish::quarantine_incomplete_candidate(&build_path)
-                    .with_context(|| format!("cannot retain unusable lexical candidate: {cause}"))?;
+                    .with_context(|| {
+                        format!("cannot retain unusable lexical candidate: {cause}")
+                    })?;
                 // Keep the exact cursor/accounting that could no longer be
                 // resumed alongside the untouched failed candidate files.
                 persist_lexical_rebuild_state(&quarantine, &rebuild_state)?;
@@ -24883,7 +24895,10 @@ fn rebuild_tantivy_from_db_with_options(
                 );
             }
             fs::create_dir(&scratch_path).with_context(|| {
-                format!("creating replacement lexical candidate {}", scratch_path.display())
+                format!(
+                    "creating replacement lexical candidate {}",
+                    scratch_path.display()
+                )
             })?;
             build_path = scratch_path.clone();
             staged_build_path = Some(scratch_path.clone());
@@ -25093,7 +25108,10 @@ fn rebuild_tantivy_from_db_with_options(
         // preflight) is not permission to erase the candidate. Leave it and its
         // checkpoint intact; a retry revalidates before initializing counters.
         let mut t_index = TantivyIndex::open_or_create(&build_path).with_context(|| {
-            format!("opening lexical rebuild writer {}; candidate retained", build_path.display())
+            format!(
+                "opening lexical rebuild writer {}; candidate retained",
+                build_path.display()
+            )
         })?;
         log_prep_step("open_tantivy", &mut prep_step_started);
 
@@ -25809,7 +25827,9 @@ fn rebuild_tantivy_from_db_with_options(
     // count after resume. Count once at completion while the readonly handle
     // is still open; fresh rebuilds already observed every canonical packet.
     let final_observed_messages = if resumed_from_checkpoint {
-        publication.run("count_canonical_messages", || count_total_messages_exact(&storage))?
+        publication.run("count_canonical_messages", || {
+            count_total_messages_exact(&storage)
+        })?
     } else {
         observed_messages.max(indexed_docs)
     };

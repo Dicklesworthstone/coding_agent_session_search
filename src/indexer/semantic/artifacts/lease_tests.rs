@@ -4,9 +4,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-use crate::indexer::semantic::{
-    EmbeddingInput, SemanticBackfillBatchPlan, SemanticIndexer,
-};
+use crate::indexer::semantic::{EmbeddingInput, SemanticBackfillBatchPlan, SemanticIndexer};
 use crate::search::embedder::Embedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::semantic_manifest::{HnswRecord, TierKind};
@@ -37,7 +35,10 @@ fn publish(data: &Path, manifest: &mut SemanticManifest) -> Result<PathBuf> {
 
 fn scratch(data: &Path) -> Result<()> {
     let root = data.join(VECTOR_INDEX_DIR);
-    fs::write(root.join(".staging-quality-fnv1a-384-deadbeef.fsvi"), b"orphan")?;
+    fs::write(
+        root.join(".staging-quality-fnv1a-384-deadbeef.fsvi"),
+        b"orphan",
+    )?;
     let reuse = root.join(".backfill-reuse-Abandoned123");
     fs::create_dir(&reuse)?;
     fs::write(reuse.join("candidate.fsvi"), b"private snapshot")?;
@@ -53,7 +54,10 @@ fn snapshot(data: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
             if entry.file_type()?.is_dir() {
                 pending.push(entry.path());
             } else {
-                files.insert(entry.path().strip_prefix(data)?.to_path_buf(), fs::read(entry.path())?);
+                files.insert(
+                    entry.path().strip_prefix(data)?.to_path_buf(),
+                    fs::read(entry.path())?,
+                );
             }
         }
     }
@@ -64,11 +68,26 @@ fn assert_stale_refusal(data: &Path, input: &mut SemanticManifest) -> Result<()>
     let before = snapshot(data)?;
     let input_before = input.clone();
     let error = SemanticIndexer::new("hash", None)?
-        .run_backfill_batch(&rows(9..10), data, input, plan("stale-request", 1, 1, false))
+        .run_backfill_batch(
+            &rows(9..10),
+            data,
+            input,
+            plan("stale-request", 1, 1, false),
+        )
         .expect_err("stale state must not enter the backfill engine");
-    assert!(error.downcast_ref::<BackfillManifestChanged>().is_some(), "{error:#}");
-    assert_eq!(*input, input_before, "do not silently reload a preselected batch's manifest");
-    assert_eq!(snapshot(data)?, before, "refusal must precede even scratch reclamation");
+    assert!(
+        error.downcast_ref::<BackfillManifestChanged>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        *input, input_before,
+        "do not silently reload a preselected batch's manifest"
+    );
+    assert_eq!(
+        snapshot(data)?,
+        before,
+        "refusal must precede even scratch reclamation"
+    );
     // A refused writer releases its OS lease; recovery is not permanently busy.
     drop(lock_file(&data.join(ARTIFACT_LOCK))?);
     Ok(())
@@ -94,9 +113,19 @@ fn same_path_checkpoint_advance_rejects_the_old_cursor_and_fresh_reload_can_fini
     let data = temp.path();
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    let first = indexer.run_backfill_batch(&rows(1..2), data, &mut manifest, plan("resume", 1, 1, false))?;
+    let first = indexer.run_backfill_batch(
+        &rows(1..2),
+        data,
+        &mut manifest,
+        plan("resume", 1, 1, false),
+    )?;
     let mut stale = manifest.clone();
-    let second = indexer.run_backfill_batch(&rows(2..3), data, &mut manifest, plan("resume", 2, 1, false))?;
+    let second = indexer.run_backfill_batch(
+        &rows(2..3),
+        data,
+        &mut manifest,
+        plan("resume", 2, 1, false),
+    )?;
     assert_eq!(first.index_path, second.index_path);
     assert_eq!(manifest.checkpoint.as_ref().unwrap().docs_embedded, 2);
     // The full cursor/count comparison is load-bearing, even within one clock tick.
@@ -106,10 +135,14 @@ fn same_path_checkpoint_advance_rejects_the_old_cursor_and_fresh_reload_can_fini
     assert_stale_refusal(data, &mut stale)?;
 
     let mut reloaded = SemanticManifest::load(data)?.unwrap();
-    let done = indexer.run_backfill_batch(&rows(3..4), data, &mut reloaded, plan("resume", 3, 1, true))?;
+    let done =
+        indexer.run_backfill_batch(&rows(3..4), data, &mut reloaded, plan("resume", 3, 1, true))?;
     assert!(done.published);
     assert!(!second.index_path.exists());
-    assert_eq!(VectorIndex::open_read_only(&done.index_path)?.record_count(), 3);
+    assert_eq!(
+        VectorIndex::open_read_only(&done.index_path)?.record_count(),
+        3
+    );
     assert!(plan_backfill_artifacts(data)?.candidates.is_empty());
     Ok(())
 }
@@ -120,9 +153,15 @@ fn published_checkpoint_cannot_be_resurrected_by_an_older_caller() -> Result<()>
     let data = temp.path();
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    let first = indexer.run_backfill_batch(&rows(1..2), data, &mut manifest, plan("resume", 1, 1, false))?;
+    let first = indexer.run_backfill_batch(
+        &rows(1..2),
+        data,
+        &mut manifest,
+        plan("resume", 1, 1, false),
+    )?;
     let mut stale = manifest.clone();
-    let done = indexer.run_backfill_batch(&rows(2..4), data, &mut manifest, plan("resume", 3, 2, true))?;
+    let done =
+        indexer.run_backfill_batch(&rows(2..4), data, &mut manifest, plan("resume", 3, 2, true))?;
     assert!(done.published && !first.index_path.exists());
     let reader = VectorIndex::open_read_only(&done.index_path)?;
     let query = HashEmbedder::default().embed_sync("compiler recovery lease")?;
@@ -131,7 +170,10 @@ fn published_checkpoint_cannot_be_resurrected_by_an_older_caller() -> Result<()>
     assert_stale_refusal(data, &mut stale)?;
     assert!(!first.index_path.exists());
     assert_eq!(reader.search_top_k(&query, 3, None)?, hits);
-    assert_eq!(VectorIndex::open_read_only(&done.index_path)?.search_top_k(&query, 3, None)?, hits);
+    assert_eq!(
+        VectorIndex::open_read_only(&done.index_path)?.search_top_k(&query, 3, None)?,
+        hits
+    );
     assert!(SemanticManifest::load(data)?.unwrap().checkpoint.is_none());
     Ok(())
 }
@@ -184,8 +226,16 @@ fn disappearing_manifest_is_not_permission_to_republish_an_old_checkpoint() -> R
     let data = temp.path();
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    let checkpoint = indexer.run_backfill_batch(&rows(1..2), data, &mut manifest, plan("resume", 1, 1, false))?;
-    fs::rename(SemanticManifest::path(data), data.join("retained-manifest.json"))?;
+    let checkpoint = indexer.run_backfill_batch(
+        &rows(1..2),
+        data,
+        &mut manifest,
+        plan("resume", 1, 1, false),
+    )?;
+    fs::rename(
+        SemanticManifest::path(data),
+        data.join("retained-manifest.json"),
+    )?;
     scratch(data)?;
     assert_stale_refusal(data, &mut manifest)?;
     assert!(!SemanticManifest::path(data).exists());
@@ -199,7 +249,12 @@ fn unpersisted_checkpoint_edits_do_not_authorize_recovery_after_a_failed_save() 
     let data = temp.path();
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    indexer.run_backfill_batch(&rows(1..2), data, &mut manifest, plan("resume", 1, 1, false))?;
+    indexer.run_backfill_batch(
+        &rows(1..2),
+        data,
+        &mut manifest,
+        plan("resume", 1, 1, false),
+    )?;
     // Mirrors the in-memory mutation left by an error before manifest rename.
     manifest.checkpoint.as_mut().unwrap().db_fingerprint = "uncommitted-replacement".into();
     scratch(data)?;
@@ -231,7 +286,12 @@ fn v1_checkpoint_input_is_accepted_without_migrating_or_rewriting_it() -> Result
     let data = temp.path();
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut manifest = SemanticManifest::default();
-    indexer.run_backfill_batch(&rows(1..2), data, &mut manifest, plan("legacy", 1, 1, false))?;
+    indexer.run_backfill_batch(
+        &rows(1..2),
+        data,
+        &mut manifest,
+        plan("legacy", 1, 1, false),
+    )?;
     manifest.manifest_version = 1;
     manifest.checkpoint.as_mut().unwrap().last_message_id = None;
     manifest.save(data)?;

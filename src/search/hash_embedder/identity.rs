@@ -18,7 +18,8 @@ const CONFORMANCE_TEXTS: [&str; 7] = [
     "\0!?",
     "alpha bravo charlie delta",
 ];
-const NORMALIZATION: &str = "l2-f32; uniform-positive-unit-vector-if-tokenless-or-exactly-cancelled-v1";
+const NORMALIZATION: &str =
+    "l2-f32; uniform-positive-unit-vector-if-tokenless-or-exactly-cancelled-v1";
 
 impl HashEmbedder {
     pub(super) fn bound_identity(&self) -> EmbedderResult<&EmbeddingIdentityBundleV1> {
@@ -34,13 +35,16 @@ impl HashEmbedder {
             "Rust Unicode {}.{}.{} lowercase; split non-alphanumeric; retain tokens with at least 2 Unicode scalar values; join with ASCII space before delegate tokenization",
             unicode.0, unicode.1, unicode.2
         );
-        let profile = identity.space.hash_control.as_mut().ok_or_else(|| {
-            EmbedderError::InvalidConfig {
-                field: "hash.identity".into(),
-                value: self.id.clone(),
-                reason: "upstream hash producer has no hash-control profile".into(),
-            }
-        })?;
+        let profile =
+            identity
+                .space
+                .hash_control
+                .as_mut()
+                .ok_or_else(|| EmbedderError::InvalidConfig {
+                    field: "hash.identity".into(),
+                    value: self.id.clone(),
+                    reason: "upstream hash producer has no hash-control profile".into(),
+                })?;
         profile.algorithm_revision = "cass-fnv1a-v1".into();
         profile.tokenization_rules = rules.clone();
         profile.normalization_rules = NORMALIZATION.into();
@@ -80,11 +84,13 @@ impl HashEmbedder {
         // identical immutable bytes. No global dimension cache or leaked model
         // owner is needed; clones retain their own initialized identity.
         let _ = self.identity.set(identity);
-        self.identity.get().ok_or_else(|| EmbedderError::InvalidConfig {
-            field: "hash.identity".into(),
-            value: self.id.clone(),
-            reason: "hash identity initialization did not complete".into(),
-        })
+        self.identity
+            .get()
+            .ok_or_else(|| EmbedderError::InvalidConfig {
+                field: "hash.identity".into(),
+                value: self.id.clone(),
+                reason: "hash identity initialization did not complete".into(),
+            })
     }
 }
 
@@ -104,8 +110,14 @@ mod tests {
             assert_eq!(identity, model.clone().identity().unwrap());
             let delegate = frankensearch::Embedder::identity(&model.delegate).unwrap();
             assert_ne!(identity.space.fingerprint(), delegate.space.fingerprint());
-            assert_ne!(identity.producer.fingerprint(), delegate.producer.fingerprint());
-            assert_eq!(identity.input.fingerprint(), identity.space.input_contract_fingerprint);
+            assert_ne!(
+                identity.producer.fingerprint(),
+                delegate.producer.fingerprint()
+            );
+            assert_eq!(
+                identity.input.fingerprint(),
+                identity.space.input_contract_fingerprint
+            );
         }
         assert_ne!(
             HashEmbedder::new(256).identity().unwrap().fingerprint(),
@@ -125,12 +137,21 @@ mod tests {
             identity.producer.golden_vectors,
             GoldenVectorCertificateV1::from_exact_f32(&CONFORMANCE_TEXTS, &vectors).unwrap()
         );
-        assert_eq!(model.embed_sync("Case CASE").unwrap(), model.embed_sync("case case").unwrap());
+        assert_eq!(
+            model.embed_sync("Case CASE").unwrap(),
+            model.embed_sync("case case").unwrap()
+        );
         // Single Unicode scalars are dropped even when they occupy multiple
         // UTF-8 bytes. The upstream delegate uses a different token-length law.
-        assert_eq!(model.embed_sync("é 中 a I").unwrap(), model.uniform_fallback());
+        assert_eq!(
+            model.embed_sync("é 中 a I").unwrap(),
+            model.uniform_fallback()
+        );
         assert_eq!(model.embed_sync("\0!?").unwrap(), model.uniform_fallback());
-        assert_ne!(model.delegate.embed_sync("é 中 a I"), model.uniform_fallback());
+        assert_ne!(
+            model.delegate.embed_sync("é 中 a I"),
+            model.uniform_fallback()
+        );
         let mut wrong = vectors;
         wrong[0][0] += 1.0;
         assert_ne!(
@@ -159,7 +180,9 @@ mod tests {
     fn concurrent_identity_admission_shares_one_immutable_value() {
         let model = HashEmbedder::new(32);
         std::thread::scope(|scope| {
-            let handles = (0..8).map(|_| scope.spawn(|| model.identity().unwrap())).collect::<Vec<_>>();
+            let handles = (0..8)
+                .map(|_| scope.spawn(|| model.identity().unwrap()))
+                .collect::<Vec<_>>();
             let first = model.identity().unwrap();
             for handle in handles {
                 assert!(std::ptr::eq(first, handle.join().unwrap()));
@@ -172,7 +195,10 @@ mod tests {
         let model = HashEmbedder::new(64);
         let expected = model.identity().unwrap().clone();
         let adapted = frankensearch::SyncEmbedderAdapter(model);
-        assert_eq!(frankensearch::Embedder::identity(&adapted).unwrap(), &expected);
+        assert_eq!(
+            frankensearch::Embedder::identity(&adapted).unwrap(),
+            &expected
+        );
         assert!(!frankensearch::Embedder::is_semantic(&adapted));
     }
 
@@ -181,9 +207,9 @@ mod tests {
     fn cass_hash_queries_real_retained_fsvi_without_borrowing_upstream_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::search::semantic_manifest::TierKind;
-        use crate::search::vector_index::SemanticDocId;
-        use crate::search::semantic_reader::{SemanticGenerationReader, SemanticShardExpectation};
         use crate::search::semantic_reader::text::TextQueryProducers;
+        use crate::search::semantic_reader::{SemanticGenerationReader, SemanticShardExpectation};
+        use crate::search::vector_index::SemanticDocId;
         use frankensearch::core::generation::{ArtifactGenerationIdentityV1, QuantizationFormat};
         use frankensearch::core::{BoundQueryEmbedding, RetrievalTopology, TieredQueryEmbeddings};
         use frankensearch::index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
@@ -196,33 +222,65 @@ mod tests {
         identity.storage.quantization = QuantizationFormat::F16;
         identity.storage.endianness = "little-endian".into();
         let binding = FsviV2IdentityBinding::new(
-            ArtifactGenerationIdentityV1::new(7, [3; 16])?, identity.freeze()?,
+            ArtifactGenerationIdentityV1::new(7, [3; 16])?,
+            identity.freeze()?,
         )?;
         let path = root.path().join("case-aware.fsvi");
         let mut writer = VectorIndex::create_v2(&path, binding.clone())?;
-        for (message_id, text) in [(1, "authentication middleware"), (2, "unrelated quantum mechanics")] {
+        for (message_id, text) in [
+            (1, "authentication middleware"),
+            (2, "unrelated quantum mechanics"),
+        ] {
             let doc = SemanticDocId {
-                message_id, chunk_idx: 0, agent_id: 1, workspace_id: 2, source_id: 3,
-                role: 1, created_at_ms: 100, content_hash: Some(Sha256::digest(text.as_bytes()).into()),
+                message_id,
+                chunk_idx: 0,
+                agent_id: 1,
+                workspace_id: 2,
+                source_id: 3,
+                role: 1,
+                created_at_ms: 100,
+                content_hash: Some(Sha256::digest(text.as_bytes()).into()),
             };
-            writer.write_record(&doc.to_doc_id_string(), &model.embed_bound_sync(text)?.values)?;
+            writer.write_record(
+                &doc.to_doc_id_string(),
+                &model.embed_bound_sync(text)?.values,
+            )?;
         }
         writer.finish()?;
-        let witness = ValidatedFsviBytes::open_published(&path, &binding)?.witness().clone();
-        let reader = SemanticGenerationReader::open(Some(&[SemanticShardExpectation {
-            path: path.clone(), binding, witness: witness.clone(),
-        }]), None)?;
+        let witness = ValidatedFsviBytes::open_published(&path, &binding)?
+            .witness()
+            .clone();
+        let reader = SemanticGenerationReader::open(
+            Some(&[SemanticShardExpectation {
+                path: path.clone(),
+                binding,
+                witness: witness.clone(),
+            }]),
+            None,
+        )?;
         let before = std::fs::read(&path)?;
-        let batch = reader.activate_text("AUTHENTICATION middleware", TextQueryProducers::Fast(&model))?.search(1, None)?;
+        let batch = reader
+            .activate_text(
+                "AUTHENTICATION middleware",
+                TextQueryProducers::Fast(&model),
+            )?
+            .search(1, None)?;
         assert_eq!(batch.hits()[0].document.message_id, 1);
-        assert_eq!(batch.coverage().requested_topology, RetrievalTopology::HashControl);
+        assert_eq!(
+            batch.coverage().requested_topology,
+            RetrievalTopology::HashControl
+        );
         assert_eq!(batch.witness(TierKind::Fast, 0), Some(&witness));
         // Equal dimensions and the same display family are not compatibility.
         let foreign = BoundQueryEmbedding::new(
             model.delegate.embed_sync("AUTHENTICATION middleware"),
             frankensearch::Embedder::identity(&model.delegate)?.clone(),
         )?;
-        assert!(reader.activate(&TieredQueryEmbeddings::fast_only(foreign)).is_err());
+        assert!(
+            reader
+                .activate(&TieredQueryEmbeddings::fast_only(foreign))
+                .is_err()
+        );
         assert_eq!(std::fs::read(path)?, before);
         Ok(())
     }

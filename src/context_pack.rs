@@ -248,8 +248,8 @@ fn score_candidate(candidate: &Candidate, facts: &PackFacts) -> Scored {
         / 100;
     // Redaction can expand a short secret into a longer marker. Charge the
     // rendered excerpt, not the original bytes; metadata remains an estimate.
-    let token_cost = estimated_tokens(&redact(&candidate.excerpt))
-        .saturating_add(REF_METADATA_TOKENS);
+    let token_cost =
+        estimated_tokens(&redact(&candidate.excerpt)).saturating_add(REF_METADATA_TOKENS);
     Scored {
         candidate: candidate.clone(),
         score,
@@ -670,16 +670,33 @@ mod tests {
             assert_eq!(out["schema_version"], json!(SCHEMA_VERSION));
             assert_eq!(out["mutation_contract"]["read_only"], json!(true));
             assert_ne!(out["bead_id"], src["bead_id"]);
-            assert_ne!(out["_meta"]["fixture_id"], json!("/home/private-fixture/input"));
+            assert_ne!(
+                out["_meta"]["fixture_id"],
+                json!("/home/private-fixture/input")
+            );
         }
         // Missing-source and live-shaped envelopes must share the same boundary.
-        assert_no_secret_leak(&render_context_pack_fixture("/home/private-fixture/input", None));
-        assert_no_secret_leak(&render_payload("/home/private-fixture/input", "live", live_facts()));
+        assert_no_secret_leak(&render_context_pack_fixture(
+            "/home/private-fixture/input",
+            None,
+        ));
+        assert_no_secret_leak(&render_payload(
+            "/home/private-fixture/input",
+            "live",
+            live_facts(),
+        ));
     }
 
     #[test]
     fn explicit_unknown_or_padded_high_risk_cannot_spend_budget_or_emit_excerpt() {
-        for risk in [json!(" HIGH \t"), json!(""), json!("classified"), json!(null), json!(17), json!([])] {
+        for risk in [
+            json!(" HIGH \t"),
+            json!(""),
+            json!("classified"),
+            json!(null),
+            json!(17),
+            json!([]),
+        ] {
             let src = json!({
                 "candidates": [{
                     "id": "excluded",
@@ -691,7 +708,10 @@ mod tests {
             assert!(out["selected"].as_array().unwrap().is_empty());
             assert_eq!(out["excluded_high_risk"].as_array().unwrap().len(), 1);
             assert_eq!(out["budget"]["used_tokens"], json!(0));
-            assert_eq!(out["summary"]["recommended_action"], json!("review-privacy-classification"));
+            assert_eq!(
+                out["summary"]["recommended_action"],
+                json!("review-privacy-classification")
+            );
             assert!(!out.to_string().contains("NEVER_EMIT_EXCLUDED_CONTEXT"));
         }
         for risk in [Some(json!(" LOW ")), Some(json!("Medium")), None] {

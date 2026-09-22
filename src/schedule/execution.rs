@@ -96,7 +96,9 @@ pub(super) fn acquire(data_dir: &Path) -> Result<Lease, AdmissionError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(path).map_err(|_| AdmissionError::Unavailable)?;
+    let file = options
+        .open(path)
+        .map_err(|_| AdmissionError::Unavailable)?;
     if !file
         .metadata()
         .map_err(|_| AdmissionError::Unavailable)?
@@ -148,7 +150,10 @@ mod tests {
         fs::write(&path, "preserved coordination metadata").unwrap();
         let lease = acquire(directory.path()).unwrap();
         drop(lease);
-        assert_eq!(fs::read_to_string(path).unwrap(), "preserved coordination metadata");
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "preserved coordination metadata"
+        );
     }
 
     #[test]
@@ -246,7 +251,10 @@ mod tests {
         let raw = fs::read_to_string(super::super::runs_log_path(directory.path())).unwrap();
         let saved: JobReport = serde_json::from_str(raw.trim()).unwrap();
         assert!(!saved.ok);
-        assert!(state_path.is_dir(), "failed publication never deletes evidence");
+        assert!(
+            state_path.is_dir(),
+            "failed publication never deletes evidence"
+        );
         assert!(!cfg.db_path.exists());
     }
 
@@ -265,7 +273,10 @@ mod tests {
         );
         let state = super::super::load_state(directory.path());
         assert!(!state.last_incremental.unwrap().ok);
-        assert!(history_path.is_dir(), "failed history append never deletes evidence");
+        assert!(
+            history_path.is_dir(),
+            "failed history append never deletes evidence"
+        );
         assert!(!cfg.db_path.exists());
     }
 
@@ -315,7 +326,10 @@ mod tests {
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !directory.path().join("child-ready").exists() {
-            assert!(child.0.try_wait().unwrap().is_none(), "lock child exited early");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "lock child exited early"
+            );
             assert!(Instant::now() < deadline, "lock child readiness timed out");
             std::thread::sleep(Duration::from_millis(10));
         }

@@ -92,7 +92,10 @@ fn busy_is_reported_as_deferred_even_before_legacy_normalization() {
         index_step(ScheduleJob::Nightly, Some(7), true),
         true,
     );
-    assert_eq!(run_detail(&legacy), "last run deferred: index-full (exit 7)");
+    assert_eq!(
+        run_detail(&legacy),
+        "last run deferred: index-full (exit 7)"
+    );
 }
 
 #[test]
