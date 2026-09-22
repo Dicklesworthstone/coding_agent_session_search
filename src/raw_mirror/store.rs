@@ -2467,10 +2467,30 @@ fn read_raw_mirror_manifest(path: &Path) -> Result<RawMirrorManifestFile> {
             RAW_MIRROR_MANIFEST_MAX_BYTES
         ));
     }
-    serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("read raw mirror manifest {}", path.display()))?,
-    )
-    .with_context(|| format!("parse raw mirror manifest {}", path.display()))
+    let mut file = open_stable_source_file(path, &metadata)?;
+    read_raw_mirror_manifest_from_open_file(path, &mut file)
+}
+
+fn read_raw_mirror_manifest_from_open_file(
+    path: &Path,
+    file: &mut File,
+) -> Result<RawMirrorManifestFile> {
+    // A metadata check alone does not bound a file that grows before/during
+    // reading. Read one sentinel byte beyond the limit, then reject before JSON
+    // parsing rather than accepting a truncated prefix.
+    let mut bytes = Vec::new();
+    file.take(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read raw mirror manifest {}", path.display()))?;
+    if bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
+        anyhow::bail!(
+            "refusing to read raw mirror manifest {} larger than {} bytes",
+            path.display(),
+            RAW_MIRROR_MANIFEST_MAX_BYTES
+        );
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse raw mirror manifest {}", path.display()))
 }
 
 fn raw_mirror_root(data_dir: &Path) -> PathBuf {
@@ -4738,6 +4758,34 @@ mod tests {
             format!("{recapture_error:#}").contains("storage metadata is invalid"),
             "unexpected structurally-invalid recapture error: {recapture_error:#}"
         );
+    }
+
+    #[test]
+    fn manifest_read_stays_bounded_when_file_grows_after_open() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path().join("growing-manifest.json");
+        fs::write(&path, b"{}")?;
+        let observed = fs::symlink_metadata(&path)?;
+        let mut opened = open_stable_source_file(&path, &observed)?;
+        assert_eq!(observed.len(), 2);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(RAW_MIRROR_MANIFEST_MAX_BYTES * 4)?;
+
+        let error = read_raw_mirror_manifest_from_open_file(&path, &mut opened)
+            .expect_err("growth after stat/open must not bypass the byte limit");
+        assert!(error.to_string().contains("larger than 16777216 bytes"));
+        assert_eq!(
+            std::io::Seek::stream_position(&mut opened)?,
+            RAW_MIRROR_MANIFEST_MAX_BYTES + 1,
+            "reject after the sentinel byte without reading the full grown file"
+        );
+        assert_eq!(
+            fs::metadata(&path)?.len(),
+            RAW_MIRROR_MANIFEST_MAX_BYTES * 4
+        );
+        Ok(())
     }
 
     #[test]
