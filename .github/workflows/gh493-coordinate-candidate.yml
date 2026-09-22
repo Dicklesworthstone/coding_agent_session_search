@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     timeout-minutes: 55
     permissions:
       contents: write
@@ -35,7 +35,7 @@ jobs:
         with:
           shared-key: gh493-identity
           cache-on-failure: true
-      - name: Prepare exact pack identity changes
+      - name: Prepare exact citation and production-boundary repairs
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -49,6 +49,9 @@ jobs:
               'tests/cli_robot.rs': '2bbae550983d5b2d6f11fb53ad78721ced05d2bb',
               'tests/e2e_cli_flows.rs': '7e345504670c80ca957f5e8cb07085b81c060b0c',
               'docs/planning/ANSWER_PACKS_CONTRACT.md': 'da7daf701813c13e2bd1cb495083db40ed975e0f',
+              'src/indexer/semantic/engine.rs': '6040a7e231fa9cdf80ecee194cd370674bd0501a',
+              'src/search/query/ann_shards/execution.rs': '010ca2b7eabd9f2b4b28b4ffbc6401a75ed4686f',
+              'src/raw_mirror.rs': '9988cf3b1d85b7b75542313095a85369cf2507c6',
           }
           for path, sha in expected.items():
               assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
@@ -60,9 +63,10 @@ jobs:
               data = base64.b64decode(result['content'])
               assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
               return data
-          patch = blob('5352abb56e820bd6e9aaae9da6194fc7429f3b4a')
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          for sha in ['5352abb56e820bd6e9aaae9da6194fc7429f3b4a', '410f55d0577b99fa97af1d1a6425b6fce1fd2a0b']:
+              patch = blob(sha)
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
           with open('tests/gh493_message_coordinates.rs', 'ab') as output:
               output.write(blob('e8709bbdcc4a6462685a25fed1c0dfc7cce74de3'))
           expected_output = {
@@ -71,13 +75,18 @@ jobs:
               'tests/cli_robot.rs': '68c78f33143487669204ee67671e2513dcd09cdf',
               'tests/e2e_cli_flows.rs': '996ef269861be8b890b16825e7adf6e1b1512f7c',
               'docs/planning/ANSWER_PACKS_CONTRACT.md': '04834c3939523115d53a9988578d52f50554ffeb',
+              'src/indexer/semantic/engine.rs': '843885af42f0b3f0227d21da8d1753f2aea932df',
+              'src/search/query/ann_shards/execution.rs': 'e719c9c0d88c0ee6b0067a9088aafba141035c05',
+              'src/raw_mirror.rs': '56ef4df60dffd6f04674c29b2710eff164f2fbab',
           }
           for path, sha in expected_output.items():
               assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          pathlib.Path('candidate').mkdir()
+          pathlib.Path('candidate/input-blobs.json').write_text(json.dumps(expected, indent=2))
           PY
       - name: Format and check the changed sources
         run: |
-          rustfmt --edition 2024 --config skip_children=true src/search/pack_planner.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/e2e_cli_flows.rs
+          rustfmt --edition 2024 --config skip_children=true src/search/pack_planner.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/e2e_cli_flows.rs src/indexer/semantic/engine.rs src/search/query/ann_shards/execution.rs src/raw_mirror.rs
           git diff --check
       - name: Publish reviewed blobs only, never commits or refs
         env:
@@ -87,11 +96,10 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json, os, pathlib, shutil, subprocess, urllib.request
-          paths = ['src/search/pack_planner.rs', 'tests/gh493_message_coordinates.rs', 'tests/cli_robot.rs', 'tests/e2e_cli_flows.rs', 'docs/planning/ANSWER_PACKS_CONTRACT.md']
-          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == set(paths)
-          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': {}, 'candidate_blobs': {}}
-          for path in paths:
-              manifest['base_blobs'][path] = subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip()
+          expected = json.loads(pathlib.Path('candidate/input-blobs.json').read_text())
+          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == set(expected)
+          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': expected, 'candidate_blobs': {}}
+          for path in expected:
               request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', data=json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'cass-candidate-review'}, method='POST')
               with urllib.request.urlopen(request, timeout=60) as response:
                   sha = json.load(response)['sha']
@@ -106,7 +114,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pack-canonical-identity-candidate
+          name: pack-and-production-boundaries-candidate
           path: candidate/
           retention-days: 1
           if-no-files-found: error
@@ -117,7 +125,14 @@ jobs:
         run: cargo test --locked --test cli_robot pack -- --nocapture
       - name: Existing real archive-to-pack journey
         if: ${{ !cancelled() }}
-        run: cargo test --locked --test e2e_cli_flows pack_handoff_journey_uses_real_archive_and_preserves_sources -- --exact --nocapture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test e2e_cli_flows pack_handoff_journey_uses_real_archive_and_preserves_sources -- --exact --nocapture | tee "$RUNNER_TEMP/pack-journey.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/pack-journey.log"
+      - name: Public semantic backfill facade retains artifact ownership
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --test semantic_artifact_reclaim_cli -- --nocapture
       - name: Strict production and regression lint
         if: ${{ !cancelled() }}
-        run: cargo clippy --locked --test gh493_message_coordinates --test gh493_windowed_followup --test cli_view_budget -- -D warnings
+        run: cargo clippy --locked --test gh493_message_coordinates --test gh493_windowed_followup --test cli_view_budget --test semantic_artifact_reclaim_cli -- -D warnings
