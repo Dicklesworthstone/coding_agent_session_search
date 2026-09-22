@@ -15202,7 +15202,10 @@ impl FrankenStorage {
                         .to_ascii_lowercase()
                         .split_whitespace()
                         .collect();
-                    if !(normalized.contains("content=''") || normalized.contains("content=\"\"")) {
+                    let has_empty_content = normalized.contains("content=''")
+                        || normalized.contains("content=\"\"");
+                    let has_contentless_delete = normalized.contains("contentless_delete=1");
+                    if !(has_empty_content && has_contentless_delete) {
                         all_contentless = false;
                     }
                     Ok(())
@@ -23781,6 +23784,55 @@ mod tests {
                 .fts_messages_schema_is_canonical_contentless()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn gh495_legacy_contentless_ddl_without_delete_support_is_residue() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-legacy-contentless-residue.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_atomic_fts_rebuild_fixture(&storage);
+        storage.raw().execute("DROP TABLE fts_messages").unwrap();
+        storage
+            .raw()
+            .execute(
+                "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                    content, title, agent, workspace, source_path,
+                    created_at UNINDEXED, message_id UNINDEXED,
+                    content='', tokenize='porter'
+                 )",
+            )
+            .unwrap();
+        let message_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages LIMIT 1", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO fts_messages(
+                    rowid, content, title, agent, workspace, source_path, created_at, message_id
+                 ) VALUES(?1, 'legacy contentless text', 'legacy', 'codex', '/tmp', '/tmp/legacy', 0, ?1)",
+                fparams![message_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.inspect_search_fallback_fts_parity().unwrap().status,
+            FtsShadowParityStatus::Residue,
+            "contentless DDL without contentless_delete=1 must not enter DELETE_ALL repair"
+        );
+        assert!(matches!(
+            storage.ensure_search_fallback_fts_consistency().unwrap(),
+            FtsConsistencyRepair::Rebuilt { inserted_rows: 1 }
+        ));
+        assert!(storage.fts_messages_schema_is_canonical_contentless().unwrap());
+        assert!(matches!(
+            storage.ensure_search_fallback_fts_consistency().unwrap(),
+            FtsConsistencyRepair::AlreadyHealthy { rows: 1 }
+        ));
     }
 
     /// GH #413 follow-up (iify0): the shadow bound drops an oversized shadow,
