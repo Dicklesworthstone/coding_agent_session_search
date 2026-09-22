@@ -21,6 +21,8 @@ include = [
 ]
 
 [dependencies]
+# Resident-memory supervision reuses the sysinfo version already in Cargo.lock.
+sysinfo = { version = "*", default-features = false, features = ["system"] }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"

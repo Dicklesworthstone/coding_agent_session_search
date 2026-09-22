@@ -909,6 +909,7 @@ dependencies = [
  "smallvec",
  "ssh2",
  "strsim",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.20",
  "tokenizers",

@@ -565,3 +565,117 @@ fn admission_refusal_reaches_both_transports_without_loading_storage() -> anyhow
     }
     Ok(())
 }
+
+#[test]
+fn service_memory_policy_is_enabled_in_both_transports_without_storage_access() -> anyhow::Result<()>
+{
+    for mcp in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let index = temp.path().join("absent-index");
+        let pool = temp.path().join("unopened-pool");
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .args(["serve", "--stdio", "--index"])
+            .arg(&index)
+            .arg("--admission-dir")
+            .arg(&pool)
+            .args(["--max-resident-mib", "2048"]);
+        if mcp {
+            command.arg("--mcp");
+        }
+        let mut child = DeadlineChild(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let mut stdout = child.0.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            std::io::Read::read_to_string(&mut stdout, &mut output).map(|_| output)
+        });
+        let mut input = child.0.stdin.take().unwrap();
+        let requests = if mcp {
+            vec![
+                serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                    "protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"fixture","version":"1"}}}),
+                serde_json::json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+                serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+                    "name":"cass_status", "arguments":{}}}),
+            ]
+        } else {
+            vec![serde_json::json!({"op":"status", "id":2})]
+        };
+        for request in requests {
+            writeln!(input, "{request}")?;
+        }
+        drop(input);
+        let status = child.0.wait_timeout(Duration::from_secs(20))?;
+        if status.is_none() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        let output = reader.join().expect("memory-status reader panicked")?;
+        assert!(status.is_some_and(|s| s.success()));
+        let replies = output
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let status = if mcp {
+            assert_eq!(replies.len(), 2);
+            &replies[1]["result"]["structuredContent"]
+        } else {
+            assert_eq!(replies.len(), 1);
+            &replies[0]["result"]
+        };
+        let memory = &status["memory_supervision"];
+        assert_eq!(memory["enabled"], true);
+        assert_eq!(memory["limit_bytes"], 2048_u64 * 1024 * 1024);
+        assert_eq!(memory["kernel_enforced"], false);
+        assert_eq!(memory["limit_exit_code"], 126);
+        assert_eq!(memory["sample_interval_ms"], 100);
+        assert!(memory["sampled_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(status["open_attempts"], 0);
+        assert_eq!(status["canonical_read_attempts"], 0);
+        assert!(!index.exists());
+        assert!(!pool.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn service_memory_configuration_and_initial_overage_fail_before_storage_access()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let index = temp.path().join("absent-index");
+    let pool = temp.path().join("unopened-pool");
+    for (value, expected_exit) in [
+        ("0", 2),
+        ("1048577", 2),
+        ("18446744073709551616", 2),
+        ("1", 126),
+    ] {
+        let mut child = DeadlineChild(
+            Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+                .args(["serve", "--stdio", "--index"])
+                .arg(&index)
+                .arg("--admission-dir")
+                .arg(&pool)
+                .args(["--max-resident-mib", value])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let status = child.0.wait_timeout(Duration::from_secs(10))?;
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(expected_exit),
+            "{value}"
+        );
+        assert!(!index.exists());
+        assert!(!pool.exists());
+    }
+    Ok(())
+}

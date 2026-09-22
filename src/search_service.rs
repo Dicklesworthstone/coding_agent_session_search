@@ -5,7 +5,8 @@
 //! and exact source/conversation/message coordinates; it never opens raw files.
 //! Neither lane starts models, writers, automatic refresh, or detached children.
 //! Request deadlines terminate the worker, including stalled native calls.
-//! Frame/page/deadline limits are not a total reader-RSS bound.
+//! Sampled resident-memory limits terminate an over-budget worker; they are
+//! not kernel allocation limits or a peak-RSS guarantee between samples.
 
 #[path = "search_service/admission.rs"]
 mod admission;
@@ -15,6 +16,8 @@ mod canonical;
 mod deadline;
 #[path = "search_service/mcp.rs"]
 mod mcp;
+#[path = "search_service/memory.rs"]
+mod memory;
 #[path = "search_service/protocol.rs"]
 mod protocol;
 #[cfg(test)]
@@ -90,6 +93,10 @@ enum ServiceCommand {
         /// Maximum reader-owning processes sharing the same admission directory.
         #[arg(long, requires = "admission_dir", value_parser = admission::parse_slots)]
         admission_slots: Option<u32>,
+        /// Terminate this worker with exit 126 when sampled resident memory exceeds this many MiB.
+        /// Sampling includes idle readers; it is not a kernel-enforced allocation limit.
+        #[arg(long, default_value_t = memory::DEFAULT_MAX_RESIDENT_MIB, value_parser = memory::parse_max_resident_mib)]
+        max_resident_mib: u64,
     },
 }
 
@@ -121,6 +128,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         request_timeout_ms,
         admission_dir,
         admission_slots,
+        max_resident_mib,
     } = cli.command;
     let index = match (index, data_dir) {
         (Some(index), None) => index,
@@ -165,6 +173,19 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         })
         .transpose()
         .map_err(cli_io_error)?;
+    // Start before serving any storage request and keep it through reader
+    // teardown. The probe never opens the index, archive or pool directory.
+    let memory_guard =
+        memory::Guard::start(max_resident_mib).map_err(|error| coding_agent_search::CliError {
+            code: memory::MONITOR_FAILURE_EXIT_CODE,
+            kind: "memory-monitor-unavailable",
+            message: error.to_string(),
+            hint: Some(
+                "Resident-memory supervision could not start; no storage reader was opened.".into(),
+            ),
+            retryable: false,
+        })?;
+    session.memory_observation = Some(memory_guard.observation());
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let result = if mcp {
@@ -177,6 +198,8 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
     let _teardown = deadline::Deadline::start(session.request_timeout)
         .unwrap_or_else(|_| std::process::exit(deadline::WATCHDOG_FAILURE_EXIT_CODE));
     drop(session);
+    // Join the sampler while the teardown deadline still protects this process.
+    drop(memory_guard);
     result.map_err(cli_io_error)
 }
 
@@ -194,6 +217,7 @@ struct Session {
     index: PathBuf,
     request_timeout: Duration,
     archive: Option<PathBuf>,
+    memory_observation: Option<std::sync::Arc<memory::Observation>>,
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
@@ -211,6 +235,7 @@ impl Session {
             index,
             request_timeout: Duration::from_millis(deadline::DEFAULT_TIMEOUT_MS),
             archive: None,
+            memory_observation: None,
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
@@ -248,6 +273,23 @@ impl Session {
     }
 
     fn status(&self) -> Value {
+        let memory = self.memory_observation.as_ref().map(|observation| {
+            let sample = observation.sample();
+            json!({
+                "enabled": true,
+                "scope": "this_process_including_idle_and_teardown",
+                "measurement": "sampled_resident_bytes",
+                "limit_bytes": sample.limit_bytes,
+                "sampled_bytes": sample.current_bytes,
+                "sampled_peak_bytes": sample.peak_bytes,
+                "sample_age_ms": sample.age_ms,
+                "samples": sample.samples,
+                "sample_interval_ms": memory::SAMPLE_INTERVAL_MS,
+                "limit_exit_code": memory::MEMORY_EXIT_CODE,
+                "monitor_failure_exit_code": memory::MONITOR_FAILURE_EXIT_CODE,
+                "kernel_enforced": false,
+            })
+        });
         json!({
             "service": "cass_lexical_stdio",
             "mode": "lexical",
@@ -265,6 +307,7 @@ impl Session {
             "canonical_reads_completed": self.canonical_reads_completed,
             "models_loaded": false,
             "maintenance_performed": false,
+            "memory_supervision": memory.unwrap_or_else(|| json!({"enabled": false})),
             "reader_admission": {
                 "enabled": self.admission_pool.is_some(),
                 "lease_held": self.reader_lease.is_some(),

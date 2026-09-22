@@ -125,7 +125,8 @@ and `offset + limit + 1` must not exceed 1,024. Each agent/workspace filter has
 at most 32 values. Individual filter and returned identity strings are limited
 to 4,096 UTF-8 bytes. Invalid budgets are refused before the reader is loaded.
 
-These are transport and candidate-window bounds, **not a total-RSS bound**.
+These are transport and candidate-window bounds, not kernel allocation limits.
+Resident-memory supervision below adds a sampled termination threshold.
 The first index admission can still be expensive. Each independently started worker still owns
 its own reader: reuse one process rather than spawning one for each query.
 Semantic/HNSW serving is not implemented by this lexical endpoint. Optional
@@ -157,8 +158,8 @@ epochs across processes. Failure of the watchdog itself exits with code 125.
 
 Termination does not wait for Rust destructors or flush evidence buffers.
 Use this mechanism only on the service's read-only paths, never for indexing
-or archive publication. It does not impose a memory limit, alter the native
-engine's cancellation API, or guarantee real-time OS scheduling under system
+or archive publication. The deadline itself does not impose a memory limit,
+alter the native engine's cancellation API, or guarantee real-time OS scheduling under system
 suspension/starvation. Hosts should still supervise the worker process and
 enforce their own end-to-end deadlines, including startup and idle lifetime.
 
@@ -378,3 +379,40 @@ against a hostile directory owner; network-filesystem locking is unqualified.
 The limit covers participating reader owners, not total machine memory. Other
 programs, workers without the option, and allocator-retained pages after
 unload are outside the count. Status reports the scope, slots and held lease.
+
+## Resident-memory supervision
+
+Every `cass serve` worker now samples its own resident memory, including idle
+retained readers and reader teardown. The default termination threshold is
+**4,096 MiB**; set `--max-resident-mib 2048` for 2 GiB. Accepted values are
+1–1,048,576 MiB; zero and overflow cannot disable monitoring. These are
+operator-selected budgets, not measured corpus requirements or throughput claims.
+
+The first fresh sample is obtained before any storage request. Subsequent
+samples are requested every 100 ms using only the worker PID, without
+enumerating Linux tasks or reading other processes' command lines/environments.
+Missing or zero samples are failures, never permission to reuse a stale low
+value. An unsupported measurement prevents startup. A later reported probe
+failure terminates with exit **125**. Status reads the last observations
+without starting an additional probe.
+
+When a sample exceeds the threshold, the entire worker exits **126**, without
+waiting for the query, acquiring output locks, flushing partial frames, or
+running reader destructors. Kernel reader-pool leases release on process death.
+Discard an incomplete response line and restart/reinitialize before retrying.
+A normal EOF closes readers and joins the monitor within the teardown deadline.
+
+`memory_supervision` reports the byte threshold, latest sampled resident bytes,
+peak among observed samples, sample age/count, interval and exit codes. This is
+**not a kernel-enforced allocation limit or a peak-RSS guarantee**: allocations
+can overshoot between samples, OS probes and scheduling take time, and swapped
+out memory is not resident memory. Process-tree memory and other applications
+are outside the measurement. A stuck OS probe is not preempted by this sampler;
+active request deadlines and external host supervision remain important.
+
+Shared reader admission and memory monitoring address different risks: the
+pool limits cooperating reader owners, while this guard limits continued
+execution after an observed per-worker overage. An unloaded allocator can
+still retain pages, so the pool count times this threshold is not a machine-wide
+memory certificate. For strict allocation containment use an OS-managed
+process/container budget as well. Neither feature adds semantic serving.
