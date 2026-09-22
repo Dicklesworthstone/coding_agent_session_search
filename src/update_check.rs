@@ -455,6 +455,66 @@ try {
 "#
 }
 
+/// Encode `& { <script> } '<arg>' ...` for `powershell -EncodedCommand`.
+///
+/// `powershell -Command <script> <arg>...` does not bind the trailing tokens
+/// to `$args`: PowerShell joins every token after `-Command` into the command
+/// text, so the script saw `$InstallUrl = $null` and the URL itself was run as
+/// a command (GH #381). A script block receives its arguments as `$args`, the
+/// arguments are single-quoted literals (every PowerShell single-quote
+/// character doubled, including the typographic ones it also accepts), and
+/// the whole command travels as base64 UTF-16LE, so no Windows command-line
+/// quoting can alter the script or split an argument.
+#[cfg(any(test, target_os = "windows"))]
+fn encode_powershell_script_invocation(script: &str, args: &[&str]) -> String {
+    use base64::prelude::*;
+    let mut command = String::with_capacity(script.len() + 16);
+    command.push_str("& {");
+    command.push_str(script);
+    command.push('}');
+    for arg in args {
+        command.push_str(" '");
+        for ch in arg.chars() {
+            if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                command.push(ch);
+            }
+            command.push(ch);
+        }
+        command.push('\'');
+    }
+    let utf16le: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    BASE64_STANDARD.encode(utf16le)
+}
+
+/// The complete `powershell.exe` argument vector for a Windows self-update.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_self_update_powershell_args(version: &str) -> Vec<String> {
+    let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
+    let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
+    let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
+    let install_checksum_url = release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET);
+    let encoded = encode_powershell_script_invocation(
+        windows_self_update_script(),
+        &[
+            &install_url,
+            &checksums_url,
+            version,
+            &checksums_alt_url,
+            &install_checksum_url,
+        ],
+    );
+    [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-NoProfile",
+        "-EncodedCommand",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(std::iter::once(encoded))
+    .collect()
+}
+
 /// Run the self-update installer script interactively.
 /// This function does NOT return - it replaces the current process with the installer.
 /// The caller should ensure the terminal is in a clean state before calling.
@@ -493,24 +553,9 @@ pub fn run_self_update(version: &str) -> ! {
 
     #[cfg(target_os = "windows")]
     {
-        let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
-        let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
-        let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
-        let install_checksum_url = release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET);
         // Windows doesn't have exec(), so we spawn and wait.
         let status = std::process::Command::new("powershell")
-            .args([
-                "-ExecutionPolicy",
-                "Bypass",
-                "-NoProfile",
-                "-Command",
-                windows_self_update_script(),
-                &install_url,
-                &checksums_url,
-                version,
-                &checksums_alt_url,
-                &install_checksum_url,
-            ])
+            .args(windows_self_update_powershell_args(version))
             .status();
         match status {
             Ok(s) => std::process::exit(installer_process_exit_code(s)),
@@ -1140,6 +1185,114 @@ mod tests {
         let script = windows_self_update_script();
         assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("@($ChecksumsUrl, $args[3], $args[4])"));
+    }
+
+    fn decode_powershell_encoded_command(encoded: &str) -> String {
+        use base64::prelude::*;
+        let bytes = BASE64_STANDARD.decode(encoded).expect("valid base64");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16LE payload has whole code units");
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units).expect("valid UTF-16")
+    }
+
+    /// GH #381: `powershell -Command <script> <url>...` never binds the URLs
+    /// to `$args` (PowerShell folds them into the command text), so every
+    /// Windows self-update ran with `$InstallUrl = $null`. No release URL may
+    /// appear as its own process argument; they must reach the script block.
+    #[test]
+    fn test_windows_self_update_passes_urls_to_the_script_block_not_the_command_line() {
+        let version = "v1.2.3";
+        let args = windows_self_update_powershell_args(version);
+        assert_eq!(
+            args[..4],
+            [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-EncodedCommand"
+            ]
+        );
+        assert_eq!(args.len(), 5, "only the encoded command follows: {args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-Command" || arg.starts_with("https://")),
+            "no URL or -Command token may reach powershell's own argv: {args:?}"
+        );
+
+        let command = decode_powershell_encoded_command(&args[4]);
+        let expected_args = [
+            release_asset_url(version, WINDOWS_INSTALL_ASSET),
+            release_asset_url(version, CHECKSUMS_ASSET),
+            version.to_string(),
+            release_asset_url(version, CHECKSUMS_ASSET_ALT),
+            release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET),
+        ];
+        let suffix: String = expected_args
+            .iter()
+            .map(|arg| format!(" '{arg}'"))
+            .collect();
+        assert_eq!(
+            command,
+            format!("& {{{}}}{suffix}", windows_self_update_script()),
+            "the script must run as a script block whose $args are, in order, \
+             install URL, checksums URL, version, alternate checksums, standalone checksum"
+        );
+    }
+
+    #[test]
+    fn test_powershell_invocation_doubles_every_single_quote_form() {
+        let encoded = encode_powershell_script_invocation(
+            "Write-Output $args[0]",
+            &[
+                "it's",
+                "typographic \u{2018}a\u{2019} \u{201A}b\u{201B}",
+                "",
+            ],
+        );
+        assert_eq!(
+            decode_powershell_encoded_command(&encoded),
+            "& {Write-Output $args[0]} 'it''s' \
+             'typographic \u{2018}\u{2018}a\u{2019}\u{2019} \u{201A}\u{201A}b\u{201B}\u{201B}' ''"
+        );
+    }
+
+    /// Executes the encoding through a real PowerShell when one is installed
+    /// (Windows CI, or pwsh on Unix); skipped otherwise.
+    #[test]
+    fn test_powershell_invocation_binds_arguments_in_a_real_shell() {
+        let shell = ["pwsh", "powershell"].into_iter().find(|shell| {
+            std::process::Command::new(shell)
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        });
+        let Some(shell) = shell else {
+            eprintln!("skipping: no PowerShell on PATH");
+            return;
+        };
+        let args = [
+            "https://example.invalid/a?x=1&y=2",
+            "it's; Write-Output injected",
+            "v1.2.3",
+        ];
+        let output = std::process::Command::new(shell)
+            .args([
+                "-NoProfile",
+                "-EncodedCommand",
+                &encode_powershell_script_invocation("Write-Output ($args -join '|')", &args),
+            ])
+            .output()
+            .expect("run PowerShell");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            args.join("|"),
+            "arguments must arrive verbatim and unexecuted"
+        );
     }
 
     #[test]
