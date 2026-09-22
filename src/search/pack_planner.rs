@@ -2667,8 +2667,8 @@ fn render_answer_pack_jsonl(
     let mut lines = Vec::with_capacity(envelope.evidence.len() + 4);
     lines.push(json_line(
         serde_json::json!({
-            "schema_version": envelope.schema_version,
             "_meta": &envelope.meta,
+            "schema_version": envelope.schema_version,
             "budget": &envelope.budget,
         }),
         request,
@@ -3566,6 +3566,7 @@ mod tests {
         assert!(lines[2].starts_with("{\"omitted\":"));
         assert!(lines[3].starts_with("{\"privacy\":"));
         let meta: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(meta["schema_version"], "cass.pack.v2");
         let omitted: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(
             meta["_meta"]["warnings"],

@@ -1,97 +1,13 @@
 name: GH493 canonical anchor candidate
 
+# The reviewed candidate is now production code. Keep this manual entry point
+# as a read-only alias for the permanent regression suite, not a blob publisher.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/gh493-coordinate-candidate.yml
 
 permissions:
   contents: read
 
 jobs:
-  prepare:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Admit and apply the complete reviewed patch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
-          inputs = {'src/ui/data.rs': '90ea9d061f36ef033368918fec3566fe8d176403', 'src/ui/app.rs': 'edd9e357f0f7b1201159863c5c0535f3e7944fd5', 'src/search/pack_planner.rs': 'ce87c5a4abbeb79b9836afb9d42e0299e6d9f98f'}
-          outputs = {'src/ui/data.rs': 'e53dbac9fc2532c1d19f7031d24cea2e1e04c072', 'src/ui/app.rs': '793ba14ca81ce81aa6332263eb2309208325837c', 'src/search/pack_planner.rs': '06aa863270e5899bb8faa959ca2ba3bcf147aa58'}
-          def git_hash(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          for path, sha in inputs.items():
-              assert git_hash(pathlib.Path(path).read_bytes()) == sha, path
-          pieces = []
-          for sha in ['a47c730a90095faa612ff1f041a82ebec354390d', '1647b759aeb599b288aa834653746d2b8cce521b', '20bdc9cfa377cde7e988873fbce4c5c537643511', '29c6b758c74a2f38a8bcc742509824e58646226f']:
-              request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'cass-canonical-tui-review'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              assert result['encoding'] == 'base64'
-              data = base64.b64decode(result['content'])
-              assert git_hash(data) == sha
-              pieces.append(data)
-          compressed = b''.join(pieces)
-          assert git_hash(compressed) == '7c77aff7e7b7f764c4f74d8077afc34537cac1a7'
-          patch = gzip.decompress(compressed)
-          assert git_hash(patch) == '19551f321bdf39e3c3b4587a5a67b7fe4f99636a'
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          for path, sha in outputs.items():
-              assert git_hash(pathlib.Path(path).read_bytes()) == sha, path
-          pathlib.Path('candidate').mkdir()
-          pathlib.Path('candidate/input-blobs.json').write_text(json.dumps(inputs, indent=2))
-          PY
-      - name: Format and verify complete changed sources
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustfmt --edition 2024 --config skip_children=true src/ui/data.rs src/ui/app.rs src/search/pack_planner.rs
-          git diff --check
-      - name: Publish reviewed blobs only, never commits or refs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os, pathlib, shutil, subprocess, urllib.request
-          inputs = json.loads(pathlib.Path('candidate/input-blobs.json').read_text())
-          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == set(inputs)
-          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': inputs, 'candidate_blobs': {}}
-          for path in inputs:
-              request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', data=json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'cass-canonical-tui-review'}, method='POST')
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  sha = json.load(response)['sha']
-              assert sha == subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              manifest['candidate_blobs'][path] = sha
-              destination = pathlib.Path('candidate') / path
-              destination.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copyfile(path, destination)
-          pathlib.Path('candidate/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff']))
-          print(json.dumps(manifest, indent=2))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: tui-canonical-exact-prepared
-          path: candidate/
-          retention-days: 1
-          if-no-files-found: error
+  verify:
+    uses: ./.github/workflows/message-coordinate-regression.yml
