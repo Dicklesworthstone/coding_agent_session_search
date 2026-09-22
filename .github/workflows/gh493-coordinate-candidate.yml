@@ -1,13 +1,39 @@
 name: GH493 canonical anchor candidate
 
-# The reviewed candidate is now production code. Keep this manual entry point
-# as a read-only alias for the permanent regression suite, not a blob publisher.
+# Read-only entry point for regression evidence and the exact tracked source.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh493-coordinate-candidate.yml
 
 permissions:
   contents: read
 
 jobs:
+  source:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Retain immutable tracked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cass-retrieval-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/cass-retrieval-source/commit.txt"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/cass-retrieval-source/source.tar"
+          sha256sum "$RUNNER_TEMP/cass-retrieval-source/source.tar"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cass-retrieval-source
+          path: ${{ runner.temp }}/cass-retrieval-source/
+          retention-days: 1
+          if-no-files-found: error
   verify:
+    if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/message-coordinate-regression.yml
