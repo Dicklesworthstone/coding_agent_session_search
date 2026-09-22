@@ -319,3 +319,76 @@ fn page_window_boundary_does_not_emit_an_unusable_continuation() -> Result<()> {
     assert!(page["next_offset"].is_null());
     Ok(())
 }
+
+#[test]
+fn admission_is_lazy_for_status_invalid_queries_and_unload() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pool = temp.path().join("pool");
+    let mut session = Session::new(temp.path().join("absent"));
+    session.admission_pool = Some(admission::Pool::new(pool.clone(), 1)?);
+    assert!(session.handle(Request::Status { id: 1 }).0.ok);
+    assert!(session.handle(Request::Unload { id: 2 }).0.ok);
+    let (invalid, _) = session.handle(request(json!({"op":"search", "id":3, "query":" "})));
+    assert_eq!(invalid.error.unwrap().kind, "invalid_request");
+    assert_eq!(session.open_attempts, 0);
+    assert!(!pool.exists());
+    Ok(())
+}
+
+#[test]
+fn one_pool_preserves_reader_reuse_and_allows_handoff_after_unload() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index");
+    drop(index(&path, &[document(42, "admissionneedle", "local")])?);
+    let before = tree(&path)?;
+    let pool = admission::Pool::new(temp.path().join("pool"), 1)?;
+    let mut first = Session::new(path.clone());
+    let mut second = Session::new(path.clone());
+    first.admission_pool = Some(pool.clone());
+    second.admission_pool = Some(pool.clone());
+    assert_eq!(search(&mut first, 1, "admissionneedle")["count"], 1);
+    assert_eq!(
+        search(&mut first, 2, "admissionneedle")["reader_reused"],
+        true
+    );
+    let (refused, _) = second.handle(request(
+        json!({"op":"search", "id":3, "query":"admissionneedle"}),
+    ));
+    assert_eq!(refused.error.unwrap().kind, "admission_busy");
+    assert_eq!(second.open_attempts, 0);
+    let (unloaded, stop) = first.handle(Request::Unload { id: 4 });
+    assert!(!stop);
+    assert_eq!(
+        unloaded.result.unwrap()["reader_admission"]["lease_held"],
+        false
+    );
+    assert_eq!(search(&mut second, 5, "admissionneedle")["count"], 1);
+    assert!(matches!(pool.acquire(), Err(admission::Refusal::Busy)));
+    assert!(second.handle(Request::Shutdown { id: 6 }).1);
+    let reopened = search(&mut first, 7, "admissionneedle");
+    assert_eq!(reopened["snapshot"]["reader_epoch"], 2);
+    assert_eq!(reopened["hits"][0]["conversation_id"], 42);
+    first.unload();
+    assert_eq!(tree(&path)?, before);
+    Ok(())
+}
+
+#[test]
+fn failed_index_admission_releases_the_reserved_slot() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pool = admission::Pool::new(temp.path().join("pool"), 1)?;
+    let mut session = Session::new(temp.path().join("absent"));
+    session.admission_pool = Some(pool.clone());
+    let (failed, _) = session.handle(Request::Reload { id: 1 });
+    assert!(!failed.ok);
+    assert_eq!(failed.error.unwrap().kind, "index_unavailable");
+    assert_eq!(session.open_attempts, 1);
+    assert!(
+        !session.status()["reader_admission"]["lease_held"]
+            .as_bool()
+            .unwrap()
+    );
+    drop(pool.acquire()?);
+    assert!(!session.index.exists());
+    Ok(())
+}

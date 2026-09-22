@@ -242,6 +242,7 @@ impl Adapter {
             "cass_search" => "search",
             "cass_status" => "status",
             "cass_reload" => "reload",
+            "cass_unload" => "unload",
             "cass_view" if session.archive.is_some() => "view",
             _ => return Some(failure(id, -32602, "unknown tool")),
         };
@@ -316,6 +317,12 @@ fn tools() -> Vec<Value> {
         json!({
             "name": "cass_status",
             "description": "Inspect only this process's reader/counters and bounds. Does not open the index or check archive health/freshness.",
+            "inputSchema": {"type": "object", "additionalProperties": false},
+            "annotations": annotations,
+        }),
+        json!({
+            "name": "cass_unload",
+            "description": "Release this worker's retained lexical reader and its admission lease without closing the connection. The next query must reopen/reacquire. Does not touch the archive or load an index; no guarantee that the allocator immediately returns all resident pages.",
             "inputSchema": {"type": "object", "additionalProperties": false},
             "annotations": annotations,
         }),

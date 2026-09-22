@@ -64,13 +64,14 @@ processed sequentially, so backpressure does not create an in-process request
 queue. Without `--mcp`, this is a CASS JSON-lines protocol, not JSON-RPC.
 The MCP adapter described below uses the same reader and bounds.
 
-Every request requires an unsigned 64-bit `id`. Four operations are always available:
+Every request requires an unsigned 64-bit `id`. Five operations are always available:
 
 ```json
 {"op":"status","id":1}
 {"op":"search","id":2,"query":"performance","limit":10,"offset":0,"filters":{"agents":["codex"],"workspaces":["/my/project"],"source_id":"work-laptop"}}
 {"op":"reload","id":3}
-{"op":"shutdown","id":4}
+{"op":"unload","id":4}
+{"op":"shutdown","id":5}
 ```
 
 Search defaults to `limit: 10`, `offset: 0`, and no filters. `filters` may contain
@@ -127,8 +128,8 @@ to 4,096 UTF-8 bytes. Invalid budgets are refused before the reader is loaded.
 These are transport and candidate-window bounds, **not a total-RSS bound**.
 The first index admission can still be expensive. Each independently started worker still owns
 its own reader: reuse one process rather than spawning one for each query.
-Semantic/HNSW serving and cross-process admission are not implemented by this
-lexical endpoint.
+Semantic/HNSW serving is not implemented by this lexical endpoint. Optional
+shared reader admission is described below; it bounds owners, not total RSS.
 
 ### Enforced request deadlines
 
@@ -238,10 +239,10 @@ clients to fall back to the supported handshake. A modern-only client cannot
 use this adapter. Protocol behavior follows the versioned MCP lifecycle and
 stdio specifications, not an assumption that every version uses initialization.
 
-The stable catalog exposes `cass_search`, `cass_status`, and `cass_reload`.
+The catalog exposes `cass_search`, `cass_status`, `cass_unload`, and `cass_reload`.
 With an explicit startup `--db`, it also exposes the read-only `cass_view` tool.
 `cass_search` arguments are the JSON-lines search fields **without** `op` or
-`id`; status and reload accept an empty object. The JSON-RPC ID is preserved
+`id`; status, unload and reload accept an empty object. The JSON-RPC ID is preserved
 exactly, including string and signed-integer IDs. There is no arbitrary file
 reader, SQL tool, shell command, indexing tool, or semantic-mode substitution.
 Tool results include both `structuredContent` and its JSON representation in
@@ -343,3 +344,37 @@ host's process-level deadline. No maintenance, recovery write, model loading,
 raw transcript read, arbitrary SQL or new filesystem authority is provided.
 The enclosing service request deadline also covers this lookup, including an
 individual native SQL call, by terminating the worker if necessary.
+
+## Shared reader admission (explicit opt-in)
+
+Use `--admission-dir /trusted/local/cass-reader-pool --admission-slots 1`
+on `cass serve --stdio` or `cass serve --stdio --mcp`. Every cooperating
+worker must use the same local directory and slot count, including workers
+serving different indexes. Counts are 1–64, default one. Without the directory
+option, shared admission is disabled. This is not a query relay: reuse an
+admitted worker for repeated queries.
+
+A worker acquires one kernel-backed lease before opening its lexical reader
+and retains it through reader destruction. A canonical view uses the existing
+lease or a temporary one through archive close. Busy admission returns
+`admission_busy` before index-open or canonical-read counters advance. Failed
+opens release their temporary lease. Status and invalid requests do not
+initialize or inspect the pool.
+
+`unload` / MCP `cass_unload` releases the reader and then its lease without
+closing the connection. The next query reacquires and reopens. Reload also
+releases first; another process can win the slot, leaving a failed reloader
+unloaded. Kernel locks release on process termination; PIDs and timestamps
+are not ownership certificates. Existing deadlines and source checks remain.
+
+This explicit option writes only a versioned policy and fixed slot lock files.
+Choose a private trusted local directory outside indexes and source trees.
+Never delete, replace or move pool files or the directory while workers may
+be alive: this splits the lock namespace. Different slot counts and partial
+policies fail closed with `admission_policy_mismatch`; there is no automatic
+repair or stale-file deletion. Symlink preflight is not an atomic sandbox
+against a hostile directory owner; network-filesystem locking is unqualified.
+
+The limit covers participating reader owners, not total machine memory. Other
+programs, workers without the option, and allocator-retained pages after
+unload are outside the count. Status reports the scope, slots and held lease.

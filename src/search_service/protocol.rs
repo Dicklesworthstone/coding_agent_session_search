@@ -59,6 +59,9 @@ pub(super) enum Request {
     Reload {
         id: u64,
     },
+    Unload {
+        id: u64,
+    },
     Shutdown {
         id: u64,
     },

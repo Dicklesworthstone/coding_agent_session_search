@@ -160,7 +160,7 @@ fn mcp_tool_catalog_is_stable_bounded_and_has_no_mutating_archive_tools() {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["cass_search", "cass_status", "cass_reload"]
+        ["cass_search", "cass_status", "cass_unload", "cass_reload"]
     );
     for tool in &catalog {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
@@ -354,4 +354,26 @@ fn mcp_calls_use_the_same_real_reader_and_explicit_reload_boundary() -> anyhow::
         b"never a database"
     );
     Ok(())
+}
+
+#[test]
+fn mcp_unload_is_explicit_and_does_not_open_an_index_or_admission_pool() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool_path = temp.path().join("pool");
+    let mut session = Session::new(temp.path().join("absent-index"));
+    session.admission_pool =
+        Some(super::super::admission::Pool::new(pool_path.clone(), 1).unwrap());
+    let mut adapter = Adapter::default();
+    initialize(&mut adapter, &mut session, CURRENT_VERSION);
+    let response = adapter
+        .handle(
+            &mut session,
+            call("release".into(), "cass_unload", json!({})),
+        )
+        .unwrap();
+    assert_eq!(response["id"], "release");
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(response["result"]["structuredContent"]["loaded"], false);
+    assert_eq!(session.open_attempts, 0);
+    assert!(!pool_path.exists());
 }

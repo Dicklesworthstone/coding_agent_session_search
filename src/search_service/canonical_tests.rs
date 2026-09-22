@@ -340,13 +340,13 @@ fn mcp_catalog_and_dispatch_require_explicit_canonical_permission() -> Result<()
     let mut session = Session::new(fixture.root.path().join("absent-index"));
     let list = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
     let replies = mcp_exchange(&mut session, &[list.clone(), mcp_view(&fixture, json!(2))])?;
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
     assert_eq!(replies[2]["error"]["code"], -32602);
     assert_eq!(session.canonical_read_attempts, 0);
     session.archive = Some(fixture.db.clone());
     let replies = mcp_exchange(&mut session, &[list])?;
     let tools = replies[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 5);
     let view = tools
         .iter()
         .find(|tool| tool["name"] == "cass_view")
@@ -484,6 +484,33 @@ fn canonical_connection_enforces_engine_read_only_not_just_query_only() -> Resul
     connection.execute("PRAGMA query_only = OFF")?;
     assert!(connection.execute(mutation).is_err());
     connection.close_without_checkpoint()?;
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn canonical_reads_share_admission_and_release_temporary_leases() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let pool = super::super::admission::Pool::new(fixture.root.path().join("pool"), 1)?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    session.admission_pool = Some(pool.clone());
+    let before = archive_image(&fixture.db)?;
+    let holder = pool.acquire()?;
+    let (refused, _) = session.handle(fixture.request(1, 0));
+    assert_eq!(refused.error.unwrap().kind, "admission_busy");
+    assert_eq!(session.canonical_read_attempts, 0);
+    drop(holder);
+    for id in [2, 3] {
+        let (reply, _) = session.handle(fixture.request(id, 0));
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(
+            reply.result.unwrap()["messages"][0]["content"],
+            "canonical content 12"
+        );
+        drop(pool.acquire()?);
+    }
+    assert_eq!(session.open_attempts, 0);
     assert_eq!(archive_image(&fixture.db)?, before);
     Ok(())
 }

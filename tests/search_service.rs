@@ -181,7 +181,7 @@ fn cass_serve_mcp_dispatches_real_negotiation_without_archive_access() -> anyhow
         .collect::<Result<_, _>>()?;
     assert_eq!(replies.len(), 3, "notifications get no response");
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
     assert_eq!(replies[2]["id"], "status");
     assert_eq!(
         replies[2]["result"]["structuredContent"]["open_attempts"],
@@ -476,6 +476,91 @@ fn trickling_input_cannot_restart_the_whole_request_deadline() -> anyhow::Result
         }
         writer.join().expect("bounded trickle writer panicked");
         assert_eq!(status.and_then(|status| status.code()), Some(124));
+        assert!(!index.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn admission_refusal_reaches_both_transports_without_loading_storage() -> anyhow::Result<()> {
+    use std::fs::OpenOptions;
+    for mcp in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let pool = temp.path().join("pool");
+        std::fs::create_dir(&pool)?;
+        std::fs::write(pool.join("policy-v1"), b"CASS-READER-POOL-1\nslots=1\n")?;
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(pool.join("reader-00.lock"))?;
+        lease.try_lock()?;
+        let index = temp.path().join("absent-index");
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .args(["serve", "--stdio", "--index"])
+            .arg(&index)
+            .arg("--admission-dir")
+            .arg(&pool);
+        if mcp {
+            command.arg("--mcp");
+        }
+        let mut child = DeadlineChild(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let mut input = child.0.stdin.take().unwrap();
+        let requests = if mcp {
+            vec![
+                serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                    "protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"fixture","version":"1"}}}),
+                serde_json::json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+                serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+                    "name":"cass_search", "arguments":{"query":"needle"}}}),
+                serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+                    "name":"cass_status", "arguments":{}}}),
+            ]
+        } else {
+            vec![
+                serde_json::json!({"op":"search", "id":2, "query":"needle"}),
+                serde_json::json!({"op":"status", "id":3}),
+            ]
+        };
+        for request in requests {
+            writeln!(input, "{request}")?;
+        }
+        drop(input);
+        assert!(
+            child
+                .0
+                .wait_timeout(Duration::from_secs(20))?
+                .is_some_and(|s| s.success())
+        );
+        let mut output = String::new();
+        std::io::Read::read_to_string(&mut child.0.stdout.take().unwrap(), &mut output)?;
+        let replies = output
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (refusal, status) = if mcp {
+            assert_eq!(replies.len(), 3);
+            assert_eq!(replies[1]["result"]["isError"], true);
+            (
+                &replies[1]["result"]["structuredContent"],
+                &replies[2]["result"]["structuredContent"],
+            )
+        } else {
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[0]["ok"], false);
+            (&replies[0], &replies[1]["result"])
+        };
+        assert_eq!(refusal["error"]["kind"], "admission_busy");
+        assert_eq!(status["open_attempts"], 0);
+        assert_eq!(status["canonical_read_attempts"], 0);
+        assert_eq!(status["reader_admission"]["lease_held"], false);
         assert!(!index.exists());
     }
     Ok(())

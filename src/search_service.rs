@@ -7,6 +7,8 @@
 //! Request deadlines terminate the worker, including stalled native calls.
 //! Frame/page/deadline limits are not a total reader-RSS bound.
 
+#[path = "search_service/admission.rs"]
+mod admission;
 #[path = "search_service/canonical.rs"]
 mod canonical;
 #[path = "search_service/deadline.rs"]
@@ -81,6 +83,13 @@ enum ServiceCommand {
             value_parser = deadline::parse_timeout_ms
         )]
         request_timeout_ms: u64,
+        /// Shared local control directory for nonblocking cross-process reader admission.
+        /// Writes only pool metadata; never place this directory inside a search index.
+        #[arg(long, value_name = "PATH")]
+        admission_dir: Option<PathBuf>,
+        /// Maximum reader-owning processes sharing the same admission directory.
+        #[arg(long, requires = "admission_dir", value_parser = admission::parse_slots)]
+        admission_slots: Option<u32>,
     },
 }
 
@@ -110,6 +119,8 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         mcp,
         db,
         request_timeout_ms,
+        admission_dir,
+        admission_slots,
     } = cli.command;
     let index = match (index, data_dir) {
         (Some(index), None) => index,
@@ -140,6 +151,17 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
             } else {
                 std::env::current_dir().map(|cwd| cwd.join(path))
             }
+        })
+        .transpose()
+        .map_err(cli_io_error)?;
+    session.admission_pool = admission_dir
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            admission::Pool::new(path, admission_slots.unwrap_or(admission::DEFAULT_SLOTS))
         })
         .transpose()
         .map_err(cli_io_error)?;
@@ -175,6 +197,9 @@ struct Session {
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
+    // Declaration/drop order matters: reader destruction precedes lease release.
+    reader_lease: Option<admission::Lease>,
+    admission_pool: Option<admission::Pool>,
     open_attempts: u64,
     successful_opens: u64,
     queries_completed: u64,
@@ -189,6 +214,8 @@ impl Session {
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
+            reader_lease: None,
+            admission_pool: None,
             open_attempts: 0,
             successful_opens: 0,
             queries_completed: 0,
@@ -197,12 +224,27 @@ impl Session {
 
     fn ensure_loaded(&mut self) -> Result<()> {
         if self.client.is_none() {
+            let lease = self.acquire_reader_lease()?;
             self.open_attempts = self.open_attempts.saturating_add(1);
             let client = open_snapshot(&self.index)?;
             self.successful_opens = self.successful_opens.saturating_add(1);
             self.client = Some(client);
+            self.reader_lease = lease;
         }
         Ok(())
+    }
+
+    fn acquire_reader_lease(&self) -> Result<Option<admission::Lease>> {
+        self.admission_pool
+            .as_ref()
+            .map(admission::Pool::acquire)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn unload(&mut self) {
+        drop(self.client.take());
+        drop(self.reader_lease.take());
     }
 
     fn status(&self) -> Value {
@@ -223,6 +265,13 @@ impl Session {
             "canonical_reads_completed": self.canonical_reads_completed,
             "models_loaded": false,
             "maintenance_performed": false,
+            "reader_admission": {
+                "enabled": self.admission_pool.is_some(),
+                "lease_held": self.reader_lease.is_some(),
+                "slots": self.admission_pool.as_ref().map(admission::Pool::slots),
+                "scope": "cooperating_processes_using_one_local_pool",
+                "bounds_total_rss": false,
+            },
             "limits": {
                 "request_bytes": protocol::MAX_REQUEST_BYTES,
                 "response_bytes": protocol::MAX_RESPONSE_BYTES,
@@ -384,6 +433,25 @@ impl Session {
                         false,
                     );
                 };
+                // A loaded lexical reader already holds this process's lease.
+                // Otherwise cover the entire per-view reader lifetime temporarily.
+                let _view_lease = if self.client.is_none() {
+                    match self.acquire_reader_lease() {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            return (
+                                Reply::failure(
+                                    Some(id),
+                                    admission_error_kind(&error, "admission_unavailable"),
+                                    format!("{error:#}"),
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.canonical_read_attempts = self.canonical_read_attempts.saturating_add(1);
                 let reply = match canonical::read(db, &request) {
                     Ok(result) => {
@@ -400,14 +468,18 @@ impl Session {
                 (reply, false)
             }
             Request::Status { id } => (Reply::success(id, self.status()), false),
+            Request::Unload { id } => {
+                self.unload();
+                (Reply::success(id, self.status()), false)
+            }
             Request::Shutdown { id } => {
-                drop(self.client.take());
+                self.unload();
                 (Reply::success(id, json!({"shutdown": true})), true)
             }
             Request::Reload { id } => {
                 // Drop first: never retain two multi-GB generations during
                 // reload. A failed reload leaves no silently stale fallback.
-                drop(self.client.take());
+                self.unload();
                 let started = Instant::now();
                 let reply = match self.ensure_loaded() {
                     Ok(()) => Reply::success(
@@ -417,9 +489,11 @@ impl Session {
                             "snapshot": self.status(),
                         }),
                     ),
-                    Err(error) => {
-                        Reply::failure(Some(id), "index_unavailable", format!("{error:#}"))
-                    }
+                    Err(error) => Reply::failure(
+                        Some(id),
+                        admission_error_kind(&error, "index_unavailable"),
+                        format!("{error:#}"),
+                    ),
                 };
                 (reply, false)
             }
@@ -436,12 +510,22 @@ impl Session {
                 }
                 let reply = match self.search(&query, filters, limit, offset) {
                     Ok(result) => Reply::success(id, result),
-                    Err(error) => Reply::failure(Some(id), "search_failed", format!("{error:#}")),
+                    Err(error) => Reply::failure(
+                        Some(id),
+                        admission_error_kind(&error, "search_failed"),
+                        format!("{error:#}"),
+                    ),
                 };
                 (reply, false)
             }
         }
     }
+}
+
+fn admission_error_kind(error: &anyhow::Error, fallback: &'static str) -> &'static str {
+    error
+        .downcast_ref::<admission::Refusal>()
+        .map_or(fallback, admission::Refusal::kind)
 }
 
 fn open_snapshot(index: &Path) -> Result<SearchClient> {
