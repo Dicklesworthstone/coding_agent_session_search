@@ -281,14 +281,16 @@ fn restore<R: BufRead>(
                     expected.get(table_count) == Some(&table),
                     "record {line}: logical table does not match this binary's canonical schema"
                 );
-                statement = Some(insert_sql(&table)?);
+                // One prepared INSERT per descriptor, not one SQL parse/compile
+                // per archive row. It remains idle across private batch commits.
+                statement = Some(connection.prepare(&insert_sql(&table)?)?);
                 table_count += 1;
             }
             Record::Row { values: cells } => {
-                let sql = statement
+                let insert = statement
                     .as_ref()
                     .ok_or_else(|| anyhow!("record {line}: row precedes its table"))?;
-                connection.execute_with_params(sql, &values(cells)?)
+                insert.execute_with_params(&values(cells)?)
                     .map_err(|_| anyhow!("record {line}: canonical row insertion failed; no destination was published"))?;
             }
             Record::Completion { .. } => {}
@@ -309,6 +311,8 @@ fn restore<R: BufRead>(
         export::schema_version(connection)? == result.0.storage_schema_version,
         "archive header and canonical schema metadata disagree"
     );
+    // Release the final prepared program before restoring schema objects.
+    drop(statement);
     for statement in triggers {
         connection.execute_batch(&statement)?;
     }
