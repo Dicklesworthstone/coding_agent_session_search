@@ -3361,6 +3361,18 @@ Update check state is stored in the data directory:
 | `CASS_NO_COLOR` | unset | Force monochrome TUI output |
 | `NO_COLOR` | unset | Honored by TUI only when `CASS_RESPECT_NO_COLOR=1` |
 | `CASS_RESPECT_NO_COLOR` | unset | Make TUI inherit global `NO_COLOR` |
+| **Lexical Rebuild Tuning** ([#483](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/483)) | | These bound the full/resumed lexical (Quill) rebuild that `cass index --full` and stale-on-read repair run. Defaults are sized from the host; the responsiveness governor below can only lower them. A single-core, low-memory profile for a wedged or memory-starved archive is `CASS_TANTIVY_REBUILD_WORKERS=1 CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS=1 CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE=1 CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=64 CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES=67108864 cass index --full --json`. The rebuild checkpoints to `.lexical-rebuild-state.json` at every durable commit and resumes from it on the next run; the connector scan phase has no equivalent per-file ledger yet ([#426](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/426)). |
+| `CASS_TANTIVY_REBUILD_WORKERS` | cores − reserved, clamped to 1..=64 | Writer/shard-builder threads for the lexical rebuild. Reserved cores default to 0 (1 core), 1 (2–4 cores), 2 (5–15 cores), else `cores/8` clamped to 2..=8; override the reservation with `CASS_TANTIVY_REBUILD_RESERVED_CORES` |
+| `CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS` | `ceil(workers / 2)` clamped to 2..=8 (`1` when workers is 1) | Threads that fetch and prepare conversation pages ahead of the writers. `1` serializes page prep |
+| `CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS` | `max(512, writer_threads × 128)`, capped at the 1024-conversation page | Conversations per SQL message-fetch chunk (the unit of writer feeding). Lower it to cap peak RSS on archives with very large conversations |
+| `CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS` | `32` | Chunk size for the first durable slice only, so the first restartable checkpoint lands quickly; the rebuild ramps to the steady-state chunk after the first commit |
+| `CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS` / `_MESSAGES` / `_MESSAGE_BYTES` | `10000` / `800000` / `536870912` | Steady-state durable-commit (checkpoint) interval; whichever bound trips first commits. Smaller values checkpoint more often at the cost of more segment merges |
+| `CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS` / `_MESSAGES` / `_MESSAGE_BYTES` | `2048` / `800000` / `134217728` | Commit interval used until the first durable commit |
+| `CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE` | `4` | Prepared pages that may queue between page prep and the writers |
+| `CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT` | fetch-chunk bytes × (channel + 1) | Cap on message bytes held in flight across the pipeline; the governor's `CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES` applies on top |
+| `CASS_RESPONSIVENESS_MAX_WORKERS` | host ceiling | Hard ceiling the load/PSI governor applies to every indexing worker pool, including the rebuild pools above |
+| `CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES` | RAM/32, never below `536870912` and never above 16 GiB | Governor ceiling on in-flight message bytes across indexing |
+| `CASS_RESPONSIVENESS_DISABLE` | unset | Set `1` to disable the load/PSI governor and run at the configured sizes regardless of host pressure |
 | **Search & Cache** | | |
 | `CASS_CACHE_SHARD_CAP` | 256 | Per-shard LRU cache entries |
 | `CASS_CACHE_TOTAL_CAP` | 2048 | Total cached search hits |
