@@ -8,7 +8,8 @@
 //!
 //! Schema bookkeeping is intentionally transformed rather than replayed:
 //! `_schema_migrations` stays at the current initializer's complete history and the
-//! legacy `meta.schema_version` row stays current. All other archived rows are
+//! legacy `meta.schema_version` row stays current. Tables introduced after the
+//! archived schema keep initializer-owned seed state. All other archived rows are
 //! compared back from the persisted publication image before it can become visible.
 
 use std::fs::{self, File, OpenOptions};
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use coding_agent_search::franken_sync::compat::RowExt;
 use coding_agent_search::franken_sync::{Connection, FrankenError, SqliteValue};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
 
@@ -128,7 +130,10 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
             .ok_or_else(|| anyhow!("logical record position overflow"))?;
     }
     let (verified_header, completion) = validator.finish()?;
-    ensure!(verified_header == header, "logical archive header changed during verification");
+    ensure!(
+        verified_header == header,
+        "logical archive header changed during verification"
+    );
     Ok(Inspected {
         header,
         completion,
@@ -228,11 +233,13 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
     let rows = connection.query(
         "SELECT name, substr(sql, 1, 65537) FROM sqlite_master WHERE type = 'trigger' ORDER BY name LIMIT 257",
     )?;
-    ensure!(rows.len() <= 256, "canonical schema exceeds restore trigger limit");
+    ensure!(
+        rows.len() <= 256,
+        "canonical schema exceeds restore trigger limit"
+    );
     let mut statements = Vec::new();
     let mut bytes = 0_usize;
     for row in rows {
-        use coding_agent_search::franken_sync::compat::RowExt;
         let name = row.get_typed::<String>(0)?;
         let sql = row.get_typed::<String>(1)?;
         bytes = bytes.saturating_add(sql.len());
@@ -247,7 +254,6 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
 }
 
 fn verify_current_schema_authority(connection: &Connection) -> Result<()> {
-    use coding_agent_search::franken_sync::compat::RowExt;
     let expected = i64::from(target_version()?);
     let version = connection
         .query_row("SELECT MAX(version) FROM _schema_migrations")?
@@ -264,15 +270,13 @@ fn verify_current_schema_authority(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn clear_initialized_data(connection: &Connection, current: &[Table]) -> Result<()> {
-    for table in current {
+fn clear_archived_data(connection: &Connection, archived: &[Table]) -> Result<()> {
+    for table in archived {
         if table.name == MIGRATIONS_TABLE {
             continue;
         }
         if table.name == META_TABLE {
-            connection.execute(
-                "DELETE FROM "meta" WHERE "key" <> 'schema_version'",
-            )?;
+            connection.execute("DELETE FROM \"meta\" WHERE \"key\" <> 'schema_version'")?;
         } else {
             connection.execute(&format!("DELETE FROM {}", export::quoted(&table.name)?))?;
         }
@@ -291,18 +295,23 @@ fn restore_older<R: BufRead>(
         source_version < target,
         "--allow-compatible-schema accepts only archives older than this binary; current-schema archives use exact restoration"
     );
-    let current = compatible_tables(connection, &inspected.tables)?;
+    compatible_tables(connection, &inspected.tables)?;
     verify_current_schema_authority(connection)?;
 
     let Some(Record::Header { header }) = input.record(1)? else {
         bail!("logical archive must begin with a header");
     };
-    ensure!(header == inspected.header, "logical archive changed between validation and replay");
+    ensure!(
+        header == inspected.header,
+        "logical archive changed between validation and replay"
+    );
     let mut validator = Validator::new(header)?;
     connection.execute("PRAGMA foreign_keys = OFF")?;
     connection.execute("BEGIN IMMEDIATE")?;
     let triggers = suspend_triggers(connection)?;
-    clear_initialized_data(connection, &current)?;
+    // Clear only tables represented by the older archive. Tables introduced by
+    // the current schema retain initializer-owned seed state.
+    clear_archived_data(connection, &inspected.tables)?;
 
     let mut statement = None;
     let mut current_table: Option<Table> = None;
@@ -486,7 +495,10 @@ impl<R: BufRead> ProjectionCursor<R> {
     }
 
     fn put_back(&mut self, record: Record) -> Result<()> {
-        ensure!(self.pending.is_none(), "logical projection cursor already has a boundary");
+        ensure!(
+            self.pending.is_none(),
+            "logical projection cursor already has a boundary"
+        );
         self.pending = Some(record);
         Ok(())
     }
@@ -548,10 +560,16 @@ fn compare_table_rows<R: BufRead>(
     let streamed = connection.query_with_params_for_each(&sql, &[], |row| {
         let result = (|| -> Result<()> {
             let Some(record) = cursor.next()? else {
-                bail!("persisted migrated table {} contains an extra row", table.name);
+                bail!(
+                    "persisted migrated table {} contains an extra row",
+                    table.name
+                );
             };
             let Record::Row { values: archived } = record else {
-                bail!("persisted migrated table {} contains more rows than the archive", table.name);
+                bail!(
+                    "persisted migrated table {} contains more rows than the archive",
+                    table.name
+                );
             };
             let actual = export::cells(row.values())?;
             ensure!(
@@ -576,7 +594,10 @@ fn compare_table_rows<R: BufRead>(
 
     if let Some(record) = cursor.next()? {
         if matches!(record, Record::Row { .. }) {
-            bail!("verified archive table {} contains a row missing from the migrated database", table.name);
+            bail!(
+                "verified archive table {} contains a row missing from the migrated database",
+                table.name
+            );
         }
         cursor.put_back(record)?;
     }
@@ -662,8 +683,12 @@ pub fn import_compatible(
     let target = target_version()?;
 
     if source_version == target {
-        let (header, completion, created) =
-            super::import::import_file_with_policy(input_path, destination, expected_archive_id, false)?;
+        let (header, completion, created) = super::import::import_file_with_policy(
+            input_path,
+            destination,
+            expected_archive_id,
+            false,
+        )?;
         return Ok(MigrationOutcome {
             header,
             completion,
@@ -684,8 +709,8 @@ pub fn import_compatible(
     let replay_path = staging.path().join("agent_search.db");
     let candidate = staging.path().join("publication.db");
 
-    let storage =
-        SqliteStorage::open(&replay_path).context("cannot initialize compatible restore candidate")?;
+    let storage = SqliteStorage::open(&replay_path)
+        .context("cannot initialize compatible restore candidate")?;
     drop(storage);
     let connection = Connection::open(export::path_text(&replay_path)?)?;
     connection.execute("PRAGMA busy_timeout = 5000")?;
@@ -738,7 +763,10 @@ mod tests {
     use coding_agent_search::storage::sqlite::SqliteStorage;
     use std::io::Write;
 
-    fn older_archive(root: &Path, remove_required_agent_column: bool) -> Result<(PathBuf, String)> {
+    fn older_archive(
+        root: &Path,
+        remove_required_agent_column: bool,
+    ) -> Result<(PathBuf, String)> {
         let source = root.join("source.db");
         let storage = SqliteStorage::open(&source)?;
         storage.ensure_agent(&Agent {
@@ -835,9 +863,9 @@ mod tests {
                             .iter()
                             .position(|column| column == "key")
                             .and_then(|offset| cells.get(offset));
-                        if key
-                            .is_some_and(|cell| matches!(cell, Cell::Text(value) if value == SCHEMA_VERSION_KEY))
-                        {
+                        if key.is_some_and(
+                            |cell| matches!(cell, Cell::Text(value) if value == SCHEMA_VERSION_KEY),
+                        ) {
                             if let Some(value_offset) =
                                 table.columns.iter().position(|column| column == "value")
                             {
@@ -850,7 +878,9 @@ mod tests {
                 })();
                 if let Err(error) = result {
                     failure = Some(error);
-                    return Err(FrankenError::Internal("fixture archive writer aborted".into()));
+                    return Err(FrankenError::Internal(
+                        "fixture archive writer aborted".into(),
+                    ));
                 }
                 Ok(())
             })?;
@@ -875,19 +905,18 @@ mod tests {
         let outcome = import_compatible(&input, &destination, "older-compatible")?;
         let receipt = outcome.migration.context("migration receipt missing")?;
         assert_eq!(receipt.from_storage_schema_version, from);
-        assert_eq!(receipt.to_storage_schema_version, target_version()?.to_string());
+        assert_eq!(
+            receipt.to_storage_schema_version,
+            target_version()?.to_string()
+        );
         assert!(receipt.source_rows_verified);
         assert!(destination.is_file());
 
         let storage = SqliteStorage::open_readonly(&destination)?;
-        assert_eq!(
-            u32::try_from(storage.schema_version()?)?,
-            target_version()?
-        );
-        let row = storage.raw().query_row(
-            "SELECT slug, version FROM agents WHERE slug = 'migration-fixture'",
-        )?;
-        use coding_agent_search::franken_sync::compat::RowExt;
+        assert_eq!(u32::try_from(storage.schema_version()?)?, target_version()?);
+        let row = storage
+            .raw()
+            .query_row("SELECT slug, version FROM agents WHERE slug = 'migration-fixture'")?;
         assert_eq!(row.get_typed::<String>(0)?, "migration-fixture");
         assert_eq!(row.get_typed::<Option<String>>(1)?, None);
         Ok(())
@@ -907,13 +936,16 @@ mod tests {
     fn future_schema_is_refused_without_creating_a_destination() -> Result<()> {
         let root = tempfile::tempdir()?;
         let (input, _) = older_archive(root.path(), false)?;
-        let mut bytes = fs::read(&input)?;
-        let current = format!("\"storage_schema_version\":\"{}\"", target_version()? - 1);
-        let future = format!("\"storage_schema_version\":\"{}\"", target_version()? + 1);
-        let text = String::from_utf8(bytes)?;
-        let changed = text.replacen(&current, &future, 1);
-        bytes = changed.into_bytes();
-        fs::write(&input, bytes)?;
+        let current = format!(
+            "\"storage_schema_version\":\"{}\"",
+            target_version()? - 1
+        );
+        let future = format!(
+            "\"storage_schema_version\":\"{}\"",
+            target_version()? + 1
+        );
+        let text = fs::read_to_string(&input)?;
+        fs::write(&input, text.replacen(&current, &future, 1))?;
         let destination = root.path().join("restored.db");
         assert!(import_compatible(&input, &destination, "older-compatible").is_err());
         assert!(!destination.exists());
