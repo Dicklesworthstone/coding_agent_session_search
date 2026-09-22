@@ -1,5 +1,4 @@
-# Temporary read-only source inspection; no repository-write permission.
-name: Inspect retrieval source
+name: Prepare bounded canonical batches
 on:
   push:
     branches: [main]
@@ -8,34 +7,131 @@ on:
 permissions:
   contents: read
 jobs:
-  source:
+  prepare:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Archive only explicitly selected tracked source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD
-          git archive --format=tar HEAD src tests scripts docs/planning .beads .github Cargo.toml Cargo.lock build.rs rust-toolchain.toml AGENTS.md | gzip > "$RUNNER_TEMP/cass-inspected-source.tar.gz"
-          sha256sum "$RUNNER_TEMP/cass-inspected-source.tar.gz"
-      - name: Summarize the actual task graph without changing it
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Apply only reviewed patch and export exact formatted blobs
         shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          import collections, json
+          import base64, hashlib, json, os, subprocess, urllib.request
           from pathlib import Path
-          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          print('STATUS_COUNTS=' + json.dumps(dict(collections.Counter(row.get('status') for row in rows)), sort_keys=True))
-          for row in sorted(rows, key=lambda row: (row.get('priority', 9), row.get('id', ''))):
-              if row.get('status') not in ('closed', 'tombstone'):
-                  print(json.dumps({key: row.get(key) for key in ('id', 'title', 'status', 'priority', 'assignee')}, ensure_ascii=False))
+          repo = 'Dicklesworthstone/coding_agent_session_search'
+          expected = {
+              'src/search_service.rs': ('060947a49d24e92bde454945da0d265f819bccdd', '330bb026ccd86f53baf1f700dadd1ba3993d29de'),
+              'src/search_service/canonical.rs': ('4ac7d5cd589591deac13b1358b2471d9cb48c579', '7c45738e3273dfdba28381e46928d4c88e20f58b'),
+              'src/search_service/canonical_tests.rs': ('e4474fd3fc6803b8adfbb7492b9ba8b9ad33db56', 'b88fdb0e66186d5cd372738b480bc58e2659c21a'),
+              'src/search_service/protocol.rs': ('8ffffc8462d92e0c41f47bf5b3efd5e4215f5666', '42b6b0786c3c44b65a7a28607dd3953752c5ba2c'),
+          }
+          def sha(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def api(path, data=None):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + path,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          for path, (original, _) in expected.items():
+              assert sha(Path(path).read_bytes()) == original, 'Source changed: ' + path
+          patch = api('/git/blobs/7926bd0a0571b60f3492e724ac8edd694821753b')
+          assert patch['encoding'] == 'base64'
+          content = base64.b64decode(patch['content'])
+          assert sha(content) == '7926bd0a0571b60f3492e724ac8edd694821753b'
+          patch_path = Path(os.environ['RUNNER_TEMP']) / 'canonical-batch.patch'
+          patch_path.write_bytes(content)
+          def run(*args):
+              subprocess.run(args, check=True)
+          run('git', 'apply', '--recount', '--check', '--whitespace=error-all', str(patch_path))
+          run('git', 'apply', '--recount', '--whitespace=error-all', str(patch_path))
+          run('git', 'apply', '--recount', '--reverse', '--check', str(patch_path))
+          run('git', 'diff', '--check')
+          assert sorted(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == sorted(expected)
+          output = {}
+          for path, (_, edited) in expected.items():
+              assert sha(Path(path).read_bytes()) == edited, 'Prepared source mismatch: ' + path
+              formatted = subprocess.check_output(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--emit', 'stdout'], input=Path(path).read_bytes())
+              Path(path).write_bytes(formatted)
+              run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', path)
+              result = api('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(formatted).decode()})
+              assert result['sha'] == sha(formatted)
+              output[path] = result['sha']
+          run('git', 'diff', '--check')
+          run('git', 'diff', '--stat')
+          print('CANONICAL_BATCH_BLOBS=' + json.dumps(output, sort_keys=True), flush=True)
+          print('Source preparation and syntax only; no compilation or runtime pass implied.', flush=True)
+          root = Path(os.environ['RUNNER_TEMP']) / 'canonical-batch-source'
+          root.mkdir()
+          for path in expected:
+              target = root / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(Path(path).read_bytes())
+          (root / 'source-blobs.json').write_text(json.dumps(output, indent=2))
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: cass-inspected-source-${{ github.sha }}
-          path: ${{ runner.temp }}/cass-inspected-source.tar.gz
+          name: canonical-batch-source-${{ github.sha }}
+          path: ${{ runner.temp }}/canonical-batch-source
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
+  native:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_MIN_STACK: '134217728'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: canonical-batch-source-${{ github.sha }}
+          path: ${{ runner.temp }}/canonical-batch-source
+      - name: Apply exact prepared source files to this isolated test checkout
+        shell: python
+        run: |
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'canonical-batch-source'
+          for path, expected in json.loads((root / 'source-blobs.json').read_text()).items():
+              data = (root / path).read_bytes()
+              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              assert actual == expected
+              Path(path).write_bytes(data)
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Execute the real canonical batch tests
+        run: |
+          set -o pipefail
+          git rev-parse HEAD
+          rustc --version
+          cargo test --locked --test search_service canonical_batch -- --test-threads=1 --nocapture 2>&1 | tee canonical-batch-tests.log
+          grep -Eq 'test result: ok\. 8 passed; 0 failed' canonical-batch-tests.log
+      - name: Clippy
+        if: always()
+        run: cargo clippy --locked --test search_service -- -D warnings
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: canonical-batch-tests-${{ github.sha }}
+          path: canonical-batch-tests.log
+          retention-days: 3
