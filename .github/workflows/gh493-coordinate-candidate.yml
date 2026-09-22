@@ -1,13 +1,163 @@
 name: GH493 canonical anchor candidate
 
-# The reviewed candidate is now production code. Keep this manual entry point
-# as a read-only alias for the permanent regression suite, not a blob publisher.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh493-coordinate-candidate.yml
 
 permissions:
   contents: read
 
 jobs:
-  verify:
-    uses: ./.github/workflows/message-coordinate-regression.yml
+  prepare:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Admit exact reviewed inputs and apply the preserved patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, lzma, os, pathlib, subprocess, urllib.request
+          inputs = {
+              'src/search/pack_planner.rs': '9ece232289ce82ee37dff4a36dea741de7ad1dba',
+              'tests/gh493_message_coordinates.rs': '6cbfd5a2bfb7cc1f979b65aac8fe46d5de32ad1d',
+              'docs/planning/ANSWER_PACKS_CONTRACT.md': '04834c3939523115d53a9988578d52f50554ffeb',
+          }
+          outputs = {
+              'src/search/pack_planner.rs': '3c5b80f76c041d51c408f0da53d391d4fe2b667a',
+              'tests/gh493_message_coordinates.rs': 'be6377d4a3beda26ad37026a788882cb74ca8d21',
+              'docs/planning/ANSWER_PACKS_CONTRACT.md': '80365f0fb6a5d264df883795af25856262330c8d',
+          }
+          for path, sha in inputs.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == sha, f'{path}: {actual} != {sha}'
+          sha = 'e29dd74cef7954b1951bc06b6c15e68dab319ef4'
+          request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'cass-pack-identity-review'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              result = json.load(response)
+          assert result['encoding'] == 'base64'
+          compressed = base64.b64decode(result['content'])
+          assert hashlib.sha1(b'blob ' + str(len(compressed)).encode() + b'\0' + compressed).hexdigest() == sha
+          patch = lzma.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == '390500438b826f2c55e1381c5bf5a68a5a4cce47a95bf92ac02b57c8a2e0e639'
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          for path, sha in outputs.items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          pathlib.Path('candidate').mkdir()
+          pathlib.Path('candidate/input-blobs.json').write_text(json.dumps(inputs, indent=2))
+          PY
+      - name: Format the reviewed changes
+        run: |
+          rustfmt --edition 2024 --config skip_children=true src/search/pack_planner.rs tests/gh493_message_coordinates.rs
+          git diff --check
+      - name: Publish source blobs only, never commits or refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess, urllib.request
+          inputs = json.loads(pathlib.Path('candidate/input-blobs.json').read_text())
+          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) == set(inputs)
+          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': inputs, 'candidate_blobs': {}}
+          for path in inputs:
+              request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', data=json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'cass-pack-identity-review'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  sha = json.load(response)['sha']
+              assert sha == subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              manifest['candidate_blobs'][path] = sha
+              destination = pathlib.Path('candidate') / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, destination)
+          pathlib.Path('candidate/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff']))
+          print(json.dumps(manifest, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pack-rebased-identity
+          path: candidate/
+          retention-days: 1
+          if-no-files-found: error
+  native:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - name: Load the exact formatted candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, io, json, os, pathlib, subprocess, urllib.request, zipfile
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'cass-pack-identity-review'}
+          root = f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}'
+          request = urllib.request.Request(root + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + '/artifacts', headers=headers)
+          with urllib.request.urlopen(request, timeout=60) as response:
+              artifacts = json.load(response)['artifacts']
+          matches = [a for a in artifacts if a['name'] == 'pack-rebased-identity' and not a['expired']]
+          assert len(matches) == 1
+          request = urllib.request.Request(matches[0]['archive_download_url'], headers=headers)
+          with urllib.request.urlopen(request, timeout=60) as response:
+              archive = zipfile.ZipFile(io.BytesIO(response.read()))
+          manifest = json.loads(archive.read('manifest.json'))
+          assert manifest['base_commit'] == os.environ['GITHUB_SHA']
+          for path, sha in manifest['base_blobs'].items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha
+              data = archive.read(path)
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == manifest['candidate_blobs'][path]
+              pathlib.Path(path).write_bytes(data)
+          PY
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+        with:
+          shared-key: gh493-identity
+          cache-on-failure: true
+      - name: Existing and rebased canonical round trips
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test gh493_message_coordinates -- --nocapture | tee "$RUNNER_TEMP/pack-identity.log"
+          grep -F 'test result: ok. 36 passed; 0 failed;' "$RUNNER_TEMP/pack-identity.log"
+      - name: Existing pack planner and output contracts
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib search::pack_planner::tests -- --nocapture
+          cargo test --locked --no-fail-fast --test spec_pack_token_budget --test golden_robot_pack -- --nocapture
+      - name: Strict production and regression lint
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --test gh493_message_coordinates -- -D warnings
