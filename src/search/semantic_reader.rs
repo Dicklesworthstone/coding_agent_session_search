@@ -18,6 +18,7 @@
 
 pub mod ann;
 pub mod publication;
+pub mod text;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};

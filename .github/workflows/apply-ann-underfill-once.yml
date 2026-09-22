@@ -1,140 +1,23 @@
-name: Verify identity-bound text retrieval
+# Both source-only landings completed. No job retains repository-write access.
+name: Verify landed retrieval commits
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/apply-ann-underfill-once.yml]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  prepare:
+  ancestry-only:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Verify exact patch and export formatted source blobs
-        shell: python
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Verify commit ancestry, not runtime qualification
+        shell: bash
         run: |
-          import base64, hashlib, json, os, subprocess, tarfile, urllib.request, zlib
-          from pathlib import Path
-          repo = 'Dicklesworthstone/coding_agent_session_search'
-          parent = 'src/search/semantic_reader.rs'
-          outputs = {
-              parent: 'f92d3f78f014148735601479efe9333412791c13',
-              'src/search/semantic_reader/text.rs': '4fd5e079c87428e07adf54accdfc81791e8c1c94',
-              'src/search/semantic_reader/text/tests.rs': '0bc452bba37f8848e7c2b36ab7042e8378254c47',
-          }
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          def api(path, data=None):
-              req = urllib.request.Request('https://api.github.com/repos/' + repo + path,
-                  data=None if data is None else json.dumps(data).encode(),
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  return json.load(response)
-          def run(*args, **kwargs):
-              return subprocess.run(args, check=True, **kwargs)
-          assert blob(Path(parent).read_bytes()) == 'ca53ea50836b51d0b2d973cb21af8972b5daa60b'
-          assert not Path('src/search/semantic_reader/text.rs').exists()
-          assert not Path('src/search/semantic_reader/text/tests.rs').exists()
-          encoded = base64.b64decode(api('/git/blobs/33f8e9e4d553fed51ec7efb08b8df216ef479b1a')['content'])
-          assert blob(encoded) == '33f8e9e4d553fed51ec7efb08b8df216ef479b1a'
-          encoded = encoded.decode('ascii')
-          # Recover known transport substitutions, never source code. Both
-          # the recovered payload and decoded manual patch have fixed hashes.
-          for old, new in [('MSJJzc','MSJzc'), ('K9UTUTMK','K9UTMK'), ('JSVV/w','JSV/w'), ('zXXZZs','zXXZs'), ('i8RsZZ0','i8RsZ0'), ('GSBVIYYc','GSBVIYc'), ('C9LTJJbc','C9LTJbc'), ('R0puZdt/l','R0puZt/l')]:
-              assert encoded.count(old) == 1
-              encoded = encoded.replace(old, new)
-          assert blob(encoded.encode()) == 'b027b52a7e23b1cb22141007eb70108c0f7f7db2'
-          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '89e5147ae11fbd5fd74139276bef85ad07d5920f5280e4e4f295e3d27f60b1bc'
-          path = Path(os.environ['RUNNER_TEMP']) / 'text-query.patch'
-          path.write_bytes(patch)
-          run('git', 'apply', '--check', '--whitespace=error-all', str(path))
-          run('git', 'apply', '--whitespace=error-all', str(path))
-          run('git', 'apply', '--reverse', '--check', str(path))
-          for path, expected in outputs.items():
-              assert blob(Path(path).read_bytes()) == expected, path
-          for path in outputs:
-              if path != parent:
-                  run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', path)
-                  run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', path)
-              else:
-                  run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--emit', 'stdout', path, stdout=subprocess.DEVNULL)
-          run('git', 'diff', '--check')
-          receipt = {'source': os.environ['GITHUB_SHA'], 'patch_sha256': hashlib.sha256(patch).hexdigest(), 'blobs': {}}
-          for path in outputs:
-              content = Path(path).read_bytes()
-              result = api('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(content).decode()})
-              assert result['sha'] == blob(content)
-              receipt['blobs'][path] = result['sha']
-          Path('text-query-receipt.json').write_text(json.dumps(receipt, indent=2))
-          with tarfile.open('text-query-source.tar.gz', 'w:gz') as tar:
-              for path in outputs:
-                  tar.add(path)
-              tar.add('text-query-receipt.json')
-          print(json.dumps(receipt, sort_keys=True))
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: text-query-source-${{ github.sha }}
-          path: text-query-source.tar.gz
-          retention-days: 3
-  native:
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: text-query-source-${{ github.sha }}
-      - name: Admit the exact prepared test source
-        run: |
-          tar -xzf text-query-source.tar.gz
-          python3 - <<'PY'
-          import hashlib, json
-          from pathlib import Path
-          for path, expected in json.loads(Path('text-query-receipt.json').read_text())['blobs'].items():
-              content = Path(path).read_bytes()
-              assert hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest() == expected
-          PY
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: clippy
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-      - name: Run actual text inference and retained-reader tests
-        run: |
-          set -o pipefail
-          cargo test --locked --lib search::semantic_reader::text::tests -- --nocapture 2>&1 | tee text-query-tests.log
-          grep -Eq 'test result: ok\. 8 passed; 0 failed' text-query-tests.log
-          cargo test --locked --lib search::semantic_reader:: -- --nocapture 2>&1 | tee retained-reader-tests.log
-      - name: Strict library Clippy
-        if: always()
-        run: cargo clippy --locked --lib -- -D warnings
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: text-query-native-${{ github.sha }}
-          path: '*-tests.log'
-          retention-days: 3
+          set -euo pipefail
+          git merge-base --is-ancestor e36ad641e95df88c289d70fc467e5159542d9c92 HEAD
+          git merge-base --is-ancestor d671ab449af2d6bd34bac12a7992f79b3c2cc36c HEAD
+          printf '%s\n' 'Both retrieval fixes are present in this history.' 'This check proves ancestry only; use Verify search retrieval for component and locked CASS tests.'
