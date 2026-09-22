@@ -89,7 +89,8 @@ exposed as bounded service filters.
 
 A response has `schema_version`, `id`, `ok`, and either `result` or `error`.
 Malformed requests use `id: null`. A failed request does not terminate the
-session except when its frame exceeds the byte limit. Errors retain their
+session except on transport failure, an oversized frame, or a process deadline.
+Ordinary request errors retain their
 cause in `error.message`; callers should branch on the stable `error.kind`.
 
 Search results contain `hits`, `count`, `limit`, `offset`, `reader_reused`,
@@ -123,14 +124,42 @@ and `offset + limit + 1` must not exceed 1,024. Each agent/workspace filter has
 at most 32 values. Individual filter and returned identity strings are limited
 to 4,096 UTF-8 bytes. Invalid budgets are refused before the reader is loaded.
 
-These are transport and candidate-window bounds, **not a total-RSS bound or a
-wall-clock deadline**. The first index admission can still be expensive, and
-an individual native query is not forcibly preempted by the service. The
-caller owns process lifetime and may terminate this read-only worker when its
-external deadline is exceeded. Each independently started worker still owns
+These are transport and candidate-window bounds, **not a total-RSS bound**.
+The first index admission can still be expensive. Each independently started worker still owns
 its own reader: reuse one process rather than spawning one for each query.
 Semantic/HNSW serving and cross-process admission are not implemented by this
 lexical endpoint.
+
+### Enforced request deadlines
+
+Both transports default to a **30,000-ms whole-request deadline**. Set
+`--request-timeout-ms 5000` for a five-second budget, or explicitly allow a
+longer cold open. Accepted values are 1–300,000 ms; zero cannot disable the
+guard. Status reports the configured deadline and termination exit code.
+
+The deadline starts when the worker first observes any byte of a new frame and
+covers the rest of input framing, decoding, native index admission/query or
+canonical lookup, result encoding, and output flushing. A partial line and a
+client that stops reading responses are therefore bounded too. Waiting for
+the first byte of the next request is idle time and is deliberately excluded.
+Completing a request joins its watchdog before another request can be admitted;
+an old timer cannot terminate an unrelated later query. Reader teardown on EOF
+or transport failure is guarded separately with the same configured duration.
+
+**Expiry terminates the entire read-only worker with exit code 124**, rather
+than returning a soft timeout while native work continues in a detached thread.
+There is no timeout JSON/tool-error response: producing one could itself block
+on the stalled output pipe. Discard an incomplete final line, observe process
+exit, and restart/reinitialize before retrying. Earlier complete responses stay
+valid. The new process starts a new session-local reader epoch; do not equate
+epochs across processes. Failure of the watchdog itself exits with code 125.
+
+Termination does not wait for Rust destructors or flush evidence buffers.
+Use this mechanism only on the service's read-only paths, never for indexing
+or archive publication. It does not impose a memory limit, alter the native
+engine's cancellation API, or guarantee real-time OS scheduling under system
+suspension/starvation. Hosts should still supervise the worker process and
+enforce their own end-to-end deadlines, including startup and idle lifetime.
 
 ## Reusing one process from Python
 
@@ -173,9 +202,10 @@ with subprocess.Popen(
             worker.wait()
 ```
 
-The example waits synchronously for replies; applications requiring a hard
-query deadline must additionally supervise the exchange itself. It does not
-turn the native engine into a cancellable operation.
+The example waits synchronously for replies and will observe EOF if the worker
+times out. Applications should additionally supervise startup and the exchange
+against their own deadline; the worker timeout is a process-termination policy,
+not resumable per-query cancellation.
 
 Native regressions are in `tests/search_service.rs`, including the complete
 production module's tests: real Quill reader reuse, source-scoped identities,
@@ -230,7 +260,7 @@ Notifications receive no response and cannot run a tool without a request ID.
 There is no MCP shutdown RPC: close stdin, then terminate the process if its
 external deadline expires. Requests are serial, so cancellation notifications
 received after native work completes are ignored. This adapter does **not**
-provide in-flight native cancellation, a global memory governor, HTTP, or
+provide resumable per-call native cancellation, a global memory governor, HTTP, or
 authentication over a network. Configure the host to approve access to the
 selected history archive and treat returned session text as untrusted data.
 
@@ -311,3 +341,5 @@ operations, with no partial result on expiry. It does **not** interrupt an
 individual engine call, bound engine-internal allocation, or replace the
 host's process-level deadline. No maintenance, recovery write, model loading,
 raw transcript read, arbitrary SQL or new filesystem authority is provided.
+The enclosing service request deadline also covers this lookup, including an
+individual native SQL call, by terminating the worker if necessary.

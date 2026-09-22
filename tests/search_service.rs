@@ -297,3 +297,148 @@ fn cass_serve_reads_explicit_canonical_archive_without_opening_an_index() -> any
     }
     Ok(())
 }
+
+// Keep every owned child reaped even when a regression assertion fails.
+struct DeadlineChild(std::process::Child);
+
+impl Drop for DeadlineChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn deadline_child(index: &std::path::Path, mcp: bool) -> std::io::Result<DeadlineChild> {
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    command.args(["serve", "--stdio", "--request-timeout-ms", "500", "--index"]);
+    command.arg(index);
+    if mcp {
+        command.arg("--mcp");
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(DeadlineChild)
+}
+
+#[test]
+fn partial_jsonl_and_mcp_frames_cannot_hold_the_worker_forever() -> anyhow::Result<()> {
+    for mcp in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let index = temp.path().join("never-opened");
+        let mut child = deadline_child(&index, mcp)?;
+        let mut input = child.0.stdin.take().unwrap();
+        input.write_all(b"{\"unfinished\":")?;
+        input.flush()?;
+        // Keep stdin open: EOF would end the frame without exercising the limit.
+        let status = child.0.wait_timeout(Duration::from_secs(10))?;
+        assert_eq!(status.and_then(|status| status.code()), Some(124));
+        assert!(!index.exists());
+        drop(input);
+    }
+    Ok(())
+}
+
+#[test]
+fn idle_connections_and_completed_requests_do_not_inherit_old_deadlines() -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+    for mcp in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let index = temp.path().join("never-opened");
+        let mut child = deadline_child(&index, mcp)?;
+        let mut input = child.0.stdin.take().unwrap();
+        let mut output = BufReader::new(child.0.stdout.take().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let mut line = String::new();
+                let result = output.read_line(&mut line).map(|_| line);
+                if sender.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        for id in [1, 2] {
+            std::thread::sleep(Duration::from_millis(750));
+            assert!(child.0.try_wait()?.is_none(), "idle time is not request work");
+            let request = if mcp {
+                serde_json::json!({"jsonrpc":"2.0", "id":id, "method":"ping"})
+            } else {
+                serde_json::json!({"op":"status", "id":id})
+            };
+            writeln!(input, "{request}")?;
+            input.flush()?;
+            // Independent outer bound: the test must fail even if the service's
+            // own watchdog regresses. DeadlineChild reaps it on an early return.
+            let line = receiver.recv_timeout(Duration::from_secs(10))??;
+            assert!(!line.is_empty());
+            let response: serde_json::Value = serde_json::from_str(&line)?;
+            assert_eq!(response["id"], id);
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        drop(input);
+        assert!(
+            child.0.wait_timeout(Duration::from_secs(10))?.is_some_and(|s| s.success())
+        );
+        reader.join().expect("bounded response reader panicked");
+        assert!(!index.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn blocked_response_pipes_terminate_both_transports() -> anyhow::Result<()> {
+    for mcp in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let index = temp.path().join("never-opened");
+        let mut child = deadline_child(&index, mcp)?;
+        let mut input = child.0.stdin.take().unwrap();
+        // Do not drain stdout. Bounded request count, with an 8-KiB correlation
+        // ID for MCP, fills the pipe without loading any index or database.
+        let request = if mcp {
+            serde_json::json!({"jsonrpc":"2.0", "id":"x".repeat(8192), "method":"ping"})
+        } else {
+            serde_json::json!({"op":"status", "id":1})
+        };
+        let writer = std::thread::spawn(move || {
+            for _ in 0..2048 {
+                if writeln!(input, "{request}").is_err() {
+                    break;
+                }
+            }
+        });
+        let status = child.0.wait_timeout(Duration::from_secs(15))?;
+        // Kill/reap on failure before joining a writer that may be in write().
+        if status.is_none() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        writer.join().expect("bounded input writer panicked");
+        assert_eq!(status.and_then(|status| status.code()), Some(124));
+        assert!(!index.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn service_rejects_disabled_or_unbounded_deadlines_before_access() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let index = temp.path().join("never-opened");
+    for value in ["0", "300001", "18446744073709551616"] {
+        let mut child = DeadlineChild(
+            Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+                .args(["serve", "--stdio", "--request-timeout-ms", value, "--index"])
+                .arg(&index)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let status = child.0.wait_timeout(Duration::from_secs(10))?;
+        assert!(status.is_some_and(|status| !status.success()));
+        assert!(!index.exists());
+    }
+    Ok(())
+}

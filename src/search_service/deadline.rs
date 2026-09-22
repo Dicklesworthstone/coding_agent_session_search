@@ -21,7 +21,9 @@ pub(super) fn parse_timeout_ms(value: &str) -> Result<u64, String> {
         .parse::<u64>()
         .ok()
         .filter(|ms| (1..=MAX_TIMEOUT_MS).contains(ms))
-        .ok_or_else(|| format!("request timeout must be between 1 and {MAX_TIMEOUT_MS} milliseconds"))
+        .ok_or_else(|| {
+            format!("request timeout must be between 1 and {MAX_TIMEOUT_MS} milliseconds")
+        })
 }
 
 pub(super) struct Deadline {
@@ -83,7 +85,10 @@ impl Deadline {
 impl Drop for Deadline {
     fn drop(&mut self) {
         let signalled = self.completed.send(Instant::now()).is_ok();
-        let joined = self.watchdog.take().is_some_and(|watchdog| watchdog.join().is_ok());
+        let joined = self
+            .watchdog
+            .take()
+            .is_some_and(|watchdog| watchdog.join().is_ok());
         if !signalled || !joined {
             // A failed supervisor must not leave later native work unprotected.
             std::process::exit(WATCHDOG_FAILURE_EXIT_CODE);
@@ -137,7 +142,12 @@ mod tests {
         // harness's test path, retaining all nested module components.
         let module = module_path!().split_once("::").unwrap().1;
         let mut child = Command::new(std::env::current_exe()?)
-            .args(["--exact", &format!("{module}::{fixture}"), "--ignored", "--nocapture"])
+            .args([
+                "--exact",
+                &format!("{module}::{fixture}"),
+                "--ignored",
+                "--nocapture",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

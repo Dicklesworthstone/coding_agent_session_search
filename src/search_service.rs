@@ -470,7 +470,8 @@ fn serve_io(
     output: &mut impl Write,
 ) -> io::Result<()> {
     loop {
-        let Some(_request_deadline) = deadline::Deadline::for_frame(input, session.request_timeout)?
+        let Some(_request_deadline) =
+            deadline::Deadline::for_frame(input, session.request_timeout)?
         else {
             return Ok(());
         };
