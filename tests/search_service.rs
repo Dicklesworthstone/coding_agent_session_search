@@ -362,7 +362,10 @@ fn idle_connections_and_completed_requests_do_not_inherit_old_deadlines() -> any
         });
         for id in [1, 2] {
             std::thread::sleep(Duration::from_millis(750));
-            assert!(child.0.try_wait()?.is_none(), "idle time is not request work");
+            assert!(
+                child.0.try_wait()?.is_none(),
+                "idle time is not request work"
+            );
             let request = if mcp {
                 serde_json::json!({"jsonrpc":"2.0", "id":id, "method":"ping"})
             } else {
@@ -380,7 +383,10 @@ fn idle_connections_and_completed_requests_do_not_inherit_old_deadlines() -> any
         }
         drop(input);
         assert!(
-            child.0.wait_timeout(Duration::from_secs(10))?.is_some_and(|s| s.success())
+            child
+                .0
+                .wait_timeout(Duration::from_secs(10))?
+                .is_some_and(|s| s.success())
         );
         reader.join().expect("bounded response reader panicked");
         assert!(!index.exists());
@@ -438,6 +444,38 @@ fn service_rejects_disabled_or_unbounded_deadlines_before_access() -> anyhow::Re
         );
         let status = child.0.wait_timeout(Duration::from_secs(10))?;
         assert!(status.is_some_and(|status| !status.success()));
+        assert!(!index.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn trickling_input_cannot_restart_the_whole_request_deadline() -> anyhow::Result<()> {
+    for mcp in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let index = temp.path().join("never-opened");
+        let mut child = deadline_child(&index, mcp)?;
+        let mut input = child.0.stdin.take().unwrap();
+        input.write_all(b"{")?;
+        input.flush()?;
+        let writer = std::thread::spawn(move || {
+            // Keep presenting frame bytes much faster than the 500-ms deadline.
+            // A per-read/sliding timer would let this incomplete request survive
+            // for five seconds; the whole-request guard must not be extended.
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(50));
+                if input.write_all(b" ").and_then(|()| input.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+        let status = child.0.wait_timeout(Duration::from_secs(3))?;
+        if status.is_none() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        writer.join().expect("bounded trickle writer panicked");
+        assert_eq!(status.and_then(|status| status.code()), Some(124));
         assert!(!index.exists());
     }
     Ok(())
