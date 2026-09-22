@@ -121098,8 +121098,7 @@ fn run_models_backfill(
         hint: None,
         retryable: true,
     })?;
-    let mut indexer = None;
-    let mut model_initializations = 0u32;
+    let mut retained = RetainedBackfillModel::default();
     let mut attempted = 0u32;
     let mut completed = 0u32;
     let mut last_report = None;
@@ -121130,8 +121129,7 @@ fn run_models_backfill(
             options.scheduled,
             data_dir_override.clone(),
             db_override.clone(),
-            &mut indexer,
-            &mut model_initializations,
+            &mut retained,
         );
         match result {
             Ok(report) => {
@@ -121189,7 +121187,7 @@ fn run_models_backfill(
     };
     report["batches_attempted"] = attempted.into();
     report["batches_completed"] = completed.into();
-    report["model_initializations"] = model_initializations.into();
+    report["model_initializations"] = retained.initializations.into();
 
     if let Some(fmt) = structured_format {
         output_structured_value(report, fmt)?;
@@ -121231,6 +121229,15 @@ fn run_models_backfill(
     }
 }
 
+/// The one semantic model a bounded backfill keeps across its batches, and how
+/// many times it was actually constructed (GH #471: the receipt must show a
+/// per-batch reload, not merely that a model exists).
+#[derive(Default)]
+struct RetainedBackfillModel {
+    indexer: Option<crate::indexer::semantic::SemanticIndexer>,
+    initializations: u32,
+}
+
 fn run_models_backfill_batch(
     tier_raw: &str,
     embedder_override: Option<&str>,
@@ -121238,8 +121245,7 @@ fn run_models_backfill_batch(
     scheduled: bool,
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
-    retained_indexer: &mut Option<crate::indexer::semantic::SemanticIndexer>,
-    model_initializations: &mut u32,
+    retained: &mut RetainedBackfillModel,
 ) -> CliResult<serde_json::Value> {
     use crate::indexer::semantic::{
         SemanticBackfillSchedulerSignals, SemanticBackfillStoragePlan, SemanticIndexer,
@@ -121357,6 +121363,10 @@ fn run_models_backfill_batch(
     // Refuse unavailable models before opening the archive: even a current-
     // schema storage open can change its shared-memory sidecar. Keep model
     // admission inside the maintenance lock so index-busy retains precedence.
+    let RetainedBackfillModel {
+        indexer: retained_indexer,
+        initializations: model_initializations,
+    } = retained;
     let indexer = match retained_indexer {
         Some(indexer) => indexer,
         vacant => vacant.insert({
