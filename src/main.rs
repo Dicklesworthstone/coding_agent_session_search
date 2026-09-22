@@ -268,16 +268,17 @@ fn main() -> anyhow::Result<()> {
         return match result {
             Ok(()) => Ok(()),
             Err(error) => {
+                let (code, kind, retryable) = logical_archive::classify_failure(&error);
                 let payload = serde_json::json!({
                     "error": {
-                        "code": 2,
-                        "kind": "logical-archive-error",
+                        "code": code,
+                        "kind": kind,
                         "message": error.to_string(),
-                        "retryable": false
+                        "retryable": retryable
                     }
                 });
                 eprintln!("{payload}");
-                std::process::exit(2);
+                std::process::exit(code);
             }
         };
     }

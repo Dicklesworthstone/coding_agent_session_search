@@ -278,6 +278,141 @@ fn real_binary_requires_privacy_acknowledgement_and_never_overwrites_conflicts()
     }
 }
 
+/// Bead ukg62: every archive failure used to exit 2 ("usage, do not retry")
+/// with one kind, so a digest mismatch and a missing file looked like typos.
+/// Each class now has its own exit code, kind and retryability, chosen by
+/// error type; a clean export/verify round trip still exits 0.
+#[test]
+fn real_binary_failure_classes_have_distinct_exit_codes_and_kinds() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path();
+    let source = home.join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let failure = |args: &[&std::ffi::OsStr]| -> (i32, String, bool) {
+        let output = command(home).arg("archive").args(args).output().unwrap();
+        assert!(output.stdout.is_empty(), "failures write no receipt");
+        let payload: Value = serde_json::from_slice(&output.stderr).expect("one JSON error");
+        let error = &payload["error"];
+        let code = output.status.code().unwrap();
+        assert_eq!(error["code"], code, "{payload}");
+        (
+            code,
+            error["kind"].as_str().unwrap().to_owned(),
+            error["retryable"].as_bool().unwrap(),
+        )
+    };
+    let usage = (2, "logical-archive-usage".to_owned(), false);
+
+    // Usage: a missing required flag, and a missing privacy acknowledgement.
+    let target = home.join("usage.jsonl");
+    assert_eq!(
+        failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            target.as_os_str(),
+        ]),
+        usage
+    );
+    assert_eq!(
+        failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--output".as_ref(),
+            target.as_os_str(),
+        ]),
+        usage
+    );
+    assert!(!target.exists());
+
+    // Success: a clean round trip.
+    let input = home.join("history.jsonl");
+    export(home, &source, &input);
+    receipt(
+        command(home)
+            .args(["archive", "verify"])
+            .arg(&input)
+            .output()
+            .unwrap(),
+    );
+
+    // Integrity: one flipped digest character in an otherwise valid export.
+    let text = fs::read_to_string(&input).unwrap();
+    let marker = "\"content_sha256\":\"";
+    let at = text.rfind(marker).unwrap() + marker.len();
+    let mut bytes = text.into_bytes();
+    bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+    let corrupt = home.join("corrupt.jsonl");
+    fs::write(&corrupt, bytes).unwrap();
+    assert_eq!(
+        failure(&["verify".as_ref(), corrupt.as_os_str()]),
+        (5, "logical-archive-integrity".to_owned(), false)
+    );
+
+    // I/O: the input does not exist. This is not an integrity verdict.
+    let io = (14, "logical-archive-io".to_owned(), true);
+    let missing = home.join("missing.jsonl");
+    assert_eq!(failure(&["verify".as_ref(), missing.as_os_str()]), io);
+
+    // Busy: another holder keeps the destination lock past the five-second wait.
+    let busy = home.join("busy.jsonl");
+    let lock = fs::File::create(home.join(".busy.jsonl.logical-archive.lock")).unwrap();
+    lock.lock().unwrap();
+    assert_eq!(
+        failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            busy.as_os_str(),
+        ]),
+        (7, "logical-archive-busy".to_owned(), true)
+    );
+    drop(lock);
+    assert!(!busy.exists());
+
+    // I/O, not usage: an unwritable destination whose path contains "usage".
+    // Root bypasses directory permissions, which would make this vacuous.
+    #[cfg(unix)]
+    if !running_as_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let sealed = home.join("usage-readonly");
+        fs::create_dir(&sealed).unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+        let output = sealed.join("history.jsonl");
+        let result = failure(&[
+            "export".as_ref(),
+            "--db".as_ref(),
+            source.as_os_str(),
+            "--archive-id".as_ref(),
+            "cli-archive".as_ref(),
+            "--include-private".as_ref(),
+            "--output".as_ref(),
+            output.as_os_str(),
+        ]);
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result, io);
+        assert!(!output.exists());
+    }
+}
+
+/// Whether the test runs as uid 0, where directory permissions are bypassed.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.stdout.trim_ascii() == b"0")
+}
+
 #[test]
 fn real_binary_never_publishes_a_valid_prefix_or_an_unknown_version() {
     let root = tempfile::tempdir().unwrap();
