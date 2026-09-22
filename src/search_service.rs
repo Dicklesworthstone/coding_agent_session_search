@@ -4,10 +4,13 @@
 //! EOF. Search is index-only. Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
 //! Neither lane starts models, writers, automatic refresh, or detached children.
-//! Frame/page bounds do not cap reader RSS or interrupt a native engine call.
+//! Request deadlines terminate the worker, including stalled native calls.
+//! Frame/page/deadline limits are not a total reader-RSS bound.
 
 #[path = "search_service/canonical.rs"]
 mod canonical;
+#[path = "search_service/deadline.rs"]
+mod deadline;
 #[path = "search_service/mcp.rs"]
 mod mcp;
 #[path = "search_service/protocol.rs"]
@@ -19,7 +22,7 @@ mod tests;
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -70,6 +73,14 @@ enum ServiceCommand {
         /// Search, status and startup still never open the database.
         #[arg(long, value_name = "PATH")]
         db: Option<PathBuf>,
+        /// Whole-request deadline, from first frame byte through response flush.
+        /// Expiry exits the worker with code 124; idle sessions are not timed out.
+        #[arg(
+            long,
+            default_value_t = deadline::DEFAULT_TIMEOUT_MS,
+            value_parser = deadline::parse_timeout_ms
+        )]
+        request_timeout_ms: u64,
     },
 }
 
@@ -98,6 +109,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         stdio: _,
         mcp,
         db,
+        request_timeout_ms,
     } = cli.command;
     let index = match (index, data_dir) {
         (Some(index), None) => index,
@@ -120,6 +132,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         std::env::current_dir().map_err(cli_io_error)?.join(index)
     };
     let mut session = Session::new(index);
+    session.request_timeout = Duration::from_millis(request_timeout_ms);
     session.archive = db
         .map(|path| {
             if path.is_absolute() {
@@ -132,12 +145,17 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         .map_err(cli_io_error)?;
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
-    if mcp {
+    let result = if mcp {
         mcp::serve_io(&mut session, &mut input, &mut output)
     } else {
         serve_io(&mut session, &mut input, &mut output)
-    }
-    .map_err(cli_io_error)
+    };
+    // EOF and transport errors must also release native readers under a guard.
+    // Ordinary Rust scope unwinding alone would leave destructor work unbounded.
+    let _teardown = deadline::Deadline::start(session.request_timeout)
+        .unwrap_or_else(|_| std::process::exit(deadline::WATCHDOG_FAILURE_EXIT_CODE));
+    drop(session);
+    result.map_err(cli_io_error)
 }
 
 fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {
@@ -152,6 +170,7 @@ fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {
 
 struct Session {
     index: PathBuf,
+    request_timeout: Duration,
     archive: Option<PathBuf>,
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
@@ -165,6 +184,7 @@ impl Session {
     fn new(index: PathBuf) -> Self {
         Self {
             index,
+            request_timeout: Duration::from_millis(deadline::DEFAULT_TIMEOUT_MS),
             archive: None,
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
@@ -211,6 +231,9 @@ impl Session {
                 "page_window": protocol::MAX_WINDOW,
                 "canonical_context": canonical::MAX_CONTEXT,
                 "canonical_content_bytes": canonical::MAX_CONTENT_BYTES,
+                "request_timeout_ms": self.request_timeout.as_millis(),
+                "timeout_exit_code": deadline::TIMEOUT_EXIT_CODE,
+                "timeout_scope": "first_frame_byte_through_response_flush",
             }
         })
     }
@@ -447,6 +470,10 @@ fn serve_io(
     output: &mut impl Write,
 ) -> io::Result<()> {
     loop {
+        let Some(_request_deadline) = deadline::Deadline::for_frame(input, session.request_timeout)?
+        else {
+            return Ok(());
+        };
         let bytes = match protocol::read_frame(input)? {
             Frame::End => return Ok(()),
             Frame::TooLarge => {

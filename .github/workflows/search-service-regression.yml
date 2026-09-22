@@ -18,6 +18,50 @@ permissions:
   contents: read
 
 jobs:
+  deadlines:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: clippy
+      - name: Exercise the exact process supervisor without engine build latency
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          rustc --version
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'cass-deadline-tests'
+          root.mkdir()
+          source = Path('src/search_service/deadline.rs').resolve().as_posix()
+          (root / 'Cargo.toml').write_text('[package]\nname="cass-deadline-tests"\nversion="0.0.0"\nedition="2024"\n[lib]\npath="lib.rs"\n')
+          (root / 'lib.rs').write_text('#[allow(dead_code)]\n#[path = ' + json.dumps(source) + ']\nmod deadline;\n')
+          PY
+          manifest="$RUNNER_TEMP/cass-deadline-tests/Cargo.toml"
+          cargo test --manifest-path "$manifest" -- --test-threads=1 --nocapture 2>&1 | tee deadline-tests.log
+          grep -Eq 'test result: ok\. 5 passed; 0 failed; 2 ignored' deadline-tests.log
+          cargo clippy --manifest-path "$manifest" --tests -- -D warnings
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: deadline-tests-${{ matrix.os }}-${{ github.sha }}
+          path: deadline-tests.log
+          if-no-files-found: warn
+          retention-days: 7
   formatting:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10

@@ -3,8 +3,8 @@
 //! Keep the wire protocol separate from the retained lexical session. Modern
 //! discovery gets Method Not Found so dual-era clients can fall back explicitly;
 //! we never advertise the stateless 2026 protocol while requiring a handshake.
-//! Requests execute sequentially. A native call is not forcibly cancellable;
-//! the host owns process deadlines, and late notifications get no response.
+//! Requests execute sequentially. Deadline expiry terminates the entire worker,
+//! including stalled native calls; late notifications get no response.
 
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
@@ -374,6 +374,11 @@ pub(super) fn serve_io(
 ) -> io::Result<()> {
     let mut adapter = Adapter::default();
     loop {
+        let Some(_request_deadline) =
+            super::deadline::Deadline::for_frame(input, session.request_timeout)?
+        else {
+            return Ok(());
+        };
         let bytes = match protocol::read_frame(input)? {
             Frame::End => return Ok(()),
             Frame::TooLarge => {
