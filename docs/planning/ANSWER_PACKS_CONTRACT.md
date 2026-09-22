@@ -252,12 +252,18 @@ by 52 characters; the final character's unused bits are zero. Published IDs
 bind to the citation core after source verification, including unverified
 fallbacks. Version 2 hashes a domain-separated, length-prefixed encoding of
 source identity and path, provider, content hash, optional conversation/message
-identity, physical span, and span hash. Missing and zero coordinates are distinct; embedded delimiters
-cannot alias neighboring fields. Evidence and candidate IDs change with this
-version. Content-based duplicate suppression within a pack is unchanged, while
-physical-span overlap suppression never crosses source/provider/conversation
-identity. Otherwise tied candidates prefer a known conversation ID to a missing
-ID and use canonical coordinates and provider as deterministic tie-breakers.
+identity, physical span, and span hash. Missing and zero canonical coordinates
+are distinct; embedded delimiters cannot alias neighboring fields. Evidence and
+candidate IDs change with this
+version. Content-based duplicate suppression within a pack is unchanged.
+Physical-span overlap suppression requires verified, nonzero, ordered file
+ranges on the same source and path. Unlike canonical session limits, physical
+overlap is independent of provider/conversation IDs: those can refer to the
+same file bytes. Unverified or malformed spans are cleared before selection,
+so they neither suppress evidence nor appear as physical citations. Canonical
+message identity is preserved. Otherwise tied candidates prefer a known
+conversation ID to a missing ID and use canonical coordinates and provider as
+deterministic tie-breakers.
 
 ## Pack Object Schema
 

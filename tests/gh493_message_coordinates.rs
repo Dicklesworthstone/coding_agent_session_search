@@ -94,7 +94,7 @@ mod pack_identity_regressions {
     }
 
     #[test]
-    fn pack_overlap_is_scoped_to_source_and_conversation_but_content_dedup_remains() {
+    fn pack_unverified_spans_do_not_suppress_canonical_evidence_but_content_dedup_remains() {
         let mut first = candidate(&hit(Some(42), Some(8), 1));
         first.line_start = Some(10);
         first.line_end = Some(12);
@@ -114,7 +114,15 @@ mod pack_identity_regressions {
         let mut same_session = candidate(&hit(Some(42), Some(13), 4));
         same_session.line_start = Some(12);
         same_session.line_end = Some(14);
-        let overlapping = plan(vec![first.clone(), same_session], 3);
+        let unverified = plan(vec![first.clone(), same_session.clone()], 3);
+        assert_eq!(unverified.selected_evidence_count, 2);
+        assert!(unverified.evidence.iter().all(|item| {
+            item.candidate.line_start.is_none() && item.candidate.line_end.is_none()
+        }));
+        let mut verified_first = first.clone();
+        verified_first.citation_verified = true;
+        same_session.citation_verified = true;
+        let overlapping = plan(vec![verified_first, same_session], 3);
         assert_eq!(overlapping.selected_evidence_count, 1);
         assert_eq!(
             overlapping.omitted[0].reason,
@@ -147,6 +155,103 @@ mod pack_identity_regressions {
             let selected = plan(candidates, 2);
             assert_eq!(selected.evidence[0].candidate.conversation_id, Some(42));
         }
+    }
+
+    #[test]
+    fn pack_invalid_physical_spans_cannot_gain_authority_or_erase_canonical_evidence() {
+        let clean = candidate(&hit(Some(42), Some(8), 1));
+        let clean_pack = plan(vec![clean.clone()], 1);
+        let clean_id = clean_pack.evidence[0].id.clone();
+        for (verified, start, end) in [
+            (false, Some(10), Some(12)),
+            (true, None, Some(12)),
+            (true, Some(0), Some(12)),
+            (true, Some(12), Some(10)),
+            (true, None, None),
+        ] {
+            let mut invalid = clean.clone();
+            invalid.citation_verified = verified;
+            invalid.line_start = start;
+            invalid.line_end = end;
+            let mut other = candidate(&hit(Some(43), Some(13), 2));
+            other.citation_verified = true;
+            other.line_start = Some(10);
+            other.line_end = Some(12);
+            for items in [
+                vec![invalid.clone(), other.clone()],
+                vec![other, invalid.clone()],
+            ] {
+                let selected = plan(items, 2);
+                assert_eq!(selected.selected_evidence_count, 2);
+                let retained = selected
+                    .evidence
+                    .iter()
+                    .find(|item| item.candidate.conversation_id == Some(42))
+                    .unwrap();
+                assert_eq!(retained.id, clean_id);
+                assert_eq!(retained.selection.citation_quality_score, 0.75);
+                assert_eq!(retained.candidate.message_index, Some(8));
+                assert!(!retained.candidate.citation_verified);
+                assert!(retained.candidate.line_start.is_none());
+                assert!(retained.candidate.line_end.is_none());
+                let output = render_answer_pack_value_without_trust_correlation(
+                    &selected,
+                    &PackRenderRequest::default(),
+                )
+                .unwrap();
+                let citation = &output["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["citation"]["conversation_id"] == 42)
+                    .unwrap()["citation"];
+                assert_eq!(citation["message_index"], 8);
+                assert_eq!(citation["message_index_base"], 1);
+                assert_eq!(citation["verified"], false);
+                assert!(citation["line_start"].is_null());
+                assert!(citation["line_end"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn pack_verified_file_overlap_is_independent_of_canonical_provider_and_conversation() {
+        let mut first = candidate(&hit(Some(42), Some(8), 1));
+        first.citation_verified = true;
+        first.line_start = Some(10);
+        first.line_end = Some(12);
+        let mut sibling = candidate(&hit(Some(43), Some(13), 2));
+        sibling.agent = "claude_code".into();
+        sibling.citation_verified = true;
+        sibling.line_start = Some(12);
+        // Missing end means a single verified physical line, not a dense
+        // canonical message position and not an unknown start.
+        sibling.line_end = None;
+        for items in [
+            vec![first.clone(), sibling.clone()],
+            vec![sibling.clone(), first.clone()],
+        ] {
+            let selected = plan(items, 2);
+            assert_eq!(selected.selected_evidence_count, 1);
+            assert_eq!(
+                selected.omitted[0].reason,
+                PackOmittedReason::DuplicateContent
+            );
+        }
+        sibling.line_start = Some(13);
+        assert_eq!(
+            plan(vec![first.clone(), sibling.clone()], 2).selected_evidence_count,
+            2
+        );
+        sibling.line_start = Some(12);
+        sibling.source_id = "another-host".into();
+        assert_eq!(
+            plan(vec![first.clone(), sibling.clone()], 2).selected_evidence_count,
+            2
+        );
+        sibling.source_id = first.source_id.clone();
+        sibling.source_path = "/different/provider.db".into();
+        assert_eq!(plan(vec![first, sibling], 2).selected_evidence_count, 2);
     }
 
     #[test]
@@ -196,7 +301,19 @@ mod pack_identity_regressions {
         let absent = evidence_id(span.clone());
         span.line_start = Some(0);
         span.line_end = Some(0);
-        assert_ne!(evidence_id(span.clone()), absent);
+        assert_eq!(
+            evidence_id(span.clone()),
+            absent,
+            "invalid physical spans are not evidence"
+        );
+        span.line_start = Some(10);
+        span.line_end = Some(12);
+        span.citation_verified = true;
+        assert_ne!(
+            evidence_id(span.clone()),
+            absent,
+            "a verified span is part of citation identity"
+        );
         let first = evidence_id(span.clone());
         span.conversation_id = Some(43);
         assert_ne!(evidence_id(span), first);
@@ -335,7 +452,6 @@ mod pack_identity_regressions {
                     "--mode",
                     "lexical",
                     "--json",
-                    "--no-maintenance",
                     "--freshness-policy",
                     "allow-stale",
                     "--require-evidence",

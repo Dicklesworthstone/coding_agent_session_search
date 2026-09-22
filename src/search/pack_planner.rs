@@ -314,6 +314,15 @@ impl PackCandidate {
             conversation_id: self.conversation_id,
         }
     }
+
+    fn verified_line_range(&self) -> Option<(usize, usize)> {
+        if !self.citation_verified {
+            return None;
+        }
+        let start = self.line_start?;
+        let end = self.line_end.unwrap_or(start);
+        (start > 0 && end >= start).then_some((start, end))
+    }
 }
 
 /// Keep archive identity separate from display redaction. A provider database
@@ -325,6 +334,38 @@ struct PackSessionKey {
     source_path: String,
     agent: String,
     conversation_id: Option<i64>,
+}
+
+/// Physical-file coordinates are not scoped by archive conversation/provider.
+/// Two canonical sessions can cite the same verified bytes in one local file;
+/// equal paths on different sources, however, are different files.
+#[derive(Debug)]
+struct VerifiedPackFileSpan {
+    source_id: String,
+    source_path: String,
+    start: usize,
+    end: usize,
+}
+
+impl VerifiedPackFileSpan {
+    fn from_candidate(candidate: &PackCandidate) -> Option<Self> {
+        let (start, end) = candidate.verified_line_range()?;
+        Some(Self {
+            source_id: candidate.source_id.clone(),
+            source_path: candidate.source_path.clone(),
+            start,
+            end,
+        })
+    }
+
+    fn overlaps(&self, candidate: &PackCandidate) -> bool {
+        candidate.verified_line_range().is_some_and(|(start, end)| {
+            self.source_id == candidate.source_id
+                && self.source_path == candidate.source_path
+                && self.start <= end
+                && start <= self.end
+        })
+    }
 }
 
 fn match_type_robot_name(match_type: MatchType) -> &'static str {
@@ -900,13 +941,24 @@ struct SelectedState {
     sessions: HashSet<PackSessionKey>,
     span_hashes: HashSet<String>,
     content_hashes: HashSet<String>,
-    ranges: Vec<(PackSessionKey, Option<usize>, Option<usize>)>,
+    verified_ranges: Vec<VerifiedPackFileSpan>,
 }
 
 pub fn plan_answer_pack(
-    request: PackPlanRequest,
+    mut request: PackPlanRequest,
 ) -> Result<PlannedAnswerPack, PackPlannerLimitError> {
     request.limits.validate()?;
+
+    // Caller-supplied ordinals or malformed spans are not verified file lines.
+    // Clear them before scoring, deduplication, IDs and rendering can mistake
+    // them for physical evidence. Preserve canonical message identity/content.
+    for candidate in &mut request.candidates {
+        if candidate.verified_line_range().is_none() {
+            candidate.citation_verified = false;
+            candidate.line_start = None;
+            candidate.line_end = None;
+        }
+    }
 
     let candidate_count = request.candidates.len();
     let diagnostics = PackPlannerDiagnostics {
@@ -1077,16 +1129,16 @@ pub fn plan_answer_pack(
         selected_state
             .source_ids
             .insert(candidate.source_id.clone());
-        selected_state.sessions.insert(session_key.clone());
+        selected_state.sessions.insert(session_key);
         selected_state
             .span_hashes
             .insert(candidate.span_hash.clone());
         selected_state
             .content_hashes
             .insert(candidate.content_hash.clone());
-        selected_state
-            .ranges
-            .push((session_key, candidate.line_start, candidate.line_end));
+        if let Some(span) = VerifiedPackFileSpan::from_candidate(candidate) {
+            selected_state.verified_ranges.push(span);
+        }
 
         selected.push(PlannedPackEvidence {
             id: evidence_id(candidate),
@@ -1275,15 +1327,14 @@ fn hard_omission_reason(
     if is_stale_under_strict_policy(candidate, request) {
         return Some(PackOmittedReason::StaleUnderStrictPolicy);
     }
-    let session_key = candidate.session_key();
     if selected_state.span_hashes.contains(&candidate.span_hash)
         || selected_state
             .content_hashes
             .contains(&candidate.content_hash)
-        || selected_state.ranges.iter().any(|(session, start, end)| {
-            session == &session_key
-                && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-        })
+        || selected_state
+            .verified_ranges
+            .iter()
+            .any(|span| span.overlaps(candidate))
     {
         return Some(PackOmittedReason::DuplicateContent);
     }
@@ -1299,20 +1350,6 @@ fn is_stale_under_strict_policy(candidate: &PackCandidate, request: &PackPlanReq
     };
     let max_age_ms = request.freshness_window_seconds.saturating_mul(1_000);
     request.now_ms.saturating_sub(created_at_ms) > max_age_ms
-}
-
-fn line_ranges_overlap(
-    left_start: Option<usize>,
-    left_end: Option<usize>,
-    right_start: Option<usize>,
-    right_end: Option<usize>,
-) -> bool {
-    let (Some(left_start), Some(right_start)) = (left_start, right_start) else {
-        return false;
-    };
-    let left_end = left_end.unwrap_or(left_start);
-    let right_end = right_end.unwrap_or(right_start);
-    left_start <= right_end && right_start <= left_end
 }
 
 fn score_candidate(
@@ -1491,7 +1528,7 @@ fn citation_quality_score(candidate: &PackCandidate) -> f64 {
     let has_path = !candidate.source_path.trim().is_empty();
     let has_source = !candidate.source_id.trim().is_empty();
     let has_agent = !candidate.agent.trim().is_empty();
-    let has_line_span = candidate.line_start.is_some() && candidate.line_end.is_some();
+    let has_line_span = candidate.verified_line_range().is_some();
     if has_path && has_source && has_agent && has_line_span {
         1.0
     } else if has_path && has_source && has_agent {
@@ -1513,11 +1550,11 @@ fn duplicate_penalty(candidate: &PackCandidate, selected_state: &SelectedState) 
     {
         return 0.5;
     }
-    let session_key = candidate.session_key();
-    if selected_state.ranges.iter().any(|(session, start, end)| {
-        session == &session_key
-            && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-    }) {
+    if selected_state
+        .verified_ranges
+        .iter()
+        .any(|span| span.overlaps(candidate))
+    {
         return 0.25;
     }
     0.0
@@ -4429,7 +4466,7 @@ mod tests {
         span_duplicate.span_hash = span_source.span_hash.clone();
 
         let range_source = candidate("range-source", "local", "/s/range.jsonl", 8.0);
-        let mut range_duplicate = candidate("range-dup", "remote", "/s/range.jsonl", 7.0);
+        let mut range_duplicate = candidate("range-dup", "local", "/s/range.jsonl", 7.0);
         range_duplicate.line_start = Some(11);
         range_duplicate.line_end = Some(14);
 
