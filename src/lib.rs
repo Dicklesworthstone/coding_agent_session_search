@@ -30835,11 +30835,9 @@ fn run_cli_search(
         mode_meta.fall_back_to_lexical(
             "semantic refinement skipped because the robot search budget is nearly exhausted",
         );
-    } else if matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    ) {
-        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
+    }
+
+    use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
     // Validate an explicitly named producer before budget shedding. This is a
     // cheap configuration check: an invalid or unavailable embedder must not
