@@ -91969,14 +91969,6 @@ pub(crate) fn run_doctor_impl(
         initial_failure_marker.clone()
     };
     let all_pass = checks.iter().all(|c| c.status == "pass");
-    let healthy = fail_count == 0 && !not_initialized;
-    let doctor_status = if not_initialized {
-        "not_initialized"
-    } else if fail_count == 0 {
-        "healthy"
-    } else {
-        "unhealthy"
-    };
     // #287: stable machine-readable reason codes for degraded doctor outcomes,
     // so an agent can make a bounded decision from the JSON verdict without
     // parsing free-form check messages. Ordered by triage priority; the first
@@ -92006,14 +91998,8 @@ pub(crate) fn run_doctor_impl(
     {
         degraded_reason_codes.push("checkpoint_incomplete");
     }
-    // g3zyo (GH #382 follow-up): on a large archive the deep page-integrity
-    // probe is deferred (bounded doctor limit) and the `database` check is a
-    // warn saying "structural integrity is unchecked" — while `status` stays
-    // "healthy" because nothing failed. That summary misled a reader into
-    // "the archive is fine" on an archive stock `quick_check` calls corrupt.
-    // Surface the unchecked state as a stable reason code so an agent sees it
-    // without parsing the check message; `healthy` keeps its fail-count
-    // contract.
+    // GH #497: readable rows do not establish structural integrity. Keep
+    // the deferral visible in both the reason code and the aggregate verdict.
     if checks.iter().any(|c| {
         c.name == "database"
             && c.status == "warn"
@@ -92022,6 +92008,16 @@ pub(crate) fn run_doctor_impl(
         degraded_reason_codes.push("integrity_unchecked");
     }
     let primary_reason_code = degraded_reason_codes.first().copied();
+    let doctor_status = if not_initialized {
+        "not_initialized"
+    } else if fail_count != 0 {
+        "unhealthy"
+    } else if degraded_reason_codes.contains(&"integrity_unchecked") {
+        "unknown"
+    } else {
+        "healthy"
+    };
+    let healthy = doctor_status == "healthy";
 
     // Output
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -92084,9 +92080,8 @@ pub(crate) fn run_doctor_impl(
             // are null/empty on a fully verified healthy run. Stable values:
             // timeout_or_busy_spin_guard, db_unavailable,
             // quarantine_circuit_breaker, checkpoint_incomplete,
-            // integrity_unchecked (status may still be "healthy": the deep
-            // page-integrity probe was deferred, so the archive's structural
-            // health is unverified rather than bad — g3zyo).
+            // integrity_unchecked (status is "unknown" unless an affirmative
+            // failure makes it "unhealthy": a deferred probe is no verdict).
             "reason_code": primary_reason_code,
             "degraded_reason_codes": degraded_reason_codes,
             "health_class": health_class,

@@ -7533,12 +7533,9 @@ fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
     );
 }
 
-/// g3zyo (GH #382 follow-up): when doctor defers the deep page-integrity
-/// probe, the run can still be `healthy` (nothing failed) while the archive's
-/// structural health is unverified; an agent reading only `status` was misled
-/// on an archive stock `quick_check` calls corrupt. Positive observable: the
-/// deferred shape yields `reason_code == "integrity_unchecked"` next to the
-/// `database` warn and `status` stays `healthy`. Planted negative: the same
+/// GH #497: a deferred deep page-integrity probe cannot certify health.
+/// The deferred shape yields `reason_code == "integrity_unchecked"` next to
+/// the `database` warn, `status == "unknown"`, and `healthy == false`. The same
 /// archive as a regular file gets a `database` pass and no reason codes. The
 /// deferral is planted the cheap way — the probe refuses a non-regular file —
 /// so no multi-hundred-megabyte fixture is needed. No-claim: this does not
@@ -7580,6 +7577,7 @@ fn doctor_reports_integrity_unchecked_reason_code_when_the_deep_probe_is_deferre
 
     let verified = run_doctor();
     assert_eq!(verified["status"].as_str(), Some("healthy"), "{verified:#}");
+    assert_eq!(verified["healthy"], true, "{verified:#}");
     assert_eq!(
         database_check(&verified)["status"].as_str(),
         Some("pass"),
@@ -7624,9 +7622,10 @@ fn doctor_reports_integrity_unchecked_reason_code_when_the_deep_probe_is_deferre
     );
     assert_eq!(
         deferred["status"].as_str(),
-        Some("healthy"),
-        "nothing failed, so the fail-count contract keeps the status: {deferred:#}"
+        Some("unknown"),
+        "a deferred integrity probe cannot certify health: {deferred:#}"
     );
+    assert_eq!(deferred["healthy"], false, "{deferred:#}");
     assert_eq!(
         deferred["reason_code"].as_str(),
         Some("integrity_unchecked"),
