@@ -52,6 +52,8 @@ pub(crate) enum SemanticFallbackReason {
     HybridExecutionError,
     /// Pack/answer evidence enrichment could not use semantic signals.
     PackEnrichmentUnavailable,
+    /// The remaining robot-search budget could not safely admit semantic work.
+    SemanticBudgetLimited,
     /// Semantic was simply not applied (generic / no specific cause).
     SemanticNotApplied,
 }
@@ -68,6 +70,7 @@ impl SemanticFallbackReason {
             Self::SemanticContextUnavailable => "semantic_context_unavailable",
             Self::HybridExecutionError => "hybrid_execution_error",
             Self::PackEnrichmentUnavailable => "pack_enrichment_unavailable",
+            Self::SemanticBudgetLimited => "semantic_budget_limited",
             Self::SemanticNotApplied => "semantic_not_applied",
         }
     }
@@ -90,6 +93,8 @@ pub(crate) fn classify_fallback_reason(reason: &str) -> SemanticFallbackReason {
         SemanticFallbackReason::SemanticAbsent
     } else if r.contains("pack semantic enrichment") {
         SemanticFallbackReason::PackEnrichmentUnavailable
+    } else if r.contains("semantic refinement skipped") && r.contains("robot search budget") {
+        SemanticFallbackReason::SemanticBudgetLimited
     } else if r.contains("context rejected") {
         SemanticFallbackReason::SemanticContextRejected
     } else if r.contains("context unavailable") {
@@ -125,7 +130,8 @@ pub(crate) fn refinement_level(
 
 /// What happened to an explicit `--mode semantic` request. Semantic-only never
 /// silently degrades to lexical: it is either satisfied or it fails visibly
-/// (exit 15), and this records which so robot output is unambiguous.
+/// with a typed nonzero error, and this records which so robot output is
+/// unambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SemanticOnlyOutcome {
@@ -381,6 +387,22 @@ mod tests {
                 SemanticFallbackReason::PackEnrichmentUnavailable,
             ),
             (
+                "semantic refinement skipped because the robot search budget is nearly exhausted",
+                SemanticFallbackReason::SemanticBudgetLimited,
+            ),
+            (
+                "semantic refinement skipped after setup because the robot search budget is nearly exhausted",
+                SemanticFallbackReason::SemanticBudgetLimited,
+            ),
+            (
+                "hybrid execution unavailable: candidate budget exceeded",
+                SemanticFallbackReason::HybridExecutionError,
+            ),
+            (
+                "semantic context unavailable: budget metadata missing",
+                SemanticFallbackReason::SemanticContextUnavailable,
+            ),
+            (
                 "semantic disabled by policy",
                 SemanticFallbackReason::SemanticPolicyDisabled,
             ),
@@ -440,6 +462,7 @@ mod tests {
             SemanticFallbackReason::SemanticAbsent,
             SemanticFallbackReason::HybridExecutionError,
             SemanticFallbackReason::PackEnrichmentUnavailable,
+            SemanticFallbackReason::SemanticBudgetLimited,
         ] {
             assert_eq!(
                 serde_json::to_string(&reason).unwrap(),

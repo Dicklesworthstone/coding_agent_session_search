@@ -34,6 +34,7 @@ use walkdir::WalkDir;
 
 mod util;
 
+
 fn cass_cmd(temp_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
