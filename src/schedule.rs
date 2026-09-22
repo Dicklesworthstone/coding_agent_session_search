@@ -43,7 +43,10 @@ use tracing::{info, warn};
 use crate::indexer::background_refresh::background_index_args;
 use crate::indexer::responsiveness;
 
+mod discovery;
 mod outcomes;
+
+pub use discovery::{SourceScheduleError, due_remote_sources};
 
 pub const DEFAULT_INTERVAL_MINS: u32 = 15;
 pub const DEFAULT_NIGHTLY_HOUR: u8 = 3;
@@ -900,27 +903,6 @@ fn skipped_step(name: &str, reason: impl Into<String>) -> StepReport {
     }
 }
 
-/// Remote sources whose `sync_schedule` is due right now (never `manual`).
-pub fn due_remote_sources(data_dir: &Path, now_ms: i64) -> Vec<(String, String)> {
-    use crate::sources::config::SourcesConfig;
-    use crate::sources::sync::{SourceSyncAction, SyncStatus};
-
-    let Ok(config) = SourcesConfig::load() else {
-        return Vec::new();
-    };
-    let status = SyncStatus::load(data_dir).unwrap_or_default();
-    config
-        .remote_sources()
-        .filter_map(|source| {
-            let decision = status.decision_for_source_at(source, now_ms, false);
-            match decision.action {
-                SourceSyncAction::Sync => Some((source.name.clone(), decision.reasons.join("; "))),
-                SourceSyncAction::Skip | SourceSyncAction::Defer => None,
-            }
-        })
-        .collect()
-}
-
 /// Decide whether a scheduled job should run now, and why not.
 pub fn job_gate(job: ScheduleJob) -> Option<String> {
     let pressure = responsiveness::machine_pressure_now();
@@ -979,7 +961,42 @@ fn run_job_with_gate(
 
     if skipped_reason.is_none() {
         // 1. Remote syncs that are due.
-        let due = due_remote_sources(&cfg.data_dir, started_ms);
+        let discovery_started = Instant::now();
+        let due = match due_remote_sources(&cfg.data_dir, started_ms) {
+            Ok(due) => due,
+            Err(error) => {
+                steps.push(StepReport {
+                    name: "sources-discovery".to_string(),
+                    argv: Vec::new(),
+                    exit_code: None,
+                    ok: false,
+                    duration_ms: u64::try_from(discovery_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    skipped_reason: None,
+                    result: Some(serde_json::json!({
+                        "status": "failed",
+                        "reason": error.reason_code(),
+                        "dependent_work_started": false,
+                    })),
+                    stderr_tail: Some(error.to_string()),
+                });
+                // No sync, index, or model process may start from an unknown
+                // source plan. Persist the failure, not fabricated freshness.
+                return persist_job_report(
+                    cfg,
+                    JobReport {
+                        job,
+                        started_ms,
+                        finished_ms: now_ms(),
+                        ok: false,
+                        skipped_reason: None,
+                        steps,
+                        pressure,
+                        user_idle,
+                    },
+                );
+            }
+        };
         if due.is_empty() {
             steps.push(skipped_step("sources-sync", "no remote source is due"));
         } else {
@@ -1142,8 +1159,12 @@ fn run_job_with_gate(
         pressure,
         user_idle,
     };
+    persist_job_report(cfg, report)
+}
+
+fn persist_job_report(cfg: &RunConfig, report: JobReport) -> JobReport {
     let mut state = load_state(&cfg.data_dir);
-    match job {
+    match report.job {
         ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
         ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
     }
