@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: macos-14
     timeout-minutes: 10
     permissions:
       contents: write
@@ -78,7 +78,8 @@ jobs:
           subprocess.run(['git','diff','--check'], check=True)
           changed = set(subprocess.check_output(['git','diff','--name-only'], text=True).splitlines())
           untracked = set(subprocess.check_output(['git','ls-files','--others','--exclude-standard'], text=True).splitlines())
-          assert changed | untracked == set(files), (changed,untracked)
+          required = {name for name, (before, after) in files.items() if before != after}
+          assert required <= changed | untracked <= set(files), (changed,untracked)
           receipt = {'source_commit':os.environ['GITHUB_SHA'],'bases':{name:pair[0] for name,pair in files.items()},'blobs':{}}
           for name in files:
               data = Path(name).read_bytes()
