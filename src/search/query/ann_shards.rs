@@ -441,7 +441,9 @@ mod tests {
             .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&filter))
             .unwrap();
         assert_eq!(ids(&hits), ids(&expected));
-        assert_eq!(hits.len(), 2);
+        // Exact recovery retains the hydration overfetch window, unlike the
+        // bounded native page. Preserve the entire exact candidate cohort.
+        assert_eq!(hits.len(), 8);
         assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
         assert!(!retry.exact_window_may_omit_competitor);
         let stats = stats.unwrap();
@@ -454,7 +456,7 @@ mod tests {
             AnnExactFallbackReason::FilteredCandidateUnderfill
         );
         assert_eq!(receipt.shard_count, 17);
-        assert_eq!(receipt.returned_messages, 2);
+        assert_eq!(receipt.returned_messages, hits.len());
         assert_eq!(snapshot(dir.path()), before);
     }
 

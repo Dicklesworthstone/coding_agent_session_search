@@ -1172,7 +1172,7 @@ mod tests {
         let dir = tempdir()?;
         let output = dir.path().join("race.json");
         let barrier = Arc::new(Barrier::new(2));
-        let writers = [b'a', b'b'].map(|marker| {
+        let writers = (*b"ab").map(|marker| {
             let output = output.clone();
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {

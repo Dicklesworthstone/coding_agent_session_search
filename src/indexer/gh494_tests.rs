@@ -52,8 +52,7 @@ fn gh494_refused_rebuild_preserves_and_bootstraps_prior_publication_authority() 
         },
         None,
     )
-    .err()
-    .expect("refuse the actual swap");
+    .expect_err("refuse the actual swap");
     drop(fault);
     assert!(
         error.to_string().contains("publish_staged_generation"),
@@ -246,8 +245,7 @@ fn gh494_missing_staged_generation_replays_canonical_content(pending: bool, lega
         DISK_FULL,
     );
     let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-        .err()
-        .expect("the first publication must reach the injected refusal");
+        .expect_err("the first publication must reach the injected refusal");
     drop(fault);
     assert!(
         error.to_string().contains("publish_staged_generation"),
@@ -510,8 +508,7 @@ fn gh494_restart_damaged_candidate(damage: &str) {
         DISK_FULL,
     );
     let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-        .err()
-        .expect("real swap fault must be reached after a complete replay");
+        .expect_err("real swap fault must be reached after a complete replay");
     drop(fault);
     assert!(
         error.to_string().contains("publish_staged_generation"),
@@ -652,8 +649,7 @@ fn gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_succe
         ENOSPC_RAW_OS_ERROR,
     );
     let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-        .err()
-        .expect("refused publication must fail, not report completion");
+        .expect_err("refused publication must fail, not report completion");
     drop(fault);
     let message = error.to_string();
     assert!(message.contains("publish_staged_generation"), "{message}");
@@ -713,8 +709,7 @@ fn gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_succe
     fs::create_dir(&candidate_manifest).unwrap();
     for _ in 0..2 {
         let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-            .err()
-            .expect("candidate certification refusal must fail before swapping");
+            .expect_err("candidate certification refusal must fail before swapping");
         assert!(
             error.to_string().contains("persist_generation_manifest"),
             "{error:#}"
@@ -812,8 +807,7 @@ fn gh494_completed_marker_cannot_hide_a_live_document_count_mismatch() {
     checkpoint.indexed_docs += 1;
     persist_lexical_rebuild_state(&index_path, &checkpoint).unwrap();
     let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-        .err()
-        .expect("completed marker cannot certify a mismatched publication");
+        .expect_err("completed marker cannot certify a mismatched publication");
     assert!(
         error.to_string().contains("reuse_completed_generation"),
         "{error:#}"
@@ -848,8 +842,7 @@ fn gh494_post_swap_io_failure_preserves_certification_and_reuses_the_generation(
         sentinel.to_str().unwrap(),
     );
     let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-        .err()
-        .expect("post-swap I/O failure must remain visible");
+        .expect_err("post-swap I/O failure must remain visible");
     drop(guard);
     assert!(
         error.to_string().contains("publish_staged_generation"),
