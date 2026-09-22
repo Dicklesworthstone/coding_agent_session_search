@@ -8923,7 +8923,7 @@ fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
 /// skipped one: the previous `if let Some(observed)` shape verified nothing
 /// in exactly the cases that matter, so a generation whose MANIFEST never
 /// landed could still be certified by a completed checkpoint.
-fn verify_published_lexical_doc_count(
+pub(crate) fn verify_published_lexical_doc_count(
     index_path: &Path,
     indexed_docs: usize,
     publish_mode: &str,

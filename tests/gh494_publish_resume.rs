@@ -203,6 +203,111 @@ fn gh494_live_eof_checkpoint_finishes_certification_instead_of_returning_early()
 }
 
 #[test]
+fn gh494_search_budget_refuses_inline_work_but_explicit_full_index_recovers() {
+    let (tmp, data_dir, index) = fixture();
+    plant_eof_checkpoint(&index);
+    let checkpoint_before = std::fs::read(index.join(CHECKPOINT)).unwrap();
+    let generation_before = std::fs::read(index.join(GENERATION)).unwrap();
+    let manifest_before = std::fs::read(index.join("MANIFEST")).unwrap();
+    for robot in [false, true] {
+        let mut command = cass(tmp.path());
+        command
+            .env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "0",
+            )
+            .timeout(Duration::from_secs(30))
+            .args(["search", PROBE, "--mode", "lexical", "--data-dir"])
+            .arg(&data_dir);
+        if robot {
+            command.arg("--json");
+        }
+        let output = command.output().expect("bounded search refusal");
+        assert!(!output.status.success(), "a refused repair cannot succeed");
+        let rendered = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for expected in ["was not started", "archive_bytes=", "maximum_bytes=0"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("rebuilding from canonical database before running query"),
+            "refusal must precede inline rebuild: {rendered}"
+        );
+        assert_eq!(
+            std::fs::read(index.join(CHECKPOINT)).unwrap(),
+            checkpoint_before
+        );
+        assert_eq!(
+            std::fs::read(index.join(GENERATION)).unwrap(),
+            generation_before
+        );
+        assert_eq!(
+            std::fs::read(index.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
+    }
+    let output = cass(tmp.path())
+        .env(
+            "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+            "0",
+        )
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("explicit full indexing remains available");
+    assert_index_success(&output);
+    assert_certified_and_searches_are_read_only(tmp.path(), &data_dir, &index);
+}
+
+#[test]
+fn gh494_readable_generation_remains_searchable_with_a_zero_repair_budget() {
+    let (tmp, data_dir, index) = fixture();
+    let checkpoint_before = std::fs::read(index.join(CHECKPOINT)).unwrap();
+    let generation_before = std::fs::read(index.join(GENERATION)).unwrap();
+    for _ in 0..2 {
+        let output = cass(tmp.path())
+            .env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "0",
+            )
+            .args([
+                "search",
+                PROBE,
+                "--json",
+                "--mode",
+                "lexical",
+                "--limit",
+                "100",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .expect("query a readable generation without maintenance");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["hits"].as_array().unwrap().len(), SESSIONS * 2);
+        assert_eq!(
+            std::fs::read(index.join(CHECKPOINT)).unwrap(),
+            checkpoint_before
+        );
+        assert_eq!(
+            std::fs::read(index.join(GENERATION)).unwrap(),
+            generation_before
+        );
+    }
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn gh494_killed_after_atomic_swap_remains_searchable_without_inline_rebuild() {
     use std::fs::File;

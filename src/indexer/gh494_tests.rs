@@ -4,6 +4,11 @@
 #[test]
 #[serial_test::serial]
 fn gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success() {
+    #[cfg(windows)]
+    const ENOSPC_RAW_OS_ERROR: i32 = 112; // ERROR_DISK_FULL
+    #[cfg(not(windows))]
+    const ENOSPC_RAW_OS_ERROR: i32 = libc::ENOSPC;
+
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
