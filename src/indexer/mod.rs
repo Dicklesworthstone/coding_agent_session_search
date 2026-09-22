@@ -10489,6 +10489,9 @@ fn should_skip_unchanged_explicit_watch_once_paths(
 
     let triggers = classify_paths(paths.clone(), roots, true);
     if triggers.is_empty() {
+        // The run ends here without reindexing, so this is the only place
+        // that can say why nothing was indexed.
+        warn_unclaimed_explicit_watch_once_paths(paths, roots);
         return Ok(true);
     }
 
@@ -29226,13 +29229,14 @@ fn reindex_paths_with_semantic_delta(
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
-    let triggers = classify_paths(
-        paths,
-        roots,
-        opts.watch_once_paths
-            .as_ref()
-            .is_some_and(|paths| !paths.is_empty()),
-    );
+    let explicit = opts
+        .watch_once_paths
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty());
+    if explicit {
+        warn_unclaimed_explicit_watch_once_paths(&paths, roots);
+    }
+    let triggers = classify_paths(paths, roots, explicit);
     if triggers.is_empty() {
         return Ok(0);
     }
@@ -30582,6 +30586,45 @@ fn explicit_watch_once_scan_path(
         path.to_path_buf()
     };
     std::fs::canonicalize(&scan_path).unwrap_or(scan_path)
+}
+
+/// GH #478: existing explicit `--watch-once` paths that no connector claims.
+/// Absent paths are excluded: the absent-path fast path deliberately treats
+/// them as a no-op (agent hooks name transcripts that may not exist yet).
+fn unclaimed_explicit_watch_once_paths(
+    paths: &[PathBuf],
+    roots: &[(ConnectorKind, ScanRoot)],
+) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| {
+            path.exists() && classify_paths(vec![(*path).clone()], roots, true).is_empty()
+        })
+        .cloned()
+        .collect()
+}
+
+/// A targeted `--watch-once` that indexes nothing looks exactly like one
+/// that indexed everything: exit 0, zero work. Name the paths that no
+/// connector claims so a backfill that did nothing is visible.
+fn warn_unclaimed_explicit_watch_once_paths(
+    paths: &[PathBuf],
+    roots: &[(ConnectorKind, ScanRoot)],
+) {
+    let unclaimed = unclaimed_explicit_watch_once_paths(paths, roots);
+    if unclaimed.is_empty() {
+        return;
+    }
+    let listed: Vec<String> = unclaimed
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    tracing::warn!(
+        unclaimed = unclaimed.len(),
+        requested = paths.len(),
+        paths = %listed.join(", "),
+        "watch-once: no enabled connector claims these existing paths, so nothing was indexed for them; check the path against `cass sources agents list --json` and the connector's session root"
+    );
 }
 
 fn classify_paths(
@@ -57903,6 +57946,35 @@ mod tests {
         assert_eq!(classified[0].1.path, canonical);
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
+    }
+
+    /// GH #478 follow-up: only existing paths that no connector claims are
+    /// reported. Claimed paths (by root or by provider hint) and absent paths
+    /// (the deliberate hook fast path) are not.
+    #[test]
+    fn unclaimed_explicit_watch_once_paths_names_only_existing_unclaimed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rooted = tmp.path().join("sessions-root/session.jsonl");
+        let hinted = tmp.path().join(".codex/sessions/2026/01/rollout-a.jsonl");
+        let unclaimed = tmp.path().join("notes/plain.jsonl");
+        for path in [&rooted, &hinted, &unclaimed] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"{}\n").unwrap();
+        }
+        let absent = tmp.path().join("notes/not-written-yet.jsonl");
+        let roots = vec![(
+            ConnectorKind::Claude,
+            ScanRoot::local(tmp.path().join("sessions-root")),
+        )];
+
+        assert_eq!(
+            unclaimed_explicit_watch_once_paths(
+                &[rooted.clone(), hinted.clone(), unclaimed.clone(), absent],
+                &roots
+            ),
+            vec![unclaimed]
+        );
+        assert!(unclaimed_explicit_watch_once_paths(&[rooted, hinted], &roots).is_empty());
     }
 
     #[cfg(unix)]
