@@ -244,6 +244,7 @@ impl Adapter {
             "cass_reload" => "reload",
             "cass_unload" => "unload",
             "cass_view" if session.archive.is_some() => "view",
+            "cass_view_batch" if session.archive.is_some() => "view_batch",
             "cass_refine" if session.refiner.enabled() => "refine",
             _ => return Some(failure(id, -32602, "unknown tool")),
         };
@@ -269,7 +270,11 @@ impl Adapter {
             self.calls = 0;
         }
         let reply = if self.calls >= MAX_TOOL_CALLS_PER_MINUTE {
-            Reply::failure(None, "rate_limited", "at most 120 tool calls per minute per process; retry after the current minute window")
+            Reply::failure(
+                None,
+                "rate_limited",
+                "at most 120 tool calls per minute per process; retry after the current minute window",
+            )
         } else {
             self.calls += 1;
             session.handle(request).0
@@ -339,18 +344,30 @@ fn tools_for_session(session: &Session) -> Vec<Value> {
     if session.archive.is_some() {
         let identity =
             json!({"type": "string", "minLength": 1, "maxLength": protocol::MAX_IDENTITY_BYTES});
+        let view_schema = json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["source_path", "source_id", "conversation_id", "message_index"],
+            "properties": {
+                "source_path": identity,
+                "source_id": identity,
+                "conversation_id": {"type": "integer", "minimum": 1, "maximum": i64::MAX},
+                "message_index": {"type": "integer", "minimum": 1, "maximum": (i64::MAX as u64) + 1},
+                "context": {"type": "integer", "minimum": 0, "maximum": super::canonical::MAX_CONTEXT, "default": 0}
+            }
+        });
         catalog.push(json!({
             "name": "cass_view",
             "description": "Read a complete canonical message with optional nearby messages. Copy all four coordinates from one search hit. Reads only the fixed startup --db; source_path is an identity, never a file to open. Context counts actual messages, including sparse indices. At most 20 messages on each side and 64 KiB of total UTF-8 body data; larger windows fail without truncation. This new archive read snapshot is not proof of lexical-index freshness.",
+            "inputSchema": view_schema,
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
+        }));
+        catalog.push(json!({
+            "name": "cass_view_batch",
+            "description": "Fetch 1-8 complete canonical windows in input order using one read-only archive open and transaction. Copy all four coordinates per window from search hits. The entire batch shares a 64 KiB UTF-8 body budget, one deadline and at most 128 requested message occurrences (sum of 2*context+1). Overlapping/repeated windows count again. Any missing, mismatched or oversized window fails the whole batch; no partial evidence is returned. Reads only the fixed startup --db, never raw source paths, models or vector assets. The shared archive snapshot does not certify lexical-index freshness.",
             "inputSchema": {
-                "type": "object", "additionalProperties": false,
-                "required": ["source_path", "source_id", "conversation_id", "message_index"],
+                "type": "object", "additionalProperties": false, "required": ["views"],
                 "properties": {
-                    "source_path": identity,
-                    "source_id": identity,
-                    "conversation_id": {"type": "integer", "minimum": 1, "maximum": i64::MAX},
-                    "message_index": {"type": "integer", "minimum": 1, "maximum": (i64::MAX as u64) + 1},
-                    "context": {"type": "integer", "minimum": 0, "maximum": super::canonical::MAX_CONTEXT, "default": 0}
+                    "views": {"type": "array", "minItems": 1, "maxItems": super::canonical::MAX_BATCH_VIEWS, "items": view_schema}
                 }
             },
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}

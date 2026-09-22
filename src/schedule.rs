@@ -43,7 +43,11 @@ use tracing::{info, warn};
 use crate::indexer::background_refresh::background_index_args;
 use crate::indexer::responsiveness;
 
+mod discovery;
+mod execution;
 mod outcomes;
+
+pub use discovery::{SourceScheduleError, due_remote_sources};
 
 pub const DEFAULT_INTERVAL_MINS: u32 = 15;
 pub const DEFAULT_NIGHTLY_HOUR: u8 = 3;
@@ -788,7 +792,8 @@ fn append_run(data_dir: &Path, report: &JobReport) -> std::io::Result<()> {
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(report).map_err(std::io::Error::other)?;
-    writeln!(file, "{line}")
+    writeln!(file, "{line}")?;
+    file.sync_all()
 }
 
 fn now_ms() -> i64 {
@@ -900,27 +905,6 @@ fn skipped_step(name: &str, reason: impl Into<String>) -> StepReport {
     }
 }
 
-/// Remote sources whose `sync_schedule` is due right now (never `manual`).
-pub fn due_remote_sources(data_dir: &Path, now_ms: i64) -> Vec<(String, String)> {
-    use crate::sources::config::SourcesConfig;
-    use crate::sources::sync::{SourceSyncAction, SyncStatus};
-
-    let Ok(config) = SourcesConfig::load() else {
-        return Vec::new();
-    };
-    let status = SyncStatus::load(data_dir).unwrap_or_default();
-    config
-        .remote_sources()
-        .filter_map(|source| {
-            let decision = status.decision_for_source_at(source, now_ms, false);
-            match decision.action {
-                SourceSyncAction::Sync => Some((source.name.clone(), decision.reasons.join("; "))),
-                SourceSyncAction::Skip | SourceSyncAction::Defer => None,
-            }
-        })
-        .collect()
-}
-
 /// Decide whether a scheduled job should run now, and why not.
 pub fn job_gate(job: ScheduleJob) -> Option<String> {
     let pressure = responsiveness::machine_pressure_now();
@@ -942,8 +926,8 @@ pub fn job_gate(job: ScheduleJob) -> Option<String> {
     None
 }
 
-/// Execute one job end-to-end. Never panics; every failure is recorded in the
-/// report and the report is persisted before returning.
+/// Execute one job end-to-end. Admitted runs persist their report, treating
+/// persistence errors as failures. Admission refusals do not clobber an owner.
 pub fn run_job(job: ScheduleJob, cfg: &RunConfig) -> JobReport {
     run_job_with_gate(job, cfg, job_gate(job))
 }
@@ -958,6 +942,12 @@ fn run_job_with_gate(
     cfg: &RunConfig,
     skipped_reason: Option<String>,
 ) -> JobReport {
+    // Hold this distinct scheduler lease through source sync, all child work,
+    // and receipt publication. The child's index lock alone is not enough.
+    let _lease = match execution::acquire(&cfg.data_dir) {
+        Ok(lease) => lease,
+        Err(error) => return error.report(job),
+    };
     let started_ms = now_ms();
     let mut steps = Vec::new();
     let pressure = serde_json::to_value(responsiveness::machine_pressure_now()).ok();
@@ -979,7 +969,42 @@ fn run_job_with_gate(
 
     if skipped_reason.is_none() {
         // 1. Remote syncs that are due.
-        let due = due_remote_sources(&cfg.data_dir, started_ms);
+        let discovery_started = Instant::now();
+        let due = match due_remote_sources(&cfg.data_dir, started_ms) {
+            Ok(due) => due,
+            Err(error) => {
+                steps.push(StepReport {
+                    name: "sources-discovery".to_string(),
+                    argv: Vec::new(),
+                    exit_code: None,
+                    ok: false,
+                    duration_ms: u64::try_from(discovery_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    skipped_reason: None,
+                    result: Some(serde_json::json!({
+                        "status": "failed",
+                        "reason": error.reason_code(),
+                        "dependent_work_started": false,
+                    })),
+                    stderr_tail: Some(error.to_string()),
+                });
+                // No sync, index, or model process may start from an unknown
+                // source plan. Persist the failure, not fabricated freshness.
+                return persist_job_report(
+                    cfg,
+                    JobReport {
+                        job,
+                        started_ms,
+                        finished_ms: now_ms(),
+                        ok: false,
+                        skipped_reason: None,
+                        steps,
+                        pressure,
+                        user_idle,
+                    },
+                );
+            }
+        };
         if due.is_empty() {
             steps.push(skipped_step("sources-sync", "no remote source is due"));
         } else {
@@ -1142,18 +1167,54 @@ fn run_job_with_gate(
         pressure,
         user_idle,
     };
+    persist_job_report(cfg, report)
+}
+
+fn persist_job_report(cfg: &RunConfig, mut report: JobReport) -> JobReport {
     let mut state = load_state(&cfg.data_dir);
-    match job {
+    match report.job {
         ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
         ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
     }
-    if let Err(error) = save_state(&cfg.data_dir, &state) {
-        warn!(error = %error, "failed to persist schedule state");
-    }
+    let state_saved = match save_state(&cfg.data_dir, &state) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(kind = ?error.kind(), "failed to persist schedule state");
+            record_persistence_failure(&mut report, "schedule_state_write_failed");
+            false
+        }
+    };
     if let Err(error) = append_run(&cfg.data_dir, &report) {
-        warn!(error = %error, "failed to append schedule run history");
+        warn!(kind = ?error.kind(), "failed to append schedule run history");
+        record_persistence_failure(&mut report, "schedule_history_write_failed");
+        // Do not leave a successful state receipt after history publication
+        // failed. Retry only this bounded correction, still under the lease.
+        if state_saved {
+            match report.job {
+                ScheduleJob::Incremental => state.last_incremental = Some(report.clone()),
+                ScheduleJob::Nightly => state.last_nightly = Some(report.clone()),
+            }
+            if let Err(error) = save_state(&cfg.data_dir, &state) {
+                warn!(kind = ?error.kind(), "failed to persist corrected schedule state");
+                record_persistence_failure(&mut report, "schedule_state_write_failed");
+            }
+        }
     }
     report
+}
+
+fn record_persistence_failure(report: &mut JobReport, reason: &str) {
+    report.ok = false;
+    report.steps.push(StepReport {
+        name: "schedule-persistence".to_string(),
+        argv: Vec::new(),
+        exit_code: None,
+        ok: false,
+        duration_ms: 0,
+        skipped_reason: None,
+        result: Some(serde_json::json!({"status": "failed", "reason": reason})),
+        stderr_tail: None,
+    });
 }
 
 /// Exit codes that mean "the semantic model / embedder is unavailable"

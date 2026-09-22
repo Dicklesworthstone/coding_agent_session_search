@@ -1,10 +1,12 @@
 //! Explicit logical-archive commands. Kept outside the ordinary search startup
-//! path. Only import's explicit --rebuild-index opts into canonical-only lexical
-//! reconstruction; export, verification and ordinary import never do so.
+//! path. Only explicit import flags opt into canonical-only lexical rebuilding
+//! or the reviewed v20 -> v21 schema migration; export and verification never do so.
 
 mod codec;
 mod export;
 mod import;
+mod migrate;
+mod query;
 mod reimport;
 
 use std::path::PathBuf;
@@ -56,7 +58,42 @@ enum Operation {
     Verify {
         input: PathBuf,
     },
-    /// Restore all canonical rows into a NEW database; never replace an archive.
+    /// Search verified backup message bodies without restoring a DB or index.
+    Search {
+        input: PathBuf,
+        /// Case-sensitive literal substring, not indexed query syntax.
+        #[arg(long)]
+        contains: String,
+        /// Maximum retained matches (1..100); the entire backup is verified.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Restrict matching to this exact positive canonical conversation ID.
+        #[arg(long)]
+        conversation_id: Option<i64>,
+        /// Continue with next_cursor from the same backup and query/filter.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Acknowledge that result excerpts contain private session content.
+        #[arg(long)]
+        include_private: bool,
+    },
+    /// Read complete bounded message bodies directly from a verified backup.
+    View {
+        input: PathBuf,
+        /// Exact canonical message ID from archive search, not a physical line.
+        #[arg(long)]
+        message_id: i64,
+        /// Bind the selected ID to the content_sha256 returned by search/verify.
+        #[arg(long)]
+        content_sha256: String,
+        /// Actual messages on each side (0..20); complete bodies must fit 64 KiB.
+        #[arg(long, short = 'C', default_value_t = 2)]
+        context: usize,
+        /// Acknowledge that complete private session text will be displayed.
+        #[arg(long)]
+        include_private: bool,
+    },
+    /// Restore canonical rows into a NEW database; never replace an archive.
     Import {
         input: PathBuf,
         /// New database file, not a data directory or an existing live archive.
@@ -68,9 +105,14 @@ enum Operation {
         /// Acknowledge that full private session bodies will be restored.
         #[arg(long)]
         include_private: bool,
-        /// Accept an existing destination only after a read-only full-digest match.
+        /// Accept an existing destination only after a read-only full-digest or
+        /// reviewed migration-projection match. This never grants overwrite permission.
         #[arg(long)]
         if_identical: bool,
+        /// Permit only the reviewed storage-schema v20 -> v21 migration. The
+        /// canonical table/column/primary-key descriptors must be identical.
+        #[arg(long)]
+        allow_compatible_schema: bool,
         /// Rebuild lexical search from the restored DB, without scanning providers.
         /// Output must be <existing-data-directory>/agent_search.db, and input
         /// must be outside that directory. The DB is retained if indexing fails.
@@ -82,7 +124,12 @@ enum Operation {
 pub fn run(args: Vec<String>) -> Result<()> {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
-        Err(error) if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
             error.print()?;
             return Ok(());
         }
@@ -92,11 +139,28 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let Root::Archive { command } = cli.command;
     let mut destination_status = None;
     let mut lexical_rebuild = None;
+    let mut schema_migration = None;
     let (operation, header, completion) = match command {
-        Operation::Export { output, archive_id, include_private } => {
-            ensure!(include_private, "full-fidelity export contains private session data; pass --include-private to acknowledge this");
-            let source = cli.db.or_else(|| cli.data_dir.map(|directory| directory.join("agent_search.db")))
-                .ok_or_else(|| anyhow!("export requires an explicit --db or --data-dir (or CASS_DATA_DIR)"))?;
+        Operation::Export {
+            output,
+            archive_id,
+            include_private,
+        } => {
+            ensure!(
+                include_private,
+                "full-fidelity export contains private session data; pass --include-private to acknowledge this"
+            );
+            let source = cli
+                .db
+                .or_else(|| {
+                    cli.data_dir
+                        .map(|directory| directory.join("agent_search.db"))
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "export requires an explicit --db or --data-dir (or CASS_DATA_DIR)"
+                    )
+                })?;
             let (header, completion) = export::export_file(&source, &output, archive_id)?;
             ("export", header, completion)
         }
@@ -104,11 +168,63 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let (header, completion) = export::verify_file(&input)?;
             ("verify", header, completion)
         }
-        Operation::Import { input, output, archive_id, include_private, if_identical, rebuild_index } => {
-            ensure!(include_private, "restoration writes private session data; pass --include-private to acknowledge this");
-            let plan = rebuild_index.then(|| ArchiveIndexPlan::prepare(&output, &input)).transpose()?;
-            let output = plan.as_ref().map_or(output.as_path(), ArchiveIndexPlan::database);
-            let (header, completion, created) = if if_identical {
+        Operation::Search {
+            input,
+            contains,
+            limit,
+            conversation_id,
+            cursor,
+            include_private,
+        } => {
+            ensure!(
+                include_private,
+                "backup search emits private session excerpts; pass --include-private to acknowledge this"
+            );
+            let result =
+                query::search(&input, &contains, limit, conversation_id, cursor.as_deref())?;
+            println!("{result}");
+            return Ok(());
+        }
+        Operation::View {
+            input,
+            message_id,
+            content_sha256,
+            context,
+            include_private,
+        } => {
+            ensure!(
+                include_private,
+                "backup view emits private session text; pass --include-private to acknowledge this"
+            );
+            let result = query::view(&input, message_id, context, &content_sha256)?;
+            println!("{result}");
+            return Ok(());
+        }
+        Operation::Import {
+            input,
+            output,
+            archive_id,
+            include_private,
+            if_identical,
+            allow_compatible_schema,
+            rebuild_index,
+        } => {
+            ensure!(
+                include_private,
+                "restoration writes private session data; pass --include-private to acknowledge this"
+            );
+            let plan = rebuild_index
+                .then(|| ArchiveIndexPlan::prepare(&output, &input))
+                .transpose()?;
+            let output = plan
+                .as_ref()
+                .map_or(output.as_path(), ArchiveIndexPlan::database);
+            let (header, completion, created) = if allow_compatible_schema {
+                let outcome =
+                    migrate::import_compatible(&input, output, &archive_id, if_identical)?;
+                schema_migration = outcome.migration;
+                (outcome.header, outcome.completion, outcome.created)
+            } else if if_identical {
                 import::import_file_with_policy(&input, output, &archive_id, true)?
             } else {
                 let (header, completion) = import::import_file(&input, output, &archive_id)?;
@@ -116,12 +232,19 @@ pub fn run(args: Vec<String>) -> Result<()> {
             };
             destination_status = Some(if created { "created" } else { "unchanged" });
             if let Some(plan) = plan {
-                lexical_rebuild = Some(plan.rebuild().map_err(|error| anyhow!(
-                    "canonical archive was {} and is retained at {}; lexical rebuild failed: {}; retry the same import with --if-identical --rebuild-index",
-                    if created { "created" } else { "verified unchanged" },
-                    plan.database().display(),
-                    error,
-                ))?);
+                let retry_flags = if schema_migration.is_some() {
+                    "--if-identical --allow-compatible-schema --rebuild-index"
+                } else {
+                    "--if-identical --rebuild-index"
+                };
+                lexical_rebuild = Some(plan.rebuild().map_err(|error| {
+                    anyhow!(
+                        "canonical archive was {} and is retained at {}; lexical rebuild failed: {}; retry the same import with {retry_flags}",
+                        if created { "created" } else { "verified unchanged" },
+                        plan.database().display(),
+                        error,
+                    )
+                })?);
             }
             ("import", header, completion)
         }
@@ -141,8 +264,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
     if let Some(status) = destination_status {
         receipt["destination_status"] = serde_json::Value::String(status.to_owned());
     }
+    if let Some(migration) = schema_migration {
+        receipt["schema_migration"] = serde_json::to_value(migration)?;
+    }
     if let Some(rebuild) = lexical_rebuild {
-        receipt["derived_search_assets"] = serde_json::json!("lexical_rebuilt_semantic_not_built");
+        receipt["derived_search_assets"] =
+            serde_json::json!("lexical_rebuilt_semantic_not_built");
         receipt["lexical_rebuild"] = serde_json::to_value(rebuild)?;
     }
     println!("{receipt}");

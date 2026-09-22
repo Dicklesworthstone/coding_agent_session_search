@@ -1,0 +1,82 @@
+name: Identity-bound text query regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/semantic-text-regression.yml
+      - src/search/hash_embedder.rs
+      - src/search/hash_embedder/**
+      - src/search/semantic_reader.rs
+      - src/search/semantic_reader/**
+      - src/search_service/semantic_query/**
+      - src/search_service/semantic_query.rs
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cass-semantic-text-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Record exact source and compiler
+        run: git rev-parse HEAD && rustc --version && cargo --version
+      - name: Real CASS hash identity and retained text retrieval
+        run: |
+          set -o pipefail
+          cargo test --locked --lib search::hash_embedder:: -- --nocapture 2>&1 | tee hash-identity-tests.log
+          grep -Eq 'test result: ok\. 25 passed; 0 failed' hash-identity-tests.log
+          cargo test --locked --lib search::semantic_reader:: -- --nocapture 2>&1 | tee retained-text-tests.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' retained-text-tests.log
+      - name: Strict library lint
+        if: always()
+        run: |
+          set -o pipefail
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee semantic-text-clippy.log
+      - name: Exact committed formatting
+        if: always()
+        run: rustfmt --edition 2024 --check --config skip_children=true src/search/hash_embedder.rs src/search/hash_embedder/identity.rs
+      - name: Preserve formatted source without repository writes
+        if: always()
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/cass-text-formatted"
+          mkdir -p "$root/src/search/hash_embedder"
+          cp src/search/hash_embedder.rs "$root/src/search/hash_embedder.rs"
+          cp src/search/hash_embedder/identity.rs "$root/src/search/hash_embedder/identity.rs"
+          rustfmt --edition 2024 --config skip_children=true "$root/src/search/hash_embedder.rs" "$root/src/search/hash_embedder/identity.rs"
+          git rev-parse HEAD > "$root/source-commit.txt"
+          tar -czf semantic-text-formatted.tar.gz -C "$root" src source-commit.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-text-${{ github.sha }}
+          path: |
+            *-tests.log
+            semantic-text-clippy.log
+            semantic-text-formatted.tar.gz
+          retention-days: 3
+          if-no-files-found: warn

@@ -459,7 +459,7 @@ fn pack_handoff_journey_uses_real_archive_and_preserves_sources() {
     )
     .expect("write scrubbed pack artifact");
 
-    assert_eq!(json["schema_version"], "cass.pack.v1");
+    assert_eq!(json["schema_version"], "cass.pack.v2");
     assert_eq!(json["query"]["text"], "checkout failure");
     assert_eq!(json["limits"]["max_tokens"], 4000);
     assert!(

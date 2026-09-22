@@ -348,6 +348,9 @@ impl Session {
                 "page_window": protocol::MAX_WINDOW,
                 "canonical_context": canonical::MAX_CONTEXT,
                 "canonical_content_bytes": canonical::MAX_CONTENT_BYTES,
+                "canonical_batch_views": canonical::MAX_BATCH_VIEWS,
+                "canonical_batch_messages": canonical::MAX_BATCH_MESSAGES,
+                "canonical_batch_content_bytes": canonical::MAX_CONTENT_BYTES,
                 "request_timeout_ms": self.request_timeout.as_millis(),
                 "timeout_exit_code": deadline::TIMEOUT_EXIT_CODE,
                 "timeout_scope": "first_frame_byte_through_response_flush",
@@ -473,6 +476,70 @@ impl Session {
 
     fn handle(&mut self, request: Request) -> (Reply, bool) {
         match request {
+            Request::ViewBatch { id, views } => {
+                if views.is_empty() || views.len() > canonical::MAX_BATCH_VIEWS {
+                    return (
+                        Reply::failure(
+                            Some(id),
+                            "invalid_request",
+                            "views must contain between 1 and 8 canonical windows",
+                        ),
+                        false,
+                    );
+                }
+                let requests = views
+                    .iter()
+                    .map(protocol::ViewSelection::view)
+                    .collect::<Vec<_>>();
+                if let Err(message) = canonical::validate_batch(&requests) {
+                    return (Reply::failure(Some(id), "invalid_request", message), false);
+                }
+                let Some(db) = &self.archive else {
+                    return (
+                        Reply::failure(
+                            Some(id),
+                            "canonical_access_disabled",
+                            "canonical batch access requires an explicit --db at service startup",
+                        ),
+                        false,
+                    );
+                };
+                // Reuse the held index lease, or retain one temporary lease
+                // through the entire batch's archive open, reads and teardown.
+                let _view_lease = if self.client.is_none() {
+                    match self.acquire_reader_lease() {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            return (
+                                Reply::failure(
+                                    Some(id),
+                                    admission_error_kind(&error, "admission_unavailable"),
+                                    format!("{error:#}"),
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Counters measure archive opens/transactions, not the number
+                // of requested windows. There is only one reader in this batch.
+                self.canonical_read_attempts = self.canonical_read_attempts.saturating_add(1);
+                let reply = match canonical::read_batch(db, &requests) {
+                    Ok(result) => {
+                        self.canonical_reads_completed =
+                            self.canonical_reads_completed.saturating_add(1);
+                        Reply::success(id, result)
+                    }
+                    Err(error) => Reply::failure(
+                        Some(id),
+                        canonical::error_kind(&error),
+                        format!("{error:#}"),
+                    ),
+                };
+                (reply, false)
+            }
             Request::Refine {
                 id,
                 query,
@@ -481,9 +548,9 @@ impl Session {
                 candidate_limit,
                 limit,
             } => {
-                if let Err(message) = refinement::validate(
-                    &query, &lexical_query, &filters, candidate_limit, limit,
-                ) {
+                if let Err(message) =
+                    refinement::validate(&query, &lexical_query, &filters, candidate_limit, limit)
+                {
                     return (Reply::failure(Some(id), "invalid_request", message), false);
                 }
                 if !self.refiner.enabled() {
@@ -496,16 +563,15 @@ impl Session {
                         false,
                     );
                 }
-                let reply = match self.refine(
-                    &query, &lexical_query, filters, candidate_limit, limit,
-                ) {
-                    Ok(result) => Reply::success(id, result),
-                    Err(error) => Reply::failure(
-                        Some(id),
-                        admission_error_kind(&error, "refinement_failed"),
-                        format!("{error:#}"),
-                    ),
-                };
+                let reply =
+                    match self.refine(&query, &lexical_query, filters, candidate_limit, limit) {
+                        Ok(result) => Reply::success(id, result),
+                        Err(error) => Reply::failure(
+                            Some(id),
+                            admission_error_kind(&error, "refinement_failed"),
+                            format!("{error:#}"),
+                        ),
+                    };
                 (reply, false)
             }
             Request::View {

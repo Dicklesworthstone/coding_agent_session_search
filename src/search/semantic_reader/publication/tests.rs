@@ -440,6 +440,119 @@ fn partial_quality_coverage_is_preserved_not_promoted_to_full() -> TestResult {
 }
 
 #[test]
+fn single_artifact_partial_tier_rejects_documents_outside_the_complete_corpus() -> TestResult {
+    for partial_fast in [false, true] {
+        let root = tempfile::tempdir()?;
+        let foreign = [(3, [1.0, 0.0, 0.0, 0.0], true)];
+        let (fast, quality, role) = if partial_fast {
+            (foreign.as_slice(), A, SemanticArtifactRole::FastVector)
+        } else {
+            (A, foreign.as_slice(), SemanticArtifactRole::QualityVector)
+        };
+        let manifest = fixture(root.path(), "foreign-partial", 1, Some(fast), Some(quality));
+        // Every declared count and digest agrees with the real FSVI bytes.
+        // Only the retained full tier can prove that message 3 is foreign.
+        manifest.validate()?;
+        select(root.path(), &manifest, None);
+        let before = snapshot(root.path());
+        assert!(matches!(
+            SelectedSemanticGeneration::open_current(
+                root.path(),
+                &manifest.corpus,
+                SemanticSelectionBudget::default(),
+            ),
+            Err(SemanticSelectionError::ArtifactMismatch {
+                role: rejected_role,
+                field: "partial_live_docset",
+            }) if rejected_role == role
+        ));
+        assert_eq!(snapshot(root.path()), before);
+    }
+    Ok(())
+}
+
+#[test]
+fn single_artifact_partial_membership_ignores_foreign_tombstones_in_either_tier() -> TestResult {
+    for partial_fast in [false, true] {
+        let root = tempfile::tempdir()?;
+        let partial = [A[0], (3, [0.0, 1.0, 0.0, 0.0], false)];
+        let (fast, quality, role, tier) = if partial_fast {
+            (
+                partial.as_slice(),
+                B,
+                SemanticArtifactRole::FastVector,
+                TierKind::Fast,
+            )
+        } else {
+            (
+                B,
+                partial.as_slice(),
+                SemanticArtifactRole::QualityVector,
+                TierKind::Quality,
+            )
+        };
+        let manifest = fixture(root.path(), "valid-partial", 1, Some(fast), Some(quality));
+        select(root.path(), &manifest, None);
+        let before = snapshot(root.path());
+        let reader = open(root.path(), &manifest);
+        let query = if partial_fast {
+            TieredQueryEmbeddings::fast_only(query(role))
+        } else {
+            TieredQueryEmbeddings::quality_only(query(role))
+        };
+        let result = reader.activate(&query)?.search(50, None)?;
+        assert_eq!(result.batch().hits().len(), 1);
+        assert_eq!(first_id(&result), 1);
+        let witness = result.batch().witness(tier, 0).unwrap();
+        assert_eq!(witness.live_count, 1);
+        assert_eq!(witness.tombstone_count, 1);
+        assert_eq!(snapshot(root.path()), before);
+    }
+    Ok(())
+}
+
+#[test]
+fn single_artifact_foreign_partial_refresh_preserves_the_retained_publication() -> TestResult {
+    for partial_fast in [false, true] {
+        let root = tempfile::tempdir()?;
+        let initial = fixture(root.path(), "initial-complete", 1, Some(A), Some(B));
+        let pointer = select(root.path(), &initial, None);
+        let mut reader = open(root.path(), &initial);
+        let query = queries();
+        let retained = reader.activate(&query)?.search(1, None)?;
+        let foreign = [(3, [1.0, 0.0, 0.0, 0.0], true)];
+        let (fast, quality) = if partial_fast {
+            (foreign.as_slice(), B)
+        } else {
+            (A, foreign.as_slice())
+        };
+        let successor = fixture(
+            root.path(),
+            "invalid-successor",
+            2,
+            Some(fast),
+            Some(quality),
+        );
+        assert_eq!(successor.corpus, initial.corpus);
+        select(root.path(), &successor, Some(&pointer));
+        let before = snapshot(root.path());
+        assert!(matches!(
+            reader.refresh_current(&initial.corpus, SemanticSelectionBudget::default()),
+            Err(SemanticSelectionError::ArtifactMismatch {
+                field: "partial_live_docset",
+                ..
+            })
+        ));
+        assert_eq!(reader.selection().pointer(), &pointer);
+        assert_eq!(retained.selection().pointer(), &pointer);
+        assert_eq!(first_id(&retained), 1);
+        assert_eq!(first_id(&reader.activate(&query)?.search(1, None)?), 1);
+        assert_eq!(snapshot(root.path()), before);
+    }
+    Ok(())
+}
+
+#[test]
 fn source_identity_and_declared_budget_are_mandatory_admission_gates() -> TestResult {
     let root = tempfile::tempdir()?;
     let m = fixture(root.path(), "gen-budget", 1, Some(A), None);
@@ -1306,3 +1419,5 @@ fn corrupt_graph_fails_strict_audit_but_preserves_fresh_exact_and_retained_ann()
 mod sharded;
 
 mod admission;
+
+mod text;

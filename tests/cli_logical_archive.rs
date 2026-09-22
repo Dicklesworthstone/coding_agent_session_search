@@ -461,10 +461,11 @@ fn indexed_import_completes_the_source_less_search_to_canonical_evidence_journey
         assert_eq!(hit["source_path"], missing_source.to_str().unwrap());
         assert!(coordinates.insert((source_id, conversation, ordinal)));
         let viewed = receipt(command(root.path())
+            .arg("--db").arg(&target)
             .args(["view", missing_source.to_str().unwrap(), "--source", source_id,
                 "--conversation-id", &conversation.to_string(), "--message-index", &ordinal.to_string(),
-                "-C", "0", "--json", "--data-dir"])
-            .arg(&data).output().unwrap());
+                "-C", "0", "--json"])
+            .output().unwrap());
         assert_eq!(viewed["lines"][0]["source_id"], source_id);
         assert_eq!(viewed["lines"][0]["conversation_id"], conversation);
         assert_eq!(viewed["lines"][0]["message_index"], ordinal);
@@ -553,4 +554,250 @@ fn indexed_import_rejects_bad_layouts_and_invalid_streams_before_any_search_buil
     assert!(!data.join("index").exists());
     assert!(!data.join("index-run.lock").exists());
     assert_eq!(fs::read(&input).unwrap(), bytes);
+}
+
+fn index_image(data: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let index = coding_agent_search::search::tantivy::expected_index_dir(data);
+    let mut image = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(&index).follow_links(false) {
+        let entry = entry.unwrap();
+        assert!(!entry.file_type().is_symlink(), "unexpected index link");
+        if entry.file_type().is_file() {
+            image.insert(
+                entry.path().strip_prefix(&index).unwrap().to_path_buf(),
+                fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    assert!(!image.is_empty(), "the index snapshot must not be vacuous");
+    image
+}
+
+#[test]
+fn conflicting_indexed_import_preserves_the_previous_searchable_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let data = root.path().join("preserved-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    receipt(import_with_lexical_rebuild(root.path(), &input, &target, false));
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array().unwrap().len(),
+        4
+    );
+
+    // Valid, complete input with the same caller-assigned archive ID but
+    // different canonical contents must not acquire rebuild authority.
+    let different = root.path().join("different.db");
+    drop(SqliteStorage::open(&different).unwrap());
+    let conflict = root.path().join("different.jsonl");
+    let changed = export(root.path(), &different, &conflict);
+    assert_ne!(changed["content_sha256"], exported["content_sha256"]);
+    let db_before = fs::read(&target).unwrap();
+    let index_before = index_image(&data);
+    let input_before = fs::read(&conflict).unwrap();
+    for identical in [false, true] {
+        let failed = import_with_lexical_rebuild(root.path(), &conflict, &target, identical);
+        assert!(!failed.status.success());
+        assert!(failed.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&failed.stderr).is_ok());
+        assert_eq!(fs::read(&target).unwrap(), db_before);
+        assert_eq!(index_image(&data), index_before);
+        assert_eq!(fs::read(&conflict).unwrap(), input_before);
+    }
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array().unwrap().len(),
+        4
+    );
+}
+
+#[test]
+fn indexed_restore_ignores_discoverable_local_provider_histories() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    // A real provider-shaped session in the isolated HOME is deliberately NOT
+    // part of the exported canonical archive. Recovery must not mix it in.
+    let project = root.path().join(".claude/projects/-test-local-history");
+    fs::create_dir_all(&project).unwrap();
+    let history = project.join("local-sentinel.jsonl");
+    let record = serde_json::json!({
+        "parentUuid": null, "cwd": "/test/local-history",
+        "sessionId": "local-sentinel", "version": "2.0.37",
+        "gitBranch": "main", "type": "user", "uuid": "local-message",
+        "timestamp": "2026-01-20T09:00:00.000Z",
+        "message": {"role": "user", "content": "LOCALHISTORYMUSTSTAYOUT unrelated local session"}
+    });
+    let history_bytes = format!("{record}\n").into_bytes();
+    fs::write(&history, &history_bytes).unwrap();
+    let data = root.path().join("isolated-recovered");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    let result = receipt(import_with_lexical_rebuild(root.path(), &input, &target, false));
+    assert_eq!(result["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(
+        search_recovered(root.path(), &data, "LOCALHISTORYMUSTSTAYOUT")["hits"]
+            .as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_bytes);
+    assert_eq!(
+        export(root.path(), &target, &root.path().join("after-local-sentinel.jsonl"))["content_sha256"],
+        exported["content_sha256"]
+    );
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn backup_search_finds_verified_evidence_without_a_database_or_provider_files() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, absent_source) = portable_search_fixture(root.path());
+    let before = fs::read(&input).unwrap();
+    let entries = fs::read_dir(root.path()).unwrap().count();
+    let output = receipt(command(root.path())
+        .args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE", "--limit", "3", "--include-private"])
+        .output().unwrap());
+    assert_eq!(output["content_sha256"], exported["content_sha256"]);
+    assert_eq!(output["matches"], 4);
+    assert_eq!(output["has_more"], true);
+    assert_eq!(output["database_opened"], false);
+    assert_eq!(output["provider_files_opened"], false);
+    assert_eq!(output["match_mode"], "literal_case_sensitive");
+    let hits = output["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3);
+    for hit in hits {
+        assert_eq!(hit["source_path"], absent_source.to_str().unwrap());
+        let source = hit["source_id"].as_str().unwrap();
+        let idx = hit["message_index"].as_u64().unwrap() - 1;
+        assert!(matches!(source, "remote-a" | "remote-b"));
+        assert!(matches!(idx, 0 | 7));
+        assert_eq!(hit["snippet"], format!("PORTABLENEEDLE complete recovered evidence {source} at {idx} δ"));
+    }
+    let scoped = receipt(command(root.path())
+        .args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE", "--include-private", "--conversation-id"])
+        .arg(hits[0]["conversation_id"].as_i64().unwrap().to_string())
+        .output().unwrap());
+    assert_eq!(scoped["matches"], 2);
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), entries);
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!absent_source.exists());
+}
+
+#[test]
+fn backup_search_withholds_all_results_until_complete_validation_and_private_consent() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, _, _) = portable_search_fixture(root.path());
+    let denied = command(root.path()).args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE"]).output().unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--include-private"));
+    let truncated = root.path().join("incomplete-search.jsonl");
+    let bytes = fs::read(&input).unwrap();
+    fs::write(&truncated, &bytes[..bytes.len() - 1]).unwrap();
+    let denied = command(root.path()).args(["archive", "search"]).arg(&truncated)
+        .args(["--contains", "PORTABLENEEDLE", "--include-private", "--limit", "1"])
+        .output().unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(serde_json::from_slice::<Value>(&denied.stderr).is_ok());
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn backup_search_to_complete_view_preserves_snapshot_source_and_sparse_context() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, absent_source) = portable_search_fixture(root.path());
+    let before = fs::read(&input).unwrap();
+    let entries = fs::read_dir(root.path()).unwrap().count();
+    let searched = receipt(command(root.path())
+        .args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE", "--include-private"])
+        .output().unwrap());
+    let digest = searched["content_sha256"].as_str().unwrap();
+    for hit in searched["hits"].as_array().unwrap() {
+        let viewed = receipt(command(root.path())
+            .args(["archive", "view"]).arg(&input)
+            .args(["--message-id", &hit["message_id"].as_i64().unwrap().to_string(),
+                "--content-sha256", digest, "--context", "1", "--include-private"])
+            .output().unwrap());
+        assert_eq!(viewed["content_sha256"], exported["content_sha256"]);
+        assert_eq!(viewed["source_id"], hit["source_id"]);
+        assert_eq!(viewed["conversation_id"], hit["conversation_id"]);
+        assert_eq!(viewed["source_path"], absent_source.to_str().unwrap());
+        assert_eq!(viewed["preview_only"], false);
+        assert_eq!(viewed["database_opened"], false);
+        assert_eq!(viewed["provider_files_opened"], false);
+        let messages = viewed["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["message_index"], 1);
+        assert_eq!(messages[1]["message_index"], 8);
+        let target = messages.iter().find(|message| message["is_target"] == true).unwrap();
+        assert_eq!(target["message_id"], hit["message_id"]);
+        assert_eq!(target["content"], hit["snippet"]);
+    }
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), entries);
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!absent_source.exists());
+}
+
+#[test]
+fn backup_view_refuses_wrong_snapshots_missing_ids_and_private_output_without_consent() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let digest = exported["content_sha256"].as_str().unwrap();
+    for (id, hash, private) in [(1, "0".repeat(64), true), (i64::MAX, digest.to_owned(), true), (1, digest.to_owned(), false)] {
+        let mut cmd = command(root.path());
+        cmd.args(["archive", "view"]).arg(&input)
+            .args(["--message-id", &id.to_string(), "--content-sha256", &hash]);
+        if private { cmd.arg("--include-private"); }
+        let result = cmd.output().unwrap();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&result.stderr).is_ok());
+    }
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn backup_cursor_pages_all_matches_and_rejects_reuse_with_different_criteria() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let mut cursor: Option<String> = None;
+    let mut ids = std::collections::BTreeSet::new();
+    for page in 0..4 {
+        let mut cmd = command(root.path());
+        cmd.args(["archive", "search"]).arg(&input)
+            .args(["--contains", "PORTABLENEEDLE", "--include-private", "--limit", "1"]);
+        if let Some(cursor) = &cursor { cmd.args(["--cursor", cursor]); }
+        let result = receipt(cmd.output().unwrap());
+        assert_eq!(result["content_sha256"], exported["content_sha256"]);
+        assert_eq!(result["matches"], 4);
+        assert_eq!(result["matches_after_cursor"], 4 - page);
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(ids.insert(hits[0]["message_id"].as_i64().unwrap()));
+        cursor = result["next_cursor"].as_str().map(str::to_owned);
+        assert_eq!(cursor.is_some(), page < 3);
+        if let Some(cursor) = &cursor {
+            let refused = command(root.path()).args(["archive", "search"]).arg(&input)
+                .args(["--contains", "different query", "--include-private", "--cursor", cursor])
+                .output().unwrap();
+            assert!(!refused.status.success());
+            assert!(refused.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("different query"));
+        }
+    }
+    assert_eq!(ids.len(), 4);
+    assert!(!root.path().join("unused-default").exists());
 }

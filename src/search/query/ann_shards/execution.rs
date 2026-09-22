@@ -177,7 +177,8 @@ impl SemanticAnnShardSet {
         Ok((exact, exact_retry, stats))
     }
 
-    /// Search the admitted main graphs plus their bounded, current WAL overlays.
+    /// Test the native leg alone; production uses `search_with_exact_fallback`
+    /// so underfilled or failed native retrieval cannot bypass cohort recovery.
     ///
     /// Statistics continue to describe native calls only. Their recall estimate
     /// is a backend heuristic, not a measured guarantee for the fused page.

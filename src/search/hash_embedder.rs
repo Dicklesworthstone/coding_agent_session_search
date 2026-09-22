@@ -34,12 +34,17 @@
 //! assert_eq!(embedding.len(), 384);
 //! ```
 
+use std::sync::OnceLock;
+
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
+use frankensearch::core::EmbeddingIdentityBundleV1;
+
+mod identity;
 use frankensearch::{
     HashAlgorithm as FsHashAlgorithm, HashEmbedder as FsHashEmbedder, ModelCategory, ModelTier,
 };
 
-/// Default embedding dimension (matches MiniLM for compatibility).
+/// Default control dimension. Equal MiniLM width does not imply a shared space.
 pub const DEFAULT_DIMENSION: usize = 384;
 
 /// Minimum token length to include in embedding.
@@ -55,6 +60,7 @@ pub struct HashEmbedder {
     dimension: usize,
     id: String,
     delegate: FsHashEmbedder,
+    identity: OnceLock<EmbeddingIdentityBundleV1>,
 }
 
 impl HashEmbedder {
@@ -74,6 +80,7 @@ impl HashEmbedder {
             dimension,
             id: format!("fnv1a-{dimension}"),
             delegate: FsHashEmbedder::new(dimension, FsHashAlgorithm::FnvModular),
+            identity: OnceLock::new(),
         }
     }
 
@@ -153,6 +160,10 @@ impl Embedder for HashEmbedder {
 
     fn embed_batch_sync(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed_sync(t)).collect()
+    }
+
+    fn identity(&self) -> EmbedderResult<&EmbeddingIdentityBundleV1> {
+        self.bound_identity()
     }
 
     fn dimension(&self) -> usize {

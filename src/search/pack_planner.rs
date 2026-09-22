@@ -225,6 +225,8 @@ pub struct PackCandidate {
     pub line_start: Option<usize>,
     pub line_end: Option<usize>,
     pub conversation_id: Option<i64>,
+    /// One-based canonical `messages.idx + 1`, as accepted by --message-index.
+    /// Physical source-file coordinates belong only in line_start/line_end.
     pub message_index: Option<usize>,
     pub citation_verified: bool,
     pub content_hash: String,
@@ -253,7 +255,7 @@ impl PackCandidate {
     ) -> Self {
         // Search navigation uses normalized message ordinals. Physical source
         // lines are assigned only after reading and matching the source record.
-        let message_index = hit.line_number.and_then(|line| line.checked_sub(1));
+        let message_index = hit.line_number.filter(|&line| line != 0);
         let source_id = if hit.source_id.trim().is_empty() {
             "local".to_string()
         } else {
@@ -265,14 +267,8 @@ impl PackCandidate {
             hit.origin_kind.trim().to_string()
         };
         let content_hash = format!("{:016x}", hit.content_hash);
-        let candidate_id = format!(
-            "{}:{}:{}",
-            source_id,
-            hit.source_path,
-            hit.line_number.unwrap_or_default()
-        );
-        Self {
-            candidate_id,
+        let mut candidate = Self {
+            candidate_id: String::new(),
             source_path: hit.source_path.clone(),
             source_id,
             origin_kind,
@@ -305,11 +301,70 @@ impl PackCandidate {
             query_phrase_count,
             source_readiness: PackSourceReadiness::Healthy,
             source_explicitly_requested: false,
+        };
+        candidate.candidate_id = evidence_id(&candidate);
+        candidate
+    }
+
+    fn session_key(&self) -> PackSessionKey {
+        PackSessionKey {
+            source_id: self.source_id.clone(),
+            source_path: self.source_path.clone(),
+            agent: self.agent.clone(),
+            conversation_id: self.conversation_id,
         }
     }
 
-    fn session_key(&self) -> (&str, &str) {
-        (&self.source_id, &self.source_path)
+    fn verified_line_range(&self) -> Option<(usize, usize)> {
+        if !self.citation_verified {
+            return None;
+        }
+        let start = self.line_start?;
+        let end = self.line_end.unwrap_or(start);
+        (start > 0 && end >= start).then_some((start, end))
+    }
+}
+
+/// Keep archive identity separate from display redaction. A provider database
+/// can hold multiple conversations at one path; unknown conversation IDs must
+/// not erase the provider identity we do have.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PackSessionKey {
+    source_id: String,
+    source_path: String,
+    agent: String,
+    conversation_id: Option<i64>,
+}
+
+/// Physical-file coordinates are not scoped by archive conversation/provider.
+/// Two canonical sessions can cite the same verified bytes in one local file;
+/// equal paths on different sources, however, are different files.
+#[derive(Debug)]
+struct VerifiedPackFileSpan {
+    source_id: String,
+    source_path: String,
+    start: usize,
+    end: usize,
+}
+
+impl VerifiedPackFileSpan {
+    fn from_candidate(candidate: &PackCandidate) -> Option<Self> {
+        let (start, end) = candidate.verified_line_range()?;
+        Some(Self {
+            source_id: candidate.source_id.clone(),
+            source_path: candidate.source_path.clone(),
+            start,
+            end,
+        })
+    }
+
+    fn overlaps(&self, candidate: &PackCandidate) -> bool {
+        candidate.verified_line_range().is_some_and(|(start, end)| {
+            self.source_id == candidate.source_id
+                && self.source_path == candidate.source_path
+                && self.start <= end
+                && start <= self.end
+        })
     }
 }
 
@@ -725,6 +780,8 @@ struct RenderedEvidence {
     redactions: Vec<RenderedRedaction>,
     #[serde(skip)]
     source_readiness: PackSourceReadiness,
+    #[serde(skip)]
+    session_key: PackSessionKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -739,6 +796,7 @@ struct RenderedCitation {
     line_start: Option<usize>,
     line_end: Option<usize>,
     message_index: Option<usize>,
+    message_index_base: u8,
     conversation_id: Option<i64>,
     content_hash: String,
     span_hash: String,
@@ -799,7 +857,7 @@ struct RenderedPrivacy {
 #[derive(Debug, Default)]
 struct SourceAccumulator {
     origin_kind: String,
-    sessions: BTreeSet<String>,
+    sessions: BTreeSet<PackSessionKey>,
     evidence_count: usize,
     newest_evidence_at_ms: Option<i64>,
     healthy: bool,
@@ -880,16 +938,27 @@ struct ScoredCandidate {
 #[derive(Debug, Default)]
 struct SelectedState {
     source_ids: HashSet<String>,
-    sessions: HashSet<(String, String)>,
+    sessions: HashSet<PackSessionKey>,
     span_hashes: HashSet<String>,
     content_hashes: HashSet<String>,
-    ranges: Vec<(String, Option<usize>, Option<usize>)>,
+    verified_ranges: Vec<VerifiedPackFileSpan>,
 }
 
 pub fn plan_answer_pack(
-    request: PackPlanRequest,
+    mut request: PackPlanRequest,
 ) -> Result<PlannedAnswerPack, PackPlannerLimitError> {
     request.limits.validate()?;
+
+    // Caller-supplied ordinals or malformed spans are not verified file lines.
+    // Clear them before scoring, deduplication, IDs and rendering can mistake
+    // them for physical evidence. Preserve canonical message identity/content.
+    for candidate in &mut request.candidates {
+        if candidate.verified_line_range().is_none() {
+            candidate.citation_verified = false;
+            candidate.line_start = None;
+            candidate.line_end = None;
+        }
+    }
 
     let candidate_count = request.candidates.len();
     let diagnostics = PackPlannerDiagnostics {
@@ -1045,9 +1114,7 @@ pub fn plan_answer_pack(
         }
 
         let session_key = candidate.session_key();
-        if !selected_state
-            .sessions
-            .contains(&(session_key.0.to_string(), session_key.1.to_string()))
+        if !selected_state.sessions.contains(&session_key)
             && selected_state.sessions.len() >= request.limits.max_sessions
         {
             omitted.push(omitted_candidate(
@@ -1062,20 +1129,16 @@ pub fn plan_answer_pack(
         selected_state
             .source_ids
             .insert(candidate.source_id.clone());
-        selected_state
-            .sessions
-            .insert((candidate.source_id.clone(), candidate.source_path.clone()));
+        selected_state.sessions.insert(session_key);
         selected_state
             .span_hashes
             .insert(candidate.span_hash.clone());
         selected_state
             .content_hashes
             .insert(candidate.content_hash.clone());
-        selected_state.ranges.push((
-            candidate.source_path.clone(),
-            candidate.line_start,
-            candidate.line_end,
-        ));
+        if let Some(span) = VerifiedPackFileSpan::from_candidate(candidate) {
+            selected_state.verified_ranges.push(span);
+        }
 
         selected.push(PlannedPackEvidence {
             id: evidence_id(candidate),
@@ -1269,13 +1332,9 @@ fn hard_omission_reason(
             .content_hashes
             .contains(&candidate.content_hash)
         || selected_state
-            .ranges
+            .verified_ranges
             .iter()
-            .any(|(source_path, start, end)| {
-                // ubs:ignore — compares public citation paths, never secret material.
-                source_path == &candidate.source_path
-                    && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-            })
+            .any(|span| span.overlaps(candidate))
     {
         return Some(PackOmittedReason::DuplicateContent);
     }
@@ -1291,20 +1350,6 @@ fn is_stale_under_strict_policy(candidate: &PackCandidate, request: &PackPlanReq
     };
     let max_age_ms = request.freshness_window_seconds.saturating_mul(1_000);
     request.now_ms.saturating_sub(created_at_ms) > max_age_ms
-}
-
-fn line_ranges_overlap(
-    left_start: Option<usize>,
-    left_end: Option<usize>,
-    right_start: Option<usize>,
-    right_end: Option<usize>,
-) -> bool {
-    let (Some(left_start), Some(right_start)) = (left_start, right_start) else {
-        return false;
-    };
-    let left_end = left_end.unwrap_or(left_start);
-    let right_end = right_end.unwrap_or(right_start);
-    left_start <= right_end && right_start <= left_end
 }
 
 fn score_candidate(
@@ -1445,7 +1490,7 @@ fn freshness_score(candidate: &PackCandidate, request: &PackPlanRequest) -> f64 
 }
 
 fn source_diversity_score(candidate: &PackCandidate, selected_state: &SelectedState) -> f64 {
-    let session_key = (candidate.source_id.clone(), candidate.source_path.clone());
+    let session_key = candidate.session_key();
     if selected_state.sessions.contains(&session_key) {
         0.0
     } else if selected_state.source_ids.contains(&candidate.source_id) {
@@ -1483,7 +1528,7 @@ fn citation_quality_score(candidate: &PackCandidate) -> f64 {
     let has_path = !candidate.source_path.trim().is_empty();
     let has_source = !candidate.source_id.trim().is_empty();
     let has_agent = !candidate.agent.trim().is_empty();
-    let has_line_span = candidate.line_start.is_some() && candidate.line_end.is_some();
+    let has_line_span = candidate.verified_line_range().is_some();
     if has_path && has_source && has_agent && has_line_span {
         1.0
     } else if has_path && has_source && has_agent {
@@ -1506,13 +1551,9 @@ fn duplicate_penalty(candidate: &PackCandidate, selected_state: &SelectedState) 
         return 0.5;
     }
     if selected_state
-        .ranges
+        .verified_ranges
         .iter()
-        .any(|(source_path, start, end)| {
-            // ubs:ignore — compares public citation paths, never secret material.
-            source_path == &candidate.source_path
-                && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
-        })
+        .any(|span| span.overlaps(candidate))
     {
         return 0.25;
     }
@@ -1560,6 +1601,24 @@ fn candidate_ordering(
         })
         .then_with(|| left_candidate.source_id.cmp(&right_candidate.source_id))
         .then_with(|| left_candidate.source_path.cmp(&right_candidate.source_path))
+        .then_with(|| {
+            match (
+                left_candidate.conversation_id,
+                right_candidate.conversation_id,
+            ) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        })
+        .then_with(|| left_candidate.agent.cmp(&right_candidate.agent))
+        .then_with(|| {
+            compare_optional_usize_low_first(
+                left_candidate.message_index,
+                right_candidate.message_index,
+            )
+        })
         .then_with(|| {
             compare_optional_usize_low_first(left_candidate.line_start, right_candidate.line_start)
         })
@@ -1621,17 +1680,47 @@ fn estimated_tokens(text: &str) -> usize {
 }
 
 fn evidence_id(candidate: &PackCandidate) -> String {
-    let mut hasher_input = String::new();
-    hasher_input.push_str(&candidate.source_id);
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.source_path);
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.line_start.unwrap_or_default().to_string());
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.line_end.unwrap_or_default().to_string());
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.span_hash);
-    let hash = blake3::hash(hasher_input.as_bytes());
+    // Pathnames alone are not session identities: provider databases contain
+    // many conversations at one path. Length-prefix strings so embedded
+    // newlines/colons cannot move data into a neighboring identity component.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass.pack.evidence.v2\0");
+    for text in [
+        &candidate.source_id,
+        &candidate.source_path,
+        &candidate.agent,
+        &candidate.content_hash,
+    ] {
+        hasher.update(&(text.len() as u64).to_le_bytes());
+        hasher.update(text.as_bytes());
+    }
+    match candidate.conversation_id {
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(&id.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    for coordinate in [
+        candidate.message_index,
+        candidate.line_start,
+        candidate.line_end,
+    ] {
+        match coordinate {
+            Some(number) => {
+                hasher.update(&[1]);
+                hasher.update(&(number as u64).to_le_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    hasher.update(&(candidate.span_hash.len() as u64).to_le_bytes());
+    hasher.update(candidate.span_hash.as_bytes());
+    let hash = hasher.finalize();
     encoded_evidence_id(hash.as_bytes())
 }
 
@@ -1819,7 +1908,7 @@ fn rendered_answer_pack_with_correlation(
     }
 
     RenderedAnswerPack {
-        schema_version: "cass.pack.v1",
+        schema_version: "cass.pack.v2",
         query: RenderedQuery {
             text: query_text,
             normalized: normalized_query,
@@ -2284,6 +2373,7 @@ fn rendered_evidence(
         line_start: candidate.line_start,
         line_end: candidate.line_end,
         message_index: candidate.message_index,
+        message_index_base: 1,
         conversation_id: candidate.conversation_id,
         content_hash: candidate.content_hash.clone(),
         span_hash: candidate.span_hash.clone(),
@@ -2314,6 +2404,7 @@ fn rendered_evidence(
             .collect(),
         redactions,
         source_readiness: candidate.source_readiness,
+        session_key: candidate.session_key(),
     }
 }
 
@@ -2398,7 +2489,7 @@ fn rendered_source_summary(evidence: &[RenderedEvidence]) -> Vec<RenderedSourceS
             healthy: true,
             ..SourceAccumulator::default()
         });
-        entry.sessions.insert(item.citation.source_path.clone());
+        entry.sessions.insert(item.session_key.clone());
         entry.evidence_count += 1;
         entry.newest_evidence_at_ms =
             newer_timestamp(entry.newest_evidence_at_ms, item.citation.created_at_ms);
@@ -2577,6 +2668,7 @@ fn render_answer_pack_jsonl(
     lines.push(json_line(
         serde_json::json!({
             "_meta": &envelope.meta,
+            "schema_version": envelope.schema_version,
             "budget": &envelope.budget,
         }),
         request,
@@ -2657,6 +2749,12 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
                     out.push('-');
                     out.push_str(&line_end.to_string());
                 }
+            }
+            if let Some(conversation_id) = item.citation.conversation_id {
+                out.push_str(&format!(" conversation_id={conversation_id}"));
+            }
+            if let Some(message_index) = item.citation.message_index {
+                out.push_str(&format!(" message_index={message_index} (1-based)"));
             }
             out.push_str("\n\n");
             // Preserve the complete prepared excerpt, including blank lines.
@@ -3081,7 +3179,7 @@ mod tests {
         let candidate = PackCandidate::from_search_hit(&hit, 1, 0);
 
         assert_eq!(candidate.match_type, "implicit_wildcard");
-        assert_eq!(candidate.message_index, Some(11));
+        assert_eq!(candidate.message_index, Some(12));
         assert_eq!(candidate.line_start, None);
         assert_eq!(candidate.line_end, None);
         assert!(!candidate.citation_verified);
@@ -3104,7 +3202,7 @@ mod tests {
         let mut item = candidate("verify", "local", path.to_str().unwrap(), 10.0);
         item.created_at_ms = None;
         item.excerpt = "verifiedneedle".to_string();
-        item.message_index = Some(0);
+        item.message_index = Some(1);
         let base = plan_answer_pack(request(vec![item])).unwrap();
 
         for (contents, expected_line) in [
@@ -3126,7 +3224,7 @@ mod tests {
             assert_eq!(citation.line_start, expected_line);
             assert_eq!(citation.line_end, expected_line);
             assert_eq!(citation.citation_verified, expected_line.is_some());
-            assert_eq!(citation.message_index, Some(0));
+            assert_eq!(citation.message_index, Some(1));
             if expected_line.is_some() {
                 assert_eq!(
                     citation.span_hash,
@@ -3425,7 +3523,7 @@ mod tests {
 
         assert!(!rendered.contains('\n'));
         assert_eq!(value, render_answer_pack_value(&plan, &req).unwrap());
-        assert_eq!(value["schema_version"], "cass.pack.v1");
+        assert_eq!(value["schema_version"], "cass.pack.v2");
         assert_eq!(value["_meta"]["format"], "compact");
         assert_eq!(value["_meta"]["partial"], false);
         assert_eq!(
@@ -3468,6 +3566,7 @@ mod tests {
         assert!(lines[2].starts_with("{\"omitted\":"));
         assert!(lines[3].starts_with("{\"privacy\":"));
         let meta: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(meta["schema_version"], "cass.pack.v2");
         let omitted: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(
             meta["_meta"]["warnings"],
@@ -4368,7 +4467,7 @@ mod tests {
         span_duplicate.span_hash = span_source.span_hash.clone();
 
         let range_source = candidate("range-source", "local", "/s/range.jsonl", 8.0);
-        let mut range_duplicate = candidate("range-dup", "remote", "/s/range.jsonl", 7.0);
+        let mut range_duplicate = candidate("range-dup", "local", "/s/range.jsonl", 7.0);
         range_duplicate.line_start = Some(11);
         range_duplicate.line_end = Some(14);
 

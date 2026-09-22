@@ -123,8 +123,8 @@ use crate::ui::components::pills::Pill;
 use crate::ui::components::toast::ToastManager;
 use crate::ui::data::{
     BudgetHealthContract, CockpitState, ConversationView, DiffStrategyContract, InputMode,
-    ResizeRegimeContract, conversation_view_matches_hit, format_time_short,
-    load_conversation_for_hit, search_hit_has_identity_hint,
+    ResizeRegimeContract, canonical_message_number, conversation_view_matches_hit,
+    format_time_short, load_conversation_for_hit, search_hit_has_identity_hint,
     search_hit_has_secondary_identity_hint,
 };
 use crate::ui::shortcuts;
@@ -6143,24 +6143,9 @@ impl CassApp {
     }
 
     fn cached_detail_for_render(&self, hit: &SearchHit) -> Option<&ConversationView> {
-        if let Some(cv) = self.cached_detail_for_hit(hit) {
-            return Some(cv);
-        }
-
-        self.cached_detail.as_ref().and_then(|(cached_path, cv)| {
-            if cached_path != &hit.source_path {
-                return None;
-            }
-
-            let cached_source_id = trimmed_non_empty(cv.convo.source_id.as_str())
-                .or_else(|| trimmed_option_non_empty(cv.convo.origin_host.as_deref()))
-                .unwrap_or(crate::sources::provenance::LOCAL_SOURCE_ID);
-
-            // Rendering should trust the already-loaded session view for the same
-            // path/source, even when the search hit payload is truncated or normalized
-            // enough to fail the stricter reload-time identity matcher.
-            (cached_source_id == hit_source_id_display(hit)).then_some(cv)
-        })
+        // A same-path cached view can belong to another conversation. Rendering
+        // must enforce the same anchor as loading, including during async reload.
+        self.cached_detail_for_hit(hit)
     }
 
     fn collect_session_hit_lines(&self, selected_hit: &SearchHit) -> Vec<usize> {
@@ -6194,6 +6179,8 @@ impl CassApp {
                     conversation_view_matches_hit(cv, hit)
                 } else if let Some(selected_conversation_id) = selected_hit.conversation_id {
                     hit.conversation_id == Some(selected_conversation_id)
+                        && hit.source_path == selected_hit.source_path
+                        && hit_source_id_display(hit) == hit_source_id_display(selected_hit)
                 } else if selected_has_identity_hint
                     && (!selected_has_secondary_identity_hint
                         || !selected_has_message_identity_hint)
@@ -6222,17 +6209,12 @@ impl CassApp {
                 term_lowers.retain(|t| !t.is_empty());
 
                 let mut convo_lines: Vec<usize> = Vec::new();
-                for (pos, msg) in cv.messages.iter().enumerate() {
+                for msg in &cv.messages {
                     let content_lower = msg.content.to_ascii_lowercase();
-                    if term_lowers.iter().any(|t| content_lower.contains(t)) {
-                        let line = if msg.idx >= 0 {
-                            (msg.idx as usize) + 1
-                        } else {
-                            pos + 1
-                        };
-                        if line > 0 {
-                            convo_lines.push(line);
-                        }
+                    if term_lowers.iter().any(|t| content_lower.contains(t))
+                        && let Some(line) = canonical_message_number(msg.idx)
+                    {
+                        convo_lines.push(line);
                     }
                 }
 
@@ -6252,6 +6234,14 @@ impl CassApp {
             && line > 0
         {
             lines.push(line);
+        }
+        if let Some(cv) = cached_detail {
+            let available: HashSet<usize> = cv
+                .messages
+                .iter()
+                .filter_map(|message| canonical_message_number(message.idx))
+                .collect();
+            lines.retain(|number| available.contains(number));
         }
         lines.sort_unstable();
         lines.dedup();
@@ -9759,14 +9749,11 @@ impl CassApp {
             for (msg_idx, msg) in cv.messages.iter().enumerate() {
                 // Record line offset for message-level navigation
                 msg_offsets.push((lines.len() as u32, msg.role.clone()));
-                let msg_line_from_idx = (msg.idx >= 0).then_some((msg.idx as usize) + 1);
-                let msg_line_from_pos = msg_idx + 1;
-                let msg_is_session_hit = msg_line_from_idx
-                    .is_some_and(|line| session_hit_lookup.contains(&line))
-                    || session_hit_lookup.contains(&msg_line_from_pos);
-                let msg_hit_rank = msg_line_from_idx
-                    .and_then(|line| session_hit_rank.get(&line).copied())
-                    .or_else(|| session_hit_rank.get(&msg_line_from_pos).copied());
+                let msg_line_from_idx = canonical_message_number(msg.idx);
+                let msg_is_session_hit =
+                    msg_line_from_idx.is_some_and(|line| session_hit_lookup.contains(&line));
+                let msg_hit_rank =
+                    msg_line_from_idx.and_then(|line| session_hit_rank.get(&line).copied());
                 let msg_is_current_session_hit =
                     msg_hit_rank.is_some_and(|rank| rank == current_session_hit_rank && rank > 0);
                 let role_s = Self::role_style(&msg.role, styles);
@@ -17944,7 +17931,9 @@ impl super::ftui_adapter::Model for CassApp {
                             }
                         }
                         Ok(None) => {
-                            // Keep fallback rendering from SearchHit content.
+                            // Keep the indexed preview, but never describe an
+                            // unresolved/stale anchor as a loaded conversation.
+                            self.status = "No unique archived message matches this hit; showing indexed preview. Re-run search.".into();
                         }
                         Err(err) => {
                             self.status = format!("Failed to load conversation detail: {err}");
@@ -32493,6 +32482,13 @@ not jsonl",
         }];
         app.cached_detail = Some((hit.source_path.clone(), cv));
 
+        assert!(
+            app.cached_detail_for_render(&hit).is_none(),
+            "a numeric conversation ID cannot override a conflicting source"
+        );
+        // Only display metadata may be stale. Preserve the canonical source
+        // before testing that the loaded title/provider/workspace take priority.
+        hit.source_id = "local".into();
         let styles = StyleContext::from_options(StyleOptions::default());
         let text: String = app
             .build_messages_lines(&hit, 100, &styles)
@@ -32638,6 +32634,11 @@ not jsonl",
         cv.convo.origin_host = None;
         app.cached_detail = Some((hit.source_path.clone(), cv));
 
+        assert!(
+            app.cached_detail_for_render(&hit).is_none(),
+            "a numeric conversation ID cannot override a conflicting source"
+        );
+        hit.source_id = "local".into();
         let styles = StyleContext::from_options(StyleOptions::default());
         let text: String = app
             .build_detail_header_lines(&hit, 100, &styles)
@@ -39502,6 +39503,130 @@ not jsonl",
             app.detail_session_hit_offsets_cache.borrow().len(),
             3,
             "render should capture one offset per contextual hit"
+        );
+    }
+
+    #[test]
+    fn gh493_sparse_detail_highlights_only_stored_ordinals_not_dense_positions() {
+        let mut app = app_with_cached_conversation();
+        let mut hit = app.panes[0].hits[0].clone();
+        hit.conversation_id = Some(42);
+        hit.line_number = Some(2);
+        {
+            let view = &mut app.cached_detail.as_mut().unwrap().1;
+            view.convo.id = Some(42);
+            view.messages.truncate(3);
+            for (message, idx) in view.messages.iter_mut().zip([1, 16, 89]) {
+                message.idx = idx;
+                message.content = format!("canonical message {}", idx + 1);
+                message.role = MessageRole::User;
+            }
+        }
+        app.panes[0].hits = vec![hit.clone()];
+        app.query.clear();
+        app.detail_session_hit_lines = vec![2, 17, 90];
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let lines = app.build_messages_lines(&hit, 120, &styles);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| {
+                line.spans()
+                    .iter()
+                    .map(|span| span.content.as_ref().to_string())
+            })
+            .collect();
+        for rank in 1..=3 {
+            assert_eq!(
+                text.matches(&format!("search hit {rank}/3")).count(),
+                1,
+                "each canonical anchor has exactly one badge"
+            );
+        }
+        assert_eq!(app.detail_session_hit_offsets_cache.borrow().len(), 3);
+        // At CASS ordinal 2 the first message, not dense position 2, is the hit.
+        app.detail_session_hit_lines = vec![2];
+        let lines = app.build_messages_lines(&hit, 120, &styles);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| {
+                line.spans()
+                    .iter()
+                    .map(|span| span.content.as_ref().to_string())
+            })
+            .collect();
+        assert_eq!(text.matches("search hit 1/1").count(), 1);
+        assert_eq!(app.detail_session_hit_offsets_cache.borrow().len(), 1);
+    }
+
+    #[test]
+    fn gh493_detail_render_never_reuses_a_conflicting_canonical_cache() {
+        let mut app = app_with_cached_conversation();
+        let mut hit = app.panes[0].hits[0].clone();
+        hit.conversation_id = Some(42);
+        hit.line_number = Some(1);
+        app.cached_detail.as_mut().unwrap().1.convo.id = Some(42);
+        assert!(app.cached_detail_for_render(&hit).is_some());
+        let styles = StyleContext::from_options(StyleOptions::default());
+        for (id, source, path, ordinal) in [
+            (43, hit.source_id.clone(), hit.source_path.clone(), 1),
+            (42, "remote".into(), hit.source_path.clone(), 1),
+            (42, hit.source_id.clone(), "/other/session".into(), 1),
+            (42, hit.source_id.clone(), hit.source_path.clone(), 999),
+        ] {
+            let mut request = hit.clone();
+            request.conversation_id = Some(id);
+            request.source_id = source;
+            request.source_path = path;
+            request.line_number = Some(ordinal);
+            assert!(app.cached_detail_for_render(&request).is_none());
+            let lines = app.build_messages_lines(&request, 120, &styles);
+            let text: String = lines
+                .iter()
+                .flat_map(|line| {
+                    line.spans()
+                        .iter()
+                        .map(|span| span.content.as_ref().to_string())
+                })
+                .collect();
+            assert!(
+                !text.contains("Please help me fix a bug"),
+                "conflicting cache must not render"
+            );
+            assert!(app.detail_session_hit_offsets_cache.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn gh493_session_hit_navigation_binds_source_and_skips_invalid_indices() {
+        let mut app = app_with_cached_conversation();
+        let mut hit = app.panes[0].hits[0].clone();
+        hit.conversation_id = Some(42);
+        hit.line_number = Some(17);
+        let mut sibling = hit.clone();
+        sibling.line_number = Some(90);
+        let mut foreign = hit.clone();
+        foreign.source_id = "another-host".into();
+        foreign.line_number = Some(77);
+        app.panes[0].hits = vec![hit.clone(), sibling, foreign];
+        let cached = app.cached_detail.take().unwrap();
+        assert_eq!(
+            app.collect_session_hit_lines(&hit),
+            vec![17, 90],
+            "same numeric conversation ID cannot join another source"
+        );
+        app.cached_detail = Some(cached);
+        let view = &mut app.cached_detail.as_mut().unwrap().1;
+        view.convo.id = Some(42);
+        view.messages.truncate(3);
+        for (message, idx) in view.messages.iter_mut().zip([-1, 16, 89]) {
+            message.idx = idx;
+            message.content = "needle".into();
+        }
+        app.query = "needle".into();
+        assert_eq!(
+            app.collect_session_hit_lines(&hit),
+            vec![17, 90],
+            "invalid idx must not become dense position 1"
         );
     }
 
