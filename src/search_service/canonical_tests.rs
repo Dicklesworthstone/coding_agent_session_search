@@ -346,7 +346,7 @@ fn mcp_catalog_and_dispatch_require_explicit_canonical_permission() -> Result<()
     session.archive = Some(fixture.db.clone());
     let replies = mcp_exchange(&mut session, &[list])?;
     let tools = replies[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 6);
     let view = tools
         .iter()
         .find(|tool| tool["name"] == "cass_view")
@@ -772,5 +772,162 @@ fn canonical_batch_json_lines_round_trip_is_a_single_complete_reply() -> Result<
         "quotes \" and NUL \0 and Unicode δ😀"
     );
     assert_eq!(session.canonical_read_attempts, 1);
+    Ok(())
+}
+
+fn mcp_batch(fixture: &Fixture, id: Value) -> Value {
+    json!({"jsonrpc":"2.0", "id":id, "method":"tools/call", "params":{
+        "name":"cass_view_batch", "arguments":{"views":[
+            {"source_path":"/absent/shared.sqlite", "source_id":"local",
+             "conversation_id":fixture.conversation, "message_index":13},
+            {"source_path":"/absent/shared.sqlite", "source_id":"local",
+             "conversation_id":fixture.conversation, "message_index":1001}
+        ]}
+    }})
+}
+
+#[test]
+fn mcp_canonical_batch_discovery_is_opt_in_and_reuses_exact_view_schema() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    let list = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+    let replies = mcp_exchange(&mut session, &[list.clone(), mcp_batch(&fixture, json!(2))])?;
+    assert!(
+        !replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "cass_view_batch")
+    );
+    assert_eq!(replies[2]["error"]["code"], -32602);
+    session.archive = Some(fixture.db.clone());
+    let replies = mcp_exchange(&mut session, &[list])?;
+    let tools = replies[1]["result"]["tools"].as_array().unwrap();
+    let batch = tools
+        .iter()
+        .find(|t| t["name"] == "cass_view_batch")
+        .unwrap();
+    let view = tools.iter().find(|t| t["name"] == "cass_view").unwrap();
+    let schema = &batch["inputSchema"]["properties"]["views"];
+    assert_eq!(schema["items"], view["inputSchema"]);
+    assert_eq!(schema["minItems"], 1);
+    assert_eq!(schema["maxItems"], MAX_BATCH_VIEWS);
+    assert_eq!(batch["annotations"]["readOnlyHint"], true);
+    assert_eq!(batch["annotations"]["openWorldHint"], false);
+    assert_eq!(batch["inputSchema"]["additionalProperties"], false);
+    assert_eq!(session.canonical_read_attempts, 0);
+    assert_eq!(session.open_attempts, 0);
+    Ok(())
+}
+
+#[test]
+fn mcp_canonical_batch_preserves_rpc_identity_and_complete_evidence() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.content(12, "Unicode δ😀 and quote \" and NUL \0")?;
+    let before = archive_image(&fixture.db)?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let replies = mcp_exchange(&mut session, &[mcp_batch(&fixture, json!("batch-δ"))])?;
+    let reply = &replies[1];
+    assert_eq!(reply["id"], "batch-δ");
+    assert_eq!(reply["result"]["isError"], false);
+    let data = &reply["result"]["structuredContent"];
+    let text: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())?;
+    assert_eq!(&text, data);
+    assert_eq!(data["window_count"], 2);
+    assert_eq!(
+        data["windows"][0]["messages"][0]["content"],
+        "Unicode δ😀 and quote \" and NUL \0"
+    );
+    assert_eq!(data["windows"][1]["message_index"], 1001);
+    assert_eq!(
+        data["snapshot_policy"],
+        "one_archive_read_transaction_per_batch"
+    );
+    assert!(data["matches_lexical_snapshot"].is_null());
+    assert_eq!(session.canonical_read_attempts, 1);
+    assert_eq!(session.canonical_reads_completed, 1);
+    assert_eq!(session.open_attempts, 0);
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn mcp_canonical_batch_rejects_escalation_invalid_tail_and_notifications() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let mut notification = mcp_batch(&fixture, json!(1));
+    notification.as_object_mut().unwrap().remove("id");
+    let mut escalation = mcp_batch(&fixture, json!(2));
+    escalation["params"]["arguments"]["views"][1]["db"] = json!("/other/archive.db");
+    let mut invalid = mcp_batch(&fixture, json!(3));
+    invalid["params"]["arguments"]["views"][1]["message_index"] = json!(0);
+    let mut empty = mcp_batch(&fixture, json!(4));
+    empty["params"]["arguments"]["views"] = json!([]);
+    let replies = mcp_exchange(&mut session, &[notification, escalation, invalid, empty])?;
+    assert_eq!(replies.len(), 4, "the notification is not a request");
+    assert_eq!(replies[1]["error"]["code"], -32602);
+    for reply in &replies[2..] {
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["kind"],
+            "invalid_request"
+        );
+    }
+    assert_eq!(session.canonical_read_attempts, 0);
+    assert_eq!(session.open_attempts, 0);
+    Ok(())
+}
+
+#[test]
+fn mcp_canonical_batch_discards_prefix_on_identity_failure_and_recovers() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let before = archive_image(&fixture.db)?;
+    let mut mismatch = mcp_batch(&fixture, json!(-9));
+    mismatch["params"]["arguments"]["views"][1]["source_id"] = json!("different-source");
+    let replies = mcp_exchange(&mut session, &[mismatch, mcp_batch(&fixture, json!(10))])?;
+    assert_eq!(replies[1]["id"], -9);
+    assert_eq!(replies[1]["result"]["isError"], true);
+    let failure = &replies[1]["result"]["structuredContent"];
+    assert_eq!(failure["error"]["kind"], "canonical_identity_mismatch");
+    assert!(failure.get("windows").is_none());
+    assert!(!replies[1].to_string().contains("canonical content 12"));
+    assert_eq!(replies[2]["result"]["isError"], false);
+    assert_eq!(session.canonical_read_attempts, 2);
+    assert_eq!(session.canonical_reads_completed, 1);
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn mcp_canonical_batch_enforces_aggregate_content_before_double_encoding() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.content(12, &"\0".repeat(MAX_CONTENT_BYTES / 2))?;
+    fixture.content(1000, &"\0".repeat(MAX_CONTENT_BYTES / 2))?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let replies = mcp_exchange(&mut session, &[mcp_batch(&fixture, json!(1))])?;
+    assert_eq!(replies[1]["result"]["isError"], false);
+    assert_eq!(
+        replies[1]["result"]["structuredContent"]["content_bytes"],
+        MAX_CONTENT_BYTES
+    );
+    assert!(serde_json::to_vec(&replies[1])?.len() < super::super::protocol::MAX_RESPONSE_BYTES);
+    fixture.content(1000, &"\0".repeat(MAX_CONTENT_BYTES / 2 + 1))?;
+    let replies = mcp_exchange(&mut session, &[mcp_batch(&fixture, json!(2))])?;
+    assert_eq!(replies[1]["result"]["isError"], true);
+    assert_eq!(
+        replies[1]["result"]["structuredContent"]["error"]["kind"],
+        "canonical_payload_too_large"
+    );
+    assert!(
+        replies[1]["result"]["structuredContent"]
+            .get("windows")
+            .is_none()
+    );
     Ok(())
 }
