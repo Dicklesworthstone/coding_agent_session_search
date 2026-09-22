@@ -15,6 +15,7 @@ on:
       - 'src/search_service/**'
       - 'src/storage/**'
       - 'tests/cli_logical_archive.rs'
+      - 'tests/cli_logical_migration.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -43,10 +44,10 @@ jobs:
           git rev-parse HEAD > "$evidence/source.txt"
           # Preserve the exact recovery dependencies and tracker contract for
           # source review, including modules too large for the Contents API.
-          git archive --format=tar.gz HEAD AGENTS.md .beads/issues.jsonl docs/planning/RUST_CLI_TOOLS_BEST_PRACTICES_GUIDE.md docs/planning/REALITY_CHECK_AND_BRIDGE_PLAN_2026-09-01.md src/storage/sqlite.rs src/indexer/mod.rs src/search/archive_rebuild.rs src/search/mod.rs src/logical_archive/mod.rs tests/cli_logical_archive.rs > "$evidence/canonical-rebuild-source.tar.gz"
+          git archive --format=tar.gz HEAD AGENTS.md .beads/issues.jsonl docs/planning/RUST_CLI_TOOLS_BEST_PRACTICES_GUIDE.md docs/planning/REALITY_CHECK_AND_BRIDGE_PLAN_2026-09-01.md src/storage/sqlite.rs src/indexer/mod.rs src/search/archive_rebuild.rs src/search/mod.rs src/logical_archive/mod.rs src/logical_archive/migrate.rs tests/cli_logical_archive.rs tests/cli_logical_migration.rs > "$evidence/canonical-rebuild-source.tar.gz"
           rustfmt --version > "$evidence/toolchain.txt"
           status=0
-          for file in src/bookmarks.rs src/logical_archive/mod.rs src/logical_archive/query.rs src/logical_archive/export.rs src/logical_archive/export_tests.rs src/logical_archive/import.rs src/search/archive_rebuild.rs tests/cli_logical_archive.rs; do
+          for file in src/bookmarks.rs src/logical_archive/mod.rs src/logical_archive/query.rs src/logical_archive/export.rs src/logical_archive/export_tests.rs src/logical_archive/import.rs src/logical_archive/migrate.rs src/search/archive_rebuild.rs tests/cli_logical_archive.rs tests/cli_logical_migration.rs; do
             mkdir -p "$evidence/$(dirname "$file")"
             sha256sum "$file" >> "$evidence/input-sha256.txt"
             rustfmt --edition 2024 --config skip_children=true --emit stdout < "$file" > "$evidence/$file"
@@ -84,7 +85,7 @@ jobs:
           rustc --version | tee "$RUNNER_TEMP/archive-evidence/toolchain.txt"
           sha256sum Cargo.lock | tee "$RUNNER_TEMP/archive-evidence/lockfile.txt"
           # Parse without changing source or presenting formatting as runtime proof.
-          rustfmt --edition 2024 --emit stdout src/logical_archive/mod.rs src/bookmarks.rs tests/cli_logical_archive.rs > "$RUNNER_TEMP/archive-evidence/formatted-source.txt"
+          rustfmt --edition 2024 --emit stdout src/logical_archive/mod.rs src/logical_archive/migrate.rs src/bookmarks.rs tests/cli_logical_archive.rs tests/cli_logical_migration.rs > "$RUNNER_TEMP/archive-evidence/formatted-source.txt"
       - name: Run locked production archive tests
         shell: bash
         run: |
@@ -95,8 +96,8 @@ jobs:
           from pathlib import Path
           text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/unit.log').read_text()
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 64:
-              raise SystemExit('Expected all 64 archive regressions, including snapshot-bound paging and complete views')
+          if not counts or max(map(int, counts)) < 70:
+              raise SystemExit('Expected at least 70 archive regressions, including reviewed v20-to-v21 migration and identical retry')
           PY
       - name: Run the real binary round trip and failure contracts
         shell: bash
@@ -110,6 +111,15 @@ jobs:
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
           if not counts or max(map(int, counts)) < 17:
               raise SystemExit('Expected all seventeen real-binary archive regressions, including backup paging and search-to-view')
+          PY
+          cargo test --locked --test cli_logical_migration -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/archive-evidence/migration-cli.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/migration-cli.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 1:
+              raise SystemExit('Expected the real-binary reviewed v20-to-v21 migration journey')
           PY
           sha256sum target/debug/cass | tee "$RUNNER_TEMP/archive-evidence/binary.txt"
       - name: Exercise canonical-only indexed restore admission
