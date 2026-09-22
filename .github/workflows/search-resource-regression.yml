@@ -1,27 +1,25 @@
-name: Search resource admission regressions
+name: Search resource memory qualification
 
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/search-resource-regression.yml
-      - src/search_service/admission.rs
+    paths: [.github/workflows/search-resource-regression.yml]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  admission:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-14, windows-2022]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_MIN_STACK: '134217728'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -31,31 +29,118 @@ jobs:
         with:
           toolchain: nightly-2026-08-31
           components: rustfmt, clippy
-      - name: Qualify actual OS leases and forced-process-death recovery
+      - name: Apply the reviewed patch without changing dependency versions
+        shell: bash
         run: |
           set -euo pipefail
-          git rev-parse HEAD
-          rustc --version
-          rustfmt --edition 2024 --check src/search_service/admission.rs
+          python - <<'PY'
+          import base64, copy, hashlib, json, subprocess, tomllib, zlib
+          from pathlib import Path
+          expected = {'src/search_service.rs':'5754fd1558397b93d147c53e0202691449cd97f8', 'src/search_service/memory.rs':None, 'tests/search_service.rs':'89a6632c518a95956804cc195b6dba34cbdc2048', 'docs/SEARCH_SERVICE.md':'5138abc95fae71565739269f7d70f91620d8557c', 'Cargo.toml':'e1fbfa58c7a7c9da4bded29a7d1e5809b476c161', 'Cargo.lock':'46e40737bf73aa8544ae2c95539e10b0098b909a'}
+          guards = dict(expected, **{'src/search_service/admission.rs':'9ec0f45ff08d2658bd673a16d79ab04a4b5a9293'})
+          for name, sha in guards.items():
+              path = Path(name)
+              if sha is None:
+                  assert not path.exists(), name
+              else:
+                  data = path.read_bytes()
+                  assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha, name
+          payload = (
+              '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'
+              '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'
+              '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'
+          )
+          patch = zlib.decompress(base64.b64decode(payload))
+          assert hashlib.sha256(patch).hexdigest() == 'e0ec0a2d447c512411537ec527045499c348e5dee0ba2692a90fbf3268814389'
+          subprocess.run(['git','apply','--check','-'], input=patch, check=True)
+          subprocess.run(['git','apply','-'], input=patch, check=True)
+          subprocess.run(['git','apply','--reverse','--check','-'], input=patch, check=True)
+          subprocess.run(['git','add','-N','src/search_service/memory.rs'], check=True)
+          manifest = Path('Cargo.toml')
+          text = manifest.read_text()
+          assert 'sysinfo' not in tomllib.loads(text)['dependencies']
+          assert text.count('[dependencies]\n') == 1
+          manifest.write_text(text.replace('[dependencies]\n','[dependencies]\n# Resident-memory supervision reuses the sysinfo version already in Cargo.lock.\nsysinfo = { version = "*", default-features = false, features = ["system"] }\n',1))
+          before = tomllib.loads(Path('Cargo.lock').read_text())
+          sysinfo = [p for p in before['package'] if p['name'] == 'sysinfo']
+          assert len(sysinfo) == 1 and sysinfo[0]['version'] == '0.39.6'
+          # Cargo, not a text rewrite, updates its generated root dependency edge.
+          subprocess.run(['cargo','metadata','--format-version','1'], check=True, stdout=subprocess.DEVNULL, timeout=600)
+          after = tomllib.loads(Path('Cargo.lock').read_text())
+          wanted = copy.deepcopy(before)
+          root = next(p for p in wanted['package'] if p['name'] == 'coding-agent-search')
+          assert 'sysinfo' not in root['dependencies']
+          root['dependencies'] = sorted(root['dependencies'] + ['sysinfo'])
+          assert after == wanted, 'refuse any dependency-version or non-root lockfile change'
+          assert set(subprocess.check_output(['git','diff','--name-only'], text=True).splitlines()) == set(expected)
+          Path('candidate-inputs.json').write_text(json.dumps(expected, indent=2))
+          subprocess.run(['git','diff','--check'], check=True)
+          PY
+      - name: Test real memory growth, idle sampling and kernel-lease recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true src/search_service.rs src/search_service/*.rs tests/search_service.rs
+          rustfmt --edition 2024 --check --config skip_children=true src/search_service.rs src/search_service/*.rs tests/search_service.rs
           python - <<'PY'
           import json, os
           from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP']) / 'cass-admission-tests'
+          root = Path(os.environ['RUNNER_TEMP']) / 'cass-memory-tests'
           root.mkdir()
-          source = Path('src/search_service/admission.rs').resolve().as_posix()
-          (root / 'Cargo.toml').write_text('[package]\nname="cass-admission-tests"\nversion="0.0.0"\nedition="2024"\n[lib]\npath="lib.rs"\n')
-          (root / 'lib.rs').write_text('#[allow(dead_code)]\n#[path = ' + json.dumps(source) + ']\nmod admission;\n')
+          (root / 'Cargo.toml').write_text('[package]\nname="cass-memory-tests"\nversion="0.0.0"\nedition="2024"\n[lib]\npath="lib.rs"\n[dependencies]\nsysinfo={version="=0.39.6",default-features=false,features=["system"]}\n')
+          modules = ''.join('#[allow(dead_code)]\n#[path = ' + json.dumps(Path('src/search_service/'+name+'.rs').resolve().as_posix()) + ']\nmod '+name+';\n' for name in ['admission','memory'])
+          (root / 'lib.rs').write_text(modules)
           PY
-          manifest="$RUNNER_TEMP/cass-admission-tests/Cargo.toml"
-          cargo test --manifest-path "$manifest" -- --test-threads=1 --nocapture 2>&1 | tee admission-tests.log
-          expected=6
-          if [[ "$RUNNER_OS" == Windows ]]; then expected=5; fi
-          grep -F "test result: ok. $expected passed; 0 failed; 1 ignored" admission-tests.log
+          manifest="$RUNNER_TEMP/cass-memory-tests/Cargo.toml"
+          cargo test --manifest-path "$manifest" -- --test-threads=1 --nocapture 2>&1 | tee memory-native.log
+          grep -F 'test result: ok. 10 passed; 0 failed; 2 ignored' memory-native.log
           cargo clippy --manifest-path "$manifest" --tests -- -D warnings
+          git diff --check
+      - name: Export qualified source blobs without updating any ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, urllib.request
+          from pathlib import Path
+          expected = json.loads(Path('candidate-inputs.json').read_text())
+          assert set(subprocess.check_output(['git','diff','--name-only'], text=True).splitlines()) == set(expected)
+          exported = {}
+          for name in expected:
+              content = Path(name).read_bytes()
+              sha = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs', data=json.dumps({'content':content.decode('utf-8'),'encoding':'utf-8'}).encode(), headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Content-Type':'application/json','User-Agent':'OpenAI File Downloader, XaiImageApiFetch/1.0'}, method='POST')
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+              assert result['sha'] == sha, name
+              exported[name] = sha
+          receipt = {'source_commit':os.environ['GITHUB_SHA'],'inputs':expected,'blobs':exported}
+          Path('memory-receipt.json').write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt))
+          subprocess.run(['tar','-czf','memory-candidate.tar.gz',*expected,'memory-receipt.json','memory-native.log'], check=True)
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: admission-tests-${{ matrix.os }}-${{ github.sha }}
-          path: admission-tests.log
+          name: memory-candidate-${{ github.sha }}
+          path: |
+            memory-candidate.tar.gz
+            memory-receipt.json
+            memory-native.log
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 3
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Full service regressions on the memory-supervised candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test search_service -- --test-threads=1 --nocapture 2>&1 | tee memory-service.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' memory-service.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: memory-service-${{ github.sha }}
+          path: memory-service.log
+          if-no-files-found: warn
+          retention-days: 3
