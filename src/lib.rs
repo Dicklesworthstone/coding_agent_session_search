@@ -121099,6 +121099,7 @@ fn run_models_backfill(
         retryable: true,
     })?;
     let mut indexer = None;
+    let mut model_initializations = 0u32;
     let mut attempted = 0u32;
     let mut completed = 0u32;
     let mut last_report = None;
@@ -121130,6 +121131,7 @@ fn run_models_backfill(
             data_dir_override.clone(),
             db_override.clone(),
             &mut indexer,
+            &mut model_initializations,
         );
         match result {
             Ok(report) => {
@@ -121187,7 +121189,7 @@ fn run_models_backfill(
     };
     report["batches_attempted"] = attempted.into();
     report["batches_completed"] = completed.into();
-    report["model_initializations"] = u32::from(indexer.is_some()).into();
+    report["model_initializations"] = model_initializations.into();
 
     if let Some(fmt) = structured_format {
         output_structured_value(report, fmt)?;
@@ -121237,6 +121239,7 @@ fn run_models_backfill_batch(
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
     retained_indexer: &mut Option<crate::indexer::semantic::SemanticIndexer>,
+    model_initializations: &mut u32,
 ) -> CliResult<serde_json::Value> {
     use crate::indexer::semantic::{
         SemanticBackfillSchedulerSignals, SemanticBackfillStoragePlan, SemanticIndexer,
@@ -121356,19 +121359,26 @@ fn run_models_backfill_batch(
     // admission inside the maintenance lock so index-busy retains precedence.
     let indexer = match retained_indexer {
         Some(indexer) => indexer,
-        vacant => vacant.insert(
-            SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
-                hint: Some(if embedder_type == "fastembed" {
-                    "Run 'cass models install -y' or retry with --embedder hash".into()
-                } else {
-                    "Use --embedder hash or install the selected embedder model".into()
-                }),
-                retryable: embedder_type != "hash",
-            })?,
-        ),
+        vacant => vacant.insert({
+            let indexer =
+                SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
+                    code: 20,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: format!(
+                        "Failed to initialize semantic embedder '{embedder_type}': {e}"
+                    ),
+                    hint: Some(if embedder_type == "fastembed" {
+                        "Run 'cass models install -y' or retry with --embedder hash".into()
+                    } else {
+                        "Use --embedder hash or install the selected embedder model".into()
+                    }),
+                    retryable: embedder_type != "hash",
+                })?;
+            // GH #471: count real constructions, so a regression that reloads
+            // the model per batch reports it instead of a presence flag.
+            *model_initializations = model_initializations.saturating_add(1);
+            indexer
+        }),
     };
 
     let storage = crate::storage::sqlite::open_current_schema_storage_with_timeout(
