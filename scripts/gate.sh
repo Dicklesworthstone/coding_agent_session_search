@@ -241,9 +241,15 @@ source_digest() {
 SOURCE_DIFF="$(source_digest)" || exit 1
 # RCH 1.0.63 does not combine --job with clean-overlay/content-receipt.
 # Verify the transferred inputs ourselves before running any stage.
+# rch's global transfer excludes drop every `.beads/` directory, so tracked
+# files such as tests/.beads/* never reach the worker. Hashing them made the
+# identity verdict depend on stale leftovers of whichever worker was chosen
+# (green on one worker, red on another for the same tree). No build or test
+# reads them, so they are not inputs this gate can or needs to verify.
 SOURCE_PATHS="$(git ls-files --cached --others --exclude-standard -z -- \
     Cargo.toml Cargo.lock rust-toolchain.toml build.rs src tests benches scripts \
-    .cargo .github README.md | sort -zu | gzip -c | base64 -w0)" || exit 1
+    .cargo .github README.md ':(exclude,glob)**/.beads/**' | \
+    sort -zu | gzip -c | base64 -w0)" || exit 1
 SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
     xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)" || exit 1
 
