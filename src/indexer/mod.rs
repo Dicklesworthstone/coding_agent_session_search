@@ -6691,6 +6691,12 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
 enum LexicalRebuildExecutionMode {
     #[default]
     SharedWriter,
+    /// One Quill writer building in the canonical scratch sibling. Its cursor
+    /// must never be applied to the prior live generation if scratch is lost.
+    StagedSingleIndex,
+    /// An explicitly in-place writer. Unrelated scratch debris must not redirect
+    /// pending-commit reconciliation or the next writer away from the live tree.
+    LiveSingleIndex,
     StagedShardBuild,
     /// Canonical workspace metadata is changing; all existing documents need
     /// rehydration even though conversation/message counts may stay identical.
@@ -6705,6 +6711,8 @@ impl LexicalRebuildExecutionMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::SharedWriter => "shared_writer",
+            Self::StagedSingleIndex => "staged_single_index",
+            Self::LiveSingleIndex => "live_single_index",
             Self::StagedShardBuild => "staged_shard_build",
             Self::CanonicalMetadataRepair => "canonical_metadata_repair",
         }
@@ -9154,6 +9162,94 @@ fn pending_commit_landed(
     }
 }
 
+/// New checkpoints bind their cursor to the physical content lane. SharedWriter
+/// remains the legacy, unspecified-location case; completed receipts always
+/// describe the published live tree, even when old scratch debris survives.
+fn lexical_rebuild_resume_content_path(
+    index_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<PathBuf> {
+    if state.completed
+        || state.effective_execution_mode() == LexicalRebuildExecutionMode::LiveSingleIndex
+    {
+        return Ok(index_path.to_path_buf());
+    }
+    let scratch = staged_lexical_rebuild_scratch_path(index_path);
+    if state.effective_execution_mode() == LexicalRebuildExecutionMode::StagedSingleIndex {
+        let metadata = fs::symlink_metadata(&scratch).with_context(|| {
+            format!("checkpoint's staged lexical generation is unavailable: {}", scratch.display())
+        })?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "checkpoint's staged lexical generation is not a real directory: {}",
+            scratch.display()
+        );
+        return Ok(scratch);
+    }
+    Ok(if scratch.is_dir() {
+        scratch
+    } else {
+        index_path.to_path_buf()
+    })
+}
+
+fn lexical_rebuild_bound_candidate_is_missing(
+    index_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<bool> {
+    if state.completed
+        || state.effective_execution_mode() != LexicalRebuildExecutionMode::StagedSingleIndex
+    {
+        return Ok(false);
+    }
+    let scratch = staged_lexical_rebuild_scratch_path(index_path);
+    match fs::symlink_metadata(&scratch) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| {
+            format!("inspecting checkpoint's staged lexical generation {}", scratch.display())
+        }),
+    }
+}
+
+fn legacy_lexical_resume_lost_its_generation(
+    index_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<bool> {
+    if state.completed
+        || state.effective_execution_mode() != LexicalRebuildExecutionMode::SharedWriter
+        || staged_lexical_rebuild_scratch_path(index_path).is_dir()
+        || (state.processed_conversations == 0 && state.pending.is_none())
+    {
+        return Ok(false);
+    }
+    // Old shared_writer checkpoints did not record a content lane. With no
+    // scratch, only the exact committed live MANIFEST proves cursor ownership.
+    // A different live manifest might be a landed in-place pending commit OR
+    // an unrelated prior generation after staging was lost. Replay safely
+    // rather than using that ambiguity as permission to skip canonical rows.
+    let current = index_meta_fingerprint(index_path)?;
+    Ok(state.committed_meta_fingerprint.is_none()
+        || current != state.committed_meta_fingerprint)
+}
+
+fn retain_missing_lexical_candidate_checkpoint(
+    index_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<PathBuf> {
+    let parent = index_path.parent().context("lexical index has no parent")?;
+    // As with candidate quarantine, keep ownership before any fallible write.
+    // A failed preservation must not remove evidence or overwrite live state.
+    let quarantine = TempDirBuilder::new()
+        .prefix(".lexical-rebuild-quarantine-")
+        .tempdir_in(parent)
+        .context("reserving missing-candidate checkpoint quarantine")?
+        .keep();
+    persist_lexical_rebuild_state(&quarantine, state)?;
+    sync_parent_directory(&quarantine)?;
+    Ok(quarantine)
+}
+
 fn reconcile_pending_lexical_commit(
     index_path: &Path,
     mut state: LexicalRebuildState,
@@ -9167,13 +9263,8 @@ fn reconcile_pending_lexical_commit(
     // with the unrelated live MANIFEST can promote rows that never committed,
     // or roll back a commit that did. Recovery must observe the same content
     // directory that commit_lexical_rebuild_progress fingerprinted.
-    let scratch_path = staged_lexical_rebuild_scratch_path(index_path);
-    let content_path = if state.is_incomplete() && scratch_path.is_dir() {
-        scratch_path.as_path()
-    } else {
-        index_path
-    };
-    let current_meta_fingerprint = index_meta_fingerprint(content_path)?;
+    let content_path = lexical_rebuild_resume_content_path(index_path, &state)?;
+    let current_meta_fingerprint = index_meta_fingerprint(&content_path)?;
     if pending_commit_landed(
         pending.base_meta_fingerprint.as_deref(),
         current_meta_fingerprint.as_deref(),
@@ -24398,7 +24489,19 @@ fn rebuild_tantivy_from_db_with_options(
     } else {
         match load_lexical_rebuild_state(&index_path)? {
             Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
-                if state.is_incomplete() && state.requires_restart_from_zero_on_resume() {
+                if lexical_rebuild_bound_candidate_is_missing(&index_path, &state)?
+                    || legacy_lexical_resume_lost_its_generation(&index_path, &state)?
+                {
+                    let quarantine = retain_missing_lexical_candidate_checkpoint(&index_path, &state)?;
+                    tracing::warn!(
+                        checkpoint_path = %lexical_rebuild_state_path(&quarantine).display(),
+                        missing_candidate = %staged_lexical_rebuild_scratch_path(&index_path).display(),
+                        processed_conversations = state.reported_processed_conversations(),
+                        indexed_docs = state.reported_indexed_docs(),
+                        "lexical resume generation is missing or ambiguous; retained its checkpoint and restarting off-live, not adopting the prior live generation"
+                    );
+                    LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+                } else if state.is_incomplete() && state.requires_restart_from_zero_on_resume() {
                     tracing::info!(
                         db_path = %db_path.display(),
                         execution_mode = state
@@ -24542,7 +24645,6 @@ fn rebuild_tantivy_from_db_with_options(
     // the state into the scratch dir would make every interrupted from-zero
     // rebuild restart from zero — the exact failure #380 reports.
     let scratch_path = staged_lexical_rebuild_scratch_path(&index_path);
-    let scratch_exists = scratch_path.is_dir();
     let mut staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
         // Fresh staged build: discard any scratch left by an abandoned run.
         if let Err(err) = fs::remove_dir_all(&scratch_path)
@@ -24563,7 +24665,10 @@ fn rebuild_tantivy_from_db_with_options(
         })?;
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
         Some(scratch_path.clone())
-    } else if scratch_exists && !will_use_atomic_staged_publish && rebuild_state.is_incomplete() {
+    } else if !will_use_atomic_staged_publish
+        && rebuild_state.is_incomplete()
+        && lexical_rebuild_resume_content_path(&index_path, &rebuild_state)? != index_path
+    {
         // Resuming a staged build that was interrupted mid-flight: the partial
         // index lives in the scratch dir, so continue there rather than in the
         // live index.
@@ -24652,6 +24757,13 @@ fn rebuild_tantivy_from_db_with_options(
         log_prep_step("validate_resume_prefix", &mut prep_step_started);
     }
 
+    // Persist this location before the first commit/heartbeat. A later process
+    // must not infer which generation owns the cursor from directory existence.
+    rebuild_state.set_execution_mode(if staged_build_path.is_some() {
+        LexicalRebuildExecutionMode::StagedSingleIndex
+    } else {
+        LexicalRebuildExecutionMode::LiveSingleIndex
+    });
     let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
     log_prep_step("restart_from_zero_reset", &mut prep_step_started);
     let batch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);

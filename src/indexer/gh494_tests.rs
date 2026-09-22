@@ -1,6 +1,238 @@
 // Included by indexer::tests; exercises the production rebuild and real
 // filesystem fault seam, not a model of the state machine.
 
+fn gh494_query_count(index_path: &Path, term: &str) -> usize {
+    use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+    SearchClient::open(index_path, None)
+        .unwrap()
+        .unwrap()
+        .search(term, SearchFilters::default(), 100, 0, FieldMask::FULL)
+        .unwrap()
+        .len()
+}
+
+fn gh494_missing_staged_generation_replays_canonical_content(pending: bool, legacy: bool) {
+    #[cfg(windows)]
+    const DISK_FULL: i32 = 112;
+    #[cfg(not(windows))]
+    const DISK_FULL: i32 = libc::ENOSPC;
+
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("db.sqlite");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    ensure_fts_schema(&storage);
+    seed_lexical_rebuild_fixture(&storage);
+    drop(storage);
+    let index_path = index_dir(&data_dir).unwrap();
+    let old_messages = (0..4)
+        .map(|idx| {
+            let mut message = norm_msg(idx, 1_700_000_000_000 + idx);
+            message.content = format!("priorgenerationneedle {idx}");
+            message
+        })
+        .collect();
+    let old_conversation = norm_conv(Some("prior-generation"), old_messages);
+    let mut old = TantivyIndex::open_or_create(&index_path).unwrap();
+    old.add_messages_with_conversation_id(&old_conversation, &old_conversation.messages, Some(900))
+        .unwrap();
+    old.commit().unwrap();
+    drop(old);
+    assert_eq!(gh494_query_count(&index_path, "priorgenerationneedle"), 4);
+    assert_eq!(gh494_query_count(&index_path, "fixture"), 0);
+    let old_manifest = fs::read(index_path.join("MANIFEST")).unwrap();
+
+    // Produce a genuine complete staged build that is refused at the swap.
+    // The old generation has EXACTLY the same count but different content:
+    // document-count validation alone cannot prove which cursor it owns.
+    #[cfg(target_os = "linux")]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+        DISK_FULL,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+        DISK_FULL,
+    );
+    let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
+        .err()
+        .expect("the first publication must reach the injected refusal");
+    drop(fault);
+    assert!(
+        error.to_string().contains("publish_staged_generation"),
+        "{error:#}"
+    );
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    assert_eq!(gh494_query_count(&scratch, "fixture"), 4);
+    assert_eq!(fs::read(index_path.join("MANIFEST")).unwrap(), old_manifest);
+    let mut interrupted = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert_eq!(
+        interrupted.execution_mode,
+        Some(LexicalRebuildExecutionMode::StagedSingleIndex)
+    );
+    assert!(!interrupted.completed);
+    if legacy {
+        interrupted.set_execution_mode(LexicalRebuildExecutionMode::SharedWriter);
+        persist_lexical_rebuild_state(&index_path, &interrupted).unwrap();
+    }
+    if pending {
+        // Also cover death between the content commit and cursor finalization.
+        // With scratch missing, comparing this base with old live would falsely
+        // promote the pending EOF cursor without ever reading canonical rows.
+        interrupted.record_pending_commit(interrupted.committed_conversation_id, 2, 4, None);
+        interrupted.committed_offset = 0;
+        interrupted.committed_conversation_id = None;
+        interrupted.processed_conversations = 0;
+        interrupted.indexed_docs = 0;
+        persist_lexical_rebuild_state(&index_path, &interrupted).unwrap();
+    }
+    let missing_candidate = tmp.path().join("removed-from-staging-but-retained");
+    fs::rename(&scratch, &missing_candidate).unwrap();
+    let missing_manifest = fs::read(missing_candidate.join("MANIFEST")).unwrap();
+
+    let rebuilt = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    assert!(rebuilt.exact_checkpoint_persisted);
+    assert_eq!(rebuilt.indexed_docs, 4);
+    assert_eq!(rebuilt.observed_conversations, 2);
+    assert_eq!(gh494_query_count(&index_path, "fixture"), 4);
+    assert_eq!(gh494_query_count(&index_path, "priorgenerationneedle"), 0);
+    let completed = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert!(completed.completed);
+    assert_eq!(
+        completed.execution_mode,
+        Some(LexicalRebuildExecutionMode::SharedWriter)
+    );
+    let quarantines: Vec<_> = fs::read_dir(index_path.parent().unwrap())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lexical-rebuild-quarantine-")
+        })
+        .collect();
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(
+        load_lexical_rebuild_state(&quarantines[0].path())
+            .unwrap()
+            .unwrap(),
+        interrupted,
+        "preserve the exact lost candidate cursor, including pending work"
+    );
+    assert_eq!(
+        fs::read(missing_candidate.join("MANIFEST")).unwrap(),
+        missing_manifest
+    );
+    let published = fs::read(index_path.join("MANIFEST")).unwrap();
+    assert!(
+        !rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
+            .unwrap()
+            .exact_checkpoint_persisted
+    );
+    assert_eq!(fs::read(index_path.join("MANIFEST")).unwrap(), published);
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_missing_staged_eof_cannot_certify_same_count_prior_live_content() {
+    gh494_missing_staged_generation_replays_canonical_content(false, false);
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_missing_staged_pending_commit_cannot_be_promoted_by_prior_live() {
+    gh494_missing_staged_generation_replays_canonical_content(true, false);
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_legacy_cursor_without_its_generation_replays_instead_of_guessing() {
+    gh494_missing_staged_generation_replays_canonical_content(false, true);
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_explicit_live_resume_ignores_unrelated_scratch_generation() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("db.sqlite");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    ensure_fts_schema(&storage);
+    seed_lexical_rebuild_fixture(&storage);
+    drop(storage);
+    rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    let index_path = index_dir(&data_dir).unwrap();
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    let mut unrelated = TantivyIndex::open_or_create(&scratch).unwrap();
+    unrelated.commit().unwrap();
+    drop(unrelated);
+    let unrelated_manifest = fs::read(scratch.join("MANIFEST")).unwrap();
+    let mut state = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    state.completed = false;
+    state.set_execution_mode(LexicalRebuildExecutionMode::LiveSingleIndex);
+    let live_fingerprint = index_meta_fingerprint(&index_path).unwrap();
+    state.record_pending_commit(Some(999), 999, 999, live_fingerprint);
+    persist_lexical_rebuild_state(&index_path, &state).unwrap();
+    let reconciled = reconcile_pending_lexical_commit(&index_path, state).unwrap();
+    assert_eq!(reconciled.processed_conversations, 2);
+    assert_eq!(reconciled.indexed_docs, 4);
+    assert!(reconciled.pending.is_none());
+    assert_eq!(
+        lexical_rebuild_resume_content_path(&index_path, &reconciled).unwrap(),
+        index_path
+    );
+    let resumed = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    assert_eq!(resumed.indexed_docs, 4);
+    assert_eq!(gh494_query_count(&index_path, "fixture"), 4);
+    assert_eq!(
+        fs::read(scratch.join("MANIFEST")).unwrap(),
+        unrelated_manifest
+    );
+}
+
+#[test]
+fn gh494_bound_staged_reconciliation_refuses_missing_content_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let index_path = tmp.path().join("index");
+    fs::create_dir(&index_path).unwrap();
+    let mut state = LexicalRebuildState::new(
+        LexicalRebuildDbState {
+            db_path: tmp.path().join("db.sqlite").to_string_lossy().into_owned(),
+            total_conversations: 2,
+            total_messages: 4,
+            storage_fingerprint: "content-v1:2:2:4".to_owned(),
+        },
+        LEXICAL_REBUILD_PAGE_SIZE,
+    );
+    state.set_execution_mode(LexicalRebuildExecutionMode::StagedSingleIndex);
+    state.record_pending_commit(Some(2), 2, 4, None);
+    persist_lexical_rebuild_state(&index_path, &state).unwrap();
+    let before = fs::read(lexical_rebuild_state_path(&index_path)).unwrap();
+    let error = reconcile_pending_lexical_commit(&index_path, state.clone()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("staged lexical generation is unavailable")
+    );
+    assert_eq!(
+        fs::read(lexical_rebuild_state_path(&index_path)).unwrap(),
+        before
+    );
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    fs::write(&scratch, "not a directory").unwrap();
+    assert!(!lexical_rebuild_bound_candidate_is_missing(&index_path, &state).unwrap());
+    assert!(lexical_rebuild_resume_content_path(&index_path, &state).is_err());
+    assert_eq!(fs::read_to_string(scratch).unwrap(), "not a directory");
+    assert_eq!(
+        fs::read(lexical_rebuild_state_path(&index_path)).unwrap(),
+        before
+    );
+}
+
 fn gh494_restart_damaged_candidate(damage: &str) {
     #[cfg(windows)]
     const DISK_FULL: i32 = 112;
