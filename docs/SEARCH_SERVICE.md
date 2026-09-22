@@ -55,6 +55,8 @@ a hit against the canonical archive, retain its `source_id`,
 line number**. Identity fields are never shortened to fit an output budget.
 For complete bounded bodies in the same service, opt in to `view` using the
 fixed `--db` configuration described below. No archive is inferred from `--data-dir`.
+Candidate-only neural reranking is separately enabled by `--reranker-model`;
+ordinary `search` remains lexical and does not load or invoke the model.
 
 ## Wire protocol, version 1
 
@@ -129,8 +131,9 @@ These are transport and candidate-window bounds, not kernel allocation limits.
 Resident-memory supervision below adds a sampled termination threshold.
 The first index admission can still be expensive. Each independently started worker still owns
 its own reader: reuse one process rather than spawning one for each query.
-Semantic/HNSW serving is not implemented by this lexical endpoint. Optional
-shared reader admission is described below; it bounds owners, not total RSS.
+Global vector/HNSW serving is not implemented by this endpoint. Opt-in
+`refine` scores only a bounded lexical shortlist. Optional shared reader
+admission below bounds owners, not total RSS.
 
 ### Enforced request deadlines
 
@@ -141,7 +144,7 @@ guard. Status reports the configured deadline and termination exit code.
 
 The deadline starts when the worker first observes any byte of a new frame and
 covers the rest of input framing, decoding, native index admission/query or
-canonical lookup, result encoding, and output flushing. A partial line and a
+canonical lookup or opt-in model loading/inference, result encoding, and output flushing. A partial line and a
 client that stops reading responses are therefore bounded too. Waiting for
 the first byte of the next request is idle time and is deliberately excluded.
 Completing a request joins its watchdog before another request can be admitted;
@@ -242,6 +245,7 @@ stdio specifications, not an assumption that every version uses initialization.
 
 The catalog exposes `cass_search`, `cass_status`, `cass_unload`, and `cass_reload`.
 With an explicit startup `--db`, it also exposes the read-only `cass_view` tool.
+With `--reranker-model`, it additionally exposes `cass_refine`, described below.
 `cass_search` arguments are the JSON-lines search fields **without** `op` or
 `id`; status, unload and reload accept an empty object. The JSON-RPC ID is preserved
 exactly, including string and signed-integer IDs. There is no arbitrary file
@@ -416,3 +420,100 @@ execution after an observed per-worker overage. An unloaded allocator can
 still retain pages, so the pool count times this threshold is not a machine-wide
 memory certificate. For strict allocation containment use an OS-managed
 process/container budget as well. Neither feature adds semantic serving.
+
+## Candidate-only neural refinement (explicit opt-in)
+
+Use `refine` when a cheap lexical query finds plausible messages but their
+order does not answer the actual question. It does **not** open a global
+embedding/vector/HNSW generation. Instead it retrieves one finite lexical
+shortlist, then runs the existing native cross-encoder only over each hit's
+title and index snippet. A separate question can guide relevance without
+making the lexical candidate query unnecessarily restrictive.
+
+Enable it with an already-installed, compatible native MS MARCO MiniLM
+reranker directory containing safetensors weights and `tokenizer.json`:
+
+```sh
+cass serve --stdio --mcp --data-dir /path/to/cass-data \
+  --reranker-model /path/to/models/ms-marco-MiniLM-L-6-v2
+```
+
+This path is fixed at startup. There is no default inferred model directory,
+network download, daemon fallback, or per-request model path. Initialization,
+discovery, status, ordinary `search`, and empty refinement results do not load
+the model. The first nonempty refinement loads it locally; later refinements
+reuse it. A previously loaded model remains resident during ordinary searches,
+but those searches never invoke it. `reload` releases the model and old lexical
+reader before opening a new lexical reader; it does not eagerly reload the
+model. The next nonempty refinement may load that same configured path again.
+Shutdown and the existing request/teardown deadlines cover both retained owners.
+
+Without `--mcp`, send:
+
+```json
+{"op":"refine","id":10,"lexical_query":"performance","query":"Which changes reduced search latency?","filters":{"workspaces":["/my/project"],"source_id":"work-laptop"},"candidate_limit":20,"limit":5}
+```
+
+With MCP, call `cass_refine` with the same arguments except `op` and `id`.
+The tool is advertised only with `--reranker-model`; guessing its name cannot
+enable model access. Canonical `--db` permission is neither required nor used.
+The existing MCP quota and whole-request watchdog include refinement, including
+model loading and native inference. No queued background work continues after
+the worker exits on its deadline.
+
+Both query strings must be nonempty and at most 4,096 UTF-8 bytes. The existing
+lexical filters retain their exact semantics. `candidate_limit` defaults to 20
+and accepts 1–32; `limit` defaults to 5 and must be 1–`candidate_limit`. A lexical
+probe can retrieve one additional hit to detect further candidates, but at most
+`candidate_limit` previews enter inference. Each input preview is at most
+8,192 bytes, and the complete input is capped at 256 KiB, counting the relevance
+query again for each candidate pair. Admission happens before model loading.
+These are input bounds, not a guarantee about model/engine resident memory.
+
+Each returned hit retains its original lexical `score`, all source/conversation/
+message coordinates, and preview fields. `rerank_score` is separate, and
+`lexical_rank` records its one-based position before refinement. Scores must be
+finite and map one-to-one to inputs; malformed outputs fail rather than invent
+scores or discard identities. Equal scores keep lexical order.
+
+`candidates_considered` and `ranking_scope: "bounded_lexical_candidate_pool"`
+make the boundary explicit. `more_lexical_candidates` is true only when an
+additional lexical hit was observed, otherwise null (unknown). There is no
+refinement pagination: `next_offset` is null, and an `offset` request is rejected.
+Changing the candidate pool can change every winner's rank. Increase or narrow
+the explicit pool rather than treating a lexical offset as ranked continuation.
+
+The result remains **preview-only**: the model receives title + newline + index
+snippet, not full canonical message bodies. The native tokenizer may further
+truncate query/passage pairs; `model_input_may_be_token_truncated` reports that
+possibility rather than claiming complete-message scoring. Use `cass_view`
+separately to verify the winners against the canonical archive. Refinement adds
+no freshness proof and cannot find semantically related messages outside the
+lexical candidate pool. Global semantic/HNSW retrieval remains a separate lane.
+
+An empty pool returns `refinement.status: "no_candidates"` without loading a
+model. Nonempty success returns `"applied"`, model reuse/setup/inference details,
+and the observed model counters. `model_epoch` is session-local, not a model
+file digest or version certificate. Missing or incompatible files and inference
+failures produce `refinement_failed`, never relabeled lexical scores. Ordinary
+search remains usable after such an error. Without startup permission,
+JSON-lines returns `refinement_disabled` and MCP treats `cass_refine` as unknown.
+
+The normal service regression target covers admission, ranking projection,
+empty and missing-model behavior, MCP permission/quota rules, and binary dispatch.
+A separate opt-in test exercises the real model and retained reader together:
+
+```sh
+CASS_TEST_RERANKER_MODEL=/path/to/models/ms-marco-MiniLM-L-6-v2 \
+  cargo test --locked --test search_service \
+  search_service::refinement::tests::native_refinement_reuses_real_model_and_reader_without_global_semantic_assets \
+  -- --ignored --exact --test-threads=1
+```
+
+Run native tests through the repository's normal verification environment.
+The opt-in test is not a passing test until the model-backed command executes.
+
+Refinement uses the same admission lease as its lexical shortlist. A busy pool
+returns `admission_busy` before index or model loading; `unload`, `reload`,
+shutdown and EOF release the model before the lease. Resident-memory sampling
+and the whole-request deadline remain active during model loading and inference.
