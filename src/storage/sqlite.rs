@@ -14133,6 +14133,19 @@ impl FrankenStorage {
         })
     }
 
+    /// The oversized shadow is already fully retired: no registration, no
+    /// leftover `fts_messages_*` table, and both durable markers recorded.
+    /// A startup preflight then has nothing to drop or record. Re-retiring
+    /// would rewrite two meta rows on every index run, moving the WAL's
+    /// physical identity and invalidating the one-shot fingerprint cache
+    /// before the next search, for no change in state.
+    pub(crate) fn fts_shadow_retirement_is_recorded(&self) -> Result<bool> {
+        Ok(!self.fts_shadow_registered()?
+            && self.fts_shadow_residue_detail(0)?.is_none()
+            && self.fts_shadow_not_viable_marker()?.is_some()
+            && self.read_fallback_fts_repair_pending()?.is_some())
+    }
+
     /// Remember how much corpus the shadow already covers, so inline flushes
     /// can tell when this run crosses the bound.
     pub(crate) fn note_fts_shadow_corpus_messages(&self, corpus_messages: u64) {
@@ -15202,8 +15215,8 @@ impl FrankenStorage {
                         .to_ascii_lowercase()
                         .split_whitespace()
                         .collect();
-                    let has_empty_content = normalized.contains("content=''")
-                        || normalized.contains("content=\"\"");
+                    let has_empty_content =
+                        normalized.contains("content=''") || normalized.contains("content=\"\"");
                     let has_contentless_delete = normalized.contains("contentless_delete=1");
                     if !(has_empty_content && has_contentless_delete) {
                         all_contentless = false;
@@ -15217,9 +15230,30 @@ impl FrankenStorage {
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
         self.invalidate_fts_messages_present_cache();
-        let before = self
+        let mut before = self
             .inspect_search_fallback_fts_parity()
             .with_context(|| "inspecting the published FTS shadow before atomic rebuild")?;
+        // GH #495: residue (shadow tables surviving without a registration, or
+        // a single registration cass never writes) cannot enter the atomic
+        // rebuild: a leftover `fts_messages_*` table makes the CREATE fail, and
+        // frankensqlite cannot recreate a virtual table in the transaction that
+        // drops it. Every direct caller (`rebuild_fts`, dedup, forget, the
+        // agent-exclusion purge, reset) previously reached a drop+recreate for
+        // the legacy-DDL shape, so remove the derived residue in autocommit and
+        // rebuild from an absent shadow. Only derived tables are dropped;
+        // canonical rows are never touched.
+        if before.status == FtsShadowParityStatus::Residue {
+            self.drop_fts_shadow_residue()
+                .with_context(|| "removing derived FTS residue before the rebuild")?;
+            before = self
+                .inspect_search_fallback_fts_parity()
+                .with_context(|| "inspecting the FTS shadow after residue removal")?;
+            anyhow::ensure!(
+                before.status == FtsShadowParityStatus::Absent,
+                "FTS residue removal left a {} shadow instead of an absent one",
+                before.status.as_str()
+            );
+        }
         // Route queryable shadows whose surviving CREATE is NOT cass's
         // canonical contentless registration through DROP+recreate instead of
         // DELETE_ALL. cass only ever creates `content='', contentless_delete=1`
@@ -23828,11 +23862,134 @@ mod tests {
             storage.ensure_search_fallback_fts_consistency().unwrap(),
             FtsConsistencyRepair::Rebuilt { inserted_rows: 1 }
         ));
-        assert!(storage.fts_messages_schema_is_canonical_contentless().unwrap());
+        assert!(
+            storage
+                .fts_messages_schema_is_canonical_contentless()
+                .unwrap()
+        );
         assert!(matches!(
             storage.ensure_search_fallback_fts_consistency().unwrap(),
             FtsConsistencyRepair::AlreadyHealthy { rows: 1 }
         ));
+    }
+
+    /// GH #495 follow-up: residue classification must not strand the direct
+    /// `rebuild_fts()` callers (agent-exclusion purge, forget, dedup, reset).
+    /// Before the residue state existed, the legacy-DDL shape reached the
+    /// drop+recreate route; after it, the atomic rebuild bailed with "FTS
+    /// residue must be removed", so `sources agents exclude` exited 5 on every
+    /// legacy archive. Both residue shapes must now rebuild to one canonical,
+    /// healthy shadow without touching canonical rows. The orphan tables are
+    /// populated (the reporter's archive carried rows in its WITHOUT ROWID
+    /// `_config`/`_idx`), so a repair that drops only the `fts_messages`
+    /// registration fails here on "fts_messages_data already exists".
+    #[test]
+    fn gh495_direct_rebuild_callers_remove_residue_instead_of_failing() {
+        type Shape = fn(&FrankenStorage);
+        let orphan_populated: Shape = |storage| {
+            storage.raw().execute("DROP TABLE fts_messages").unwrap();
+            for sql in [
+                "CREATE TABLE fts_messages_config(k PRIMARY KEY, v) WITHOUT ROWID",
+                "INSERT INTO fts_messages_config VALUES('version', 4)",
+                "CREATE TABLE fts_messages_content(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5, c6)",
+                "INSERT INTO fts_messages_content VALUES(99, 'orphan residue text', 't', 'codex', '/tmp', '/tmp/x', 0, 99)",
+                "CREATE TABLE fts_messages_data(id INTEGER PRIMARY KEY, block BLOB)",
+                "INSERT INTO fts_messages_data VALUES(1, x'00')",
+                "CREATE TABLE fts_messages_docsize(id INTEGER PRIMARY KEY, sz BLOB)",
+                "INSERT INTO fts_messages_docsize VALUES(99, x'01')",
+                "CREATE TABLE fts_messages_idx(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+                "INSERT INTO fts_messages_idx VALUES(1, 'orphan', 1)",
+            ] {
+                storage.raw().execute(sql).unwrap();
+            }
+        };
+        let legacy_ddl: Shape = |storage| {
+            storage.raw().execute("DROP TABLE fts_messages").unwrap();
+            storage
+                .raw()
+                .execute(
+                    "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                        content, title, agent, workspace, source_path,
+                        created_at UNINDEXED, message_id UNINDEXED, tokenize='porter'
+                     )",
+                )
+                .unwrap();
+        };
+        for (name, shape) in [
+            ("orphan-populated", orphan_populated),
+            ("legacy-ddl", legacy_ddl),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let storage =
+                FrankenStorage::open(&dir.path().join(format!("gh495-direct-{name}.db"))).unwrap();
+            seed_atomic_fts_rebuild_fixture(&storage);
+            shape(&storage);
+            let canonical_rows = || {
+                storage
+                    .raw()
+                    .query("SELECT id, conversation_id, idx, content FROM messages ORDER BY id")
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>()
+            };
+            let before_rows = canonical_rows();
+            assert_eq!(
+                storage.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Residue,
+                "{name}: fixture must start as residue"
+            );
+
+            storage
+                .rebuild_fts()
+                .unwrap_or_else(|err| panic!("{name}: direct rebuild must converge: {err:#}"));
+
+            assert_eq!(
+                storage.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Healthy,
+                "{name}: rebuild must publish exact parity"
+            );
+            assert!(
+                storage
+                    .fts_messages_schema_is_canonical_contentless()
+                    .unwrap(),
+                "{name}: only the canonical registration may survive"
+            );
+            let matches = |term: &str| {
+                storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
+                        fparams![term],
+                        |row| row.get_typed::<i64>(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(
+                matches("survives"),
+                1,
+                "{name}: canonical text is searchable"
+            );
+            assert_eq!(
+                matches("orphan"),
+                0,
+                "{name}: residue text must not survive"
+            );
+            assert_eq!(
+                canonical_rows(),
+                before_rows,
+                "{name}: canonical rows changed"
+            );
+
+            // Idempotent: a healthy canonical shadow takes the ordinary
+            // transactional path and stays canonical.
+            storage.rebuild_fts().unwrap();
+            assert_eq!(
+                storage.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Healthy
+            );
+            assert_eq!(matches("survives"), 1);
+        }
     }
 
     /// GH #413 follow-up (iify0): the shadow bound drops an oversized shadow,
@@ -24032,9 +24189,19 @@ mod tests {
                         storage.inspect_search_fallback_fts_parity().unwrap().status,
                         FtsShadowParityStatus::Absent
                     );
-                    assert_eq!(
-                        storage.fts_shadow_not_viable_marker().unwrap().as_deref(),
-                        marker_present.then_some(historical_marker)
+                    // The refusal records the durable size-retirement marker
+                    // with the current counts whether or not one existed: the
+                    // next full index reads it as the terminal
+                    // `SkippedNotViable` state instead of retrying a repair
+                    // that must fail (GH #495, repair_fallback_fts_after_full_index_run).
+                    let marker = storage.fts_shadow_not_viable_marker().unwrap();
+                    assert!(
+                        marker
+                            .as_deref()
+                            .is_some_and(|marker| marker != historical_marker
+                                && error_message_indicates_fts_shadow_not_viable(marker)),
+                        "over-bound refusal must record a fresh not-viable marker \
+                         (marker_present={marker_present}): {marker:?}"
                     );
                 } else {
                     assert!(matches!(

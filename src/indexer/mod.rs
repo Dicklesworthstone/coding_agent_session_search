@@ -2871,6 +2871,11 @@ fn preflight_fts_shadow_before_lexical_readers(db_path: &Path) -> Result<()> {
             bound_messages,
         } = storage.fts_shadow_viability()?
         {
+            // Already retired by an earlier run: nothing to drop, and
+            // rewriting the markers would only churn the archive's WAL.
+            if storage.fts_shadow_retirement_is_recorded()? {
+                return Ok(());
+            }
             let detail = crate::storage::sqlite::fts_shadow_not_viable_detail(
                 corpus_messages,
                 bound_messages,
@@ -15664,6 +15669,11 @@ fn run_index_inner(
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
+    if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS").ok().and_then(|value| {
+        crate::connectors::codex::path_policy::colon_separated_exclusion_warning(&value)
+    }) {
+        tracing::warn!("{warning}");
+    }
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
@@ -53012,6 +53022,89 @@ mod tests {
                 }
             )
         );
+    }
+
+    /// GH #495 follow-up: since an absent over-bound shadow counts as
+    /// `NotViable`, the startup preflight retires it on the first run. A later
+    /// run on the same, already retired archive must not rewrite the markers
+    /// (per-run meta writes move the WAL's physical identity and invalidate
+    /// the one-shot fingerprint cache), while a half-recorded retirement must
+    /// still be recorded again.
+    #[test]
+    fn gh495_preflight_leaves_an_already_retired_shadow_untouched() {
+        const CHILD: &str = "CASS_TEST_GH495_PREFLIGHT_CHILD";
+        if dotenvy::var(CHILD).is_err() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "indexer::tests::gh495_preflight_leaves_an_already_retired_shadow_untouched",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable;
+        const SENTINEL: &str = "sentinel retirement recorded by an earlier run";
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("gh495-preflight.db");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            seed_lexical_rebuild_fixture(&storage);
+            storage.close_without_checkpoint().unwrap();
+        }
+        let with_deferred = |f: &dyn Fn(&FrankenStorage)| {
+            let storage = FrankenStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
+            f(&storage);
+            storage.close_without_checkpoint().unwrap();
+        };
+        let markers = || {
+            let storage = FrankenStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
+            let markers = (
+                storage.fts_shadow_not_viable_marker().unwrap(),
+                storage.read_fallback_fts_repair_pending().unwrap(),
+            );
+            storage.close_without_checkpoint().unwrap();
+            markers
+        };
+
+        // First run retires the over-bound shadow and records both markers.
+        preflight_fts_shadow_before_lexical_readers(&db_path).unwrap();
+        let (marker, pending) = markers();
+        assert!(
+            marker
+                .as_deref()
+                .is_some_and(error_message_indicates_fts_shadow_not_viable),
+            "first preflight must record the retirement: {marker:?}"
+        );
+        assert!(pending.is_some());
+
+        // An already retired archive keeps its recorded state byte-for-byte.
+        with_deferred(&|storage| storage.drop_fts_shadow_as_not_viable(SENTINEL).unwrap());
+        preflight_fts_shadow_before_lexical_readers(&db_path).unwrap();
+        assert_eq!(markers().0.as_deref(), Some(SENTINEL));
+
+        // Negative: a half-recorded retirement is not current, so the next
+        // preflight records it again (a bare "skip when unregistered" fails).
+        with_deferred(&|storage| storage.record_fallback_fts_repair_pending(None).unwrap());
+        preflight_fts_shadow_before_lexical_readers(&db_path).unwrap();
+        let (marker, pending) = markers();
+        assert!(
+            marker.as_deref().is_some_and(|marker| marker != SENTINEL
+                && error_message_indicates_fts_shadow_not_viable(marker)),
+            "a half-recorded retirement must be recorded again: {marker:?}"
+        );
+        assert!(pending.is_some());
     }
 
     /// #439: the fallback-FTS shadow maintenance must report liveness per
