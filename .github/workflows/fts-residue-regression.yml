@@ -29,11 +29,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64, gzip, hashlib, pathlib, re, subprocess
+          import base64, gzip, hashlib, re, subprocess
           transport = subprocess.check_output(['git', 'show', 'e5a882e8eefb22ded2ea5bb557af0e7c007f8122:.github/workflows/fts-residue-regression.yml'], text=True)
           payload = re.search(r"printf '%s' '([^']+)'", transport).group(1)
-          # Repair four transcription errors in the immutable transport;
-          # authenticate the resulting exact Git patch before applying it.
           for start, end, old, new in reversed([(510,511,'e',''), (1801,1803,'FS',''), (12044,12044,'','V'), (16657,16657,'','/')]):
               assert payload[start:end] == old
               payload = payload[:start] + new + payload[end:]
@@ -42,20 +40,32 @@ jobs:
           subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
           subprocess.run(['git', 'apply', '-'], input=patch, check=True)
           PY
+          git apply - <<'PATCH'
+          --- a/src/storage/sqlite.rs
+          +++ b/src/storage/sqlite.rs
+          @@ -23563,6 +23563,11 @@
+                       storage.ensure_search_fallback_fts_consistency().unwrap();
+                       storage.raw().execute("DELETE FROM fts_messages_docsize WHERE id = 2").unwrap();
+                       if stray_content {
+          +                // A contentless registration need not create _content at all.
+          +                // Model residue from an older registration explicitly.
+          +                storage.raw().execute(
+          +                    "CREATE TABLE IF NOT EXISTS fts_messages_content(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5, c6)"
+          +                ).unwrap();
+                           storage.raw().execute(
+                               "INSERT OR REPLACE INTO fts_messages_content(id,c0) VALUES(2,'unbound old content')"
+                           ).unwrap();
+          PATCH
           rustfmt --edition 2024 --config skip_children=true src/storage/sqlite.rs src/doctor_recover.rs src/indexer/mod.rs src/lib.rs
           git diff --check
           git diff --stat
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Run residue and convergence regressions
+      - name: Run all fallback FTS regressions
         run: |
           set -o pipefail
-          cargo test --locked --lib fts_residue -- --test-threads=1 2>&1 | tee fts-residue-test.log
-          cargo test --locked --lib fts_shadow_ -- --test-threads=1 2>&1 | tee fts-shadow-test.log
-          cargo test --locked --lib fts_contentless_docsize -- --test-threads=1 2>&1 | tee fts-contentless-test.log
-          cargo test --locked --lib fts_repair_refuses_an_active_index_lease -- --test-threads=1 2>&1 | tee fts-lock-test.log
-          cargo test --locked --lib fallback_fts -- --test-threads=1 2>&1 | tee fallback-fts-test.log
+          cargo test --locked --lib fts -- --test-threads=1 2>&1 | tee fts-test.log
       - name: Publish repair directly to main
         run: |
           git config user.name 'github-actions[bot]'
