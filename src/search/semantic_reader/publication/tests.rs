@@ -1306,3 +1306,5 @@ fn corrupt_graph_fails_strict_audit_but_preserves_fresh_exact_and_retained_ann()
 mod sharded;
 
 mod admission;
+
+mod text;

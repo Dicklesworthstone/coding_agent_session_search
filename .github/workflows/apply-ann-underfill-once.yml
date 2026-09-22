@@ -1,144 +1,23 @@
-name: Verify publication-bound text retrieval
+# Both source-only landings completed. No job retains repository-write access.
+name: Verify landed retrieval commits
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/apply-ann-underfill-once.yml]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  prepare:
-    runs-on: macos-14
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Prepare only exact reviewed source blobs
-        shell: python
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          import base64, hashlib, json, os, subprocess, tarfile, urllib.request
-          from pathlib import Path
-          repo = 'Dicklesworthstone/coding_agent_session_search'
-          parents = {
-              'src/search/semantic_reader/publication.rs': ('8a372f053c811825c51cffc2dcc5d8ace5ccc2ab', '24b95a509c7724eb877bb67e3799412324ec6943'),
-              'src/search/semantic_reader/publication/tests.rs': ('8d606b52626b30091d30244a267d03ad6c311de9', '2e788d0ca59341267a99905bf5d0e4ba1a67c4d2'),
-          }
-          additions = {
-              'src/search/semantic_reader/publication/text.rs': 'd604353f64df83bfc1fddb3f0ae176601091100c',
-              'src/search/semantic_reader/publication/tests/text.rs': '307b56b54b2a1c8f3c8956e8111c280c0ee2d383',
-              'docs/SEMANTIC_TEXT_READER.md': '088192ee74f4dfddc0be56aac92b079e4d7753a2',
-          }
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          def api(path, data=None):
-              request = urllib.request.Request('https://api.github.com/repos/' + repo + path,
-                  data=None if data is None else json.dumps(data).encode(),
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  return json.load(response)
-          def content(sha):
-              result = api('/git/blobs/' + sha)
-              assert result['encoding'] == 'base64'
-              data = base64.b64decode(result['content'])
-              assert blob(data) == sha
-              return data
-          def run(*args, **kwargs):
-              return subprocess.run(args, check=True, **kwargs)
-          for path, (expected, _) in parents.items():
-              assert blob(Path(path).read_bytes()) == expected, path
-          for path in additions:
-              assert not Path(path).exists(), path
-          patch = Path(os.environ['RUNNER_TEMP']) / 'publication-text.patch'
-          patch.write_bytes(content('390f023db1aac70f773bc5ed1f3603ca106a398d'))
-          run('git', 'apply', '--check', '--whitespace=error-all', str(patch))
-          run('git', 'apply', '--whitespace=error-all', str(patch))
-          run('git', 'apply', '--reverse', '--check', str(patch))
-          for path, (_, expected) in parents.items():
-              assert blob(Path(path).read_bytes()) == expected, path
-          for path, sha in additions.items():
-              target = Path(path)
-              target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_bytes(content(sha))
-          paths = list(parents) + list(additions)
-          for path in paths:
-              if path.endswith('.rs'):
-                  run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', path)
-                  run('rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--check', path)
-          run('git', 'diff', '--check')
-          receipt = {'source': os.environ['GITHUB_SHA'], 'blobs': {}}
-          for path in paths:
-              data = Path(path).read_bytes()
-              result = api('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
-              assert result['sha'] == blob(data)
-              receipt['blobs'][path] = result['sha']
-          Path('publication-text-receipt.json').write_text(json.dumps(receipt, indent=2))
-          with tarfile.open('publication-text-source.tar.gz', 'w:gz') as tar:
-              for path in paths:
-                  tar.add(path)
-              tar.add('publication-text-receipt.json')
-          print(json.dumps(receipt, sort_keys=True))
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: publication-text-source-${{ github.sha }}
-          path: publication-text-source.tar.gz
-          retention-days: 3
-  native:
-    needs: prepare
+  ancestry-only:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: publication-text-source-${{ github.sha }}
-      - name: Verify prepared source before native execution
+      - name: Verify commit ancestry, not runtime qualification
+        shell: bash
         run: |
-          tar -xzf publication-text-source.tar.gz
-          python3 - <<'PY'
-          import hashlib, json
-          from pathlib import Path
-          for path, expected in json.loads(Path('publication-text-receipt.json').read_text())['blobs'].items():
-              data = Path(path).read_bytes()
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected
-          PY
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: clippy
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-      - name: Run selected-publication and core text tests
-        run: |
-          set -o pipefail
-          cargo test --locked --lib search::semantic_reader::publication::tests::text -- --nocapture 2>&1 | tee publication-text-tests.log
-          grep -Eq 'test result: ok\. 4 passed; 0 failed; 1 ignored' publication-text-tests.log
-          cargo test --locked --lib search::semantic_reader::text::tests -- --nocapture 2>&1 | tee text-query-tests.log
-          grep -Eq 'test result: ok\. 8 passed; 0 failed' text-query-tests.log
-          cargo test --locked --lib search::semantic_reader:: -- --nocapture 2>&1 | tee retained-reader-tests.log
-      - name: Strict library Clippy
-        if: always()
-        run: cargo clippy --locked --lib -- -D warnings
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: publication-text-native-${{ github.sha }}
-          path: '*-tests.log'
-          retention-days: 3
+          set -euo pipefail
+          git merge-base --is-ancestor e36ad641e95df88c289d70fc467e5159542d9c92 HEAD
+          git merge-base --is-ancestor d671ab449af2d6bd34bac12a7992f79b3c2cc36c HEAD
+          printf '%s\n' 'Both retrieval fixes are present in this history.' 'This check proves ancestry only; use Verify search retrieval for component and locked CASS tests.'

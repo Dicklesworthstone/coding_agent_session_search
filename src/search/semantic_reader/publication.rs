@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 mod coverage;
 mod live_docset;
+pub mod text;
 
 use frankensearch::core::TieredQueryEmbeddings;
 use frankensearch::core::filter::SearchFilter;
