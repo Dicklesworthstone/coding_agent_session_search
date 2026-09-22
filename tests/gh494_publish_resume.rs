@@ -206,6 +206,13 @@ fn gh494_live_eof_checkpoint_finishes_certification_instead_of_returning_early()
 fn gh494_search_budget_refuses_inline_work_but_explicit_full_index_recovers() {
     let (tmp, data_dir, index) = fixture();
     plant_eof_checkpoint(&index);
+    // No independent proof exists in this refusal fixture. A completed prior
+    // generation with a valid receipt is covered by the availability control.
+    std::fs::rename(
+        index.join(".lexical-published-state.json"),
+        tmp.path().join("saved-publication-receipt.json"),
+    )
+    .unwrap();
     let checkpoint_before = std::fs::read(index.join(CHECKPOINT)).unwrap();
     let generation_before = std::fs::read(index.join(GENERATION)).unwrap();
     let manifest_before = std::fs::read(index.join("MANIFEST")).unwrap();
@@ -304,6 +311,69 @@ fn gh494_readable_generation_remains_searchable_with_a_zero_repair_budget() {
             std::fs::read(index.join(GENERATION)).unwrap(),
             generation_before
         );
+    }
+}
+
+#[test]
+fn gh494_interrupted_rebuild_keeps_certified_prior_searches_available() {
+    let (tmp, data_dir, index) = fixture();
+    plant_eof_checkpoint(&index);
+    let paths = [
+        CHECKPOINT,
+        GENERATION,
+        "MANIFEST",
+        ".lexical-published-state.json",
+    ];
+    let before: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(index.join(path)).unwrap())
+        .collect();
+    for no_maintenance in [false, true] {
+        for robot in [false, true] {
+            let mut command = cass(tmp.path());
+            command
+                .env(
+                    "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                    "0",
+                )
+                .timeout(Duration::from_secs(30))
+                .args([
+                    "search",
+                    PROBE,
+                    "--mode",
+                    "lexical",
+                    "--limit",
+                    "100",
+                    "--data-dir",
+                ])
+                .arg(&data_dir);
+            if no_maintenance {
+                command.arg("--no-maintenance");
+            }
+            if robot {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if robot {
+                let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(json["hits"].as_array().unwrap().len(), SESSIONS * 2);
+            } else {
+                assert!(String::from_utf8_lossy(&output.stdout).contains(PROBE));
+            }
+            assert!(
+                !String::from_utf8_lossy(&output.stderr)
+                    .contains("rebuilding from canonical database before running query")
+            );
+            for (path, bytes) in paths.iter().zip(&before) {
+                assert_eq!(std::fs::read(index.join(path)).unwrap(), *bytes, "{path}");
+            }
+            assert_eq!(read_json(&index.join(CHECKPOINT))["completed"], false);
+        }
     }
 }
 

@@ -114,7 +114,12 @@ jobs:
             gh494_missing_staged_pending_commit_cannot_be_promoted_by_prior_live \
             gh494_legacy_cursor_without_its_generation_replays_instead_of_guessing \
             gh494_explicit_live_resume_ignores_unrelated_scratch_generation \
-            gh494_bound_staged_reconciliation_refuses_missing_content_without_mutation
+            gh494_bound_staged_reconciliation_refuses_missing_content_without_mutation \
+            gh494_refused_rebuild_preserves_and_bootstraps_prior_publication_authority \
+            gh494_publication_receipt_rejects_inconsistent_counts_contract_and_identity \
+            gh494_publication_receipt_is_bounded_and_never_repairs_itself_on_read \
+            gh494_incomplete_rebuild_without_independent_receipt_is_not_searchable \
+            gh494_active_rebuild_serves_certified_prior_generation_without_joining
           do
             grep -F "$name: test" "$RUNNER_TEMP/gh494-results/test-list.log"
           done
@@ -128,6 +133,12 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --test gh494_publish_resume -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/cli-resume-regressions.log"
+          grep -F 'gh494_interrupted_rebuild_keeps_certified_prior_searches_available ... ok' "$RUNNER_TEMP/gh494-results/cli-resume-regressions.log"
+      - name: Retain all search self-heal and strict-admission controls
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
+        shell: bash
+        run: |
+          cargo test --locked --lib search_lexical_self_heal_tests:: -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/search-self-heal.log"
       - name: Retain hollow-generation and publication rollback coverage
         if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
         shell: bash

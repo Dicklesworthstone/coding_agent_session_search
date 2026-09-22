@@ -679,3 +679,83 @@ fn service_memory_configuration_and_initial_overage_fail_before_storage_access()
     }
     Ok(())
 }
+
+#[test]
+fn binary_refinement_opt_in_is_lazy_and_mcp_rejects_invalid_work_before_access() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    for enabled in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let index = temp.path().join("never-opened-index");
+        let model = temp.path().join("never-opened-model");
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .args(["serve", "--stdio", "--mcp", "--request-timeout-ms", "5000", "--index"])
+            .arg(&index);
+        if enabled {
+            command.arg("--reranker-model").arg(&model);
+        }
+        let mut child = DeadlineChild(command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?);
+        // Drain both pipes while the process runs: an expanded tool catalog
+        // must not deadlock the test at an operating-system pipe capacity.
+        let mut stdout = child.0.stdout.take().unwrap();
+        let output = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let mut stderr = child.0.stderr.take().unwrap();
+        let diagnostics = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let mut input = child.0.stdin.take().unwrap();
+        for request in [
+            serde_json::json!({"jsonrpc": "2.0", "id": "initialize", "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "fixture", "version": "1"}}}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "catalog", "method": "tools/list"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "refine", "method": "tools/call",
+                "params": {"name": "cass_refine", "arguments": {
+                    "query": "relevance", "lexical_query": "performance", "limit": 0}}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": "status", "method": "tools/call",
+                "params": {"name": "cass_status", "arguments": {}}}),
+        ] {
+            writeln!(input, "{request}")?;
+        }
+        drop(input);
+        let status = child.0.wait_timeout(Duration::from_secs(15))?;
+        if status.is_none() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        let bytes = output.join().expect("stdout reader panicked")?;
+        let stderr = diagnostics.join().expect("stderr reader panicked")?;
+        assert!(status.is_some_and(|status| status.success()), "{}", String::from_utf8_lossy(&stderr));
+        let replies = std::str::from_utf8(&bytes)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(replies.len(), 4);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), if enabled { 5 } else { 4 });
+        assert_eq!(replies[2]["id"], "refine");
+        if enabled {
+            assert_eq!(replies[2]["result"]["isError"], true);
+            assert_eq!(replies[2]["result"]["structuredContent"]["error"]["kind"], "invalid_request");
+        } else {
+            assert_eq!(replies[2]["error"]["code"], -32602);
+        }
+        let state = &replies[3]["result"]["structuredContent"];
+        assert_eq!(state["refinement"]["enabled"], enabled);
+        assert_eq!(state["refinement"]["load_attempts"], 0);
+        assert_eq!(state["open_attempts"], 0);
+        assert_eq!(state["models_loaded"], false);
+        assert!(!index.exists());
+        assert!(!model.exists());
+    }
+    Ok(())
+}

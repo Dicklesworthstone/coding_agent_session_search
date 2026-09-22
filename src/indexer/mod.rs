@@ -8910,6 +8910,114 @@ fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState)
     write_json_pretty_atomically(&path, state)
 }
 
+// Rebuild progress and publication authority have different lifetimes. A staged
+// rebuild overwrites .lexical-rebuild-state.json in the LIVE directory before
+// touching its documents. Keep a separate, immutable-until-publication receipt
+// so readers need not join (or restart) that rebuild to search the prior index.
+const LEXICAL_PUBLISHED_STATE_FILE: &str = ".lexical-published-state.json";
+const LEXICAL_PUBLISHED_STATE_MAX_BYTES: u64 = 1024 * 1024;
+
+fn lexical_state_can_certify_publication(state: &LexicalRebuildState) -> bool {
+    state.version == LEXICAL_REBUILD_STATE_VERSION
+        && state.completed
+        && state.pending.is_none()
+        && state.schema_hash == crate::search::tantivy::SCHEMA_HASH
+        && lexical_rebuild_page_size_is_compatible(state.page_size)
+        && state.processed_conversations == state.db.total_conversations
+        && usize::try_from(state.committed_offset).ok() == Some(state.db.total_conversations)
+        && state.indexed_docs <= state.db.total_messages
+        && completed_lexical_storage_fingerprint_matches_total(
+            &state.db.storage_fingerprint,
+            state.db.total_conversations,
+        )
+        && state
+            .committed_meta_fingerprint
+            .as_ref()
+            .is_some_and(|hash| !hash.is_empty())
+}
+
+fn lexical_publication_receipt_matches_live(
+    index_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<bool> {
+    if !lexical_state_can_certify_publication(state) {
+        return Ok(false);
+    }
+    let before = index_meta_fingerprint(index_path)?;
+    if before != state.committed_meta_fingerprint {
+        return Ok(false);
+    }
+    let count_matches = crate::search::tantivy::searchable_index_live_doc_count(index_path)
+        .is_some_and(|docs| u128::from(docs) == state.indexed_docs as u128);
+    // A concurrent atomic swap must not combine one generation's receipt with
+    // another's count. No canonical DB open, repair, or freshness claim here.
+    Ok(count_matches && index_meta_fingerprint(index_path)? == before)
+}
+
+fn persist_lexical_publication_receipt(
+    index_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<()> {
+    anyhow::ensure!(
+        lexical_state_can_certify_publication(state),
+        "cannot publish an incomplete or inconsistent lexical receipt"
+    );
+    let path = index_path.join(LEXICAL_PUBLISHED_STATE_FILE);
+    write_json_pretty_atomically(&path, state)?;
+    sync_parent_directory(&path)
+}
+
+/// Read-only proof for serving the last completed generation during a staged
+/// rebuild. This never certifies the INCOMPLETE rebuild or advances its cursor.
+/// Callers must also admit the engine's readable contract before serving it.
+pub(crate) fn has_usable_lexical_publication_receipt(index_path: &Path, db_path: &Path) -> bool {
+    let inspect = || -> Result<bool> {
+        use std::io::Read;
+        let path = index_path.join(LEXICAL_PUBLISHED_STATE_FILE);
+        let metadata = fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() <= LEXICAL_PUBLISHED_STATE_MAX_BYTES,
+            "lexical publication receipt is not a bounded regular file"
+        );
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A replaced receipt must not turn this bounded read into a FIFO
+            // open or a symlink traversal between metadata inspection and open.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&path)?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "lexical receipt is not a regular file"
+        );
+        let mut bytes = Vec::new();
+        file.take(LEXICAL_PUBLISHED_STATE_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= LEXICAL_PUBLISHED_STATE_MAX_BYTES,
+            "lexical publication receipt exceeds its read budget"
+        );
+        let state: LexicalRebuildState = serde_json::from_slice(&bytes)?;
+        if !crate::stored_path_identity_matches(&state.db.db_path, db_path) {
+            return Ok(false);
+        }
+        lexical_publication_receipt_matches_live(index_path, &state)
+    };
+    match inspect() {
+        Ok(usable) => usable,
+        Err(error) => {
+            tracing::debug!(
+                error = %format!("{error:#}"),
+                "no usable independent lexical publication receipt"
+            );
+            false
+        }
+    }
+}
+
 fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
     let path = lexical_rebuild_state_path(index_path);
     match fs::remove_file(&path) {
@@ -9301,6 +9409,21 @@ fn persist_lexical_rebuild_state_for_active_run_start(
     index_path: &Path,
     state: &LexicalRebuildState,
 ) -> Result<()> {
+    // Bootstrap older completed generations before replacing their only
+    // checkpoint with progress for an off-live candidate. Never copy an
+    // incomplete checkpoint or a receipt for different engine bytes.
+    if !state.completed
+        && let Some(previous) = load_lexical_rebuild_state(index_path)?
+    {
+        match lexical_publication_receipt_matches_live(index_path, &previous) {
+            Ok(true) => persist_lexical_publication_receipt(index_path, &previous)?,
+            Ok(false) => {}
+            Err(error) => tracing::debug!(
+                error = %format!("{error:#}"),
+                "previous generation cannot be certified; continuing explicit rebuild"
+            ),
+        }
+    }
     persist_lexical_rebuild_state(index_path, state)
 }
 
@@ -25737,6 +25860,9 @@ fn rebuild_tantivy_from_db_with_options(
     rebuild_state.mark_completed(completed_fingerprint);
     publication.run("persist_completed_checkpoint", || {
         persist_lexical_rebuild_state(&build_path, &rebuild_state)
+    })?;
+    publication.run("persist_publication_receipt", || {
+        persist_lexical_publication_receipt(&build_path, &rebuild_state)
     })?;
     publication.run("sync_certified_candidate", || {
         sync_parent_directory(&lexical_rebuild_state_path(&build_path))

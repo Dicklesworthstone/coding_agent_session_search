@@ -27611,6 +27611,11 @@ fn search_lexical_self_heal_diagnosis(
         ))));
     }
     if !checkpoint.completed {
+        if crate::indexer::has_usable_lexical_publication_receipt(index_path, db_path) {
+            return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
+                "lexical rebuild is incomplete; serving the independently certified prior generation and deferring refresh",
+            )));
+        }
         return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
             "lexical rebuild checkpoint is incomplete",
         )));
@@ -27840,6 +27845,11 @@ fn search_lexical_read_only_diagnosis(
         ))));
     }
     if !checkpoint.completed {
+        if crate::indexer::has_usable_lexical_publication_receipt(index_path, db_path) {
+            return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
+                "lexical rebuild is incomplete; serving the independently certified prior generation without maintenance",
+            )));
+        }
         return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
             "lexical rebuild checkpoint is incomplete",
         )));
@@ -27999,8 +28009,9 @@ fn repair_lexical_index_for_search_with_stall_watchdog(
 
 // A lock race does not make the generation observed before the race safe.
 // Reuse only a freshly diagnosed readable generation, including intentionally
-// stale-but-readable ones; missing, foreign and incomplete generations cannot
-// become usable merely because another indexer acquired the lock.
+// stale-but-readable ones. An incomplete rebuild can coexist with an independently
+// certified publication; missing, foreign or unverified generations cannot become
+// usable merely because another indexer acquired the lock.
 fn search_existing_lexical_generation_is_usable(
     index_path: &Path,
     db_path: &Path,
@@ -28630,6 +28641,13 @@ mod search_lexical_self_heal_tests {
             false,
         )
         .expect("build checkpointed lexical generation");
+        // This matrix exercises unverified assets. A certified prior generation
+        // may outlive incomplete rebuild progress (covered by GH494 controls).
+        std::fs::rename(
+            index_path.join(".lexical-published-state.json"),
+            data_dir.join("saved-publication-receipt.json"),
+        )
+        .expect("retain receipt outside the unverified admission fixture");
         let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
         let original: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&checkpoint_path).expect("read checkpoint"))
@@ -29173,6 +29191,12 @@ mod search_lexical_self_heal_tests {
         )
         .expect("initial rebuild from active database");
 
+        // No independent prior-generation proof is available in this case.
+        std::fs::rename(
+            index_path.join(".lexical-published-state.json"),
+            data_dir.join("saved-publication-receipt.json"),
+        )
+        .expect("retain receipt outside the unverified active-rebuild fixture");
         let state_path = index_path.join(".lexical-rebuild-state.json");
         let mut state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
@@ -29236,6 +29260,13 @@ mod search_lexical_self_heal_tests {
         )
         .expect("initial rebuild from active database");
 
+        // Preserve the unverified-generation refusal case: a valid prior
+        // receipt would authorize stale reads, not an inline repair.
+        std::fs::rename(
+            index_path.join(".lexical-published-state.json"),
+            data_dir.join("saved-publication-receipt.json"),
+        )
+        .expect("retain receipt outside the robot refusal fixture");
         // Mark the checkpoint incomplete AND grow the canonical DB so the
         // live-index doc count no longer matches — the cheap metadata-only
         // checkpoint refresh then cannot reconcile, and only the heavyweight

@@ -1,5 +1,6 @@
 //! Explicit logical-archive commands. Kept outside the ordinary search startup
-//! path: these commands do not construct search indexes, models or maintenance.
+//! path. Only import's explicit --rebuild-index opts into canonical-only lexical
+//! reconstruction; export, verification and ordinary import never do so.
 
 mod codec;
 mod export;
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
+use coding_agent_search::search::archive_rebuild::ArchiveIndexPlan;
 
 #[derive(Parser)]
 #[command(name = "cass", disable_version_flag = true)]
@@ -69,6 +71,11 @@ enum Operation {
         /// Accept an existing destination only after a read-only full-digest match.
         #[arg(long)]
         if_identical: bool,
+        /// Rebuild lexical search from the restored DB, without scanning providers.
+        /// Output must be <existing-data-directory>/agent_search.db, and input
+        /// must be outside that directory. The DB is retained if indexing fails.
+        #[arg(long)]
+        rebuild_index: bool,
     },
 }
 
@@ -84,6 +91,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let _ = cli.json;
     let Root::Archive { command } = cli.command;
     let mut destination_status = None;
+    let mut lexical_rebuild = None;
     let (operation, header, completion) = match command {
         Operation::Export { output, archive_id, include_private } => {
             ensure!(include_private, "full-fidelity export contains private session data; pass --include-private to acknowledge this");
@@ -96,15 +104,25 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let (header, completion) = export::verify_file(&input)?;
             ("verify", header, completion)
         }
-        Operation::Import { input, output, archive_id, include_private, if_identical } => {
+        Operation::Import { input, output, archive_id, include_private, if_identical, rebuild_index } => {
             ensure!(include_private, "restoration writes private session data; pass --include-private to acknowledge this");
+            let plan = rebuild_index.then(|| ArchiveIndexPlan::prepare(&output, &input)).transpose()?;
+            let output = plan.as_ref().map_or(output.as_path(), ArchiveIndexPlan::database);
             let (header, completion, created) = if if_identical {
-                import::import_file_with_policy(&input, &output, &archive_id, true)?
+                import::import_file_with_policy(&input, output, &archive_id, true)?
             } else {
-                let (header, completion) = import::import_file(&input, &output, &archive_id)?;
+                let (header, completion) = import::import_file(&input, output, &archive_id)?;
                 (header, completion, true)
             };
             destination_status = Some(if created { "created" } else { "unchanged" });
+            if let Some(plan) = plan {
+                lexical_rebuild = Some(plan.rebuild().map_err(|error| anyhow!(
+                    "canonical archive was {} and is retained at {}; lexical rebuild failed: {}; retry the same import with --if-identical --rebuild-index",
+                    if created { "created" } else { "verified unchanged" },
+                    plan.database().display(),
+                    error,
+                ))?);
+            }
             ("import", header, completion)
         }
     };
@@ -122,6 +140,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
     });
     if let Some(status) = destination_status {
         receipt["destination_status"] = serde_json::Value::String(status.to_owned());
+    }
+    if let Some(rebuild) = lexical_rebuild {
+        receipt["derived_search_assets"] = serde_json::json!("lexical_rebuilt_semantic_not_built");
+        receipt["lexical_rebuild"] = serde_json::to_value(rebuild)?;
     }
     println!("{receipt}");
     Ok(())

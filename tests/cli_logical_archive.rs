@@ -375,3 +375,182 @@ fn real_binary_verify_preserves_regular_input_and_refuses_a_link_to_it() {
     assert_eq!(fs::read_link(&linked).unwrap(), input);
     assert!(!root.path().join("unused-default").exists());
 }
+
+fn import_with_lexical_rebuild(home: &Path, input: &Path, target: &Path, identical: bool) -> Output {
+    let mut cmd = command(home);
+    cmd.args(["archive", "import"])
+        .arg(input)
+        .args(["--archive-id", "cli-archive", "--include-private", "--rebuild-index", "--output"])
+        .arg(target);
+    if identical {
+        cmd.arg("--if-identical");
+    }
+    cmd.output().unwrap()
+}
+
+fn search_recovered(home: &Path, data_dir: &Path, query: &str) -> Value {
+    // No --db: the recovered profile must be usable by the ordinary CLI.
+    // --no-maintenance prevents a search-triggered repair from hiding a failed
+    // import-time rebuild. Explicit lexical mode needs no installed model.
+    receipt(command(home)
+        .args(["search", query, "--mode", "lexical", "--robot", "--no-maintenance", "--limit", "20", "--data-dir"])
+        .arg(data_dir)
+        .output().unwrap())
+}
+
+fn portable_search_fixture(home: &Path) -> (std::path::PathBuf, Value, std::path::PathBuf) {
+    let original = home.join("original-search-source");
+    fs::create_dir(&original).unwrap();
+    let source = original.join("agent_search.db");
+    let missing_source = home.join("vanished-provider/shared.jsonl");
+    let storage = SqliteStorage::open(&source).unwrap();
+    for (agent, source_id) in [("claude_code", "remote-a"), ("codex", "remote-b")] {
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None, slug: agent.into(), name: agent.into(), version: None, kind: AgentKind::Cli,
+        }).unwrap();
+        storage.insert_conversation_tree(agent_id, None, &Conversation {
+            id: None, agent_slug: agent.into(), workspace: None,
+            external_id: Some(format!("indexed-{source_id}")),
+            title: Some(format!("Portable search {source_id}")),
+            source_path: missing_source.clone(), started_at: Some(1_733_000_000_000),
+            ended_at: None, approx_tokens: None, metadata_json: serde_json::json!({}),
+            messages: [0, 7].into_iter().map(|idx| Message {
+                id: None, idx, role: MessageRole::User, author: None,
+                created_at: Some(1_733_000_000_000 + idx),
+                content: format!("PORTABLENEEDLE complete recovered evidence {source_id} at {idx} δ"),
+                extra_json: serde_json::json!({}), snippets: Vec::new(),
+            }).collect(),
+            source_id: source_id.into(), origin_host: Some(source_id.into()),
+        }).unwrap();
+    }
+    drop(storage);
+    let input = home.join("searchable-history.jsonl");
+    let exported = export(home, &source, &input);
+    fs::rename(&original, home.join("retired-search-source")).unwrap();
+    assert!(!source.exists());
+    assert!(!missing_source.exists());
+    (input, exported, missing_source)
+}
+
+#[test]
+fn indexed_import_completes_the_source_less_search_to_canonical_evidence_journey() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, missing_source) = portable_search_fixture(root.path());
+    let input_bytes = fs::read(&input).unwrap();
+    let data = root.path().join("recovered-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    let imported = receipt(import_with_lexical_rebuild(root.path(), &input, &target, false));
+    assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+    assert_eq!(imported["destination_status"], "created");
+    assert_eq!(imported["derived_search_assets"], "lexical_rebuilt_semantic_not_built");
+    assert_eq!(imported["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(imported["lexical_rebuild"]["provider_scan_performed"], false);
+    assert_eq!(imported["lexical_rebuild"]["semantic_assets_built"], false);
+    let database_bytes = fs::read(&target).unwrap();
+    let searched = search_recovered(root.path(), &data, "PORTABLENEEDLE");
+    let hits = searched["hits"].as_array().expect("ordinary search hits");
+    assert_eq!(hits.len(), 4, "{searched}");
+    let mut coordinates = std::collections::BTreeSet::new();
+    for hit in hits {
+        let source_id = hit["source_id"].as_str().unwrap();
+        let conversation = hit["conversation_id"].as_i64().unwrap();
+        let ordinal = hit["line_number"].as_u64().unwrap();
+        assert!(matches!(source_id, "remote-a" | "remote-b"));
+        assert!(matches!(ordinal, 1 | 8));
+        assert_eq!(hit["source_path"], missing_source.to_str().unwrap());
+        assert!(coordinates.insert((source_id, conversation, ordinal)));
+        let viewed = receipt(command(root.path())
+            .args(["view", missing_source.to_str().unwrap(), "--source", source_id,
+                "--conversation-id", &conversation.to_string(), "--message-index", &ordinal.to_string(),
+                "-C", "0", "--json", "--data-dir"])
+            .arg(&data).output().unwrap());
+        assert_eq!(viewed["lines"][0]["source_id"], source_id);
+        assert_eq!(viewed["lines"][0]["conversation_id"], conversation);
+        assert_eq!(viewed["lines"][0]["message_index"], ordinal);
+        assert_eq!(viewed["lines"][0]["content"],
+            format!("PORTABLENEEDLE complete recovered evidence {source_id} at {} δ", ordinal - 1));
+    }
+    let repeated = receipt(import_with_lexical_rebuild(root.path(), &input, &target, true));
+    assert_eq!(repeated["destination_status"], "unchanged");
+    assert_eq!(repeated["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"].as_array().unwrap().len(), 4);
+    assert_eq!(fs::read(&target).unwrap(), database_bytes);
+    assert_eq!(fs::read(&input).unwrap(), input_bytes);
+    assert_eq!(export(root.path(), &target, &root.path().join("reindexed.jsonl"))["content_sha256"], exported["content_sha256"]);
+    assert!(!missing_source.exists());
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!data.join("models").exists());
+    assert!(!data.join("vector_index").exists());
+}
+
+#[test]
+fn indexed_empty_archive_produces_a_readable_empty_lexical_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("empty.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let input = root.path().join("empty.jsonl");
+    let exported = export(root.path(), &source, &input);
+    let data = root.path().join("empty-recovered");
+    fs::create_dir(&data).unwrap();
+    let imported = receipt(import_with_lexical_rebuild(root.path(), &input, &data.join("agent_search.db"), false));
+    assert_eq!(imported["lexical_rebuild"]["indexed_documents"], 0);
+    assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+    assert_eq!(search_recovered(root.path(), &data, "unmatched")["hits"].as_array().unwrap().len(), 0);
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn failed_index_rebuild_retains_the_complete_restore_and_identical_retry_can_finish() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let data = root.path().join("retry-profile");
+    fs::create_dir(&data).unwrap();
+    // Actual filesystem refusal at index-run admission, after canonical import.
+    let obstruction = data.join("index-run.lock");
+    fs::create_dir(&obstruction).unwrap();
+    let target = data.join("agent_search.db");
+    let failed = import_with_lexical_rebuild(root.path(), &input, &target, false);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert!(error.to_string().contains("is retained"), "{error}");
+    assert!(error.to_string().contains("--if-identical --rebuild-index"));
+    assert!(target.is_file());
+    assert_eq!(export(root.path(), &target, &root.path().join("after-rebuild-refusal.jsonl"))["content_sha256"], exported["content_sha256"]);
+    let before = fs::read(&target).unwrap();
+    fs::rename(&obstruction, data.join("retained-lock-obstruction")).unwrap();
+    let retried = receipt(import_with_lexical_rebuild(root.path(), &input, &target, true));
+    assert_eq!(retried["destination_status"], "unchanged");
+    assert_eq!(retried["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(fs::read(&target).unwrap(), before);
+    assert_eq!(search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn indexed_import_rejects_bad_layouts_and_invalid_streams_before_any_search_build() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source).unwrap());
+    let input = root.path().join("input.jsonl");
+    export(root.path(), &source, &input);
+    let data = root.path().join("destination");
+    fs::create_dir(&data).unwrap();
+    let wrong = data.join("not-the-profile-database.db");
+    let result = import_with_lexical_rebuild(root.path(), &input, &wrong, false);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("agent_search.db"));
+    assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
+    let invalid = root.path().join("truncated.jsonl");
+    let bytes = fs::read(&input).unwrap();
+    fs::write(&invalid, &bytes[..bytes.len() - 1]).unwrap();
+    let target = data.join("agent_search.db");
+    let result = import_with_lexical_rebuild(root.path(), &invalid, &target, false);
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(serde_json::from_slice::<Value>(&result.stderr).is_ok());
+    assert!(!target.exists());
+    assert!(!data.join("index").exists());
+    assert!(!data.join("index-run.lock").exists());
+    assert_eq!(fs::read(&input).unwrap(), bytes);
+}

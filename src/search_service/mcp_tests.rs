@@ -377,3 +377,92 @@ fn mcp_unload_is_explicit_and_does_not_open_an_index_or_admission_pool() {
     assert_eq!(session.open_attempts, 0);
     assert!(!pool_path.exists());
 }
+
+#[test]
+fn mcp_refinement_catalog_requires_startup_permission_and_matches_lexical_filters() {
+    use super::super::refinement::{MAX_CANDIDATES, Refiner};
+
+    let mut session = Session::new(PathBuf::from("never-opened-index"));
+    let mut adapter = Adapter::default();
+    initialize(&mut adapter, &mut session, CURRENT_VERSION);
+    assert_eq!(tools_for_session(&session).len(), 4);
+    let denied = adapter.handle(&mut session, call(
+        "disabled".into(), "cass_refine",
+        json!({"query": "relevance", "lexical_query": "performance"}),
+    )).unwrap();
+    assert_eq!(denied["error"]["code"], -32602);
+    assert_eq!(adapter.calls, 0);
+    session.refiner = Refiner::new(Some(PathBuf::from("never-opened-model")));
+    let catalog = tools_for_session(&session);
+    assert_eq!(catalog.len(), 5);
+    let tool = catalog.last().unwrap();
+    assert_eq!(tool["name"], "cass_refine");
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["required"], json!(["query", "lexical_query"]));
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["candidate_limit"]["maximum"], MAX_CANDIDATES);
+    assert_eq!(
+        schema["properties"]["filters"],
+        catalog[0]["inputSchema"]["properties"]["filters"]
+    );
+    assert!(schema["properties"].get("offset").is_none());
+    assert_eq!(session.open_attempts, 0);
+    assert_eq!(session.refiner.status()["load_attempts"], 0);
+    session.archive = Some(PathBuf::from("never-opened-archive"));
+    assert_eq!(tools_for_session(&session).len(), 6);
+    assert_eq!(session.canonical_read_attempts, 0);
+}
+
+#[test]
+fn mcp_refinement_preserves_rpc_ids_and_refuses_privilege_escalation_before_work() {
+    use super::super::refinement::Refiner;
+
+    let mut session = Session::new(PathBuf::from("never-opened-index"));
+    session.refiner = Refiner::new(Some(PathBuf::from("never-opened-model")));
+    let mut adapter = Adapter::default();
+    initialize(&mut adapter, &mut session, CURRENT_VERSION);
+    let invalid = adapter.handle(&mut session, call(
+        "δ-refine".into(), "cass_refine",
+        json!({"query": "relevance", "lexical_query": "performance", "candidate_limit": 33}),
+    )).unwrap();
+    assert_eq!(invalid["id"], "δ-refine");
+    assert_eq!(invalid["result"]["isError"], true);
+    assert_eq!(invalid["result"]["structuredContent"]["error"]["kind"], "invalid_request");
+    let text: Value = serde_json::from_str(
+        invalid["result"]["content"][0]["text"].as_str().unwrap(),
+    ).unwrap();
+    assert_eq!(text, invalid["result"]["structuredContent"]);
+    for field in ["db", "model", "reranker_model", "offset", "op", "id", "candidates"] {
+        let mut arguments = json!({"query": "relevance", "lexical_query": "performance"});
+        arguments[field] = json!("override");
+        let result = adapter.handle(&mut session, call(9.into(), "cass_refine", arguments)).unwrap();
+        assert_eq!(result["error"]["code"], -32602, "{field}");
+    }
+    assert!(adapter.handle(&mut session, rpc(json!({
+        "jsonrpc": "2.0", "method": "tools/call",
+        "params": {"name": "cass_refine", "arguments": {
+            "query": "relevance", "lexical_query": "performance"
+        }}
+    }))).is_none());
+    assert_eq!(session.open_attempts, 0);
+    assert_eq!(session.refiner.status()["load_attempts"], 0);
+    assert_eq!(session.canonical_read_attempts, 0);
+}
+
+#[test]
+fn mcp_refinement_obeys_the_existing_nonblocking_work_quota() {
+    use super::super::refinement::Refiner;
+
+    let mut session = Session::new(PathBuf::from("never-opened-index"));
+    session.refiner = Refiner::new(Some(PathBuf::from("never-opened-model")));
+    let mut adapter = Adapter::default();
+    initialize(&mut adapter, &mut session, CURRENT_VERSION);
+    adapter.calls = MAX_TOOL_CALLS_PER_MINUTE;
+    let limited = adapter.handle(&mut session, call(
+        12.into(), "cass_refine", json!({"query": "relevance", "lexical_query": "performance"}),
+    )).unwrap();
+    assert_eq!(limited["result"]["structuredContent"]["error"]["kind"], "rate_limited");
+    assert_eq!(session.open_attempts, 0);
+    assert_eq!(session.refiner.status()["load_attempts"], 0);
+}

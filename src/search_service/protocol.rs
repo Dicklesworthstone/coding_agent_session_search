@@ -34,6 +34,17 @@ pub(super) struct Filters {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
+    Refine {
+        id: u64,
+        query: String,
+        lexical_query: String,
+        #[serde(default)]
+        filters: Filters,
+        #[serde(default = "super::refinement::default_candidates")]
+        candidate_limit: usize,
+        #[serde(default = "super::refinement::default_limit")]
+        limit: usize,
+    },
     View {
         id: u64,
         source_path: String,

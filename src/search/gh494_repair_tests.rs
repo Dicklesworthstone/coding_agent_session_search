@@ -31,10 +31,59 @@ fn gh494_search_repair_success_requires_a_completed_readable_publication() {
     gh494_edit_checkpoint(&index_path, |checkpoint| {
         checkpoint["completed"] = serde_json::json!(false);
     });
-    assert!(!search_existing_lexical_generation_is_usable(&index_path, &db_path).unwrap());
+    // The old immutable generation may still answer queries, but that must
+    // never turn the unfinished REPAIR into a successful publication.
+    assert!(search_existing_lexical_generation_is_usable(&index_path, &db_path).unwrap());
     let error =
         verify_search_lexical_repair_publication(&index_path, &db_path, indexed_docs).unwrap_err();
     assert!(error.to_string().contains("publication is incomplete"));
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_incomplete_rebuild_without_independent_receipt_is_not_searchable() {
+    let (tmp, db_path, index_path, _) = gh494_completed_search_repair_fixture();
+    std::fs::rename(
+        index_path.join(".lexical-published-state.json"),
+        tmp.path().join("saved-publication-receipt.json"),
+    )
+    .unwrap();
+    gh494_edit_checkpoint(&index_path, |checkpoint| {
+        checkpoint["completed"] = serde_json::json!(false);
+    });
+    assert!(!search_existing_lexical_generation_is_usable(&index_path, &db_path).unwrap());
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_active_rebuild_serves_certified_prior_generation_without_joining() {
+    let (tmp, db_path, index_path, _) = gh494_completed_search_repair_fixture();
+    gh494_edit_checkpoint(&index_path, |checkpoint| {
+        checkpoint["completed"] = serde_json::json!(false);
+        checkpoint["processed_conversations"] = serde_json::json!(0);
+        checkpoint["indexed_docs"] = serde_json::json!(0);
+    });
+    let _lock = hold_active_index_run_lock(tmp.path(), &db_path);
+    let before = data_tree_snapshot(tmp.path());
+    let healed = ensure_lexical_assets_for_search(
+        tmp.path(),
+        &db_path,
+        &index_path,
+        Some(0),
+        Instant::now(),
+        false,
+        true,
+    )
+    .unwrap();
+    assert_eq!(healed.action, "active-rebuild-searching-existing-index");
+    let (strict, opened) =
+        inspect_lexical_assets_for_search_read_only(tmp.path(), &db_path, &index_path).unwrap();
+    assert_eq!(
+        strict.action,
+        "no-maintenance-active-rebuild-searching-existing-index"
+    );
+    assert!(opened.is_some());
+    assert_eq!(data_tree_snapshot(tmp.path()), before);
 }
 
 #[test]

@@ -3,7 +3,8 @@
 //! The reader is loaded lazily and retained until explicit reload, shutdown, or
 //! EOF. Search is index-only. Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
-//! Neither lane starts models, writers, automatic refresh, or detached children.
+//! Only opt-in refinement loads a local model, never global vector assets.
+//! No lane starts writers, automatic refresh, downloads, or detached children.
 //! Request deadlines terminate the worker, including stalled native calls.
 //! Sampled resident-memory limits terminate an over-budget worker; they are
 //! not kernel allocation limits or a peak-RSS guarantee between samples.
@@ -20,6 +21,8 @@ mod mcp;
 mod memory;
 #[path = "search_service/protocol.rs"]
 mod protocol;
+#[path = "search_service/refinement.rs"]
+mod refinement;
 #[cfg(test)]
 #[path = "search_service/tests.rs"]
 mod tests;
@@ -49,7 +52,7 @@ struct ServiceCli {
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
     /// Reuse one read-only lexical index reader for a stream of JSON requests.
-    /// Does not load models or check archive freshness. See docs/SEARCH_SERVICE.md.
+    /// Model use requires explicit refinement opt-in. See docs/SEARCH_SERVICE.md.
     Serve {
         /// Published lexical index directory, instead of --data-dir.
         #[arg(
@@ -78,6 +81,10 @@ enum ServiceCommand {
         /// Search, status and startup still never open the database.
         #[arg(long, value_name = "PATH")]
         db: Option<PathBuf>,
+        /// Opt in to candidate-only refinement with this installed local reranker.
+        /// Never downloads files; ordinary search, startup and status stay model-free.
+        #[arg(long, value_name = "PATH")]
+        reranker_model: Option<PathBuf>,
         /// Whole-request deadline, from first frame byte through response flush.
         /// Expiry exits the worker with code 124; idle sessions are not timed out.
         #[arg(
@@ -125,6 +132,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         stdio: _,
         mcp,
         db,
+        reranker_model,
         request_timeout_ms,
         admission_dir,
         admission_slots,
@@ -186,6 +194,18 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
             retryable: false,
         })?;
     session.memory_observation = Some(memory_guard.observation());
+    session.refiner = refinement::Refiner::new(
+        reranker_model
+            .map(|path| {
+                if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    std::env::current_dir().map(|cwd| cwd.join(path))
+                }
+            })
+            .transpose()
+            .map_err(cli_io_error)?,
+    );
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let result = if mcp {
@@ -218,6 +238,7 @@ struct Session {
     request_timeout: Duration,
     archive: Option<PathBuf>,
     memory_observation: Option<std::sync::Arc<memory::Observation>>,
+    refiner: refinement::Refiner,
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
@@ -236,6 +257,7 @@ impl Session {
             request_timeout: Duration::from_millis(deadline::DEFAULT_TIMEOUT_MS),
             archive: None,
             memory_observation: None,
+            refiner: refinement::Refiner::default(),
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
@@ -268,6 +290,8 @@ impl Session {
     }
 
     fn unload(&mut self) {
+        // Keep the shared slot until BOTH model and index owners are released.
+        self.refiner.unload();
         drop(self.client.take());
         drop(self.reader_lease.take());
     }
@@ -305,7 +329,8 @@ impl Session {
             "canonical_database_accessed": self.canonical_read_attempts != 0,
             "canonical_read_attempts": self.canonical_read_attempts,
             "canonical_reads_completed": self.canonical_reads_completed,
-            "models_loaded": false,
+            "models_loaded": self.refiner.loaded(),
+            "refinement": self.refiner.status(),
             "maintenance_performed": false,
             "memory_supervision": memory.unwrap_or_else(|| json!({"enabled": false})),
             "reader_admission": {
@@ -448,6 +473,41 @@ impl Session {
 
     fn handle(&mut self, request: Request) -> (Reply, bool) {
         match request {
+            Request::Refine {
+                id,
+                query,
+                lexical_query,
+                filters,
+                candidate_limit,
+                limit,
+            } => {
+                if let Err(message) = refinement::validate(
+                    &query, &lexical_query, &filters, candidate_limit, limit,
+                ) {
+                    return (Reply::failure(Some(id), "invalid_request", message), false);
+                }
+                if !self.refiner.enabled() {
+                    return (
+                        Reply::failure(
+                            Some(id),
+                            "refinement_disabled",
+                            "refinement requires --reranker-model at startup; ordinary search remains lexical",
+                        ),
+                        false,
+                    );
+                }
+                let reply = match self.refine(
+                    &query, &lexical_query, filters, candidate_limit, limit,
+                ) {
+                    Ok(result) => Reply::success(id, result),
+                    Err(error) => Reply::failure(
+                        Some(id),
+                        admission_error_kind(&error, "refinement_failed"),
+                        format!("{error:#}"),
+                    ),
+                };
+                (reply, false)
+            }
             Request::View {
                 id,
                 source_path,

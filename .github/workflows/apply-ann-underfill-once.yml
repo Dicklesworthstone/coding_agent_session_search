@@ -1,23 +1,41 @@
-# Both source-only landings completed. No job retains repository-write access.
-name: Verify landed retrieval commits
+# Temporary read-only source inspection; no repository-write permission.
+name: Inspect retrieval source
 on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/apply-ann-underfill-once.yml]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  ancestry-only:
-    runs-on: ubuntu-24.04
+  source:
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Verify commit ancestry, not runtime qualification
+      - name: Archive only explicitly selected tracked source
         shell: bash
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor e36ad641e95df88c289d70fc467e5159542d9c92 HEAD
-          git merge-base --is-ancestor d671ab449af2d6bd34bac12a7992f79b3c2cc36c HEAD
-          printf '%s\n' 'Both retrieval fixes are present in this history.' 'This check proves ancestry only; use Verify search retrieval for component and locked CASS tests.'
+          git rev-parse HEAD
+          git archive --format=tar HEAD src tests scripts docs/planning .beads .github Cargo.toml Cargo.lock build.rs rust-toolchain.toml AGENTS.md | gzip > "$RUNNER_TEMP/cass-inspected-source.tar.gz"
+          sha256sum "$RUNNER_TEMP/cass-inspected-source.tar.gz"
+      - name: Summarize the actual task graph without changing it
+        shell: python
+        run: |
+          import collections, json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          print('STATUS_COUNTS=' + json.dumps(dict(collections.Counter(row.get('status') for row in rows)), sort_keys=True))
+          for row in sorted(rows, key=lambda row: (row.get('priority', 9), row.get('id', ''))):
+              if row.get('status') not in ('closed', 'tombstone'):
+                  print(json.dumps({key: row.get(key) for key in ('id', 'title', 'status', 'priority', 'assignee')}, ensure_ascii=False))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cass-inspected-source-${{ github.sha }}
+          path: ${{ runner.temp }}/cass-inspected-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
