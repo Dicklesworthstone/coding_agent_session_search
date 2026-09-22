@@ -712,3 +712,59 @@ fn backup_search_withholds_all_results_until_complete_validation_and_private_con
     assert!(serde_json::from_slice::<Value>(&denied.stderr).is_ok());
     assert!(!root.path().join("unused-default").exists());
 }
+
+#[test]
+fn backup_search_to_complete_view_preserves_snapshot_source_and_sparse_context() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, absent_source) = portable_search_fixture(root.path());
+    let before = fs::read(&input).unwrap();
+    let entries = fs::read_dir(root.path()).unwrap().count();
+    let searched = receipt(command(root.path())
+        .args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE", "--include-private"])
+        .output().unwrap());
+    let digest = searched["content_sha256"].as_str().unwrap();
+    for hit in searched["hits"].as_array().unwrap() {
+        let viewed = receipt(command(root.path())
+            .args(["archive", "view"]).arg(&input)
+            .args(["--message-id", &hit["message_id"].as_i64().unwrap().to_string(),
+                "--content-sha256", digest, "--context", "1", "--include-private"])
+            .output().unwrap());
+        assert_eq!(viewed["content_sha256"], exported["content_sha256"]);
+        assert_eq!(viewed["source_id"], hit["source_id"]);
+        assert_eq!(viewed["conversation_id"], hit["conversation_id"]);
+        assert_eq!(viewed["source_path"], absent_source.to_str().unwrap());
+        assert_eq!(viewed["preview_only"], false);
+        assert_eq!(viewed["database_opened"], false);
+        assert_eq!(viewed["provider_files_opened"], false);
+        let messages = viewed["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["message_index"], 1);
+        assert_eq!(messages[1]["message_index"], 8);
+        let target = messages.iter().find(|message| message["is_target"] == true).unwrap();
+        assert_eq!(target["message_id"], hit["message_id"]);
+        assert_eq!(target["content"], hit["snippet"]);
+    }
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), entries);
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!absent_source.exists());
+}
+
+#[test]
+fn backup_view_refuses_wrong_snapshots_missing_ids_and_private_output_without_consent() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let digest = exported["content_sha256"].as_str().unwrap();
+    for (id, hash, private) in [(1, "0".repeat(64), true), (i64::MAX, digest.to_owned(), true), (1, digest.to_owned(), false)] {
+        let mut cmd = command(root.path());
+        cmd.args(["archive", "view"]).arg(&input)
+            .args(["--message-id", &id.to_string(), "--content-sha256", &hash]);
+        if private { cmd.arg("--include-private"); }
+        let result = cmd.output().unwrap();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&result.stderr).is_ok());
+    }
+    assert!(!root.path().join("unused-default").exists());
+}

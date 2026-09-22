@@ -20,6 +20,8 @@ const MAX_QUERY_BYTES: usize = 1024;
 const MAX_IDENTITY_BYTES: usize = 4096;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const SNIPPET_CHARS: usize = 256;
+const MAX_CONTEXT: usize = 20;
+const MAX_VIEW_CONTENT_BYTES: usize = 64 * 1024;
 
 fn column(table: &Table, name: &str) -> Result<usize> {
     table.columns.iter().position(|item| item == name)
@@ -138,6 +140,18 @@ struct Conversation {
     source_path: String,
 }
 
+fn conversation_identity(values: &[Cell], columns: &ConversationColumns) -> Result<Conversation> {
+    let source_id = text(values, columns.source_id)?;
+    let source_path = text(values, columns.source_path)?;
+    ensure!(
+        !source_id.is_empty() && !source_path.is_empty()
+            && source_id.len() <= MAX_IDENTITY_BYTES
+            && source_path.len() <= MAX_IDENTITY_BYTES,
+        "selected conversation identity must contain 1..4096 bytes; identities are never truncated"
+    );
+    Ok(Conversation { source_id: source_id.to_owned(), source_path: source_path.to_owned() })
+}
+
 fn resolve_conversations(
     input: &mut (impl BufRead + Seek),
     selected: &BTreeSet<i64>,
@@ -149,17 +163,7 @@ fn resolve_conversations(
         if let Rows::Conversations(columns) = rows {
             let id = integer(values, columns.id)?;
             if selected.contains(&id) {
-                let source_id = text(values, columns.source_id)?;
-                let source_path = text(values, columns.source_path)?;
-                ensure!(
-                    !source_id.is_empty() && !source_path.is_empty()
-                        && source_id.len() <= MAX_IDENTITY_BYTES
-                        && source_path.len() <= MAX_IDENTITY_BYTES,
-                    "selected conversation identity must contain 1..4096 bytes; identities are never truncated"
-                );
-                found.insert(id, Conversation {
-                    source_id: source_id.to_owned(), source_path: source_path.to_owned(),
-                });
+                found.insert(id, conversation_identity(values, columns)?);
             }
         }
         Ok(())
@@ -266,7 +270,160 @@ fn search_stream(
         "match_mode": "literal_case_sensitive", "order": "message_id",
         "matches": total, "limit": limit, "has_more": total > hits.len() as u64, "hits": hits,
         "coordinate_space": "message_index", "content_source": "logical_archive",
-        "preview_only": true, "database_opened": false, "provider_files_opened": false,
+        "preview_only": true, "contains_private_data": true,
+        "database_opened": false, "provider_files_opened": false,
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Anchor {
+    id: i64,
+    conversation: i64,
+    idx: i64,
+}
+
+impl Anchor {
+    fn read(values: &[Cell], columns: &MessageColumns) -> Result<Self> {
+        let anchor = Self {
+            id: integer(values, columns.id)?,
+            conversation: integer(values, columns.conversation)?,
+            idx: integer(values, columns.idx)?,
+        };
+        ensure!(anchor.id > 0 && anchor.conversation > 0 && anchor.idx >= 0,
+            "logical message identities or coordinates are invalid");
+        Ok(anchor)
+    }
+}
+
+fn validate_view(message_id: i64, context: usize, digest: &str) -> Result<()> {
+    ensure!(message_id > 0, "--message-id must be positive");
+    ensure!(context <= MAX_CONTEXT, "--context must be between 0 and 20");
+    ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "--content-sha256 requires the 64 lowercase hex digits from archive search or verify");
+    Ok(())
+}
+
+// Primary-key order is not message-index order. Keep the nearest actual
+// neighbours while streaming, not idx +/- context and not adjacent wire rows.
+// Bodies are deliberately not retained until this bounded selection is final.
+fn retain_neighbour(
+    selected: &mut BTreeMap<i64, Anchor>,
+    anchor: Anchor,
+    context: usize,
+    preceding: bool,
+) -> Result<()> {
+    ensure!(!selected.contains_key(&anchor.idx), "selected conversation contains duplicate message coordinates");
+    selected.insert(anchor.idx, anchor);
+    if selected.len() > context {
+        if preceding { selected.pop_first(); } else { selected.pop_last(); }
+    }
+    Ok(())
+}
+
+/// Resolve an exact search hit against its content digest, then return complete
+/// bounded bodies. Different snapshots cannot reuse a numeric message identity.
+pub fn view(path: &Path, message_id: i64, context: usize, digest: &str) -> Result<Value> {
+    validate_view(message_id, context, digest)?;
+    let mut input = BufReader::new(super::import::open_input(path)?);
+    view_stream(&mut input, message_id, context, digest)
+}
+
+fn view_stream(
+    input: &mut (impl BufRead + Seek),
+    message_id: i64,
+    context: usize,
+    digest: &str,
+) -> Result<Value> {
+    validate_view(message_id, context, digest)?;
+    let mut target = None;
+    let verified = scan(input, |rows, values| {
+        if let Rows::Messages(columns) = rows
+            && integer(values, columns.id)? == message_id
+        {
+            target = Some(Anchor::read(values, columns)?);
+        }
+        Ok(())
+    })?;
+    ensure!(verified.1.content_sha256 == digest,
+        "logical backup does not match --content-sha256; rerun search instead of reusing a different snapshot's message ID");
+    let target = target.context("message ID not found in the verified logical backup; no neighbour was substituted")?;
+
+    input.rewind().context("cannot rewind the admitted logical backup")?;
+    let mut before = BTreeMap::new();
+    let mut after = BTreeMap::new();
+    let mut before_count = 0_u64;
+    let mut after_count = 0_u64;
+    let mut conversation = None;
+    let second = scan(input, |rows, values| {
+        match rows {
+            Rows::Conversations(columns) if integer(values, columns.id)? == target.conversation => {
+                conversation = Some(conversation_identity(values, columns)?);
+            }
+            Rows::Messages(columns) if integer(values, columns.conversation)? == target.conversation => {
+                let anchor = Anchor::read(values, columns)?;
+                match anchor.idx.cmp(&target.idx) {
+                    std::cmp::Ordering::Equal => ensure!(anchor == target,
+                        "selected conversation contains duplicate target coordinates"),
+                    std::cmp::Ordering::Less => {
+                        before_count = before_count.checked_add(1).context("neighbour count overflow")?;
+                        retain_neighbour(&mut before, anchor, context, true)?;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        after_count = after_count.checked_add(1).context("neighbour count overflow")?;
+                        retain_neighbour(&mut after, anchor, context, false)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    ensure!(second == verified, "logical backup changed during context selection");
+    let conversation = conversation.context("selected message refers to a missing canonical conversation")?;
+    let more_before = before_count > before.len() as u64;
+    let more_after = after_count > after.len() as u64;
+    let anchors: BTreeMap<i64, Anchor> = before.into_values()
+        .chain(std::iter::once(target)).chain(after.into_values())
+        .map(|anchor| (anchor.id, anchor)).collect();
+    ensure!(anchors.len() <= 2 * context + 1, "logical context exceeded its selection budget");
+
+    input.rewind().context("cannot rewind the admitted logical backup")?;
+    let mut messages = BTreeMap::new();
+    let mut content_bytes = 0_usize;
+    let third = scan(input, |rows, values| {
+        if let Rows::Messages(columns) = rows {
+            let id = integer(values, columns.id)?;
+            if let Some(expected) = anchors.get(&id) {
+                let actual = Anchor::read(values, columns)?;
+                ensure!(&actual == expected, "logical message coordinates changed during body hydration");
+                let content = text(values, columns.content)?;
+                ensure!(content.len() <= MAX_VIEW_CONTENT_BYTES - content_bytes,
+                    "complete logical message window exceeds 64 KiB; reduce context or restore the backup for larger bodies");
+                let role = text(values, columns.role)?;
+                ensure!(role.len() <= 128, "selected message role exceeds 128 bytes");
+                content_bytes += content.len();
+                messages.insert(actual.idx, json!({
+                    "message_id": id, "message_index": actual.idx as u64 + 1,
+                    "content": content, "role": role, "is_target": id == target.id,
+                }));
+            }
+        }
+        Ok(())
+    })?;
+    ensure!(third == verified, "logical backup changed during body hydration");
+    ensure!(messages.len() == anchors.len(), "selected logical messages are missing or ambiguous");
+    bounded_response(json!({
+        "operation": "view", "format": codec::FORMAT, "schema_version": codec::VERSION,
+        "archive_id": verified.0.archive_id, "content_sha256": verified.1.content_sha256,
+        "integrity_verified": true, "database_integrity_checked": false,
+        "source_id": conversation.source_id, "source_path": conversation.source_path,
+        "conversation_id": target.conversation, "message_id": target.id,
+        "message_index": target.idx as u64 + 1, "context": context,
+        "messages": messages.into_values().collect::<Vec<_>>(), "content_bytes": content_bytes,
+        "more_before": more_before, "more_after": more_after,
+        "coordinate_space": "message_index", "content_source": "logical_archive",
+        "preview_only": false, "contains_private_data": true,
+        "database_opened": false, "provider_files_opened": false,
     }))
 }
 
@@ -400,5 +557,99 @@ mod tests {
     fn response_budget_counts_json_escaping_without_truncation() {
         assert!(bounded_response(json!({"text":"\0".repeat(MAX_RESPONSE_BYTES / 6)})).is_err());
         assert!(bounded_response(json!({"text":"δ\0😀"})).is_ok());
+    }
+
+    fn view_fixture(bytes: &[u8], id: i64, context: usize) -> Result<Value> {
+        let (_, completion) = scan(&mut Cursor::new(bytes), |_, _| Ok(()))?;
+        view_stream(&mut Cursor::new(bytes), id, context, &completion.content_sha256)
+    }
+
+    #[test]
+    fn full_view_uses_sparse_message_order_not_wire_order_or_source_path() {
+        let mut rows = records();
+        rows.push(message(5, 2, 2, "earliest"));
+        rows.push(message(6, 2, 90, "closest after"));
+        let result = view_fixture(&wire(rows), 2, 1).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.iter().map(|m| m["message_id"].as_i64().unwrap()).collect::<Vec<_>>(), [5, 2, 6]);
+        assert_eq!(messages.iter().map(|m| m["message_index"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 8, 91]);
+        assert_eq!(messages[1]["content"], "δ\0 needle beta");
+        assert_eq!(messages.iter().filter(|m| m["is_target"] == true).count(), 1);
+        assert_eq!(result["source_id"], "remote-b");
+        assert_eq!(result["source_path"], "/absent/same.jsonl");
+        assert_eq!(result["more_before"], false);
+        assert_eq!(result["more_after"], true);
+        assert_eq!(result["preview_only"], false);
+        assert_eq!(result["database_opened"], false);
+    }
+
+    #[test]
+    fn view_requires_the_selected_snapshot_and_an_exact_existing_message() {
+        let bytes = wire(records());
+        let error = view_fixture(&bytes, 999, 0).unwrap_err().to_string();
+        assert!(error.contains("not found"));
+        let (_, original) = scan(&mut Cursor::new(&bytes), |_, _| Ok(())).unwrap();
+        let mut rows = records();
+        rows[5] = message(2, 2, 7, "different body at the same message ID");
+        assert!(view_stream(&mut Cursor::new(wire(rows)), 2, 0, &original.content_sha256).is_err());
+        assert!(view_stream(&mut Cursor::new(&bytes[..bytes.len() - 1]), 2, 0, &original.content_sha256).is_err());
+        for (id, context, digest) in [(0, 0, original.content_sha256.as_str()), (2, 21, original.content_sha256.as_str()), (2, 0, "wrong")] {
+            assert!(view(Path::new("/missing-backup"), id, context, digest).is_err());
+        }
+    }
+
+    #[test]
+    fn view_counts_complete_utf8_and_nul_bytes_and_never_truncates_a_body() {
+        let exact = "\0é".repeat(MAX_VIEW_CONTENT_BYTES / 3) + "x";
+        assert_eq!(exact.len(), MAX_VIEW_CONTENT_BYTES);
+        let mut rows = records();
+        rows[5] = message(2, 2, 7, &exact);
+        let bytes = wire(rows.clone());
+        let result = view_fixture(&bytes, 2, 0).unwrap();
+        assert_eq!(result["messages"][0]["content"], exact);
+        assert_eq!(result["content_bytes"], MAX_VIEW_CONTENT_BYTES);
+        assert!(view_fixture(&bytes, 2, 1).is_err());
+        rows[5] = message(2, 2, 7, &(exact + "x"));
+        assert!(view_fixture(&wire(rows), 2, 0).is_err());
+    }
+
+    #[test]
+    fn unselected_large_bodies_do_not_consume_the_final_view_window() {
+        let mut rows = records();
+        // This is discovered before the closer neighbour but must not be
+        // retained as content, charged to the final budget, or cause refusal.
+        rows[7] = message(4, 2, 1000, &"x".repeat(MAX_VIEW_CONTENT_BYTES + 1));
+        rows.push(message(5, 2, 8, "the actually closest neighbour"));
+        let result = view_fixture(&wire(rows), 2, 1).unwrap();
+        assert_eq!(result["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(result["messages"][1]["content"], "the actually closest neighbour");
+        assert_eq!(result["more_after"], true);
+    }
+
+    #[test]
+    fn full_view_rejects_duplicate_target_coordinates_and_selected_orphans() {
+        let mut rows = records();
+        rows.push(message(5, 2, 7, "same coordinate different ID"));
+        assert!(view_fixture(&wire(rows), 2, 0).is_err());
+        let mut rows = records();
+        rows.push(message(5, 2, 1000, "duplicate closest neighbour"));
+        assert!(view_fixture(&wire(rows), 2, 1).is_err());
+        let mut rows = records();
+        rows.push(message(5, 999, 0, "orphan"));
+        assert!(view_fixture(&wire(rows), 5, 0).is_err());
+    }
+
+    #[test]
+    fn context_metadata_stays_bounded_independent_of_conversation_size() {
+        let mut before = BTreeMap::new();
+        let mut after = BTreeMap::new();
+        for idx in (0..10_000).rev() {
+            let anchor = Anchor { id: idx + 1, conversation: 1, idx };
+            retain_neighbour(&mut before, anchor, MAX_CONTEXT, true).unwrap();
+            retain_neighbour(&mut after, anchor, MAX_CONTEXT, false).unwrap();
+            assert!(before.len() <= MAX_CONTEXT && after.len() <= MAX_CONTEXT);
+        }
+        assert_eq!(before.first_key_value().unwrap().0, &9980);
+        assert_eq!(after.last_key_value().unwrap().0, &19);
     }
 }

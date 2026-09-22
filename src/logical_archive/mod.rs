@@ -73,6 +73,22 @@ enum Operation {
         #[arg(long)]
         include_private: bool,
     },
+    /// Read complete bounded message bodies directly from a verified backup.
+    View {
+        input: PathBuf,
+        /// Exact canonical message ID from archive search, not a physical line.
+        #[arg(long)]
+        message_id: i64,
+        /// Bind the selected ID to the content_sha256 returned by search/verify.
+        #[arg(long)]
+        content_sha256: String,
+        /// Actual messages on each side (0..20); complete bodies must fit 64 KiB.
+        #[arg(long, short = 'C', default_value_t = 2)]
+        context: usize,
+        /// Acknowledge that complete private session text will be displayed.
+        #[arg(long)]
+        include_private: bool,
+    },
     /// Restore all canonical rows into a NEW database; never replace an archive.
     Import {
         input: PathBuf,
@@ -124,6 +140,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Operation::Search { input, contains, limit, conversation_id, include_private } => {
             ensure!(include_private, "backup search emits private session excerpts; pass --include-private to acknowledge this");
             let result = query::search(&input, &contains, limit, conversation_id)?;
+            println!("{result}");
+            return Ok(());
+        }
+        Operation::View { input, message_id, content_sha256, context, include_private } => {
+            ensure!(include_private, "backup view emits private session text; pass --include-private to acknowledge this");
+            let result = query::view(&input, message_id, context, &content_sha256)?;
             println!("{result}");
             return Ok(());
         }
