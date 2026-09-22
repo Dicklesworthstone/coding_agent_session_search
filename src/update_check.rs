@@ -1266,13 +1266,17 @@ mod tests {
     /// (Windows CI, or pwsh on Unix); skipped otherwise.
     #[test]
     fn test_powershell_invocation_binds_arguments_in_a_real_shell() {
-        let shell = ["pwsh", "powershell"].into_iter().find(|shell| {
-            std::process::Command::new(shell)
+        // A fixed allowlist of interpreters, each named by a literal.
+        let interpreters: [fn() -> std::process::Command; 2] = [
+            || std::process::Command::new("pwsh"),
+            || std::process::Command::new("powershell"),
+        ];
+        let Some(shell) = interpreters.into_iter().find(|shell| {
+            shell()
                 .args(["-NoProfile", "-Command", "exit 0"])
                 .output()
                 .is_ok_and(|output| output.status.success())
-        });
-        let Some(shell) = shell else {
+        }) else {
             eprintln!("skipping: no PowerShell on PATH");
             return;
         };
@@ -1281,7 +1285,7 @@ mod tests {
             "it's; Write-Output injected",
             "v1.2.3",
         ];
-        let output = std::process::Command::new(shell)
+        let output = shell()
             .args([
                 "-NoProfile",
                 "-EncodedCommand",
