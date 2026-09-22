@@ -34,19 +34,19 @@ jobs:
           python3 - <<'PY'
           import base64, hashlib, json, os, pathlib, subprocess, urllib.request
           inputs = {'src/ui/data.rs': '90ea9d061f36ef033368918fec3566fe8d176403', 'src/ui/app.rs': 'edd9e357f0f7b1201159863c5c0535f3e7944fd5', 'src/search/pack_planner.rs': 'ce87c5a4abbeb79b9836afb9d42e0299e6d9f98f'}
-          outputs = {'src/ui/data.rs': 'e53dbac9fc2532c1d19f7031d24cea2e1e04c072', 'src/ui/app.rs': '1da4c2e5229e8bf90c39097477b389901db8b726', 'src/search/pack_planner.rs': '06aa863270e5899bb8faa959ca2ba3bcf147aa58'}
+          outputs = {'src/ui/data.rs': 'e53dbac9fc2532c1d19f7031d24cea2e1e04c072', 'src/ui/app.rs': '793ba14ca81ce81aa6332263eb2309208325837c', 'src/search/pack_planner.rs': '06aa863270e5899bb8faa959ca2ba3bcf147aa58'}
           for path, sha in inputs.items():
               assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
-          sha = 'c406129b9acf8864abd8520c4167b73dc179724c'
-          request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'cass-canonical-tui-review'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              result = json.load(response)
-          assert result['encoding'] == 'base64'
-          patch = base64.b64decode(result['content'])
-          assert hashlib.sha1(b'blob ' + str(len(patch)).encode() + b'\0' + patch).hexdigest() == sha
-          command = ['git', 'apply', '--recount', '--unidiff-zero']
-          subprocess.run(command + ['--check', '-'], input=patch, check=True)
-          subprocess.run(command + ['-'], input=patch, check=True)
+          for sha in ['c406129b9acf8864abd8520c4167b73dc179724c', '1f7ce537d90c9684ec8e1ef09959c046d2ca7284']:
+              request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'cass-canonical-tui-review'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['encoding'] == 'base64'
+              patch = base64.b64decode(result['content'])
+              assert hashlib.sha1(b'blob ' + str(len(patch)).encode() + b'\0' + patch).hexdigest() == sha
+              command = ['git', 'apply', '--recount', '--unidiff-zero']
+              subprocess.run(command + ['--check', '-'], input=patch, check=True)
+              subprocess.run(command + ['-'], input=patch, check=True)
           for path, sha in outputs.items():
               assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
           pathlib.Path('candidate').mkdir()
