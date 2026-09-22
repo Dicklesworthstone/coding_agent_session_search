@@ -663,10 +663,15 @@ source-specific sync command after reviewing the reported evidence.
 
 Raw-mirror retention is explicit and audited. Use `cass mirror prune
 --older-than 90d --json` or `cass mirror prune --max-size 100GB --json` to get a
-dry-run plan; add `--apply` only after reviewing the manifest/blob list. Add
+dry-run plan; add `--apply` only after reviewing the scope and totals. Preview
+`entries` contain at most 1,000 manifest/blob details; `omitted_entry_count`
+reports additional candidates. Planned counts and bytes cover the entire plan,
+including omitted details. Use provider/path selectors to inspect a narrower
+scope. Previews do not append audit records. Add
 `--keep-tag <tag>` to pin captures linked to tagged conversations. `prune`
 holds down blobs referenced by captures from the last 7 days by default, writes
-`raw-mirror/v1/pruned.jsonl` for every non-empty plan, and refuses apply mode
+complete intent/result records to `raw-mirror/v1/pruned.jsonl` for non-empty
+applied plans, and refuses apply mode
 while an index/watch job is active.
 
 Use `--provider opencode` and/or `--source-path '*/opencode.db'` with an age

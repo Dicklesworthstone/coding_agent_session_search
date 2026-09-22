@@ -285,8 +285,12 @@ pub struct RawMirrorPruneReport {
     pub applied_blob_count: u64,
     pub applied_reclaim_bytes: u64,
     pub audit_log_path: Option<String>,
+    /// Preview details omitted from `entries`; aggregate counts still cover the full plan.
+    pub omitted_entry_count: u64,
     pub entries: Vec<RawMirrorPruneEntry>,
 }
+
+const PRUNE_PREVIEW_ENTRY_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RawMirrorPruneEntry {
@@ -378,6 +382,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         applied_blob_count: 0,
         applied_reclaim_bytes: 0,
         audit_log_path: None,
+        omitted_entry_count: 0,
         entries: Vec::new(),
     };
 
@@ -652,6 +657,14 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         let Some(manifest) = manifest_by_id.get(manifest_id) else {
             continue;
         };
+        report.planned_manifest_count += 1;
+        report.planned_reclaim_bytes = report
+            .planned_reclaim_bytes
+            .saturating_add(manifest.size_bytes);
+        if !options.apply && entries.len() == PRUNE_PREVIEW_ENTRY_LIMIT {
+            report.omitted_entry_count += 1;
+            continue;
+        }
         let reason = manifest_reasons
             .remove(manifest_id)
             .unwrap_or_else(|| "selected by retention policy".to_string());
@@ -673,6 +686,12 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
             .get(&blob_relative_path)
             .map(|blob| blob.size_bytes)
             .unwrap_or(0);
+        report.planned_blob_count += 1;
+        report.planned_reclaim_bytes = report.planned_reclaim_bytes.saturating_add(size);
+        if !options.apply && entries.len() == PRUNE_PREVIEW_ENTRY_LIMIT {
+            report.omitted_entry_count += 1;
+            continue;
+        }
         let blob_blake3 = blob_relative_path
             .rsplit('/')
             .next()
@@ -693,16 +712,6 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
             applied: false,
         });
     }
-
-    report.planned_manifest_count = entries
-        .iter()
-        .filter(|entry| entry.kind == "manifest")
-        .count() as u64;
-    report.planned_blob_count = entries.iter().filter(|entry| entry.kind == "blob").count() as u64;
-    report.planned_reclaim_bytes = entries
-        .iter()
-        .map(|entry| entry.size_bytes)
-        .fold(0, u64::saturating_add);
 
     report.entries = entries;
     if options.apply {
