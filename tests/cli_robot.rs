@@ -10,6 +10,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -22,14 +23,12 @@ use util::cass_bin;
 fn base_cmd() -> Command {
     let mut cmd = Command::new(cass_bin());
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
-    // WS-A.6 (2w1sc): 52 tests in this binary read the committed fixture
-    // archive IN PLACE (`tests/fixtures/search_demo_data`). Stale-on-read
-    // auto-refresh only stays quiet for data dirs under the OS temp dir, and
-    // the fixture is under the checkout, so on a fleet worker a `search` here
-    // spawned a detached `cass index --background` INTO the fixture, which
-    // ingested that worker's real sessions; every golden test that later
-    // copied the fixture absorbed them. These tests observe a fixture; they
-    // never want a live refresh.
+    // WS-A.6 (2w1sc): tests here used to read the committed fixture archive in
+    // place, and a `search` on a fleet worker spawned a detached
+    // `cass index --background` INTO it, ingesting that worker's real
+    // sessions. They now read copies (`shared_search_demo_data`,
+    // `isolated_search_demo_data`); these tests observe an archive and never
+    // want a live refresh.
     cmd.env("CASS_AUTO_REFRESH", "0");
     cmd
 }
@@ -155,6 +154,51 @@ fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn 
         coding_agent_search::franken_sync::params![current_workspace],
     )?;
     Ok(tmp)
+}
+
+/// One private copy of the demo archive per test binary, shared by the tests
+/// that only observe it, with its lexical index built before any of them runs
+/// (bead uxz8y). Derived indexes are gitignored, so the committed fixture has
+/// none for the current version: pointing those tests at it made the first
+/// searches rebuild an index inside the checkout, and the tests running in
+/// parallel against the same directory failed with exit 7 `index-busy`.
+/// `get_or_init` blocks every caller until the warm-up search has finished.
+/// The copy lives for the whole process; tests that mutate an archive keep
+/// using `isolated_search_demo_data`.
+fn shared_search_demo_data() -> &'static str {
+    static SHARED: OnceLock<(TempDir, String)> = OnceLock::new();
+    &SHARED
+        .get_or_init(|| {
+            let copy = isolated_search_demo_data().expect("copy the search demo fixture");
+            let path = copy
+                .path()
+                .to_str()
+                .expect("UTF-8 temporary directory")
+                .to_owned();
+            base_cmd()
+                .args(["search", "", "--json", "--limit", "1", "--data-dir", &path])
+                .assert()
+                .success();
+            (copy, path)
+        })
+        .1
+}
+
+/// uxz8y: bead xwi3f made this binary hermetic, then later tests pointed
+/// commands at the committed fixture again. Only `SEARCH_DEMO_DATA_DIR`, the
+/// copy source, may name it.
+#[test]
+fn commands_never_target_the_committed_demo_fixture() {
+    let fixture = concat!("tests/fixtures/", "search_demo_data");
+    let named = |source: &str| source.matches(fixture).count();
+    // Negative control: both spellings a test could use are counted.
+    let direct = format!(r#"cmd.args(["--data-dir", "{fixture}", "data_dir={fixture}"]);"#);
+    assert_eq!(named(&direct), 2);
+    assert_eq!(
+        named(include_str!("cli_robot.rs")),
+        1,
+        "point observers at shared_search_demo_data() and mutators at isolated_search_demo_data()"
+    );
 }
 
 fn decoded_cursor_offset(cursor: &str) -> u64 {
@@ -2190,7 +2234,7 @@ fn search_cursor_and_token_budget() {
 
 #[test]
 fn search_cursor_jsonl_and_compact() {
-    let data_dir = "tests/fixtures/search_demo_data";
+    let data_dir = shared_search_demo_data();
     // JSONL meta line contains next_cursor
     let mut cmd = base_cmd();
     cmd.args([
@@ -2281,7 +2325,7 @@ fn search_cursor_jsonl_and_compact() {
 #[test]
 fn search_robot_format_sessions_matches_source_paths() {
     // rob.ctx.sessions: sessions output should match the unique sorted source_path set from JSON hits.
-    let data_dir = "tests/fixtures/search_demo_data";
+    let data_dir = shared_search_demo_data();
 
     // 1) Get source_path values via compact JSON.
     let mut compact = base_cmd();
@@ -2611,7 +2655,7 @@ fn search_returns_json_results() {
         "",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -2650,7 +2694,7 @@ fn search_respects_limit() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -2674,7 +2718,7 @@ fn search_empty_query_returns_all() {
         "",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -2698,7 +2742,7 @@ fn assert_search_limit_alias_limits_to_one(alias_args: &[&str]) {
     let mut cmd = base_cmd();
     let mut args = vec!["search", "", "--json"];
     args.extend(alias_args.iter().copied());
-    args.extend(["--data-dir", "tests/fixtures/search_demo_data"]);
+    args.extend(["--data-dir", shared_search_demo_data()]);
     cmd.args(args);
 
     let output = cmd.assert().success().get_output().clone();
@@ -2752,7 +2796,7 @@ fn search_filter_assignments_attach_to_options() {
         "agent=aider",
         "fields=minimal",
         "mode=lexical",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -2785,7 +2829,7 @@ fn search_time_window_assignments_attach_to_options() {
         "--dry-run",
         "last=7d",
         "before=now",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -2806,7 +2850,7 @@ fn search_since_now_assignment_filters_to_zero_hits() {
         "--json",
         "since=now",
         "limit=1",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -2829,7 +2873,7 @@ fn search_time_window_alias_flags_filter_to_zero_hits() {
         "7",
         "--before=now",
         "limit=1",
-        "data_dir=tests/fixtures/search_demo_data",
+        format!("data_dir={}", shared_search_demo_data()).as_str(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -2855,7 +2899,7 @@ fn search_no_match_returns_empty_hits() {
         "xyznonexistentquery12345",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -2889,7 +2933,7 @@ fn search_writes_trace_on_success() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     cmd.assert().success();
@@ -3082,7 +3126,7 @@ fn search_json_includes_match_type() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3109,7 +3153,7 @@ fn search_robot_format_is_valid_json_lines() {
         "hello",
         "--robot",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3137,7 +3181,7 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3409,7 +3453,7 @@ fn search_robot_meta_reports_explicit_hybrid_fail_open() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3460,7 +3504,7 @@ fn search_robot_meta_reports_explicit_lexical_override() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -3785,12 +3829,7 @@ fn introspect_sessions_command_exposes_workspace_current_and_limit() {
 #[test]
 fn diag_json_reports_paths_and_connectors() {
     let mut cmd = base_cmd();
-    cmd.args([
-        "diag",
-        "--json",
-        "--data-dir",
-        "tests/fixtures/search_demo_data",
-    ]);
+    cmd.args(["diag", "--json", "--data-dir", shared_search_demo_data()]);
 
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3843,7 +3882,7 @@ fn status_json_reports_staleness_flags() {
         "status",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
         "--stale-threshold",
         "1",
     ]);
@@ -3909,7 +3948,7 @@ fn search_agent_filter_limits_hits() {
         "--agent",
         "aider",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -3936,7 +3975,7 @@ fn search_provider_alias_filters_like_agent() {
         let mut cmd = base_cmd();
         cmd.args(["search", "", "--json", "--limit", "10"]);
         cmd.args(alias_args);
-        cmd.args(["--data-dir", "tests/fixtures/search_demo_data"]);
+        cmd.args(["--data-dir", shared_search_demo_data()]);
 
         let output = cmd.assert().success().get_output().clone();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3966,7 +4005,7 @@ fn search_offset_skips_results() {
         "--limit",
         "3",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let full_bytes = cmd_full.assert().success().get_output().stdout.to_vec();
     let full_stdout = String::from_utf8_lossy(&full_bytes);
@@ -3987,7 +4026,7 @@ fn search_offset_skips_results() {
         "--offset",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let offset_bytes = cmd_offset.assert().success().get_output().stdout.to_vec();
     let offset_stdout = String::from_utf8_lossy(&offset_bytes);
@@ -4018,7 +4057,7 @@ fn robot_mode_auto_quiet_suppresses_info_logs() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let assert = cmd.assert().success();
     let output = assert.get_output();
@@ -4046,7 +4085,7 @@ fn non_robot_mode_shows_info_logs() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let assert = cmd.assert().success();
     let output = assert.get_output();
@@ -4076,7 +4115,7 @@ fn fields_filters_to_requested_only() {
         "--fields",
         "source_path,line_number",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4112,7 +4151,7 @@ fn fields_minimal_preset_expands() {
         "--fields",
         "minimal",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4147,7 +4186,7 @@ fn fields_summary_preset_expands() {
         "--fields",
         "summary",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4186,7 +4225,7 @@ fn fields_works_with_jsonl_format() {
         "--fields",
         "source_path,score",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4226,7 +4265,7 @@ fn max_content_length_truncates_long_content() {
         "--max-content-length",
         "5",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4270,7 +4309,7 @@ fn max_content_length_adds_truncated_indicator() {
         "--max-content-length",
         "3",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4311,7 +4350,7 @@ fn max_content_length_preserves_short_content() {
         "--max-content-length",
         "1000",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4353,7 +4392,7 @@ fn max_content_length_works_with_fields() {
         "--fields",
         "content,snippet",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -4990,7 +5029,7 @@ fn aggregate_single_field_returns_buckets() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5039,7 +5078,7 @@ fn aggregate_multiple_fields_returns_all() {
         "--aggregate",
         "agent,workspace",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5066,7 +5105,7 @@ fn aggregate_includes_total_matches() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5099,7 +5138,7 @@ fn aggregate_with_limit_returns_both_hits_and_aggs() {
         "--limit",
         "2",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5132,7 +5171,7 @@ fn aggregate_match_type_returns_exact_wildcard_buckets() {
         "--aggregate",
         "match_type",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5175,7 +5214,7 @@ fn aggregate_empty_query_returns_aggs() {
         "--aggregate",
         "agent",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5204,7 +5243,7 @@ fn aggregate_preserves_offset_when_not_aggregating() {
         "--offset",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let output = cmd_no_agg.assert().success().get_output().clone();
@@ -5449,7 +5488,7 @@ fn search_json_includes_suggestions_for_typos() {
         "gemenii",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -5503,7 +5542,7 @@ fn subcommand_alias_find_to_search() {
         "test query",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     // 'find' should be normalized to 'search'
     // May succeed or fail based on search results, but should not fail on parsing
@@ -5558,7 +5597,7 @@ fn subcommand_alias_query_to_search() {
         "test",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let assert = cmd.assert();
     assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
@@ -6481,7 +6520,7 @@ fn search_json_includes_source_id_provenance() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -6519,7 +6558,7 @@ fn search_fields_provenance_preset_expands() {
         "--fields",
         "provenance,source_path",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -6560,7 +6599,7 @@ fn search_default_output_includes_provenance_fields() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     let assert = cmd.assert().success();
@@ -6863,7 +6902,7 @@ fn exit_code_0_success_search() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     cmd.assert().code(0);
 }
@@ -6982,7 +7021,7 @@ fn trace_includes_contract_fields_on_success() {
         "hello",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
 
     cmd.assert().success();
@@ -7832,7 +7871,7 @@ fn robot_format_toon_is_valid_option() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     // Ensure the flag is accepted and command succeeds.
     cmd.assert().success();
@@ -7849,7 +7888,7 @@ fn cass_output_format_env_triggers_robot_mode() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -7871,7 +7910,7 @@ fn toon_default_format_env_json_works() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -7895,7 +7934,7 @@ fn cli_robot_format_overrides_env() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -7962,7 +8001,7 @@ fn cass_output_format_takes_precedence() {
         "--limit",
         "1",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        shared_search_demo_data(),
     ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
