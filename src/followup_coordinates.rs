@@ -6,6 +6,7 @@
 //! together; it never reparses or mutates the source file or archive.
 
 use crate::franken_sync::compat::{ConnectionExt, RowExt};
+use crate::robot_budget_envelope::RobotBudget;
 use crate::storage::sqlite::FrankenStorage;
 use crate::{CliError, CliErrorKind, CliResult, RobotFormat, ViewWindow};
 use serde_json::{Value, json};
@@ -21,7 +22,35 @@ struct Request {
     context: usize,
 }
 
+mod stream;
 mod window;
+
+const DEADLINE_EXCEEDED: &str = "followup-deadline-exceeded";
+
+fn check_deadline(budget: &RobotBudget) -> CliResult<()> {
+    if budget.is_exhausted() {
+        return Err(deadline_error());
+    }
+    Ok(())
+}
+
+fn deadline_error() -> CliError {
+    CliError {
+        code: 9,
+        kind: DEADLINE_EXCEEDED,
+        message: "Follow-up request deadline exhausted".into(),
+        hint: None,
+        retryable: true,
+    }
+}
+
+fn resource_limit(reason: &str) -> CliError {
+    error(
+        "followup-resource-limit",
+        reason,
+        "Reduce -C/--context or inspect the source with a streaming tool. No partial target was emitted. Follow-ups admit at most 8 MiB per record, 32 MiB of window text and 4096 records.",
+    )
+}
 
 fn error(kind: &'static str, message: impl Into<String>, hint: &str) -> CliError {
     CliError {
@@ -41,7 +70,8 @@ fn lookup_error(err: impl std::fmt::Display) -> CliError {
     )
 }
 
-fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
+fn resolve(request: &Request, expand: bool, budget: &RobotBudget) -> CliResult<Value> {
+    check_deadline(budget)?;
     if request.message_index == 0 {
         return Err(error(
             CliErrorKind::InvalidLine.kind_str(),
@@ -57,13 +87,14 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
         ));
     }
     let storage = FrankenStorage::open_strict_readonly(&request.db).map_err(lookup_error)?;
+    check_deadline(budget)?;
     // Pin identity selection, index validation and content hydration to one
     // read transaction. Never choose against one snapshot and render another.
     storage
         .raw()
         .execute("BEGIN DEFERRED")
         .map_err(lookup_error)?;
-    let result = resolve_snapshot(request, expand, &storage);
+    let result = resolve_snapshot(request, expand, &storage, budget);
     let released = storage.raw().execute("ROLLBACK").map_err(lookup_error);
     match result {
         Err(err) => Err(err),
@@ -71,7 +102,13 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
     }
 }
 
-fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -> CliResult<Value> {
+fn resolve_snapshot(
+    request: &Request,
+    expand: bool,
+    storage: &FrankenStorage,
+    budget: &RobotBudget,
+) -> CliResult<Value> {
+    check_deadline(budget)?;
     let source_sql = crate::normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
     // Resolve ambiguity before reading ANY message content. Empty conversations
     // still participate, including multiple sessions stored in one provider DB.
@@ -95,6 +132,7 @@ fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -
             |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
         )
         .map_err(lookup_error)?;
+    check_deadline(budget)?;
     let (conversation_id, source_id) = conversations.first().ok_or_else(|| {
         error(
             CliErrorKind::IndexedSessionRequired.kind_str(),
@@ -112,6 +150,7 @@ fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -
     let conversation_id = *conversation_id;
     let mut selection = window::Selection::new(request.message_index, request.context);
     let mut invalid_index = None;
+    let mut scan_expired = false;
     // The (conversation_id, idx) index can stream this ordered metadata pass.
     // Context is measured in actual messages, NOT arithmetic on sparse idxs.
     // Keep only O(context) anchors, but validate/count the whole conversation.
@@ -119,6 +158,12 @@ fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -
         "SELECT id, idx FROM messages WHERE conversation_id = ?1 ORDER BY idx",
         &[crate::franken_sync::SqliteValue::Integer(conversation_id)],
         |row| {
+            if budget.is_exhausted() {
+                scan_expired = true;
+                return Err(crate::franken_sync::FrankenError::Internal(
+                    DEADLINE_EXCEEDED.into(),
+                ));
+            }
             let id = row.get_typed::<i64>(0)?;
             let idx = row.get_typed::<i64>(1)?;
             selection.observe(id, idx).map_err(|reason| {
@@ -127,6 +172,9 @@ fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -
             })
         },
     );
+    if scan_expired {
+        check_deadline(budget)?;
+    }
     if let Some(reason) = invalid_index {
         return Err(error(
             CliErrorKind::InvalidLine.kind_str(),
@@ -135,6 +183,7 @@ fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -
         ));
     }
     scanned.map_err(lookup_error)?;
+    check_deadline(budget)?;
     if !selection.found {
         return Err(error(
             CliErrorKind::LineNotFound.kind_str(),
@@ -171,6 +220,7 @@ fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -
             },
         )
         .map_err(lookup_error)?;
+    check_deadline(budget)?;
     if rows.len() != selection.anchors.len() {
         return Err(lookup_error(
             "message window changed during snapshot hydration",
@@ -178,6 +228,7 @@ fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -
     }
     let mut lines = Vec::new();
     for ((id, idx, role, content), anchor) in rows.into_iter().zip(&selection.anchors) {
+        check_deadline(budget)?;
         if id != anchor.id || idx != anchor.idx {
             return Err(lookup_error(
                 "message identity changed during snapshot hydration",
@@ -244,37 +295,51 @@ fn run(
                 format
             }
         });
-    let budget = timeout_ms.unwrap_or_else(|| {
+    let budget_ms = timeout_ms.unwrap_or_else(|| {
         dotenvy::var("CASS_VIEW_BUDGET_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(10_000)
     });
+    let budget = RobotBudget::new(budget_ms);
     // Lookup AND output projection run inside the existing read-only deadline.
     // A timeout is an error, not a successful payload with an invented target.
-    let encoded = crate::run_read_only_search_worker(budget, move || {
-        let payload = resolve(&request, expand)?;
+    let encoded = crate::run_read_only_search_worker(budget.remaining_ms(), move || {
+        let payload = resolve(&request, expand, &budget)?;
+        check_deadline(&budget)?;
         if let Some(format) = format {
-            return crate::encode_structured_value(payload, format);
+            let encoded = crate::encode_structured_value(payload, format)?;
+            check_deadline(&budget)?;
+            return Ok(encoded);
         }
         let lines = if expand { &payload } else { &payload["lines"] };
         let mut output = format!("Archived messages in {}\n", request.path.display());
         for message in lines.as_array().expect("message projection is an array") {
+            check_deadline(&budget)?;
             output.push_str(&format!(
                 "{} M{} {}\n{}\n\n",
-                if message["is_target"] == true { ">>>" } else { "   " },
+                if message["is_target"] == true {
+                    ">>>"
+                } else {
+                    "   "
+                },
                 message["message_index"],
                 message["role"].as_str().unwrap_or("unknown"),
                 message["content"].as_str().unwrap_or_default(),
             ));
         }
+        check_deadline(&budget)?;
         Ok(output)
-    })?
+    });
+    let encoded = match encoded {
+        Err(error) if error.kind == DEADLINE_EXCEEDED => None,
+        result => result?,
+    }
     .ok_or_else(|| CliError {
         code: 9,
         kind: "message-lookup-timeout",
-        message: format!("Canonical message lookup exceeded its {budget}ms budget"),
+        message: format!("Canonical message lookup exceeded its {budget_ms}ms budget"),
         hint: Some("Retry the same --message-index, --source, and --conversation-id with a larger view --timeout or CASS_VIEW_BUDGET_MS.".to_string()),
         retryable: true,
     })?;
@@ -285,9 +350,17 @@ fn run(
 // Physical coordinates must never pass through the archive serializer: it
 // emits one line per normalized message, not one line per source-file record.
 // This reader has no database handle or path and opens the source exactly once.
-fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> CliResult<Value> {
+fn resolve_physical(
+    path: &Path,
+    line: usize,
+    context: usize,
+    expand: bool,
+    budget: &RobotBudget,
+) -> CliResult<Value> {
     use std::collections::VecDeque;
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
+
+    check_deadline(budget)?;
 
     if line == 0 {
         return Err(error(
@@ -296,7 +369,8 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
             "Use --line 1 for a physical file line, or --message-index for a search hit.",
         ));
     }
-    let file = std::fs::File::open(path).map_err(|err| CliError {
+    let open_error = |err: std::io::Error| {
+        CliError {
         code: if err.kind() == std::io::ErrorKind::NotFound {
             3
         } else {
@@ -313,7 +387,8 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
         ),
         hint: Some("Use the search hit's source and conversation identity. --line never substitutes archived messages.".into()),
         retryable: false,
-    })?;
+    }
+    };
     let file_error = |err: std::io::Error| {
         CliError {
         code: 9,
@@ -323,6 +398,23 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
         retryable: false,
     }
     };
+    // Refuse special files before opening. On Unix, nonblocking open also
+    // closes the metadata/open race with a path replaced by a FIFO. A regular
+    // file (including a symlink to one) keeps its ordinary read semantics.
+    if !std::fs::metadata(path).map_err(open_error)?.is_file() {
+        return Err(file_error(std::io::Error::other(
+            "source is not a regular file",
+        )));
+    }
+    check_deadline(budget)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(open_error)?;
     if !file.metadata().map_err(file_error)?.is_file() {
         return Err(file_error(std::io::Error::other(
             "source is not a regular file",
@@ -348,14 +440,49 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
     let mut total_lines = 0_usize;
     let mut found = false;
     let mut following = 0_usize;
-    for raw in BufReader::new(file).lines() {
-        let raw = raw.map_err(file_error)?;
+    let mut retained = stream::WindowSize::default();
+    let mut reader = BufReader::new(file);
+    loop {
+        let next_line = total_lines
+            .checked_add(1)
+            .ok_or_else(|| file_error(std::io::Error::other("physical line count overflow")))?;
+        // Literal view context is known from physical coordinates before any
+        // allocation. Expand must parse prior records when counting context,
+        // but -C 0 can skip them without decoding or retaining their bodies.
+        let retain = if expand {
+            next_line >= line || context != 0
+        } else {
+            next_line >= line.saturating_sub(context) && next_line <= line.saturating_add(context)
+        };
+        let raw = stream::read_line(&mut reader, retain, stream::MAX_RECORD_BYTES, || {
+            if budget.is_exhausted() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    DEADLINE_EXCEEDED,
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|error| match error {
+            stream::ReadError::RecordTooLarge => resource_limit("physical record exceeds 8 MiB"),
+            stream::ReadError::Io(error)
+                if error.kind() == std::io::ErrorKind::TimedOut && budget.is_exhausted() =>
+            {
+                deadline_error()
+            }
+            stream::ReadError::Io(error) => file_error(error),
+        })?;
+        let Some(raw) = raw else {
+            break;
+        };
         total_lines = total_lines
             .checked_add(1)
             .ok_or_else(|| file_error(std::io::Error::other("physical line count overflow")))?;
-        if (total_lines < line && context == 0) || (!expand && found && following == context) {
+        let Some(raw) = raw else {
             continue;
-        }
+        };
+        check_deadline(budget)?;
         let mut entry = if expand {
             let Ok(record) = serde_json::from_str::<Value>(&raw) else {
                 if total_lines == line {
@@ -376,18 +503,24 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
         entry["content_source"] = json!("file");
         entry["is_target"] = json!(total_lines == line);
         entry["highlighted"] = json!(total_lines == line);
+        let entry_bytes = physical_entry_bytes(&entry);
         if total_lines < line {
             if context > 0 {
-                if preceding.len() == context {
-                    preceding.pop_front();
+                if preceding.len() == context
+                    && let Some(old) = preceding.pop_front()
+                {
+                    retained.release(physical_entry_bytes(&old));
                 }
+                retained.admit(entry_bytes).map_err(resource_limit)?;
                 preceding.push_back(entry);
             }
         } else if total_lines == line {
+            retained.admit(entry_bytes).map_err(resource_limit)?;
             found = true;
             selected.extend(preceding.drain(..));
             selected.push(entry);
         } else if found && following < context {
+            retained.admit(entry_bytes).map_err(resource_limit)?;
             selected.push(entry);
             following += 1;
         }
@@ -397,6 +530,7 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
             break;
         }
     }
+    check_deadline(budget)?;
     if !expand && total_lines == 0 {
         return Err(CliError {
             code: 9,
@@ -435,6 +569,13 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
         "source_exists": true,
         "archive_only": false,
     }))
+}
+
+fn physical_entry_bytes(entry: &Value) -> usize {
+    entry["content"]
+        .as_str()
+        .map_or(0, str::len)
+        .saturating_add(entry["role"].as_str().map_or(0, str::len))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -491,9 +632,11 @@ fn run_physical(
     let worker_read_finished = std::sync::Arc::clone(&read_finished);
     let encoded = crate::run_read_only_search_worker(budget.remaining_ms(), move || {
         crate::maybe_test_view_delay();
-        let mut payload = resolve_physical(&request_path, line, context, expand)?;
+        check_deadline(&budget)?;
+        let mut payload = resolve_physical(&request_path, line, context, expand, &budget)?;
         worker_read_finished.store(true, std::sync::atomic::Ordering::Release);
         crate::maybe_test_search_worker_delay("CASS_TEST_VIEW_PROJECTION_SLOW_MS");
+        check_deadline(&budget)?;
         if !expand {
             payload["budget"] = serde_json::to_value(
                 crate::robot_budget_envelope::BudgetBlock::from_budget(&budget, Vec::new(), None),
@@ -507,11 +650,14 @@ fn run_physical(
             })?;
         }
         if let Some(format) = format {
-            return crate::encode_structured_value(payload, format);
+            let encoded = crate::encode_structured_value(payload, format)?;
+            check_deadline(&budget)?;
+            return Ok(encoded);
         }
         let lines = if expand { &payload } else { &payload["lines"] };
         let mut output = format!("Physical lines in {}\n", request_path.display());
         for entry in lines.as_array().expect("physical projection is an array") {
+            check_deadline(&budget)?;
             let content = entry["content"].as_str().unwrap_or_default();
             let display = if expand {
                 content.chars().take(300).collect::<String>()
@@ -530,8 +676,13 @@ fn run_physical(
                 display,
             ));
         }
+        check_deadline(&budget)?;
         Ok(output)
-    })?;
+    });
+    let encoded = match encoded {
+        Err(error) if error.kind == DEADLINE_EXCEEDED => None,
+        result => result?,
+    };
     if let Some(encoded) = encoded {
         println!("{encoded}");
         return Ok(());
