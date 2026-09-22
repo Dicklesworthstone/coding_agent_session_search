@@ -18,6 +18,8 @@ use super::protocol::MAX_IDENTITY_BYTES;
 
 pub(super) const MAX_CONTEXT: usize = 20;
 pub(super) const MAX_CONTENT_BYTES: usize = 64 * 1024;
+pub(super) const MAX_BATCH_VIEWS: usize = 8;
+pub(super) const MAX_BATCH_MESSAGES: usize = 128;
 const MAX_ROLE_BYTES: usize = 128;
 const LOOKUP_BUDGET: Duration = Duration::from_secs(3);
 
@@ -71,7 +73,7 @@ enum Refusal {
     #[error("canonical message coordinates are ambiguous or invalid; no message was selected")]
     InvalidCoordinates,
     #[error(
-        "the complete canonical window exceeds 64 KiB of message content; narrow context or use the explicit CLI follow-up"
+        "the complete canonical request exceeds 64 KiB of message content; narrow context or split the batch"
     )]
     PayloadTooLarge,
     #[error(
@@ -162,11 +164,50 @@ fn open_archive(db: &Path) -> Result<Connection> {
 /// calls. The host continues to own the process-level deadline and memory cap.
 pub(super) fn read(db: &Path, request: &View<'_>) -> Result<Value> {
     request.validate().map_err(anyhow::Error::msg)?;
+    with_snapshot(db, |connection, started| {
+        read_snapshot(connection, request, started)
+    })
+}
+
+/// Validate every coordinate and the worst-case aggregate work before opening
+/// the archive. Repeated/overlapping windows count again: they are repeated
+/// output, not permission to evade the content or message budget.
+pub(super) fn validate_batch(requests: &[View<'_>]) -> Result<(), &'static str> {
+    if requests.is_empty() || requests.len() > MAX_BATCH_VIEWS {
+        return Err("views must contain between 1 and 8 canonical windows");
+    }
+    let mut messages = 0_usize;
+    for request in requests {
+        request.validate()?;
+        messages = messages
+            .checked_add(2 * request.context + 1)
+            .ok_or("canonical batch message budget overflow")?;
+        if messages > MAX_BATCH_MESSAGES {
+            return Err("the batch may request at most 128 message occurrences in total");
+        }
+    }
+    Ok(())
+}
+
+/// Retrieve an ordered batch using one open, one read transaction and one
+/// cooperative deadline. Any failure discards the entire result, including
+/// previously read windows. Transport code publishes only a complete frame.
+pub(super) fn read_batch(db: &Path, requests: &[View<'_>]) -> Result<Value> {
+    validate_batch(requests).map_err(anyhow::Error::msg)?;
+    with_snapshot(db, |connection, started| {
+        read_batch_snapshot(connection, requests, started)
+    })
+}
+
+fn with_snapshot(
+    db: &Path,
+    read: impl FnOnce(&Connection, Instant) -> Result<Value>,
+) -> Result<Value> {
     let started = Instant::now();
     let connection = open_archive(db)?;
     check_budget(started)?;
     let snapshot = Snapshot::begin(&connection)?;
-    let result = read_snapshot(&connection, request, started);
+    let result = read(&connection, started);
     let released = snapshot.release();
     // Preserve the primary typed failure, including its original storage cause.
     match result {
@@ -178,7 +219,55 @@ pub(super) fn read(db: &Path, request: &View<'_>) -> Result<Value> {
     }
 }
 
+fn read_batch_snapshot(
+    connection: &Connection,
+    requests: &[View<'_>],
+    started: Instant,
+) -> Result<Value> {
+    // Keep this boundary safe for internal callers as well as the wire route.
+    validate_batch(requests).map_err(anyhow::Error::msg)?;
+    let mut remaining_bytes = MAX_CONTENT_BYTES;
+    let mut windows = Vec::with_capacity(requests.len());
+    let mut message_occurrences = 0_usize;
+    for request in requests {
+        let mut window = read_window(connection, request, started, &mut remaining_bytes)?;
+        message_occurrences += window["messages"]
+            .as_array()
+            .context("canonical window has no messages")?
+            .len();
+        window["snapshot_policy"] = json!("one_archive_read_transaction_per_batch");
+        windows.push(window);
+    }
+    check_budget(started)?;
+    ensure!(
+        message_occurrences <= MAX_BATCH_MESSAGES,
+        "canonical batch exceeded its message budget"
+    );
+    Ok(json!({
+        "windows": windows,
+        "window_count": requests.len(),
+        "message_occurrences": message_occurrences,
+        "content_bytes": MAX_CONTENT_BYTES - remaining_bytes,
+        "snapshot_policy": "one_archive_read_transaction_per_batch",
+        "all_or_nothing": true,
+        "matches_lexical_snapshot": null,
+        "lexical_freshness": "not_checked",
+        "preview_only": false,
+        "maintenance_performed": false,
+    }))
+}
+
 fn read_snapshot(connection: &Connection, request: &View<'_>, started: Instant) -> Result<Value> {
+    let mut remaining_bytes = MAX_CONTENT_BYTES;
+    read_window(connection, request, started, &mut remaining_bytes)
+}
+
+fn read_window(
+    connection: &Connection,
+    request: &View<'_>,
+    started: Instant,
+    remaining_bytes: &mut usize,
+) -> Result<Value> {
     check_budget(started)?;
     // A fixed primary-key lookup cannot resolve an identically named session
     // in another source. Compare literal path/source BEFORE any body read.
@@ -279,7 +368,7 @@ fn read_snapshot(connection: &Connection, request: &View<'_>, started: Instant) 
     let mut messages = Vec::with_capacity(anchors.len());
     for anchor in anchors {
         check_budget(started)?;
-        let remaining = i64::try_from(MAX_CONTENT_BYTES - content_bytes)?;
+        let remaining = i64::try_from(*remaining_bytes)?;
         // Check byte lengths inside SQL BEFORE transferring bodies to the host.
         // An oversized/invalid body is never shortened into successful evidence.
         // This is not a guarantee about the engine's internal page allocations.
@@ -310,7 +399,7 @@ fn read_snapshot(connection: &Connection, request: &View<'_>, started: Instant) 
             "canonical message content must be text, not {kind}"
         );
         let length = usize::try_from(length.context("canonical content has no byte length")?)?;
-        if length > MAX_CONTENT_BYTES - content_bytes {
+        if length > *remaining_bytes {
             return Err(Refusal::PayloadTooLarge.into());
         }
         let content = content.context("canonical content was refused by the bounded projection")?;
@@ -325,6 +414,7 @@ fn read_snapshot(connection: &Connection, request: &View<'_>, started: Instant) 
             role
         };
         content_bytes += length;
+        *remaining_bytes -= length;
         messages.push(json!({
             "message_id": id, "message_index": (index as u64) + 1,
             "role": role, "content": content, "is_target": id == target.id,

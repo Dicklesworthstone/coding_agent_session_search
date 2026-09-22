@@ -514,3 +514,263 @@ fn canonical_reads_share_admission_and_release_temporary_leases() -> Result<()> 
     assert_eq!(archive_image(&fixture.db)?, before);
     Ok(())
 }
+
+fn batch_request(fixture: &Fixture, id: u64, indices: &[u64], context: usize) -> Request {
+    Request::ViewBatch {
+        id,
+        views: indices
+            .iter()
+            .map(|&message_index| super::super::protocol::ViewSelection {
+                source_path: "/absent/shared.sqlite".into(),
+                source_id: "local".into(),
+                conversation_id: fixture.conversation,
+                message_index,
+                context,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn canonical_batch_returns_ordered_sparse_windows_with_one_reader_admission() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let pool = super::super::admission::Pool::new(fixture.root.path().join("batch-pool"), 1)?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    session.admission_pool = Some(pool.clone());
+    let before = archive_image(&fixture.db)?;
+    let holder = pool.acquire()?;
+    let (refused, _) = session.handle(batch_request(&fixture, 1, &[1001, 13], 1));
+    assert_eq!(refused.error.unwrap().kind, "admission_busy");
+    assert_eq!(session.canonical_read_attempts, 0);
+    drop(holder);
+    let (reply, stop) = session.handle(batch_request(&fixture, 2, &[1001, 13], 1));
+    assert!(reply.ok && !stop, "{reply:?}");
+    let data = reply.result.unwrap();
+    assert_eq!(data["window_count"], 2);
+    assert_eq!(data["message_occurrences"], 5);
+    assert_eq!(data["windows"][0]["message_index"], 1001);
+    assert_eq!(data["windows"][1]["message_index"], 13);
+    assert_eq!(
+        data["windows"][1]["messages"][1]["content"],
+        "canonical content 12"
+    );
+    let mut bytes = 0;
+    for window in data["windows"].as_array().unwrap() {
+        assert_eq!(
+            window["snapshot_policy"],
+            "one_archive_read_transaction_per_batch"
+        );
+        assert_eq!(window["source_path"], "/absent/shared.sqlite");
+        assert!(window["matches_lexical_snapshot"].is_null());
+        bytes += window["content_bytes"].as_u64().unwrap();
+    }
+    assert_eq!(data["content_bytes"], bytes);
+    assert_eq!(data["all_or_nothing"], true);
+    assert_eq!(session.canonical_read_attempts, 1);
+    assert_eq!(session.canonical_reads_completed, 1);
+    assert_eq!(session.open_attempts, 0);
+    assert!(!session.refiner.loaded());
+    drop(pool.acquire()?);
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn canonical_batch_rejects_all_invalid_work_before_archive_or_pool_access() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut session = Session::new(root.path().join("absent-index"));
+    let db = root.path().join("absent.db");
+    let pool_path = root.path().join("absent-pool");
+    session.archive = Some(db.clone());
+    session.admission_pool = Some(super::super::admission::Pool::new(pool_path.clone(), 1)?);
+    let valid = json!({"source_path":"/not-opened", "source_id":"local",
+        "conversation_id":1, "message_index":1});
+    let mut invalid = valid.clone();
+    invalid["message_index"] = json!(0);
+    let mut huge_context = valid.clone();
+    huge_context["context"] = json!(usize::MAX);
+    let mut wide = valid.clone();
+    wide["context"] = json!(8);
+    for views in [
+        vec![],
+        vec![valid.clone(); MAX_BATCH_VIEWS + 1],
+        vec![valid.clone(), invalid],
+        vec![valid.clone(), huge_context],
+        vec![wide; MAX_BATCH_VIEWS],
+    ] {
+        let request = serde_json::from_value(json!({"op":"view_batch", "id":7, "views":views}))?;
+        let (reply, stop) = session.handle(request);
+        assert!(!stop && !reply.ok);
+        assert_eq!(reply.error.unwrap().kind, "invalid_request");
+    }
+    let mut escalated = valid;
+    escalated["db"] = json!("/other/archive");
+    assert!(
+        serde_json::from_value::<Request>(json!({"op":"view_batch", "id":8,
+        "views":[escalated]}))
+        .is_err()
+    );
+    assert_eq!(session.canonical_read_attempts, 0);
+    assert_eq!(session.open_attempts, 0);
+    assert!(!db.exists());
+    assert!(!pool_path.exists());
+    Ok(())
+}
+
+#[test]
+fn canonical_batch_permission_is_not_implied_by_valid_coordinates() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    let (reply, _) = session.handle(batch_request(&fixture, 1, &[13], 0));
+    assert_eq!(reply.error.unwrap().kind, "canonical_access_disabled");
+    assert_eq!(session.canonical_read_attempts, 0);
+    Ok(())
+}
+
+#[test]
+fn canonical_batch_later_failure_never_publishes_a_successful_prefix() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let before = archive_image(&fixture.db)?;
+    for mutate in 0..3 {
+        let mut request = batch_request(&fixture, 1, &[13, 100], 0);
+        let Request::ViewBatch { views, .. } = &mut request else {
+            unreachable!()
+        };
+        let expected = match mutate {
+            0 => {
+                views[1].message_index = 12;
+                "canonical_not_found"
+            }
+            1 => {
+                views[1].source_id = "wrong-source".into();
+                "canonical_identity_mismatch"
+            }
+            _ => {
+                views[1].source_path = "/absent/SHARED.sqlite".into();
+                "canonical_identity_mismatch"
+            }
+        };
+        let (reply, _) = session.handle(request);
+        assert!(!reply.ok);
+        assert!(
+            reply.result.is_none(),
+            "no prefix or body may accompany the error"
+        );
+        assert_eq!(reply.error.unwrap().kind, expected);
+    }
+    assert_eq!(session.canonical_reads_completed, 0);
+    assert_eq!(session.canonical_read_attempts, 3);
+    let (recovered, _) = session.handle(batch_request(&fixture, 2, &[13, 100], 0));
+    assert!(recovered.ok, "{recovered:?}");
+    assert_eq!(session.canonical_reads_completed, 1);
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn canonical_batch_has_one_utf8_byte_budget_even_for_repeated_windows() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let half = "\0é".repeat((MAX_CONTENT_BYTES / 2) / 3) + "xx";
+    assert_eq!(half.len(), MAX_CONTENT_BYTES / 2);
+    fixture.content(12, &half)?;
+    let before = archive_image(&fixture.db)?;
+    let pair = [fixture.view(0), fixture.view(0)];
+    let data = read_batch(&fixture.db, &pair)?;
+    assert_eq!(data["content_bytes"], MAX_CONTENT_BYTES);
+    assert_eq!(data["windows"][0]["messages"][0]["content"], half);
+    assert_eq!(data["windows"][1]["messages"][0]["content"], half);
+    let error = read_batch(
+        &fixture.db,
+        &[fixture.view(0), fixture.view(0), fixture.view(0)],
+    )
+    .unwrap_err();
+    assert_eq!(error_kind(&error), "canonical_payload_too_large");
+    // A refused batch must release its transaction and preserve later reads.
+    assert!(read_batch(&fixture.db, &pair).is_ok());
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn canonical_batch_uses_one_pinned_snapshot_and_shared_deadline() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let connection = open_archive(&fixture.db)?;
+    let snapshot = Snapshot::begin(&connection)?;
+    let pinned = connection.query_map_collect(
+        "SELECT id FROM conversations WHERE id = ?1",
+        params![fixture.conversation],
+        |row| row.get_typed::<i64>(0),
+    )?;
+    assert_eq!(pinned, vec![fixture.conversation]);
+    fixture.content(12, "a newer committed generation")?;
+    let before = archive_image(&fixture.db)?;
+    let old = read_batch_snapshot(
+        &connection,
+        &[fixture.view(0), fixture.view(0)],
+        Instant::now(),
+    )?;
+    for window in old["windows"].as_array().unwrap() {
+        assert_eq!(window["messages"][0]["content"], "canonical content 12");
+    }
+    let error = read_batch_snapshot(
+        &connection,
+        &[fixture.view(0)],
+        Instant::now() - LOOKUP_BUDGET - Duration::from_millis(1),
+    )
+    .unwrap_err();
+    assert_eq!(error_kind(&error), "canonical_deadline");
+    snapshot.release()?;
+    drop(connection);
+    let fresh = read_batch(&fixture.db, &[fixture.view(0)])?;
+    assert_eq!(
+        fresh["windows"][0]["messages"][0]["content"],
+        "a newer committed generation"
+    );
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn canonical_batch_boundaries_do_not_reset_for_each_window() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let at_limit = (0..8).map(|_| fixture.view(7)).collect::<Vec<_>>();
+    assert!(validate_batch(&at_limit).is_ok()); // 120 requested occurrences
+    let beyond = (0..8).map(|_| fixture.view(8)).collect::<Vec<_>>();
+    assert!(validate_batch(&beyond).is_err()); // 136 requested occurrences
+    let too_many = (0..9).map(|_| fixture.view(0)).collect::<Vec<_>>();
+    assert!(validate_batch(&too_many).is_err());
+    assert!(validate_batch(&[]).is_err());
+    Ok(())
+}
+
+#[test]
+fn canonical_batch_json_lines_round_trip_is_a_single_complete_reply() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.content(12, "quotes \" and NUL \0 and Unicode δ😀")?;
+    let mut session = Session::new(fixture.root.path().join("absent-index"));
+    session.archive = Some(fixture.db.clone());
+    let request = json!({"op":"view_batch", "id":42, "views":[
+        {"source_path":"/absent/shared.sqlite", "source_id":"local",
+         "conversation_id":fixture.conversation, "message_index":13},
+        {"source_path":"/absent/shared.sqlite", "source_id":"local",
+         "conversation_id":fixture.conversation, "message_index":1001}
+    ]});
+    let mut input = std::io::Cursor::new(format!("{request}\n{{\"op\":\"shutdown\",\"id\":43}}\n"));
+    let mut output = Vec::new();
+    super::super::serve_io(&mut session, &mut input, &mut output)?;
+    let lines = std::str::from_utf8(&output)?.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    let response: Value = serde_json::from_str(lines[0])?;
+    assert_eq!(response["id"], 42);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["window_count"], 2);
+    assert_eq!(
+        response["result"]["windows"][0]["messages"][0]["content"],
+        "quotes \" and NUL \0 and Unicode δ😀"
+    );
+    assert_eq!(session.canonical_read_attempts, 1);
+    Ok(())
+}
