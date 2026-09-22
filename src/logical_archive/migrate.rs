@@ -906,12 +906,10 @@ mod tests {
                             .and_then(|offset| cells.get(offset));
                         if key.is_some_and(
                             |cell| matches!(cell, Cell::Text(value) if value == SCHEMA_VERSION_KEY),
-                        ) {
-                            if let Some(value_offset) =
-                                table.columns.iter().position(|column| column == "value")
-                            {
-                                cells[value_offset] = Cell::Text(source_version.to_string());
-                            }
+                        ) && let Some(value_offset) =
+                            table.columns.iter().position(|column| column == "value")
+                        {
+                            cells[value_offset] = Cell::Text(source_version.to_string());
                         }
                     }
                     output.write_all(&validator.push(&Record::Row { values: cells })?)?;

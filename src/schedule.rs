@@ -1462,7 +1462,18 @@ mod tests {
     fn launchd_jobs_keep_cpu_niceness_without_background_io_throttling() {
         for job in [ScheduleJob::Incremental, ScheduleJob::Nightly] {
             let plist = render_launchd_plist(&spec(), job);
-            assert!(plist.contains("<key>Nice</key>\n    <integer>15</integer>"));
+            // The renderer's line-continuation literal drops indentation, so
+            // check the key/value pairing structurally rather than by exact
+            // whitespace: the value that follows `Nice` must be 15.
+            let nice_at = plist
+                .find("<key>Nice</key>")
+                .unwrap_or_else(|| panic!("{} must set Nice: {plist}", job.as_str()));
+            let after_nice = plist[nice_at + "<key>Nice</key>".len()..].trim_start();
+            assert!(
+                after_nice.starts_with("<integer>15</integer>"),
+                "{} must keep Nice=15: {plist}",
+                job.as_str()
+            );
             for key in ["ProcessType", "LowPriorityIO", "LowPriorityBackgroundIO"] {
                 assert!(
                     !plist.contains(&format!("<key>{key}</key>")),
