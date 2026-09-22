@@ -1,6 +1,5 @@
 name: GH493 canonical anchor candidate
 
-# Read-only entry point for regression evidence and the exact tracked source.
 on:
   workflow_dispatch:
   push:
@@ -12,28 +11,105 @@ permissions:
   contents: read
 
 jobs:
-  source:
+  prepare:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Retain immutable tracked source
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+        with:
+          shared-key: gh493-identity
+          cache-on-failure: true
+      - name: Apply hash-checked manually authored changes
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/cass-retrieval-source"
-          git rev-parse HEAD > "$RUNNER_TEMP/cass-retrieval-source/commit.txt"
-          git archive --format=tar HEAD > "$RUNNER_TEMP/cass-retrieval-source/source.tar"
-          sha256sum "$RUNNER_TEMP/cass-retrieval-source/source.tar"
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          expected = {'src/followup_coordinates.rs': '0ade3d2899b2bddc24a855638ef4362b2a8d5206', 'tests/cli_view_budget.rs': '90e7c74e0c544b7f69ef2c94ca3dfe594a0fadaf'}
+          for path, sha in expected.items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          def blob(sha):
+              request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+              return data
+          for sha in ['96d7f956778b2c25c69598043d3bbd133aea135e', '516aa3380beefcf6fe83b394e5a53cc8d4171404']:
+              patch = blob(sha)
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          path = pathlib.Path('src/followup_coordinates/stream.rs')
+          assert not path.exists()
+          path.write_bytes(blob('ae6d1665f4a652b1816d731a281acedc9dc5d433'))
+          for path, sha in {'src/followup_coordinates.rs': '5f80479988d0986b04dc49eca68750ead93e9262', 'tests/cli_view_budget.rs': '1cd83013a26139f855f65e4a5203eb294838bab7'}.items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          PY
+      - name: Format and execute the exact streaming reader
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true src/followup_coordinates.rs src/followup_coordinates/stream.rs tests/cli_view_budget.rs
+          git diff --check
+          printf '#[path = "%s/src/followup_coordinates/stream.rs"] mod stream;\n' "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/stream-tests.rs"
+          rustc --edition 2024 --test "$RUNNER_TEMP/stream-tests.rs" -o "$RUNNER_TEMP/stream-tests"
+          "$RUNNER_TEMP/stream-tests" --nocapture
+      - name: Publish reviewed blobs only, never commits or refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess, urllib.request
+          paths = ['src/followup_coordinates.rs', 'src/followup_coordinates/stream.rs', 'tests/cli_view_budget.rs']
+          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': {}, 'candidate_blobs': {}}
+          for path in paths:
+              old = subprocess.run(['git', 'rev-parse', f'HEAD:{path}'], capture_output=True, text=True)
+              manifest['base_blobs'][path] = old.stdout.strip() if old.returncode == 0 else None
+              request = urllib.request.Request(f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', data=json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  sha = json.load(response)['sha']
+              assert sha == subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              manifest['candidate_blobs'][path] = sha
+              destination = pathlib.Path('candidate') / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, destination)
+          pathlib.Path('candidate/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff']))
+          print(json.dumps(manifest, indent=2))
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: cass-retrieval-source
-          path: ${{ runner.temp }}/cass-retrieval-source/
+          name: bounded-followup-candidate
+          path: candidate/
           retention-days: 1
           if-no-files-found: error
-  verify:
-    if: github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/message-coordinate-regression.yml
+      - name: Real follow-up bounds, canonical identities and error contracts
+        run: cargo test --locked --no-fail-fast --test cli_view_budget --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test spec_view_expand_error_envelopes -- --nocapture
+      - name: Existing raw-line recovery and dispatch contracts
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked --test cli_robot view_
+          cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
+      - name: Strict native lint
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --test cli_view_budget --test gh493_message_coordinates --test gh493_windowed_followup -- -D warnings
