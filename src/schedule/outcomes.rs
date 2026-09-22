@@ -9,6 +9,14 @@ fn is_busy_index(step: &StepReport) -> bool {
     matches!(step.name.as_str(), "index" | "index-full") && step.exit_code == Some(7)
 }
 
+fn is_deferred(step: &StepReport) -> bool {
+    is_busy_index(step)
+        || (step.name == "schedule-admission"
+            && step.result.as_ref().is_some_and(|result| {
+                result.get("reason").and_then(serde_json::Value::as_str) == Some("schedule_busy")
+            }))
+}
+
 /// Older receipts converted index-busy into `ok: true`. Interpret those receipts
 /// truthfully when reading them, without writing to state or history during reads.
 pub(super) fn normalize_state(mut state: ScheduleState) -> ScheduleState {
@@ -17,7 +25,7 @@ pub(super) fn normalize_state(mut state: ScheduleState) -> ScheduleState {
         .flatten()
     {
         for step in &mut report.steps {
-            if is_busy_index(step) {
+            if is_deferred(step) {
                 step.ok = false;
             }
         }
@@ -33,10 +41,10 @@ fn run_detail(report: &JobReport) -> String {
     let failures: Vec<&StepReport> = report
         .steps
         .iter()
-        .filter(|step| !step.ok || is_busy_index(step))
+        .filter(|step| !step.ok || is_deferred(step))
         .collect();
     if !failures.is_empty() {
-        let deferred = failures.iter().all(|step| is_busy_index(step));
+        let deferred = failures.iter().all(|step| is_deferred(step));
         let outcome = if deferred { "deferred" } else { "failed" };
         let steps = failures
             .iter()

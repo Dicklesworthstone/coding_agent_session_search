@@ -10,8 +10,12 @@ on:
       - src/connectors/codex/**
       - src/raw_mirror.rs
       - src/raw_mirror/**
+      - src/schedule.rs
+      - src/schedule/**
       - scripts/test_raw_mirror_exclusions.py
       - tests/retrieval_core_*.rs
+      - tests/cli_schedule.rs
+      - tests/schedule_admission.rs
   workflow_dispatch:
 
 permissions:
@@ -90,6 +94,11 @@ jobs:
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
       - name: Record exact source and compiler identity
         run: git rev-parse HEAD && rustc --version && cargo --version
+      - name: Run scheduled source admission and real CLI regressions
+        run: |
+          cargo test --locked --lib schedule:: -- --nocapture
+          cargo test --locked --test schedule_admission -- --nocapture
+          cargo test --locked --test cli_schedule -- --nocapture
       - name: Run immutable semantic admission regressions
         run: cargo test --locked --lib search::semantic_manifest::selection::tests -- --nocapture
       - name: Run retained semantic reader and publication regressions
