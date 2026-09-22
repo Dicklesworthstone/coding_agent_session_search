@@ -8,6 +8,9 @@
 use super::*;
 use crate::search::ann_index::{AnnExactFallbackReason, AnnExactFallbackStats, AnnSearchStats};
 
+mod refinement;
+use refinement::{NativeRefillBudget, accumulate_native_stats};
+
 pub(super) struct SemanticAnnShardSet {
     artifacts: Arc<Vec<SemanticIndexArtifact>>,
     graphs: Vec<FsHnswIndex>,
@@ -42,11 +45,11 @@ impl std::fmt::Display for NativeAnnSearchFailure {
 impl std::error::Error for NativeAnnSearchFailure {}
 
 impl SemanticAnnShardSet {
-    /// Recover native failure or underfill from the same complete exact cohort.
-    /// Native top-k is selected before metadata filtering and message collapse;
-    /// a full raw window therefore does not prove there are no more matching
-    /// messages. Do not combine native and exact scores, or repair just one shard.
-    /// The existing exact driver owns its bounded message-refill policy.
+    /// Refill underfilled native windows before paying for a complete exact scan.
+    /// Extra native passes keep the same retained cohort, query and filter, and
+    /// have a shared graph-call/window budget. A complete initial page performs
+    /// no extra work. Native failure or unresolved underfill still recovers the
+    /// entire exact cohort; no partial native/exact ranking is returned.
     /// Invalid queries and mismatched context owners remain errors, not fallbacks.
     pub(super) fn search_with_exact_fallback(
         &self,
@@ -59,30 +62,70 @@ impl SemanticAnnShardSet {
         SemanticCandidateRetryState,
         Option<AnnSearchStats>,
     )> {
-        let (mut stats, native_messages, reason) =
-            match self.search(&context.artifacts, embedding, fetch_limit, filter) {
-                Ok((hits, retry, stats)) => {
+        let mut budget = NativeRefillBudget::new(fetch_limit, context.artifacts.len());
+        let mut native_window = fetch_limit;
+        let mut stats: Option<AnnSearchStats> = None;
+        let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+        let (native_messages, reason) = loop {
+            match self.search(&context.artifacts, embedding, native_window, filter) {
+                Ok((hits, mut retry, measured)) => {
+                    if let Some(measured) = measured {
+                        match stats.as_mut() {
+                            Some(total) => accumulate_native_stats(total, &measured),
+                            None => stats = Some(measured),
+                        }
+                    }
+                    // A larger approximate window need not be a strict superset
+                    // of the previous one. Keep its earlier valid winners too;
+                    // between passes, retain only the requested message page.
+                    for hit in hits {
+                        best_by_message
+                            .entry(hit.message_id)
+                            .and_modify(|best| {
+                                if hit.score.total_cmp(&best.score).is_gt() {
+                                    best.score = hit.score;
+                                    best.chunk_idx = hit.chunk_idx;
+                                }
+                            })
+                            .or_insert(hit);
+                    }
+                    let omitted_retained = best_by_message.len() > fetch_limit;
+                    let hits =
+                        SearchClient::collapse_semantic_results(best_by_message, fetch_limit);
                     if hits.len() >= fetch_limit || !retry.has_more_candidates {
+                        retry.has_more_candidates |= omitted_retained;
                         return Ok((hits, retry, stats));
                     }
-                    let reason = if filter.is_some() {
-                        AnnExactFallbackReason::FilteredCandidateUnderfill
-                    } else {
-                        AnnExactFallbackReason::MessageCandidateUnderfill
+                    let Some(next_window) = budget.next_window() else {
+                        let reason = if filter.is_some() {
+                            AnnExactFallbackReason::FilteredCandidateUnderfill
+                        } else {
+                            AnnExactFallbackReason::MessageCandidateUnderfill
+                        };
+                        break (hits.len(), reason);
                     };
-                    (stats, hits.len(), reason)
+                    best_by_message = hits.into_iter().map(|hit| (hit.message_id, hit)).collect();
+                    native_window = next_window;
                 }
-                Err(error) => {
-                    // Preserve caller/provenance errors instead of treating
-                    // them as failed derived graphs that warrant an exact scan.
-                    let failure = error.downcast::<NativeAnnSearchFailure>()?;
-                    (
-                        Some(failure.completed_stats),
-                        0,
-                        AnnExactFallbackReason::NativeSearchFailed,
-                    )
-                }
-            };
+                Err(error) => match error.downcast::<NativeAnnSearchFailure>() {
+                    Ok(failure) => {
+                        // Include completed calls from earlier refill passes,
+                        // not just the prefix of the pass that failed. Discard
+                        // ALL native hits before complete-cohort exact recovery.
+                        match stats.as_mut() {
+                            Some(total) => {
+                                accumulate_native_stats(total, &failure.completed_stats);
+                            }
+                            None => stats = Some(failure.completed_stats),
+                        }
+                        break (0, AnnExactFallbackReason::NativeSearchFailed);
+                    }
+                    // Do not turn a caller/provenance error into an expensive
+                    // exact scan, or mistake it for a failed derived graph.
+                    Err(error) => return Err(error),
+                },
+            }
+        };
         let started = std::time::Instant::now();
         let (exact, exact_retry) =
             SearchClient::search_exact_semantic_indexes(context, embedding, fetch_limit, filter)?;
@@ -236,6 +279,9 @@ impl SemanticAnnShardSet {
                     SearchClient::record_fs_semantic_hit(&mut best_by_message, hit);
                 }
             }
+            // Raw graph exhaustion is not message-page exhaustion: collapsing
+            // an exhaustive native window can still discard eligible messages.
+            has_more_candidates |= best_by_message.len() > fetch_limit;
             best_by_message = SearchClient::collapse_semantic_results(best_by_message, fetch_limit)
                 .into_iter()
                 .map(|hit| (hit.message_id, hit))
@@ -375,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_native_underfill_recovers_matching_messages_from_every_shard() {
+    fn filtered_native_underfill_refills_every_shard_before_exact_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let context = recovery_context(Arc::new(vec![
             selective_shard(dir.path(), "select-a", 1, 0.6),
@@ -398,22 +444,17 @@ mod tests {
         assert_eq!(ids(&hits), vec![2, 1]);
         assert!(!retry.exact_window_may_omit_competitor);
         let stats = stats.unwrap();
-        assert!(!stats.is_approximate);
-        assert_eq!(stats.index_size, 82);
-        assert_eq!(stats.k_requested, 16, "retain actual native work counters");
-        let receipt = stats.exact_fallback.as_ref().unwrap();
-        assert_eq!(
-            receipt.reason,
-            AnnExactFallbackReason::FilteredCandidateUnderfill
+        assert_eq!(stats.index_size, 82, "count the retained cohort only once");
+        // Per shard: 8 initial candidates, 32 on the first refill, and all 41
+        // on the second. These are real backend requests, not result counts.
+        assert_eq!(stats.k_requested, 2 * (8 + 32 + 41));
+        assert!(stats.exact_fallback.is_none());
+        assert!(
+            serde_json::to_value(&stats)
+                .unwrap()
+                .get("exact_fallback")
+                .is_none()
         );
-        assert_eq!(receipt.shard_count, 2);
-        assert_eq!(receipt.returned_messages, 2);
-        let json = serde_json::to_value(&stats).unwrap();
-        assert_eq!(
-            json["exact_fallback"]["reason"],
-            "filtered_candidate_underfill"
-        );
-        assert_eq!(json["is_approximate"], false);
         assert_eq!(snapshot(dir.path()), before);
     }
 
@@ -448,11 +489,9 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&hits), vec![1, 2, 3]);
         let stats = stats.unwrap();
-        assert!(!stats.is_approximate);
-        assert_eq!(
-            stats.exact_fallback.unwrap().reason,
-            AnnExactFallbackReason::MessageCandidateUnderfill
-        );
+        assert!(stats.exact_fallback.is_none());
+        assert_eq!(stats.index_size, 42);
+        assert_eq!(stats.k_requested, 12 + 42);
     }
 
     #[test]
@@ -516,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_recovery_keeps_empty_filters_empty_and_rejects_wrong_owners() {
+    fn native_refinement_keeps_empty_filters_empty_and_rejects_wrong_owners() {
         let dir = tempfile::tempdir().unwrap();
         let context =
             recovery_context(Arc::new(vec![selective_shard(dir.path(), "empty", 1, 0.8)]));
@@ -529,7 +568,7 @@ mod tests {
             .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&filter))
             .unwrap();
         assert!(hits.is_empty());
-        assert_eq!(stats.unwrap().exact_fallback.unwrap().returned_messages, 0);
+        assert!(stats.unwrap().exact_fallback.is_none());
         let other = recovery_context(Arc::new(context.artifacts.as_ref().clone()));
         assert!(
             set.search_with_exact_fallback(&other, &[1.0, 0.0], 2, Some(&filter))
@@ -542,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_recovery_uses_retained_readers_after_paths_are_renamed() {
+    fn native_refinement_uses_retained_readers_after_paths_are_renamed() {
         let dir = tempfile::tempdir().unwrap();
         let context = recovery_context(Arc::new(vec![selective_shard(
             dir.path(),
@@ -569,8 +608,109 @@ mod tests {
             .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&filter))
             .unwrap();
         assert_eq!(ids(&hits), vec![1]);
-        assert!(stats.unwrap().exact_fallback.is_some());
+        assert!(stats.unwrap().exact_fallback.is_none());
         assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn refill_call_budget_is_shared_and_still_recovers_the_complete_exact_cohort() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seventeen shards admit one extra full-cohort pass, not two: the
+        // shared allowance is 32 graph calls. Neither 8 nor 32 candidates
+        // reaches the selected source behind 40 unrelated messages.
+        let artifacts = (1..=17)
+            .map(|message| {
+                selective_shard(dir.path(), &format!("budget-{message}"), message, 0.8)
+            })
+            .collect();
+        let context = recovery_context(Arc::new(artifacts));
+        let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
+        let filter = selected_source();
+        let before = snapshot(dir.path());
+        let (expected, expected_retry) =
+            SearchClient::search_exact_semantic_indexes(&context, &[1.0, 0.0], 2, Some(&filter))
+                .unwrap();
+        let (hits, retry, stats) = set
+            .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&filter))
+            .unwrap();
+        assert_eq!(ids(&hits), ids(&expected));
+        assert_eq!(hits.len(), 2);
+        assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
+        assert!(!retry.exact_window_may_omit_competitor);
+        let stats = stats.unwrap();
+        assert_eq!(stats.index_size, 17 * 41);
+        assert_eq!(stats.k_requested, 17 * (8 + 32));
+        assert!(!stats.is_approximate);
+        let receipt = stats.exact_fallback.unwrap();
+        assert_eq!(
+            receipt.reason,
+            AnnExactFallbackReason::FilteredCandidateUnderfill
+        );
+        assert_eq!(receipt.shard_count, 17);
+        assert_eq!(receipt.returned_messages, 2);
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn refined_pages_do_not_erase_pagination_when_the_last_native_pass_is_exhaustive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rows = (0..40)
+            .map(|n| (doc(1000 + n, 4), [1.0, 0.0]))
+            .collect::<Vec<_>>();
+        rows.extend([
+            (doc(1, 3), [0.8, 0.6]),
+            (doc(2, 3), [0.6, 0.8]),
+            (doc(3, 3), [0.0, 1.0]),
+        ]);
+        let context = recovery_context(Arc::new(vec![shard_with_config(
+            dir.path(),
+            "pagination",
+            &rows,
+            HnswConfig {
+                m: 64,
+                ..Default::default()
+            },
+        )]));
+        let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
+        let (hits, retry, stats) = set
+            .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&selected_source()))
+            .unwrap();
+        assert_eq!(ids(&hits), vec![1, 2]);
+        assert!(
+            retry.has_more_candidates,
+            "message 3 still exists beyond this page"
+        );
+        assert!(stats.unwrap().exact_fallback.is_none());
+    }
+
+    #[test]
+    fn exhaustive_initial_native_windows_keep_omitted_message_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            (doc(1, 3), [1.0, 0.0]),
+            (doc(2, 3), [0.8, 0.6]),
+            (doc(3, 3), [0.6, 0.8]),
+        ];
+        for split in [false, true] {
+            let artifacts = if split {
+                vec![
+                    shard(dir.path(), "page-a", &rows[..1]),
+                    shard(dir.path(), "page-b", &rows[1..]),
+                ]
+            } else {
+                vec![shard(dir.path(), "page-all", &rows)]
+            };
+            let context = recovery_context(Arc::new(artifacts));
+            let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
+            let (hits, retry, stats) = set
+                .search_with_exact_fallback(&context, &[1.0, 0.0], 1, None)
+                .unwrap();
+            assert_eq!(ids(&hits), vec![1]);
+            assert!(retry.has_more_candidates, "two eligible messages were omitted");
+            let stats = stats.unwrap();
+            assert_eq!(stats.k_requested, 3, "one exhaustive native pass is enough");
+            assert!(stats.exact_fallback.is_none());
+        }
     }
 
     #[test]
@@ -991,10 +1131,7 @@ mod tests {
             };
             assert_eq!(ids(&hits), vec![2, 1]);
             assert_eq!(signature(&hits), signature(&expected));
-            assert_eq!(
-                retry.has_more_candidates,
-                expected_retry.has_more_candidates
-            );
+            assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
             assert_eq!(
                 retry.exact_window_may_omit_competitor,
                 expected_retry.exact_window_may_omit_competitor
@@ -1003,10 +1140,7 @@ mod tests {
             assert!(!stats.is_approximate);
             assert_eq!(stats.estimated_recall, 0.0);
             assert_eq!(stats.index_size, failed_shard * 41);
-            assert_eq!(
-                stats.k_requested,
-                failed_shard * 2 * ANN_CANDIDATE_MULTIPLIER
-            );
+            assert_eq!(stats.k_requested, failed_shard * 2 * ANN_CANDIDATE_MULTIPLIER);
             let receipt = stats.exact_fallback.as_ref().unwrap();
             assert_eq!(receipt.reason, AnnExactFallbackReason::NativeSearchFailed);
             assert_eq!(receipt.shard_count, 2);

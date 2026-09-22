@@ -6468,7 +6468,8 @@ mod canonical_top_level_command_tests {
     #[test]
     fn ann_index_parse_error_explains_the_index_command() {
         for format in ["--json", "--robot"] {
-            let args = ["cass", "index", "--semantic", "--approximate", format].map(str::to_string);
+            let args = ["cass", "index", "--semantic", "--approximate", format]
+                .map(str::to_string);
             let error = Cli::try_parse_from(&args).expect_err("query-only flag rejected");
             let output = format_friendly_parse_error(error, &args, &args);
             let payload: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
