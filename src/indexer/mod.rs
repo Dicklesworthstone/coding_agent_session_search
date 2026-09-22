@@ -28801,6 +28801,7 @@ impl ConnectorKind {
             "goose" => Some(Self::Goose),
             "crush" => Some(Self::Crush),
             "hermes" => Some(Self::Hermes),
+            "codebuff" => Some(Self::Codebuff),
             _ => None,
         }
     }
@@ -28838,6 +28839,7 @@ impl ConnectorKind {
             Self::Goose => "goose",
             Self::Crush => "crush",
             Self::Hermes => "hermes",
+            Self::Codebuff => "codebuff",
         }
     }
 
@@ -28876,6 +28878,7 @@ impl ConnectorKind {
             Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
+            Self::Codebuff => Box::new(franken_agent_detection::CodebuffConnector::new()),
         }
     }
 }
@@ -30265,6 +30268,9 @@ enum ConnectorKind {
     Crush,
     #[serde(rename = "hm", alias = "Hermes")]
     Hermes,
+    /// Shared Codebuff / Freebuff (Manicode) CLI history (GH #423).
+    #[serde(rename = "bf", alias = "Codebuff")]
+    Codebuff,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

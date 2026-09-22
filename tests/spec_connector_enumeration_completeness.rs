@@ -1,7 +1,7 @@
 //! INV-cass-19 — `cass diag --json::connectors` enumeration completeness.
 //!
-//! cass advertises support for **31 coding-agent providers**: aider, amp,
-//! antigravity, chatgpt, claude_code, clawdbot, cline, codex, copilot,
+//! cass advertises support for **32 coding-agent providers**: aider, amp,
+//! antigravity, chatgpt, claude_code, clawdbot, cline, codebuff, codex, copilot,
 //! copilot_cli, crush, cursor, devin, factory, gemini, goose, grok, grok_bot, hermes,
 //! kimi, kiro, muse, openclaw, omp, opencode, openhands, pi_agent, prime_agent,
 //! qwen, shelley, vibe. Each is a separate
@@ -29,7 +29,7 @@
 //! Two invariants:
 //!
 //!   1. The set of connector names emitted by `cass diag --json::
-//!      connectors[].name` exactly equals the documented set of 31.
+//!      connectors[].name` exactly equals the documented set of 32.
 //!      Equality is checked via `symmetric_difference` so the
 //!      diagnostic shows exactly what's missing or extra in either
 //!      direction.
@@ -60,7 +60,7 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     }
 }
 
-/// The canonical set of 31 documented provider connectors. Sourced from the
+/// The canonical set of 32 documented provider connectors. Sourced from the
 /// runtime registry `franken_agent_detection::get_connector_factories()` (as
 /// surfaced by `cass capabilities --json` / `cass diag --json`) under the
 /// franken-agent-detection features cass enables in Cargo.toml. A peer adding a
@@ -73,6 +73,7 @@ const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "claude_code",
     "clawdbot",
     "cline",
+    "codebuff",
     "codex",
     "copilot",
     "copilot_cli",
