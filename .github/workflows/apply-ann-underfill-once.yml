@@ -91,9 +91,11 @@ jobs:
           tests = 'src/search/query/message_topk_integration.rs'
           formatted = subprocess.check_output([
               'rustfmt', '+nightly-2026-08-31', '--edition', '2024', '--config',
-              'skip_children=true', '--emit', 'stdout', tests,
-          ])
+              'skip_children=true', '--emit', 'stdout',
+          ], input=Path(tests).read_bytes())
           Path(tests).write_bytes(formatted)
+          run('rustfmt', '+nightly-2026-08-31', '--edition', '2024', '--config',
+              'skip_children=true', '--check', tests)
           run('git', 'diff', '--check')
           run('git', 'diff', '--stat')
           receipt = {'input_blobs': expected, 'patch_blob': patch_sha,
