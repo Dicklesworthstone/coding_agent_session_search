@@ -1,6 +1,6 @@
 //! Explicit logical-archive commands. Kept outside the ordinary search startup
 //! path. Only explicit import flags opt into canonical-only lexical rebuilding
-//! or compatible additive schema migration; export and verification never do so.
+//! or the reviewed v20 -> v21 schema migration; export and verification never do so.
 
 mod codec;
 mod export;
@@ -106,11 +106,11 @@ enum Operation {
         #[arg(long)]
         include_private: bool,
         /// Accept an existing destination only after a read-only full-digest or
-        /// compatible-projection match. This never grants overwrite permission.
+        /// reviewed migration-projection match. This never grants overwrite permission.
         #[arg(long)]
         if_identical: bool,
-        /// Permit a structurally compatible older archive to be replayed into
-        /// today's initializer schema. Renamed/removed fields and PK drift fail.
+        /// Permit only the reviewed storage-schema v20 -> v21 migration. The
+        /// canonical table/column/primary-key descriptors must be identical.
         #[arg(long)]
         allow_compatible_schema: bool,
         /// Rebuild lexical search from the restored DB, without scanning providers.
@@ -232,9 +232,14 @@ pub fn run(args: Vec<String>) -> Result<()> {
             };
             destination_status = Some(if created { "created" } else { "unchanged" });
             if let Some(plan) = plan {
+                let retry_flags = if schema_migration.is_some() {
+                    "--if-identical --allow-compatible-schema --rebuild-index"
+                } else {
+                    "--if-identical --rebuild-index"
+                };
                 lexical_rebuild = Some(plan.rebuild().map_err(|error| {
                     anyhow!(
-                        "canonical archive was {} and is retained at {}; lexical rebuild failed: {}; retry the same import with --if-identical --rebuild-index",
+                        "canonical archive was {} and is retained at {}; lexical rebuild failed: {}; retry the same import with {retry_flags}",
                         if created { "created" } else { "verified unchanged" },
                         plan.database().display(),
                         error,
