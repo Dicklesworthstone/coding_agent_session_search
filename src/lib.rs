@@ -29812,7 +29812,21 @@ fn output_search_budget_partial(
             "semantic_refinement": false,
         });
     }
-    output_structured_value(payload, format)
+    // GH #422 follow-on: exit 0 with `hits: []` is the documented timeout
+    // contract, but with a quiet stderr a caller that checks only the exit
+    // status and the hit list reads it as "no history matches". Name the
+    // partial result on the diagnostics stream; stdout stays data-only.
+    let budget_ms = payload["budget"]["budget_ms"].as_u64().unwrap_or_default();
+    output_structured_value(payload, format)?;
+    eprintln!(
+        "note: search did not finish within its {budget_ms} ms budget; the empty hit list is \
+         incomplete, not a no-match result (budget.timed_out=true){}",
+        retry
+            .as_deref()
+            .map(|retry| format!("; retry: {retry}"))
+            .unwrap_or_default()
+    );
+    Ok(())
 }
 
 struct CliSearchSetup {
