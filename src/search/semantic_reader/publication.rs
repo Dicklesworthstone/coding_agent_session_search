@@ -194,11 +194,10 @@ impl SelectedSemanticGeneration {
             if fast.binding.generation() != quality.binding.generation() {
                 return Err(SemanticReaderError::MixedGeneration.into());
             }
-            if selected.manifest.schema_version
-                == crate::search::semantic_manifest::SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION
-            {
-                coverage::validate(fast, quality, selected.manifest.corpus.document_count)?;
-            }
+            // Both manifest schemas permit partial tiers. Their authenticated
+            // subset digest proves which rows were published, not that those
+            // rows belong to the complete companion tier's canonical corpus.
+            coverage::validate(fast, quality, selected.manifest.corpus.document_count)?;
             let fast_images: HashSet<_> = fast
                 .shards
                 .iter()
