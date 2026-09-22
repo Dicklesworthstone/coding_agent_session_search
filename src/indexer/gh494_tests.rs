@@ -1,6 +1,195 @@
 // Included by indexer::tests; exercises the production rebuild and real
 // filesystem fault seam, not a model of the state machine.
 
+fn gh494_publication_receipt_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("db.sqlite");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    ensure_fts_schema(&storage);
+    seed_lexical_rebuild_fixture(&storage);
+    drop(storage);
+    rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    let index_path = index_dir(&data_dir).unwrap();
+    assert!(has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    (tmp, data_dir, db_path, index_path)
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_refused_rebuild_preserves_and_bootstraps_prior_publication_authority() {
+    #[cfg(windows)]
+    const DISK_FULL: i32 = 112;
+    #[cfg(not(windows))]
+    const DISK_FULL: i32 = libc::ENOSPC;
+    let (tmp, data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    let receipt_path = index_path.join(LEXICAL_PUBLISHED_STATE_FILE);
+    let receipt_before = fs::read(&receipt_path).unwrap();
+    // Simulate an older binary's completed generation, without the new file.
+    fs::rename(&receipt_path, tmp.path().join("saved-receipt.json")).unwrap();
+    let manifest_before = fs::read(index_path.join("MANIFEST")).unwrap();
+    #[cfg(target_os = "linux")]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+        DISK_FULL,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+        DISK_FULL,
+    );
+    let error = rebuild_tantivy_from_db_with_options(
+        &db_path,
+        &data_dir,
+        2,
+        None,
+        LexicalRebuildStartupOptions {
+            defer_initial_content_fingerprint: true,
+        },
+        None,
+    )
+    .err()
+    .expect("refuse the actual swap");
+    drop(fault);
+    assert!(
+        error.to_string().contains("publish_staged_generation"),
+        "{error:#}"
+    );
+    assert!(
+        !load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+    assert_eq!(
+        fs::read(index_path.join("MANIFEST")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    assert!(has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    assert!(has_usable_lexical_publication_receipt(&scratch, &db_path));
+    rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    assert!(
+        load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+    assert!(has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_publication_receipt_rejects_inconsistent_counts_contract_and_identity() {
+    let (tmp, _data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    let receipt_path = index_path.join(LEXICAL_PUBLISHED_STATE_FILE);
+    let before = fs::read(&receipt_path).unwrap();
+    let good: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    for (field, value) in [
+        ("version", serde_json::json!(255)),
+        ("completed", serde_json::json!(false)),
+        ("schema_hash", serde_json::json!("wrong-schema")),
+        ("page_size", serde_json::json!(0)),
+        ("processed_conversations", serde_json::json!(1)),
+        ("committed_offset", serde_json::json!(-1)),
+        ("indexed_docs", serde_json::json!(3)),
+        (
+            "committed_meta_fingerprint",
+            serde_json::json!("different-generation"),
+        ),
+        (
+            "pending",
+            serde_json::json!({
+                "next_offset": 2, "next_conversation_id": 2,
+                "processed_conversations": 2, "indexed_docs": 4,
+                "base_meta_fingerprint": null,
+            }),
+        ),
+    ] {
+        let mut changed = good.clone();
+        changed[field] = value;
+        write_json_pretty_atomically(&receipt_path, &changed).unwrap();
+        assert!(
+            !has_usable_lexical_publication_receipt(&index_path, &db_path),
+            "{field}"
+        );
+    }
+    for (field, value) in [
+        ("db_path", serde_json::json!(tmp.path().join("foreign.db"))),
+        ("total_conversations", serde_json::json!(3)),
+        ("total_messages", serde_json::json!(0)),
+        (
+            "storage_fingerprint",
+            serde_json::json!("content-pending-v1:2"),
+        ),
+    ] {
+        let mut changed = good.clone();
+        changed["db"][field] = value;
+        write_json_pretty_atomically(&receipt_path, &changed).unwrap();
+        assert!(
+            !has_usable_lexical_publication_receipt(&index_path, &db_path),
+            "{field}"
+        );
+    }
+    fs::write(&receipt_path, before).unwrap();
+    assert!(has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &tmp.path().join("other.db")
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_publication_receipt_is_bounded_and_never_repairs_itself_on_read() {
+    let (tmp, _data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    let path = index_path.join(LEXICAL_PUBLISHED_STATE_FILE);
+    let checkpoint = fs::read(lexical_rebuild_state_path(&index_path)).unwrap();
+    let manifest = fs::read(index_path.join("MANIFEST")).unwrap();
+    fs::rename(&path, tmp.path().join("saved-receipt.json")).unwrap();
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    assert!(!path.exists());
+    fs::write(&path, b"{").unwrap();
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    assert_eq!(fs::read(&path).unwrap(), b"{");
+    let file = OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(LEXICAL_PUBLISHED_STATE_MAX_BYTES + 1).unwrap();
+    drop(file);
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        LEXICAL_PUBLISHED_STATE_MAX_BYTES + 1
+    );
+    assert_eq!(
+        fs::read(lexical_rebuild_state_path(&index_path)).unwrap(),
+        checkpoint
+    );
+    assert_eq!(fs::read(index_path.join("MANIFEST")).unwrap(), manifest);
+}
+
 fn gh494_query_count(index_path: &Path, term: &str) -> usize {
     use crate::search::query::{FieldMask, SearchClient, SearchFilters};
     SearchClient::open(index_path, None)

@@ -1,26 +1,37 @@
-name: Prepare reviewed publication authority
+name: Lexical publication regression
 
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/gh494-publish-regression.yml']
+    paths:
+      - 'src/indexer/**'
+      - 'src/lib.rs'
+      - 'src/search/inline_repair.rs'
+      - 'src/search/gh494_repair_tests.rs'
+      - 'src/search/semantic_reader/publication/tests.rs'
+      - 'src/search/tantivy.rs'
+      - 'src/search/quill_bridge.rs'
+      - 'tests/gh494_publish_resume.rs'
+      - 'tests/util/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/gh494-publish-regression.yml'
+  workflow_dispatch:
 
+# The reviewed edit is now on main. This workflow only reads and tests code;
+# it cannot commit, push, or replay a source transformation.
 permissions:
   contents: read
 
-# Prepare exact source, never update a branch. Restore the read-only regression
-# workflow in the explicit source commit after inspecting the exported blobs.
 concurrency:
-  group: gh494-independent-publication-preparation
+  group: gh494-regressions-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   publication-regressions:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    permissions:
-      contents: write
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -30,7 +41,19 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
-      - name: Read pinned toolchain
+      - name: Preserve the exact tracked publication source
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/gh494-results"
+          git rev-parse HEAD > "$RUNNER_TEMP/gh494-results/source-commit.txt"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/gh494-results/publication-source.tar.gz" HEAD AGENTS.md Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo src/indexer src/search src/storage src/lib.rs tests/gh494_publish_resume.rs tests/util .github/workflows/gh494-publish-regression.yml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh494-publication-source-${{ github.sha }}
+          path: ${{ runner.temp }}/gh494-results/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Read the repository's dated toolchain
         id: toolchain
         shell: bash
         run: |
@@ -41,100 +64,92 @@ jobs:
               print(f'name={name}', file=output)
           PY
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        id: rust
         with:
           toolchain: ${{ steps.toolchain.outputs.name }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-      - name: Apply the reviewed patch to its exact base blobs
+      - name: Record exact source and compiler
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/gh494-authority"
-          test "$(git hash-object AGENTS.md)" = 6fbc0c72667bd680c8ed981ff77cb743a05d99a7
-          test "$(git hash-object src/indexer/mod.rs)" = 1a803dc07b120869d2d232b4e142e1d2c6d76db7
-          test "$(git hash-object src/indexer/gh494_tests.rs)" = 7bb02c0c4ca1169d8a43d8c8d69024b69340a2d6
-          test "$(git hash-object src/lib.rs)" = 75676995c86aec5af17991480a14a0b65e9ee0b0
-          test "$(git hash-object src/search/gh494_repair_tests.rs)" = 792f1e1778f2be19e41a40b65512d2d0e1d36328
-          test "$(git hash-object tests/gh494_publish_resume.rs)" = 135aad30e0055e97490dd0bed1f08c6fcfc229b7
-          gh api -H 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0' "repos/$GITHUB_REPOSITORY/git/blobs/12dbd5e0ac9327e3e65e2ad16611b5ae19498c83" --jq .content | base64 --decode > "$RUNNER_TEMP/authority.patch.gz"
-          test "$(git hash-object "$RUNNER_TEMP/authority.patch.gz")" = 12dbd5e0ac9327e3e65e2ad16611b5ae19498c83
-          gzip --decompress --stdout "$RUNNER_TEMP/authority.patch.gz" > "$RUNNER_TEMP/authority.patch"
-          test "$(git hash-object "$RUNNER_TEMP/authority.patch")" = f9c8137c32cfce05740c057f1be40dba81c14ff9
-          git apply --check --whitespace=error "$RUNNER_TEMP/authority.patch"
-          git apply --whitespace=error "$RUNNER_TEMP/authority.patch"
-          gh api -H 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0' "repos/$GITHUB_REPOSITORY/git/blobs/3c2b3a4848f4b035cad0e5da8336026fda6b3467" --jq .content | base64 --decode > "$RUNNER_TEMP/fixtures.patch"
-          test "$(git hash-object "$RUNNER_TEMP/fixtures.patch")" = 3c2b3a4848f4b035cad0e5da8336026fda6b3467
-          git apply --check --whitespace=error "$RUNNER_TEMP/fixtures.patch"
-          git apply --whitespace=error "$RUNNER_TEMP/fixtures.patch"
-          rustfmt --edition 2024 --config skip_children=true src/indexer/gh494_tests.rs src/search/gh494_repair_tests.rs tests/gh494_publish_resume.rs
-          rustfmt --edition 2024 --config skip_children=true --check src/indexer/gh494_tests.rs src/search/gh494_repair_tests.rs tests/gh494_publish_resume.rs
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/indexer.parsed.rs"
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/lib.rs > "$RUNNER_TEMP/lib.parsed.rs"
-          git diff --check
-          printf '%s\n' src/indexer/gh494_tests.rs src/indexer/mod.rs src/lib.rs src/search/gh494_repair_tests.rs tests/gh494_publish_resume.rs > "$RUNNER_TEMP/expected-paths"
-          git diff --name-only | sort | diff - "$RUNNER_TEMP/expected-paths"
-          git diff --binary > "$RUNNER_TEMP/gh494-authority/reviewed.patch"
-          { git rev-parse HEAD; rustc --version --verbose; cargo --version; git hash-object Cargo.toml Cargo.lock; } > "$RUNNER_TEMP/gh494-authority/source-and-compiler.txt"
-          echo 'STAGE=reviewed-authority-patch-format-and-parse EXIT=0'
-      - name: Store immutable reviewed blobs without any commit or ref write
+          {
+            git rev-parse HEAD
+            git hash-object src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs tests/gh494_publish_resume.rs
+            rustc --version --verbose
+            cargo --version
+          } | tee "$RUNNER_TEMP/gh494-results/source-and-compiler.txt"
+          rustfmt --edition 2024 --check src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
+          rustfmt --edition 2024 --check src/search/inline_repair.rs src/search/gh494_repair_tests.rs
+          rustfmt --edition 2024 --config skip_children=true --check tests/gh494_publish_resume.rs
+      - name: Execute the exact diagnostic helper independently of the monolithic test build
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess
-          paths = ['src/indexer/gh494_tests.rs', 'src/indexer/mod.rs', 'src/lib.rs', 'src/search/gh494_repair_tests.rs', 'tests/gh494_publish_resume.rs']
-          report = {'base_commit': os.environ['GITHUB_SHA'], 'patch_blobs': ['12dbd5e0ac9327e3e65e2ad16611b5ae19498c83', '3c2b3a4848f4b035cad0e5da8336026fda6b3467'], 'blobs': {}}
-          for path in paths:
-              data = pathlib.Path(path).read_bytes()
-              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
-              response = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0', '--method', 'POST', f"repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs", '--input', '-'], input=payload, text=True, capture_output=True, check=True)
-              sha = json.loads(response.stdout)['sha']
-              assert sha == expected, (path, sha, expected)
-              before = subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip()
-              report['blobs'][path] = {'before_sha': before, 'sha': sha}
-          text = json.dumps(report, indent=2) + '\n'
-          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'gh494-authority/blobs.json').write_text(text)
-          print(text)
+          import os, pathlib, shutil, tomllib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gh494-phase-harness'
+          (root / 'src').mkdir(parents=True)
+          packages = tomllib.loads(pathlib.Path('Cargo.lock').read_text())['package']
+          deps = {name: next(p['version'] for p in packages if p['name'] == name) for name in ('anyhow', 'tracing', 'serde_json', 'tempfile')}
+          manifest = '[package]\nname = "gh494-phase-harness"\nversion = "0.0.0"\nedition = "2024"\n[dependencies]\n'
+          manifest += ''.join(f'{name} = "={version}"\n' for name, version in deps.items())
+          (root / 'Cargo.toml').write_text(manifest)
+          (root / 'src/lib.rs').write_text('mod lexical_publish;\nmod inline_repair;\n')
+          shutil.copyfile('src/indexer/lexical_publish.rs', root / 'src/lexical_publish.rs')
+          shutil.copyfile('src/search/inline_repair.rs', root / 'src/inline_repair.rs')
+          print('Exact diagnostic-helper dependency versions:', deps)
           PY
-          tar -czf "$RUNNER_TEMP/gh494-authority/candidate-source.tar.gz" src/indexer/gh494_tests.rs src/indexer/mod.rs src/lib.rs src/search/gh494_repair_tests.rs tests/gh494_publish_resume.rs
-      - name: Retain prepared source before native compilation
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: gh494-authority-prepared-${{ github.sha }}
-          path: ${{ runner.temp }}/gh494-authority/
-          if-no-files-found: error
-          retention-days: 14
-      - name: Execute production publication and recovery tests
-        id: library
+          cargo test --manifest-path "$RUNNER_TEMP/gh494-phase-harness/Cargo.toml" gh494_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/diagnostics.log"
+      - name: Require publication and checkpoint content-binding regressions
+        id: rebuild-list
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         shell: bash
         run: |
-          cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-authority/library.log"
-          for name in gh494_refused_rebuild_preserves_and_bootstraps_prior_publication_authority gh494_publication_receipt_rejects_inconsistent_counts_contract_and_identity gh494_publication_receipt_is_bounded_and_never_repairs_itself_on_read gh494_incomplete_rebuild_without_independent_receipt_is_not_searchable gh494_active_rebuild_serves_certified_prior_generation_without_joining; do
-            grep -F "$name ... ok" "$RUNNER_TEMP/gh494-authority/library.log"
+          cargo test --locked --lib gh494_ -- --list 2>&1 | tee "$RUNNER_TEMP/gh494-results/test-list.log"
+          for name in \
+            gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success \
+            gh494_zero_conversations_still_publish_a_readable_completed_generation \
+            gh494_completed_marker_cannot_hide_a_live_document_count_mismatch \
+            gh494_missing_staged_eof_cannot_certify_same_count_prior_live_content \
+            gh494_missing_staged_pending_commit_cannot_be_promoted_by_prior_live \
+            gh494_legacy_cursor_without_its_generation_replays_instead_of_guessing \
+            gh494_explicit_live_resume_ignores_unrelated_scratch_generation \
+            gh494_bound_staged_reconciliation_refuses_missing_content_without_mutation \
+            gh494_refused_rebuild_preserves_and_bootstraps_prior_publication_authority \
+            gh494_publication_receipt_rejects_inconsistent_counts_contract_and_identity \
+            gh494_publication_receipt_is_bounded_and_never_repairs_itself_on_read \
+            gh494_incomplete_rebuild_without_independent_receipt_is_not_searchable \
+            gh494_active_rebuild_serves_certified_prior_generation_without_joining
+          do
+            grep -F "$name: test" "$RUNNER_TEMP/gh494-results/test-list.log"
           done
-          echo 'STAGE=production-publication-authority-and-recovery EXIT=0'
-      - name: Retain the full search self-heal and strict-admission controls
-        if: ${{ !cancelled() && steps.library.outcome == 'success' }}
+      - name: Execute publication refusal, EOF retry, empty archive, and completion validation
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
         shell: bash
         run: |
-          cargo test --locked --lib search_lexical_self_heal_tests:: -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-authority/self-heal.log"
-          echo 'STAGE=search-self-heal-and-strict-admission EXIT=0'
-      - name: Execute real CLI publication and search availability regressions
-        if: ${{ !cancelled() && steps.library.outcome == 'success' }}
+          cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/rebuild-regressions.log"
+      - name: Execute CLI EOF resume and repeated read-only searches
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
         shell: bash
         run: |
-          cargo test --locked --test gh494_publish_resume -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-authority/cli.log"
-          grep -F 'gh494_interrupted_rebuild_keeps_certified_prior_searches_available ... ok' "$RUNNER_TEMP/gh494-authority/cli.log"
-          echo 'STAGE=cli-publication-and-prior-generation-availability EXIT=0'
-      - name: Retain all validation receipts including failures
+          cargo test --locked --test gh494_publish_resume -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/cli-resume-regressions.log"
+          grep -F 'gh494_interrupted_rebuild_keeps_certified_prior_searches_available ... ok' "$RUNNER_TEMP/gh494-results/cli-resume-regressions.log"
+      - name: Retain all search self-heal and strict-admission controls
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
+        shell: bash
+        run: |
+          cargo test --locked --lib search_lexical_self_heal_tests:: -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/search-self-heal.log"
+      - name: Retain hollow-generation and publication rollback coverage
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
+        shell: bash
+        run: |
+          cargo test --locked --lib hollow -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh494-results/hollow.log"
+          cargo test --locked --lib publish_staged_lexical_index -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh494-results/publication-rollback.log"
+      - name: Preserve validation receipts, including failures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: gh494-authority-results-${{ github.sha }}
-          path: ${{ runner.temp }}/gh494-authority/
+          name: gh494-publication-results-${{ github.sha }}
+          path: ${{ runner.temp }}/gh494-results/
           if-no-files-found: warn
           retention-days: 14
