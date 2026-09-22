@@ -5,6 +5,7 @@
 mod codec;
 mod export;
 mod import;
+mod query;
 mod reimport;
 
 use std::path::PathBuf;
@@ -56,6 +57,22 @@ enum Operation {
     Verify {
         input: PathBuf,
     },
+    /// Search verified backup message bodies without restoring a DB or index.
+    Search {
+        input: PathBuf,
+        /// Case-sensitive literal substring, not indexed query syntax.
+        #[arg(long)]
+        contains: String,
+        /// Maximum retained matches (1..100); the entire backup is verified.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Restrict matching to this exact positive canonical conversation ID.
+        #[arg(long)]
+        conversation_id: Option<i64>,
+        /// Acknowledge that result excerpts contain private session content.
+        #[arg(long)]
+        include_private: bool,
+    },
     /// Restore all canonical rows into a NEW database; never replace an archive.
     Import {
         input: PathBuf,
@@ -103,6 +120,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Operation::Verify { input } => {
             let (header, completion) = export::verify_file(&input)?;
             ("verify", header, completion)
+        }
+        Operation::Search { input, contains, limit, conversation_id, include_private } => {
+            ensure!(include_private, "backup search emits private session excerpts; pass --include-private to acknowledge this");
+            let result = query::search(&input, &contains, limit, conversation_id)?;
+            println!("{result}");
+            return Ok(());
         }
         Operation::Import { input, output, archive_id, include_private, if_identical, rebuild_index } => {
             ensure!(include_private, "restoration writes private session data; pass --include-private to acknowledge this");

@@ -461,10 +461,11 @@ fn indexed_import_completes_the_source_less_search_to_canonical_evidence_journey
         assert_eq!(hit["source_path"], missing_source.to_str().unwrap());
         assert!(coordinates.insert((source_id, conversation, ordinal)));
         let viewed = receipt(command(root.path())
+            .arg("--db").arg(&target)
             .args(["view", missing_source.to_str().unwrap(), "--source", source_id,
                 "--conversation-id", &conversation.to_string(), "--message-index", &ordinal.to_string(),
-                "-C", "0", "--json", "--data-dir"])
-            .arg(&data).output().unwrap());
+                "-C", "0", "--json"])
+            .output().unwrap());
         assert_eq!(viewed["lines"][0]["source_id"], source_id);
         assert_eq!(viewed["lines"][0]["conversation_id"], conversation);
         assert_eq!(viewed["lines"][0]["message_index"], ordinal);
@@ -650,5 +651,64 @@ fn indexed_restore_ignores_discoverable_local_provider_histories() {
         export(root.path(), &target, &root.path().join("after-local-sentinel.jsonl"))["content_sha256"],
         exported["content_sha256"]
     );
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn backup_search_finds_verified_evidence_without_a_database_or_provider_files() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, absent_source) = portable_search_fixture(root.path());
+    let before = fs::read(&input).unwrap();
+    let entries = fs::read_dir(root.path()).unwrap().count();
+    let output = receipt(command(root.path())
+        .args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE", "--limit", "3", "--include-private"])
+        .output().unwrap());
+    assert_eq!(output["content_sha256"], exported["content_sha256"]);
+    assert_eq!(output["matches"], 4);
+    assert_eq!(output["has_more"], true);
+    assert_eq!(output["database_opened"], false);
+    assert_eq!(output["provider_files_opened"], false);
+    assert_eq!(output["match_mode"], "literal_case_sensitive");
+    let hits = output["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3);
+    for hit in hits {
+        assert_eq!(hit["source_path"], absent_source.to_str().unwrap());
+        let source = hit["source_id"].as_str().unwrap();
+        let idx = hit["message_index"].as_u64().unwrap() - 1;
+        assert!(matches!(source, "remote-a" | "remote-b"));
+        assert!(matches!(idx, 0 | 7));
+        assert_eq!(hit["snippet"], format!("PORTABLENEEDLE complete recovered evidence {source} at {idx} δ"));
+    }
+    let scoped = receipt(command(root.path())
+        .args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE", "--include-private", "--conversation-id"])
+        .arg(hits[0]["conversation_id"].as_i64().unwrap().to_string())
+        .output().unwrap());
+    assert_eq!(scoped["matches"], 2);
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), entries);
+    assert!(!root.path().join("unused-default").exists());
+    assert!(!absent_source.exists());
+}
+
+#[test]
+fn backup_search_withholds_all_results_until_complete_validation_and_private_consent() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, _, _) = portable_search_fixture(root.path());
+    let denied = command(root.path()).args(["archive", "search"]).arg(&input)
+        .args(["--contains", "PORTABLENEEDLE"]).output().unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--include-private"));
+    let truncated = root.path().join("incomplete-search.jsonl");
+    let bytes = fs::read(&input).unwrap();
+    fs::write(&truncated, &bytes[..bytes.len() - 1]).unwrap();
+    let denied = command(root.path()).args(["archive", "search"]).arg(&truncated)
+        .args(["--contains", "PORTABLENEEDLE", "--include-private", "--limit", "1"])
+        .output().unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(serde_json::from_slice::<Value>(&denied.stderr).is_ok());
     assert!(!root.path().join("unused-default").exists());
 }
