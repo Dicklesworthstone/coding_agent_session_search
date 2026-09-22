@@ -1,17 +1,17 @@
-//! Opt-in additive migration for verified logical archives from older CASS schemas.
+//! Reviewed cross-version restoration for CASS logical archives.
 //!
-//! Exact-schema restoration remains the default. This module accepts only an older
-//! archive whose declared tables/columns are an unambiguous subset of today's
-//! canonical schema with identical primary-key names/order. The current initializer
-//! remains the sole executable schema authority; no SQL or path from the archive is
-//! executed. Missing current columns are left to SQLite defaults/NULL constraints.
+//! Exact-schema restoration remains the default. Cross-version restoration is
+//! deliberately allowlisted rather than inferred from "compatible-looking" SQL
+//! shapes: data backfills can be semantically required even when columns appear
+//! additive. The first reviewed bridge is storage schema v20 -> v21. Repository
+//! migration fixtures establish that v21 adds the conversation-context index and
+//! advances schema authority while leaving canonical table layouts unchanged.
 //!
-//! Schema bookkeeping is intentionally transformed rather than replayed:
-//! `_schema_migrations` stays at the current initializer's complete history and the
-//! legacy `meta.schema_version` row stays current. Tables introduced after the
-//! archived schema keep initializer-owned seed state. All other archived rows are
-//! compared back from the persisted publication image before it can become visible.
-//! An existing destination is accepted only through the same read-only comparison.
+//! The current initializer remains the sole executable schema authority. Archived
+//! `_schema_migrations` rows and `meta.schema_version` are verified as input but
+//! never replayed as current authority. Every other archived row is replayed into
+//! private staging and streamed back from the persisted publication image before
+//! no-clobber publication. Identical retries use the same read-only projection.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -33,6 +33,8 @@ const MAX_TRIGGER_BYTES: usize = 1024 * 1024;
 const MIGRATIONS_TABLE: &str = "_schema_migrations";
 const META_TABLE: &str = "meta";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
+const REVIEWED_SOURCE_VERSION: u32 = 20;
+const REVIEWED_TARGET_VERSION: u32 = 21;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaMigrationReceipt {
@@ -105,6 +107,14 @@ fn parse_source_version(header: &Header) -> Result<u32> {
         .context("logical archive storage schema version is invalid")
 }
 
+fn require_reviewed_transition(source: u32, target: u32) -> Result<()> {
+    ensure!(
+        source == REVIEWED_SOURCE_VERSION && target == REVIEWED_TARGET_VERSION,
+        "no reviewed logical-archive migration exists from storage schema {source} to {target}; exact restore or a version-specific migration is required"
+    );
+    Ok(())
+}
+
 fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
     file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(file);
@@ -142,40 +152,12 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
     })
 }
 
-fn primary_key_names(table: &Table) -> Vec<&str> {
-    table
-        .primary_key
-        .iter()
-        .map(|&offset| table.columns[offset].as_str())
-        .collect()
-}
-
-fn compatible_tables(connection: &Connection, archived: &[Table]) -> Result<Vec<Table>> {
+fn require_reviewed_table_layout(connection: &Connection, archived: &[Table]) -> Result<Vec<Table>> {
     let current = export::tables(connection)?;
-    for source in archived {
-        let target = current
-            .iter()
-            .find(|table| table.name == source.name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "older archive table {} no longer exists in the current canonical schema",
-                    source.name
-                )
-            })?;
-        ensure!(
-            primary_key_names(source) == primary_key_names(target),
-            "older archive table {} changed primary-key identity; automatic migration is unsafe",
-            source.name
-        );
-        for column in &source.columns {
-            ensure!(
-                target.columns.iter().any(|candidate| candidate == column),
-                "older archive column {}.{} no longer exists; automatic migration is unsafe",
-                source.name,
-                column
-            );
-        }
-    }
+    ensure!(
+        archived == current,
+        "reviewed v20 -> v21 migration requires identical canonical table/column/primary-key descriptors; index-only migration does not authorize table drift"
+    );
     Ok(current)
 }
 
@@ -285,18 +267,15 @@ fn clear_archived_data(connection: &Connection, archived: &[Table]) -> Result<()
     Ok(())
 }
 
-fn restore_older<R: BufRead>(
+fn restore_v20<R: BufRead>(
     connection: &Connection,
     input: &mut Input<R>,
     inspected: &Inspected,
 ) -> Result<()> {
     let source_version = parse_source_version(&inspected.header)?;
     let target = target_version()?;
-    ensure!(
-        source_version < target,
-        "--allow-compatible-schema accepts only archives older than this binary; current-schema archives use exact restoration"
-    );
-    compatible_tables(connection, &inspected.tables)?;
+    require_reviewed_transition(source_version, target)?;
+    require_reviewed_table_layout(connection, &inspected.tables)?;
     verify_current_schema_authority(connection)?;
 
     let Some(Record::Header { header }) = input.record(1)? else {
@@ -351,7 +330,7 @@ fn restore_older<R: BufRead>(
                     .as_ref()
                     .ok_or_else(|| anyhow!("record {line}: row precedes its table"))?;
                 if table.name == MIGRATIONS_TABLE {
-                    // The current initializer's migration ledger is authoritative.
+                    // v20 migration history is input evidence, never current authority.
                 } else if meta_schema_version_row(table, &cells) {
                     saw_schema_marker = true;
                 } else {
@@ -361,7 +340,7 @@ fn restore_older<R: BufRead>(
                         .execute_with_params(&values(cells)?)
                         .map_err(|_| {
                             anyhow!(
-                                "record {line}: row cannot satisfy the current additive schema; no destination was published"
+                                "record {line}: row does not satisfy the reviewed v21 schema; no destination was published"
                             )
                         })?;
                 }
@@ -379,15 +358,15 @@ fn restore_older<R: BufRead>(
     let (header, completion) = validator.finish()?;
     ensure!(
         (header, completion) == (inspected.header.clone(), inspected.completion.clone()),
-        "logical archive changed during compatible replay"
+        "logical archive changed during reviewed migration replay"
     );
     ensure!(
         table_count == inspected.tables.len(),
-        "logical archive table set changed during compatible replay"
+        "logical archive table set changed during reviewed migration replay"
     );
     ensure!(
         saw_schema_marker,
-        "older logical archive lacks the schema_version marker required for additive migration"
+        "v20 logical archive lacks the schema_version marker required for reviewed migration"
     );
 
     drop(statement);
@@ -473,7 +452,7 @@ fn require_same_file(connection: &Connection, path: &Path) -> Result<()> {
     let actual = identity(path)?;
     ensure!(
         connection.file_identity()? == Some(actual),
-        "restore destination changed during compatible comparison; retry without replacing it"
+        "restore destination changed during reviewed migration comparison; retry without replacing it"
     );
     Ok(())
 }
@@ -596,7 +575,7 @@ fn compare_table_rows<R: BufRead>(
         if let Err(error) = result {
             failure = Some(error);
             return Err(FrankenError::Internal(
-                "compatible archive projection comparison aborted".to_owned(),
+                "reviewed archive projection comparison aborted".to_owned(),
             ));
         }
         Ok(())
@@ -640,18 +619,18 @@ fn verify_persisted_projection(
     if let Some(expected_identity) = expected_identity {
         ensure!(
             reader.file_identity()? == Some(expected_identity),
-            "restore destination changed before compatible comparison; nothing was replaced"
+            "restore destination changed before reviewed migration comparison; nothing was replaced"
         );
     }
     super::import::verify_database(&reader)?;
     verify_current_schema_authority(&reader)?;
-    compatible_tables(&reader, &inspected.tables)?;
+    require_reviewed_table_layout(&reader, &inspected.tables)?;
 
     file.seek(SeekFrom::Start(0))?;
     let verified = codec::verify(&mut BufReader::new(&mut *file))?;
     ensure!(
         verified == (inspected.header.clone(), inspected.completion.clone()),
-        "logical archive changed after compatible replay"
+        "logical archive changed after reviewed migration replay"
     );
 
     file.seek(SeekFrom::Start(0))?;
@@ -701,7 +680,7 @@ fn verify_persisted_projection(
 
 fn migration_receipt(inspected: &Inspected) -> Result<SchemaMigrationReceipt> {
     Ok(SchemaMigrationReceipt {
-        mode: "compatible_additive",
+        mode: "reviewed_v20_to_v21",
         from_storage_schema_version: inspected.header.storage_schema_version.clone(),
         to_storage_schema_version: target_version()?.to_string(),
         schema_authority: "current_binary_initializer",
@@ -734,10 +713,7 @@ pub fn import_compatible(
             migration: None,
         });
     }
-    ensure!(
-        source_version < target,
-        "logical archive schema is newer than this binary; downgrade migration is not supported"
-    );
+    require_reviewed_transition(source_version, target)?;
 
     let _lock = DestinationLock::acquire(destination)?;
     if if_identical && fs::symlink_metadata(destination).is_ok() {
@@ -750,7 +726,7 @@ pub fn import_compatible(
             false,
         )
         .context(
-            "restore conflict: existing canonical data is not the verified compatible migration; nothing was replaced",
+            "restore conflict: existing canonical data is not the verified reviewed migration; nothing was replaced",
         )?;
         return Ok(MigrationOutcome {
             header: inspected.header.clone(),
@@ -768,7 +744,7 @@ pub fn import_compatible(
     let candidate = staging.path().join("publication.db");
 
     let storage = SqliteStorage::open(&replay_path)
-        .context("cannot initialize compatible restore candidate")?;
+        .context("cannot initialize reviewed migration candidate")?;
     drop(storage);
     let connection = Connection::open(export::path_text(&replay_path)?)?;
     connection.execute("PRAGMA busy_timeout = 5000")?;
@@ -777,13 +753,13 @@ pub fn import_compatible(
         .get_typed::<String>(0)?;
     ensure!(
         mode.eq_ignore_ascii_case("wal"),
-        "cannot enable WAL for private compatible replay"
+        "cannot enable WAL for private reviewed migration replay"
     );
     connection.execute("PRAGMA synchronous = FULL")?;
 
     file.seek(SeekFrom::Start(0))?;
     let mut bounded = Input::new(BufReader::new(&mut file));
-    restore_older(&connection, &mut bounded, &inspected)?;
+    restore_v20(&connection, &mut bounded, &inspected)?;
     materialize_candidate(&connection, &candidate)?;
     connection.close()?;
 
@@ -832,31 +808,33 @@ mod tests {
             .collect()
     }
 
-    fn older_archive(
+    fn versioned_archive(
         root: &Path,
-        remove_required_agent_column: bool,
-    ) -> Result<(PathBuf, String)> {
-        let source = root.join("source.db");
+        source_version: u32,
+        descriptor_drift: bool,
+    ) -> Result<PathBuf> {
+        ensure!(
+            target_version()? == REVIEWED_TARGET_VERSION,
+            "reviewed migration tests require schema v21; update policy before accepting a newer target"
+        );
+        let source = root.join(format!("source-{source_version}.db"));
         let storage = SqliteStorage::open(&source)?;
         storage.ensure_agent(&Agent {
             id: None,
             slug: "migration-fixture".into(),
             name: "Migration Fixture".into(),
-            version: Some("old-version".into()),
+            version: Some("v20-data".into()),
             kind: AgentKind::Cli,
         })?;
         drop(storage);
 
         let connection = export::open_source(&source)?;
-        let target = target_version()?;
-        ensure!(target > 1, "migration fixture requires a version above one");
-        let from = target - 1;
         let header = Header {
             format: codec::FORMAT.to_owned(),
             schema_version: codec::VERSION,
-            archive_id: "older-compatible".to_owned(),
+            archive_id: "reviewed-migration".to_owned(),
             exported_at_ms: 1,
-            storage_schema_version: from.to_string(),
+            storage_schema_version: source_version.to_string(),
             record_types: ["table", "row", "completion"]
                 .into_iter()
                 .map(str::to_owned)
@@ -865,31 +843,20 @@ mod tests {
             omissions: vec!["derived_search_assets".to_owned()],
         };
         let mut validator = Validator::new(header.clone())?;
-        let path = root.join("older.jsonl");
+        let path = root.join(format!("schema-{source_version}.jsonl"));
         let mut output = File::create(&path)?;
         output.write_all(&codec::encode(&Record::Header {
             header: header.clone(),
         })?)?;
 
         for mut table in export::tables(&connection)? {
-            if table.name == MIGRATIONS_TABLE {
-                continue;
-            }
-            if table.name == "agents" {
-                let removed = if remove_required_agent_column {
-                    "slug"
-                } else {
-                    "version"
-                };
+            if descriptor_drift && table.name == "agents" {
                 let removed_offset = table
                     .columns
                     .iter()
-                    .position(|column| column == removed)
-                    .context("fixture agent column missing")?;
-                ensure!(
-                    !table.primary_key.contains(&removed_offset),
-                    "fixture must not remove an agent primary key"
-                );
+                    .position(|column| column == "version")
+                    .context("fixture agent version column missing")?;
+                ensure!(!table.primary_key.contains(&removed_offset));
                 table.columns.remove(removed_offset);
                 for offset in &mut table.primary_key {
                     if *offset > removed_offset {
@@ -918,8 +885,13 @@ mod tests {
                 })
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
+            let predicate = if table.name == MIGRATIONS_TABLE {
+                format!(" WHERE version <= {source_version}")
+            } else {
+                String::new()
+            };
             let sql = format!(
-                "SELECT {columns} FROM {} ORDER BY {order}",
+                "SELECT {columns} FROM {}{predicate} ORDER BY {order}",
                 export::quoted(&table.name)?
             );
             let mut failure = None;
@@ -938,7 +910,7 @@ mod tests {
                             if let Some(value_offset) =
                                 table.columns.iter().position(|column| column == "value")
                             {
-                                cells[value_offset] = Cell::Text(from.to_string());
+                                cells[value_offset] = Cell::Text(source_version.to_string());
                             }
                         }
                     }
@@ -964,43 +936,49 @@ mod tests {
         validator.finish()?;
         connection.execute("ROLLBACK")?;
         connection.close_without_checkpoint()?;
-        Ok((path, from.to_string()))
+        Ok(path)
     }
 
     #[test]
-    fn additive_migration_restores_older_subset_into_current_schema() -> Result<()> {
+    fn reviewed_v20_migration_restores_rows_under_current_v21_authority() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let (input, from) = older_archive(root.path(), false)?;
+        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
         let destination = root.path().join("restored.db");
-        let outcome = import_compatible(&input, &destination, "older-compatible", false)?;
+        let outcome =
+            import_compatible(&input, &destination, "reviewed-migration", false)?;
         let receipt = outcome.migration.context("migration receipt missing")?;
-        assert_eq!(receipt.from_storage_schema_version, from);
+        assert_eq!(receipt.mode, "reviewed_v20_to_v21");
+        assert_eq!(
+            receipt.from_storage_schema_version,
+            REVIEWED_SOURCE_VERSION.to_string()
+        );
         assert_eq!(
             receipt.to_storage_schema_version,
-            target_version()?.to_string()
+            REVIEWED_TARGET_VERSION.to_string()
         );
         assert!(receipt.source_rows_verified);
-        assert!(destination.is_file());
 
         let storage = SqliteStorage::open_readonly(&destination)?;
-        assert_eq!(u32::try_from(storage.schema_version()?)?, target_version()?);
+        assert_eq!(u32::try_from(storage.schema_version()?)?, REVIEWED_TARGET_VERSION);
         let row = storage
             .raw()
             .query_row("SELECT slug, version FROM agents WHERE slug = 'migration-fixture'")?;
         assert_eq!(row.get_typed::<String>(0)?, "migration-fixture");
-        assert_eq!(row.get_typed::<Option<String>>(1)?, None);
+        assert_eq!(row.get_typed::<Option<String>>(1)?, Some("v20-data".into()));
         Ok(())
     }
 
     #[test]
-    fn repeated_compatible_import_is_read_only_and_reports_unchanged() -> Result<()> {
+    fn repeated_reviewed_migration_is_read_only_and_reports_unchanged() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let (input, _) = older_archive(root.path(), false)?;
+        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
         let destination = root.path().join("restored.db");
-        let created = import_compatible(&input, &destination, "older-compatible", false)?;
+        let created =
+            import_compatible(&input, &destination, "reviewed-migration", false)?;
         assert!(created.created);
         let before = database_files(&destination);
-        let repeated = import_compatible(&input, &destination, "older-compatible", true)?;
+        let repeated =
+            import_compatible(&input, &destination, "reviewed-migration", true)?;
         assert!(!repeated.created);
         assert!(repeated.migration.is_some());
         assert_eq!(before, database_files(&destination));
@@ -1010,49 +988,53 @@ mod tests {
     #[test]
     fn changed_migrated_destination_is_a_conflict_not_an_overwrite() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let (input, _) = older_archive(root.path(), false)?;
+        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
         let destination = root.path().join("restored.db");
-        import_compatible(&input, &destination, "older-compatible", false)?;
+        import_compatible(&input, &destination, "reviewed-migration", false)?;
         let writer = Connection::open(export::path_text(&destination)?)?;
         writer.execute(
             "INSERT INTO meta (key, value) VALUES ('operator_note', 'keep migrated note')",
         )?;
         writer.close()?;
         let before = database_files(&destination);
-        assert!(import_compatible(&input, &destination, "older-compatible", true).is_err());
+        assert!(
+            import_compatible(&input, &destination, "reviewed-migration", true).is_err()
+        );
         assert_eq!(before, database_files(&destination));
         Ok(())
     }
 
     #[test]
-    fn missing_current_required_column_fails_without_publication() -> Result<()> {
+    fn reviewed_index_only_bridge_rejects_canonical_descriptor_drift() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let (input, _) = older_archive(root.path(), true)?;
+        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, true)?;
         let destination = root.path().join("restored.db");
         assert!(
-            import_compatible(&input, &destination, "older-compatible", false).is_err()
+            import_compatible(&input, &destination, "reviewed-migration", false).is_err()
         );
         assert!(!destination.exists());
         Ok(())
     }
 
     #[test]
-    fn future_schema_is_refused_without_creating_a_destination() -> Result<()> {
+    fn unreviewed_older_schema_is_refused_without_publication() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let (input, _) = older_archive(root.path(), false)?;
-        let current = format!(
-            "\"storage_schema_version\":\"{}\"",
-            target_version()? - 1
-        );
-        let future = format!(
-            "\"storage_schema_version\":\"{}\"",
-            target_version()? + 1
-        );
-        let text = fs::read_to_string(&input)?;
-        fs::write(&input, text.replacen(&current, &future, 1))?;
+        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION - 1, false)?;
         let destination = root.path().join("restored.db");
         assert!(
-            import_compatible(&input, &destination, "older-compatible", false).is_err()
+            import_compatible(&input, &destination, "reviewed-migration", false).is_err()
+        );
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn newer_schema_is_refused_without_publication() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = versioned_archive(root.path(), REVIEWED_TARGET_VERSION + 1, false)?;
+        let destination = root.path().join("restored.db");
+        assert!(
+            import_compatible(&input, &destination, "reviewed-migration", false).is_err()
         );
         assert!(!destination.exists());
         Ok(())
