@@ -1271,7 +1271,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
 
-    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v2"));
     assert_eq!(json["query"]["text"].as_str(), Some("auth"));
     assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
     assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
@@ -5909,7 +5909,7 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
 
-    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v2"));
     assert_eq!(json["query"]["text"].as_str(), Some("auth failed"));
     assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
     assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
@@ -6362,7 +6362,7 @@ fn explicit_search_pack_only_flags_run_pack_in_robot_mode() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
 
-        assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+        assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v2"));
         assert_eq!(json["query"]["text"].as_str(), Some("auth failed"));
         assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
         assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));

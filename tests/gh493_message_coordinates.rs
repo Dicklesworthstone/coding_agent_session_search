@@ -1056,3 +1056,405 @@ fn corrected_robot_failures_are_one_error_envelope_and_success_still_teaches() {
         );
     }
 }
+
+fn pack_candidate(
+    source: &str,
+    path: &str,
+    conversation_id: Option<i64>,
+    number: Option<usize>,
+    hash: u64,
+) -> coding_agent_search::search::pack_planner::PackCandidate {
+    use coding_agent_search::search::pack_planner::PackCandidate;
+    use coding_agent_search::search::query::{MatchType, SearchHit};
+    PackCandidate::from_search_hit(
+        &SearchHit {
+            title: "pack identity".into(),
+            snippet: "pack evidence".into(),
+            content: format!("distinct pack evidence {hash}"),
+            content_hash: hash,
+            conversation_id,
+            score: 1.0,
+            source_path: path.into(),
+            agent: "claude_code".into(),
+            workspace: "/work".into(),
+            workspace_original: None,
+            created_at: Some(1_733_000_000_000),
+            line_number: number,
+            match_type: MatchType::Exact,
+            source_id: source.into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+        },
+        1,
+        0,
+    )
+}
+
+#[test]
+fn pack_indices_and_evidence_ids_bind_the_complete_canonical_identity() {
+    use coding_agent_search::search::pack_planner::{PackPlanRequest, plan_answer_pack};
+    for number in [None, Some(0), Some(1), Some(8), Some(129), Some(541)] {
+        let candidate = pack_candidate("local", "/shared/provider.db", Some(42), number, 1);
+        assert_eq!(candidate.message_index, number.filter(|&value| value != 0));
+        assert!(candidate.line_start.is_none());
+        assert!(!candidate.citation_verified);
+    }
+    // Identical content and source spans in separate single-item packs must
+    // still identify the right conversation and message. Content deduplication
+    // WITHIN a pack is intentionally unchanged.
+    let candidates = vec![
+        pack_candidate("local", "/shared/provider.db", Some(42), Some(8), 1),
+        pack_candidate("local", "/shared/provider.db", Some(43), Some(8), 1),
+        pack_candidate("local", "/shared/provider.db", Some(42), Some(9), 1),
+        pack_candidate("remote-host", "/shared/provider.db", Some(42), Some(8), 1),
+        pack_candidate("local", "/shared/provider.db", None, Some(8), 1),
+        pack_candidate("local", "/shared/provider.db", Some(42), None, 1),
+        // These collided with newline-delimited citation hashing.
+        pack_candidate("local\n/shared", "provider.db", Some(42), Some(8), 1),
+        pack_candidate("local", "/shared\nprovider.db", Some(42), Some(8), 1),
+    ];
+    let mut candidate_ids = std::collections::HashSet::new();
+    let mut evidence_ids = std::collections::HashSet::new();
+    for candidate in candidates {
+        assert!(candidate_ids.insert(candidate.candidate_id.clone()));
+        let request = PackPlanRequest {
+            candidates: vec![candidate],
+            ..Default::default()
+        };
+        let plan = plan_answer_pack(request.clone()).unwrap();
+        let repeat = plan_answer_pack(request).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        assert_eq!(plan.evidence[0].id, repeat.evidence[0].id);
+        assert!(evidence_ids.insert(plan.evidence[0].id.clone()));
+    }
+}
+
+#[test]
+fn pack_session_caps_and_source_summaries_count_shared_path_conversations() {
+    use coding_agent_search::search::pack_planner::{
+        PackOmittedReason, PackPlanRequest, PackRenderRequest, plan_answer_pack,
+        render_answer_pack_value_without_trust_correlation,
+    };
+    let candidates = vec![
+        pack_candidate("local", "/shared/provider.db", Some(11), Some(1), 11),
+        pack_candidate("local", "/shared/provider.db", Some(22), Some(1), 22),
+        pack_candidate("local", "/shared/provider.db", Some(11), Some(2), 12),
+    ];
+    for cap in [1, 2] {
+        let mut request = PackPlanRequest {
+            candidates: candidates.clone(),
+            ..Default::default()
+        };
+        request.limits.max_sessions = cap;
+        let plan = plan_answer_pack(request.clone()).unwrap();
+        assert_eq!(plan.selected_session_count, cap);
+        assert_eq!(plan.selected_evidence_count, if cap == 1 { 2 } else { 3 });
+        if cap == 1 {
+            assert_eq!(plan.omitted.len(), 1);
+            assert_eq!(
+                plan.omitted[0].reason,
+                PackOmittedReason::MaxSessionsReached
+            );
+        }
+        request.candidates.reverse();
+        let reversed = plan_answer_pack(request).unwrap();
+        assert_eq!(
+            plan.evidence
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>(),
+            reversed
+                .evidence
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>(),
+            "equal-ranked shared paths must not make selection depend on input order",
+        );
+        let value = render_answer_pack_value_without_trust_correlation(
+            &plan,
+            &PackRenderRequest::default(),
+        )
+        .unwrap();
+        assert_eq!(value["realized"]["selected_session_count"], cap);
+        assert_eq!(value["pack"]["source_summary"][0]["session_count"], cap);
+    }
+}
+
+#[test]
+fn pack_physical_overlap_deduplication_is_scoped_to_the_source() {
+    use coding_agent_search::search::pack_planner::{PackPlanRequest, plan_answer_pack};
+    let mut left = pack_candidate("local", "/shared/session.jsonl", Some(11), Some(8), 11);
+    left.line_start = Some(4);
+    left.line_end = Some(7);
+    left.citation_verified = true;
+    let mut right = pack_candidate(
+        "work-laptop",
+        "/shared/session.jsonl",
+        Some(22),
+        Some(8),
+        22,
+    );
+    right.line_start = left.line_start;
+    right.line_end = left.line_end;
+    right.citation_verified = true;
+    let plan = plan_answer_pack(PackPlanRequest {
+        candidates: vec![left.clone(), right.clone()],
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        plan.selected_evidence_count, 2,
+        "same pathname on different hosts is not one file"
+    );
+    right.source_id = "local".into();
+    let plan = plan_answer_pack(PackPlanRequest {
+        candidates: vec![left, right],
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        plan.selected_evidence_count, 1,
+        "actual same-source physical overlap is still deduplicated"
+    );
+}
+
+#[test]
+fn pack_renderer_coordinates_are_self_describing_without_bypassing_privacy() {
+    use coding_agent_search::search::pack_planner::{
+        PackPlanRequest, PackRenderFormat, PackRenderRequest, plan_answer_pack,
+        render_answer_pack_without_trust_correlation,
+    };
+    let mut candidate = pack_candidate(
+        "alice.internal",
+        "/home/alice/history.jsonl",
+        Some(42),
+        Some(8),
+        1,
+    );
+    candidate.origin_kind = "ssh".into();
+    candidate.origin_host = Some("alice.internal".into());
+    let plan = plan_answer_pack(PackPlanRequest {
+        candidates: vec![candidate],
+        ..Default::default()
+    })
+    .unwrap();
+    for format in [
+        PackRenderFormat::Json,
+        PackRenderFormat::CompactJson,
+        PackRenderFormat::Jsonl,
+        PackRenderFormat::Markdown,
+    ] {
+        let request = PackRenderRequest {
+            format,
+            ..Default::default()
+        };
+        let output = render_answer_pack_without_trust_correlation(&plan, &request).unwrap();
+        assert!(!output.contains("alice.internal"));
+        assert!(!output.contains("/home/alice"));
+        if format == PackRenderFormat::Markdown {
+            assert!(output.contains("conversation_id=42 message_index=8 (1-based)"));
+        } else if format == PackRenderFormat::Jsonl {
+            let lines: Vec<Value> = output
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(lines[0]["schema_version"], "cass.pack.v2");
+            let citation = &lines
+                .iter()
+                .find(|line| line.get("evidence").is_some())
+                .unwrap()["evidence"]["citation"];
+            assert_eq!(citation["message_index_base"], 1);
+            assert_eq!(citation["message_index"], 8);
+        } else {
+            let payload: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(payload["schema_version"], "cass.pack.v2");
+            let citation = &payload["evidence"][0]["citation"];
+            assert_eq!(citation["message_index_base"], 1);
+            assert_eq!(citation["message_index"], 8);
+            assert_eq!(citation["conversation_id"], 42);
+            assert!(citation["line_start"].is_null());
+        }
+    }
+}
+
+#[test]
+fn actual_pack_citations_round_trip_unchanged_with_shared_paths_and_missing_sources() {
+    let fixture = Fixture::new(&[0, 1, 7]);
+    let storage = FrankenStorage::open(&fixture.db).unwrap();
+    let other = seed(&storage, &fixture.path, "codex", &[0, 1, 7]);
+    let targets = [
+        (
+            fixture.conversation_id,
+            "PACK493TARGET first conversation evidence",
+        ),
+        (other, "PACK493TARGET second conversation evidence"),
+    ];
+    for (conversation_id, content) in targets {
+        storage
+            .raw()
+            .execute_compat(
+                "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND idx = 1",
+                coding_agent_search::franken_sync::params![content, conversation_id],
+            )
+            .unwrap();
+    }
+    drop(storage);
+    for (conversation_id, _) in targets {
+        let indexed = fixture
+            .command("index")
+            .arg("--data-dir")
+            .arg(&fixture.data)
+            .arg("--reconcile-conversation")
+            .arg(conversation_id.to_string())
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(
+            indexed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+    }
+    // Both the previous canonical message and physical file line 2 exist and
+    // are plausible WRONG targets. A mistaken offset must not pass this test.
+    let wrong = decode(fixture.follow(
+        "view",
+        1,
+        &["--conversation-id", &fixture.conversation_id.to_string()],
+    ));
+    assert_eq!(wrong["lines"][0]["content"], "canonical neighbour");
+    let source = std::fs::read(&fixture.path).unwrap();
+    let retained_source = fixture.path.with_extension("retained");
+    std::fs::rename(&fixture.path, &retained_source).unwrap();
+    let before = std::fs::read(&fixture.db).unwrap();
+    for (format, args) in [
+        ("json", vec!["--json"]),
+        ("compact", vec!["--robot-format", "compact"]),
+        ("jsonl", vec!["--robot-format", "jsonl"]),
+        ("minimal", vec!["--json", "--fields", "minimal"]),
+        (
+            "custom",
+            vec![
+                "--json",
+                "--fields",
+                "schema_version,evidence[].citation,evidence[].excerpt",
+            ],
+        ),
+    ] {
+        let output = fixture
+            .command("pack")
+            .args([
+                "PACK493TARGET",
+                "--mode",
+                "lexical",
+                "--freshness-policy",
+                "allow-stale",
+                "--max-sessions",
+                "2",
+                "--max-tokens",
+                "20000",
+                "--timeout",
+                "30000",
+                "--require-evidence",
+            ])
+            .arg("--data-dir")
+            .arg(&fixture.data)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let items: Vec<Value> = if format == "jsonl" {
+            let records: Vec<Value> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records[0]["schema_version"], "cass.pack.v2");
+            records
+                .into_iter()
+                .filter_map(|mut row| row.get_mut("evidence").map(Value::take))
+                .collect()
+        } else {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["schema_version"], "cass.pack.v2");
+            if format == "json" || format == "compact" {
+                assert_eq!(value["realized"]["selected_session_count"], 2);
+                assert_eq!(value["pack"]["source_summary"][0]["session_count"], 2);
+            }
+            value["evidence"].as_array().unwrap().clone()
+        };
+        assert_eq!(
+            items.len(),
+            2,
+            "{format}: distinct conversations cannot be collapsed"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for item in items {
+            let citation = &item["citation"];
+            assert_eq!(citation["message_index_base"], 1);
+            assert_eq!(citation["message_index"], 2);
+            assert!(citation["line_start"].is_null());
+            let cid = citation["conversation_id"].as_i64().unwrap();
+            assert!(seen.insert(cid));
+            let expected = targets.iter().find(|(id, _)| *id == cid).unwrap().1;
+            assert_eq!(item["excerpt"], expected);
+            for command in ["view", "expand"] {
+                let value = decode(
+                    fixture
+                        .command(command)
+                        .arg(citation["source_path"].as_str().unwrap())
+                        .args(["--source", citation["source_id"].as_str().unwrap()])
+                        .arg("--conversation-id")
+                        .arg(cid.to_string())
+                        .arg("--message-index")
+                        .arg(citation["message_index"].as_u64().unwrap().to_string())
+                        .args(["-C", "0", "--json"])
+                        .output()
+                        .unwrap(),
+                );
+                let rows = if command == "view" {
+                    &value["lines"]
+                } else {
+                    &value
+                };
+                assert_eq!(rows.as_array().unwrap().len(), 1);
+                assert_eq!(rows[0]["content"], expected);
+                assert_eq!(rows[0]["conversation_id"], cid);
+                assert_eq!(rows[0]["message_index"], 2);
+                assert_eq!(rows[0]["is_target"], true);
+            }
+        }
+    }
+    let capped = decode(
+        fixture
+            .command("pack")
+            .args([
+                "PACK493TARGET",
+                "--mode",
+                "lexical",
+                "--freshness-policy",
+                "allow-stale",
+                "--json",
+                "--max-sessions",
+                "1",
+                "--max-tokens",
+                "20000",
+                "--timeout",
+                "30000",
+                "--require-evidence",
+            ])
+            .arg("--data-dir")
+            .arg(&fixture.data)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(capped["realized"]["selected_session_count"], 1);
+    assert_eq!(capped["evidence"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), before);
+    assert_eq!(std::fs::read(&retained_source).unwrap(), source);
+    assert!(!fixture.path.exists());
+}

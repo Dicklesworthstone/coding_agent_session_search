@@ -141,9 +141,23 @@ exit code.
 
 All object keys are stable and snake_case.
 
+The current response is **`cass.pack.v2`**. Version 1's zero-based
+`citation.message_index` must not be passed directly to `view`/`expand`.
+Version 2 preserves search's one-based `line_number` unchanged as
+`citation.message_index` and includes `message_index_base: 1` on every citation.
+Use it with `--message-index`, never `--line`, preserving `source_path`,
+`source_id`, `conversation_id`, and the archive used for search. This is the
+stored `messages.idx + 1`, not a dense vector position or a physical file line.
+Unknown indices remain null. Explicit field masks may omit required identity
+fields; consumers must not invent the missing components.
+
+Session limits, diversity and source summaries distinguish conversations by
+source, source path and conversation ID, including multiple sessions in a single
+provider database. Without a conversation ID, only path-level identity is known.
+
 ```json
 {
-  "schema_version": "cass.pack.v1",
+  "schema_version": "cass.pack.v2",
   "query": {
     "text": "storage open recovery",
     "normalized": "storage open recovery",
@@ -232,7 +246,12 @@ Evidence IDs encode all 32 bytes of the BLAKE3 digest using the RFC 4648
 base32 alphabet (`A-Z`, `2-7`), without `=` padding. Each ID is `ev_` followed
 by 52 characters; the final character's unused bits are zero. Published IDs
 bind to the citation core after source verification, including unverified
-fallbacks.
+fallbacks. Version 2 hashes a domain-separated, length-prefixed encoding of
+source identity and path, optional conversation/message identity, physical span,
+and span hash. Missing and zero coordinates are distinct; embedded delimiters
+cannot alias neighboring fields. Evidence and candidate IDs change with this
+version. Content-based duplicate suppression within a pack is unchanged, while
+physical-span overlap suppression never crosses source identity.
 
 ## Pack Object Schema
 
@@ -287,7 +306,8 @@ Citation fields:
 | `agent` | string | Agent slug. |
 | `line_start` | integer or null | One-indexed first source line for the span. |
 | `line_end` | integer or null | One-indexed last source line for the span. |
-| `message_index` | integer or null | Zero-indexed message position when known. |
+| `message_index` | integer or null | One-based stored message index (`messages.idx + 1`), unchanged from search's `line_number`; use with `--message-index`. |
+| `message_index_base` | integer | Always `1`, including when the index is unknown/null. |
 | `conversation_id` | integer or null | Internal DB conversation id when available. |
 | `content_hash` | string | Hex hash of normalized content. |
 | `span_hash` | string | Hex hash of the exact selected span before redaction. |
@@ -527,7 +547,7 @@ Empty search results are success by default:
 
 ```json
 {
-  "schema_version": "cass.pack.v1",
+  "schema_version": "cass.pack.v2",
   "evidence": [],
   "omitted": {"count": 0, "items": []},
   "warnings": ["no_evidence_found"]
@@ -541,7 +561,7 @@ same fields. TOON encodes the same payload with the existing `toon` crate path.
 
 JSONL emits one object per line:
 
-1. `{"_meta": ...}`
+1. `{"schema_version": "cass.pack.v2", "_meta": ..., "budget": ...}`
 2. `{"pack": ...}`
 3. One line per `evidence` item.
 4. One line with `{"omitted": ...}`
@@ -558,7 +578,7 @@ Markdown output must include citations inline:
 
 ## Evidence
 
-[ev_abc123] codex local /path/session.jsonl:42-47
+[ev_abc123] codex local /path/session.jsonl:42-47 conversation_id=7 message_index=8 (1-based)
 ```
 
 Markdown is not a replacement for robot JSON; implementation must add JSON

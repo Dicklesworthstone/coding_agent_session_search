@@ -225,6 +225,8 @@ pub struct PackCandidate {
     pub line_start: Option<usize>,
     pub line_end: Option<usize>,
     pub conversation_id: Option<i64>,
+    /// One-based canonical `messages.idx + 1`, as accepted by --message-index.
+    /// Physical source-file coordinates belong only in line_start/line_end.
     pub message_index: Option<usize>,
     pub citation_verified: bool,
     pub content_hash: String,
@@ -253,7 +255,7 @@ impl PackCandidate {
     ) -> Self {
         // Search navigation uses normalized message ordinals. Physical source
         // lines are assigned only after reading and matching the source record.
-        let message_index = hit.line_number.and_then(|line| line.checked_sub(1));
+        let message_index = hit.line_number.filter(|&line| line != 0);
         let source_id = if hit.source_id.trim().is_empty() {
             "local".to_string()
         } else {
@@ -265,14 +267,8 @@ impl PackCandidate {
             hit.origin_kind.trim().to_string()
         };
         let content_hash = format!("{:016x}", hit.content_hash);
-        let candidate_id = format!(
-            "{}:{}:{}",
-            source_id,
-            hit.source_path,
-            hit.line_number.unwrap_or_default()
-        );
-        Self {
-            candidate_id,
+        let mut candidate = Self {
+            candidate_id: String::new(),
             source_path: hit.source_path.clone(),
             source_id,
             origin_kind,
@@ -305,11 +301,13 @@ impl PackCandidate {
             query_phrase_count,
             source_readiness: PackSourceReadiness::Healthy,
             source_explicitly_requested: false,
-        }
+        };
+        candidate.candidate_id = evidence_id(&candidate);
+        candidate
     }
 
-    fn session_key(&self) -> (&str, &str) {
-        (&self.source_id, &self.source_path)
+    fn session_key(&self) -> (&str, &str, Option<i64>) {
+        (&self.source_id, &self.source_path, self.conversation_id)
     }
 }
 
@@ -739,6 +737,7 @@ struct RenderedCitation {
     line_start: Option<usize>,
     line_end: Option<usize>,
     message_index: Option<usize>,
+    message_index_base: u8,
     conversation_id: Option<i64>,
     content_hash: String,
     span_hash: String,
@@ -799,7 +798,7 @@ struct RenderedPrivacy {
 #[derive(Debug, Default)]
 struct SourceAccumulator {
     origin_kind: String,
-    sessions: BTreeSet<String>,
+    sessions: BTreeSet<(String, Option<i64>)>,
     evidence_count: usize,
     newest_evidence_at_ms: Option<i64>,
     healthy: bool,
@@ -880,10 +879,10 @@ struct ScoredCandidate {
 #[derive(Debug, Default)]
 struct SelectedState {
     source_ids: HashSet<String>,
-    sessions: HashSet<(String, String)>,
+    sessions: HashSet<(String, String, Option<i64>)>,
     span_hashes: HashSet<String>,
     content_hashes: HashSet<String>,
-    ranges: Vec<(String, Option<usize>, Option<usize>)>,
+    ranges: Vec<(String, String, Option<usize>, Option<usize>)>,
 }
 
 pub fn plan_answer_pack(
@@ -1045,10 +1044,11 @@ pub fn plan_answer_pack(
         }
 
         let session_key = candidate.session_key();
-        if !selected_state
-            .sessions
-            .contains(&(session_key.0.to_string(), session_key.1.to_string()))
-            && selected_state.sessions.len() >= request.limits.max_sessions
+        if !selected_state.sessions.contains(&(
+            session_key.0.to_string(),
+            session_key.1.to_string(),
+            session_key.2,
+        )) && selected_state.sessions.len() >= request.limits.max_sessions
         {
             omitted.push(omitted_candidate(
                 candidate,
@@ -1062,9 +1062,11 @@ pub fn plan_answer_pack(
         selected_state
             .source_ids
             .insert(candidate.source_id.clone());
-        selected_state
-            .sessions
-            .insert((candidate.source_id.clone(), candidate.source_path.clone()));
+        selected_state.sessions.insert((
+            candidate.source_id.clone(),
+            candidate.source_path.clone(),
+            candidate.conversation_id,
+        ));
         selected_state
             .span_hashes
             .insert(candidate.span_hash.clone());
@@ -1072,6 +1074,7 @@ pub fn plan_answer_pack(
             .content_hashes
             .insert(candidate.content_hash.clone());
         selected_state.ranges.push((
+            candidate.source_id.clone(),
             candidate.source_path.clone(),
             candidate.line_start,
             candidate.line_end,
@@ -1271,9 +1274,10 @@ fn hard_omission_reason(
         || selected_state
             .ranges
             .iter()
-            .any(|(source_path, start, end)| {
+            .any(|(source_id, source_path, start, end)| {
                 // ubs:ignore — compares public citation paths, never secret material.
-                source_path == &candidate.source_path
+                source_id == &candidate.source_id
+                    && source_path == &candidate.source_path
                     && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
             })
     {
@@ -1445,7 +1449,11 @@ fn freshness_score(candidate: &PackCandidate, request: &PackPlanRequest) -> f64 
 }
 
 fn source_diversity_score(candidate: &PackCandidate, selected_state: &SelectedState) -> f64 {
-    let session_key = (candidate.source_id.clone(), candidate.source_path.clone());
+    let session_key = (
+        candidate.source_id.clone(),
+        candidate.source_path.clone(),
+        candidate.conversation_id,
+    );
     if selected_state.sessions.contains(&session_key) {
         0.0
     } else if selected_state.source_ids.contains(&candidate.source_id) {
@@ -1508,9 +1516,10 @@ fn duplicate_penalty(candidate: &PackCandidate, selected_state: &SelectedState) 
     if selected_state
         .ranges
         .iter()
-        .any(|(source_path, start, end)| {
+        .any(|(source_id, source_path, start, end)| {
             // ubs:ignore — compares public citation paths, never secret material.
-            source_path == &candidate.source_path
+            source_id == &candidate.source_id
+                && source_path == &candidate.source_path
                 && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
         })
     {
@@ -1560,6 +1569,17 @@ fn candidate_ordering(
         })
         .then_with(|| left_candidate.source_id.cmp(&right_candidate.source_id))
         .then_with(|| left_candidate.source_path.cmp(&right_candidate.source_path))
+        .then_with(|| {
+            left_candidate
+                .conversation_id
+                .cmp(&right_candidate.conversation_id)
+        })
+        .then_with(|| {
+            compare_optional_usize_low_first(
+                left_candidate.message_index,
+                right_candidate.message_index,
+            )
+        })
         .then_with(|| {
             compare_optional_usize_low_first(left_candidate.line_start, right_candidate.line_start)
         })
@@ -1621,17 +1641,42 @@ fn estimated_tokens(text: &str) -> usize {
 }
 
 fn evidence_id(candidate: &PackCandidate) -> String {
-    let mut hasher_input = String::new();
-    hasher_input.push_str(&candidate.source_id);
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.source_path);
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.line_start.unwrap_or_default().to_string());
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.line_end.unwrap_or_default().to_string());
-    hasher_input.push('\n');
-    hasher_input.push_str(&candidate.span_hash);
-    let hash = blake3::hash(hasher_input.as_bytes());
+    // Pathnames alone are not session identities: provider databases contain
+    // many conversations at one path. Length-prefix strings so embedded
+    // newlines/colons cannot move data into a neighboring identity component.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass.pack.evidence.v2\0");
+    for text in [&candidate.source_id, &candidate.source_path] {
+        hasher.update(&(text.len() as u64).to_le_bytes());
+        hasher.update(text.as_bytes());
+    }
+    match candidate.conversation_id {
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(&id.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    for coordinate in [
+        candidate.message_index,
+        candidate.line_start,
+        candidate.line_end,
+    ] {
+        match coordinate {
+            Some(number) => {
+                hasher.update(&[1]);
+                hasher.update(&(number as u64).to_le_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    hasher.update(&(candidate.span_hash.len() as u64).to_le_bytes());
+    hasher.update(candidate.span_hash.as_bytes());
+    let hash = hasher.finalize();
     encoded_evidence_id(hash.as_bytes())
 }
 
@@ -1819,7 +1864,7 @@ fn rendered_answer_pack_with_correlation(
     }
 
     RenderedAnswerPack {
-        schema_version: "cass.pack.v1",
+        schema_version: "cass.pack.v2",
         query: RenderedQuery {
             text: query_text,
             normalized: normalized_query,
@@ -2284,6 +2329,7 @@ fn rendered_evidence(
         line_start: candidate.line_start,
         line_end: candidate.line_end,
         message_index: candidate.message_index,
+        message_index_base: 1,
         conversation_id: candidate.conversation_id,
         content_hash: candidate.content_hash.clone(),
         span_hash: candidate.span_hash.clone(),
@@ -2398,7 +2444,10 @@ fn rendered_source_summary(evidence: &[RenderedEvidence]) -> Vec<RenderedSourceS
             healthy: true,
             ..SourceAccumulator::default()
         });
-        entry.sessions.insert(item.citation.source_path.clone());
+        entry.sessions.insert((
+            item.citation.source_path.clone(),
+            item.citation.conversation_id,
+        ));
         entry.evidence_count += 1;
         entry.newest_evidence_at_ms =
             newer_timestamp(entry.newest_evidence_at_ms, item.citation.created_at_ms);
@@ -2576,6 +2625,7 @@ fn render_answer_pack_jsonl(
     let mut lines = Vec::with_capacity(envelope.evidence.len() + 4);
     lines.push(json_line(
         serde_json::json!({
+            "schema_version": envelope.schema_version,
             "_meta": &envelope.meta,
             "budget": &envelope.budget,
         }),
@@ -2657,6 +2707,12 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
                     out.push('-');
                     out.push_str(&line_end.to_string());
                 }
+            }
+            if let Some(conversation_id) = item.citation.conversation_id {
+                out.push_str(&format!(" conversation_id={conversation_id}"));
+            }
+            if let Some(message_index) = item.citation.message_index {
+                out.push_str(&format!(" message_index={message_index} (1-based)"));
             }
             out.push_str("\n\n");
             // Preserve the complete prepared excerpt, including blank lines.
@@ -3081,7 +3137,7 @@ mod tests {
         let candidate = PackCandidate::from_search_hit(&hit, 1, 0);
 
         assert_eq!(candidate.match_type, "implicit_wildcard");
-        assert_eq!(candidate.message_index, Some(11));
+        assert_eq!(candidate.message_index, Some(12));
         assert_eq!(candidate.line_start, None);
         assert_eq!(candidate.line_end, None);
         assert!(!candidate.citation_verified);
@@ -3104,7 +3160,7 @@ mod tests {
         let mut item = candidate("verify", "local", path.to_str().unwrap(), 10.0);
         item.created_at_ms = None;
         item.excerpt = "verifiedneedle".to_string();
-        item.message_index = Some(0);
+        item.message_index = Some(1);
         let base = plan_answer_pack(request(vec![item])).unwrap();
 
         for (contents, expected_line) in [
@@ -3126,7 +3182,7 @@ mod tests {
             assert_eq!(citation.line_start, expected_line);
             assert_eq!(citation.line_end, expected_line);
             assert_eq!(citation.citation_verified, expected_line.is_some());
-            assert_eq!(citation.message_index, Some(0));
+            assert_eq!(citation.message_index, Some(1));
             if expected_line.is_some() {
                 assert_eq!(
                     citation.span_hash,
@@ -3425,7 +3481,7 @@ mod tests {
 
         assert!(!rendered.contains('\n'));
         assert_eq!(value, render_answer_pack_value(&plan, &req).unwrap());
-        assert_eq!(value["schema_version"], "cass.pack.v1");
+        assert_eq!(value["schema_version"], "cass.pack.v2");
         assert_eq!(value["_meta"]["format"], "compact");
         assert_eq!(value["_meta"]["partial"], false);
         assert_eq!(

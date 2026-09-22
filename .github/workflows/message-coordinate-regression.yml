@@ -9,11 +9,15 @@ on:
       - src/followup_coordinates.rs
       - src/followup_coordinates/**
       - src/search/query.rs
+      - src/search/pack_planner.rs
       - src/indexer/lexical_reconcile/canary.rs
       - tests/lexical_reconcile_canary.rs
       - tests/gh493_message_coordinates.rs
       - tests/gh493_reported_coordinates.rs
       - tests/gh493_windowed_followup.rs
+      - tests/e2e_cli_flows.rs
+      - tests/golden_robot_pack.rs
+      - docs/planning/ANSWER_PACKS_CONTRACT.md
       - docs/reference/QUICK_REFERENCE.md
       - tests/cli_robot.rs
       - tests/cli_view_budget.rs
@@ -107,8 +111,8 @@ jobs:
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
         with:
           cache-on-failure: true
-      - name: Run reconciliation, coordinate, field-mask and deadline regressions
-        run: cargo test --locked --no-fail-fast --test lexical_reconcile_canary --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget --test spec_field_mask_contract -- --nocapture
+      - name: Run reconciliation, coordinate, pack, field-mask and deadline regressions
+        run: cargo test --locked --no-fail-fast --test lexical_reconcile_canary --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget --test spec_field_mask_contract --test golden_robot_pack -- --nocapture
       # Keep every gate failing on errors, but do not let one failure hide the
       # remaining independent contracts or the production compiler diagnostics.
       - name: Check existing dispatch and error envelopes
@@ -122,9 +126,19 @@ jobs:
           cargo test --locked --test cli_robot view_
           cargo test --locked --test cli_robot fields_
           cargo test --locked --test cli_robot capabilities_matches_golden_contract
+      - name: Check pack aliases, field masks and timeout contracts
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --test cli_robot pack -- --nocapture
+      - name: Check the real archive-to-pack journey
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test e2e_cli_flows pack_handoff_journey_uses_real_archive_and_preserves_sources -- --exact --nocapture | tee "$RUNNER_TEMP/pack-journey.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/pack-journey.log"
       - name: Lint the regression targets and production dependency
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test lexical_reconcile_canary -- -D warnings
       - name: Check coordinate implementation formatting
         if: ${{ !cancelled() }}
-        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs src/followup_coordinates/window.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/gh493_windowed_followup.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs tests/util/timeout.rs tests/spec_field_mask_contract.rs
+        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/search/pack_planner.rs src/followup_coordinates.rs src/followup_coordinates/window.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/gh493_windowed_followup.rs tests/cli_robot.rs tests/e2e_cli_flows.rs tests/cli_dispatch_coverage.rs tests/util/timeout.rs tests/spec_field_mask_contract.rs
