@@ -16,14 +16,24 @@ fn fixture(path: &Path) {
     connection.close().unwrap();
 }
 
-fn contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    fs::read_dir(root)
-        .unwrap()
-        .map(|entry| {
+fn contents(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut contents = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
             let path = entry.unwrap().path();
-            (path.clone(), fs::read(path).unwrap())
-        })
-        .collect()
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                contents.insert(path.clone(), None);
+                pending.push(path);
+            } else {
+                assert!(metadata.is_file());
+                contents.insert(path.clone(), Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    contents
 }
 
 #[test]
