@@ -930,6 +930,77 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
     );
 }
 
+/// Bead dndyv: an archive that exists but cannot be opened, and a path with
+/// no archive at all, each used to print "No already archived data for that
+/// agent was present" — telling the user there was nothing to purge while the
+/// agent's rows could still be in the archive.
+#[test]
+fn sources_agents_exclude_distinguishes_unopenable_and_missing_archives() {
+    let tracker =
+        tracker_for("sources_agents_exclude_distinguishes_unopenable_and_missing_archives");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let exclude = |data_dir: &Path, agent: &str| {
+        let output = tracker
+            .cass_assert_command()
+            .args(["sources", "agents", "exclude", agent])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("CASS_DATA_DIR", data_dir)
+            .output()
+            .expect("sources agents exclude command");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "the exclusion itself succeeds: {}\nstdout: {stdout}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+
+    // An existing file that is not a SQLite database.
+    let unreadable_dir = tmp.path().join("unreadable");
+    fs::create_dir_all(&unreadable_dir).unwrap();
+    let db_path = unreadable_dir.join("agent_search.db");
+    let garbage = b"not a sqlite database\n".repeat(400);
+    fs::write(&db_path, &garbage).unwrap();
+    let stdout = exclude(&unreadable_dir, "openclaw");
+    assert!(stdout.contains("could not be opened"), "{stdout}");
+    assert!(stdout.contains("NOT purged"), "{stdout}");
+    assert!(stdout.contains(&db_path.display().to_string()), "{stdout}");
+    assert!(!stdout.contains("No already archived data"), "{stdout}");
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        garbage,
+        "the archive is left as found"
+    );
+
+    // No archive at the resolved path.
+    let empty_dir = tmp.path().join("empty");
+    fs::create_dir_all(&empty_dir).unwrap();
+    let stdout = exclude(&empty_dir, "codex");
+    assert!(stdout.contains("No local archive exists at"), "{stdout}");
+    assert!(!stdout.contains("No already archived data"), "{stdout}");
+    assert!(!empty_dir.join("agent_search.db").exists());
+
+    // Both exclusions were saved even though nothing was purged.
+    let output = tracker
+        .cass_assert_command()
+        .args(["sources", "agents", "list", "--json"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources agents list command");
+    assert!(output.status.success(), "sources agents list failed");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let disabled = json["disabled_agents"].as_array().expect("disabled_agents");
+    for agent in ["openclaw", "codex"] {
+        assert!(disabled.iter().any(|value| value == agent), "{json}");
+    }
+
+    tracker.complete();
+}
+
 /// Test: sources list --verbose shows additional details.
 #[test]
 fn sources_list_verbose() {

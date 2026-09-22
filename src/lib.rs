@@ -122100,15 +122100,23 @@ fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
         .unwrap_or_else(default_data_dir)
 }
 
-fn purge_excluded_agent_archive_data(
-    agent: &str,
-    cli: &Cli,
-) -> CliResult<crate::storage::sqlite::AgentArchivePurgeResult> {
-    use crate::storage::sqlite::{AgentArchivePurgeResult, FrankenStorage};
+/// What `sources agents exclude` did with rows already archived for the agent.
+/// "Nothing to purge" and "could not look" must not print the same sentence.
+enum ExcludedAgentPurge {
+    /// The archive opened; the result may report zero rows.
+    Purged(crate::storage::sqlite::AgentArchivePurgeResult),
+    /// No archive file exists at the resolved path.
+    NoArchive(PathBuf),
+    /// An archive exists but could not be opened, so nothing was purged.
+    ArchiveUnavailable { db_path: PathBuf, error: String },
+}
+
+fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<ExcludedAgentPurge> {
+    use crate::storage::sqlite::FrankenStorage;
 
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
     if !db_path.is_file() {
-        return Ok(AgentArchivePurgeResult::default());
+        return Ok(ExcludedAgentPurge::NoArchive(db_path));
     }
 
     let data_dir = archive_data_dir_for_agents_command(cli);
@@ -122121,7 +122129,10 @@ fn purge_excluded_agent_archive_data(
                 error = %err,
                 "skipping excluded-agent archive purge because the local archive could not be opened"
             );
-            return Ok(AgentArchivePurgeResult::default());
+            return Ok(ExcludedAgentPurge::ArchiveUnavailable {
+                db_path,
+                error: format!("{err:#}"),
+            });
         }
     };
 
@@ -122135,7 +122146,7 @@ fn purge_excluded_agent_archive_data(
             retryable: false,
         })?;
     if purge.conversations_deleted == 0 {
-        return Ok(purge);
+        return Ok(ExcludedAgentPurge::Purged(purge));
     }
 
     storage.rebuild_fts().map_err(|e| CliError {
@@ -122192,7 +122203,7 @@ fn purge_excluded_agent_archive_data(
             retryable: false,
         })?;
 
-    Ok(purge)
+    Ok(ExcludedAgentPurge::Purged(purge))
 }
 
 fn run_agents_list(output_format: Option<RobotFormat>) -> CliResult<()> {
@@ -122266,36 +122277,49 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
     })?;
 
     let purge = if keep_indexed_data {
-        crate::storage::sqlite::AgentArchivePurgeResult::default()
+        None
     } else {
-        purge_excluded_agent_archive_data(agent, cli)?
+        Some(purge_excluded_agent_archive_data(agent, cli)?)
     };
 
+    let agent_slug = agent.trim().to_ascii_lowercase();
     if changed {
-        println!(
-            "Excluded '{}' from future indexing runs.",
-            agent.trim().to_ascii_lowercase()
-        );
+        println!("Excluded '{agent_slug}' from future indexing runs.");
         println!("This applies to local scans, remote mirror scans, and watch mode.");
     } else {
-        println!(
-            "'{}' was already excluded from indexing.",
-            agent.trim().to_ascii_lowercase()
-        );
+        println!("'{agent_slug}' was already excluded from indexing.");
     }
-    if keep_indexed_data {
-        println!("Existing indexed archive data was left untouched.");
-    } else if purge.conversations_deleted > 0 {
-        println!(
-            "Purged {} conversations and {} messages already archived for that agent.",
-            purge.conversations_deleted, purge.messages_deleted
-        );
-        println!("Lexical search data was rebuilt from the remaining archive.");
-        println!(
-            "If you use semantic search assets, rerun `cass index --semantic` once to refresh them."
-        );
-    } else {
-        println!("No already archived data for that agent was present in the local archive.");
+    match purge {
+        None => println!("Existing indexed archive data was left untouched."),
+        Some(ExcludedAgentPurge::Purged(purge)) if purge.conversations_deleted > 0 => {
+            println!(
+                "Purged {} conversations and {} messages already archived for that agent.",
+                purge.conversations_deleted, purge.messages_deleted
+            );
+            println!("Lexical search data was rebuilt from the remaining archive.");
+            println!(
+                "If you use semantic search assets, rerun `cass index --semantic` once to refresh them."
+            );
+        }
+        Some(ExcludedAgentPurge::Purged(_)) => {
+            println!("No already archived data for that agent was present in the local archive.");
+        }
+        Some(ExcludedAgentPurge::NoArchive(db_path)) => {
+            println!(
+                "No local archive exists at {}; there was nothing to purge.",
+                db_path.display()
+            );
+        }
+        Some(ExcludedAgentPurge::ArchiveUnavailable { db_path, error }) => {
+            println!(
+                "The local archive at {} could not be opened ({error}).",
+                db_path.display()
+            );
+            println!("Data already archived for that agent was NOT purged.");
+            println!(
+                "Inspect it with `cass doctor --json`, then rerun `cass sources agents exclude {agent_slug}` to purge."
+            );
+        }
     }
     println!();
     println!("View exclusions with:");
