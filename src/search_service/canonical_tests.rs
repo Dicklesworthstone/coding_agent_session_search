@@ -1,6 +1,7 @@
 use super::super::{Session, protocol::Request};
 use super::*;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use std::path::PathBuf;
 
 struct Fixture {
@@ -290,9 +291,9 @@ fn symlink_archive_is_not_admitted() -> Result<()> {
 #[test]
 fn expired_budget_is_an_explicit_refusal_before_snapshot_queries() -> Result<()> {
     let fixture = Fixture::new()?;
-    let storage = FrankenStorage::open_strict_readonly(&fixture.db)?;
+    let connection = open_archive(&fixture.db)?;
     let error = read_snapshot(
-        &storage,
+        &connection,
         &fixture.view(0),
         Instant::now() - Duration::from_secs(4),
     )
@@ -443,9 +444,9 @@ fn mcp_oversized_canonical_body_is_a_tool_error_not_partial_evidence() -> Result
 #[test]
 fn retained_read_transaction_cannot_mix_identity_with_a_newer_body() -> Result<()> {
     let fixture = Fixture::new()?;
-    let storage = FrankenStorage::open_strict_readonly(&fixture.db)?;
-    let snapshot = Snapshot::begin(&storage)?;
-    let pinned = storage.raw().query_map_collect(
+    let connection = open_archive(&fixture.db)?;
+    let snapshot = Snapshot::begin(&connection)?;
+    let pinned = connection.query_map_collect(
         "SELECT id FROM conversations WHERE id = ?1",
         params![fixture.conversation],
         |row| row.get_typed::<i64>(0),
@@ -453,15 +454,36 @@ fn retained_read_transaction_cannot_mix_identity_with_a_newer_body() -> Result<(
     assert_eq!(pinned, vec![fixture.conversation]);
     fixture.content(12, "new body from concurrent writer")?;
     let before = archive_image(&fixture.db)?;
-    let old = read_snapshot(&storage, &fixture.view(0), Instant::now())?;
+    let old = read_snapshot(&connection, &fixture.view(0), Instant::now())?;
     assert_eq!(old["messages"][0]["content"], "canonical content 12");
     snapshot.release()?;
-    drop(storage);
+    drop(connection);
     let new = read(&fixture.db, &fixture.view(0))?;
     assert_eq!(
         new["messages"][0]["content"],
         "new body from concurrent writer"
     );
+    assert_eq!(archive_image(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn canonical_connection_enforces_engine_read_only_not_just_query_only() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let before = archive_image(&fixture.db)?;
+    let connection = open_archive(&fixture.db)?;
+    assert_eq!(
+        connection
+            .query_row("PRAGMA query_only")?
+            .get_typed::<i64>(0)?,
+        1
+    );
+    let mutation = "CREATE TABLE forbidden_service_write (id INTEGER PRIMARY KEY)";
+    assert!(connection.execute(mutation).is_err());
+    // Even disabling the SQL policy cannot upgrade the read-only engine open.
+    connection.execute("PRAGMA query_only = OFF")?;
+    assert!(connection.execute(mutation).is_err());
+    connection.close_without_checkpoint()?;
     assert_eq!(archive_image(&fixture.db)?, before);
     Ok(())
 }

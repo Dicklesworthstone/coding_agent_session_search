@@ -8,9 +8,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
-use coding_agent_search::franken_sync::params;
-use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::franken_sync::compat::{
+    ConnectionExt, OpenFlags, RowExt, open_with_flags,
+};
+use coding_agent_search::franken_sync::{Connection, params};
 use serde_json::{Value, json};
 
 use super::protocol::MAX_IDENTITY_BYTES;
@@ -98,25 +99,23 @@ fn check_budget(started: Instant) -> Result<()> {
 }
 
 struct Snapshot<'a> {
-    storage: &'a FrankenStorage,
+    connection: &'a Connection,
     active: bool,
 }
 
 impl<'a> Snapshot<'a> {
-    fn begin(storage: &'a FrankenStorage) -> Result<Self> {
-        storage
-            .raw()
+    fn begin(connection: &'a Connection) -> Result<Self> {
+        connection
             .execute("BEGIN DEFERRED")
             .context("begin canonical read snapshot")?;
         Ok(Self {
-            storage,
+            connection,
             active: true,
         })
     }
 
     fn release(mut self) -> Result<()> {
-        self.storage
-            .raw()
+        self.connection
             .execute("ROLLBACK")
             .context("release canonical read snapshot")?;
         self.active = false;
@@ -127,7 +126,7 @@ impl<'a> Snapshot<'a> {
 impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
         if self.active
-            && let Err(error) = self.storage.raw().execute("ROLLBACK")
+            && let Err(error) = self.connection.execute("ROLLBACK")
         {
             tracing::warn!(%error, "failed to release canonical service read snapshot");
         }
@@ -140,22 +139,34 @@ struct Anchor {
     idx: i64,
 }
 
-/// Read only through the established strict storage opener. Admission and one
-/// native SQL call are not preemptible here; deadlines are checked between
-/// calls. The host continues to own the process-level deadline and memory cap.
-pub(super) fn read(db: &Path, request: &View<'_>) -> Result<Value> {
-    request.validate().map_err(anyhow::Error::msg)?;
-    let started = Instant::now();
+/// The binary is a separate crate from the storage library. Use its public
+/// engine API, not the library's crate-private storage constructor, and never
+/// substitute a read/write initializer to resolve that visibility boundary.
+fn open_archive(db: &Path) -> Result<Connection> {
     let metadata = std::fs::symlink_metadata(db).context("inspect configured canonical archive")?;
     ensure!(
         metadata.file_type().is_file(),
         "configured canonical archive must be a regular file, not a symlink"
     );
-    let storage = FrankenStorage::open_strict_readonly(db)
+    let path = db
+        .to_str()
+        .context("canonical archive path must be valid UTF-8")?;
+    let connection = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("open configured archive strictly read-only")?;
+    connection.execute("PRAGMA query_only = ON")?;
+    Ok(connection)
+}
+
+/// Read only through the strict engine connection above. Admission and one
+/// native SQL call are not preemptible here; deadlines are checked between
+/// calls. The host continues to own the process-level deadline and memory cap.
+pub(super) fn read(db: &Path, request: &View<'_>) -> Result<Value> {
+    request.validate().map_err(anyhow::Error::msg)?;
+    let started = Instant::now();
+    let connection = open_archive(db)?;
     check_budget(started)?;
-    let snapshot = Snapshot::begin(&storage)?;
-    let result = read_snapshot(&storage, request, started);
+    let snapshot = Snapshot::begin(&connection)?;
+    let result = read_snapshot(&connection, request, started);
     let released = snapshot.release();
     // Preserve the primary typed failure, including its original storage cause.
     match result {
@@ -167,12 +178,11 @@ pub(super) fn read(db: &Path, request: &View<'_>) -> Result<Value> {
     }
 }
 
-fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant) -> Result<Value> {
+fn read_snapshot(connection: &Connection, request: &View<'_>, started: Instant) -> Result<Value> {
     check_budget(started)?;
     // A fixed primary-key lookup cannot resolve an identically named session
     // in another source. Compare literal path/source BEFORE any body read.
-    let identities = storage
-        .raw()
+    let identities = connection
         .query_map_collect(
             "SELECT source_path, source_id FROM conversations WHERE id = ?1 LIMIT 2",
             params![request.conversation_id],
@@ -190,8 +200,7 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
     }
     let idx = i64::try_from(request.message_index - 1)?;
     check_budget(started)?;
-    let targets = storage
-        .raw()
+    let targets = connection
         .query_map_collect(
             "SELECT id, idx FROM messages WHERE conversation_id = ?1 AND idx = ?2 LIMIT 2",
             params![request.conversation_id, idx],
@@ -217,7 +226,7 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
         // canonical indices count as actual messages, not idx +/- context.
         let count = i64::try_from(request.context + 1)?;
         check_budget(started)?;
-        let mut before = storage.raw().query_map_collect(
+        let mut before = connection.query_map_collect(
             "SELECT id, idx FROM messages WHERE conversation_id = ?1 AND idx < ?2 ORDER BY idx DESC LIMIT ?3",
             params![request.conversation_id, idx, count],
             |row| Ok(Anchor { id: row.get_typed(0)?, idx: row.get_typed(1)? }),
@@ -236,7 +245,7 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
         anchors.extend(before);
         anchors.push(target);
         check_budget(started)?;
-        let mut after = storage.raw().query_map_collect(
+        let mut after = connection.query_map_collect(
             "SELECT id, idx FROM messages WHERE conversation_id = ?1 AND idx > ?2 ORDER BY idx LIMIT ?3",
             params![request.conversation_id, idx, count],
             |row| Ok(Anchor { id: row.get_typed(0)?, idx: row.get_typed(1)? }),
@@ -274,7 +283,7 @@ fn read_snapshot(storage: &FrankenStorage, request: &View<'_>, started: Instant)
         // Check byte lengths inside SQL BEFORE transferring bodies to the host.
         // An oversized/invalid body is never shortened into successful evidence.
         // This is not a guarantee about the engine's internal page allocations.
-        let rows = storage.raw().query_map_collect(
+        let rows = connection.query_map_collect(
             "SELECT id, idx, typeof(content), length(CAST(content AS BLOB)),
              CASE WHEN typeof(content) = 'text' AND length(CAST(content AS BLOB)) <= ?4 THEN content ELSE NULL END,
              CASE WHEN typeof(role) = 'text' AND length(CAST(role AS BLOB)) <= ?5 THEN role ELSE NULL END
