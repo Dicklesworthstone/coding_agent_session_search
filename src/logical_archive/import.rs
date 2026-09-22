@@ -383,8 +383,8 @@ pub fn import_file_with_policy(
         .tempdir_in(export::parent(destination)?)?;
     let replay_path = staging.path().join("agent_search.db");
     let candidate = staging.path().join("publication.db");
-    let storage =
-        SqliteStorage::open(&replay_path).context("cannot initialize canonical restore candidate")?;
+    let storage = SqliteStorage::open(&replay_path)
+        .context("cannot initialize canonical restore candidate")?;
     drop(storage);
     let connection = Connection::open(export::path_text(&replay_path)?)?;
     connection.execute("PRAGMA busy_timeout = 5000")?;
@@ -424,6 +424,8 @@ pub fn import_file_with_policy(
         fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600))?;
     }
     sync_candidate(&candidate)?;
+    #[cfg(all(test, unix))]
+    publication_tests::pause_verified_crash_child(destination)?;
     require_new_destination(destination)?;
     // Same-filesystem hard-link publication is atomic and never replaces an
     // existing name (including symlinks). No rename/copy-over fallback is safe.
@@ -441,6 +443,129 @@ mod tests;
 mod publication_tests {
     use super::*;
 
+    // Test-binary-only barrier: the parent kills a real import after all
+    // persisted-image validation and fsync, while its destination lock is held.
+    // Release binaries contain neither this hook nor its environment control.
+    #[cfg(unix)]
+    pub(super) fn pause_verified_crash_child(destination: &Path) -> Result<()> {
+        if let Ok(root) = dotenvy::var("CASS_TEST_LOGICAL_ARCHIVE_CRASH_ROOT") {
+            let root = PathBuf::from(root);
+            if destination == root.join("restored.db") {
+                fs::write(root.join("verified-ready"), b"verified\n")?;
+                loop {
+                    std::thread::park();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess entry point driven by killed_verified_import_publishes_nothing_and_retries"]
+    fn crash_import_subprocess() {
+        let root = PathBuf::from(
+            dotenvy::var("CASS_TEST_LOGICAL_ARCHIVE_CRASH_ROOT").expect("parent supplies fixture"),
+        );
+        import_file(
+            &root.join("history.jsonl"),
+            &root.join("restored.db"),
+            "crash-archive",
+        )
+        .unwrap();
+        panic!("verified-image crash barrier was not armed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killed_verified_import_publishes_nothing_and_retries() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct KillOnDrop(Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.db");
+        drop(SqliteStorage::open(&source).unwrap());
+        let input = root.path().join("history.jsonl");
+        let expected = export::export_file(&source, &input, "crash-archive".to_owned()).unwrap();
+        let input_before = fs::read(&input).unwrap();
+        let source_before = fs::read(&source).unwrap();
+        let destination = root.path().join("restored.db");
+        let mut child = KillOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "logical_archive::import::publication_tests::crash_import_subprocess",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("CASS_TEST_LOGICAL_ARCHIVE_CRASH_ROOT", root.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if fs::read(root.path().join("verified-ready"))
+                .is_ok_and(|bytes| bytes == b"verified\n")
+            {
+                break;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "restore child exited before verifying its image"
+            );
+            assert!(Instant::now() < deadline, "restore child missed its deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!destination.exists());
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+
+        // SIGKILL skips both the destination-lock and TempDir destructors.
+        // The complete private image stays available, but it is not a restore.
+        assert!(!destination.exists());
+        let retained = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".cass-restore-")
+            })
+            .unwrap()
+            .join("publication.db");
+        assert!(retained.is_file());
+        require_candidate_without_sidecars(&retained).unwrap();
+        let reader = export::open_source(&retained).unwrap();
+        assert_eq!(
+            export::snapshot(&reader, "crash-archive".to_owned(), &mut io::sink())
+                .unwrap()
+                .1,
+            expected.1
+        );
+        reader.execute("ROLLBACK").unwrap();
+        reader.close_without_checkpoint().unwrap();
+        // The OS released the crashed process's lock. A fresh import can
+        // publish without trusting, deleting or reusing the interrupted stage.
+        let retried = import_file(&input, &destination, "crash-archive").unwrap();
+        assert_eq!(retried, expected);
+        assert!(destination.is_file());
+        assert!(retained.is_file());
+        assert_eq!(fs::read(&input).unwrap(), input_before);
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+    }
+
     #[test]
     fn publication_materializes_wal_rows_without_borrowing_replay_sidecars() {
         let root = tempfile::tempdir().unwrap();
@@ -448,18 +573,23 @@ mod publication_tests {
         let writer = Connection::open(export::path_text(&replay_path).unwrap()).unwrap();
         writer.execute("PRAGMA journal_mode = WAL").unwrap();
         writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
-        writer.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        writer
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta VALUES ('schema_version', '9');
              CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL);",
-        ).unwrap();
+            )
+            .unwrap();
         let body = "committed WAL-only transcript δ ".repeat(1024);
-        writer.execute_with_params(
-            "INSERT INTO messages VALUES (7, ?1)",
-            &[SqliteValue::Text(body.clone().into())],
-        ).unwrap();
+        writer
+            .execute_with_params(
+                "INSERT INTO messages VALUES (7, ?1)",
+                &[SqliteValue::Text(body.clone().into())],
+            )
+            .unwrap();
         let expected = export::snapshot(&writer, "wal-publication".to_owned(), &mut io::sink())
-            .unwrap().1;
+            .unwrap()
+            .1;
         // Negative control: copying only the replay's main file cannot satisfy
         // this fixture. The new production path must include committed WAL data.
         let incomplete = root.path().join("main-only.db");
@@ -468,7 +598,10 @@ mod publication_tests {
             export::snapshot(&reader, "wal-publication".to_owned(), &mut io::sink())
         });
         if let Ok((_, completion)) = copied {
-            assert_ne!(completion, expected, "fixture must require its committed WAL");
+            assert_ne!(
+                completion, expected,
+                "fixture must require its committed WAL"
+            );
         }
 
         // Parameter binding must handle both quotes and Unicode in the path.
@@ -477,17 +610,31 @@ mod publication_tests {
         let reader = export::open_source(&candidate).unwrap();
         verify_database(&reader).unwrap();
         assert_eq!(
-            export::snapshot(&reader, "wal-publication".to_owned(), &mut io::sink()).unwrap().1,
+            export::snapshot(&reader, "wal-publication".to_owned(), &mut io::sink())
+                .unwrap()
+                .1,
             expected
         );
-        assert_eq!(reader.query_row("SELECT body FROM messages WHERE id = 7")
-            .unwrap().get_typed::<String>(0).unwrap(), body);
+        assert_eq!(
+            reader
+                .query_row("SELECT body FROM messages WHERE id = 7")
+                .unwrap()
+                .get_typed::<String>(0)
+                .unwrap(),
+            body
+        );
         reader.execute("ROLLBACK").unwrap();
         reader.close_without_checkpoint().unwrap();
         require_candidate_without_sidecars(&candidate).unwrap();
         // The writer stays usable; snapshot materialization is not relocation.
-        assert_eq!(writer.query_row("SELECT COUNT(*) FROM messages")
-            .unwrap().get_typed::<i64>(0).unwrap(), 1);
+        assert_eq!(
+            writer
+                .query_row("SELECT COUNT(*) FROM messages")
+                .unwrap()
+                .get_typed::<i64>(0)
+                .unwrap(),
+            1
+        );
         writer.close().unwrap();
     }
 
@@ -495,7 +642,9 @@ mod publication_tests {
     fn publication_does_not_clobber_an_image_or_its_orphan_sidecars() {
         let root = tempfile::tempdir().unwrap();
         let writer = Connection::open(":memory:").unwrap();
-        writer.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY)").unwrap();
+        writer
+            .execute("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+            .unwrap();
         for (ordinal, suffix) in ["", "-wal", "-shm", "-journal"].iter().enumerate() {
             let candidate = root.path().join(format!("image-{ordinal}.db"));
             let mut occupied = candidate.as_os_str().to_os_string();

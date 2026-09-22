@@ -232,7 +232,11 @@ fn restored_remote_sessions_are_readable_without_the_original_archive_or_sources
         "unchanged"
     );
     assert_eq!(
-        export(root.path(), &restored, &root.path().join("after-followup.jsonl"))["content_sha256"],
+        export(
+            root.path(),
+            &restored,
+            &root.path().join("after-followup.jsonl")
+        )["content_sha256"],
         exported["content_sha256"]
     );
 }

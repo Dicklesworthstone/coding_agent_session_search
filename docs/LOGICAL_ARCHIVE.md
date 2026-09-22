@@ -19,11 +19,12 @@ as identity. Receipts are JSON on stdout; failures are JSON on stderr.
 Export opens FrankenSQLite read-only and holds one transaction across schema
 inspection and all table scans. It does not migrate, repair, checkpoint, acquire
 models, or update source export metadata. Physical logical tables are streamed
-one row at a time; the known derived `fts_messages` virtual table and its shadow
-tables, and SQLite internal tables, are omitted. Unknown virtual tables and
-unkeyed tables are refused rather than silently losing data. Canonical schemas
-with unsupported identifiers, key types, or oversized rows require an explicit
-format extension; they are not truncated.
+one row at a time; the known derived `fts_messages` virtual table and its exact
+FTS5 shadow names, and SQLite internal tables, are omitted. Other prefix-sharing
+tables are not discarded. Unknown virtual tables and unkeyed tables are refused
+rather than silently losing data. Canonical schemas with unsupported identifiers,
+key types, or oversized rows require an explicit format extension; they are not
+truncated.
 
 The destination uses a separate adjacent lock, with a five-second lock
 acquisition deadline. An export is written to a private temporary file in the
@@ -31,6 +32,7 @@ same directory, flushed, synced, and independently reread through the verifier
 before no-clobber publication. An existing output is never replaced. Persistent
 lock files prevent competing processes from locking different inodes. These
 controls do not impose a wall-clock deadline on database opening or scanning.
+Offline verification rejects special files and symlinks before reading JSONL.
 
 ## Restore into a new canonical database
 
@@ -40,35 +42,66 @@ whose parent already exists, not a live archive to overwrite. Existing database
 files, links and SQLite `-wal`, `-shm` or `-journal` sidecars are refused by default.
 
 The importer opens one regular, non-symlink input file and validates the header
-before initializing a private candidate. Only this binary's canonical storage
-initializer supplies executable schema. The storage version and every table,
-column and primary-key descriptor must match exactly; a matching version number
-alone is not sufficient. Unknown, additional or omitted tables fail explicitly.
-There is no cross-schema migration or execution of SQL from the interchange file.
+before initializing a private replay database. Only this binary's canonical
+storage initializer supplies executable schema. The storage version and every
+table, column and primary-key descriptor must match exactly; a matching version
+number alone is not sufficient. Unknown, additional or omitted tables fail
+explicitly. There is no cross-schema migration or execution of SQL from input.
 
-Rows are individually bound as typed SQL parameters. No exported path is used as
-a write destination and no URL or provider source is fetched. Initializer seeds
-are removed only from the new private candidate. Trusted initializer triggers
-are suspended during replay and reinstated afterward, avoiding duplicate derived
-writes. Input batches are limited to 128 records or 16 MiB of consumed JSONL,
-including whitespace, whichever comes first. Batch commits are never exposed as
-a valid partial restore: the complete stream, footer, counts, digest, canonical
-schema metadata, foreign keys and database integrity must all pass first.
+Rows are individually bound as typed SQL parameters using one prepared INSERT
+per table. No exported path is used as a write destination and no URL or provider
+source is fetched. Initializer seeds are removed only from the new private
+replay database. Trusted initializer triggers are suspended during replay and
+reinstated afterward, avoiding duplicate derived writes. Input batches are
+limited to 128 records or 16 MiB of consumed JSONL, including whitespace,
+whichever comes first. Batch commits are never exposed as a valid partial
+restore: the complete stream, footer, counts, digest, canonical schema metadata,
+foreign keys and database integrity must all pass first.
 
-After closing the writer, import reopens the persisted candidate read-only and
-re-exports its actual typed rows to a digest sink. Its digest must equal the input
-completion. This catches storage-affinity conversions, missing writes and schema
-side effects that input-only verification would miss. Publication requires a
-single database independent of SQLite sidecars. A synced same-filesystem hard
-link creates the new destination atomically without replacement; unsupported
-filesystems fail instead of falling back to an overwriting copy or rename.
-Unix output permissions are private (0600), and the parent directory is synced.
+Replay retains the canonical WAL writer policy. A journal-mode change or clean
+close does not by itself prove a self-contained database. After all private
+batches commit and validate, parameterized `VACUUM INTO` materializes a separate
+publication image containing the committed logical database. The replay files
+are never relabelled as a complete image, and their sidecars are not discarded
+to manufacture a successful check. Allow disk space for both the replay database
+and its sidecars and the separate publication image during restoration.
+
+Import rejects content-bearing sidecars beside the image, closes the writer,
+then reopens that image read-only. It checks persisted foreign keys and integrity
+and re-exports the actual typed rows to a digest sink. Its digest must equal the
+input completion. This catches storage-affinity conversions, missing writes and
+schema side effects that input-only verification would miss. Sidecar absence is
+checked again after closing the reader. Only this synced image is published,
+using a same-filesystem hard link that cannot replace an existing destination;
+unsupported filesystems fail instead of falling back to an overwriting copy or
+rename. Unix output permissions are private (0600), and the parent directory is
+synced. A failure syncing that directory after publication is reported explicitly;
+a visible destination after that failure is not a confirmed durability receipt.
 
 The input, source archive, existing destinations and provider histories remain
 untouched. This does not install lexical or semantic search assets: those must
 be rebuilt separately. The receipt reports `omitted_rebuild_required` rather than
 claiming that search indexes are already usable. Inspection and restore do not
 start model acquisition, provider scans or detached maintenance.
+
+## Reading a recovered conversation
+
+For a known conversation, canonical `view` and `expand` do not need the original
+provider file or a search index. Exact-schema restoration preserves conversation
+IDs, source IDs, source paths, and stored message indices. Select the recovered
+database explicitly and use the canonical coordinate, not a physical file line:
+
+```sh
+cass --db /existing/private/directory/restored.db \
+  view /original/provider/session.jsonl --source remote-host \
+  --conversation-id 42 --message-index 8 -C 2 --json
+```
+
+The IDs and index above are examples; use the identities from the archive. A
+one-based `--message-index 8` selects stored `messages.idx = 7`, not the eighth
+physical line and not the eighth row in a sparse conversation. The same selectors
+work with `expand`. Explicit source and conversation identity disambiguate
+histories from different machines that use the same source pathname.
 
 ## Repeating an import safely
 
@@ -94,6 +127,9 @@ the snapshot examined, not a lease excluding ordinary index writers afterward.
 The source archive identity remains an explicit caller assertion matched against
 the input header; the checksum is not external proof of identity or authenticity.
 A missing destination still goes through the full private-candidate restore.
+An interrupted pre-publication import can be retried from the original JSONL;
+a later attempt does not trust or promote leftover private stages. Process-kill
+recovery is distinct from proving power-loss durability on every filesystem.
 
 ## Version 1 wire contract
 
@@ -141,19 +177,23 @@ is an integrity checksum, **not** a signature or proof of source authenticity.
 Current restoration supports a new database with the exact current canonical
 schema, plus opt-in read-only comparison for an identical existing destination.
 Merge, cross-schema migration and automatic search-index rebuild are not
-implemented by these slices. They do not close bead
-`.34`. The ordinary library command parser, root help, completion generation and
-robot capabilities are not yet extended; `cass archive --help` documents the
-binary's explicit archive frontend. Search and existing commands retain their path.
+implemented by these slices. They do not close bead `.34`. The ordinary library
+command parser, root help, completion generation and robot capabilities are not
+yet extended; `cass archive --help` documents the binary's explicit archive
+frontend. Search and existing commands retain their path.
 
 Rust regressions cover typed rows, cross-table relationships, trigger suspension,
 schema disagreement, bounded batches, provenance, truncation and tampering,
 source preservation, existing-output/sidecar protection and symlink refusal.
-Additional tests cover read-only idempotence, conflicts and descriptor identity;
-real-binary tests exercise JSON receipts, privacy acknowledgement, round-trip
-parity, conflict diagnostics and unknown/truncated inputs. The targeted GitHub
-Actions lane records immutable source/lockfile/binary identities and rejects empty
-test-filter success. A workflow definition alone is not an execution receipt.
-Native compilation, these tests, RCH/Clippy/UBS, large-archive bounds and platform
-acceptance must be executed before release qualification. Source tests are not
-passing-test receipts.
+Publication tests include committed WAL data with a main-file-only negative
+control and a subprocess killed after image validation/fsync but before the
+atomic link, followed by retry. The ignored subprocess entry point is invoked
+by its non-ignored parent test; it is not counted as a passing regression.
+A real-binary journey restores 260 messages from two remote providers, then
+checks exact sparse `view`/`expand` coordinates with the original archive and
+source path unavailable. Idempotence and re-export checks retain digest equality.
+The targeted GitHub Actions lane records immutable source/lockfile/binary
+identities and rejects empty test-filter success. A workflow definition or a
+source test is not an execution receipt. Native compilation, tests,
+RCH/Clippy/UBS, large-archive bounds and platform acceptance must be executed
+before release qualification.
