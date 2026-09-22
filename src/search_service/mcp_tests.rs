@@ -386,10 +386,16 @@ fn mcp_refinement_catalog_requires_startup_permission_and_matches_lexical_filter
     let mut adapter = Adapter::default();
     initialize(&mut adapter, &mut session, CURRENT_VERSION);
     assert_eq!(tools_for_session(&session).len(), 4);
-    let denied = adapter.handle(&mut session, call(
-        "disabled".into(), "cass_refine",
-        json!({"query": "relevance", "lexical_query": "performance"}),
-    )).unwrap();
+    let denied = adapter
+        .handle(
+            &mut session,
+            call(
+                "disabled".into(),
+                "cass_refine",
+                json!({"query": "relevance", "lexical_query": "performance"}),
+            ),
+        )
+        .unwrap();
     assert_eq!(denied["error"]["code"], -32602);
     assert_eq!(adapter.calls, 0);
     session.refiner = Refiner::new(Some(PathBuf::from("never-opened-model")));
@@ -401,7 +407,10 @@ fn mcp_refinement_catalog_requires_startup_permission_and_matches_lexical_filter
     let schema = &tool["inputSchema"];
     assert_eq!(schema["required"], json!(["query", "lexical_query"]));
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["properties"]["candidate_limit"]["maximum"], MAX_CANDIDATES);
+    assert_eq!(
+        schema["properties"]["candidate_limit"]["maximum"],
+        MAX_CANDIDATES
+    );
     assert_eq!(
         schema["properties"]["filters"],
         catalog[0]["inputSchema"]["properties"]["filters"]
@@ -410,7 +419,22 @@ fn mcp_refinement_catalog_requires_startup_permission_and_matches_lexical_filter
     assert_eq!(session.open_attempts, 0);
     assert_eq!(session.refiner.status()["load_attempts"], 0);
     session.archive = Some(PathBuf::from("never-opened-archive"));
-    assert_eq!(tools_for_session(&session).len(), 6);
+    let enabled_names = tools_for_session(&session)
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        enabled_names,
+        [
+            "cass_search",
+            "cass_status",
+            "cass_unload",
+            "cass_reload",
+            "cass_view",
+            "cass_view_batch",
+            "cass_refine",
+        ]
+    );
     assert_eq!(session.canonical_read_attempts, 0);
 }
 
@@ -428,23 +452,42 @@ fn mcp_refinement_preserves_rpc_ids_and_refuses_privilege_escalation_before_work
     )).unwrap();
     assert_eq!(invalid["id"], "δ-refine");
     assert_eq!(invalid["result"]["isError"], true);
-    assert_eq!(invalid["result"]["structuredContent"]["error"]["kind"], "invalid_request");
-    let text: Value = serde_json::from_str(
-        invalid["result"]["content"][0]["text"].as_str().unwrap(),
-    ).unwrap();
+    assert_eq!(
+        invalid["result"]["structuredContent"]["error"]["kind"],
+        "invalid_request"
+    );
+    let text: Value =
+        serde_json::from_str(invalid["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(text, invalid["result"]["structuredContent"]);
-    for field in ["db", "model", "reranker_model", "offset", "op", "id", "candidates"] {
+    for field in [
+        "db",
+        "model",
+        "reranker_model",
+        "offset",
+        "op",
+        "id",
+        "candidates",
+    ] {
         let mut arguments = json!({"query": "relevance", "lexical_query": "performance"});
         arguments[field] = json!("override");
-        let result = adapter.handle(&mut session, call(9.into(), "cass_refine", arguments)).unwrap();
+        let result = adapter
+            .handle(&mut session, call(9.into(), "cass_refine", arguments))
+            .unwrap();
         assert_eq!(result["error"]["code"], -32602, "{field}");
     }
-    assert!(adapter.handle(&mut session, rpc(json!({
-        "jsonrpc": "2.0", "method": "tools/call",
-        "params": {"name": "cass_refine", "arguments": {
-            "query": "relevance", "lexical_query": "performance"
-        }}
-    }))).is_none());
+    assert!(
+        adapter
+            .handle(
+                &mut session,
+                rpc(json!({
+                    "jsonrpc": "2.0", "method": "tools/call",
+                    "params": {"name": "cass_refine", "arguments": {
+                        "query": "relevance", "lexical_query": "performance"
+                    }}
+                }))
+            )
+            .is_none()
+    );
     assert_eq!(session.open_attempts, 0);
     assert_eq!(session.refiner.status()["load_attempts"], 0);
     assert_eq!(session.canonical_read_attempts, 0);
@@ -459,10 +502,23 @@ fn mcp_refinement_obeys_the_existing_nonblocking_work_quota() {
     let mut adapter = Adapter::default();
     initialize(&mut adapter, &mut session, CURRENT_VERSION);
     adapter.calls = MAX_TOOL_CALLS_PER_MINUTE;
-    let limited = adapter.handle(&mut session, call(
-        12.into(), "cass_refine", json!({"query": "relevance", "lexical_query": "performance"}),
-    )).unwrap();
-    assert_eq!(limited["result"]["structuredContent"]["error"]["kind"], "rate_limited");
+    let limited = adapter
+        .handle(
+            &mut session,
+            call(
+                12.into(),
+                "cass_refine",
+                json!({"query": "relevance", "lexical_query": "performance"}),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        limited["result"]["structuredContent"]["error"]["kind"],
+        "rate_limited"
+    );
     assert_eq!(session.open_attempts, 0);
     assert_eq!(session.refiner.status()["load_attempts"], 0);
 }
+
+// Keep the real resource/evidence journey in this adapter's test scope.
+include!("mcp_refinement_evidence_tests.rs");
