@@ -34,6 +34,15 @@ pub(super) struct Filters {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
+    View {
+        id: u64,
+        source_path: String,
+        source_id: String,
+        conversation_id: i64,
+        message_index: u64,
+        #[serde(default)]
+        context: usize,
+    },
     Search {
         id: u64,
         query: String,

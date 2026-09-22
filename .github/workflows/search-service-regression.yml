@@ -19,9 +19,36 @@ permissions:
 
 concurrency:
   group: cass-search-service-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  formatting:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt
+      - name: Check exact committed formatting
+        run: rustfmt --edition 2024 --check --config skip_children=true src/search_service.rs src/search_service/*.rs tests/search_service.rs
+      - name: Preserve formatter output for review without publishing it
+        if: always()
+        run: |
+          git rev-parse HEAD > source-commit.txt
+          rustfmt --version > formatter-version.txt
+          rustfmt --edition 2024 --config skip_children=true src/search_service.rs src/search_service/*.rs tests/search_service.rs
+          tar -czf search-service-formatted.tar.gz src/search_service.rs src/search_service tests/search_service.rs source-commit.txt formatter-version.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: search-service-formatted-${{ github.sha }}
+          path: search-service-formatted.tar.gz
+          if-no-files-found: error
+          retention-days: 3
   native:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45

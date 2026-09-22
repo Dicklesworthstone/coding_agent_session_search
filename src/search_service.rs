@@ -1,14 +1,17 @@
 //! A caller-owned, persistent lexical search session over standard I/O.
 //!
 //! The reader is loaded lazily and retained until explicit reload, shutdown, or
-//! EOF. It is an index-only snapshot: no canonical database, model, raw source,
-//! writer, automatic refresh, network listener, or detached child is opened here.
+//! EOF. Search is index-only. Canonical follow-up requires an explicit --db
+//! and exact source/conversation/message coordinates; it never opens raw files.
+//! Neither lane starts models, writers, automatic refresh, or detached children.
 //! Frame/page bounds do not cap reader RSS or interrupt a native engine call.
 
 #[path = "search_service/protocol.rs"]
 mod protocol;
 #[path = "search_service/mcp.rs"]
 mod mcp;
+#[path = "search_service/canonical.rs"]
+mod canonical;
 #[cfg(test)]
 #[path = "search_service/tests.rs"]
 mod tests;
@@ -61,6 +64,10 @@ enum ServiceCommand {
         /// Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport.
         #[arg(long, requires = "stdio")]
         mcp: bool,
+        /// Opt in to canonical view requests against this fixed read-only archive.
+        /// Search, status and startup still never open the database.
+        #[arg(long, value_name = "PATH")]
+        db: Option<PathBuf>,
     },
 }
 
@@ -83,7 +90,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
             };
         }
     };
-    let ServiceCommand::Serve { index, data_dir, stdio: _, mcp } = cli.command;
+    let ServiceCommand::Serve { index, data_dir, stdio: _, mcp, db } = cli.command;
     let index = match (index, data_dir) {
         (Some(index), None) => index,
         (None, Some(data_dir)) => {
@@ -103,6 +110,10 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         std::env::current_dir().map_err(cli_io_error)?.join(index)
     };
     let mut session = Session::new(index);
+    session.archive = db.map(|path| {
+        if path.is_absolute() { Ok(path) }
+        else { std::env::current_dir().map(|cwd| cwd.join(path)) }
+    }).transpose().map_err(cli_io_error)?;
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     if mcp {
@@ -125,6 +136,9 @@ fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {
 
 struct Session {
     index: PathBuf,
+    archive: Option<PathBuf>,
+    canonical_read_attempts: u64,
+    canonical_reads_completed: u64,
     client: Option<SearchClient>,
     open_attempts: u64,
     successful_opens: u64,
@@ -135,6 +149,9 @@ impl Session {
     fn new(index: PathBuf) -> Self {
         Self {
             index,
+            archive: None,
+            canonical_read_attempts: 0,
+            canonical_reads_completed: 0,
             client: None,
             open_attempts: 0,
             successful_opens: 0,
@@ -164,7 +181,10 @@ impl Session {
             "queries_completed": self.queries_completed,
             "snapshot_policy": "pinned_until_reload",
             "freshness": "not_checked",
-            "canonical_database_accessed": false,
+            "canonical_view_enabled": self.archive.is_some(),
+            "canonical_database_accessed": self.canonical_read_attempts != 0,
+            "canonical_read_attempts": self.canonical_read_attempts,
+            "canonical_reads_completed": self.canonical_reads_completed,
             "models_loaded": false,
             "maintenance_performed": false,
             "limits": {
@@ -173,6 +193,8 @@ impl Session {
                 "query_bytes": protocol::MAX_QUERY_BYTES,
                 "limit": protocol::MAX_LIMIT,
                 "page_window": protocol::MAX_WINDOW,
+                "canonical_context": canonical::MAX_CONTEXT,
+                "canonical_content_bytes": canonical::MAX_CONTENT_BYTES,
             }
         })
     }
@@ -273,6 +295,28 @@ impl Session {
 
     fn handle(&mut self, request: Request) -> (Reply, bool) {
         match request {
+            Request::View { id, source_path, source_id, conversation_id, message_index, context } => {
+                let request = canonical::View {
+                    source_path: &source_path, source_id: &source_id,
+                    conversation_id, message_index, context,
+                };
+                if let Err(message) = request.validate() {
+                    return (Reply::failure(Some(id), "invalid_request", message), false);
+                }
+                let Some(db) = &self.archive else {
+                    return (Reply::failure(Some(id), "canonical_access_disabled",
+                        "canonical view requires an explicit --db at service startup; search remains index-only"), false);
+                };
+                self.canonical_read_attempts = self.canonical_read_attempts.saturating_add(1);
+                let reply = match canonical::read(db, &request) {
+                    Ok(result) => {
+                        self.canonical_reads_completed = self.canonical_reads_completed.saturating_add(1);
+                        Reply::success(id, result)
+                    }
+                    Err(error) => Reply::failure(Some(id), canonical::error_kind(&error), format!("{error:#}")),
+                };
+                (reply, false)
+            }
             Request::Status { id } => (Reply::success(id, self.status()), false),
             Request::Shutdown { id } => {
                 drop(self.client.take());
