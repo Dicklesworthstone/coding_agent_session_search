@@ -539,6 +539,7 @@ fn fts_parity_json(parity: &FtsShadowParity) -> serde_json::Value {
 fn planned_fts_repair(status: FtsShadowParityStatus) -> &'static str {
     match status {
         FtsShadowParityStatus::Absent => "failure_atomic_recreate",
+        FtsShadowParityStatus::Residue => "drop_residue_and_recreate_from_canonical",
         FtsShadowParityStatus::Healthy => "verify_and_record_generation",
         FtsShadowParityStatus::Partial => "resumable_incremental_catch_up",
         FtsShadowParityStatus::Excess | FtsShadowParityStatus::Divergent => {
@@ -551,6 +552,7 @@ fn planned_fts_repair(status: FtsShadowParityStatus) -> &'static str {
 fn fts_repair_is_applicable(status: FtsShadowParityStatus) -> bool {
     match status {
         FtsShadowParityStatus::Absent
+        | FtsShadowParityStatus::Residue
         | FtsShadowParityStatus::Healthy
         | FtsShadowParityStatus::Partial => true,
         FtsShadowParityStatus::Excess
@@ -578,10 +580,20 @@ fn fts_dry_run_parity_json(parity: &FtsDryRunParity) -> serde_json::Value {
 
 fn fts_rebuild_dry_run_envelope(db_path: &Path, parity: &FtsDryRunParity) -> serde_json::Value {
     let applicable = parity.exact_status.map(fts_repair_is_applicable);
-    let planned_action = parity
-        .exact_status
-        .map(planned_fts_repair)
-        .unwrap_or("exact_parity_inspection_deferred_to_apply");
+    let exceeds_bound = crate::storage::sqlite::fts_shadow_max_messages()
+        .is_some_and(|bound| u64::try_from(parity.indexable_messages).unwrap_or(0) > bound);
+    let planned_action = if exceeds_bound
+        && matches!(
+            parity.exact_status,
+            Some(FtsShadowParityStatus::Absent | FtsShadowParityStatus::Residue)
+        ) {
+        "drop_residue_and_mark_not_viable"
+    } else {
+        parity
+            .exact_status
+            .map(planned_fts_repair)
+            .unwrap_or("exact_parity_inspection_deferred_to_apply")
+    };
     let apply_command = match applicable {
         Some(true) | None => Some("cass doctor --rebuild-canonical-fts --yes --json"),
         Some(false) => None,
@@ -636,6 +648,29 @@ pub fn run_doctor_rebuild_canonical_fts(
             Some("Recover the source tree with 'cass doctor --recover-from-archive <DIR>' first."),
         ));
     }
+
+    // GH #495: every mutating FTS repair shares the authoritative index-run
+    // lock with index/watch. This prevents residue cleanup from racing a
+    // watcher that still has the old virtual-table shape loaded.
+    let _mutation_guard = if dry_run {
+        None
+    } else {
+        Some(
+            crate::indexer::acquire_search_maintenance_mutation_lock(
+                &data_dir,
+                &db_path,
+                crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+            )
+            .map_err(|err| {
+                storage_error(
+                    format!(
+                        "acquiring exclusive index-run lock for canonical FTS5 repair: {err:#}"
+                    ),
+                    Some("Stop the active cass index/watch process, then retry the repair."),
+                )
+            })?,
+        )
+    };
 
     let storage_open = if dry_run {
         FrankenStorage::open_readonly(&db_path)
