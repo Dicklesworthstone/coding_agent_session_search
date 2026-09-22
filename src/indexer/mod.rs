@@ -10454,6 +10454,18 @@ fn repair_fallback_fts_after_full_index_run(
     fresh_storage.set_fts_maintenance_heartbeat(heartbeat);
 
     let outcome: FallbackFtsRepairOutcome = 'compute: {
+        // GH #495: an absent shadow carrying the durable size-retirement
+        // marker is a terminal derived-asset state, not a failed repair to
+        // retry on every full index. Re-evaluate viability so lowering/removing
+        // the bound still lets the normal recreation path resume.
+        if let Ok(Some(detail)) = fresh_storage.fts_shadow_not_viable_marker()
+            && matches!(
+                fresh_storage.fts_shadow_viability(),
+                Ok(crate::storage::sqlite::FtsShadowViability::NotViable { .. })
+            )
+        {
+            break 'compute FallbackFtsRepairOutcome::SkippedNotViable { detail };
+        }
         if let Some(archive_fingerprint) = known_archive_fingerprint {
             match fresh_storage
                 .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)
@@ -20403,7 +20415,8 @@ fn targeted_watch_once_fts_parity_problem(
         // shadow with bad or unprovable parity must stop canonical mutation.
         crate::storage::sqlite::FtsShadowParityStatus::Healthy
         | crate::storage::sqlite::FtsShadowParityStatus::Absent => Ok(None),
-        crate::storage::sqlite::FtsShadowParityStatus::Partial
+        crate::storage::sqlite::FtsShadowParityStatus::Residue
+        | crate::storage::sqlite::FtsShadowParityStatus::Partial
         | crate::storage::sqlite::FtsShadowParityStatus::Excess
         | crate::storage::sqlite::FtsShadowParityStatus::Divergent
         | crate::storage::sqlite::FtsShadowParityStatus::Unqueryable => Ok(Some(format!(
