@@ -81,6 +81,7 @@ use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 #[cfg(test)]
+use crate::storage::sqlite::incompatible_legacy_fts_shadow_ddl;
 use crate::storage::sqlite::{DailyStatsRebuildResult, StatsAggregator, StatsDelta};
 use crate::storage::sqlite::{
     FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
@@ -20357,19 +20358,6 @@ fn archive_bundle_size_for_integrity_preflight(storage: &FrankenStorage) -> Opti
     // absent WAL/SHM as zero while preserving filename bytes.
     fs::metadata(&db_path).ok()?;
     Some(database_bundle_size_bytes(&db_path))
-}
-
-fn incompatible_legacy_fts_shadow_ddl(table: &str, ddl: &str) -> Option<String> {
-    let normalized = ddl
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    (!normalized.contains("withoutrowid")).then(|| {
-        format!(
-            "legacy {table} schema is not WITHOUT ROWID; this pre-fix FTS5 shadow shape can carry a stale implicit autoindex and must be rebuilt before full indexing"
-        )
-    })
 }
 
 /// Detect the exact legacy FTS5 shadow DDL behind GH #374 without walking the

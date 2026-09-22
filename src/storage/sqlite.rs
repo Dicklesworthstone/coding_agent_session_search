@@ -15030,6 +15030,25 @@ impl FrankenStorage {
                     .to_string(),
             ));
         }
+        if fts_schema_rows == 1 {
+            // GH #374: a canonical registration over legacy rowid shadow
+            // tables. Row counts can match exactly, so without this the full
+            // index refused the archive and pointed at a repair that found
+            // nothing to do.
+            let shadow_ddl = self.conn.query_map_collect(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('fts_messages_config', 'fts_messages_idx')
+                 ORDER BY name",
+                fparams![],
+                |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+            )?;
+            if let Some(problem) = shadow_ddl
+                .iter()
+                .find_map(|(table, ddl)| incompatible_legacy_fts_shadow_ddl(table, ddl))
+            {
+                return Ok(Some(problem));
+            }
+        }
         Ok(None)
     }
 
@@ -15201,11 +15220,15 @@ impl FrankenStorage {
     }
 
     /// True when every `sqlite_master` row named `fts_messages` declares the
-    /// canonical cass registration's external-empty content option
-    /// (`content=''`), i.e. the contentless family cass itself creates.
+    /// canonical cass registration's options, `content=''` AND
+    /// `contentless_delete=1` (see [`FTS5_REGISTER_SQL`]).
     ///
-    /// A `false` here means the catalog carries a CREATE cass never wrote:
-    /// either a pre-contentless legacy schema (internal or external content)
+    /// A `false` here means the catalog carries a CREATE cass no longer
+    /// writes: a pre-contentless legacy schema (internal or external content),
+    /// the `content=''`-only family cass created until 2026-08-04 (GH #497:
+    /// a 2-column `_docsize` into which older engines wrote 3-column rows that
+    /// the current reader rejects, wedging every ingest that touched it; it
+    /// also cannot take the transactional DELETE rebuild),
     /// or a stale duplicate row left behind by an interrupted legacy
     /// migration. FrankenSQLite 0.1.19 keeps such a duplicate visible when
     /// the canonical `fts_messages_content` shadow table exists on disk, and
@@ -15279,10 +15302,10 @@ impl FrankenStorage {
         // that name plus the module shadow-table cascade, leaving one clean
         // canonical schema, and the repopulate is fully derived from
         // canonical messages so nothing user-authored is at stake. The
-        // `content=''`-without-`contentless_delete` legacy family still takes
-        // the DELETE_ALL arm below, where the engine's rejection of the
-        // DELETE preserves its published contents via rollback; Unqueryable
-        // still bails in the match below.
+        // `content=''`-without-`contentless_delete` legacy family is
+        // non-canonical too (GH #497); with a single catalog row it is
+        // classified as residue above. Unqueryable still bails in the match
+        // below.
         if matches!(
             before.status,
             FtsShadowParityStatus::Healthy
@@ -17330,6 +17353,24 @@ pub(crate) enum FtsShadowViability {
 
 /// The one sentence every surface (index log, status marker, doctor) uses
 /// for a shadow the engine cannot materialize.
+/// GH #374: frankensqlite versions before its canonical-shadow fix created the
+/// FTS5 `%_config`/`%_idx` shadow tables as ordinary rowid tables. Stock SQLite
+/// then reports `wrong # of entries in index sqlite_autoindex_fts_messages_config_1`
+/// while fsqlite's own `quick_check` can still return `ok`. Shared by the full
+/// index preflight and residue classification so both agree on the shape.
+pub(crate) fn incompatible_legacy_fts_shadow_ddl(table: &str, ddl: &str) -> Option<String> {
+    let normalized = ddl
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (!normalized.contains("withoutrowid")).then(|| {
+        format!(
+            "legacy {table} schema is not WITHOUT ROWID; this pre-fix FTS5 shadow shape can carry a stale implicit autoindex and must be rebuilt before full indexing"
+        )
+    })
+}
+
 pub(crate) fn fts_shadow_not_viable_detail(corpus_messages: u64, bound_messages: u64) -> String {
     format!(
         "{FTS_SHADOW_NOT_VIABLE_ERROR_PREFIX}the canonical corpus is {corpus_messages} messages, \
