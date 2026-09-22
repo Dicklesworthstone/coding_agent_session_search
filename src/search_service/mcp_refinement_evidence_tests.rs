@@ -129,9 +129,8 @@ fn mcp_refinement_respects_admission_and_unload_restores_capacity() -> anyhow::R
 
     let mut fixture = refinement_evidence_fixture()?;
     let session = &mut fixture.session;
-    session.refiner = super::super::refinement::Refiner::new(Some(
-        fixture.root.path().join("absent-model"),
-    ));
+    session.refiner =
+        super::super::refinement::Refiner::new(Some(fixture.root.path().join("absent-model")));
     let database = session.archive.clone().unwrap();
     let archive_before = refinement_archive_image(&database)?;
     let pool = session.admission_pool.clone().unwrap();
@@ -143,7 +142,11 @@ fn mcp_refinement_respects_admission_and_unload_restores_capacity() -> anyhow::R
     let blocked = adapter
         .handle(
             session,
-            call("busy".into(), "cass_refine", refinement_evidence_arguments()),
+            call(
+                "busy".into(),
+                "cass_refine",
+                refinement_evidence_arguments(),
+            ),
         )
         .unwrap();
     assert_eq!(blocked["id"], "busy");
@@ -173,7 +176,11 @@ fn mcp_refinement_respects_admission_and_unload_restores_capacity() -> anyhow::R
         unavailable["result"]["structuredContent"]["error"]["kind"],
         "refinement_failed"
     );
-    assert!(unavailable["result"]["structuredContent"].get("hits").is_none());
+    assert!(
+        unavailable["result"]["structuredContent"]
+            .get("hits")
+            .is_none()
+    );
     assert_eq!(session.successful_opens, 1);
     assert_eq!(session.refiner.status()["load_attempts"], 1);
     assert!(session.reader_lease.is_some());
@@ -194,7 +201,10 @@ fn mcp_refinement_respects_admission_and_unload_restores_capacity() -> anyhow::R
         .unwrap();
     assert_eq!(lexical["result"]["isError"], false, "{lexical}");
     assert_eq!(lexical["result"]["structuredContent"]["count"], 1);
-    assert_eq!(lexical["result"]["structuredContent"]["reader_reused"], true);
+    assert_eq!(
+        lexical["result"]["structuredContent"]["reader_reused"],
+        true
+    );
     assert_eq!(session.successful_opens, 1);
     assert_eq!(session.refiner.status()["load_attempts"], 1);
 
