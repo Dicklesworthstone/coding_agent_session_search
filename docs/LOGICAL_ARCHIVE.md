@@ -79,10 +79,94 @@ synced. A failure syncing that directory after publication is reported explicitl
 a visible destination after that failure is not a confirmed durability receipt.
 
 The input, source archive, existing destinations and provider histories remain
-untouched. This does not install lexical or semantic search assets: those must
-be rebuilt separately. The receipt reports `omitted_rebuild_required` rather than
-claiming that search indexes are already usable. Inspection and restore do not
-start model acquisition, provider scans or detached maintenance.
+untouched. By default import installs no lexical or semantic assets and reports
+`derived_search_assets: "omitted_rebuild_required"`. It does not start model
+acquisition, provider scans or detached maintenance. The explicit indexed-recovery
+option below adds canonical-only lexical reconstruction; export and verification
+never invoke that option.
+
+## Recover a searchable profile without the original provider files
+
+Add `--rebuild-index` to reconstruct lexical search immediately after the verified
+canonical restore. The output must use the ordinary profile layout, and the
+interchange input must be outside that profile:
+
+```sh
+mkdir -p /private/recovered-cass
+cass archive import /private/backups/history.jsonl \
+  --archive-id workstation-history --include-private \
+  --output /private/recovered-cass/agent_search.db --rebuild-index
+cass search "authentication" --data-dir /private/recovered-cass \
+  --mode lexical --robot --no-maintenance
+```
+
+The destination directory must already exist. Its final component, and any
+existing components of its lexical index path, cannot be symlinks. A filename
+other than `agent_search.db` is rejected **before** restoration: the normal
+`--data-dir` commands must not silently look for a different database. Keep the
+input outside the destination directory because index, lock and checkpoint
+names there belong to maintenance, not interchange storage. The output path,
+not an ambient `CASS_DATA_DIR` or export-source `--db`, selects this profile.
+
+This path reads only the restored canonical database. It does not run normal
+provider discovery, rescan local histories, salvage historical source bundles,
+create a semantic index, or acquire a model. It reuses the existing exclusive
+index-run lock and the canonical scratch-build, checkpoint and atomic-publication
+pipeline; it does not implement a second publisher. The index contains the
+canonical search projection, while the database remains the full-fidelity
+source of truth. Index document counts can differ from total stored rows.
+
+On success the existing canonical digest, counts and `destination_status` remain
+in the receipt. This opt-in additionally reports:
+
+```json
+{
+  "derived_search_assets": "lexical_rebuilt_semantic_not_built",
+  "lexical_rebuild": {
+    "data_dir": "/private/recovered-cass",
+    "index_path": "/private/recovered-cass/index/v9-quill",
+    "indexed_documents": 4,
+    "source": "canonical_archive",
+    "provider_scan_performed": false,
+    "semantic_assets_built": false
+  }
+}
+```
+
+The path and count above are illustrative; use the returned `index_path` rather
+than hard-coding a schema-version directory. This is a lexical publication
+receipt, not proof of semantic readiness or a lease against subsequent archive
+writers. Canonical verification and lexical rebuilding are successive operations,
+not one transaction spanning the database and search index. Run recovery in a
+dedicated profile rather than alongside active ingest into that same profile.
+
+The example search uses `--no-maintenance` to demonstrate that the import already
+built a usable index, rather than allowing search to repair it implicitly.
+Search results' exact source, conversation and message coordinates can then be
+passed to the canonical follow-up commands below, even when the original provider
+files and the original archive are unavailable.
+
+### When canonical restoration succeeds but indexing fails
+
+A disk/lock/publication error during lexical rebuilding makes the command fail,
+with no success receipt. The already verified canonical database is **retained**;
+it is not undone, deleted or overwritten. Read known conversations directly, or
+resolve the indexing obstruction and repeat:
+
+```sh
+cass archive import /private/backups/history.jsonl \
+  --archive-id workstation-history --include-private \
+  --output /private/recovered-cass/agent_search.db \
+  --if-identical --rebuild-index
+```
+
+`--if-identical` must verify the whole existing database before granting rebuild
+authority. A different archive is a conflict even when its caller-assigned
+archive ID matches; its import does not replace the existing database or rebuild
+its search index. A successful retry reports `destination_status: "unchanged"`
+for the canonical database while permitting writes to **derived** lexical assets.
+Thus the combined flags are not a whole-directory read-only operation. Repeating
+without `--if-identical` still refuses an existing database.
 
 ## Reading a recovered conversation
 
@@ -105,8 +189,9 @@ histories from different machines that use the same source pathname.
 
 ## Repeating an import safely
 
-Add `--if-identical` to permit an existing destination **only as a read-only
-no-op**. It is not an overwrite, merge, repair or upgrade flag:
+Without `--rebuild-index`, add `--if-identical` to permit an existing destination
+**only as a read-only no-op**. It is not an overwrite, merge, repair or upgrade
+flag:
 
 ```sh
 cass archive import history.jsonl --archive-id workstation-history \
@@ -179,11 +264,12 @@ is an integrity checksum, **not** a signature or proof of source authenticity.
 
 Current restoration supports a new database with the exact current canonical
 schema, plus opt-in read-only comparison for an identical existing destination.
-Merge, cross-schema migration and automatic search-index rebuild are not
-implemented by these slices. They do not close bead `.34`. The ordinary library
-command parser, root help, completion generation and robot capabilities are not
-yet extended; `cass archive --help` documents the binary's explicit archive
-frontend. Search and existing commands retain their path.
+Explicit indexed restoration additionally rebuilds canonical lexical search.
+Merge, cross-schema migration and semantic reconstruction remain outside these
+slices; default restoration remains offline. These slices do not close bead
+`.34`. The ordinary library command parser, root help, completion generation
+and robot capabilities are not yet extended; `cass archive --help` documents
+the binary's explicit archive frontend. Existing commands retain their path.
 
 Rust regressions cover typed rows, cross-table relationships, trigger suspension,
 schema disagreement, bounded batches, provenance, truncation and tampering,
@@ -191,22 +277,25 @@ source preservation, existing-output/sidecar protection and symlink refusal.
 Publication tests include committed WAL data with a main-file-only negative
 control and subprocesses killed on both sides of the atomic link, after image
 validation/fsync but before any success receipt, followed by create-or-verify
-retry. The ignored subprocess entry point is invoked
-by its non-ignored parent test; it is not counted as a passing regression.
-A real-binary journey restores 260 messages from two remote providers, then
-checks exact sparse `view`/`expand` coordinates with the original archive and
-source path unavailable. Idempotence and re-export checks retain digest equality.
-The targeted GitHub Actions lane records immutable source/lockfile/binary
-identities and rejects empty test-filter success. A workflow definition or a
-source test is not an execution receipt. Native compilation, tests,
-RCH/Clippy/UBS, large-archive bounds and platform acceptance must be executed
-before release qualification.
+retry. The ignored subprocess entry point is invoked by its non-ignored parent
+test; it is not counted as a passing regression. A real-binary journey restores
+260 messages from two remote providers and checks exact sparse `view`/`expand`
+coordinates with the original archive and source path unavailable.
 
-Native Linux run `35672185382` at immutable source `d504e6e` compiled the real
-production binary, passed all 46 archive regressions and all five CLI regressions
-then present, including canonical restoration and read-only identical reimport.
-The separate library-test gate failed on unrelated test compilation errors, so
-the whole workflow was not green. Later prepared-replay, populated source-less
-follow-up and process-kill tests require their own exact-source execution results;
-they are not certified by the earlier run. No large-archive RSS, cross-platform,
-power-loss or full-release qualification follows from these fixture results.
+Indexed-recovery regressions additionally exercise ordinary maintenance-disabled
+search followed by canonical view, empty profiles, conflicting imports with
+unchanged prior index files, local-history isolation, and lexical rebuild
+failure followed by an identical retry. Admission tests cover invalid layouts,
+input/profile separation, corrupt/missing canonical files and path aliases.
+Their source presence is not a native execution receipt.
+
+Native Linux run `35675603482` at immutable source `6cefa248` completed both
+workflow jobs successfully: 48 archive regressions, six archive CLI regressions,
+15 canonical-service regressions, 20 bookmark tests and nine bookmark-CLI tests
+passed. This supersedes the earlier partial run `35672185382` at `d504e6e` and
+covers prepared replay, source-less follow-up and both process-kill boundaries.
+It does **not** qualify the later opt-in indexed-recovery implementation.
+The latter needs its own exact-source native result. No large-archive RSS,
+cross-platform, power-loss, Clippy/UBS or full-release qualification follows from
+these fixture results. The targeted workflow records immutable source, lockfile
+and binary identities and rejects empty test-filter success.

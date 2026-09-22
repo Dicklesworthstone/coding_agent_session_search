@@ -554,3 +554,101 @@ fn indexed_import_rejects_bad_layouts_and_invalid_streams_before_any_search_buil
     assert!(!data.join("index-run.lock").exists());
     assert_eq!(fs::read(&input).unwrap(), bytes);
 }
+
+fn index_image(data: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let index = coding_agent_search::search::tantivy::expected_index_dir(data);
+    let mut image = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(&index).follow_links(false) {
+        let entry = entry.unwrap();
+        assert!(!entry.file_type().is_symlink(), "unexpected index link");
+        if entry.file_type().is_file() {
+            image.insert(
+                entry.path().strip_prefix(&index).unwrap().to_path_buf(),
+                fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    assert!(!image.is_empty(), "the index snapshot must not be vacuous");
+    image
+}
+
+#[test]
+fn conflicting_indexed_import_preserves_the_previous_searchable_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let data = root.path().join("preserved-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    receipt(import_with_lexical_rebuild(root.path(), &input, &target, false));
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array().unwrap().len(),
+        4
+    );
+
+    // Valid, complete input with the same caller-assigned archive ID but
+    // different canonical contents must not acquire rebuild authority.
+    let different = root.path().join("different.db");
+    drop(SqliteStorage::open(&different).unwrap());
+    let conflict = root.path().join("different.jsonl");
+    let changed = export(root.path(), &different, &conflict);
+    assert_ne!(changed["content_sha256"], exported["content_sha256"]);
+    let db_before = fs::read(&target).unwrap();
+    let index_before = index_image(&data);
+    let input_before = fs::read(&conflict).unwrap();
+    for identical in [false, true] {
+        let failed = import_with_lexical_rebuild(root.path(), &conflict, &target, identical);
+        assert!(!failed.status.success());
+        assert!(failed.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&failed.stderr).is_ok());
+        assert_eq!(fs::read(&target).unwrap(), db_before);
+        assert_eq!(index_image(&data), index_before);
+        assert_eq!(fs::read(&conflict).unwrap(), input_before);
+    }
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array().unwrap().len(),
+        4
+    );
+}
+
+#[test]
+fn indexed_restore_ignores_discoverable_local_provider_histories() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    // A real provider-shaped session in the isolated HOME is deliberately NOT
+    // part of the exported canonical archive. Recovery must not mix it in.
+    let project = root.path().join(".claude/projects/-test-local-history");
+    fs::create_dir_all(&project).unwrap();
+    let history = project.join("local-sentinel.jsonl");
+    let record = serde_json::json!({
+        "parentUuid": null, "cwd": "/test/local-history",
+        "sessionId": "local-sentinel", "version": "2.0.37",
+        "gitBranch": "main", "type": "user", "uuid": "local-message",
+        "timestamp": "2026-01-20T09:00:00.000Z",
+        "message": {"role": "user", "content": "LOCALHISTORYMUSTSTAYOUT unrelated local session"}
+    });
+    let history_bytes = format!("{record}\n").into_bytes();
+    fs::write(&history, &history_bytes).unwrap();
+    let data = root.path().join("isolated-recovered");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    let result = receipt(import_with_lexical_rebuild(root.path(), &input, &target, false));
+    assert_eq!(result["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(
+        search_recovered(root.path(), &data, "LOCALHISTORYMUSTSTAYOUT")["hits"]
+            .as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_bytes);
+    assert_eq!(
+        export(root.path(), &target, &root.path().join("after-local-sentinel.jsonl"))["content_sha256"],
+        exported["content_sha256"]
+    );
+    assert!(!root.path().join("unused-default").exists());
+}
