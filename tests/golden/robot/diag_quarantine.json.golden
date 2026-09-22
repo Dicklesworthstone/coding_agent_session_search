@@ -156,6 +156,11 @@
       "found": false
     },
     {
+      "name": "codebuff",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "goose",
       "path": "(not detected)",
       "found": false

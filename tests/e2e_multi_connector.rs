@@ -51,7 +51,7 @@ fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
             .unwrap();
     };
     let start = SystemTime::now() - Duration::from_secs(3600);
-    write_transcript("pin it in rust-toolchain.toml", start);
+    write_transcript("codebuffprior: pin it in rust-toolchain.toml", start);
     std::fs::write(
         chat.join("run-state.json"),
         serde_json::to_vec(&json!({
@@ -138,13 +138,16 @@ fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
     );
     assert_eq!(messages(), 2);
 
-    // An edited native message updates in place instead of duplicating.
-    write_transcript(
-        "revised codebuffrevision answer",
-        start + Duration::from_secs(600),
-    );
+    // An edited native message updates in place instead of duplicating. A real
+    // edit is newer than the previous run, which incremental discovery requires.
+    write_transcript("revised codebuffrevision answer", SystemTime::now());
+    assert_eq!(search("codebuffprior").len(), 1);
     command().args(["index", "--json"]).assert().success();
     assert_eq!(search("codebuffrevision").len(), 1);
+    assert!(
+        search("codebuffprior").is_empty(),
+        "the replaced answer must leave the lexical index"
+    );
     assert_eq!(messages(), 2, "a native-ID edit must not append a message");
 }
 
