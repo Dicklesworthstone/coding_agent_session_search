@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: fts-residue-regression-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   transport:
     runs-on: ubuntu-latest
@@ -13,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 4
+          fetch-depth: 8
       - name: Preserve reviewed patch transport
         run: git show e5a882e8eefb22ded2ea5bb557af0e7c007f8122:.github/workflows/fts-residue-regression.yml > patch-transport.yml
       - uses: actions/upload-artifact@v4
