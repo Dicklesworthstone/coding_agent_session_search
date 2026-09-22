@@ -80,8 +80,8 @@ use crate::search::vector_index::{
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
-#[cfg(test)]
 use crate::storage::sqlite::incompatible_legacy_fts_shadow_ddl;
+#[cfg(test)]
 use crate::storage::sqlite::{DailyStatsRebuildResult, StatsAggregator, StatsDelta};
 use crate::storage::sqlite::{
     FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,

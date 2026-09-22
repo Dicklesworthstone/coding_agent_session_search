@@ -14339,8 +14339,6 @@ impl FrankenStorage {
 
     /// The persisted fallback-FTS repair-pending detail, if the last full index
     /// run left the canonical `fts_messages` shadow unrepaired (zn1xn).
-    #[cfg(test)]
-    #[cfg(test)]
     pub(crate) fn read_fallback_fts_repair_pending(&self) -> Result<Option<String>> {
         Ok(self
             .conn
