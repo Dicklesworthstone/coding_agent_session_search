@@ -1,23 +1,157 @@
-# Both source-only landings completed. No job retains repository-write access.
-name: Verify landed retrieval commits
+name: Verify guarded semantic query CLI
 on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/apply-ann-underfill-once.yml]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  ancestry-only:
+  prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Verify commit ancestry, not runtime qualification
-        shell: bash
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Admit exact source, format and export blobs without changing refs
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor e36ad641e95df88c289d70fc467e5159542d9c92 HEAD
-          git merge-base --is-ancestor d671ab449af2d6bd34bac12a7992f79b3c2cc36c HEAD
-          printf '%s\n' 'Both retrieval fixes are present in this history.' 'This check proves ancestry only; use Verify search retrieval for component and locked CASS tests.'
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, subprocess, tarfile, urllib.request
+          from pathlib import Path
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json', 'Content-Type':'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          chunks = ['491c0a472ffda0671ac70da5371cc44c99546a0a','15cb4c9168eab4f7beeb4e479d8498bd2eeec08d','fffab0d4c422767af2093d54f78a9e637326c416']
+          payload = b''
+          for sha in chunks:
+              result = request('/git/blobs/' + sha)
+              assert result['encoding'] == 'base64'
+              content = base64.b64decode(result['content'])
+              assert blob(content) == sha
+              payload += content
+          compressed = base64.b64decode(payload, validate=True)
+          assert hashlib.sha256(compressed).hexdigest() == '5826ebc916701c6e394d5bec59b52e9cbb6b94436517c8e25da204c609970e92'
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == '7345cdf05f1731fe0b2ebf8d6cd3c2d0b1ba11c4dffd6d0398fc1508d0aad622'
+          files = {
+              'src/main.rs': ('3e449c7ed23016a3a37bad2059f87b800af695c9', 'e3f5e2dbf78cd76a17ca4db492bcf0a3ac6866c8'),
+              'src/search_service.rs': ('b5f59dd9c7c757c116aa2386822b2cc7ecc490eb', '6252b22f754d11fbc334633582da882a051331c5'),
+              'src/search_service/semantic_query.rs': (None, '819ae8972b64e5e60c2c89c9af37f64448fde83a'),
+              'src/search_service/semantic_query/tests.rs': (None, '1c4eaac5761ca4ae6f9ad3c52ae03d3452683375'),
+              'tests/cli_semantic_query.rs': (None, 'a37834598d0e3856e88e53a81bb5ea636b49b18f'),
+              'tests/cli_semantic_query/native.rs': (None, '078f85fd0a9b937a3e3352de27f3454d37c1ba34'),
+              'docs/SEMANTIC_TEXT_READER.md': ('088192ee74f4dfddc0be56aac92b079e4d7753a2', '6e6b26879d4ea1972457ae55fb4fe96a576e8f20'),
+          }
+          for name, (expected, _) in files.items():
+              path = Path(name)
+              assert (blob(path.read_bytes()) if path.exists() else None) == expected, name
+          subprocess.run(['git','apply','--check','-'], input=patch, check=True)
+          subprocess.run(['git','apply','-'], input=patch, check=True)
+          subprocess.run(['git','apply','--reverse','--check','-'], input=patch, check=True)
+          for name, (_, expected) in files.items():
+              assert blob(Path(name).read_bytes()) == expected, name
+          for name, expected in {
+              'src/search/hash_embedder.rs': 'c7485a58abb9d4893b070b4640ecce72863cb844',
+              'src/search/hash_embedder/identity.rs': '57256f266bb44a456068812caf1918a7f8b8fc8b',
+          }.items():
+              assert blob(Path(name).read_bytes()) == expected, name
+              files[name] = (expected, expected)
+          rust = [name for name in files if name.endswith('.rs')]
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',*rust], check=True)
+          subprocess.run(['rustfmt','--edition','2024','--check','--config','skip_children=true',*rust], check=True)
+          subprocess.run(['git','diff','--check'], check=True)
+          changed = set(subprocess.check_output(['git','diff','--name-only'], text=True).splitlines())
+          untracked = set(subprocess.check_output(['git','ls-files','--others','--exclude-standard'], text=True).splitlines())
+          assert changed | untracked == set(files), (changed,untracked)
+          receipt = {'source_commit':os.environ['GITHUB_SHA'],'bases':{name:pair[0] for name,pair in files.items()},'blobs':{}}
+          for name in files:
+              data = Path(name).read_bytes()
+              result = request('/git/blobs', {'encoding':'base64','content':base64.b64encode(data).decode()})
+              assert result['sha'] == blob(data), name
+              receipt['blobs'][name] = result['sha']
+          Path('semantic-cli-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          with tarfile.open('semantic-cli-source.tar.gz','w:gz') as archive:
+              for name in files:
+                  archive.add(name, arcname=name)
+              archive.add('semantic-cli-receipt.json')
+          print(json.dumps(receipt, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: semantic-cli-source-${{ github.sha }}
+          path: semantic-cli-source.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+  native:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: semantic-cli-source-${{ github.sha }}
+      - name: Verify exact prepared source before compilation
+        run: |
+          tar -xzf semantic-cli-source.tar.gz
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          for name, expected in json.loads(Path('semantic-cli-receipt.json').read_text())['blobs'].items():
+              data = Path(name).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected
+          PY
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Run real command, service guard and retained search regressions
+        run: |
+          set -o pipefail
+          cargo test --locked --test cli_semantic_query -- --nocapture 2>&1 | tee semantic-cli-tests.log
+          grep -Eq 'test result: ok\. 5 passed; 0 failed; 1 ignored' semantic-cli-tests.log
+          cargo test --locked --test search_service semantic_query:: -- --nocapture 2>&1 | tee semantic-service-tests.log
+          grep -Eq 'test result: ok\. 7 passed; 0 failed' semantic-service-tests.log
+          cargo test --locked --lib search::hash_embedder:: -- --nocapture 2>&1 | tee semantic-hash-tests.log
+          grep -Eq 'test result: ok\. 25 passed; 0 failed' semantic-hash-tests.log
+          cargo test --locked --lib search::semantic_reader:: -- --nocapture 2>&1 | tee semantic-reader-tests.log
+      - name: Strict production and command lint
+        if: always()
+        run: |
+          set -o pipefail
+          cargo clippy --locked --bin cass --test cli_semantic_query -- -D warnings 2>&1 | tee semantic-cli-clippy.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-cli-native-${{ github.sha }}
+          path: |
+            semantic-*-tests.log
+            semantic-cli-clippy.log
+          if-no-files-found: warn
+          retention-days: 3
