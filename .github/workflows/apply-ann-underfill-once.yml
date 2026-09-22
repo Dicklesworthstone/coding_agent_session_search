@@ -1,112 +1,23 @@
-# Temporary, hash-pinned preparation for the owner's direct-main WAL fix.
-# This job creates Git blobs only; it cannot choose or update a branch here.
-name: Prepare retained-WAL query fix
+# Both source-only landings completed. No job retains repository-write access.
+name: Verify landed retrieval commits
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/apply-ann-underfill-once.yml']
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  prepare-reviewed-blobs:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
+  ancestry-only:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
-      - name: Install repository-pinned Rust formatter
+      - name: Verify commit ancestry, not runtime qualification
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git hash-object rust-toolchain.toml)" = 575d8be2b479e4ad8f416fd026bf55da6f97620d
-          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt
-          rustfmt +nightly-2026-08-31 --version
-      - name: Apply reviewed patch to complete pinned files and export blobs
-        shell: python
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          import base64
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          import urllib.request
-
-          repo = 'Dicklesworthstone/coding_agent_session_search'
-          patch_sha = '9d156397f749e9ee49844a5fe1bb4c8b56a6ebdc'
-          expected = {
-              'src/search/query.rs': '4807c131e3340c65c8762078fe97aad0bd525fa4',
-              'src/search/query/message_topk_integration.rs': 'fe2a95e36eed2a9dbc23fcdb8ecb34c6d2bfd24f',
-          }
-          def blob_sha(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          def api(path, data=None):
-              payload = None if data is None else json.dumps(data).encode()
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/' + repo + path,
-                  data=payload,
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                           'Accept': 'application/vnd.github+json',
-                           'Content-Type': 'application/json',
-                           'X-GitHub-Api-Version': '2022-11-28'},
-              )
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  return json.load(response)
-          def run(*args, **kwargs):
-              return subprocess.run(args, check=True, **kwargs)
-          for path, sha in expected.items():
-              actual = blob_sha(Path(path).read_bytes())
-              if actual != sha:
-                  raise SystemExit('Input changed: ' + path + ' ' + actual)
-          stored = api('/git/blobs/' + patch_sha)
-          if stored['encoding'] != 'base64':
-              raise SystemExit('Unexpected patch encoding')
-          patch = base64.b64decode(stored['content'])
-          if blob_sha(patch) != patch_sha:
-              raise SystemExit('Patch identity mismatch')
-          patch_path = Path(os.environ['RUNNER_TEMP']) / 'reviewed-wal.patch'
-          patch_path.write_bytes(patch)
-          # Recount the manually edited hunk lengths; context and input hashes
-          # remain strict. No regex-based source rewriting or whole-file reset.
-          run('git', 'apply', '--recount', '--check', '--whitespace=error-all', str(patch_path))
-          run('git', 'apply', '--recount', '--whitespace=error-all', str(patch_path))
-          run('git', 'apply', '--recount', '--reverse', '--check', str(patch_path))
-          run('git', 'diff', '--check')
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          if sorted(changed) != sorted(expected):
-              raise SystemExit('Unexpected changed paths: ' + repr(changed))
-          # Parsing a full module is a syntax check, not compilation or tests.
-          with open(os.devnull, 'wb') as sink:
-              run('rustfmt', '+nightly-2026-08-31', '--edition', '2024', '--config',
-                  'skip_children=true', '--emit', 'stdout', 'src/search/query.rs', stdout=sink)
-          tests = 'src/search/query/message_topk_integration.rs'
-          formatted = subprocess.check_output([
-              'rustfmt', '+nightly-2026-08-31', '--edition', '2024', '--config',
-              'skip_children=true', '--emit', 'stdout',
-          ], input=Path(tests).read_bytes())
-          Path(tests).write_bytes(formatted)
-          run('rustfmt', '+nightly-2026-08-31', '--edition', '2024', '--config',
-              'skip_children=true', '--check', tests)
-          run('git', 'diff', '--check')
-          run('git', 'diff', '--stat')
-          receipt = {'input_blobs': expected, 'patch_blob': patch_sha,
-                     'scope': 'full-file patch, reverse-apply and native Rust syntax; no compile/test claim',
-                     'output_blobs': {}}
-          for path in expected:
-              content = Path(path).read_bytes()
-              sha = blob_sha(content)
-              result = api('/git/blobs', {'content': base64.b64encode(content).decode(), 'encoding': 'base64'})
-              if result['sha'] != sha:
-                  raise SystemExit('Published blob mismatch: ' + path)
-              receipt['output_blobs'][path] = sha
-          print('WAL_QUERY_PREPARE_RECEIPT=' + json.dumps(receipt, sort_keys=True), flush=True)
-          print('No commit or branch update was performed by this job.', flush=True)
+          git merge-base --is-ancestor e36ad641e95df88c289d70fc467e5159542d9c92 HEAD
+          git merge-base --is-ancestor d671ab449af2d6bd34bac12a7992f79b3c2cc36c HEAD
+          printf '%s\n' 'Both retrieval fixes are present in this history.' 'This check proves ancestry only; use Verify search retrieval for component and locked CASS tests.'

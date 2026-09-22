@@ -5016,7 +5016,9 @@ impl SearchClient {
             return Ok((initial, retry));
         }
         let record_count = context.artifacts.iter().fold(0usize, |total, artifact| {
-            total.saturating_add(artifact.index().record_count())
+            total
+                .saturating_add(artifact.index().record_count())
+                .saturating_add(artifact.index().wal_record_count())
         });
         let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
         let mut refills_left = message_topk::MAX_EXACT_MESSAGE_REFILLS;
@@ -5024,11 +5026,12 @@ impl SearchClient {
         let mut best_by_message = HashMap::<u64, VectorSearchResult>::new();
         for artifact in context.artifacts.iter() {
             let index = artifact.index();
-            let target = return_limit.min(index.record_count());
+            let physical_count = index.record_count().saturating_add(index.wal_record_count());
+            let target = return_limit.min(physical_count);
             // Retain the existing message-overfetch allowance for hydration.
             // Bound each raw window independently of the total archive size;
             // the extra lookahead proves strict score cutoffs without a refill.
-            let window = target.saturating_mul(4).saturating_add(1);
+            let window = target.saturating_mul(4).saturating_add(1).min(physical_count);
             let selection = message_topk::collect_exact_messages(
                 target,
                 window,
@@ -5040,7 +5043,7 @@ impl SearchClient {
                         ceiling,
                     };
                     let hits = index
-                        .search_top_k(embedding, window, Some(&filter))
+                        .search_top_k(embedding, window.min(physical_count), Some(&filter))
                         .map_err(|error| anyhow!("exact semantic refill failed: {error}"))?;
                     hits.into_iter()
                         .map(|hit| {
@@ -5107,7 +5110,10 @@ impl SearchClient {
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         if context.artifacts.len() == 1 {
             let index = context.artifacts[0].index();
-            let record_count = index.record_count();
+            // The retained query view includes WAL additions and replacements.
+            // Main rows plus retained WAL rows bound physical candidates, not
+            // distinct live messages; only the backend resolves replacements.
+            let record_count = index.record_count().saturating_add(index.wal_record_count());
             let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
             let fs_hits = index
                 .search_top_k(embedding, candidate_limit, fs_filter)
@@ -5147,7 +5153,8 @@ impl SearchClient {
         let mut has_more_candidates = false;
         for artifact in context.artifacts.iter() {
             let index = artifact.index();
-            let shard_record_count = index.record_count();
+            // A main-empty shard can still have searchable durable WAL rows.
+            let shard_record_count = index.record_count().saturating_add(index.wal_record_count());
             // Search chunks, then collapse by message. A message can have many
             // high-scoring chunks, so per-shard top-k chunks alone is not a
             // proof of per-message top-k. Use a bounded overfetch window and
@@ -5179,6 +5186,9 @@ impl SearchClient {
             // only the eventual return window after each shard, rather than
             // retaining a full candidate page for every opened shard.
             let keep = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
+            // Exhausting each physical shard does not exhaust the merged
+            // candidate page when bounded global retention discards messages.
+            has_more_candidates |= best_by_message.len() > keep;
             best_by_message = Self::collapse_semantic_results(best_by_message, keep)
                 .into_iter()
                 .map(|hit| (hit.message_id, hit))
