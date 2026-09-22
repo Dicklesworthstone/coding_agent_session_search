@@ -1601,11 +1601,107 @@ fn default_max_inflight_bytes_for_available(available_bytes: Option<u64>) -> usi
     budget.clamp(DEFAULT_MAX_INFLIGHT_BYTES, ceiling)
 }
 
+/// GH #496: the memory this process may still use under its cgroup limits.
+///
+/// Host `MemAvailable` ignores systemd `MemoryMax`, container limits and
+/// memory-capped slices, so budgets sized from it (in-flight bytes, writer
+/// heaps, caches) could exceed the real ceiling and swap-thrash or OOM inside
+/// a 10 GB unit on a larger host. Walks from this process's cgroup to the
+/// root and returns the tightest level's headroom: `memory.max - usage`,
+/// crediting that level's reclaimable `inactive_file` page cache the way
+/// `MemAvailable` does. `None` when no level sets a limit.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_memory_budget(
+    proc_self_cgroup: &str,
+    cgroup_root: &std::path::Path,
+) -> Option<CgroupMemoryBudget> {
+    let read = |path: std::path::PathBuf| std::fs::read_to_string(path).ok();
+    let number = |text: Option<String>| text?.trim().parse::<u64>().ok();
+    let stat_field = |text: Option<String>, field: &str| {
+        text?.lines().find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == field).then(|| value.trim().parse::<u64>().ok())?
+        })
+    };
+    // cgroup v1 reports "no limit" as a page-rounded i64::MAX.
+    const V1_UNLIMITED_FLOOR: u64 = 1 << 62;
+    let mut tightest: Option<CgroupMemoryBudget> = None;
+    let mut consider = |limit: u64, usage: u64, inactive_file: u64| {
+        let headroom = limit
+            .saturating_sub(usage.saturating_sub(inactive_file))
+            .min(limit);
+        let level = CgroupMemoryBudget { limit, headroom };
+        tightest = Some(match tightest {
+            Some(current) => CgroupMemoryBudget {
+                limit: current.limit.min(level.limit),
+                headroom: current.headroom.min(level.headroom),
+            },
+            None => level,
+        });
+    };
+    for line in proc_self_cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(relative)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let relative = relative.trim_start_matches('/');
+        let (base, v2) = if controllers.is_empty() {
+            (cgroup_root.to_path_buf(), true)
+        } else if controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+        {
+            (cgroup_root.join("memory"), false)
+        } else {
+            continue;
+        };
+        let mut level = base.join(relative);
+        loop {
+            if v2 {
+                if let Some(limit) = number(read(level.join("memory.max"))) {
+                    let usage = number(read(level.join("memory.current"))).unwrap_or(0);
+                    let inactive = stat_field(read(level.join("memory.stat")), "inactive_file");
+                    consider(limit, usage, inactive.unwrap_or(0));
+                }
+            } else if let Some(limit) = number(read(level.join("memory.limit_in_bytes")))
+                && limit < V1_UNLIMITED_FLOOR
+            {
+                let usage = number(read(level.join("memory.usage_in_bytes"))).unwrap_or(0);
+                let stat = read(level.join("memory.stat"));
+                let inactive = stat_field(stat.clone(), "total_inactive_file")
+                    .or_else(|| stat_field(stat, "inactive_file"));
+                consider(limit, usage, inactive.unwrap_or(0));
+            }
+            if level == base || !level.pop() || !level.starts_with(&base) {
+                break;
+            }
+        }
+    }
+    tightest
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CgroupMemoryBudget {
+    limit: u64,
+    headroom: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn current_cgroup_memory_budget() -> Option<CgroupMemoryBudget> {
+    let proc_self_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_memory_budget(&proc_self_cgroup, std::path::Path::new("/sys/fs/cgroup"))
+}
+
 pub(crate) fn available_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        proc_kib_field_bytes(&meminfo, "MemAvailable:")
+        let host = proc_kib_field_bytes(&meminfo, "MemAvailable:")?;
+        Some(current_cgroup_memory_budget().map_or(host, |budget| host.min(budget.headroom)))
     }
     // #294: on macOS there is no `/proc/meminfo`, so the Linux probe returned
     // `None` and the entire host-memory-reserve throttle in the lexical
@@ -1632,7 +1728,8 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        proc_kib_field_bytes(&meminfo, "MemTotal:")
+        let host = proc_kib_field_bytes(&meminfo, "MemTotal:")?;
+        Some(current_cgroup_memory_budget().map_or(host, |budget| host.min(budget.limit)))
     }
     #[cfg(target_os = "macos")]
     {
@@ -1836,6 +1933,107 @@ fn macos_phys_footprint_bytes_from_output(text: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    fn cgroup_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (relative, contents) in files {
+            let path = root.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        root
+    }
+
+    /// GH #496: a 10 GB systemd unit on a 64 GB host must size budgets from
+    /// the unit, not the host; the tightest ancestor wins; reclaimable page
+    /// cache counts as headroom like MemAvailable does.
+    #[test]
+    fn cgroup_v2_budget_takes_the_tightest_ancestor_and_credits_page_cache() {
+        const GIB: u64 = 1 << 30;
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", &format!("{}\n", 10 * GIB)),
+            ("user.slice/memory.current", &format!("{}\n", 3 * GIB)),
+            (
+                "user.slice/memory.stat",
+                &format!("anon 1\ninactive_file {}\n", GIB),
+            ),
+            ("user.slice/app.scope/memory.max", "max\n"),
+            (
+                "user.slice/app.scope/memory.current",
+                &format!("{}\n", 2 * GIB),
+            ),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice/app.scope\n", root.path())
+            .expect("a limited ancestor must produce a budget");
+        assert_eq!(budget.limit, 10 * GIB);
+        assert_eq!(budget.headroom, 8 * GIB, "10 - (3 - 1 reclaimable) GiB");
+
+        // A tighter leaf wins over the slice.
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", &format!("{}\n", 10 * GIB)),
+            ("user.slice/memory.current", "0\n"),
+            ("user.slice/app.scope/memory.max", &format!("{}\n", 2 * GIB)),
+            ("user.slice/app.scope/memory.current", &format!("{}\n", GIB)),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice/app.scope\n", root.path()).unwrap();
+        assert_eq!(
+            budget,
+            CgroupMemoryBudget {
+                limit: 2 * GIB,
+                headroom: GIB
+            }
+        );
+    }
+
+    #[test]
+    fn cgroup_budget_is_none_without_a_limit_and_skips_malformed_lines() {
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", "max\n"),
+            ("user.slice/memory.current", "123\n"),
+            (
+                "memory/legacy/memory.limit_in_bytes",
+                "9223372036854771712\n",
+            ),
+            ("memory/legacy/memory.usage_in_bytes", "123\n"),
+        ]);
+        assert_eq!(
+            cgroup_memory_budget("garbage\n0::/user.slice\n", root.path()),
+            None,
+            "'max' (v2) means unlimited"
+        );
+        assert_eq!(
+            cgroup_memory_budget("4:memory:/legacy\n", root.path()),
+            None,
+            "the v1 page-rounded i64::MAX sentinel means unlimited"
+        );
+        assert_eq!(cgroup_memory_budget("", root.path()), None);
+    }
+
+    #[test]
+    fn cgroup_v1_budget_reads_the_memory_controller_hierarchy() {
+        const MIB: u64 = 1 << 20;
+        let root = cgroup_fixture(&[
+            (
+                "memory/docker/abc/memory.limit_in_bytes",
+                &format!("{}\n", 512 * MIB),
+            ),
+            (
+                "memory/docker/abc/memory.usage_in_bytes",
+                &format!("{}\n", 300 * MIB),
+            ),
+            (
+                "memory/docker/abc/memory.stat",
+                &format!("total_inactive_file {}\n", 100 * MIB),
+            ),
+        ]);
+        let budget = cgroup_memory_budget(
+            "7:cpu,cpuacct:/docker/abc\n5:memory:/docker/abc\n",
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(budget.limit, 512 * MIB);
+        assert_eq!(budget.headroom, 312 * MIB);
+    }
 
     /// macOS load-average parser is pure so it runs on Linux CI too.
     #[test]

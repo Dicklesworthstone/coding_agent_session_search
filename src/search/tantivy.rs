@@ -107,20 +107,10 @@ fn positive_usize_env(name: &str) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_available_memory_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return kb.checked_mul(1024);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
 fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
-    linux_available_memory_bytes()
+    // GH #496: MemAvailable clamped to this process's cgroup headroom, so a
+    // memory-capped unit does not size its writer heap from the whole host.
+    crate::indexer::responsiveness::available_memory_bytes()
 }
 
 #[cfg(target_os = "macos")]
