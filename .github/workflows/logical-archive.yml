@@ -87,8 +87,8 @@ jobs:
           from pathlib import Path
           text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/unit.log').read_text()
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 47:
-              raise SystemExit('Expected all 47 production archive regressions, including killed-import recovery')
+          if not counts or max(map(int, counts)) < 48:
+              raise SystemExit('Expected all 48 production archive regressions, including both publication crash boundaries')
           PY
       - name: Run the real binary round trip and failure contracts
         shell: bash

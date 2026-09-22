@@ -425,12 +425,14 @@ pub fn import_file_with_policy(
     }
     sync_candidate(&candidate)?;
     #[cfg(all(test, unix))]
-    publication_tests::pause_verified_crash_child(destination)?;
+    publication_tests::pause_verified_crash_child(destination, "before-publish")?;
     require_new_destination(destination)?;
     // Same-filesystem hard-link publication is atomic and never replaces an
     // existing name (including symlinks). No rename/copy-over fallback is safe.
     fs::hard_link(&candidate, destination)
         .context("cannot publish restored archive without replacing existing data; destination must support hard links")?;
+    #[cfg(all(test, unix))]
+    publication_tests::pause_verified_crash_child(destination, "after-publish")?;
     export::sync_parent(destination)?;
     Ok((result.0, result.1, true))
 }
@@ -447,11 +449,13 @@ mod publication_tests {
     // persisted-image validation and fsync, while its destination lock is held.
     // Release binaries contain neither this hook nor its environment control.
     #[cfg(unix)]
-    pub(super) fn pause_verified_crash_child(destination: &Path) -> Result<()> {
+    pub(super) fn pause_verified_crash_child(destination: &Path, phase: &str) -> Result<()> {
         if let Ok(root) = dotenvy::var("CASS_TEST_LOGICAL_ARCHIVE_CRASH_ROOT") {
             let root = PathBuf::from(root);
-            if destination == root.join("restored.db") {
-                fs::write(root.join("verified-ready"), b"verified\n")?;
+            let requested = dotenvy::var("CASS_TEST_LOGICAL_ARCHIVE_CRASH_PHASE")
+                .unwrap_or_else(|_| "before-publish".to_owned());
+            if destination == root.join("restored.db") && requested == phase {
+                fs::write(root.join("verified-ready"), phase.as_bytes())?;
                 loop {
                     std::thread::park();
                 }
@@ -479,6 +483,17 @@ mod publication_tests {
     #[cfg(unix)]
     #[test]
     fn killed_verified_import_publishes_nothing_and_retries() {
+        assert_interrupted_import_recovers(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_import_without_a_receipt_can_be_verified_and_retried() {
+        assert_interrupted_import_recovers(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_interrupted_import_recovers(published: bool) {
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
 
@@ -498,6 +513,11 @@ mod publication_tests {
         let input_before = fs::read(&input).unwrap();
         let source_before = fs::read(&source).unwrap();
         let destination = root.path().join("restored.db");
+        let phase = if published {
+            "after-publish"
+        } else {
+            "before-publish"
+        };
         let mut child = KillOnDrop(
             Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -508,6 +528,7 @@ mod publication_tests {
                     "--test-threads=1",
                 ])
                 .env("CASS_TEST_LOGICAL_ARCHIVE_CRASH_ROOT", root.path())
+                .env("CASS_TEST_LOGICAL_ARCHIVE_CRASH_PHASE", phase)
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -516,7 +537,7 @@ mod publication_tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if fs::read(root.path().join("verified-ready"))
-                .is_ok_and(|bytes| bytes == b"verified\n")
+                .is_ok_and(|bytes| bytes == phase.as_bytes())
             {
                 break;
             }
@@ -524,16 +545,20 @@ mod publication_tests {
                 child.0.try_wait().unwrap().is_none(),
                 "restore child exited before verifying its image"
             );
-            assert!(Instant::now() < deadline, "restore child missed its deadline");
+            assert!(
+                Instant::now() < deadline,
+                "restore child missed its deadline"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!destination.exists());
+        assert_eq!(destination.exists(), published);
         child.0.kill().unwrap();
         assert!(!child.0.wait().unwrap().success());
 
         // SIGKILL skips both the destination-lock and TempDir destructors.
-        // The complete private image stays available, but it is not a restore.
-        assert!(!destination.exists());
+        // Before the atomic link, no restore exists. After it, the public name
+        // identifies the entire verified image even without a success receipt.
+        assert_eq!(destination.exists(), published);
         let retained = fs::read_dir(root.path())
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -556,10 +581,20 @@ mod publication_tests {
         );
         reader.execute("ROLLBACK").unwrap();
         reader.close_without_checkpoint().unwrap();
-        // The OS released the crashed process's lock. A fresh import can
-        // publish without trusting, deleting or reusing the interrupted stage.
-        let retried = import_file(&input, &destination, "crash-archive").unwrap();
-        assert_eq!(retried, expected);
+        // The OS released the crashed process's lock. A retry either creates
+        // a fresh image or proves the already published image without writes.
+        if published {
+            let before = fs::read(&destination).unwrap();
+            assert!(import_file(&input, &destination, "crash-archive").is_err());
+            let (header, completion, created) =
+                import_file_with_policy(&input, &destination, "crash-archive", true).unwrap();
+            assert!(!created, "lost success receipt must not cause replacement");
+            assert_eq!((header, completion), expected);
+            assert_eq!(fs::read(&destination).unwrap(), before);
+        } else {
+            let retried = import_file(&input, &destination, "crash-archive").unwrap();
+            assert_eq!(retried, expected);
+        }
         assert!(destination.is_file());
         assert!(retained.is_file());
         assert_eq!(fs::read(&input).unwrap(), input_before);

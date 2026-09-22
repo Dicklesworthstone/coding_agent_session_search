@@ -130,6 +130,9 @@ A missing destination still goes through the full private-candidate restore.
 An interrupted pre-publication import can be retried from the original JSONL;
 a later attempt does not trust or promote leftover private stages. Process-kill
 recovery is distinct from proving power-loss durability on every filesystem.
+After publication, a lost success receipt does not justify replacing the
+destination: retry with `--if-identical` to validate its complete contents and
+report `unchanged`. A different or incomplete destination remains a conflict.
 
 ## Version 1 wire contract
 
@@ -186,8 +189,9 @@ Rust regressions cover typed rows, cross-table relationships, trigger suspension
 schema disagreement, bounded batches, provenance, truncation and tampering,
 source preservation, existing-output/sidecar protection and symlink refusal.
 Publication tests include committed WAL data with a main-file-only negative
-control and a subprocess killed after image validation/fsync but before the
-atomic link, followed by retry. The ignored subprocess entry point is invoked
+control and subprocesses killed on both sides of the atomic link, after image
+validation/fsync but before any success receipt, followed by create-or-verify
+retry. The ignored subprocess entry point is invoked
 by its non-ignored parent test; it is not counted as a passing regression.
 A real-binary journey restores 260 messages from two remote providers, then
 checks exact sparse `view`/`expand` coordinates with the original archive and
@@ -197,3 +201,12 @@ identities and rejects empty test-filter success. A workflow definition or a
 source test is not an execution receipt. Native compilation, tests,
 RCH/Clippy/UBS, large-archive bounds and platform acceptance must be executed
 before release qualification.
+
+Native Linux run `35672185382` at immutable source `d504e6e` compiled the real
+production binary, passed all 46 archive regressions and all five CLI regressions
+then present, including canonical restoration and read-only identical reimport.
+The separate library-test gate failed on unrelated test compilation errors, so
+the whole workflow was not green. Later prepared-replay, populated source-less
+follow-up and process-kill tests require their own exact-source execution results;
+they are not certified by the earlier run. No large-archive RSS, cross-platform,
+power-loss or full-release qualification follows from these fixture results.
