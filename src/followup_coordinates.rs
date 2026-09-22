@@ -148,7 +148,11 @@ fn resolve_snapshot(
         ));
     }
     let conversation_id = *conversation_id;
-    let mut selection = window::Selection::new(request.message_index, request.context);
+    let mut selection = window::Selection::new(
+        request.message_index,
+        request.context,
+        stream::MAX_WINDOW_RECORDS,
+    );
     let mut invalid_index = None;
     let mut scan_expired = false;
     // The (conversation_id, idx) index can stream this ordered metadata pass.
@@ -176,11 +180,16 @@ fn resolve_snapshot(
         check_deadline(budget)?;
     }
     if let Some(reason) = invalid_index {
-        return Err(error(
-            CliErrorKind::InvalidLine.kind_str(),
-            reason,
-            "Inspect the canonical archive; no target has been selected.",
-        ));
+        return Err(match reason {
+            window::SelectionError::ResourceLimit => {
+                resource_limit("canonical window exceeds 4096 records")
+            }
+            window::SelectionError::InvalidIndex(reason) => error(
+                CliErrorKind::InvalidLine.kind_str(),
+                reason,
+                "Inspect the canonical archive; no target has been selected.",
+            ),
+        });
     }
     scanned.map_err(lookup_error)?;
     check_deadline(budget)?;
@@ -202,59 +211,105 @@ fn resolve_snapshot(
         .anchors
         .back()
         .ok_or_else(|| lookup_error("empty message window"))?;
-    // Hydrate only the exact selected range. Even -C 0 previously decoded and
-    // retained every tool result in the transcript before discarding it.
-    let rows = storage
-        .raw()
-        .query_map_collect(
-            "SELECT id, idx, role, content FROM messages
-             WHERE conversation_id = ?1 AND idx >= ?2 AND idx <= ?3 ORDER BY idx",
-            crate::franken_sync::params![conversation_id, first.idx, last.idx],
-            |row| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<i64>(1)?,
-                    row.get_typed::<Option<String>>(2)?,
-                    row.get_typed::<Option<String>>(3)?,
-                ))
-            },
-        )
-        .map_err(lookup_error)?;
+    // Stream only the selected range, with a SQL byte guard before transferring
+    // each body across the engine boundary. Byte lengths use BLOB casts: TEXT
+    // length counts characters and can stop at an embedded NUL. A refusal is
+    // never shortened into successful evidence. The engine's own page/value
+    // allocations and time inside one engine call are not bounded by this guard.
+    let mut lines = Vec::new();
+    let mut retained = stream::WindowSize::default();
+    let mut hydration_error = None;
+    let hydrated = storage.raw().query_with_params_for_each(
+        "SELECT id, idx, typeof(role), typeof(content),
+         COALESCE(length(CAST(role AS BLOB)), 0),
+         COALESCE(length(CAST(content AS BLOB)), 0),
+         CASE WHEN COALESCE(length(CAST(role AS BLOB)), 0) + COALESCE(length(CAST(content AS BLOB)), 0) <= ?4
+                   AND typeof(role) IN ('text', 'null') THEN role ELSE NULL END,
+         CASE WHEN COALESCE(length(CAST(role AS BLOB)), 0) + COALESCE(length(CAST(content AS BLOB)), 0) <= ?4
+                   AND typeof(content) IN ('text', 'null') THEN content ELSE NULL END
+         FROM messages WHERE conversation_id = ?1 AND idx >= ?2 AND idx <= ?3 ORDER BY idx",
+        &[
+            crate::franken_sync::SqliteValue::Integer(conversation_id),
+            crate::franken_sync::SqliteValue::Integer(first.idx),
+            crate::franken_sync::SqliteValue::Integer(last.idx),
+            crate::franken_sync::SqliteValue::Integer(stream::MAX_RECORD_BYTES as i64),
+        ],
+        |row| {
+            let result = (|| -> CliResult<Value> {
+                check_deadline(budget)?;
+                let anchor = selection.anchors.get(lines.len())
+                    .ok_or_else(|| lookup_error("unexpected message in snapshot hydration"))?;
+                let id = row.get_typed::<i64>(0).map_err(lookup_error)?;
+                let idx = row.get_typed::<i64>(1).map_err(lookup_error)?;
+                if id != anchor.id || idx != anchor.idx {
+                    return Err(lookup_error("message identity changed during snapshot hydration"));
+                }
+                let role_type = row.get_typed::<String>(2).map_err(lookup_error)?;
+                let content_type = row.get_typed::<String>(3).map_err(lookup_error)?;
+                if !matches!(role_type.as_str(), "text" | "null")
+                    || !matches!(content_type.as_str(), "text" | "null") {
+                    return Err(lookup_error("canonical role/content must be text or null"));
+                }
+                let role_bytes = usize::try_from(row.get_typed::<i64>(4).map_err(lookup_error)?)
+                    .map_err(lookup_error)?;
+                let content_bytes = usize::try_from(row.get_typed::<i64>(5).map_err(lookup_error)?)
+                    .map_err(lookup_error)?;
+                if role_bytes.saturating_add(content_bytes) > stream::MAX_RECORD_BYTES {
+                    return Err(resource_limit("canonical role and content exceed 8 MiB"));
+                }
+                let role = row.get_typed::<Option<String>>(6).map_err(lookup_error)?;
+                let content = row.get_typed::<Option<String>>(7).map_err(lookup_error)?;
+                if (role_type == "text" && role.is_none())
+                    || (content_type == "text" && content.is_none())
+                    || role.as_ref().map_or(0, String::len) != role_bytes
+                    || content.as_ref().map_or(0, String::len) != content_bytes {
+                    return Err(lookup_error("bounded hydration did not return the complete canonical text"));
+                }
+                let role = role.unwrap_or_else(|| "unknown".to_string());
+                let role = match role.to_ascii_lowercase().as_str() {
+                    "agent" | "assistant" => "assistant".to_string(),
+                    "user" => "user".to_string(),
+                    "tool" => "tool".to_string(),
+                    "system" => "system".to_string(),
+                    _ => role,
+                };
+                let content = content.unwrap_or_default();
+                retained.admit(role.len().saturating_add(content.len())).map_err(resource_limit)?;
+                Ok(json!({
+                    "line": anchor.number,
+                    "message_index": anchor.number,
+                    "coordinate_space": "message_index",
+                    "content_source": "archive",
+                    "message_id": id,
+                    "conversation_id": conversation_id,
+                    "source_id": source_id,
+                    "role": role,
+                    "content": content,
+                    "is_target": anchor.number == request.message_index,
+                    "highlighted": anchor.number == request.message_index,
+                }))
+            })();
+            match result {
+                Ok(line) => {
+                    lines.push(line);
+                    Ok(())
+                }
+                Err(error) => {
+                    hydration_error = Some(error);
+                    Err(crate::franken_sync::FrankenError::Internal("canonical hydration stopped".into()))
+                }
+            }
+        },
+    );
+    if let Some(error) = hydration_error {
+        return Err(error);
+    }
+    hydrated.map_err(lookup_error)?;
     check_deadline(budget)?;
-    if rows.len() != selection.anchors.len() {
+    if lines.len() != selection.anchors.len() {
         return Err(lookup_error(
             "message window changed during snapshot hydration",
         ));
-    }
-    let mut lines = Vec::new();
-    for ((id, idx, role, content), anchor) in rows.into_iter().zip(&selection.anchors) {
-        check_deadline(budget)?;
-        if id != anchor.id || idx != anchor.idx {
-            return Err(lookup_error(
-                "message identity changed during snapshot hydration",
-            ));
-        }
-        let role = role.unwrap_or_else(|| "unknown".to_string());
-        let role = match role.to_ascii_lowercase().as_str() {
-            "agent" | "assistant" => "assistant".to_string(),
-            "user" => "user".to_string(),
-            "tool" => "tool".to_string(),
-            "system" => "system".to_string(),
-            _ => role,
-        };
-        lines.push(json!({
-            "line": anchor.number,
-            "message_index": anchor.number,
-            "coordinate_space": "message_index",
-            "content_source": "archive",
-            "message_id": id,
-            "conversation_id": conversation_id,
-            "source_id": source_id,
-            "role": role,
-            "content": content.unwrap_or_default(),
-            "is_target": anchor.number == request.message_index,
-            "highlighted": anchor.number == request.message_index,
-        }));
     }
     if expand {
         return Ok(Value::Array(lines));

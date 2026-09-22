@@ -11,6 +11,9 @@ use tempfile::TempDir;
 #[path = "../src/followup_coordinates/window.rs"]
 mod window;
 
+const RECORD_BYTES: usize = 8 * 1024 * 1024;
+const WINDOW_RECORDS: usize = 4096;
+
 struct Fixture {
     root: TempDir,
     db: PathBuf,
@@ -119,6 +122,121 @@ fn decode(output: Output) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_resource_refusal(output: Output) {
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "no partial canonical target may escape"
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "followup-resource-limit");
+    assert_eq!(error["error"]["retryable"], false);
+}
+
+#[test]
+fn canonical_byte_guards_cover_multibyte_nul_and_role_payloads_without_reading_excluded_bodies()
+-> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let storage = FrankenStorage::open(&fixture.db)?;
+    // Both character-counting and TEXT length up to NUL would understate this.
+    let oversized = format!("\0{}", "é".repeat(RECORD_BYTES / 2));
+    storage.raw().execute_compat(
+        "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND idx = 0",
+        coding_agent_search::franken_sync::params![oversized.as_str(), fixture.conversation_id],
+    )?;
+    storage.raw().execute_compat(
+        "UPDATE messages SET role = ?1 WHERE conversation_id = ?2 AND idx = 7",
+        coding_agent_search::franken_sync::params![oversized.as_str(), fixture.conversation_id],
+    )?;
+    let complete = "before\0after 漢字 😀";
+    storage.raw().execute_compat(
+        "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND idx = 12",
+        coding_agent_search::franken_sync::params![complete, fixture.conversation_id],
+    )?;
+    drop(storage);
+    let before = std::fs::read(&fixture.db)?;
+    for command in ["view", "expand"] {
+        let payload = decode(fixture.command(command, 13, 0).output()?);
+        let rows = if command == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
+        assert_eq!(
+            rows[0]["content"], complete,
+            "NUL is not a truncation boundary"
+        );
+        assert_eq!(rows[0]["conversation_id"], fixture.conversation_id);
+        for target in [1, 8] {
+            assert_resource_refusal(fixture.command(command, target, 0).output()?);
+        }
+    }
+    assert_eq!(std::fs::read(&fixture.db)?, before);
+    assert!(!fixture.source.exists());
+    Ok(())
+}
+
+#[test]
+fn canonical_total_window_bytes_fail_closed_while_narrow_same_identity_succeeds()
+-> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let storage = FrankenStorage::open(&fixture.db)?;
+    let body = "x".repeat(7 * 1024 * 1024);
+    storage.raw().execute_compat(
+        "UPDATE messages SET content = ?1 WHERE conversation_id = ?2",
+        coding_agent_search::franken_sync::params![body.as_str(), fixture.conversation_id],
+    )?;
+    drop(storage);
+    let before = std::fs::read(&fixture.db)?;
+    for command in ["view", "expand"] {
+        // Five individually admissible rows exceed the aggregate 32 MiB cap.
+        assert_resource_refusal(fixture.command(command, 13, 2).output()?);
+        let payload = decode(fixture.command(command, 13, 0).output()?);
+        let rows = if command == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["content"].as_str().unwrap(), body);
+        assert_eq!(rows[0]["message_index"], 13);
+    }
+    assert_eq!(std::fs::read(&fixture.db)?, before);
+    Ok(())
+}
+
+#[test]
+fn canonical_actual_window_count_is_bounded_but_tail_metadata_still_counts() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let storage = FrankenStorage::open(&fixture.db)?;
+    storage.raw().execute("BEGIN IMMEDIATE")?;
+    for idx in 2000..2000 + WINDOW_RECORDS {
+        storage.raw().execute_compat(
+            "INSERT INTO messages (conversation_id, idx, role, content) VALUES (?1, ?2, 'user', 'bounded tail')",
+            coding_agent_search::franken_sync::params![fixture.conversation_id, idx as i64],
+        )?;
+    }
+    storage.raw().execute("COMMIT")?;
+    drop(storage);
+    let before = std::fs::read(&fixture.db)?;
+    for command in ["view", "expand"] {
+        assert_resource_refusal(fixture.command(command, 1, usize::MAX).output()?);
+        let payload = decode(fixture.command(command, 13, 0).output()?);
+        let rows = if command == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["content"], "canonical message idx 12");
+        if command == "view" {
+            assert_eq!(payload["total_messages"], WINDOW_RECORDS + 5);
+        }
+    }
+    assert_eq!(std::fs::read(&fixture.db)?, before);
+    Ok(())
 }
 
 #[test]
