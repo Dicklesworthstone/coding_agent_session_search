@@ -285,3 +285,178 @@ fn check() -> Result<(), String> {
 fn models_build_hnsw_builds_verifies_and_records_accelerator() -> Result<(), String> {
     check()
 }
+
+#[test]
+fn index_build_hnsw_maintains_already_published_vectors() -> Result<(), String> {
+    let fixture = semantic_fixture()?;
+    let (out, missing) = build_hnsw(&fixture, "index_hnsw_before", &["--check"])?;
+    if !out.status.success() || str_at(&missing, "state_before") != "missing" {
+        return Err(format!(
+            "fixture must start without an accelerator: {missing}"
+        ));
+    }
+    let vector_path = fixture.data_dir.join(str_at(&missing, "artifact_path"));
+    let vectors_before = std::fs::read(&vector_path).map_err(|e| e.to_string())?;
+    let index_args = [
+        "index",
+        "--semantic",
+        "--build-hnsw",
+        "--embedder",
+        "hash",
+        "--json",
+        "--no-progress-events",
+    ];
+    let out = run(
+        &fixture,
+        "index_hnsw_existing_vectors",
+        &index_args,
+        INDEX_TIMEOUT,
+    );
+    if !out.status.success() {
+        return Err(format!(
+            "index graph maintenance failed: {}",
+            text(&out.stderr)
+        ));
+    }
+    if std::fs::read(&vector_path).map_err(|e| e.to_string())? != vectors_before {
+        return Err("graph maintenance must not rewrite already-current vectors".into());
+    }
+    let (out, built) = build_hnsw(&fixture, "index_hnsw_admission", &["--check"])?;
+    if !out.status.success()
+        || str_at(&built, "state_before") != "native_valid"
+        || built.get("manifest_recorded").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "index must publish a natively admitted graph: {built}"
+        ));
+    }
+    let graph_path = fixture.data_dir.join(str_at(&built, "hnsw_path"));
+    let graph_before = std::fs::read(&graph_path).map_err(|e| e.to_string())?;
+    let modified_before = std::fs::metadata(&graph_path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|e| e.to_string())?;
+    let manifest_before = manifest_hnsw(&fixture.data_dir)?;
+
+    let out = run(
+        &fixture,
+        "index_hnsw_current_noop",
+        &index_args,
+        INDEX_TIMEOUT,
+    );
+    if !out.status.success() {
+        return Err(format!("repeated index failed: {}", text(&out.stderr)));
+    }
+    if std::fs::read(&graph_path).map_err(|e| e.to_string())? != graph_before
+        || std::fs::metadata(&graph_path)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|e| e.to_string())?
+            != modified_before
+        || manifest_hnsw(&fixture.data_dir)? != manifest_before
+    {
+        return Err("a current native graph must be retained without rewriting its receipt".into());
+    }
+
+    // A subsequent small ingest must maintain the new vector generation too;
+    // the bulk-embedding branch alone cannot implement the requested flag.
+    const DELTA_KEYWORD: &str = "orbitalquartzdelta searchable appended evidence";
+    util::seed_codex_session(
+        &fixture.codex_home,
+        "rollout-2026-04-23T11-00-00-hnsw-delta.jsonl",
+        DELTA_KEYWORD,
+        true,
+    );
+    let out = run(&fixture, "index_hnsw_delta", &index_args, INDEX_TIMEOUT);
+    if !out.status.success() {
+        return Err(format!("delta index failed: {}", text(&out.stderr)));
+    }
+    let (out, current) = build_hnsw(&fixture, "index_hnsw_delta_admission", &["--check"])?;
+    if !out.status.success()
+        || str_at(&current, "state_before") != "native_valid"
+        || current.get("manifest_recorded").and_then(Value::as_bool) != Some(true)
+        || current.get("vector_count").and_then(Value::as_u64)
+            <= built.get("vector_count").and_then(Value::as_u64)
+    {
+        return Err(format!(
+            "delta must be covered by the current native graph: {current}"
+        ));
+    }
+    let out = run(
+        &fixture,
+        "index_hnsw_delta_search",
+        &[
+            "search",
+            DELTA_KEYWORD,
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--approximate",
+            "--robot",
+            "--robot-meta",
+            "--limit",
+            "5",
+        ],
+        MODELS_TIMEOUT,
+    );
+    let results = json_stdout(&out, "delta semantic search")?;
+    if !out.status.success()
+        || results.pointer("/_meta/ann_stats").is_none()
+        || results.pointer("/_meta/ann_unavailable_reason").is_some()
+        || !results
+            .get("hits")
+            .and_then(Value::as_array)
+            .is_some_and(|hits| {
+                hits.iter().any(|hit| {
+                    str_at(hit, "source_path")
+                        .ends_with("rollout-2026-04-23T11-00-00-hnsw-delta.jsonl")
+                })
+            })
+    {
+        return Err(format!(
+            "new evidence must remain searchable after maintenance: {results}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn models_build_hnsw_serializes_publication_with_indexing() -> Result<(), String> {
+    use fs2::FileExt;
+
+    let fixture = semantic_fixture()?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(fixture.data_dir.join("index-run.lock"))
+        .map_err(|e| e.to_string())?;
+    lock.lock_exclusive().map_err(|e| e.to_string())?;
+    let out = run(
+        &fixture,
+        "hnsw_build_busy",
+        &["models", "build-hnsw", "--json"],
+        MODELS_TIMEOUT,
+    );
+    if out.status.code() != Some(7) || manifest_hnsw(&fixture.data_dir)?.is_some() {
+        return Err(format!(
+            "concurrent indexing must refuse graph publication with exit 7: {} {}",
+            text(&out.stdout),
+            text(&out.stderr)
+        ));
+    }
+    let (out, check) = build_hnsw(&fixture, "hnsw_check_while_busy", &["--check"])?;
+    if !out.status.success() || str_at(&check, "state_before") != "missing" {
+        return Err(format!(
+            "read-only graph checks should remain available: {check}"
+        ));
+    }
+    drop(lock);
+    let (out, built) = build_hnsw(&fixture, "hnsw_build_after_busy", &[])?;
+    if !out.status.success() || str_at(&built, "state_after") != "native_valid" {
+        return Err(format!(
+            "graph maintenance must succeed after the writer exits: {built}"
+        ));
+    }
+    Ok(())
+}

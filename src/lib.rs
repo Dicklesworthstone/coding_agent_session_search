@@ -120931,62 +120931,6 @@ fn run_models_verify(
     Ok(())
 }
 
-/// Admissibility of the on-disk HNSW accelerator for one published artifact,
-/// as the runtime loader would judge it (`cass models build-hnsw`, gh#408).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HnswAcceleratorState {
-    /// No accelerator metadata at the canonical path.
-    Missing,
-    /// The path exists but is a symlink or not a regular file; never loaded.
-    InvalidEntry,
-    /// The exact native graph matches the published artifact (ids, vector
-    /// fingerprint, dimension, topology).
-    NativeValid,
-    /// Readable metadata, but the graph is legacy, stale, incomplete, or
-    /// corrupt — search silently falls back to exact scans.
-    StaleOrLegacy,
-    /// Metadata unreadable or dimensionally incompatible.
-    Unreadable,
-}
-
-impl HnswAcceleratorState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::InvalidEntry => "invalid_entry",
-            Self::NativeValid => "native_valid",
-            Self::StaleOrLegacy => "stale_or_legacy",
-            Self::Unreadable => "unreadable",
-        }
-    }
-
-    fn is_current(self) -> bool {
-        matches!(self, Self::NativeValid)
-    }
-}
-
-/// Classify the accelerator at `ann_path` against `fs_index` without writing.
-fn inspect_hnsw_accelerator(
-    ann_path: &Path,
-    fs_index: &crate::search::vector_index::VectorIndex,
-) -> HnswAcceleratorState {
-    match std::fs::symlink_metadata(ann_path) {
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => {
-            return HnswAcceleratorState::Missing;
-        }
-        Err(_) => return HnswAcceleratorState::Unreadable,
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
-            return HnswAcceleratorState::InvalidEntry;
-        }
-        Ok(_) => {}
-    }
-    match frankensearch::index::HnswIndex::try_load_native(ann_path, fs_index) {
-        Ok(Some(_)) => HnswAcceleratorState::NativeValid,
-        Ok(None) => HnswAcceleratorState::StaleOrLegacy,
-        Err(_) => HnswAcceleratorState::Unreadable,
-    }
-}
-
 /// `cass models build-hnsw` (bead uaulb, gh#408): build or verify the HNSW
 /// accelerator for an ALREADY-PUBLISHED semantic vector artifact.
 ///
@@ -121002,12 +120946,41 @@ fn run_models_build_hnsw(
     data_dir_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use crate::search::ann_index::hnsw_index_path;
+    use crate::search::ann_index::{
+        HnswAcceleratorState, hnsw_index_path, inspect_hnsw_accelerator, maintain_hnsw_accelerator,
+    };
     use crate::search::semantic_manifest::{HnswRecord, SemanticManifest, TierKind};
     use crate::search::vector_index::VectorIndex as FsVectorIndex;
     use colored::Colorize;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    // Keep the selected vector/manifest generation stable through native
+    // admission and manifest publication. The lock does not open the archive;
+    // --check remains a strictly read-only inspection.
+    let _maintenance_guard = if check {
+        None
+    } else {
+        let db_path = data_dir.join("agent_search.db");
+        Some(
+            crate::indexer::acquire_semantic_backfill_lock(&data_dir, &db_path).map_err(
+                |error| {
+                    let rendered = format!("{error:#}");
+                    if error_chain_indicates_active_cass_index(&rendered) {
+                        return active_index_run_details(&data_dir, &db_path)
+                            .map(|details| details.to_cli_error())
+                            .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
+                    }
+                    CliError {
+                        code: 5,
+                        kind: CliErrorKind::Storage.kind_str(),
+                        message: format!("Failed to acquire HNSW maintenance lock: {rendered}"),
+                        hint: Some("Check permissions under the cass data directory".into()),
+                        retryable: true,
+                    }
+                },
+            )?,
+        )
+    };
     let mut manifest = SemanticManifest::load(&data_dir)
         .map_err(|err| CliError {
             code: 5,
@@ -121072,7 +121045,7 @@ fn run_models_build_hnsw(
         });
     }
     let index_path = data_dir.join(&record.index_path);
-    let fs_index = FsVectorIndex::open(&index_path).map_err(|err| CliError {
+    let fs_index = FsVectorIndex::open_read_only(&index_path).map_err(|err| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
         message: format!(
@@ -121110,58 +121083,38 @@ fn run_models_build_hnsw(
         .unwrap_or(ann_path.as_path())
         .to_string_lossy()
         .to_string();
-    let before = inspect_hnsw_accelerator(&ann_path, &fs_index);
     let manifest_records_current = manifest.hnsw.as_ref().is_some_and(|hnsw| {
         hnsw.ready
             && hnsw.base_tier.as_str().cmp(tier.as_str()).is_eq()
             && hnsw.embedder_id.cmp(&record.embedder_id).is_eq()
+            && hnsw.index_path == relative_ann_path
     });
 
-    let (action, after, manifest_published) = if check {
-        ("check_only", before, false)
-    } else if before.is_current() && !force {
-        // Re-record a current graph the manifest forgot (e.g. revoked by an
-        // earlier delta) without rebuilding it.
-        let published = !manifest_records_current;
-        ("unchanged", before, published)
+    let (before, action, after, manifest_published) = if check {
+        let before = inspect_hnsw_accelerator(&ann_path, &fs_index);
+        (before, "check_only", before, false)
     } else {
-        let hnsw = frankensearch::index::HnswIndex::build_from_vector_index(
+        let maintenance = maintain_hnsw_accelerator(
+            &ann_path,
             &fs_index,
             frankensearch::index::HnswConfig::default(),
+            force,
         )
         .map_err(|err| CliError {
             code: 5,
             kind: CliErrorKind::Storage.kind_str(),
-            message: format!("building HNSW accelerator failed: {err}"),
-            hint: None,
-            retryable: false,
+            message: format!("HNSW accelerator maintenance failed: {err:#}"),
+            hint: Some("Retry; if it persists run 'cass doctor check --json'".into()),
+            retryable: true,
         })?;
-        hnsw.save(&ann_path).map_err(|err| CliError {
-            code: 5,
-            kind: CliErrorKind::Storage.kind_str(),
-            message: format!(
-                "saving HNSW accelerator to {} failed: {err}",
-                ann_path.display()
-            ),
-            hint: None,
-            retryable: false,
-        })?;
-        drop(hnsw);
-        let after = inspect_hnsw_accelerator(&ann_path, &fs_index);
-        if !after.is_current() {
-            return Err(CliError {
-                code: 5,
-                kind: CliErrorKind::Storage.kind_str(),
-                message: format!(
-                    "HNSW accelerator was written but does not load back as the native graph for {} (state: {}); the manifest was left unchanged",
-                    index_path.display(),
-                    after.as_str()
-                ),
-                hint: Some("Retry; if it persists run 'cass doctor check --json'".into()),
-                retryable: true,
-            });
-        }
-        ("rebuilt", after, true)
+        // Re-record a verified graph that the manifest forgot, without
+        // rebuilding it or changing its existing native generation.
+        (
+            maintenance.before,
+            maintenance.action(),
+            HnswAcceleratorState::NativeValid,
+            maintenance.rebuilt || !manifest_records_current,
+        )
     };
 
     if manifest_published {

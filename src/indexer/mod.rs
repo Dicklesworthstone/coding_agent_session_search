@@ -9874,6 +9874,83 @@ fn semantic_index_has_current_contract(data_dir: &Path, requested_embedder: &str
     })
 }
 
+/// Honor explicit ANN maintenance even when no embedding work was needed.
+/// The index-run lock is held by the caller. Only the published requested
+/// artifact may be accelerated; constructing a model is unnecessary here.
+fn maintain_requested_hnsw(data_dir: &Path, requested_embedder: &str) -> Result<usize> {
+    use crate::search::ann_index::{hnsw_index_path, maintain_hnsw_accelerator};
+    use crate::search::semantic_manifest::HnswRecord;
+
+    let Some(mut manifest) = SemanticManifest::load(data_dir)? else {
+        tracing::info!(
+            action = "skipped",
+            reason = "no_vectors",
+            "HNSW maintenance has no published semantic artifact"
+        );
+        return Ok(0);
+    };
+    anyhow::ensure!(
+        semantic_index_has_current_contract(data_dir, requested_embedder),
+        "cannot build HNSW: the requested semantic artifact is not published under the current input contract; run 'cass index --semantic --force-rebuild'"
+    );
+    let tier = if matches!(requested_embedder, "hash" | "fnv1a-384") {
+        SemanticTierKind::Fast
+    } else {
+        SemanticTierKind::Quality
+    };
+    let artifact = semantic_artifact_for_tier(&manifest, tier)
+        .context("requested semantic tier is absent after publication")?;
+    let index_path = semantic_artifact_index_path(data_dir, artifact)?;
+    let index = FsVectorIndex::open_read_only(&index_path)
+        .context("opening the published semantic artifact for HNSW maintenance")?;
+    let vector_count = index.record_count();
+    anyhow::ensure!(
+        u64::try_from(vector_count).ok() == Some(artifact.doc_count),
+        "cannot build HNSW: published vector count does not match the selected semantic artifact"
+    );
+    let embedder_id = artifact.embedder_id.clone();
+    let ann_path = hnsw_index_path(data_dir, &embedder_id);
+    let relative_ann_path = ann_path
+        .strip_prefix(data_dir)
+        .context("HNSW path must remain inside the selected data directory")?
+        .to_string_lossy()
+        .into_owned();
+    let maintenance = maintain_hnsw_accelerator(
+        &ann_path,
+        &index,
+        frankensearch::index::HnswConfig::default(),
+        false,
+    )?;
+    let already_recorded = manifest.hnsw.as_ref().is_some_and(|record| {
+        record.ready
+            && record.base_tier == tier
+            && record.embedder_id == embedder_id
+            && record.index_path == relative_ann_path
+    });
+    if maintenance.rebuilt || !already_recorded {
+        manifest.publish_hnsw(HnswRecord {
+            base_tier: tier,
+            embedder_id,
+            ef_search: frankensearch::index::HNSW_DEFAULT_EF_SEARCH,
+            index_path: relative_ann_path,
+            size_bytes: fs::metadata(&ann_path)?.len(),
+            built_at_ms: semantic_indexing_now_ms(),
+            ready: true,
+        });
+        manifest
+            .save(data_dir)
+            .context("recording the natively verified HNSW accelerator in the semantic manifest")?;
+    }
+    tracing::info!(
+        action = maintenance.action(),
+        reason = maintenance.reason,
+        vector_count,
+        manifest_published = maintenance.rebuilt || !already_recorded,
+        "completed requested HNSW maintenance for the published semantic artifact"
+    );
+    Ok(vector_count)
+}
+
 /// Republish the semantic manifest after a direct `cass index --semantic`
 /// pass so `cass status` reflects the freshly-built vector index.
 ///
@@ -17921,7 +17998,7 @@ fn run_index_inner(
                     0,
                     embedded_doc_count,
                 );
-                let vector_index = semantic_indexer.build_and_save_index_with_progress(
+                semantic_indexer.build_and_save_index_with_progress(
                     embedded_messages,
                     &opts.data_dir,
                     |current| {
@@ -17942,36 +18019,6 @@ fn run_index_inner(
                     embedder = semantic_indexer.embedder_id(),
                     "saved semantic vector index"
                 );
-
-                // Build HNSW index for approximate nearest neighbor search (if enabled)
-                if opts.build_hnsw {
-                    set_semantic_phase("semantic:hnsw");
-                    let vector_count = vector_index.record_count();
-                    set_semantic_progress_phase(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        INDEX_PHASE_SEMANTIC_HNSW,
-                        0,
-                        vector_count,
-                    );
-                    let hnsw_path = semantic_indexer.build_hnsw_index(
-                        &vector_index,
-                        &opts.data_dir,
-                        None, // Use default M
-                        None, // Use default ef_construction
-                    )?;
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        vector_count,
-                        vector_count,
-                    );
-                    tracing::info!(
-                        path = %hnsw_path.display(),
-                        embedder = semantic_indexer.embedder_id(),
-                        "saved HNSW index for approximate search"
-                    );
-                }
 
                 // Publish the artifact to the semantic manifest so `cass
                 // status` reflects the freshly-built index. Without this,
@@ -18046,6 +18093,27 @@ fn run_index_inner(
                 )?;
             }
             update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
+        }
+        // The embedding watermark can skip the bulk pass, or the delta path
+        // can publish a replacement generation. Both still owe explicitly
+        // requested graph maintenance, after the exact artifact is published.
+        if opts.build_hnsw {
+            prepare_progress_for_semantic_build(opts.progress.as_ref());
+            index_run_lock.set_phase(initial_lock_mode, "semantic:hnsw")?;
+            set_semantic_progress_phase(
+                opts.progress.as_ref(),
+                &progress_bump,
+                INDEX_PHASE_SEMANTIC_HNSW,
+                0,
+                0,
+            );
+            let vector_count = maintain_requested_hnsw(&opts.data_dir, &opts.embedder)?;
+            update_semantic_progress(
+                opts.progress.as_ref(),
+                &progress_bump,
+                vector_count,
+                vector_count,
+            );
         }
     }
 
@@ -18679,6 +18747,12 @@ fn run_index_inner(
                             indexed,
                             pre_watch_semantic_conversations,
                         )?;
+                        if opts_clone.build_hnsw {
+                            if let Some(progress) = opts_clone.progress.as_ref() {
+                                progress.set_phase_progress(INDEX_PHASE_SEMANTIC_HNSW, 0, 0);
+                            }
+                            maintain_requested_hnsw(&data_dir_for_semantic, &embedder_id)?;
+                        }
                         record_semantic_watch_once_stats(opts_clone.progress.as_ref(), stats);
                     }
                     indexed
@@ -19464,11 +19538,15 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
         && !opts.watch
         && !opts.full
         && !opts.force_rebuild
-        && !opts.build_hnsw
         && opts
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty())
+        // Explicit graph construction previously seeded missing vectors via
+        // the broad build. Retain that path when targeted reconciliation has
+        // no compatible published base to extend.
+        && (!opts.build_hnsw
+            || semantic_index_has_current_contract(&opts.data_dir, &opts.embedder))
 }
 
 const fn should_optimize_tantivy_after_watch_once_ingest(

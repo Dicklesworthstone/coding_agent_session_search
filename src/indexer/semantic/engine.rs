@@ -4360,10 +4360,11 @@ impl SemanticIndexer {
         outcome
     }
 
-    /// Build and save an HNSW index for approximate nearest neighbor search.
+    /// Build or verify an HNSW index for approximate nearest neighbor search.
     ///
-    /// This creates an HNSW graph structure from the existing VectorIndex,
-    /// enabling O(log n) approximate search with the `--approximate` flag.
+    /// A matching persisted native graph is retained without rewriting it.
+    /// Missing, invalid, or differently configured graphs are rebuilt from the
+    /// existing vectors and read back before success is reported.
     ///
     /// # Arguments
     /// * `vector_index` - The VectorIndex to build HNSW from
@@ -4380,33 +4381,33 @@ impl SemanticIndexer {
         m: Option<usize>,
         ef_construction: Option<usize>,
     ) -> Result<PathBuf> {
-        let m = m.unwrap_or(FS_HNSW_DEFAULT_M);
-        let ef_construction = ef_construction.unwrap_or(FS_HNSW_DEFAULT_EF_CONSTRUCTION);
-
-        tracing::info!(
-            embedder = self.embedder_id(),
-            count = vector_index.record_count(),
-            m,
-            ef_construction,
-            "Building HNSW index for approximate nearest neighbor search"
-        );
-
+        let expected_revision = self.vector_space_revision()?;
+        if vector_index.embedder_id() != self.embedder_id()
+            || vector_index.dimension() != self.embedder_dimension()
+            || vector_index.embedder_revision() != expected_revision
+        {
+            bail!(
+                "cannot build HNSW for an incompatible semantic vector space: expected {} revision {} dimension {}, found {} revision {} dimension {}",
+                self.embedder_id(),
+                expected_revision,
+                self.embedder_dimension(),
+                vector_index.embedder_id(),
+                vector_index.embedder_revision(),
+                vector_index.dimension()
+            );
+        }
         let config = FsHnswConfig {
-            m,
-            ef_construction,
+            m: m.unwrap_or(FS_HNSW_DEFAULT_M),
+            ef_construction: ef_construction.unwrap_or(FS_HNSW_DEFAULT_EF_CONSTRUCTION),
             ..FsHnswConfig::default()
         };
-        let hnsw = FsHnswIndex::build_from_vector_index(vector_index, config)
-            .map_err(|err| anyhow::anyhow!("build HNSW index failed: {err}"))?;
-
         let hnsw_path = hnsw_index_path(data_dir, self.embedder_id());
-        if let Some(parent) = hnsw_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        hnsw.save(&hnsw_path)
-            .map_err(|err| anyhow::anyhow!("save HNSW index failed: {err}"))?;
-
-        tracing::info!(?hnsw_path, "Saved HNSW index");
+        crate::search::ann_index::maintain_hnsw_accelerator(
+            &hnsw_path,
+            vector_index,
+            config,
+            false,
+        )?;
         Ok(hnsw_path)
     }
 }
@@ -4419,6 +4420,46 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn hnsw_maintenance_refuses_an_incompatible_vector_contract() -> Result<()> {
+        let temp = tempdir()?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        for (name, embedder_id, revision, dimension) in [
+            ("old-input", "fnv1a-384", "hash-fnv1a-modular-v1", 384),
+            ("other-model", "minilm-384", HASH_VECTOR_SPACE_REVISION, 384),
+            (
+                "other-dimension",
+                "fnv1a-384",
+                HASH_VECTOR_SPACE_REVISION,
+                16,
+            ),
+        ] {
+            let path = temp.path().join(format!("{name}.fsvi"));
+            let mut writer = FsVectorIndex::create_with_revision(
+                &path,
+                embedder_id,
+                revision,
+                dimension,
+                FsQuantization::F16,
+            )?;
+            let mut vector = vec![0.0; dimension];
+            vector[0] = 1.0;
+            writer.write_record("example", &vector)?;
+            writer.finish()?;
+            let index = FsVectorIndex::open_read_only(&path)?;
+            let error = indexer
+                .build_hnsw_index(&index, temp.path(), None, None)
+                .expect_err("foreign vector contracts must be refused before graph publication");
+            assert!(
+                error
+                    .to_string()
+                    .contains("incompatible semantic vector space")
+            );
+            assert!(!hnsw_index_path(temp.path(), indexer.embedder_id()).exists());
+        }
+        Ok(())
+    }
 
     /// Counts inference inputs while executing the real hash producer.
     struct MeasuredHashEmbedder {
