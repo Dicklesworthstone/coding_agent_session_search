@@ -529,10 +529,11 @@ mod tests {
     /// drift immediately at CI time.
     #[test]
     fn variant_count_matches_audited_lib_rs_kind_literals() {
-        // 94 unique kinds after the final answer-pack output budget adds
-        // `pack-budget-too-small`. If lib.rs grows a new
-        // kind, bump this count AND add the variant + arms above.
-        const AUDITED_KIND_COUNT: usize = 94;
+        // 95 unique kinds after background indexing's deferred storage
+        // migration repair adds `migration-repair-pending` (GH #450). If
+        // lib.rs grows a new kind, bump this count AND add the variant +
+        // arms above.
+        const AUDITED_KIND_COUNT: usize = 95;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,
