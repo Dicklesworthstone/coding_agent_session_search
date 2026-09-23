@@ -28939,7 +28939,8 @@ fn dispatch_watch_callback<F>(
     roots: &[(ConnectorKind, ScanRoot)],
     is_rebuild: bool,
     callback: &F,
-) where
+) -> bool
+where
     F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<BTreeSet<PathBuf>>,
 {
     let paths = if is_rebuild {
@@ -28948,13 +28949,152 @@ fn dispatch_watch_callback<F>(
         pending.iter().cloned().collect()
     };
     match callback(paths, roots, is_rebuild) {
-        Ok(deferred) => *pending = deferred,
+        Ok(deferred) => {
+            *pending = deferred;
+            true
+        }
         Err(error) => {
             tracing::warn!(%error, is_rebuild, "watch callback failed; retaining sources for retry");
             if is_rebuild {
                 pending.extend(roots.iter().map(|(_, root)| root.path.clone()));
             }
+            false
         }
+    }
+}
+
+// Both the notification-thread mailbox and the consumer's debounced pending
+// set have these bounds. Once an event cannot fit, one full-root scan replaces
+// the individual paths. BTreeSet overhead is bounded by the path count; the
+// byte bound charges actual PathBuf capacities, including overallocated paths.
+const WATCH_PENDING_MAX_PATHS: usize = 4096;
+const WATCH_PENDING_MAX_PATH_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct WatchEventBacklog {
+    paths: BTreeSet<PathBuf>,
+    path_bytes: usize,
+}
+
+impl WatchEventBacklog {
+    fn extend(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> bool {
+        for path in paths {
+            if self.paths.contains(&path) {
+                continue;
+            }
+            let path_bytes = self.path_bytes.saturating_add(path.capacity());
+            if self.paths.len() >= WATCH_PENDING_MAX_PATHS
+                || path_bytes > WATCH_PENDING_MAX_PATH_BYTES
+            {
+                self.clear();
+                return false;
+            }
+            self.path_bytes = path_bytes;
+            self.paths.insert(path);
+        }
+        true
+    }
+
+    fn clear(&mut self) {
+        self.paths.clear();
+        self.path_bytes = 0;
+    }
+}
+
+/// The notify thread must never wait for indexing or retain an unbounded event
+/// queue. Contention is treated like a kernel event overflow: the next scan
+/// visits every watched root without trusting its prior event watermark.
+fn enqueue_watch_notification(
+    result: notify::Result<notify::Event>,
+    backlog: &Mutex<WatchEventBacklog>,
+    rescan: &AtomicBool,
+    wake: &Sender<()>,
+) {
+    match result {
+        Ok(event) if event.need_rescan() => rescan.store(true, Ordering::Release),
+        Ok(event) => {
+            if !watch_event_should_trigger_reindex(&event) || event.paths.is_empty() {
+                return;
+            }
+            match backlog.try_lock() {
+                Ok(mut backlog) => {
+                    if !backlog.extend(event.paths) {
+                        rescan.store(true, Ordering::Release);
+                    }
+                }
+                Err(_) => rescan.store(true, Ordering::Release),
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "filesystem watcher error; scheduling a full-root scan");
+            rescan.store(true, Ordering::Release);
+        }
+    }
+    // A full channel already contains the wakeup for this coalesced work.
+    let _ = wake.try_send(());
+}
+
+fn collect_watch_notifications(
+    backlog: &Mutex<WatchEventBacklog>,
+    rescan: &AtomicBool,
+    pending: &mut WatchEventBacklog,
+    pending_rescan: &mut bool,
+) {
+    let received = {
+        let mut backlog = backlog.lock().unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut *backlog)
+    };
+    *pending_rescan |= rescan.swap(false, Ordering::AcqRel);
+    if *pending_rescan {
+        pending.clear();
+    } else if !pending.extend(received.paths) {
+        *pending_rescan = true;
+    }
+}
+
+fn dispatch_pending_watch_callback<F>(
+    pending: &mut WatchEventBacklog,
+    pending_rescan: &mut bool,
+    roots: &[(ConnectorKind, ScanRoot)],
+    callback: &F,
+) where
+    F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<BTreeSet<PathBuf>>,
+{
+    let is_rebuild = std::mem::take(pending_rescan);
+    let mut paths = std::mem::take(&mut pending.paths);
+    pending.path_bytes = 0;
+    let succeeded = dispatch_watch_callback(&mut paths, roots, is_rebuild, callback);
+    // A failed full-root scan cannot become a timestamp-filtered retry: the
+    // lost notification may describe a source older than the directory mtime.
+    if (is_rebuild && !succeeded) || !pending.extend(paths) {
+        *pending_rescan = true;
+    }
+}
+
+enum WatchLoopEvent {
+    Control(IndexerEvent),
+    Filesystem,
+    Timeout,
+    Disconnected,
+}
+
+fn next_watch_loop_event(
+    controls: &Receiver<IndexerEvent>,
+    notifications: &Receiver<()>,
+    timeout: Duration,
+) -> WatchLoopEvent {
+    // Control traffic has its own channel and always wins over filesystem
+    // notifications. A busy filesystem cannot crowd out operator commands.
+    crossbeam_channel::select_biased! {
+        recv(controls) -> event => match event {
+            Ok(event) => WatchLoopEvent::Control(event),
+            Err(_) => WatchLoopEvent::Disconnected,
+        },
+        recv(notifications) -> event => match event {
+            Ok(()) => WatchLoopEvent::Filesystem,
+            Err(_) => WatchLoopEvent::Disconnected,
+        },
+        default(timeout) => WatchLoopEvent::Timeout,
     }
 }
 
@@ -29000,23 +29140,17 @@ where
         return Ok(());
     }
 
-    let (tx, rx) = event_channel.unwrap_or_else(crossbeam_channel::unbounded);
-    let tx_clone = tx.clone();
+    let (_control_sender, controls) = event_channel
+        .map(|(sender, receiver)| (Some(sender), receiver))
+        .unwrap_or_else(|| (None, never()));
+    let (wake, notifications) = bounded(1);
+    let notification_backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+    let notification_rescan = Arc::new(AtomicBool::new(false));
+    let backlog_for_watcher = Arc::clone(&notification_backlog);
+    let rescan_for_watcher = Arc::clone(&notification_rescan);
 
-    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-        Ok(event) => {
-            if event.need_rescan() {
-                let _ = tx_clone.send(IndexerEvent::Command(ReindexCommand::Full));
-                return;
-            }
-            if !watch_event_should_trigger_reindex(&event) || event.paths.is_empty() {
-                return;
-            }
-            let _ = tx_clone.send(IndexerEvent::Notify(event.paths));
-        }
-        Err(e) => {
-            tracing::warn!("filesystem watcher error: {}", e);
-        }
+    let mut watcher = recommended_watcher(move |result| {
+        enqueue_watch_notification(result, &backlog_for_watcher, &rescan_for_watcher, &wake);
     })?;
 
     // Watch all detected roots
@@ -29046,8 +29180,9 @@ where
     let min_scan_interval = Duration::from_secs(watch_interval_secs.max(1));
     // Stale check interval: check every 5 minutes for quicker detection
     let stale_check_interval = Duration::from_secs(300);
-    let mut pending = deferred_sources;
-    let mut first_event = (!pending.is_empty()).then(Instant::now);
+    let mut pending = WatchEventBacklog::default();
+    let mut pending_rescan = !pending.extend(deferred_sources);
+    let mut first_event = (pending_rescan || !pending.paths.is_empty()).then(Instant::now);
     let mut last_stale_check = Instant::now();
     // Initialize to the past so the first scan can fire immediately.
     // Use checked_sub to avoid panic if system uptime < min_scan_interval
@@ -29076,7 +29211,7 @@ where
         let cooldown_remaining = min_scan_interval.saturating_sub(last_scan.elapsed());
 
         // Calculate timeout: use stale check interval when idle, debounce when active
-        let timeout = if pending.is_empty() {
+        let timeout = if !pending_rescan && pending.paths.is_empty() {
             stale_check_interval
         } else {
             let now = Instant::now();
@@ -29084,9 +29219,14 @@ where
             if elapsed >= max_wait {
                 if cooldown_remaining.is_zero() {
                     // Cooldown elapsed and max_wait exceeded: fire now.
-                    dispatch_watch_callback(&mut pending, &roots, false, &callback);
+                    dispatch_pending_watch_callback(
+                        &mut pending,
+                        &mut pending_rescan,
+                        &roots,
+                        &callback,
+                    );
                     last_scan = Instant::now();
-                    first_event = (!pending.is_empty()).then(Instant::now);
+                    first_event = (pending_rescan || !pending.paths.is_empty()).then(Instant::now);
                     continue;
                 }
                 // max_wait exceeded but cooldown still active: wait for
@@ -29100,31 +29240,61 @@ where
             }
         };
 
-        match rx.recv_timeout(timeout) {
-            Ok(IndexerEvent::Notify(paths)) => {
-                if pending.is_empty() {
+        match next_watch_loop_event(&controls, &notifications, timeout) {
+            WatchLoopEvent::Filesystem => {
+                if !pending_rescan && pending.paths.is_empty() {
                     first_event = Some(Instant::now());
                 }
-                pending.extend(paths);
+                collect_watch_notifications(
+                    &notification_backlog,
+                    &notification_rescan,
+                    &mut pending,
+                    &mut pending_rescan,
+                );
             }
-            Ok(IndexerEvent::Command(cmd)) => match cmd {
+            WatchLoopEvent::Control(IndexerEvent::Notify(paths)) => {
+                if !pending_rescan && pending.paths.is_empty() {
+                    first_event = Some(Instant::now());
+                }
+                if !pending_rescan && !pending.extend(paths) {
+                    pending_rescan = true;
+                }
+            }
+            WatchLoopEvent::Control(IndexerEvent::Command(cmd)) => match cmd {
                 ReindexCommand::Full => {
                     // Full rebuild commands bypass cooldown for responsive
-                    // operator-initiated rebuilds.
-                    if !pending.is_empty() {
-                        dispatch_watch_callback(&mut pending, &roots, false, &callback);
-                    }
-                    dispatch_watch_callback(&mut pending, &roots, true, &callback);
+                    // operator-initiated rebuilds. Drain notifications that
+                    // precede the scan; later events remain queued for retry.
+                    collect_watch_notifications(
+                        &notification_backlog,
+                        &notification_rescan,
+                        &mut pending,
+                        &mut pending_rescan,
+                    );
+                    pending_rescan = true;
+                    dispatch_pending_watch_callback(
+                        &mut pending,
+                        &mut pending_rescan,
+                        &roots,
+                        &callback,
+                    );
                     last_scan = Instant::now();
-                    first_event = (!pending.is_empty()).then(Instant::now);
+                    first_event = (pending_rescan || !pending.paths.is_empty()).then(Instant::now);
                 }
             },
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            WatchLoopEvent::Timeout => {
                 // Process pending events only if cooldown has elapsed
-                if !pending.is_empty() && last_scan.elapsed() >= min_scan_interval {
-                    dispatch_watch_callback(&mut pending, &roots, false, &callback);
+                if (pending_rescan || !pending.paths.is_empty())
+                    && last_scan.elapsed() >= min_scan_interval
+                {
+                    dispatch_pending_watch_callback(
+                        &mut pending,
+                        &mut pending_rescan,
+                        &roots,
+                        &callback,
+                    );
                     last_scan = Instant::now();
-                    first_event = (!pending.is_empty()).then(Instant::now);
+                    first_event = (pending_rescan || !pending.paths.is_empty()).then(Instant::now);
                 }
 
                 // Periodic stale check
@@ -29154,9 +29324,22 @@ where
                                     "stale state detected, triggering automatic full rebuild"
                                 );
                                 // Trigger full rebuild
-                                dispatch_watch_callback(&mut pending, &roots, true, &callback);
+                                collect_watch_notifications(
+                                    &notification_backlog,
+                                    &notification_rescan,
+                                    &mut pending,
+                                    &mut pending_rescan,
+                                );
+                                pending_rescan = true;
+                                dispatch_pending_watch_callback(
+                                    &mut pending,
+                                    &mut pending_rescan,
+                                    &roots,
+                                    &callback,
+                                );
                                 last_scan = Instant::now();
-                                first_event = (!pending.is_empty()).then(Instant::now);
+                                first_event = (pending_rescan || !pending.paths.is_empty())
+                                    .then(Instant::now);
                             }
                             StaleAction::None => {
                                 // Stale detection disabled, should not reach here
@@ -29165,7 +29348,7 @@ where
                     }
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            WatchLoopEvent::Disconnected => break,
         }
     }
     Ok(())
@@ -59141,6 +59324,232 @@ mod tests {
     }
 
     #[test]
+    fn watch_notification_backlog_coalesces_and_overflow_retains_a_full_scan() {
+        let backlog = Mutex::new(WatchEventBacklog::default());
+        let rescan = AtomicBool::new(false);
+        let (wake, notifications) = bounded(1);
+        for _ in 0..10_000 {
+            enqueue_watch_notification(
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(PathBuf::from("sessions/repeated.jsonl"))),
+                &backlog,
+                &rescan,
+                &wake,
+            );
+        }
+        assert_eq!(notifications.len(), 1, "wakeups must coalesce");
+        assert_eq!(backlog.lock().unwrap().paths.len(), 1);
+        assert!(!rescan.load(Ordering::Acquire));
+
+        // Simulate a filesystem flood while indexing owns the consumer thread.
+        for index in 0..WATCH_PENDING_MAX_PATHS {
+            enqueue_watch_notification(
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(PathBuf::from(format!("sessions/rollout-{index}.jsonl")))),
+                &backlog,
+                &rescan,
+                &wake,
+            );
+        }
+        assert_eq!(notifications.len(), 1);
+        assert!(rescan.load(Ordering::Acquire));
+        assert!(backlog.lock().unwrap().paths.len() <= WATCH_PENDING_MAX_PATHS);
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        assert!(pending_rescan, "overflow must not silently drop sources");
+        assert!(pending.paths.is_empty());
+
+        let roots = [(
+            ConnectorKind::Codex,
+            ScanRoot::local(PathBuf::from("sessions")),
+        )];
+        let deferred = PathBuf::from("sessions/still-active.jsonl");
+        dispatch_pending_watch_callback(
+            &mut pending,
+            &mut pending_rescan,
+            &roots,
+            &|paths, actual_roots, rebuilding| {
+                assert!(rebuilding, "lost events require a watermark-free scan");
+                assert!(paths.is_empty());
+                assert_eq!(actual_roots[0].1.path, roots[0].1.path);
+                Ok(BTreeSet::from([deferred.clone()]))
+            },
+        );
+        assert!(!pending_rescan);
+        assert_eq!(pending.paths, BTreeSet::from([deferred.clone()]));
+        dispatch_pending_watch_callback(
+            &mut pending,
+            &mut pending_rescan,
+            &roots,
+            &|paths, _, rebuilding| {
+                assert!(!rebuilding);
+                assert_eq!(paths, vec![deferred.clone()]);
+                Ok(BTreeSet::new())
+            },
+        );
+        assert!(pending.paths.is_empty());
+    }
+
+    #[test]
+    fn watch_notification_backlog_bounds_retained_path_capacity_and_pending_paths() {
+        let backlog = Mutex::new(WatchEventBacklog::default());
+        let rescan = AtomicBool::new(false);
+        let (wake, notifications) = bounded(1);
+        let mut overallocated = PathBuf::with_capacity(WATCH_PENDING_MAX_PATH_BYTES + 1);
+        overallocated.push("sessions/small-name.jsonl");
+        enqueue_watch_notification(
+            Ok(notify::Event::new(notify::EventKind::Any).add_path(overallocated)),
+            &backlog,
+            &rescan,
+            &wake,
+        );
+        assert!(rescan.load(Ordering::Acquire));
+        assert_eq!(notifications.len(), 1, "an empty queue must still wake");
+        assert_eq!(backlog.lock().unwrap().path_bytes, 0);
+
+        let mut pending = WatchEventBacklog::default();
+        assert!(pending.extend(
+            (0..WATCH_PENDING_MAX_PATHS).map(|index| PathBuf::from(format!("session-{index}")))
+        ));
+        let mut pending_rescan = false;
+        collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        assert!(pending_rescan);
+        assert!(pending.paths.is_empty());
+        assert_eq!(pending.path_bytes, 0);
+
+        // Separately exercise overflow while merging individually bounded
+        // notifications into the consumer's debounce window.
+        pending_rescan = false;
+        assert!(pending.extend(
+            (0..WATCH_PENDING_MAX_PATHS).map(|index| PathBuf::from(format!("session-{index}")))
+        ));
+        enqueue_watch_notification(
+            Ok(notify::Event::new(notify::EventKind::Any)
+                .add_path(PathBuf::from("one-more-session"))),
+            &backlog,
+            &rescan,
+            &wake,
+        );
+        collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        assert!(pending_rescan);
+        assert!(pending.paths.is_empty());
+    }
+
+    #[test]
+    fn watch_notification_backlog_never_waits_for_the_consumer_lock() {
+        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, notifications) = bounded(1);
+        let (done, completed) = bounded(1);
+        let held = backlog.lock().unwrap();
+        let producer_backlog = Arc::clone(&backlog);
+        let producer_rescan = Arc::clone(&rescan);
+        let producer = thread::spawn(move || {
+            enqueue_watch_notification(
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(PathBuf::from("sessions/changed-while-locked.jsonl"))),
+                &producer_backlog,
+                &producer_rescan,
+                &wake,
+            );
+            done.send(()).unwrap();
+        });
+        let finished_without_lock = completed.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(held);
+        producer.join().unwrap();
+        assert!(finished_without_lock, "notify must never wait for indexing");
+        assert!(rescan.load(Ordering::Acquire));
+        assert_eq!(notifications.len(), 1);
+    }
+
+    #[test]
+    fn watch_notification_backlog_preserves_changes_during_a_failed_full_scan() {
+        let backlog = Mutex::new(WatchEventBacklog::default());
+        let rescan = AtomicBool::new(false);
+        let (wake, _notifications) = bounded(1);
+        let roots = [(
+            ConnectorKind::Codex,
+            ScanRoot::local(PathBuf::from("sessions")),
+        )];
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = true;
+        dispatch_pending_watch_callback(
+            &mut pending,
+            &mut pending_rescan,
+            &roots,
+            &|_, _, rebuilding| {
+                assert!(rebuilding);
+                enqueue_watch_notification(
+                    Ok(notify::Event::new(notify::EventKind::Any)
+                        .add_path(PathBuf::from("sessions/changed-during-scan.jsonl"))),
+                    &backlog,
+                    &rescan,
+                    &wake,
+                );
+                anyhow::bail!("transient storage failure")
+            },
+        );
+        assert!(
+            pending_rescan,
+            "failed full scan must retain full-scan debt"
+        );
+        collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        dispatch_pending_watch_callback(
+            &mut pending,
+            &mut pending_rescan,
+            &roots,
+            &|_, _, rebuilding| {
+                assert!(rebuilding, "a retry must not restore timestamp cutoffs");
+                // An event after this scan starts is distinct work even if
+                // this full-root scan eventually completes successfully.
+                enqueue_watch_notification(
+                    Ok(notify::Event::new(notify::EventKind::Any)
+                        .add_path(PathBuf::from("sessions/after-retry-start.jsonl"))),
+                    &backlog,
+                    &rescan,
+                    &wake,
+                );
+                Ok(BTreeSet::new())
+            },
+        );
+        assert!(!pending_rescan);
+        collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        assert!(!pending_rescan);
+        assert_eq!(
+            pending.paths,
+            BTreeSet::from([PathBuf::from("sessions/after-retry-start.jsonl")])
+        );
+    }
+
+    #[test]
+    fn watch_notification_backlog_keeps_control_commands_ahead_of_wakeups() {
+        let (commands, controls) = bounded(1);
+        let (wake, notifications) = bounded(1);
+        wake.send(()).unwrap();
+        commands
+            .send(IndexerEvent::Command(ReindexCommand::Full))
+            .unwrap();
+        assert!(matches!(
+            next_watch_loop_event(&controls, &notifications, Duration::ZERO),
+            WatchLoopEvent::Control(IndexerEvent::Command(ReindexCommand::Full))
+        ));
+        assert!(matches!(
+            next_watch_loop_event(&controls, &notifications, Duration::ZERO),
+            WatchLoopEvent::Filesystem
+        ));
+        assert!(matches!(
+            next_watch_loop_event(&controls, &notifications, Duration::ZERO),
+            WatchLoopEvent::Timeout
+        ));
+        drop(commands);
+        assert!(matches!(
+            next_watch_loop_event(&controls, &notifications, Duration::ZERO),
+            WatchLoopEvent::Disconnected
+        ));
+    }
+
+    #[test]
     #[serial]
     fn watch_state_round_trips_to_disk() {
         let tmp = TempDir::new().unwrap();
@@ -60113,6 +60522,116 @@ mod tests {
             &index_dir(&opts.data_dir)?,
             false,
         )
+    }
+
+    #[test]
+    #[serial]
+    fn watch_notification_backlog_overflow_recovers_old_sources_without_resetting_archive() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass");
+        fs::create_dir_all(&data_dir).unwrap();
+        let selected = tmp.path().join("selected/amp");
+        let missed = selected.join("thread-missed.json");
+        let unrelated = tmp.path().join("unrelated/amp/thread-other.json");
+        write_watch_lexical_source(&missed, "thread-missed", "overflowrecoveryneedle");
+        write_watch_lexical_source(&unrelated, "thread-other", "overflowpreservedneedle");
+        fs::File::options()
+            .write(true)
+            .open(&missed)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .unwrap();
+        let source_bytes = fs::read(&missed).unwrap();
+        let source_mtime = fs::metadata(&missed).unwrap().modified().unwrap();
+        let opts = watch_lexical_options(&data_dir);
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(&data_dir).unwrap();
+        let index = Mutex::new(Some(TantivyIndex::open_or_create(&index_path).unwrap()));
+        assert_eq!(
+            run_watch_lexical_selection(&opts, &unrelated, &storage, &index).unwrap(),
+            1
+        );
+        let preserved_rows = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        let preserved_ids = watch_lexical_search_ids(&index_path, "overflowpreservedneedle");
+        assert_eq!(preserved_rows.len(), 1);
+        assert_eq!(preserved_ids.len(), 1);
+        let roots = [(ConnectorKind::Amp, ScanRoot::local(selected.clone()))];
+        let state = Mutex::new(HashMap::from([(ConnectorKind::Amp, i64::MAX / 4)]));
+
+        // A directory-only incremental retry does not recover the lost event:
+        // both the event watermark and directory mtime postdate this source.
+        assert_eq!(
+            reindex_paths(
+                &opts,
+                vec![selected.clone()],
+                &roots,
+                &state,
+                &storage,
+                &index,
+                &index_path,
+                false,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(watch_lexical_search_ids(&index_path, "overflowrecoveryneedle").is_empty());
+
+        let backlog = Mutex::new(WatchEventBacklog::default());
+        let rescan = AtomicBool::new(false);
+        let (wake, _notifications) = bounded(1);
+        for index in 0..=WATCH_PENDING_MAX_PATHS {
+            enqueue_watch_notification(
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(selected.join(format!("lost-notification-{index}")))),
+                &backlog,
+                &rescan,
+                &wake,
+            );
+        }
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        assert!(pending_rescan);
+        dispatch_pending_watch_callback(
+            &mut pending,
+            &mut pending_rescan,
+            &roots,
+            &|paths, roots, rebuilding| {
+                assert!(paths.is_empty());
+                assert!(rebuilding);
+                let indexed = reindex_paths(
+                    &opts,
+                    roots.iter().map(|(_, root)| root.path.clone()).collect(),
+                    roots,
+                    &state,
+                    &storage,
+                    &index,
+                    &index_path,
+                    rebuilding,
+                )?;
+                assert_eq!(indexed, 1);
+                Ok(BTreeSet::new())
+            },
+        );
+        assert!(!pending_rescan);
+        let rows = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], preserved_rows[0]);
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "overflowpreservedneedle"),
+            preserved_ids
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "overflowrecoveryneedle").len(),
+            1
+        );
+        assert_eq!(fs::read(&missed).unwrap(), source_bytes);
+        assert_eq!(
+            fs::metadata(&missed).unwrap().modified().unwrap(),
+            source_mtime
+        );
     }
 
     #[test]
