@@ -62530,15 +62530,35 @@ fn doctor_push_interrupted_scan_entries(
             continue;
         }
         let kind = doctor_interrupted_kind_for_path(entry.path());
-        reports.push(doctor_interrupted_report_for_path(
+        let mut report = doctor_interrupted_report_for_path(
             data_dir,
             entry.path(),
             kind,
             DoctorInterruptedOperationDisposition::NeedsInspection,
             vec![evidence_label.to_string()],
-        ));
+        );
+        if doctor_interrupted_artifact_is_quarantinable(data_dir, entry.path()) {
+            report.next_action = DOCTOR_CLEANUP_INTERRUPTED_ARTIFACTS_NEXT_ACTION.to_string();
+        }
+        reports.push(report);
     }
 }
+
+/// The staging root `cass doctor --cleanup-interrupted-artifacts --yes`
+/// quarantines (every child, renamed under `doctor/quarantine/`, never deleted).
+fn doctor_raw_mirror_capture_staging_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("raw-mirror").join("v1").join("tmp")
+}
+
+/// GH #497: whether the supported cleanup command clears this interrupted
+/// artifact, so doctor can name that command instead of asking for manual
+/// inspection. Decided by location, not by the path's words, because the
+/// cleanup command moves exactly the children of the staging root.
+fn doctor_interrupted_artifact_is_quarantinable(data_dir: &Path, path: &Path) -> bool {
+    path.starts_with(doctor_raw_mirror_capture_staging_root(data_dir))
+}
+
+const DOCTOR_CLEANUP_INTERRUPTED_ARTIFACTS_NEXT_ACTION: &str = "run cass doctor --cleanup-interrupted-artifacts --yes to quarantine interrupted raw-mirror capture staging (moved under doctor/quarantine/interrupted-artifacts, never deleted), then rerun cass doctor --json";
 
 fn doctor_lexical_publish_in_progress_backup_path(index_path: &Path) -> Option<PathBuf> {
     let file_name = index_path.file_name()?.to_string_lossy();
@@ -62571,7 +62591,7 @@ fn collect_doctor_interrupted_operation_states(
     doctor_push_interrupted_scan_entries(
         &mut reports,
         data_dir,
-        &data_dir.join("raw-mirror").join("v1").join("tmp"),
+        &doctor_raw_mirror_capture_staging_root(data_dir),
         "raw-mirror-interrupted-capture",
     );
     doctor_push_interrupted_scan_entries(
@@ -62646,6 +62666,13 @@ fn build_doctor_operation_state_report(
         .iter()
         .filter(|state| state.blocks_mutation)
         .count();
+    let quarantinable_blocker_count = interrupted_states
+        .iter()
+        .filter(|state| {
+            state.blocks_mutation
+                && doctor_interrupted_artifact_is_quarantinable(data_dir, Path::new(&state.path))
+        })
+        .count();
     let mutation_blocked_reason = if active_index_maintenance {
         Some("active index/watch maintenance lock blocks mutating doctor repair".to_string())
     } else if external_doctor_repair_active {
@@ -62666,6 +62693,17 @@ fn build_doctor_operation_state_report(
         }
         Some(reason) if reason.contains("another cass doctor") => {
             "wait for the active cass doctor --fix process to finish, then rerun cass doctor --json"
+        }
+        // GH #497: name the supported command that clears the blocker when
+        // one exists, rather than only asking for inspection.
+        Some(reason)
+            if reason.contains("interrupted")
+                && quarantinable_blocker_count == interrupted_blocker_count =>
+        {
+            DOCTOR_CLEANUP_INTERRUPTED_ARTIFACTS_NEXT_ACTION
+        }
+        Some(reason) if reason.contains("interrupted") && quarantinable_blocker_count > 0 => {
+            "run cass doctor --cleanup-interrupted-artifacts --yes to quarantine the interrupted raw-mirror capture staging, then inspect the remaining operation_state.interrupted_states before running cass doctor --fix"
         }
         Some(reason) if reason.contains("interrupted") => {
             "inspect operation_state.interrupted_states before running cass doctor --fix"
@@ -71279,6 +71317,97 @@ mod doctor_asset_taxonomy_tests {
             }),
             "publish sidecar should be classified as recoverable, not deleted: {report:#?}"
         );
+    }
+
+    /// GH #497: an empty interrupted raw-mirror capture dir blocked every
+    /// mutating repair while doctor only said "inspect", although
+    /// `--cleanup-interrupted-artifacts --yes` is the supported way to clear
+    /// it. Doctor must name that command, and the command must actually
+    /// clear the blocker. The data dir sits under a directory named `backup`
+    /// so a word-based path classifier cannot be what decides.
+    #[test]
+    fn gh497_interrupted_capture_blocker_names_the_cleanup_command_that_clears_it() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("backup").join("cass");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let capture = doctor_raw_mirror_capture_staging_root(&data_dir).join("capture.4242.1");
+        std::fs::create_dir_all(&capture).expect("create empty interrupted capture dir");
+        let snapshot = crate::search::asset_state::SearchMaintenanceSnapshot::default();
+        let doctor_lock = DoctorMutationLockObservation::Absent {
+            path: doctor_mutation_lock_path(&data_dir),
+        };
+        let build = || {
+            build_doctor_operation_state_report(
+                &data_dir,
+                &db_path,
+                &index_path,
+                &snapshot,
+                &doctor_lock,
+            )
+        };
+
+        let blocked = build();
+        assert!(!blocked.mutating_doctor_allowed, "{blocked:#?}");
+        assert_eq!(
+            blocked.next_action, DOCTOR_CLEANUP_INTERRUPTED_ARTIFACTS_NEXT_ACTION,
+            "{blocked:#?}"
+        );
+        assert!(
+            blocked
+                .next_action
+                .contains("cass doctor --cleanup-interrupted-artifacts --yes")
+        );
+        assert!(
+            blocked.interrupted_states.iter().all(|state| state
+                .next_action
+                .contains("--cleanup-interrupted-artifacts --yes")),
+            "{blocked:#?}"
+        );
+
+        // A blocker the cleanup command does not cover keeps the inspection
+        // instruction next to the cleanup command.
+        let foreign = data_dir
+            .join("doctor")
+            .join("tmp")
+            .join("interrupted-repair");
+        std::fs::create_dir_all(&foreign).expect("create interrupted doctor tmp dir");
+        let mixed = build();
+        assert!(
+            mixed
+                .next_action
+                .contains("cass doctor --cleanup-interrupted-artifacts --yes")
+                && mixed
+                    .next_action
+                    .contains("inspect the remaining operation_state.interrupted_states"),
+            "{mixed:#?}"
+        );
+        assert!(
+            mixed
+                .interrupted_states
+                .iter()
+                .filter(|state| !doctor_interrupted_artifact_is_quarantinable(
+                    &data_dir,
+                    Path::new(&state.path)
+                ))
+                .all(|state| !state
+                    .next_action
+                    .contains("--cleanup-interrupted-artifacts")),
+            "{mixed:#?}"
+        );
+        std::fs::rename(&foreign, temp.path().join("moved-aside"))
+            .expect("move the foreign blocker out of the data dir");
+
+        crate::doctor_recover::run_doctor_cleanup_interrupted_artifacts(
+            Some(data_dir.clone()),
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("the named cleanup command succeeds");
+        assert!(!capture.exists(), "the capture dir was quarantined");
+        let cleared = build();
+        assert!(cleared.mutating_doctor_allowed, "{cleared:#?}");
+        assert_eq!(cleared.mutation_blocked_reason, None, "{cleared:#?}");
     }
 
     #[test]
