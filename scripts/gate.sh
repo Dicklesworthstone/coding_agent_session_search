@@ -221,6 +221,25 @@ if [ "${#UBS_FILES[@]}" -eq 0 ]; then
         git ls-files --others --exclude-standard -z -- '*.rs' '*.py' '*.sh' '*.js' '*.ts' '*.tsx' '*.jsx'
     } | sort -zu)
 fi
+# Honour .ubsignore. The pinned runner scans every file it is named, even one
+# its own .ubsignore, --ignore-file or --exclude covers, so the config-level
+# suppression AGENTS.md prescribes only takes effect if the gate drops those
+# paths before naming them. Each skipped path is printed in the receipt.
+if [ -f .ubsignore ] && [ "${#UBS_FILES[@]}" -gt 0 ]; then
+    declare -A ubs_ignored=()
+    while IFS= read -r -d '' path; do
+        ubs_ignored["$path"]=1
+    done < <(git ls-files -z -c -o -i --exclude-from=.ubsignore -- "${UBS_FILES[@]}")
+    ubs_kept=()
+    for path in "${UBS_FILES[@]}"; do
+        if [ -n "${ubs_ignored[${path#./}]:-}" ]; then
+            echo "gate: UBS skips .ubsignore path ${path}"
+        else
+            ubs_kept+=("$path")
+        fi
+    done
+    UBS_FILES=("${ubs_kept[@]}")
+fi
 UBS_FILES_ARG=""
 if [ "${#UBS_FILES[@]}" -gt 0 ]; then
     for path in "${UBS_FILES[@]}"; do

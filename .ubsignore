@@ -19,6 +19,11 @@ tests/golden/html_export/*.golden
 # Lock files (auto-generated)
 Cargo.lock
 
+# Third-party Pages vendor artifacts, pinned byte for byte by size and SHA-256
+# in src/pages/bundle.rs and src/pages_assets/vendor/manifest.json. They are
+# never edited or formatted here, so a finding in them cannot be fixed in-tree.
+src/pages_assets/vendor/
+
 # Editor/IDE
 .idea/
 .vscode/
