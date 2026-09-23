@@ -57,6 +57,79 @@ fn index_help_prints_usage() {
         .stdout(contains("--embedder"));
 }
 
+/// GH #450: a background run (stale-on-read refresh, scheduled job) must not
+/// start the engine's one-time migration repair of a large archive. It exits
+/// 7 with kind migration-repair-pending and leaves the archive untouched; once
+/// the migration marker is complete it no longer defers. The size guard is
+/// lowered for the child process only, so an 8 KiB file counts as large.
+#[test]
+fn background_index_defers_migration_repair_of_a_large_unmigrated_archive() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    fs::File::create(&db_path).unwrap().set_len(8192).unwrap();
+    let run = || {
+        base_cmd(tmp.path())
+            .args(["index", "--background", "--json", "--data-dir"])
+            .arg(&data_dir)
+            .env("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES", "4096")
+            .env("CASS_AUTO_REFRESH", "0")
+            .output()
+            .unwrap()
+    };
+    let error_kind = |output: &std::process::Output| {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+            .map(|payload| payload["error"].clone())
+    };
+
+    let deferred = run();
+    assert_eq!(deferred.status.code(), Some(7), "{deferred:?}");
+    let error = error_kind(&deferred).expect("a JSON error envelope");
+    assert_eq!(error["kind"], "migration-repair-pending", "{error}");
+    assert_eq!(error["retryable"], false, "{error}");
+    assert!(
+        error["hint"]
+            .as_str()
+            .unwrap()
+            .contains("cass index --full"),
+        "{error}"
+    );
+    assert_eq!(fs::metadata(&db_path).unwrap().len(), 8192);
+    for suffix in [
+        "-wal",
+        "-fsqlite-ns-gate",
+        ".pre-migration-bak",
+        ".fsqlite-migration-state",
+    ] {
+        let mut sidecar = db_path.clone().into_os_string();
+        sidecar.push(suffix);
+        assert!(
+            !std::path::Path::new(&sidecar).exists(),
+            "a deferred run must not open the archive: {suffix} exists"
+        );
+    }
+
+    // Negative control: a completed migration marker lets the run proceed
+    // (this 8 KiB file is not a database, so it then fails differently).
+    let mut marker = db_path.clone().into_os_string();
+    marker.push(".fsqlite-migration-state");
+    fs::write(
+        &marker,
+        br#"{"last_upgrade_version":1,"last_run_at":0,"repairs_applied":[]}"#,
+    )
+    .unwrap();
+    let proceeded = run();
+    assert_ne!(
+        error_kind(&proceeded).map(|error| error["kind"].clone()),
+        Some(serde_json::Value::from("migration-repair-pending")),
+        "{proceeded:?}"
+    );
+}
+
 #[test]
 fn index_parses_semantic_flags() -> Result<(), String> {
     let cli = parse_cli_ok(

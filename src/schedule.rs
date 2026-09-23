@@ -1251,9 +1251,27 @@ pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
         return false;
     }
     step.ok = false;
-    step.skipped_reason =
-        Some("another index run already holds the index lock; skipped this cycle".to_string());
+    // Exit 7 also covers a background run that deferred the one-time storage
+    // migration repair (GH #450); name the cause the child reported.
+    step.skipped_reason = Some(
+        if step_error_kind(step).as_deref() == Some("migration-repair-pending") {
+            "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
+        } else {
+            "another index run already holds the index lock; skipped this cycle".to_string()
+        },
+    );
     true
+}
+
+/// `error.kind` from the last JSON error envelope a step wrote to stderr.
+fn step_error_kind(step: &StepReport) -> Option<String> {
+    step.stderr_tail.as_deref()?.lines().rev().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()?
+            .pointer("/error/kind")?
+            .as_str()
+            .map(str::to_owned)
+    })
 }
 
 /// Probe whether the MiniLM model is installed via `models status --json`.
@@ -1670,6 +1688,25 @@ mod tests {
         let mut failed = step(Some(3), false);
         assert!(!soften_busy_index_step(&mut failed));
         assert!(!failed.ok);
+
+        // GH #450: exit 7 from a deferred migration repair names that cause;
+        // lock contention keeps its own reason.
+        let with_stderr = |stderr: &str| StepReport {
+            stderr_tail: Some(stderr.to_string()),
+            ..step(Some(7), false)
+        };
+        let mut deferred = with_stderr(
+            "note: something\n{\"error\":{\"code\":7,\"kind\":\"migration-repair-pending\",\"retryable\":false}}",
+        );
+        assert!(soften_busy_index_step(&mut deferred));
+        assert!(!deferred.ok);
+        let reason = deferred.skipped_reason.unwrap();
+        assert!(reason.contains("migration repair"), "{reason}");
+        assert!(reason.contains("cass index --full"), "{reason}");
+        let mut locked =
+            with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
+        assert!(soften_busy_index_step(&mut locked));
+        assert!(locked.skipped_reason.unwrap().contains("index lock"));
     }
 
     #[test]

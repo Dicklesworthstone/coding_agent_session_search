@@ -515,6 +515,7 @@ Provides unified full-text and semantic search across all local coding agent ses
 - **Daemon timer:** `CASS_DAEMON_INDEX_INTERVAL_SECS=900` makes the resident semantic daemon spawn the same detached incremental index while it lives (`src/daemon/core.rs::spawn_periodic_index`).
 - **Idle gates:** scheduled jobs skip under severe load (Linux loadavg/PSI, macOS `sysctl vm.loadavg` — `responsiveness::machine_pressure_now`); `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` adds a macOS console-idle requirement for nightly/backfill work (`responsiveness::user_idle_gate`; fails open elsewhere). Foreground `cass index` is never gated.
 - Every step is a child `cass` process, so exit 7 `index-busy` remains the only concurrency contract; do not add in-process schedulers that bypass the lock.
+- **Background runs never start the one-time storage migration repair on a large archive** (GH #450). When the archive bundle exceeds `CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES` (default 2 GiB) and its `.fsqlite-migration-state` marker is absent or incomplete, `cass index --background` (stale-on-read refresh, scheduled jobs) exits 7 with kind `migration-repair-pending` and leaves the archive untouched; the scheduler records it as a skip naming the cause. A foreground `cass index --full` performs the repair once (it keeps a `.pre-migration-bak` copy, so plan for that much free space).
 
 ### Lexical Publish Durability (Atomic-Swap)
 

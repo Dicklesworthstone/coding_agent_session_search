@@ -106283,6 +106283,28 @@ fn run_index_with_data(
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let embedder = resolve_semantic_index_embedder(embedder.as_deref());
 
+    // GH #450: a background run never starts the engine's one-time migration
+    // repair on a large archive; a foreground `cass index` performs it once.
+    if background
+        && let Some(bundle_bytes) =
+            crate::indexer::background_migration_repair_pending_bytes(&db_path)
+    {
+        return Err(CliError {
+            code: 7,
+            kind: CliErrorKind::MigrationRepairPending.kind_str(),
+            message: format!(
+                "background index deferred: the {:.1} GiB archive at {} still needs its one-time storage migration repair, which rewrites the whole archive; background runs leave it to a foreground run",
+                bundle_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                db_path.display()
+            ),
+            hint: Some(
+                "Run `cass index --full` in the foreground at a quiet time; it performs the repair once, preserves the original as a .pre-migration-bak copy (plan for that much free space), and later runs skip it"
+                    .to_string(),
+            ),
+            retryable: false,
+        });
+    }
+
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact

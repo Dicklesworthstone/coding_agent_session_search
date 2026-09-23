@@ -773,7 +773,7 @@ fn open_index_schema_connection_with_timeout(
     }
 }
 
-fn index_engine_migration_is_complete(path: &Path) -> bool {
+pub(crate) fn index_engine_migration_is_complete(path: &Path) -> bool {
     // fsqlite-core 0.3.18 migration::MigrationMarker and
     // CURRENT_MIGRATION_VERSION. build.rs enforces this exact engine family;
     // review this admission when changing the pin. The engine's marker is

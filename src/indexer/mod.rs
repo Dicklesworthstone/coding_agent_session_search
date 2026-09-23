@@ -20338,6 +20338,34 @@ fn index_integrity_preflight_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES)
 }
 
+/// GH #450: the archive bundle size when a background index run (stale-on-read
+/// refresh or scheduled job) must not start the engine's one-time first-open
+/// migration repair, or `None` when it may proceed. That repair copies and
+/// rewrites the whole archive; on a 2.6 GiB archive it ran for 25 minutes and
+/// saturated host IO even at idle IO priority, so only a foreground
+/// `cass index` performs it on archives above the same size guard that already
+/// defers the full-rebuild integrity preflight.
+pub fn background_migration_repair_pending_bytes(db_path: &Path) -> Option<u64> {
+    background_migration_repair_pending_bytes_with_max_bytes(
+        db_path,
+        index_integrity_preflight_max_bytes(),
+    )
+}
+
+fn background_migration_repair_pending_bytes_with_max_bytes(
+    db_path: &Path,
+    max_bytes: u64,
+) -> Option<u64> {
+    if !db_path.is_file() {
+        return None;
+    }
+    let bundle_bytes = database_bundle_size_bytes(db_path);
+    if should_run_engine_backed_archive_integrity_preflight(Some(bundle_bytes), max_bytes) {
+        return None;
+    }
+    (!crate::storage::sqlite::index_engine_migration_is_complete(db_path)).then_some(bundle_bytes)
+}
+
 fn should_run_engine_backed_archive_integrity_preflight(
     bundle_bytes: Option<u64>,
     max_bytes: u64,
@@ -51969,6 +51997,44 @@ mod tests {
                 sidecar.display()
             );
         }
+    }
+
+    /// GH #450: background runs defer the engine's one-time migration repair
+    /// only for a large archive whose migration marker is absent or invalid.
+    #[test]
+    fn background_migration_repair_deferral_needs_a_large_unmigrated_archive() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        let pending = |max_bytes| {
+            background_migration_repair_pending_bytes_with_max_bytes(&db_path, max_bytes)
+        };
+        assert_eq!(pending(4096), None, "no archive, nothing to defer");
+
+        let archive = File::create(&db_path).unwrap();
+        archive.set_len(8192).unwrap();
+        drop(archive);
+        assert_eq!(pending(4096), Some(8192), "large and never migrated");
+        assert_eq!(
+            pending(16384),
+            None,
+            "small archives migrate in the background"
+        );
+        assert_eq!(pending(0), None, "a zero cap disables the size guard");
+
+        let marker = database_path_with_suffix(&db_path, ".fsqlite-migration-state");
+        fs::write(&marker, b"{\"last_upgrade_version\":1}").unwrap();
+        assert_eq!(
+            pending(4096),
+            Some(8192),
+            "a truncated marker is not a migration"
+        );
+        fs::write(
+            &marker,
+            br#"{"last_upgrade_version":1,"last_run_at":0,"repairs_applied":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(pending(4096), None, "a completed migration never defers");
+        assert_eq!(fs::metadata(&db_path).unwrap().len(), 8192);
     }
 
     #[test]
