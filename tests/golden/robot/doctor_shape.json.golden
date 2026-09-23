@@ -1437,6 +1437,9 @@
             "retained_publish_backup_bytes": {
               "type": "integer"
             },
+            "rebuild_staging_bytes": {
+              "type": "integer"
+            },
             "available_bytes": {
               "type": "integer"
             },

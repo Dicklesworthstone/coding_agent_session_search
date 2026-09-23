@@ -21005,6 +21005,11 @@ pub(crate) struct FullRebuildHeadroomProjection {
     /// them (retention keeps the newest, `cass doctor cleanup` reclaims the
     /// rest); excluded from `required_bytes`.
     pub(crate) retained_backup_bytes: u64,
+    /// A previous rebuild's staged scratch generation
+    /// ([`LexicalIndexFootprint::rebuild_staging_bytes`]). The next rebuild
+    /// resumes into it or clears it first; excluded from `required_bytes`
+    /// (GH #496: doubling it locked a failed large rebuild out of its retry).
+    pub(crate) rebuild_staging_bytes: u64,
 }
 
 /// Single source of truth for the authoritative (full) rebuild headroom rule.
@@ -21046,6 +21051,7 @@ pub(crate) fn full_rebuild_headroom_projection(
         retired_segment_bytes: footprint.retired_segment_bytes,
         retired_segment_files: footprint.retired_segment_files,
         retained_backup_bytes: footprint.retained_backup_bytes,
+        rebuild_staging_bytes: footprint.rebuild_staging_bytes,
     }
 }
 
@@ -21054,8 +21060,8 @@ pub(crate) fn full_rebuild_headroom_projection(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LexicalIndexFootprint {
     /// Everything a rebuild rewrites: segment files the current MANIFEST
-    /// references, manifests and sidecars, schema markers, staging scratch,
-    /// and any file whose classification is uncertain.
+    /// references, manifests and sidecars, schema markers, and any file whose
+    /// classification is uncertain.
     pub(crate) live_bytes: u64,
     /// `seg-*.fslx` files (and `.retired` receipts) inside a readable Quill
     /// index directory that its MANIFEST no longer references: merge-folded
@@ -21068,6 +21074,12 @@ pub(crate) struct LexicalIndexFootprint {
     /// generations kept for rollback, pruned to the retention cap on the next
     /// staged publish and reclaimable through `cass doctor cleanup`.
     pub(crate) retained_backup_bytes: u64,
+    /// Everything under a staged rebuild's scratch generation
+    /// (`.<name>.rebuild-staging`, see `staged_lexical_rebuild_scratch_path`):
+    /// what an interrupted or failed rebuild left behind. The next rebuild
+    /// resumes into it or clears it before starting over, so a rebuild never
+    /// writes it a second time (GH #496).
+    pub(crate) rebuild_staging_bytes: u64,
 }
 
 impl LexicalIndexFootprint {
@@ -21077,12 +21089,22 @@ impl LexicalIndexFootprint {
         self.live_bytes
             .saturating_add(self.retired_segment_bytes)
             .saturating_add(self.retained_backup_bytes)
+            .saturating_add(self.rebuild_staging_bytes)
     }
 }
 
 /// Directory under `index/` where staged publishes park the prior live
 /// generation (see `lexical_publish_backups_dir`).
 const LEXICAL_PUBLISH_BACKUPS_DIR_NAME: &str = ".lexical-publish-backups";
+
+/// Suffix of a staged rebuild's scratch generation directory,
+/// `.<name>.rebuild-staging` (see `staged_lexical_rebuild_scratch_path`).
+const LEXICAL_REBUILD_STAGING_SUFFIX: &str = ".rebuild-staging";
+
+fn is_lexical_rebuild_staging_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with('.') && name.ends_with(LEXICAL_REBUILD_STAGING_SUFFIX))
+}
 
 /// Outcome of one explicit lexical garbage sweep (`cass index --gc`, #453).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -21183,9 +21205,10 @@ pub fn run_lexical_segment_gc(data_dir: &Path) -> Result<LexicalSegmentGcReport>
 /// is a reason to over-provision, never to call bytes reclaimable.
 pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint {
     let mut footprint = LexicalIndexFootprint::default();
-    // (path, whether an ancestor is the retained-backups directory)
-    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false)];
-    while let Some((path, in_backups)) = stack.pop() {
+    // (path, whether an ancestor is the retained-backups directory, whether
+    // an ancestor is a staged rebuild's scratch generation)
+    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false, false)];
+    while let Some((path, in_backups, in_staging)) = stack.pop() {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -21196,6 +21219,10 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
             if in_backups {
                 footprint.retained_backup_bytes = footprint
                     .retained_backup_bytes
+                    .saturating_add(metadata.len());
+            } else if in_staging {
+                footprint.rebuild_staging_bytes = footprint
+                    .rebuild_staging_bytes
                     .saturating_add(metadata.len());
             } else {
                 footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
@@ -21209,7 +21236,12 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
             || path
                 .file_name()
                 .is_some_and(|name| name == LEXICAL_PUBLISH_BACKUPS_DIR_NAME);
-        let quill = if in_backups {
+        let in_staging = in_staging
+            || path
+                .file_name()
+                .is_some_and(is_lexical_rebuild_staging_dir_name);
+        // Backups and staging are counted whole, never split by a MANIFEST.
+        let quill = if in_backups || in_staging {
             None
         } else {
             crate::search::quill_bridge::quill_directory_footprint(&path)
@@ -21231,7 +21263,7 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
             if quill.is_some() && !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            stack.push((entry.path(), in_backups));
+            stack.push((entry.path(), in_backups, in_staging));
         }
     }
     footprint
@@ -22982,7 +23014,7 @@ fn staged_lexical_rebuild_scratch_path(index_path: &Path) -> PathBuf {
     let name = index_path
         .file_name()
         .map_or_else(|| "index".to_string(), |n| n.to_string_lossy().into_owned());
-    index_path.with_file_name(format!(".{name}.rebuild-staging"))
+    index_path.with_file_name(format!(".{name}{LEXICAL_REBUILD_STAGING_SUFFIX}"))
 }
 
 fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> Result<()> {
@@ -52011,6 +52043,62 @@ mod tests {
             projection.required_bytes
                 < projection.db_bundle_bytes * 2 + with_extras.total_bytes() * 2,
             "the recursive size would have demanded more"
+        );
+    }
+
+    /// GH #496: a failed or interrupted rebuild's staged generation is
+    /// reported but not doubled into the requirement. The next rebuild
+    /// resumes into it or clears it first; doubling it locked a large archive
+    /// out of the retry (13.4 GB archive: 67.8 GB required, 64.7 GB free).
+    #[test]
+    fn full_rebuild_headroom_does_not_double_a_leftover_rebuild_staging_generation() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let index_path = plant_merged_quill_index(&data_dir, 2);
+        let before = lexical_index_footprint(&data_dir);
+        let projection_before = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert_eq!(before.rebuild_staging_bytes, 0, "control: nothing staged");
+        assert_eq!(projection_before.rebuild_staging_bytes, 0);
+
+        // A leftover staged generation beside the live index, as a failed
+        // `cass index --full` leaves it.
+        let staging = staged_lexical_rebuild_scratch_path(&index_path);
+        std::fs::create_dir_all(staging.join("merge-00000")).unwrap();
+        std::fs::File::create(staging.join("seg-00000000000000ff.fslx"))
+            .unwrap()
+            .set_len(96 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(staging.join("MANIFEST"), b"staging is counted whole").unwrap();
+        std::fs::write(
+            staging.join("merge-00000").join("scratch.bin"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+        let staged = 96 * 1024 * 1024 + "staging is counted whole".len() as u64 + 1000;
+
+        let after = lexical_index_footprint(&data_dir);
+        assert_eq!(after.rebuild_staging_bytes, staged);
+        assert_eq!(after.live_bytes, before.live_bytes, "staging is not live");
+        assert_eq!(
+            after.total_bytes(),
+            recursive_size_for_test(&data_dir.join(LEXICAL_INDEX_ROOT_DIR)),
+            "the classification is exhaustive over the index tree"
+        );
+
+        let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert_eq!(projection.rebuild_staging_bytes, staged);
+        assert_eq!(
+            projection.required_bytes, projection_before.required_bytes,
+            "a leftover staged generation must not raise the requirement"
+        );
+        assert_eq!(
+            projection.required_bytes,
+            projection.db_bundle_bytes * 2 + after.live_bytes * 2
         );
     }
 

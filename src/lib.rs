@@ -44282,6 +44282,10 @@ struct DoctorFullRebuildReadinessReport {
     /// (retention keeps the newest; `cass doctor cleanup` reclaims the rest).
     /// Excluded from `required_bytes` for the same reason.
     retained_publish_backup_bytes: u64,
+    /// GH #496: an interrupted or failed rebuild's staged generation under
+    /// `index/.<name>.rebuild-staging/`. The next rebuild resumes into it or
+    /// clears it first, so it is excluded from `required_bytes`.
+    rebuild_staging_bytes: u64,
     /// Free bytes at the most constrained probe path (`None` when unknown).
     available_bytes: Option<u64>,
     /// `required_bytes - available_bytes` when blocked, else 0.
@@ -44412,6 +44416,12 @@ fn build_doctor_full_rebuild_readiness(
             projection.retained_backup_bytes
         ));
     }
+    if projection.rebuild_staging_bytes > 0 {
+        notes.push(format!(
+            "{} bytes of an interrupted or failed rebuild's staged generation sit under index/ (the .rebuild-staging directory) and are not doubled: the next `cass index --full` resumes into them or clears them before starting over.",
+            projection.rebuild_staging_bytes
+        ));
+    }
     if !enforced {
         notes.push(
             "CASS_INDEX_SKIP_DISK_HEADROOM_CHECK is set, so the indexer would skip this preflight; the verdict is advisory."
@@ -44430,6 +44440,7 @@ fn build_doctor_full_rebuild_readiness(
         retired_segment_bytes: projection.retired_segment_bytes,
         retired_segment_files: projection.retired_segment_files,
         retained_publish_backup_bytes: projection.retained_backup_bytes,
+        rebuild_staging_bytes: projection.rebuild_staging_bytes,
         available_bytes,
         shortfall_bytes,
         probe_path,
@@ -102266,6 +102277,7 @@ mod response_schema_tests {
             retired_segment_bytes: 4_200_000_000,
             retired_segment_files: 1_642,
             retained_backup_bytes: 6_400_000_000,
+            rebuild_staging_bytes: 32_000_000_000,
         };
         let root = PathBuf::from("/probe");
         let blocked = build_doctor_full_rebuild_readiness(
@@ -102300,6 +102312,13 @@ mod response_schema_tests {
             .expect("retained-backup note");
         assert!(backup_note.contains("6400000000 bytes"), "{backup_note}");
         assert!(backup_note.contains("cass doctor cleanup"), "{backup_note}");
+        let staging_note = blocked
+            .notes
+            .iter()
+            .find(|note| note.contains(".rebuild-staging"))
+            .expect("rebuild-staging note (GH #496)");
+        assert!(staging_note.contains("32000000000 bytes"), "{staging_note}");
+        assert!(staging_note.contains("not doubled"), "{staging_note}");
         assert!(
             blocked
                 .notes
@@ -102316,6 +102335,7 @@ mod response_schema_tests {
             json["retained_publish_backup_bytes"].as_u64(),
             Some(6_400_000_000)
         );
+        assert_eq!(json["rebuild_staging_bytes"].as_u64(), Some(32_000_000_000));
 
         // With nothing reclaimable the notes stay exactly the two-line shape
         // the robot goldens pin.
@@ -102324,6 +102344,7 @@ mod response_schema_tests {
                 retired_segment_bytes: 0,
                 retired_segment_files: 0,
                 retained_backup_bytes: 0,
+                rebuild_staging_bytes: 0,
                 ..projection
             },
             vec![(root, Ok(37_000_000_000))],

@@ -942,6 +942,7 @@
       "retired_segment_bytes": 0,
       "retired_segment_files": 0,
       "retained_publish_backup_bytes": 0,
+      "rebuild_staging_bytes": 0,
       "available_bytes": "[LIVE_BYTES]",
       "shortfall_bytes": 0,
       "probe_path": "[TEST_HOME]",
