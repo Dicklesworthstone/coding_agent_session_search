@@ -147,6 +147,35 @@ impl Fixture {
     }
 }
 
+/// Files under `root` whose bytes contain `needle`: the canonical DB and its
+/// sidecars, raw mirror, lexical and vector assets, checkpoints and logs.
+fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(path),
+                Ok(kind) if kind.is_file() => {
+                    if fs::read(&path).is_ok_and(|bytes| {
+                        bytes
+                            .windows(needle.len())
+                            .any(|window| window == needle.as_bytes())
+                    }) {
+                        found.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
 #[test]
 fn all_excluded_inventory_never_falls_back_to_raw_copy_in_either_ingest_mode() {
     for streaming in ["0", "1"] {
@@ -183,6 +212,21 @@ fn removing_exclusions_ingests_old_sources_without_hidden_raw_copies_or_duplicat
         fixture.assert_hits("cassprivateproof9z", 0);
         fixture.assert_hits("cassarchiveproof8z", 0);
         fixture.assert_hits("casspublicproof7z", 1);
+        // Bead 2l1b0.37: an excluded sentinel reaches no byte of the data
+        // directory. Positive control: the included one is found, so the sweep
+        // can see stored text.
+        let data = fixture.home.path().join("data");
+        for excluded in ["cassprivateproof9z", "cassarchiveproof8z"] {
+            assert_eq!(
+                files_containing(&data, excluded),
+                Vec::<PathBuf>::new(),
+                "{excluded} leaked into the data dir (streaming={streaming})"
+            );
+        }
+        assert!(
+            !files_containing(&data, "casspublicproof7z").is_empty(),
+            "the sweep must find the included sentinel (streaming={streaming})"
+        );
 
         // No full rebuild and no source mutation: exclusion-aware watermark
         // preservation must make both previously omitted files reachable.
