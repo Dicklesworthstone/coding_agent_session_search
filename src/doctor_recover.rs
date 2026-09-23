@@ -578,21 +578,33 @@ fn fts_dry_run_parity_json(parity: &FtsDryRunParity) -> serde_json::Value {
     })
 }
 
-fn fts_rebuild_dry_run_envelope(db_path: &Path, parity: &FtsDryRunParity) -> serde_json::Value {
-    let applicable = parity.exact_status.map(fts_repair_is_applicable);
+/// `retirement_recorded` is [`FrankenStorage::fts_shadow_retirement_is_current`]:
+/// no registration, no leftover shadow table, and both retirement markers
+/// already describing the current corpus and bound.
+fn fts_rebuild_dry_run_envelope(
+    db_path: &Path,
+    parity: &FtsDryRunParity,
+    retirement_recorded: bool,
+) -> serde_json::Value {
     let exceeds_bound = crate::storage::sqlite::fts_shadow_max_messages()
         .is_some_and(|bound| u64::try_from(parity.indexable_messages).unwrap_or(0) > bound);
-    let planned_action = if exceeds_bound
-        && matches!(
-            parity.exact_status,
-            Some(FtsShadowParityStatus::Absent | FtsShadowParityStatus::Residue)
-        ) {
-        "drop_residue_and_mark_not_viable"
+    // GH #497 follow-up: an oversized corpus whose shadow is already retired
+    // is settled. The apply would only re-report the retirement, so the plan
+    // must not claim a mutation.
+    let settled_retirement = exceeds_bound
+        && retirement_recorded
+        && parity.exact_status == Some(FtsShadowParityStatus::Absent);
+    let applicable = if settled_retirement {
+        Some(false)
     } else {
-        parity
-            .exact_status
-            .map(planned_fts_repair)
-            .unwrap_or("exact_parity_inspection_deferred_to_apply")
+        parity.exact_status.map(fts_repair_is_applicable)
+    };
+    let planned_action = match parity.exact_status {
+        _ if settled_retirement => "none_shadow_retired_not_viable",
+        Some(FtsShadowParityStatus::Residue) if exceeds_bound => "drop_residue_and_mark_not_viable",
+        Some(FtsShadowParityStatus::Absent) if exceeds_bound => "record_not_viable_retirement",
+        Some(status) => planned_fts_repair(status),
+        None => "exact_parity_inspection_deferred_to_apply",
     };
     let apply_command = match applicable {
         Some(true) | None => Some("cass doctor --rebuild-canonical-fts --yes --json"),
@@ -607,6 +619,7 @@ fn fts_rebuild_dry_run_envelope(db_path: &Path, parity: &FtsDryRunParity) -> ser
         "parity": fts_dry_run_parity_json(parity),
         "planned_action": planned_action,
         "would_mutate": applicable,
+        "shadow_retired_not_viable": settled_retirement,
         "canonical_rows_modified": false,
         "apply_command": apply_command,
         "note": "Read-only bounded inspection only; an indeterminate result never means healthy. The --yes path performs exact parity validation before any mutation, and --yes never overrides --dry-run.",
@@ -779,7 +792,15 @@ pub fn run_doctor_rebuild_canonical_fts(
                     ),
                 )
             })?;
-        let envelope = fts_rebuild_dry_run_envelope(&db_path, &before);
+        let retirement_recorded = storage.fts_shadow_retirement_is_current().map_err(|e| {
+            storage_error(
+                format!("inspecting the fallback FTS shadow retirement markers: {e:#}"),
+                Some(
+                    "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
+                ),
+            )
+        })?;
+        let envelope = fts_rebuild_dry_run_envelope(&db_path, &before, retirement_recorded);
         if structured_format.is_some() {
             print_json(&envelope)?;
         } else {
@@ -811,10 +832,28 @@ pub fn run_doctor_rebuild_canonical_fts(
         )
     })?;
 
-    let repair = storage
-        .ensure_search_fallback_fts_consistency()
-        .map_err(|e| {
-            if is_fts5_oversized_leaf_error(&e) {
+    let retirement_recorded_before = storage.fts_shadow_retirement_is_current().map_err(|e| {
+        storage_error(
+            format!("inspecting the fallback FTS shadow retirement markers before repair: {e:#}"),
+            Some(
+                "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
+            ),
+        )
+    })?;
+    let repair = match storage.ensure_search_fallback_fts_consistency() {
+        Ok(repair) => repair,
+        Err(e) if fts_shadow_not_viable_detail_in(&e).is_some() => {
+            return report_fts_shadow_retired(
+                &storage,
+                &db_path,
+                &before,
+                retirement_recorded_before,
+                &e,
+                structured_format,
+            );
+        }
+        Err(e) => {
+            return Err(if is_fts5_oversized_leaf_error(&e) {
                 // GH #369: a known, content-dependent engine limitation — not
                 // archive corruption. Surface a distinct, reassuring diagnostic
                 // instead of the generic storage wall so operators do not treat
@@ -827,8 +866,9 @@ pub fn run_doctor_rebuild_canonical_fts(
                         "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
                     ),
                 )
-            }
-        })?;
+            });
+        }
+    };
     // GH #438: an explicit repair of a shadow whose rows already match must
     // still rewrite segments written by an older engine (frankensqlite#404);
     // queryable rows do not prove a valid segment format. Optimize rewrites
@@ -903,6 +943,89 @@ pub fn run_doctor_rebuild_canonical_fts(
                 ""
             },
             after.indexable_messages,
+            db_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The not-viable detail carried by a repair error, if the repair stopped
+/// because the corpus is over `CASS_FTS_SHADOW_MAX_MESSAGES`.
+fn fts_shadow_not_viable_detail_in(error: &anyhow::Error) -> Option<String> {
+    error.chain().map(ToString::to_string).find(|message| {
+        crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable(message)
+    })
+}
+
+/// GH #497 follow-up: the repair stopped because the corpus is over the
+/// shadow bound. When the archive now holds the current retirement (no
+/// registration, no shadow table, both markers describing this corpus and
+/// bound), that is the converged state
+/// for this corpus, so report it as a completed repair (exit 0,
+/// `repair_kind = retired_not_viable`) instead of a storage failure.
+/// `shadow_mutated` says whether this run retired the shadow or found the
+/// retirement already recorded.
+fn report_fts_shadow_retired(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    before: &FtsShadowParity,
+    retirement_recorded_before: bool,
+    error: &anyhow::Error,
+    structured_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let detail = fts_shadow_not_viable_detail_in(error).unwrap_or_else(|| format!("{error:#}"));
+    let retired = storage.fts_shadow_retirement_is_current().map_err(|e| {
+        storage_error(
+            format!("verifying the fallback FTS shadow retirement after repair: {e:#}"),
+            Some("Repair is not complete until the retirement is verified."),
+        )
+    })?;
+    if !retired {
+        return Err(storage_error(
+            format!(
+                "safely repairing canonical FTS5 shadow tables: {detail}; the retirement was not \
+                 recorded (a derived FTS object remains, or a retirement marker is missing or \
+                 does not describe the current corpus)"
+            ),
+            Some(
+                "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
+            ),
+        ));
+    }
+    let after = storage.inspect_search_fallback_fts_parity().map_err(|e| {
+        storage_error(
+            format!("validating the retired canonical FTS5 shadow: {e:#}"),
+            Some("Repair is not complete until the retirement is verified."),
+        )
+    })?;
+    let shadow_mutated = !retirement_recorded_before;
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "doctor_contract_version": 1,
+        "kind": "rebuild_canonical_fts",
+        "db_path": db_path.display().to_string(),
+        "repair_kind": "retired_not_viable",
+        "inserted_rows": 0,
+        "segments_optimized": false,
+        "shadow_retired": true,
+        "shadow_mutated": shadow_mutated,
+        "detail": detail,
+        "parity_before": fts_parity_json(before),
+        "parity_after": fts_parity_json(&after),
+        "mutated_asset_class": shadow_mutated.then_some("canonical_fts5_shadow"),
+        "canonical_rows_modified": false,
+        "note": "The canonical corpus is over CASS_FTS_SHADOW_MAX_MESSAGES, so the derived SQL-fallback FTS shadow is retired rather than rebuilt; this is the settled state for this archive, not a failure. Quill lexical search is unaffected. Canonical rows are never modified.",
+    });
+    if structured_format.is_some() {
+        print_json(&envelope)?;
+    } else if shadow_mutated {
+        println!(
+            "Canonical FTS5 shadow retired (not viable for this corpus) in {}: {detail}",
+            db_path.display()
+        );
+    } else {
+        println!(
+            "Canonical FTS5 shadow is already retired (not viable for this corpus); nothing to do in {}: {detail}",
             db_path.display()
         );
     }
@@ -1478,7 +1601,7 @@ mod tests {
             detail: Some("equal counts conceal rowid divergence".to_string()),
         };
         let parity = exact_dry_run_parity(parity);
-        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/divergent.db"), &parity);
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/divergent.db"), &parity, false);
         assert_eq!(
             envelope["planned_action"],
             "refuse_unsafe_destructive_rebuild"
@@ -1486,6 +1609,59 @@ mod tests {
         assert_eq!(envelope["would_mutate"], false);
         assert_eq!(envelope["apply_command"], serde_json::Value::Null);
         assert_eq!(envelope["parity"]["status"], "divergent");
+    }
+
+    /// GH #497 follow-up: over the shadow bound, the dry-run plan must match
+    /// what the apply does. A residue shadow is dropped and retired, an absent
+    /// shadow without the retirement markers gets them, and an already
+    /// recorded retirement is settled: nothing to apply, nothing mutated.
+    #[test]
+    fn gh497_oversized_fts_dry_run_plans_match_the_retirement_state() {
+        let Some(bound) = crate::storage::sqlite::fts_shadow_max_messages() else {
+            // CASS_FTS_SHADOW_MAX_MESSAGES=0 in this environment disables the
+            // bound, so no corpus is oversized and there is nothing to plan.
+            return;
+        };
+        let over_bound = i64::try_from(bound.saturating_add(1)).unwrap_or(i64::MAX);
+        let oversized = |status| {
+            exact_dry_run_parity(FtsShadowParity {
+                status,
+                canonical_messages: over_bound,
+                indexable_messages: over_bound,
+                indexed_messages: None,
+                detail: None,
+            })
+        };
+        let db = Path::new("/tmp/oversized.db");
+
+        let settled =
+            fts_rebuild_dry_run_envelope(db, &oversized(FtsShadowParityStatus::Absent), true);
+        assert_eq!(settled["planned_action"], "none_shadow_retired_not_viable");
+        assert_eq!(settled["would_mutate"], false);
+        assert_eq!(settled["shadow_retired_not_viable"], true);
+        assert_eq!(settled["apply_command"], serde_json::Value::Null);
+
+        let unrecorded =
+            fts_rebuild_dry_run_envelope(db, &oversized(FtsShadowParityStatus::Absent), false);
+        assert_eq!(unrecorded["planned_action"], "record_not_viable_retirement");
+        assert_eq!(unrecorded["would_mutate"], true);
+        assert_eq!(unrecorded["shadow_retired_not_viable"], false);
+
+        let residue =
+            fts_rebuild_dry_run_envelope(db, &oversized(FtsShadowParityStatus::Residue), false);
+        assert_eq!(
+            residue["planned_action"],
+            "drop_residue_and_mark_not_viable"
+        );
+        assert_eq!(residue["would_mutate"], true);
+
+        // Within the bound a recorded marker is obsolete: the apply clears it
+        // and recreates the shadow, so the plan says so.
+        let mut fits = oversized(FtsShadowParityStatus::Absent);
+        fits.indexable_messages = 1;
+        let fits = fts_rebuild_dry_run_envelope(db, &fits, true);
+        assert_eq!(fits["planned_action"], "failure_atomic_recreate");
+        assert_eq!(fits["would_mutate"], true);
     }
 
     #[test]
@@ -1498,7 +1674,8 @@ mod tests {
             detail: Some("counting fts_messages_docsize failed".to_string()),
         };
         let parity = exact_dry_run_parity(parity);
-        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/unqueryable.db"), &parity);
+        let envelope =
+            fts_rebuild_dry_run_envelope(Path::new("/tmp/unqueryable.db"), &parity, false);
         assert_eq!(
             envelope["planned_action"],
             "refuse_unqueryable_preserve_bundle"
@@ -1553,7 +1730,7 @@ mod tests {
             ),
         };
         assert_eq!(parity.divergent_rowids_at_least(), 9);
-        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity);
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity, false);
         assert_eq!(envelope["parity"]["status"], "indeterminate");
         assert_eq!(envelope["parity"]["inspection_complete"], false);
         assert_eq!(envelope["parity"]["divergent_rowids_at_least"], 9);
@@ -1579,7 +1756,7 @@ mod tests {
             observed_excess_fts_rowids_at_least: 0,
             detail: Some("bounded comparison reached its cap".to_string()),
         };
-        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity);
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity, false);
         assert_eq!(envelope["parity"]["status"], "indeterminate");
         assert_eq!(envelope["parity"]["inspection_complete"], false);
         assert_eq!(

@@ -14146,6 +14146,33 @@ impl FrankenStorage {
             && self.read_fallback_fts_repair_pending()?.is_some())
     }
 
+    /// GH #497 follow-up: the shadow is retired and both markers already hold
+    /// exactly `detail` as [`Self::drop_fts_shadow_as_not_viable`] would
+    /// write it, so retiring again would change nothing.
+    fn fts_shadow_retirement_matches(&self, detail: &str) -> Result<bool> {
+        let expected = bounded_fts_marker_detail(detail);
+        Ok(self.fts_shadow_retirement_is_recorded()?
+            && self.fts_shadow_not_viable_marker()?.as_deref() == Some(expected.as_str())
+            && self.read_fallback_fts_repair_pending()?.as_deref() == Some(expected.as_str()))
+    }
+
+    /// GH #497 follow-up: the corpus is over the current bound and the
+    /// recorded retirement already describes it exactly, so a repair has
+    /// nothing to do (read-only; safe on a read-only connection).
+    pub(crate) fn fts_shadow_retirement_is_current(&self) -> Result<bool> {
+        let Some(bound_messages) = fts_shadow_max_messages() else {
+            return Ok(false);
+        };
+        let corpus_messages = self.fts_shadow_corpus_messages()?;
+        if corpus_messages <= bound_messages {
+            return Ok(false);
+        }
+        self.fts_shadow_retirement_matches(&fts_shadow_not_viable_detail(
+            corpus_messages,
+            bound_messages,
+        ))
+    }
+
     /// Remember how much corpus the shadow already covers, so inline flushes
     /// can tell when this run crosses the bound.
     pub(crate) fn note_fts_shadow_corpus_messages(&self, corpus_messages: u64) {
@@ -14173,10 +14200,7 @@ impl FrankenStorage {
         self.fts_shadow_run
             .drop_pending
             .store(false, Ordering::SeqCst);
-        let bounded: String = detail
-            .chars()
-            .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
-            .collect();
+        let bounded = bounded_fts_marker_detail(detail);
         self.conn
             .execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
@@ -14314,10 +14338,7 @@ impl FrankenStorage {
     pub(crate) fn record_fallback_fts_repair_pending(&self, detail: Option<&str>) -> Result<()> {
         match detail {
             Some(detail) => {
-                let bounded: String = detail
-                    .chars()
-                    .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
-                    .collect();
+                let bounded = bounded_fts_marker_detail(detail);
                 self.conn
                     .execute_compat(
                         "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
@@ -15115,7 +15136,14 @@ impl FrankenStorage {
                 // archive has no historical size-retirement marker. The index
                 // run maps this error to a nonfatal outcome.
                 if let Some(detail) = self.fts_shadow_recreate_refused()? {
-                    self.drop_fts_shadow_as_not_viable(&detail)?;
+                    // GH #497 follow-up: when the recorded retirement already
+                    // says exactly this, it is the settled state; rewriting
+                    // identical markers on every repair is a mutation with no
+                    // change in state. A stale, foreign, or missing marker is
+                    // still rewritten with the current counts.
+                    if !self.fts_shadow_retirement_matches(&detail)? {
+                        self.drop_fts_shadow_as_not_viable(&detail)?;
+                    }
                     anyhow::bail!("{detail}");
                 }
                 let inserted_rows = self.rebuild_unusable_fts_shadow(&before)?;
@@ -17370,14 +17398,27 @@ pub(crate) fn incompatible_legacy_fts_shadow_ddl(table: &str, ddl: &str) -> Opti
 }
 
 pub(crate) fn fts_shadow_not_viable_detail(corpus_messages: u64, bound_messages: u64) -> String {
+    // GH #497 follow-up: the settled-state statement comes first because the
+    // persisted markers keep only the first 400 characters of this text.
     format!(
-        "{FTS_SHADOW_NOT_VIABLE_ERROR_PREFIX}the canonical corpus is {corpus_messages} messages, \
-         over the {bound_messages} message bound (CASS_FTS_SHADOW_MAX_MESSAGES); fsqlite's FTS5 \
-         rebuilds the whole shadow in memory on the first write after every writable open \
-         (about 32 KB of RAM per message; GH #413), so the derived shadow was dropped. Quill \
-         lexical search is unaffected; the SQL search fallback scans messages. The shadow is \
-         recreated by the next `cass index --full` once the corpus fits the bound"
+        "{FTS_SHADOW_NOT_VIABLE_ERROR_PREFIX}settled state, not a pending repair: the canonical \
+         corpus is {corpus_messages} messages, over the {bound_messages} message bound \
+         (CASS_FTS_SHADOW_MAX_MESSAGES), so the derived shadow stays retired. Quill lexical \
+         search is unaffected; the SQL search fallback scans messages. fsqlite's FTS5 rebuilds \
+         the whole shadow in memory on the first write after every writable open (about 32 KB \
+         of RAM per message; GH #413). `cass index --full` or `cass doctor \
+         --rebuild-canonical-fts --yes` recreates it only after CASS_FTS_SHADOW_MAX_MESSAGES is \
+         raised to at least the corpus size"
     )
+}
+
+/// The persisted form of a fallback-FTS marker detail: the first
+/// `FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES` characters.
+fn bounded_fts_marker_detail(detail: &str) -> String {
+    detail
+        .chars()
+        .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
+        .collect()
 }
 
 pub(crate) fn error_message_indicates_fts_shadow_not_viable(detail: &str) -> bool {
@@ -24226,6 +24267,122 @@ mod tests {
                 corpus_messages: corpus
             }
         );
+    }
+
+    /// GH #497 follow-up: once the recorded retirement describes the current
+    /// corpus exactly, a repeat repair must not write (the reporter saw every
+    /// doctor run and dry-run claim a mutation on a settled archive), while a
+    /// retirement whose marker no longer matches is still rewritten.
+    #[test]
+    fn gh497_current_fts_retirement_is_not_rewritten_but_a_stale_one_is() {
+        const CHILD_ENV: &str = "CASS_TEST_FTS_RETIREMENT_NOOP_CHILD";
+        const TEST_NAME: &str = "storage::sqlite::tests::gh497_current_fts_retirement_is_not_rewritten_but_a_stale_one_is";
+        if !matches!(dotenvy::var(CHILD_ENV).as_deref(), Ok("1")) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current library test executable"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("CASS_FTS_SHADOW_MAX_MESSAGES", "2")
+            .output()
+            .expect("run isolated FTS retirement regression");
+            assert!(
+                output.status.success(),
+                "FTS retirement child failed: {}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the child must execute the regression, not silently filter it out"
+            );
+            return;
+        }
+        assert_eq!(fts_shadow_max_messages(), Some(2));
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-retirement-noop.db");
+        let storage = FrankenStorage::open(&db_path).expect("open retirement fixture");
+        seed_atomic_fts_rebuild_fixture(&storage);
+        let conversation_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        for idx in 1..3_i64 {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, 'user', 'retired corpus message')",
+                    fparams![conversation_id, idx],
+                )
+                .unwrap();
+        }
+        assert_eq!(storage.fts_shadow_corpus_messages().unwrap(), 3);
+        let wal_len = || {
+            std::fs::metadata(database_sidecar_path(&db_path, "-wal"))
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        let markers = || {
+            (
+                storage.fts_shadow_not_viable_marker().unwrap(),
+                storage.read_fallback_fts_repair_pending().unwrap(),
+            )
+        };
+        let refuse = || {
+            let error = storage
+                .ensure_search_fallback_fts_consistency()
+                .expect_err("over-bound recreation must be refused");
+            assert!(error_message_indicates_fts_shadow_not_viable(&format!(
+                "{error:#}"
+            )));
+        };
+
+        // The first refusal drops the canonical shadow and records both markers.
+        assert!(!storage.fts_shadow_retirement_is_current().unwrap());
+        storage
+            .drop_fts_shadow_as_not_viable("an older retirement text")
+            .unwrap();
+        assert!(
+            !storage.fts_shadow_retirement_is_current().unwrap(),
+            "a marker that does not describe this corpus is not current"
+        );
+        refuse();
+        assert!(storage.fts_shadow_retirement_is_current().unwrap());
+        let settled = markers();
+        let expected = bounded_fts_marker_detail(&fts_shadow_not_viable_detail(3, 2));
+        assert_eq!(settled.0.as_deref(), Some(expected.as_str()));
+        assert_eq!(settled.1.as_deref(), Some(expected.as_str()));
+
+        // Settled: repeat refusals write nothing at all.
+        let settled_wal = wal_len();
+        assert!(settled_wal > 0, "the fixture must write through the WAL");
+        refuse();
+        refuse();
+        assert_eq!(
+            wal_len(),
+            settled_wal,
+            "a settled retirement must not be rewritten"
+        );
+        assert_eq!(markers(), settled);
+
+        // A stale marker (here: an index run's different pending reason) is
+        // rewritten with the current retirement.
+        storage
+            .record_fallback_fts_repair_pending(Some("some other pending reason"))
+            .unwrap();
+        assert!(!storage.fts_shadow_retirement_is_current().unwrap());
+        let stale_wal = wal_len();
+        refuse();
+        assert!(
+            wal_len() > stale_wal,
+            "a stale retirement must be rewritten"
+        );
+        assert!(storage.fts_shadow_retirement_is_current().unwrap());
+        assert_eq!(markers(), settled);
     }
 
     #[test]
