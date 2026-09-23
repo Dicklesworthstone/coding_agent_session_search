@@ -702,9 +702,14 @@ fn view_command_returns_session_detail() {
                 .enumerate()
                 .filter(|(index, _)| (index + 1).abs_diff(target) <= context)
                 .map(|(index, content)| {
+                    // #493: every line names its coordinate space and source.
                     serde_json::json!({
                         "line": index + 1,
+                        "file_line": index + 1,
+                        "coordinate_space": "file_line",
+                        "content_source": "file",
                         "content": content,
+                        "is_target": index + 1 == target,
                         "highlighted": index + 1 == target,
                     })
                 })
@@ -737,16 +742,34 @@ fn view_command_returns_session_detail() {
                     assert_eq!(actual["target_line"], target);
                     assert_eq!(actual["archive_only"], false);
                 } else {
+                    // #493 human layout: an `L<n>` header per line (`>>>` marks
+                    // the target), then that line's content.
                     let stdout = String::from_utf8(output.stdout).unwrap();
-                    let actual: Vec<&str> = stdout
-                        .lines()
-                        .filter_map(|line| line.split_once(" | ").map(|(_, text)| text))
+                    let lines: Vec<&str> = stdout.lines().collect();
+                    let actual: Vec<(bool, &str)> = lines
+                        .windows(2)
+                        .filter(|pair| {
+                            pair[0]
+                                .trim_start_matches(">>>")
+                                .trim_start()
+                                .strip_prefix('L')
+                                .and_then(|rest| rest.split_whitespace().next())
+                                .is_some_and(|number| {
+                                    number.chars().all(|digit| digit.is_ascii_digit())
+                                })
+                        })
+                        .map(|pair| (pair[0].starts_with(">>>"), pair[1]))
                         .collect();
-                    let expected_text: Vec<&str> = expected
+                    let expected_text: Vec<(bool, &str)> = expected
                         .iter()
-                        .map(|line| line["content"].as_str().unwrap())
+                        .map(|line| {
+                            (
+                                line["highlighted"] == true,
+                                line["content"].as_str().unwrap(),
+                            )
+                        })
                         .collect();
-                    assert_eq!(actual, expected_text);
+                    assert_eq!(actual, expected_text, "{stdout}");
                 }
             }
         }
@@ -794,8 +817,12 @@ fn expand_command_with_context() {
                 .map(|(index, content)| {
                     serde_json::json!({
                         "line": index + 1,
+                        "file_line": index + 1,
+                        "coordinate_space": "file_line",
+                        "content_source": "file",
                         "role": if index == 1 { "assistant" } else { "user" },
                         "is_target": index + 1 == target,
+                        "highlighted": index + 1 == target,
                         "content": content,
                     })
                 })

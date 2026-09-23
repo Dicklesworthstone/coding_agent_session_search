@@ -1253,11 +1253,42 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
             citation["span_hash"],
             blake3::hash(cited.as_bytes()).to_hex().to_string()
         );
-        let citation_core = format!(
-            "local\n{}\n{line}\n{line}\n{}",
-            source_path.display(),
-            blake3::hash(cited.as_bytes()).to_hex()
-        );
+        // Recompute the v2 identity (#493) independently of the production
+        // hasher: a domain tag, then length-prefixed text fields, then tagged
+        // optional coordinates. The line and span hash it binds are the ones
+        // checked against the source file just above.
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"cass.pack.evidence.v2\0");
+        for field in ["source_id", "source_path", "agent", "content_hash"] {
+            let text = citation[field].as_str().expect(field);
+            identity.update(&(text.len() as u64).to_le_bytes());
+            identity.update(text.as_bytes());
+        }
+        match citation["conversation_id"].as_i64() {
+            Some(id) => {
+                identity.update(&[1]);
+                identity.update(&id.to_le_bytes());
+            }
+            None => {
+                identity.update(&[0]);
+            }
+        }
+        for field in ["message_index", "line_start", "line_end"] {
+            match citation[field].as_u64() {
+                Some(number) => {
+                    identity.update(&[1]);
+                    identity.update(&number.to_le_bytes());
+                }
+                None => {
+                    identity.update(&[0]);
+                }
+            }
+        }
+        let span_hash = blake3::hash(cited.as_bytes()).to_hex().to_string();
+        identity.update(&(span_hash.len() as u64).to_le_bytes());
+        identity.update(span_hash.as_bytes());
+        assert_eq!(citation["line_start"], line);
+        assert_eq!(citation["source_id"], "local");
         let encoded = item["id"]
             .as_str()
             .expect("evidence ID")
@@ -1284,7 +1315,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         }
         assert_eq!(
             &decoded,
-            blake3::hash(citation_core.as_bytes()).as_bytes(),
+            identity.finalize().as_bytes(),
             "evidence identity must bind the actual verified source span"
         );
         assert!(citation["message_index"].is_u64());
