@@ -2933,7 +2933,8 @@ fn gh495_residue_fts_shadows_converge_through_doctor_and_full_index() {
         };
         storage.close_without_checkpoint().unwrap();
         (
-            ddl.split_whitespace().collect::<Vec<_>>().join(" "),
+            // Whitespace-free, so `content = ''` and `content=''` compare alike.
+            ddl.split_whitespace().collect::<String>(),
             docsize,
             messages,
             canonical,

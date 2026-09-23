@@ -160,14 +160,15 @@ fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
             let path = entry.path();
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => pending.push(path),
-                Ok(kind) if kind.is_file() => {
-                    if fs::read(&path).is_ok_and(|bytes| {
-                        bytes
-                            .windows(needle.len())
-                            .any(|window| window == needle.as_bytes())
-                    }) {
-                        found.push(path);
-                    }
+                Ok(kind)
+                    if kind.is_file()
+                        && fs::read(&path).is_ok_and(|bytes| {
+                            bytes
+                                .windows(needle.len())
+                                .any(|window| window == needle.as_bytes())
+                        }) =>
+                {
+                    found.push(path);
                 }
                 _ => {}
             }
