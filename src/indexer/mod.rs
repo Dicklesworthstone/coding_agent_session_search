@@ -54157,42 +54157,17 @@ mod tests {
         drop(storage);
 
         let index_path = index_dir(&data_dir).unwrap();
-        std::fs::create_dir_all(&index_path).unwrap();
-        let fingerprint = lexical_storage_fingerprint_for_db(&db_path).unwrap();
-        std::fs::write(
-            lexical_rebuild_state_path(&index_path),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": LEXICAL_REBUILD_STATE_VERSION,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 2,
-                    "total_messages": 4,
-                    "storage_fingerprint": fingerprint,
-                },
-                "page_size": LEXICAL_REBUILD_PAGE_SIZE,
-                "committed_offset": 2,
-                "processed_conversations": 2,
-                "indexed_docs": 4,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": true,
-                "updated_at_ms": FrankenStorage::now_millis(),
-                "runtime": {
-                    "queue_depth": 0,
-                    "inflight_message_bytes": 0,
-                    "pending_batch_conversations": 0,
-                    "pending_batch_message_bytes": 0,
-                    "page_prep_workers": 0,
-                    "active_page_prep_jobs": 0,
-                    "ordered_buffered_pages": 0,
-                    "budget_generation": 0,
-                    "updated_at_ms": FrankenStorage::now_millis(),
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        // #494: a completed checkpoint is honoured only over a readable
+        // generation whose live count matches it. Build that generation for
+        // real rather than planting a checkpoint over an empty directory.
+        let first = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        assert_eq!(first.indexed_docs, 4);
+        assert!(
+            load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .is_some_and(|state| state.completed),
+            "the first rebuild must leave a completed checkpoint"
+        );
 
         let _prep_profile = set_env("CASS_PREP_PROFILE", "1");
         let logs = capture_logs(|| {
