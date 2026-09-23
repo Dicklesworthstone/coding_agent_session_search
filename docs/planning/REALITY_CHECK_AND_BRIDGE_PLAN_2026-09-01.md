@@ -18,8 +18,9 @@ features but **shipping**: 626 commits sit on `main` after v0.8.0 (a
 the open GitHub issues are fixed on `main` but unreleased. The remaining red is
 concentrated in a few places: large-archive memory (GH #320), incremental ANN
 (GH #460), the native-ANN WAL admission tests owned by `ds7uy.3.3`, the strict
-UBS gate, and a search-timeout contract conflict that today's branch merges
-brought onto `main` (`vy4ic`, needs an owner decision).
+UBS gate, and e2e tests the #493 identity work left behind
+(`2l1b0.43`). The search-timeout contract conflict that the day's branch merges
+brought onto `main` is resolved (`vy4ic`: exit 10 for explicit semantic).
 
 ### What was verified directly (not inferred)
 
@@ -85,12 +86,13 @@ disagreeing with code that had since changed.
 
 | Class | Issues |
 |---|---|
-| Closed with evidence | #459, #449 (released-binary acceptance), #413, #390, #329, #395 (fixed in shipped releases, reporters invited to reopen), #489 (validated by the reporter on `main`), #422 (fixed in v0.8.0; `692998f1` adds the timeout stderr note) |
+| Closed with evidence | #459, #449 (released-binary acceptance), #413, #390, #329, #395 (fixed in shipped releases, reporters invited to reopen), #489 (validated by the reporter on `main`), #422 (fixed in v0.8.0; `692998f1` adds the timeout stderr note), #475 (audit delivered) |
 | Fixed on `main`, unreleased (close at release) | #462, #477, #476, #379, #494, #473, #474, #426, #466, #463, #480, #469, #471, #472, #478, #468, #465, #464, #447, #415, #388, #423 |
 | Partial: this pass closed the named gap, other acceptance remains | #495 (direct-caller regression), #497 (legacy `content=''` residue, `032464af`), #374 (rowid shadow residue loop), #438 (explicit repair now rewrites old segments), #381 (Windows self-updater), #461 (per-run full content scan), #496/#483 (cgroup-blind budgets) |
 | Still open on cass | #320 (indexing peak memory; profile first), #460 (incremental HNSW append, L), #470 (passage gaps above 4,080 chars), #452 (semantic serving in `cass serve`), #349 (in-place v14 migration), #382 (ARM64 MiniLM needs a native run on the adopted pin) |
 | Upstream | #391 (frankensqlite#397) |
-| Owner judgment / reporter info | #481 (GPU/external embeddings under the attested-producer model), #450 (repair opt-in/throttle policy), #475 (downstream skill recipes live outside this repo), #443 (retest on v0.8.0), #467 (needs one darwin-arm64 run) |
+| Decided (owner delegated), then acted on | #481 (no in-process GPU; an opt-in external-endpoint embedding space with a known-answer probe is the direction, `gl29d`), #450 (policy implemented in `36c5d4d5`; open until release), #475 (skill-recipe audit done and filed in the skills repo, issue closed) |
+| Reporter info | #443 (retest on v0.8.0; follow-up posted), #467 (needs one darwin-arm64 run) |
 
 ### Work landed in this pass
 
@@ -119,6 +121,10 @@ disagreeing with code that had since changed.
 | `4bc2d40e` | rustfmt of a merge-introduced blank line (fmt was red on `main`) | — |
 | `0a1be788` | two lib tests whose premises other changes made stale (legacy-DDL "healthy" fixture; Codex budget message) | `2l1b0.45`, `2l1b0.40` |
 | `00a7403a` | a spec test's failure message shows the observed budget object | `u3vho` |
+| `c3ac835a` | decision: explicit semantic budget exhaustion is a typed exit-10 timeout (ds7uy.4.1); spec test and README/AGENTS aligned | `vy4ic` |
+| `36c5d4d5` | decision for #450: `--background` runs never start the one-time storage migration repair on a large unmigrated archive (exit 7 `migration-repair-pending`); foreground `index` still performs it | `2l1b0.6` |
+| `d34142f5`, `ec7fd8b1`, `557cf59b` | real-binary #495 acceptance: orphan shadow tables, legacy DDL and legacy DDL missing a `_docsize` row converge through both `doctor --rebuild-canonical-fts --yes` and `index --full`; canonical rows unchanged | `2l1b0.45` |
+| `5ab5f7d9`, `640d2c6f` | #486: no byte of the data dir contains an excluded sentinel (with a positive control) | `2l1b0.37` |
 
 Beads closed on cited evidence: `sxhgy`, `2l1b0.14`, `eayhf`, `ukg62`,
 `gdwzy`, `dndyv`, `ljf90`, `0dbkt`, `ubq10`, `test-env-api-isolation-qu81y.1`.
@@ -150,6 +156,23 @@ proof its analysis requires), `kz23l` (requires strict-UBS receipts),
 `hh4jf` (its view/expand probe now fails against the #493 output), `962e8`,
 `cooow`, `jfkqh`, `fyepq` (real gaps), `lgpqg`, `uc7nz`, `kupq4` (no
 implementing commit).
+
+The follow-up triage (recorded on `5v57k`) measured where the findings are.
+Over `src/` (368 files) the pinned-family scanner reports 306 critical,
+57,545 warning and 21,374 info. Excluding test code removes about 94% of the
+warnings (the direct Rust scanner without the ast-grep pack: 30,622 warnings
+drop to 1,782 and 93 criticals to 55). The 55 production criticals reviewed
+here are all false positives: redaction regex constants and table or env-var
+names read as "secrets", enum comparisons read as "timing-unsafe", and cass
+re-launching its own binary. Two tooling facts decide the path. The pinned
+UBS v5.4.4 already supports fingerprinted `--save-baseline` / `--baseline
+--new-only`: replaying `612bd808` against its parent reports exactly the two
+`Command::new(shell)` criticals that commit introduced. But the same replay
+shows 14 new *test* warnings, and the Rust module's `--exclude-tests` is not
+exposed by the `ubs` runner. The proposed gate is therefore delta +
+exclude-tests + fail-on-warning: new production warnings still block, and it
+needs a UBS runner change and release first. Dropping `--fail-on-warning`
+without it would be a gate weakening, so the gate is unchanged.
 
 ### Answers to the five reality-check questions
 
