@@ -1,6 +1,51 @@
-# Reality Check and Bridge Plan — refreshed 2026-09-22 (evening execution pass)
+# Reality Check and Bridge Plan — refreshed 2026-09-23
 
-## Current assessment: 2026-09-22 evening (execution pass, SageSnow)
+## Update: 2026-09-23 (SageSnow)
+
+**The first complete lib-suite run in weeks** (`0e77ef78`, 12,600 s cap,
+receipt `/data/tmp/cass-gate.jkf85b`): 7,758 passed, **82 failed**, 44
+ignored. Earlier gates never finished the suite inside the 2,400 s cap, so
+nothing showed how red `main` actually was. The failures break down as:
+
+| Cause | Tests | Resolution |
+|---|---|---|
+| `cf0fdb85` prettier-formatted six pinned third-party Pages vendor assets; their SHA-256/size pins failed | ~60 (`pages::*`) | Reverted in `aa47c7f4`; all six match their pins again, pins unchanged (`ggq7g`) |
+| `36c5d4d5` (#450, mine) added an error kind without bumping the audited count | 1 | `8325ddfd` |
+| TUI cached-detail/find-bar/footer, probably since `d499554f` (#493 anchors) | 7 | New bead `2gy3y` |
+| Semantic FSVI v2 / native-ANN WAL fixtures | 5 | Existing owners `962e8`, `ds7uy.3.3`; exact-search case `nohx1` |
+| Indexer: watch backlog overflow (new test), rebuild skip-when-complete metadata, gh473 budget | 3 | New bead `fqt9s` |
+| Watch lexical OOM retry | 1 | Existing `dh3vd` |
+| `gh477` read-only opener | 1 | Passed on re-run; load-sensitive (`vpsls`) |
+
+At `da06837c` the same filter set is down to the 16 tracked residuals, with
+all pages and error-kind tests green (receipt `/data/tmp/cass-gate.eqOyiv`).
+
+**GH #498 fixed (`da06837c`, `o5d74`).** A full rebuild of a >4.2M-message
+archive could never commit:
+- Quill's in-commit tier merge folds any eight same-tier segments, and its top tier has no bound.
+- After cass's byte-capped end-of-rebuild fold left eight or more large segments, the next commit folded them past the per-term posting limit (2^22).
+
+cass now disables the engine tier merge (`tier_fanout = usize::MAX`) and bounds
+every planned fold at `MAX_FOLD_OUTPUT_DOCS`. A real-engine reproduction covers
+the reporter's path: 4.24M documents in eight large segments.
+- The engine default fails with the reporter's exact error.
+- The cass config commits and folds into 3.71M + 0.53M segments.
+
+The upstream planner needs the same bound (noted on the bead).
+
+**Gate defect fixed (`01854fa3`).** The pinned UBS runner scans every
+explicitly named file even when `.ubsignore` covers it. So the config-level
+suppression AGENTS.md prescribes never applied in the gate's changed-file
+mode. The gate now filters by `.ubsignore` and prints each skipped path.
+On this change set that skips exactly the five scanner-visible vendor
+files; the three owned files stay scanned.
+
+**Other outcomes:**
+- #467: closed, verified by its reporter on darwin-arm64.
+- #369 bead `cb0gl`: closed on its probe.
+- #483: the conv-192 stall no longer reproduces on `main` (reporter's retest); what blocked them was #498.
+
+## Assessment: 2026-09-22 evening (execution pass, SageSnow)
 
 This section supersedes current-state statements below. The midday assessment
 that follows remains the record of the audit; this pass executed against it and
