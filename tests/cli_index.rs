@@ -2840,6 +2840,167 @@ fn fts_repair_liveness_index_cmd(home: &std::path::Path, data_dir: &std::path::P
     cmd
 }
 
+/// GH #495 (bead 2l1b0.45): archives whose SQL-fallback FTS shadow is residue
+/// must converge through both reported journeys, `cass doctor
+/// --rebuild-canonical-fts --yes` (exit 13 on the reporter's archives) and
+/// `cass index --full`, without changing canonical history. The shapes are the
+/// reported ones: orphan shadow tables with no virtual table (a surviving
+/// `_data` collided with the repair's CREATE), the legacy 7-column
+/// internal-content DDL, and that DDL with a row missing from `_docsize`
+/// (PRIMARY KEY failure). An already canonical contentless shadow is the control.
+#[test]
+fn gh495_residue_fts_shadows_converge_through_doctor_and_full_index() {
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+
+    const LEGACY_DDL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(
+        content, title, agent, workspace, source_path,
+        created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+    let reshape = |db_path: &std::path::Path, shape: &str| {
+        let storage = SqliteStorage::open(db_path).unwrap();
+        let raw = storage.raw();
+        let mut statements: Vec<&str> = Vec::new();
+        match shape {
+            "orphan-shadow-tables" => statements.extend([
+                "DROP TABLE fts_messages",
+                "CREATE TABLE fts_messages_config(k PRIMARY KEY, v) WITHOUT ROWID",
+                "CREATE TABLE fts_messages_content(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5, c6)",
+                "CREATE TABLE fts_messages_data(id INTEGER PRIMARY KEY, block BLOB)",
+                "CREATE TABLE fts_messages_docsize(id INTEGER PRIMARY KEY, sz BLOB)",
+                "CREATE TABLE fts_messages_idx(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+                "INSERT INTO fts_messages_data(id, block) VALUES (10, X'00')",
+            ]),
+            "legacy-ddl" | "legacy-ddl-missing-docsize" => {
+                statements.extend(["DROP TABLE fts_messages", LEGACY_DDL]);
+            }
+            "canonical-control" => {}
+            other => panic!("unknown shape {other}"),
+        }
+        for statement in statements {
+            raw.execute(statement)
+                .unwrap_or_else(|err| panic!("{shape}: {statement}: {err}"));
+        }
+        if shape.starts_with("legacy-ddl") {
+            // Populate the legacy internal-content shadow one row per message,
+            // as the pre-V14 writer did.
+            let messages: Vec<(i64, String)> = raw
+                .query("SELECT id, content FROM messages ORDER BY id")
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap()))
+                .collect();
+            for (id, content) in &messages {
+                raw.execute_compat(
+                    "INSERT INTO fts_messages(
+                        rowid, content, title, agent, workspace, source_path, created_at, message_id
+                     ) VALUES (?1, ?2, '', '', '', '', 0, ?1)",
+                    coding_agent_search::franken_sync::params![*id, content.as_str()],
+                )
+                .unwrap_or_else(|err| panic!("{shape}: legacy shadow row {id}: {err}"));
+            }
+            if shape == "legacy-ddl-missing-docsize" {
+                raw.execute_compat(
+                    "DELETE FROM fts_messages_docsize WHERE id = ?1",
+                    coding_agent_search::franken_sync::params![messages[0].0],
+                )
+                .unwrap();
+            }
+        }
+        storage.close().unwrap();
+    };
+    let inspect = |db_path: &std::path::Path| {
+        let storage = SqliteStorage::open_readonly(db_path).unwrap();
+        let raw = storage.raw();
+        let count = |sql: &str| raw.query(sql).unwrap()[0].get_typed::<i64>(0).unwrap();
+        let ddl = raw
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fts_messages'")
+            .unwrap()
+            .first()
+            .map(|row| row.get_typed::<String>(0).unwrap())
+            .unwrap_or_default();
+        let canonical = ["conversations", "messages"].map(|table| {
+            raw.query(&format!("SELECT * FROM {table} ORDER BY id"))
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        });
+        let messages = count("SELECT COUNT(*) FROM messages");
+        let docsize = if ddl.is_empty() {
+            -1
+        } else {
+            count("SELECT COUNT(*) FROM fts_messages_docsize")
+        };
+        storage.close_without_checkpoint().unwrap();
+        (
+            ddl.split_whitespace().collect::<Vec<_>>().join(" "),
+            docsize,
+            messages,
+            canonical,
+        )
+    };
+
+    for shape in [
+        "orphan-shadow-tables",
+        "legacy-ddl",
+        "legacy-ddl-missing-docsize",
+        "canonical-control",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let data_dir = home.join("cass_data");
+        fs::create_dir_all(&data_dir).unwrap();
+        seed_fts_liveness_sessions(home);
+        let cass = |args: &[&str]| {
+            base_cmd(home)
+                .current_dir(home)
+                .args(args)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_FTS_SHADOW_MAX_MESSAGES", "0")
+                .output()
+                .unwrap()
+        };
+        let seeded = cass(&["index", "--full", "--json", "--no-progress-events"]);
+        assert!(
+            seeded.status.success(),
+            "{shape}: seed failed: {}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        let db_path = data_dir.join("agent_search.db");
+        let (_, _, messages, canonical_before) = inspect(&db_path);
+        assert!(messages > 1, "{shape}: the fixture must have messages");
+
+        for journey in [
+            &["doctor", "--rebuild-canonical-fts", "--yes", "--json"][..],
+            &["index", "--full", "--json", "--no-progress-events"][..],
+        ] {
+            reshape(&db_path, shape);
+            let output = cass(journey);
+            assert!(
+                output.status.success(),
+                "{shape} {journey:?}: exit {:?}\nstdout: {}\nstderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let (ddl, docsize, messages_after, canonical_after) = inspect(&db_path);
+            assert!(
+                ddl.contains("content=''") && ddl.contains("contentless_delete=1"),
+                "{shape} {journey:?}: the shadow must be the canonical contentless one: {ddl}"
+            );
+            assert_eq!(
+                docsize, messages_after,
+                "{shape} {journey:?}: every message must be in the shadow exactly once"
+            );
+            assert_eq!(
+                canonical_after, canonical_before,
+                "{shape} {journey:?}: canonical rows must not change"
+            );
+        }
+    }
+}
+
 fn seed_fts_liveness_sessions(home: &std::path::Path) {
     let codex_root = home.join(".codex");
     make_codex_session(
