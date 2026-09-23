@@ -104,7 +104,12 @@ impl Fixture {
             .get_output()
             .stdout
             .clone();
-        let summary: Value = serde_json::from_slice(&output).unwrap();
+        let summary: Value = serde_json::from_slice(&output).unwrap_or_else(|err| {
+            panic!(
+                "index --json must print one JSON document ({err}); stdout:\n{}",
+                String::from_utf8_lossy(&output)
+            )
+        });
         assert_eq!(summary["success"], true, "{summary}");
     }
 
