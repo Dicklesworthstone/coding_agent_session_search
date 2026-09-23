@@ -23775,6 +23775,87 @@ mod tests {
         }
     }
 
+    /// GH #369 (bead cb0gl): a rebuild batch whose distinct terms and doclists
+    /// encode past one 64 KiB segment leaf failed with "segment leaf term
+    /// offset exceeds u16" and rolled back, leaving no fallback shadow. The
+    /// pinned engine now writes multi-leaf segments; the shadow must build and
+    /// answer terms from both ends of the batch.
+    #[test]
+    fn gh369_fts_rebuild_survives_a_batch_larger_than_one_segment_leaf() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("fts-multileaf.db")).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        // 400 messages x 100 distinct terms: 40,000 terms, roughly 440 KB of
+        // term text, several times one leaf even if the rebuild splits batches.
+        let term = |message: usize, word: usize| format!("t{message:04}x{word:03}q");
+        let messages = (0..400)
+            .map(|message| Message {
+                id: None,
+                idx: message as i64,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_000 + message as i64),
+                content: (0..100)
+                    .map(|word| term(message, word))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: Some(PathBuf::from("/tmp/fts-multileaf")),
+                    external_id: Some("fts-multileaf".into()),
+                    title: Some("FTS multi-leaf fixture".into()),
+                    source_path: PathBuf::from("/tmp/fts-multileaf.jsonl"),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_400),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages,
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap();
+
+        storage
+            .rebuild_fts()
+            .expect("a batch past one segment leaf must rebuild");
+        assert_eq!(
+            storage.inspect_search_fallback_fts_parity().unwrap().status,
+            FtsShadowParityStatus::Healthy
+        );
+        let matches = |needle: &str| {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
+                    fparams![needle],
+                    |row| row.get_typed::<i64>(0),
+                )
+                .unwrap()
+        };
+        for needle in [term(0, 0), term(199, 50), term(399, 99)] {
+            assert_eq!(matches(&needle), 1, "{needle}");
+        }
+        assert_eq!(matches("t9999x999q"), 0, "an absent term must not match");
+    }
+
     #[test]
     fn gh495_orphan_shadow_tables_are_residue_and_repair_converges() {
         let dir = TempDir::new().unwrap();
