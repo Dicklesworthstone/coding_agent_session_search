@@ -27708,9 +27708,15 @@ fn search_active_rebuild_wait_duration(timeout_ms: Option<u64>, started_at: Inst
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30_000);
     let configured = Duration::from_millis(configured_ms);
+    // Stop a tenth of the remaining time early: a bounded search runs setup on
+    // a worker with the same deadline, and a wait that ends exactly there
+    // loses the race, turning this busy verdict into an empty timed-out result.
     timeout_ms
         .map(Duration::from_millis)
-        .map(|timeout| timeout.saturating_sub(started_at.elapsed()).min(configured))
+        .map(|timeout| {
+            let remaining = timeout.saturating_sub(started_at.elapsed());
+            (remaining - remaining / 10).min(configured)
+        })
         .unwrap_or(configured)
 }
 
@@ -27748,6 +27754,14 @@ fn search_lock_busy_error(data_dir: &Path) -> CliError {
     }
 }
 
+fn search_lock_busy_error_with_progress(data_dir: &Path, index_path: &Path) -> CliError {
+    let mut error = search_lock_busy_error(data_dir);
+    if let Some(progress) = lexical_rebuild_progress_note(index_path) {
+        error.message = format!("{} ({progress})", error.message);
+    }
+    error
+}
+
 fn lexical_repair_error_is_active_index_run(rendered: &str) -> bool {
     rendered.contains("already holds")
 }
@@ -27771,6 +27785,109 @@ fn search_robot_degraded_error(
         hint: Some(next_action.to_string()),
         retryable: true,
     }
+}
+
+/// Start the lexical repair that search will not run inline as a detached
+/// `cass index --background` child, and say what happened in words an agent can
+/// act on. `None` means no spawn was attempted (scratch data dir or headless
+/// harness, matching stale-on-read refresh), so the caller keeps its own hint.
+///
+/// Search used to leave this repair to whoever read the refusal, or to run it
+/// inside the search process. Either way nothing built the index: an agent's
+/// `cass index --full` or an inline repair dies with the command timeout that
+/// wraps it, a large archive commits nothing before its first batch, and every
+/// retry started again from zero. The detached child has its own process group
+/// and outlives the search. The spawn guard, cooldown, failure breaker, and the
+/// index-run lock keep repeated searches from stacking rebuilds.
+fn start_background_lexical_repair_for_search(
+    data_dir: &Path,
+    db_path: &Path,
+    trigger: &str,
+    full: bool,
+) -> Option<String> {
+    use crate::indexer::background_refresh;
+
+    if auto_refresh_is_scratch_data_dir(data_dir) || dotenvy::var("TUI_HEADLESS").is_ok() {
+        return None;
+    }
+    let outcome = if full {
+        background_refresh::maybe_spawn_background_full_index(data_dir, db_path, trigger)
+    } else {
+        background_refresh::maybe_spawn_background_index_refresh(data_dir, db_path, trigger, None)
+    };
+    Some(describe_background_lexical_repair(
+        outcome,
+        full,
+        &background_refresh::log_path(data_dir),
+    ))
+}
+
+/// Words for the caller of a search whose lexical repair was handed to (or
+/// could not be handed to) a background `cass index`.
+fn describe_background_lexical_repair(
+    outcome: crate::indexer::background_refresh::AutoRefreshOutcome,
+    full: bool,
+    log: &Path,
+) -> String {
+    use crate::indexer::background_refresh::AutoRefreshOutcome;
+
+    let command = if full {
+        "cass index --full --json"
+    } else {
+        "cass index --json"
+    };
+    match outcome {
+        AutoRefreshOutcome::Spawned { pid, .. } => format!(
+            "cass started `{command} --background` as a detached process (pid {pid}) to rebuild the search index. Retry this search after it finishes; `cass status --json` shows its progress under .rebuild. Do not run `{command}` yourself meanwhile: it would exit 7 (index-busy)."
+        ),
+        AutoRefreshOutcome::IndexRunActive | AutoRefreshOutcome::GuardBusy => {
+            "A cass index run is already rebuilding the search index. Retry this search after it finishes; `cass status --json` shows its progress under .rebuild."
+                .to_string()
+        }
+        AutoRefreshOutcome::Cooldown { remaining_secs } => format!(
+            "A background rebuild was started in the last few minutes but does not hold the index lock: it is either still starting or has already failed (log: {}). Retry this search shortly; automatic restarts resume in {remaining_secs}s, and to rebuild now, run `{command}` in a process that is not killed by a short timeout.",
+            log.display()
+        ),
+        AutoRefreshOutcome::BackedOff {
+            consecutive_failures,
+            remaining_secs,
+            detail,
+        } => format!(
+            "The last {consecutive_failures} background rebuild(s) ended without finishing ({detail}; log: {}). Automatic restarts resume in {remaining_secs}s; to rebuild now, run `{command}` in a process that is not killed by a short timeout.",
+            log.display()
+        ),
+        AutoRefreshOutcome::Tripped {
+            consecutive_failures,
+            detail,
+        } => format!(
+            "Automatic background rebuilds stopped after {consecutive_failures} failures ({detail}; log: {}). Run `{command}` in a process that is not killed by a short timeout; automatic rebuilds resume after one finishes.",
+            log.display()
+        ),
+        AutoRefreshOutcome::Disabled => format!(
+            "Automatic background rebuilds are disabled (CASS_AUTO_REFRESH=0). Run `{command}` in a process that is not killed by a short timeout."
+        ),
+        AutoRefreshOutcome::SpawnFailed { error } => format!(
+            "cass could not start a background rebuild ({error}). Run `{command}` in a process that is not killed by a short timeout."
+        ),
+    }
+}
+
+/// Progress of the lexical rebuild recorded under `index_path`, for messages
+/// that tell a caller how far an active rebuild has come.
+fn lexical_rebuild_progress_note(index_path: &Path) -> Option<String> {
+    let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(index_path)
+        .ok()
+        .flatten()?;
+    if checkpoint.completed || checkpoint.total_conversations == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} of {} conversations processed",
+        checkpoint
+            .processed_conversations
+            .min(checkpoint.total_conversations),
+        checkpoint.total_conversations
+    ))
 }
 
 fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliError {
@@ -28119,6 +28236,15 @@ fn ensure_lexical_assets_for_search(
             }
         }
 
+        // With no searchable generation, the active run is a first build or a
+        // full rebuild, which takes minutes on a large archive. Waiting out the
+        // search budget for it almost never ends in results; it turned every
+        // agent search during a rebuild into a long stall before this same
+        // verdict. Robot callers get it at once, with progress.
+        if robot_bounded_degraded && !initial_index_exists {
+            return Err(search_lock_busy_error_with_progress(data_dir, index_path));
+        }
+
         let waited = wait_for_searchable_index_after_active_rebuild(
             data_dir,
             db_path,
@@ -28126,7 +28252,7 @@ fn ensure_lexical_assets_for_search(
             search_active_rebuild_wait_duration(timeout_ms, started_at),
         );
         if !waited {
-            return Err(search_lock_busy_error(data_dir));
+            return Err(search_lock_busy_error_with_progress(data_dir, index_path));
         }
 
         if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
@@ -28146,8 +28272,20 @@ fn ensure_lexical_assets_for_search(
     // Admit maintenance before even trying a checkpoint refresh: refreshing an
     // incomplete archive can reopen SQLite and perform substantial work. A
     // readable stale generation still takes the existing fail-open path below.
-    if !diagnosis.existing_index_search_allowed {
-        admit_search_lexical_repair(db_path, &reason)?;
+    // An archive over the inline budget gets its full rebuild started in the
+    // background, so the refusal is not the end of it.
+    if !diagnosis.existing_index_search_allowed
+        && let Err(mut error) = admit_search_lexical_repair(db_path, &reason)
+    {
+        if let Some(note) = start_background_lexical_repair_for_search(
+            data_dir,
+            db_path,
+            "search-lexical-repair-over-inline-budget",
+            true,
+        ) {
+            error.hint = Some(note);
+        }
+        return Err(error);
     }
 
     if initial_index_exists && diagnosis.checkpoint_refresh_allowed {
@@ -28220,19 +28358,25 @@ fn ensure_lexical_assets_for_search(
             // it here sent agents in a circle (search defers to index, index
             // defers the repair, search defers again). Point straight at
             // `--full` when this database exceeds the auto-repair threshold.
-            let next_action = if crate::indexer::db_size_bytes_for_incremental_lexical_repair_policy(
-                db_path,
-            )
-                > crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes()
-            {
+            let needs_full =
+                crate::indexer::db_size_bytes_for_incremental_lexical_repair_policy(db_path)
+                    > crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes();
+            let manual_action = if needs_full {
                 "Run `cass index --full --json` to rebuild the lexical checkpoint: this database exceeds the automatic-repair size threshold, so plain `cass index` defers the repair (unless CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR=1 forces it)."
             } else {
                 "Run `cass index --json` to complete the lexical rebuild checkpoint, then retry the search."
             };
+            let next_action = start_background_lexical_repair_for_search(
+                data_dir,
+                db_path,
+                "search-checkpoint-incomplete",
+                needs_full,
+            )
+            .unwrap_or_else(|| manual_action.to_string());
             return Err(search_robot_degraded_error(
                 "checkpoint_incomplete",
                 &reason,
-                next_action,
+                &next_action,
             ));
         }
     }
@@ -29393,6 +29537,90 @@ mod search_lexical_self_heal_tests {
                 .is_some_and(|hint| hint.contains("cass index --watch-once")),
             "hint must name the recovery command: {err:?}"
         );
+    }
+
+    /// A robot search with no searchable index while a rebuild holds the
+    /// index-run lock gets the busy verdict at once. It used to wait out
+    /// CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS (30 s by default) first, a stall on
+    /// every agent search during a first build that runs for minutes.
+    #[test]
+    fn robot_search_without_index_reports_active_rebuild_immediately() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        assert!(!crate::search::tantivy::searchable_index_exists(
+            &index_path
+        ));
+        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
+
+        let started = Instant::now();
+        let err = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            true,
+        )
+        .expect_err("no index plus an active rebuild is a busy verdict");
+        assert_eq!(err.code, 7);
+        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "robot search waited {:?} for a rebuild that cannot finish in time",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn active_rebuild_wait_ends_before_a_bounded_search_deadline() {
+        let wait = search_active_rebuild_wait_duration(Some(1_000), Instant::now());
+        assert!(
+            wait <= Duration::from_millis(900),
+            "the wait must leave the search worker time to report before its deadline: {wait:?}"
+        );
+    }
+
+    #[test]
+    fn background_lexical_repair_description_names_the_next_step() {
+        use crate::indexer::background_refresh::AutoRefreshOutcome;
+        let log = Path::new("/d/auto-refresh.log");
+
+        let spawned = describe_background_lexical_repair(
+            AutoRefreshOutcome::Spawned {
+                pid: 42,
+                reason: "search-lexical-repair-over-inline-budget".to_string(),
+            },
+            true,
+            log,
+        );
+        assert!(spawned.contains("pid 42"), "{spawned}");
+        assert!(
+            spawned.contains("`cass index --full --json --background`"),
+            "{spawned}"
+        );
+        assert!(spawned.contains("exit 7"), "{spawned}");
+
+        let busy =
+            describe_background_lexical_repair(AutoRefreshOutcome::IndexRunActive, true, log);
+        assert!(busy.contains("already rebuilding"), "{busy}");
+
+        let tripped = describe_background_lexical_repair(
+            AutoRefreshOutcome::Tripped {
+                consecutive_failures: 3,
+                detail: "exit 70".to_string(),
+            },
+            false,
+            log,
+        );
+        assert!(tripped.contains("`cass index --json`"), "{tripped}");
+        assert!(tripped.contains("/d/auto-refresh.log"), "{tripped}");
+        assert!(tripped.contains("exit 70"), "{tripped}");
+
+        let disabled = describe_background_lexical_repair(AutoRefreshOutcome::Disabled, true, log);
+        assert!(disabled.contains("CASS_AUTO_REFRESH=0"), "{disabled}");
     }
 
     #[test]
