@@ -711,6 +711,10 @@ fn blocking_sessions_file_search_returns_bounded_partial_without_broadening_scop
     Ok(())
 }
 
+/// Explicit `--mode semantic` under an exhausted robot budget fails closed with
+/// the typed retryable timeout (exit 10, ds7uy.4.1) instead of returning a
+/// lexical result or an empty success (bead vy4ic chose this contract over the
+/// generic exit-0 timeout envelope, which still applies to other searches).
 #[test]
 fn explicit_semantic_timeout_never_substitutes_lexical_hits() -> TestResult {
     let tmp = TempDir::new()?;
@@ -732,34 +736,38 @@ fn explicit_semantic_timeout_never_substitutes_lexical_hits() -> TestResult {
             data_dir.to_str().ok_or("non-utf8 path")?,
         ])
         .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
     ensure(
-        output.status.success(),
+        output.status.code() == Some(10),
         format!(
-            "semantic timeout failed: status={:?}; stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            "explicit semantic timeout must exit 10: status={:?}; stderr={stderr}",
+            output.status
         ),
     )?;
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    // No result document at all, so no lexical hits can reach a consumer.
     ensure(
-        payload["_meta"]["requested_search_mode"] == "semantic",
-        "semantic timeout lost requested mode",
+        output.stdout.is_empty(),
+        format!(
+            "explicit semantic timeout must not print a result: {}",
+            String::from_utf8_lossy(&output.stdout)
+        ),
+    )?;
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("explicit semantic timeout must emit a JSON error")?;
+    let payload: serde_json::Value = serde_json::from_str(last_line.trim())?;
+    let error = &payload["error"];
+    ensure(
+        error["kind"] == "timeout" && error["code"] == 10 && error["retryable"] == true,
+        format!("expected a retryable timeout error: {payload}"),
     )?;
     ensure(
-        payload["_meta"]["search_mode"] == "semantic",
-        "semantic timeout silently substituted lexical mode",
-    )?;
-    ensure(
-        payload["_meta"]["fallback_tier"].is_null(),
-        "semantic timeout reported a lexical fallback tier",
-    )?;
-    ensure(
-        payload["_meta"]["semantic_refinement"] == false,
-        "semantic timeout claimed incomplete semantic work was completed",
-    )?;
-    ensure(
-        payload["hits"].as_array().is_some_and(Vec::is_empty),
-        "semantic timeout must not return lexical hits",
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("semantic_budget checkpoint=")),
+        format!("the error must name the budget checkpoint that refused semantic: {payload}"),
     )?;
     Ok(())
 }
