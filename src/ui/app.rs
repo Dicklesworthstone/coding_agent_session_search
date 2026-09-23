@@ -30535,6 +30535,7 @@ mod tests {
                 snippets: vec![],
             },
         ];
+        anchor_selected_hit_to_detail(app, &mut cv);
         app.cached_detail = Some((source_path, cv));
         app.focus_manager.focus(focus_ids::DETAIL_PANE);
     }
@@ -32263,6 +32264,34 @@ not jsonl",
         }
     }
 
+    /// Stored message ordinals are unique within a conversation.
+    fn number_messages_canonically(messages: &mut [Message]) {
+        for (idx, message) in messages.iter_mut().enumerate() {
+            message.idx = i64::try_from(idx).expect("small message index");
+        }
+    }
+
+    /// Make `cv` the selected hit's own conversation under the #493 exact
+    /// anchor (`conversation_view_matches_hit`): same source, path and
+    /// conversation id, unique stored ordinals, and a hit line that names
+    /// exactly one stored message. `app_with_hits` numbers hit 0 at line 0,
+    /// which is no stored coordinate, so the hit is anchored on the view's
+    /// first message.
+    fn anchor_selected_hit_to_detail(app: &mut CassApp, cv: &mut ConversationView) {
+        let Some(hit) = app
+            .panes
+            .get_mut(app.active_pane)
+            .and_then(|pane| pane.hits.get_mut(pane.selected))
+        else {
+            return;
+        };
+        number_messages_canonically(&mut cv.messages);
+        hit.line_number = (!cv.messages.is_empty()).then_some(1);
+        cv.convo.id = hit.conversation_id;
+        cv.convo.source_path = std::path::PathBuf::from(&hit.source_path);
+        cv.convo.source_id = hit.source_id.clone();
+    }
+
     fn markdown_span_fg_for_text(
         lines: &[ftui::text::Line],
         needle: &str,
@@ -33473,6 +33502,8 @@ not jsonl",
                 snippets: Vec::new(),
             },
         ];
+        anchor_selected_hit_to_detail(&mut app, &mut loaded_view);
+        let hit = app.selected_hit().cloned().expect("anchored selected hit");
         app.cached_detail = Some((hit.source_path.clone(), loaded_view));
 
         let _ = app.update(CassMsg::DetailLoadRequested { hit: hit.clone() });
@@ -34297,9 +34328,12 @@ not jsonl",
                 snippets: vec![],
             },
         ];
+        // Anchor the hit exactly on this conversation's first message (#493).
+        let mut hit = make_test_hit();
+        hit.conversation_id = cv.convo.id;
+        hit.line_number = Some(1);
         app.cached_detail = Some(("/test/session.jsonl".to_string(), cv));
 
-        let hit = make_test_hit();
         let styles = app.resolved_style_context();
         let lines = app.build_messages_lines(&hit, 100, &styles);
         let rendered = lines
@@ -36255,8 +36289,7 @@ not jsonl",
         app.status = "indexing 3/9".to_string();
         app.last_search_ms = Some(42);
         let mut cv = make_test_conversation_view();
-        cv.convo.source_path = std::path::PathBuf::from("/path/0");
-        cv.convo.source_id = "local".to_string();
+        anchor_selected_hit_to_detail(&mut app, &mut cv);
         app.cached_detail = Some(("/path/0".to_string(), cv));
 
         let text = buffer_to_text(&render_at_degradation(
@@ -38535,6 +38568,7 @@ not jsonl",
             msg(MessageRole::Tool, "tool output here"),
             msg(MessageRole::System, "system note"),
         ];
+        anchor_selected_hit_to_detail(&mut app, &mut cv);
         app.cached_detail = Some(("/path/0".to_string(), cv));
 
         let _ = app.update(CassMsg::ToolCollapseAll);
@@ -38798,6 +38832,8 @@ not jsonl",
             msg(MessageRole::User, "thanks for help", Some(4_000)),
             msg(MessageRole::Agent, "you are welcome", Some(5_000)),
         ];
+        // Line 1 must name exactly one stored message (#493).
+        number_messages_canonically(&mut cv.messages);
         let mut hit = make_test_hit();
         hit.line_number = Some(1);
         hit.created_at = Some(1_000);
