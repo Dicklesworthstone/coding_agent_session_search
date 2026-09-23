@@ -2850,7 +2850,8 @@ fn fts_repair_liveness_index_cmd(home: &std::path::Path, data_dir: &std::path::P
 /// (PRIMARY KEY failure). An already canonical contentless shadow is the control.
 #[test]
 fn gh495_residue_fts_shadows_converge_through_doctor_and_full_index() {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use frankensqlite::compat::RowExt;
 
     const LEGACY_DDL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(
         content, title, agent, workspace, source_path,
