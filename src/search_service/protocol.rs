@@ -19,7 +19,7 @@ fn default_limit() -> usize {
     10
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Filters {
     #[serde(default)]
@@ -57,6 +57,20 @@ impl ViewSelection {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
+    SemanticSearch {
+        id: u64,
+        query: String,
+        #[serde(default)]
+        mode: super::semantic::Mode,
+        #[serde(default)]
+        approximate: bool,
+        #[serde(default = "default_limit")]
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        filters: Filters,
+    },
     ViewBatch {
         id: u64,
         views: Vec<ViewSelection>,

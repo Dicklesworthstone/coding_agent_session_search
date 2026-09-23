@@ -522,3 +522,49 @@ fn mcp_refinement_obeys_the_existing_nonblocking_work_quota() {
 
 // Keep the real resource/evidence journey in this adapter's test scope.
 include!("mcp_refinement_evidence_tests.rs");
+
+#[test]
+fn mcp_semantic_catalog_is_opt_in_and_invalid_arguments_stay_lazy() {
+    use super::super::semantic::{EmbedderChoice, Semantic};
+
+    let mut session = Session::new(PathBuf::from("never-opened-index"));
+    assert!(
+        tools_for_session(&session)
+            .iter()
+            .all(|tool| tool["name"] != "cass_semantic_search")
+    );
+    session.archive = Some(PathBuf::from("never-opened-archive"));
+    session.semantic = Semantic::new(PathBuf::from("never-opened-data"), EmbedderChoice::Hash);
+    let catalog = tools_for_session(&session);
+    let semantic = catalog
+        .iter()
+        .find(|tool| tool["name"] == "cass_semantic_search")
+        .unwrap();
+    assert_eq!(semantic["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        semantic["inputSchema"]["properties"]["mode"]["enum"],
+        json!(["semantic", "hybrid"])
+    );
+    assert!(
+        catalog[0]["inputSchema"]["properties"]
+            .get("mode")
+            .is_none()
+    );
+    let mut adapter = Adapter::default();
+    initialize(&mut adapter, &mut session, CURRENT_VERSION);
+    for arguments in [
+        json!({"query":"needle", "mode":"lexical"}),
+        json!({"query":"needle", "db":"another.db"}),
+        json!({"query":"needle", "approximate":"yes"}),
+    ] {
+        let response = adapter
+            .handle(
+                &mut session,
+                call(5.into(), "cass_semantic_search", arguments),
+            )
+            .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    assert_eq!(session.status()["semantic"]["load_attempts"], 0);
+    assert_eq!(session.open_attempts, 0);
+}

@@ -1,4 +1,4 @@
-# Persistent lexical search over standard I/O
+# Persistent search over standard I/O
 
 `cass serve` lets a coding agent or local coordinator keep one lexical reader
 open across repeated searches instead of paying the full index-open cost for
@@ -57,6 +57,8 @@ For complete bounded bodies in the same service, opt in to `view` using the
 fixed `--db` configuration described below. No archive is inferred from `--data-dir`.
 Candidate-only neural reranking is separately enabled by `--reranker-model`;
 ordinary `search` remains lexical and does not load or invoke the model.
+Global semantic retrieval is separately enabled by `--semantic-embedder` with
+explicit `--data-dir` and `--db`; see the retained semantic search section below.
 
 ## Wire protocol, version 1
 
@@ -83,8 +85,8 @@ existing lexical engine. `source_id` is always one exact ID: strings such as
 `remote` and `all` are **not** special groups here. To search every source,
 omit that field. Empty agent/workspace lists mean unrestricted.
 
-Unsupported fields and operations are errors, never silently ignored. There
-is no `mode`, semantic fallback, session-path filter, arbitrary per-request
+Unsupported fields and operations are errors, never silently ignored. Ordinary
+`search` has no `mode`, semantic fallback, session-path filter, arbitrary per-request
 index path, full-content search, or maintenance operation. Canonical `view` is
 separately enabled by `--db`. In particular,
 post-filter routes that can expand to corpus-sized candidate windows are not
@@ -131,9 +133,96 @@ These are transport and candidate-window bounds, not kernel allocation limits.
 Resident-memory supervision below adds a sampled termination threshold.
 The first index admission can still be expensive. Each independently started worker still owns
 its own reader: reuse one process rather than spawning one for each query.
-Global vector/HNSW serving is not implemented by this endpoint. Opt-in
-`refine` scores only a bounded lexical shortlist. Optional shared reader
+Opt-in `semantic_search` retains global vectors for exact retrieval; its cold
+admission still has global model, vector, and filter-map costs. Opt-in `refine`
+scores only a bounded lexical shortlist. Optional shared reader
 admission below bounds owners, not total RSS.
+
+## Retained semantic and hybrid search
+
+Enable global vector retrieval explicitly against one archive and its installed
+assets:
+
+```sh
+cass serve --stdio --data-dir /path/to/cass-data \
+  --db /path/to/cass-data/agent_search.db --semantic-embedder minilm
+```
+
+Supported choices are `minilm`, `multilingual-minilm`, and `hash`. The two
+neural choices require installed local model files and compatible vectors;
+acquire/build them separately with the ordinary model/index commands. `hash`
+uses existing hash vectors without loading a neural model. The service never
+silently substitutes hash embeddings for a requested neural embedder, downloads
+models, contacts a daemon, or starts maintenance. Startup, status, MCP discovery,
+and ordinary `search` remain lazy and model-free.
+
+```json
+{"op":"semantic_search","id":10,"query":"How was authentication caching fixed?","mode":"hybrid","limit":10}
+{"op":"semantic_search","id":11,"query":"authentication cache invalidation","mode":"semantic","filters":{"agents":["codex"],"source_id":"local"}}
+```
+
+`mode` defaults to `hybrid`. Hybrid retrieves lexical and semantic candidates
+independently and fuses them using CASS's production reciprocal-rank fusion.
+Semantic retrieval can introduce messages absent from the lexical shortlist.
+If semantic setup or querying is unavailable, hybrid returns lexical results
+with `realized_mode: "lexical"` and `semantic_fallback_reason`. Explicit
+`mode: "semantic"` returns a typed error instead. If the lexical leg fails
+after semantic retrieval succeeds, hybrid returns the semantic page and names
+the failure in `lexical_degrade_reason`.
+
+The model, opened vector owners, semantic filter maps, query-embedding cache,
+and strict canonical hydration connection are retained between requests.
+`semantic_reused`, `semantic_setup_ms`, and `snapshot.semantic` expose actual
+reuse, successful-load epochs, attempts and completed semantic calls. Ordinary
+`search` keeps its independent index-only reader. Semantic-only calls do not
+open the lexical reader at all. One admission lease covers this process's
+lexical, semantic and canonical readers; `unload`, `reload`, shutdown and EOF
+release all owners. Reload reopens the lexical index and leaves semantic assets
+lazy until the next semantic request.
+
+Semantic filters and page/output bounds match ordinary search. Hybrid admits
+up to `min(3 * (offset + limit + 1), 1024)` candidates per retrieval leg before
+fusion. The production semantic reducer can overfetch for deduplication and
+filtered pages. Returned messages are bounded previews with complete source,
+conversation and one-based message coordinates. Internal canonical hydration
+may read full message text to construct those previews, so response bounds are
+not an allocation bound. The existing process deadline, sampled resident-memory
+limit and optional cross-process admission pool cover setup and every query.
+Cold global admission and exact vector scanning may still be expensive; this
+feature provides reuse, not a measured large-archive speed or memory guarantee.
+
+`approximate` defaults to false. This persistent service currently performs
+exact vector retrieval for both values. Native ANN admission is disabled until
+the backend can release all graph/data owners on unload. With
+`approximate: true`, `ann.requested` is true, `ann.used` and `ann.attempted` are
+false, `ann.stats` is null, and `ann.unavailable_reason` is
+`persistent_native_ann_requires_reclaimable_owners`. No native graph loader or
+lazy ANN diagnostic runs. Invalid or missing optional ANN sidecars do not
+prevent exact semantic search. Ordinary one-shot search has its own ANN policy.
+
+Reuse is guarded by retained file-identity handles, lengths and modification
+times for the canonical DB and WAL/journal, semantic manifests/current pointer,
+and selected embedder's vector/WAL files, including shard records. Optional ANN
+files and their generation payloads are neither loaded nor guarded. Unix
+also checks ctime, which catches same-size writes with restored mtime. Witnesses
+are captured before semantic admission and checked before and after queries.
+Changed or replaced files discard the semantic context and report
+`semantic_reload_required`; hybrid can continue with lexical results until the
+caller reloads. Final-component symlinks and unguarded artifact layouts are
+refused. The strict production loader still validates model/vector producer
+identity, dimensions, revisions, readiness and canonical invalidation markers.
+
+These checks detect ordinary concurrent publication and archive changes; they
+do **not** certify an immutable cross-index/archive generation or defend against
+an adversary preserving filesystem change metadata. Non-Unix systems lack the
+ctime check. Status therefore reports
+`immutable_generation_certified: false`; the retained semantic epoch is only a
+session-local counter. Changes after the final check remain a normal concurrent
+publication boundary, and the next query checks again.
+
+With `--mcp`, the same opt-in capability appears as `cass_semantic_search` with
+identical arguments and bounds. It is absent from the tool catalog unless
+semantic retrieval was enabled at startup. `cass_search` remains lexical.
 
 ### Enforced request deadlines
 

@@ -4072,6 +4072,23 @@ fn stored_preview_is_complete_content(stored_preview: &str) -> bool {
 }
 
 impl SearchClient {
+    /// Create a database-backed semantic client without opening a lexical index.
+    ///
+    /// The archive connection and semantic assets remain lazy. Callers must
+    /// attach a validated semantic context before querying; this constructor
+    /// performs no index repair, model loading, or background work.
+    pub fn open_semantic(db_path: &Path, options: SearchClientOptions) -> Result<Option<Self>> {
+        Self::from_opened_lexical_index(
+            crate::search::tantivy::OpenedLexicalIndex {
+                path: db_path.to_path_buf(),
+                reader: None,
+                federated_readers: None,
+            },
+            Some(db_path),
+            options,
+        )
+    }
+
     pub fn open(index_path: &Path, db_path: Option<&Path>) -> Result<Option<Self>> {
         Self::open_with_options(index_path, db_path, SearchClientOptions::default())
     }

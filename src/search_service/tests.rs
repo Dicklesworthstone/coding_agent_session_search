@@ -102,6 +102,368 @@ fn protocol_rejects_unsupported_work_instead_of_silently_downgrading() {
 }
 
 #[test]
+fn semantic_service_is_explicit_and_lazy() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut session = Session::new(temp.path().join("missing-index"));
+    let request_value = json!({"op":"semantic_search", "id":1, "query":"needle"});
+    let (reply, _) = session.handle(request(request_value.clone()));
+    assert_eq!(reply.error.unwrap().kind, "semantic_disabled");
+    session.semantic =
+        semantic::Semantic::new(temp.path().to_path_buf(), semantic::EmbedderChoice::Hash);
+    session.archive = Some(temp.path().join("missing.db"));
+    assert_eq!(session.status()["semantic"]["load_attempts"], 0);
+    let (invalid, _) = session.handle(request(
+        json!({"op":"semantic_search", "id":2, "query":"needle", "limit":0}),
+    ));
+    assert_eq!(invalid.error.unwrap().kind, "invalid_request");
+    assert_eq!(session.status()["semantic"]["load_attempts"], 0);
+    assert!(tree(temp.path())?.is_empty());
+    for argv in [
+        vec![
+            "cass",
+            "serve",
+            "--stdio",
+            "--index",
+            "x",
+            "--semantic-embedder",
+            "hash",
+        ],
+        vec![
+            "cass",
+            "serve",
+            "--stdio",
+            "--data-dir",
+            "x",
+            "--semantic-embedder",
+            "hash",
+        ],
+    ] {
+        assert!(ServiceCli::try_parse_from(argv).is_err());
+    }
+    assert!(
+        ServiceCli::try_parse_from([
+            "cass",
+            "serve",
+            "--stdio",
+            "--data-dir",
+            "x",
+            "--db",
+            "x/archive.db",
+            "--semantic-embedder",
+            "hash"
+        ])
+        .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<Request>(
+            json!({"op":"semantic_search", "id":1, "query":"x", "mode":"lexical"})
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+fn semantic_service_fixture() -> Result<(tempfile::TempDir, Session, i64)> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::search::embedder::Embedder;
+    use coding_agent_search::search::hash_embedder::HashEmbedder;
+    use coding_agent_search::search::vector_index::{
+        SemanticDocId, VectorIndex, vector_index_path,
+    };
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let root = tempfile::tempdir()?;
+    let database = root.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&database)?;
+    let agent_id = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "codex".into(),
+        name: "Codex".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    let workspace = PathBuf::from("/work/semantic-fixture");
+    let workspace_id = storage.ensure_workspace(&workspace, None)?;
+    let source_path = root.path().join("raw-history-never-created.jsonl");
+    let outcome = storage.insert_conversation_tree(
+        agent_id,
+        Some(workspace_id),
+        &Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(workspace),
+            external_id: Some("semantic-service-fixture".into()),
+            title: Some("Global retrieval".into()),
+            source_path: source_path.clone(),
+            started_at: None,
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: json!({}),
+            source_id: "local".into(),
+            origin_host: None,
+            messages: [
+                (7, "semanticneedle persistent retained vector search"),
+                (12, "unrelated banana orchard cultivation"),
+            ]
+            .into_iter()
+            .map(|(idx, content)| Message {
+                id: None,
+                idx,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: None,
+                content: content.into(),
+                extra_json: json!({}),
+                snippets: Vec::new(),
+            })
+            .collect(),
+        },
+    )?;
+    let messages = storage.fetch_messages(outcome.conversation_id)?;
+    let embedder = HashEmbedder::default();
+    let vector_path = vector_index_path(root.path(), embedder.id());
+    std::fs::create_dir_all(vector_path.parent().unwrap())?;
+    let mut vectors = VectorIndex::create_with_revision(
+        &vector_path,
+        embedder.id(),
+        coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION,
+        embedder.dimension(),
+        frankensearch::index::Quantization::F16,
+    )?;
+    for message in &messages {
+        let doc_id = SemanticDocId {
+            message_id: message.id.unwrap() as u64,
+            chunk_idx: 0,
+            agent_id: agent_id as u32,
+            workspace_id: workspace_id as u32,
+            source_id: crc32fast::hash(b"local"),
+            role: 1,
+            created_at_ms: 0,
+            content_hash: None,
+        }
+        .to_doc_id_string();
+        vectors.write_record(&doc_id, &embedder.embed_sync(&message.content)?)?;
+    }
+    vectors.finish()?;
+    drop(storage);
+    let lexical = root.path().join("lexical-index");
+    let mut writer = TantivyIndex::open_or_create(&lexical)?;
+    writer.add_prebuilt_documents_slice(&[CassDocument {
+        source_path: source_path.to_string_lossy().into_owned(),
+        msg_idx: 12,
+        conversation_id: Some(outcome.conversation_id),
+        content: messages[1].content.clone(),
+        workspace: Some("/work/semantic-fixture".into()),
+        ..document(outcome.conversation_id, "", "local")
+    }])?;
+    writer.commit()?;
+    drop(writer);
+    let mut session = Session::new(lexical);
+    session.archive = Some(database);
+    session.semantic =
+        semantic::Semantic::new(root.path().to_path_buf(), semantic::EmbedderChoice::Hash);
+    Ok((root, session, outcome.conversation_id))
+}
+
+#[test]
+fn semantic_service_reuses_global_vectors_without_a_lexical_match_and_preserves_filters()
+-> Result<()> {
+    let (root, mut session, conversation) = semantic_service_fixture()?;
+    let before = tree(root.path())?;
+    for id in 1..=2 {
+        let (reply, _) = session.handle(request(json!({"op":"semantic_search", "id":id,
+            "query":"semanticneedle", "mode":"semantic", "limit":1, "approximate":true,
+            "filters":{"agents":["codex"], "source_id":"local", "workspaces":["/work/semantic-fixture"]}})));
+        assert!(reply.ok, "{reply:?}");
+        let result = reply.result.unwrap();
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["hits"][0]["conversation_id"], conversation);
+        assert_eq!(result["hits"][0]["message_index"], 8);
+        assert_eq!(result["hits"][0]["source_id"], "local");
+        assert_eq!(result["semantic_reused"], id > 1);
+        assert_eq!(result["snapshot"]["semantic"]["successful_loads"], 1);
+        assert_eq!(result["snapshot"]["semantic"]["neural"], false);
+        assert_eq!(
+            result["snapshot"]["open_attempts"], 0,
+            "semantic-only search must never load lexical"
+        );
+        assert_eq!(result["ann"]["requested"], true);
+        assert_eq!(
+            result["ann"]["used"], false,
+            "persistent service must use reclaimable exact vector owners"
+        );
+        assert_eq!(result["ann"]["attempted"], false);
+        assert_eq!(
+            result["ann"]["unavailable_reason"],
+            "persistent_native_ann_requires_reclaimable_owners"
+        );
+        assert!(result["hits"][0].get("content").is_none());
+    }
+    let lexical = search(&mut session, 3, "semanticneedle");
+    assert_eq!(
+        lexical["count"], 0,
+        "positive semantic evidence is absent from the lexical candidate pool"
+    );
+    let (hybrid, _) = session.handle(request(
+        json!({"op":"semantic_search", "id":4, "query":"semanticneedle", "limit":1}),
+    ));
+    assert!(hybrid.ok, "{hybrid:?}");
+    assert_eq!(hybrid.result.as_ref().unwrap()["realized_mode"], "hybrid");
+    assert_eq!(hybrid.result.unwrap()["hits"][0]["message_index"], 8);
+    for filters in [
+        json!({"agents":["absent"]}),
+        json!({"source_id":"different-source"}),
+        json!({"workspaces":["/another/workspace"]}),
+        json!({"created_from":1000}),
+    ] {
+        let (filtered, _) = session.handle(request(json!({"op":"semantic_search", "id":5,
+            "query":"semanticneedle", "mode":"semantic", "filters":filters})));
+        assert!(filtered.ok, "{filtered:?}");
+        assert_eq!(filtered.result.unwrap()["count"], 0);
+    }
+    session.unload();
+    assert_eq!(session.status()["semantic"]["loaded"], false);
+    assert_eq!(
+        tree(root.path())?,
+        before,
+        "read-only service changed its assets"
+    );
+    Ok(())
+}
+
+#[test]
+fn semantic_service_missing_assets_falls_back_only_for_hybrid() -> Result<()> {
+    let (root, mut session, _) = semantic_service_fixture()?;
+    session.semantic =
+        semantic::Semantic::new(root.path().to_path_buf(), semantic::EmbedderChoice::Minilm);
+    let before = tree(root.path())?;
+    let (hybrid, _) = session.handle(request(
+        json!({"op":"semantic_search", "id":1, "query":"banana"}),
+    ));
+    assert!(hybrid.ok, "{hybrid:?}");
+    let hybrid = hybrid.result.unwrap();
+    assert_eq!(hybrid["count"], 1);
+    assert_eq!(hybrid["realized_mode"], "lexical");
+    assert!(
+        hybrid["semantic_fallback_reason"]
+            .as_str()
+            .unwrap()
+            .contains("model")
+    );
+    let (semantic, _) = session.handle(request(
+        json!({"op":"semantic_search", "id":2, "query":"banana", "mode":"semantic"}),
+    ));
+    assert!(!semantic.ok);
+    assert_eq!(semantic.error.unwrap().kind, "semantic_unavailable");
+    session.unload();
+    assert_eq!(
+        tree(root.path())?,
+        before,
+        "missing models must never initiate downloads or create assets"
+    );
+    Ok(())
+}
+
+#[test]
+fn semantic_service_replacement_invalidates_retained_context_until_reload() -> Result<()> {
+    use coding_agent_search::search::embedder::Embedder;
+    use coding_agent_search::search::hash_embedder::HashEmbedder;
+    use coding_agent_search::search::vector_index::vector_index_path;
+
+    let (root, mut session, _) = semantic_service_fixture()?;
+    let search_request = json!({"op":"semantic_search", "id":1, "query":"semanticneedle", "mode":"semantic", "limit":1});
+    assert!(session.handle(request(search_request.clone())).0.ok);
+    let path = vector_index_path(root.path(), HashEmbedder::default().id());
+    let replacement = root.path().join("replacement.fsvi");
+    std::fs::copy(&path, &replacement)?;
+    std::fs::rename(&path, root.path().join("retained-old.fsvi"))?;
+    std::fs::rename(&replacement, &path)?;
+    let (changed, _) = session.handle(request(search_request.clone()));
+    assert_eq!(changed.error.unwrap().kind, "semantic_reload_required");
+    assert_eq!(session.status()["semantic"]["loaded"], false);
+    assert_eq!(session.status()["semantic"]["requires_reload"], true);
+    assert_eq!(
+        session
+            .handle(request(search_request.clone()))
+            .0
+            .error
+            .unwrap()
+            .kind,
+        "semantic_reload_required"
+    );
+    assert!(session.handle(Request::Reload { id: 3 }).0.ok);
+    let reloaded = session.handle(request(search_request)).0;
+    assert!(reloaded.ok, "{reloaded:?}");
+    assert_eq!(
+        reloaded.result.unwrap()["snapshot"]["semantic"]["successful_loads"],
+        2
+    );
+    session.unload();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_service_same_size_archive_edit_with_restored_mtime_is_refused() -> Result<()> {
+    let (_root, mut session, _) = semantic_service_fixture()?;
+    let value =
+        json!({"op":"semantic_search", "id":1, "query":"semanticneedle", "mode":"semantic"});
+    assert!(session.handle(request(value.clone())).0.ok);
+    let path = session.archive.as_ref().unwrap();
+    let original_time = std::fs::metadata(path)?.modified()?;
+    let original = std::fs::read(path)?;
+    // The bytes and count even remain identical: ctime, not size/count/mtime,
+    // must detect an in-place rewrite of a previously admitted database.
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.write_all(&original)?;
+    file.set_modified(original_time)?;
+    drop(file);
+    let (changed, _) = session.handle(request(value));
+    assert_eq!(changed.error.unwrap().kind, "semantic_reload_required");
+    session.unload();
+    Ok(())
+}
+
+#[test]
+fn semantic_service_shares_one_admission_slot_with_hybrid_and_canonical_view() -> Result<()> {
+    let (root, mut session, _) = semantic_service_fixture()?;
+    let pool = admission::Pool::new(root.path().join("admission"), 1)?;
+    session.admission_pool = Some(pool.clone());
+    let (semantic, _) = session.handle(request(json!({"op":"semantic_search", "id":1,
+        "query":"semanticneedle", "mode":"semantic", "limit":1})));
+    assert!(semantic.ok, "{semantic:?}");
+    assert!(
+        pool.acquire().is_err(),
+        "semantic context must retain the only owner slot"
+    );
+    assert_eq!(session.status()["canonical_database_accessed"], true);
+    assert_eq!(session.status()["semantic"]["queries_attempted"], 1);
+    let hit = &semantic.result.as_ref().unwrap()["hits"][0];
+    let (view, _) = session.handle(request(json!({"op":"view", "id":2,
+        "source_path":hit["source_path"], "source_id":hit["source_id"],
+        "conversation_id":hit["conversation_id"], "message_index":hit["message_index"]})));
+    assert!(
+        view.ok,
+        "canonical view must reuse the semantic owner slot: {view:?}"
+    );
+    let (hybrid, _) = session.handle(request(json!({"op":"semantic_search", "id":3,
+        "query":"semanticneedle", "limit":1})));
+    assert!(hybrid.ok, "{hybrid:?}");
+    assert_eq!(
+        hybrid.result.unwrap()["realized_mode"],
+        "hybrid",
+        "opening the lexical leg must not acquire a second slot"
+    );
+    assert!(pool.acquire().is_err());
+    session.unload();
+    assert!(
+        pool.acquire().is_ok(),
+        "unload must release every native owner before the slot"
+    );
+    Ok(())
+}
+
+#[test]
 fn framed_exchange_is_lazy_recovers_after_bad_json_and_stops_on_shutdown() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let mut session = Session::new(temp.path().join("absent"));
@@ -390,5 +752,45 @@ fn failed_index_admission_releases_the_reserved_slot() -> Result<()> {
     );
     drop(pool.acquire()?);
     assert!(!session.index.exists());
+    Ok(())
+}
+
+#[test]
+fn semantic_service_invalid_optional_ann_does_not_block_exact_retrieval() -> Result<()> {
+    use coding_agent_search::search::ann_index::hnsw_index_path;
+    use coding_agent_search::search::embedder::Embedder;
+    use coding_agent_search::search::hash_embedder::HashEmbedder;
+
+    let (root, mut session, conversation) = semantic_service_fixture()?;
+    // A directory at the expected sidecar path is unusable as ANN. The optional
+    // accelerator must not become a prerequisite of the exact serving lane.
+    let sidecar = hnsw_index_path(root.path(), HashEmbedder::default().id());
+    std::fs::create_dir_all(&sidecar)?;
+    let before = tree(root.path())?;
+    for (id, approximate) in [(1, false), (2, true)] {
+        let (reply, _) = session.handle(request(json!({"op":"semantic_search", "id":id,
+            "query":"semanticneedle", "mode":"semantic", "limit":1, "approximate":approximate})));
+        assert!(reply.ok, "{reply:?}");
+        let result = reply.result.unwrap();
+        assert_eq!(result["hits"][0]["conversation_id"], conversation);
+        assert_eq!(result["hits"][0]["message_index"], 8);
+        assert_eq!(result["realized_mode"], "semantic");
+        assert_eq!(result["semantic_reused"], id > 1);
+        assert_eq!(result["ann"]["requested"], approximate);
+        assert_eq!(result["ann"]["used"], false);
+        assert_eq!(result["ann"]["attempted"], false);
+        assert!(result["ann"]["stats"].is_null());
+        if approximate {
+            assert_eq!(
+                result["ann"]["unavailable_reason"],
+                "persistent_native_ann_requires_reclaimable_owners"
+            );
+        } else {
+            assert!(result["ann"]["unavailable_reason"].is_null());
+        }
+        assert_eq!(result["snapshot"]["semantic"]["ann_supported"], false);
+    }
+    session.unload();
+    assert_eq!(tree(root.path())?, before);
     Ok(())
 }

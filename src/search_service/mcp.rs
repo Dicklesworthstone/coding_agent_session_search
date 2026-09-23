@@ -240,6 +240,7 @@ impl Adapter {
         };
         let op = match call.name.as_str() {
             "cass_search" => "search",
+            "cass_semantic_search" if session.semantic.enabled() => "semantic_search",
             "cass_status" => "status",
             "cass_reload" => "reload",
             "cass_unload" => "unload",
@@ -339,6 +340,19 @@ fn tools() -> Vec<Value> {
 
 fn tools_for_session(session: &Session) -> Vec<Value> {
     let mut catalog = tools();
+    if session.semantic.enabled() {
+        let mut schema = catalog[0]["inputSchema"].clone();
+        schema["properties"]["mode"] = json!({
+            "type": "string", "enum": ["semantic", "hybrid"], "default": "hybrid"
+        });
+        schema["properties"]["approximate"] = json!({"type": "boolean", "default": false});
+        catalog.push(json!({
+            "name": "cass_semantic_search",
+            "description": "Search retained global vectors exactly with the explicitly configured local embedder and canonical database. Hybrid mode fuses independently retrieved semantic and lexical candidates, falling back to lexical with an explicit reason if semantic assets are unavailable. Semantic mode fails when unavailable. Models/vectors/filter maps are reused until unload/reload. Changed archive or vector files invalidate reuse. Preview results preserve exact canonical coordinates. approximate=true still uses exact retrieval and reports native ANN unavailable because its owners cannot yet be reclaimed. Cold loading and global search may be expensive; worker deadline and sampled memory supervision apply.",
+            "inputSchema": schema,
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
+        }));
+    }
     // Startup configuration is immutable for the lifetime of a production
     // session; this catalog does not require list-changed notifications.
     if session.archive.is_some() {

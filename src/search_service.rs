@@ -3,7 +3,7 @@
 //! The reader is loaded lazily and retained until explicit reload, shutdown, or
 //! EOF. Search is index-only. Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
-//! Only opt-in refinement loads a local model, never global vector assets.
+//! Separate opt-in semantic retrieval retains local models and vector assets.
 //! No lane starts writers, automatic refresh, downloads, or detached children.
 //! Request deadlines terminate the worker, including stalled native calls.
 //! Sampled resident-memory limits terminate an over-budget worker; they are
@@ -23,6 +23,8 @@ mod memory;
 mod protocol;
 #[path = "search_service/refinement.rs"]
 mod refinement;
+#[path = "search_service/semantic.rs"]
+mod semantic;
 #[cfg(test)]
 #[path = "search_service/tests.rs"]
 mod tests;
@@ -35,7 +37,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use coding_agent_search::search::query::{
-    FieldMask, SearchClient, SearchClientOptions, SearchFilters,
+    FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit,
 };
 use coding_agent_search::sources::provenance::SourceFilter;
 use serde_json::{Value, json};
@@ -51,8 +53,8 @@ struct ServiceCli {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
-    /// Reuse one read-only lexical index reader for a stream of JSON requests.
-    /// Model use requires explicit refinement opt-in. See docs/SEARCH_SERVICE.md.
+    /// Reuse read-only search readers for a stream of JSON requests.
+    /// Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md.
     Serve {
         /// Published lexical index directory, instead of --data-dir.
         #[arg(
@@ -85,6 +87,10 @@ enum ServiceCommand {
         /// Never downloads files; ordinary search, startup and status stay model-free.
         #[arg(long, value_name = "PATH")]
         reranker_model: Option<PathBuf>,
+        /// Opt in to retained semantic/hybrid retrieval using installed assets.
+        /// Requires explicit --data-dir and --db; ordinary search stays lexical.
+        #[arg(long, value_enum, requires_all = ["data_dir", "db"])]
+        semantic_embedder: Option<semantic::EmbedderChoice>,
         /// Whole-request deadline, from first frame byte through response flush.
         /// Expiry exits the worker with code 124; idle sessions are not timed out.
         #[arg(
@@ -133,11 +139,13 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         mcp,
         db,
         reranker_model,
+        semantic_embedder,
         request_timeout_ms,
         admission_dir,
         admission_slots,
         max_resident_mib,
     } = cli.command;
+    let semantic_data_dir = data_dir.clone();
     let index = match (index, data_dir) {
         (Some(index), None) => index,
         (None, Some(data_dir)) => {
@@ -170,6 +178,16 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         })
         .transpose()
         .map_err(cli_io_error)?;
+    if let (Some(embedder), Some(data_dir)) = (semantic_embedder, semantic_data_dir) {
+        let data_dir = if data_dir.is_absolute() {
+            data_dir
+        } else {
+            std::env::current_dir()
+                .map_err(cli_io_error)?
+                .join(data_dir)
+        };
+        session.semantic = semantic::Semantic::new(data_dir, embedder);
+    }
     session.admission_pool = admission_dir
         .map(|path| {
             let path = if path.is_absolute() {
@@ -239,6 +257,7 @@ struct Session {
     archive: Option<PathBuf>,
     memory_observation: Option<std::sync::Arc<memory::Observation>>,
     refiner: refinement::Refiner,
+    semantic: semantic::Semantic,
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
@@ -258,6 +277,7 @@ impl Session {
             archive: None,
             memory_observation: None,
             refiner: refinement::Refiner::default(),
+            semantic: semantic::Semantic::default(),
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
@@ -271,12 +291,18 @@ impl Session {
 
     fn ensure_loaded(&mut self) -> Result<()> {
         if self.client.is_none() {
-            let lease = self.acquire_reader_lease()?;
+            let lease = if self.reader_lease.is_none() {
+                self.acquire_reader_lease()?
+            } else {
+                None
+            };
             self.open_attempts = self.open_attempts.saturating_add(1);
             let client = open_snapshot(&self.index)?;
             self.successful_opens = self.successful_opens.saturating_add(1);
             self.client = Some(client);
-            self.reader_lease = lease;
+            if lease.is_some() {
+                self.reader_lease = lease;
+            }
         }
         Ok(())
     }
@@ -292,6 +318,7 @@ impl Session {
     fn unload(&mut self) {
         // Keep the shared slot until BOTH model and index owners are released.
         self.refiner.unload();
+        self.semantic.unload();
         drop(self.client.take());
         drop(self.reader_lease.take());
     }
@@ -317,6 +344,7 @@ impl Session {
         json!({
             "service": "cass_lexical_stdio",
             "mode": "lexical",
+            "default_operation": "search",
             "loaded": self.client.is_some(),
             // A session-local epoch is NOT an archive generation certificate.
             "reader_epoch": self.client.as_ref().map(|_| self.successful_opens),
@@ -326,11 +354,12 @@ impl Session {
             "snapshot_policy": "pinned_until_reload",
             "freshness": "not_checked",
             "canonical_view_enabled": self.archive.is_some(),
-            "canonical_database_accessed": self.canonical_read_attempts != 0,
+            "canonical_database_accessed": self.canonical_read_attempts != 0 || self.semantic.archive_access_attempted(),
             "canonical_read_attempts": self.canonical_read_attempts,
             "canonical_reads_completed": self.canonical_reads_completed,
-            "models_loaded": self.refiner.loaded(),
+            "models_loaded": self.refiner.loaded() || self.semantic.model_loaded(),
             "refinement": self.refiner.status(),
+            "semantic": self.semantic.status(),
             "maintenance_performed": false,
             "memory_supervision": memory.unwrap_or_else(|| json!({"enabled": false})),
             "reader_admission": {
@@ -411,50 +440,7 @@ impl Session {
                     .is_some_and(|n| n <= protocol::MAX_WINDOW)
         });
         hits.truncate(limit);
-        let mut summaries = Vec::with_capacity(hits.len());
-        for hit in hits {
-            ensure!(
-                hit.score.is_finite(),
-                "search backend returned a non-finite score"
-            );
-            ensure!(
-                hit.line_number != Some(0),
-                "search backend returned an invalid message ordinal"
-            );
-            for value in [
-                Some(hit.source_path.as_str()),
-                Some(hit.source_id.as_str()),
-                Some(hit.agent.as_str()),
-                Some(hit.workspace.as_str()),
-                Some(hit.origin_kind.as_str()),
-                hit.origin_host.as_deref(),
-                hit.workspace_original.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                ensure!(
-                    value.len() <= MAX_IDENTITY_BYTES,
-                    "search identity exceeds the service's 4096-byte bound; identities are never truncated"
-                );
-            }
-            summaries.push(json!({
-                "title": prefix(&hit.title, 256),
-                "snippet": prefix(&hit.snippet, 800),
-                "score": hit.score,
-                "source_path": hit.source_path,
-                "source_id": hit.source_id,
-                "conversation_id": hit.conversation_id,
-                "message_index": hit.line_number,
-                "agent": hit.agent,
-                "workspace": hit.workspace,
-                "workspace_original": hit.workspace_original,
-                "created_at": hit.created_at,
-                "match_type": hit.match_type,
-                "origin_kind": hit.origin_kind,
-                "origin_host": hit.origin_host,
-            }));
-        }
+        let summaries = summarize_hits(hits)?;
         self.queries_completed = self.queries_completed.saturating_add(1);
         Ok(json!({
             "hits": summaries,
@@ -506,7 +492,7 @@ impl Session {
                 };
                 // Reuse the held index lease, or retain one temporary lease
                 // through the entire batch's archive open, reads and teardown.
-                let _view_lease = if self.client.is_none() {
+                let _view_lease = if self.reader_lease.is_none() {
                     match self.acquire_reader_lease() {
                         Ok(lease) => lease,
                         Err(error) => {
@@ -604,7 +590,7 @@ impl Session {
                 };
                 // A loaded lexical reader already holds this process's lease.
                 // Otherwise cover the entire per-view reader lifetime temporarily.
-                let _view_lease = if self.client.is_none() {
+                let _view_lease = if self.reader_lease.is_none() {
                     match self.acquire_reader_lease() {
                         Ok(lease) => lease,
                         Err(error) => {
@@ -666,6 +652,39 @@ impl Session {
                 };
                 (reply, false)
             }
+            Request::SemanticSearch {
+                id,
+                query,
+                mode,
+                approximate,
+                limit,
+                offset,
+                filters,
+            } => {
+                if let Err(message) = protocol::validate_search(&query, limit, offset, &filters) {
+                    return (Reply::failure(Some(id), "invalid_request", message), false);
+                }
+                if !self.semantic.enabled() {
+                    return (
+                        Reply::failure(
+                            Some(id),
+                            "semantic_disabled",
+                            "semantic_search requires --semantic-embedder, --data-dir and --db at startup",
+                        ),
+                        false,
+                    );
+                }
+                let reply =
+                    match self.semantic_search(&query, mode, approximate, filters, limit, offset) {
+                        Ok(result) => Reply::success(id, result),
+                        Err(error) => Reply::failure(
+                            Some(id),
+                            admission_error_kind(&error, semantic::error_kind(&error)),
+                            format!("{error:#}"),
+                        ),
+                    };
+                (reply, false)
+            }
             Request::Search {
                 id,
                 query,
@@ -715,6 +734,46 @@ fn prefix(value: &str, maximum_chars: usize) -> &str {
         .char_indices()
         .nth(maximum_chars)
         .map_or(value, |(at, _)| &value[..at])
+}
+
+fn summarize_hits(hits: Vec<SearchHit>) -> Result<Vec<Value>> {
+    let mut summaries = Vec::with_capacity(hits.len());
+    for hit in hits {
+        ensure!(
+            hit.score.is_finite(),
+            "search backend returned a non-finite score"
+        );
+        ensure!(
+            hit.line_number != Some(0),
+            "search backend returned an invalid message ordinal"
+        );
+        for value in [
+            Some(hit.source_path.as_str()),
+            Some(hit.source_id.as_str()),
+            Some(hit.agent.as_str()),
+            Some(hit.workspace.as_str()),
+            Some(hit.origin_kind.as_str()),
+            hit.origin_host.as_deref(),
+            hit.workspace_original.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(
+                value.len() <= MAX_IDENTITY_BYTES,
+                "search identity exceeds the service's 4096-byte bound; identities are never truncated"
+            );
+        }
+        summaries.push(json!({
+            "title": prefix(&hit.title, 256), "snippet": prefix(&hit.snippet, 800),
+            "score": hit.score, "source_path": hit.source_path, "source_id": hit.source_id,
+            "conversation_id": hit.conversation_id, "message_index": hit.line_number,
+            "agent": hit.agent, "workspace": hit.workspace,
+            "workspace_original": hit.workspace_original, "created_at": hit.created_at,
+            "match_type": hit.match_type, "origin_kind": hit.origin_kind, "origin_host": hit.origin_host,
+        }));
+    }
+    Ok(summaries)
 }
 
 fn serve_io(
