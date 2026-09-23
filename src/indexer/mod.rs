@@ -16128,6 +16128,22 @@ fn run_index_inner(
             bump_index_run_lock_progress_atomic(&progress_bump);
         }};
     }
+    // The long stages after preflight (the scan, the authoritative lexical
+    // rebuild) name themselves in the lock. Otherwise the last preflight
+    // breadcrumb persists for the whole run, and an operator reading the lock
+    // is told a step that finished minutes ago is still active (#483/#497).
+    // These are not watch-startup steps, so the preflight watchdog ignores them.
+    macro_rules! work_phase {
+        ($phase:expr) => {{
+            if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
+                tracing::debug!(
+                    phase = $phase,
+                    error = %err,
+                    "index work phase breadcrumb write failed (continuing)"
+                );
+            }
+        }};
+    }
 
     preflight_phase!("watch_startup:ensure_index_dir");
     let index_path = index_dir(&opts.data_dir)?;
@@ -16876,6 +16892,7 @@ fn run_index_inner(
             "selected_lexical_population_strategy"
         );
         ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
+        work_phase!("lexical:rebuild");
         let rebuild = if restart_pending_lexical_rebuild_from_zero {
             rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                 &opts.db_path,
@@ -17180,6 +17197,7 @@ fn run_index_inner(
             ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
             let rebuild_start = std::time::Instant::now();
             let rebuild_convs = canonical_sessions_before_salvage;
+            work_phase!("lexical:rebuild");
             let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                 &opts.db_path,
                 &opts.data_dir,
@@ -17247,6 +17265,7 @@ fn run_index_inner(
                     &opts.db_path,
                 )?;
                 let rebuild_convs = count_total_conversations_exact(&storage)?;
+                work_phase!("lexical:rebuild");
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
@@ -17431,6 +17450,7 @@ fn run_index_inner(
                 }
                 preflight_phase!("watch_startup:scan_entry");
                 complete_preflight_phase!();
+                work_phase!("index:scan");
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     let scan_outcome = run_streaming_index(

@@ -4149,6 +4149,14 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
         committed_docs > checkpoint_docs,
         "the kill window must have the authority ahead of the checkpoint: {payload}"
     );
+    // 7qirz: mid-rebuild, the lock names the rebuild, not the last preflight
+    // step (which is what #483/#497 operators saw for a whole 42-minute pass).
+    let lock = fs::read_to_string(data_dir.join("index-run.lock"))
+        .expect("index-run.lock while the rebuild is parked");
+    assert!(
+        lock.lines().any(|line| line == "phase=lexical:rebuild"),
+        "the lock must name the active rebuild: {lock}"
+    );
     child.kill().expect("kill parked force-rebuild");
     let _ = child.wait();
 
