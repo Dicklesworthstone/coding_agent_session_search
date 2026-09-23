@@ -76,14 +76,28 @@ pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
 ///   lease, which the hole-ratio-gated tier merge can never fold. With
 ///   explicit publication only, a segment is sealed on the accumulation
 ///   budget or at commit, and the MANIFEST moves only when CASS says so.
+/// * `tier_fanout` is effectively infinite, which switches off the engine's
+///   own tier merge. That merge runs inside every commit and folds any
+///   `tier_fanout` adjacent same-tier segments, and its top tier has no upper
+///   bound: eight "large" segments are each wider than the medium boundary
+///   (524,288 docids), so their fold spans more than 4,194,304 documents —
+///   the per-term posting limit every Quill reader and concat merge enforces
+///   ([`MAX_FOLD_OUTPUT_DOCS`]). On a multi-million-message archive a common
+///   token is in more documents than that, so the rebuild's final commit
+///   failed with "posting validation limit 4194304 exceeded" (GH #498). The
+///   same unbounded fold also bypassed the #456 merge-memory cap. CASS's own
+///   planners ([`plan_capped_merge_runs`], [`plan_capped_balanced_merge_runs`])
+///   already own merging after incremental runs and at the end of a rebuild,
+///   under both the byte cap and the document bound.
 /// * `query_fuel_budget` honours [`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`].
 ///
 /// Everything else keeps the engine default so the on-disk format and the
-/// admission/merge semantics stay exactly what the pinned engine documents.
+/// admission semantics stay exactly what the pinned engine documents.
 #[must_use]
 pub fn cass_quill_config() -> QuillConfig {
     let mut config = QuillConfig {
         max_visibility_lag_ms: u64::MAX,
+        tier_fanout: usize::MAX,
         ..QuillConfig::default()
     };
     if let Some(budget) = query_fuel_budget_override(
@@ -934,6 +948,12 @@ impl QuillCassIndex {
     /// Returns an error when the directory cannot be created or the index
     /// cannot be opened under the CASS schema.
     pub fn open_or_create(path: &Path) -> Result<Self> {
+        Self::open_or_create_with_config(path, &cass_quill_config())
+    }
+
+    /// [`Self::open_or_create`] under an explicit engine configuration; tests
+    /// use it to isolate one knob against the engine's own behaviour.
+    fn open_or_create_with_config(path: &Path, config: &QuillConfig) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let directory = path.to_path_buf();
         // Create ONLY when the directory holds no published manifest.
@@ -952,23 +972,13 @@ impl QuillCassIndex {
         let index_exists = path.join(QUILL_INDEX_MARKER).exists();
         let index = drive(|cx| {
             let directory = directory.clone();
+            let config = config.clone();
             async move {
                 if index_exists {
-                    QuillIndex::open_with_schema(
-                        &cx,
-                        directory,
-                        CASS_SEMANTIC_SCHEMA,
-                        cass_quill_config(),
-                    )
-                    .await
+                    QuillIndex::open_with_schema(&cx, directory, CASS_SEMANTIC_SCHEMA, config).await
                 } else {
-                    QuillIndex::create_with_schema(
-                        &cx,
-                        directory,
-                        CASS_SEMANTIC_SCHEMA,
-                        cass_quill_config(),
-                    )
-                    .await
+                    QuillIndex::create_with_schema(&cx, directory, CASS_SEMANTIC_SCHEMA, config)
+                        .await
                 }
             }
         })
@@ -1329,7 +1339,9 @@ impl QuillCassIndex {
     /// under [`lexical_merge_max_output_bytes`], which bounds the peak merge
     /// allocation by the cap and the generation by roughly
     /// `index_bytes / cap` segments — a handful, not the hundreds #441 was
-    /// about.
+    /// about. Each run also holds at most [`MAX_FOLD_OUTPUT_DOCS`] documents,
+    /// so a multi-million-message archive folds into several segments rather
+    /// than one whose common-token posting lists no reader could open (#498).
     ///
     /// # Errors
     ///
@@ -1371,6 +1383,7 @@ impl QuillCassIndex {
                     file_len: manifest.file_len,
                     docid_lo: manifest.docid_lo,
                     docid_hi: manifest.docid_hi,
+                    doc_count: u64::from(manifest.doc_count),
                 }
             })
             .collect())
@@ -1652,7 +1665,7 @@ fn plan_capped_balanced_merge_runs(
                 continue;
             }
             if u128::from(left.max(right)) <= 2 * u128::from(left.min(right))
-                && estimated_fold_output_bytes(pair_folds) <= max_output_bytes
+                && fold_fits(pair_folds, max_output_bytes)
             {
                 used.insert(left_id);
                 used.insert(right_id);
@@ -1705,6 +1718,34 @@ pub(crate) struct SegmentFoldProfile {
     pub file_len: u64,
     pub docid_lo: u64,
     pub docid_hi: u64,
+    /// Physical documents the segment holds, tombstoned ones included until
+    /// compaction: everything its posting lists can cover (GH #498).
+    pub doc_count: u64,
+}
+
+/// GH #498: the most physical documents one concat-merge output may hold.
+///
+/// Every Quill reader parses a term's posting list under the engine's
+/// `DEFAULT_MAX_POSTINGS_PER_TERM` (2^22) and the concat merge refuses to
+/// assemble a list it could not reopen, so an output where a common token is
+/// in more documents than that fails with "posting validation limit 4194304
+/// exceeded". A term's postings cover at most every document the sources
+/// hold, so a fold within this bound cannot hit the limit whatever the text.
+pub(crate) const MAX_FOLD_OUTPUT_DOCS: u64 =
+    frankensearch::quill::quiver::DEFAULT_MAX_POSTINGS_PER_TERM as u64;
+
+/// Physical documents a concat merge of `run` would hold (GH #498).
+fn fold_doc_count(run: &[SegmentFoldProfile]) -> u64 {
+    run.iter()
+        .map(|segment| segment.doc_count)
+        .fold(0_u64, u64::saturating_add)
+}
+
+/// Whether a concat merge of `run` stays under both the output byte cap
+/// (GH #456) and the posting limit (GH #498).
+fn fold_fits(run: &[SegmentFoldProfile], max_output_bytes: u64) -> bool {
+    estimated_fold_output_bytes(run) <= max_output_bytes
+        && fold_doc_count(run) <= MAX_FOLD_OUTPUT_DOCS
 }
 
 /// Conservative per-docid cost of the docid *hull* a concat-merge output
@@ -1744,9 +1785,10 @@ fn estimated_fold_output_bytes(run: &[SegmentFoldProfile]) -> u64 {
 
 /// Split a manifest-ordered fold profile into consecutive runs whose
 /// estimated merge output ([`estimated_fold_output_bytes`]) stays at or below
-/// `max_output_bytes`, keeping only runs of two or more segments (a single
-/// segment has nothing to fold into). A segment whose own estimate exceeds
-/// the cap closes the run before it and is left as it is. Greedy and
+/// `max_output_bytes` and whose documents stay within
+/// [`MAX_FOLD_OUTPUT_DOCS`], keeping only runs of two or more segments (a
+/// single segment has nothing to fold into). A segment that exceeds either
+/// bound on its own closes the run before it and is left as it is. Greedy and
 /// deterministic in manifest order, so the runs stay consecutive — the shape
 /// a Q1-preserving concat merge requires — and merging one run never breaks
 /// the adjacency of another.
@@ -1757,6 +1799,7 @@ pub(crate) fn plan_capped_merge_runs(
     let mut runs: Vec<Vec<u64>> = Vec::new();
     let mut current: Vec<SegmentFoldProfile> = Vec::new();
     let mut current_bytes = 0_u64;
+    let mut current_docs = 0_u64;
     let mut current_lo = 0_u64;
     let mut current_hi = 0_u64;
     let close = |current: &mut Vec<SegmentFoldProfile>, runs: &mut Vec<Vec<u64>>| {
@@ -1768,6 +1811,7 @@ pub(crate) fn plan_capped_merge_runs(
     for &segment in profile {
         if !current.is_empty() {
             let next_bytes = current_bytes.saturating_add(segment.file_len);
+            let next_docs = current_docs.saturating_add(segment.doc_count);
             let next_lo = current_lo.min(segment.docid_lo);
             let next_hi = current_hi.max(segment.docid_hi);
             let next_estimate = next_bytes.saturating_add(
@@ -1775,22 +1819,24 @@ pub(crate) fn plan_capped_merge_runs(
                     .saturating_sub(next_lo)
                     .saturating_mul(FOLD_HULL_BYTES_PER_DOCID),
             );
-            if next_estimate > max_output_bytes {
+            if next_estimate > max_output_bytes || next_docs > MAX_FOLD_OUTPUT_DOCS {
                 close(&mut current, &mut runs);
             } else {
                 current.push(segment);
                 current_bytes = next_bytes;
+                current_docs = next_docs;
                 current_lo = next_lo;
                 current_hi = next_hi;
                 continue;
             }
         }
-        if estimated_fold_output_bytes(std::slice::from_ref(&segment)) > max_output_bytes {
-            // Oversized on its own: never a merge input under this cap.
+        if !fold_fits(std::slice::from_ref(&segment), max_output_bytes) {
+            // Oversized on its own: never a merge input under these bounds.
             continue;
         }
         current.push(segment);
         current_bytes = segment.file_len;
+        current_docs = segment.doc_count;
         current_lo = segment.docid_lo;
         current_hi = segment.docid_hi;
     }
@@ -1847,12 +1893,210 @@ mod tests {
             "the CASS config must pass engine validation"
         );
         let default = QuillConfig::default();
-        assert_eq!(config.tier_fanout, default.tier_fanout);
+        assert_eq!(
+            config.tier_fanout,
+            usize::MAX,
+            "#498: the engine's unbounded tier merge must never run under CASS"
+        );
         assert_eq!(
             config.scribe_shard_budget_bytes,
             default.scribe_shard_budget_bytes
         );
         assert_eq!(config.query_fuel_budget, default.query_fuel_budget);
+    }
+
+    /// Segments and documents published after `commits` single-document
+    /// commits under `config`, pinned to one deterministic ingest shard so
+    /// every sealed segment is adjacent in one docid lease — the shape the
+    /// engine's tier merge folds.
+    fn segments_after_single_document_commits(commits: usize, tier_fanout: usize) -> (usize, u64) {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let config = QuillConfig {
+            deterministic_ingest: true,
+            tier_fanout,
+            ..cass_quill_config()
+        };
+        let mut index =
+            QuillCassIndex::open_or_create_with_config(directory.path(), &config).expect("open");
+        for commit in 0..commits {
+            let msg_idx = u64::try_from(commit).expect("small count");
+            index
+                .add_cass_documents(&[sample("tier", msg_idx, "tier fold message")])
+                .expect("index document");
+            index.commit().expect("commit");
+        }
+        (
+            published_segment_count(&index),
+            index.doc_count().expect("doc count"),
+        )
+    }
+
+    /// GH #498: CASS commits never run the engine's own tier merge, while the
+    /// engine default folds the same commits. That merge has no upper bound
+    /// on its top tier; CASS's capped planners are the only merge authority.
+    #[test]
+    fn cass_commits_never_run_the_engine_tier_merge() {
+        let fanout = frankensearch::quill::config::DEFAULT_TIER_FANOUT;
+        let commits = fanout + 1;
+        let (engine_segments, engine_docs) =
+            segments_after_single_document_commits(commits, fanout);
+        assert!(
+            engine_segments < commits,
+            "control: the engine default must tier-merge {commits} adjacent segments, left {engine_segments}"
+        );
+        let (cass_segments, cass_docs) =
+            segments_after_single_document_commits(commits, cass_quill_config().tier_fanout);
+        assert_eq!(
+            cass_segments, commits,
+            "a CASS commit must publish its segment without an engine fold"
+        );
+        let expected_docs = u64::try_from(commits).expect("small count");
+        assert_eq!(engine_docs, expected_docs);
+        assert_eq!(cass_docs, expected_docs);
+    }
+
+    /// GH #498 end to end on the real engine, along the reporter's path
+    /// (`phase=checkpoint_after_fold`): a rebuild's own fold leaves eight
+    /// "large" segments — each wider than the engine's 524,288-docid medium
+    /// tier — holding 4,240,000 documents that share a token, and the next
+    /// commit runs the engine tier merge over them. Under the engine's
+    /// default fanout that commit fails exactly as reported; under the CASS
+    /// config it publishes, and the CASS fold stays within the posting limit
+    /// and keeps the token searchable.
+    ///
+    /// Ignored by default (4.24M documents); run with
+    /// `cargo test --lib gh498_multi_million -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "ingests 4.24M documents; run explicitly for #498 evidence"]
+    fn gh498_multi_million_document_generation_commits_and_folds() {
+        const LARGE_SEGMENT_DOCS: u64 = 530_000;
+        const LARGE_SEGMENTS: u64 = 8;
+        let config_with_fanout = |tier_fanout: usize| QuillConfig {
+            deterministic_ingest: true,
+            tier_fanout,
+            // Seal at commit, not on the 64 MiB accumulation budget.
+            scribe_shard_budget_bytes: 4 << 30,
+            ..cass_quill_config()
+        };
+        let common = |source: &str, msg_idx: u64| sample(source, msg_idx, "common posting token");
+        let directory = tempfile::tempdir().expect("bridge index directory");
+
+        // Ingest without engine merges, then fold consecutive segments as a
+        // rebuild's capped fold does, into eight large segments.
+        let mut index = QuillCassIndex::open_or_create_with_config(
+            directory.path(),
+            &config_with_fanout(usize::MAX),
+        )
+        .expect("open");
+        for commit in 0..LARGE_SEGMENTS {
+            let batch: Vec<_> = (0..LARGE_SEGMENT_DOCS)
+                .map(|offset| common(&format!("gh498-{commit}"), offset))
+                .collect();
+            index.add_cass_documents(&batch).expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let mut run = Vec::new();
+        let mut run_docs = 0_u64;
+        for segment in index
+            .published_segment_fold_profile()
+            .expect("fold profile")
+        {
+            run.push(segment.segment_id);
+            run_docs += segment.doc_count;
+            if run_docs >= LARGE_SEGMENT_DOCS {
+                if run.len() > 1 {
+                    index
+                        .concat_merge_run(&run)
+                        .expect("fold into one large segment");
+                }
+                run.clear();
+                run_docs = 0;
+            }
+        }
+        let large = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        eprintln!("gh498 large generation: {large:?}");
+        assert_eq!(
+            large.len(),
+            usize::try_from(LARGE_SEGMENTS).expect("small count")
+        );
+        assert!(
+            large
+                .iter()
+                .all(|segment| segment.docid_hi - segment.docid_lo
+                    > frankensearch::quill::config::DEFAULT_TIER_MEDIUM_MAX_DOCID_WIDTH),
+            "every folded segment must be in the engine's large tier: {large:?}"
+        );
+        assert!(fold_doc_count(&large) > MAX_FOLD_OUTPUT_DOCS);
+        drop(index);
+
+        // Control: the next commit under the engine default tier-merges them.
+        let mut control = QuillCassIndex::open_or_create_with_config(
+            directory.path(),
+            &config_with_fanout(frankensearch::quill::config::DEFAULT_TIER_FANOUT),
+        )
+        .expect("reopen under the engine default");
+        control
+            .add_cass_documents(&[common("gh498-control", 0)])
+            .expect("index one more document");
+        let error = format!(
+            "{:#}",
+            control
+                .commit()
+                .expect_err("control: the engine tier merge must refuse the oversized fold")
+        );
+        eprintln!("gh498 control error: {error}");
+        assert!(
+            error.contains("posting validation limit 4194304 exceeded"),
+            "control must reproduce #498: {error}"
+        );
+        drop(control);
+
+        // Fix: the same commit under the CASS config publishes, and the CASS
+        // fold splits the generation within the posting limit.
+        let mut index = QuillCassIndex::open_or_create_with_config(
+            directory.path(),
+            &config_with_fanout(cass_quill_config().tier_fanout),
+        )
+        .expect("reopen under the CASS config");
+        index
+            .add_cass_documents(&[common("gh498-fixed", 0)])
+            .expect("index one more document");
+        index
+            .commit()
+            .expect("a CASS commit never runs the engine tier merge");
+        let total = index.doc_count().expect("doc count");
+        assert!(total > MAX_FOLD_OUTPUT_DOCS);
+        let before = index.segment_count();
+        index
+            .force_merge_with_output_cap(u64::MAX)
+            .expect("the fold is planned within the posting limit");
+        let folded = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        eprintln!("gh498 folded generation: {folded:?}");
+        assert!(
+            folded.len() >= 2 && folded.len() < before,
+            "the fold must merge, but not into one segment: {folded:?}"
+        );
+        assert!(
+            folded
+                .iter()
+                .all(|segment| segment.doc_count <= MAX_FOLD_OUTPUT_DOCS),
+            "{folded:?}"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), total);
+        let reader = index.reader().expect("reader over the folded generation");
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        let parsed = parser.parse(
+            "common",
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page = search_paginated(&reader, &parsed.query, 10, 0, false)
+            .expect("the common token's posting lists reopen");
+        assert_eq!(page.hits.len(), 10);
     }
 
     #[test]
@@ -1955,6 +2199,7 @@ mod tests {
                         file_len: *docs,
                         docid_lo: position as u64,
                         docid_hi: position as u64 + 1,
+                        doc_count: 1,
                     })
                     .collect();
                 let runs = plan_capped_balanced_merge_runs(&profile, &folds, u64::MAX);
@@ -1989,6 +2234,7 @@ mod tests {
                 file_len: 100,
                 docid_lo: *id - 1,
                 docid_hi: *id,
+                doc_count: 1,
             })
             .collect();
         let cap = 3 * (100 + FOLD_HULL_BYTES_PER_DOCID);
@@ -2023,6 +2269,7 @@ mod tests {
                 file_len: 100,
                 docid_lo: *id - 1,
                 docid_hi: *id,
+                doc_count: 1,
             })
             .collect();
         let cap = 2 * (100 + FOLD_HULL_BYTES_PER_DOCID);
@@ -2417,6 +2664,7 @@ mod tests {
             file_len: bytes,
             docid_lo: lo,
             docid_hi: lo + docs,
+            doc_count: docs,
         };
         let profile = [
             dense(1, 300, 0, 1),
@@ -2473,6 +2721,78 @@ mod tests {
         assert_eq!(
             plan_capped_merge_runs(&sparse, u64::MAX),
             vec![vec![1, 2, 3]]
+        );
+    }
+
+    /// GH #498: no planned fold may hold more documents than a Quill posting
+    /// list can reopen, however generous the byte cap. The reporter's
+    /// generation was 7,113,816 documents; a single fold of it failed with
+    /// "posting validation limit 4194304 exceeded by declared doc_freq".
+    #[test]
+    fn capped_merge_runs_never_exceed_the_engine_posting_limit() {
+        assert_eq!(
+            MAX_FOLD_OUTPUT_DOCS, 4_194_304,
+            "the bound must be the limit the engine reports in #498"
+        );
+        let dense = |id: u64, lo: u64, docs: u64| SegmentFoldProfile {
+            segment_id: id,
+            file_len: docs,
+            docid_lo: lo,
+            docid_hi: lo + docs,
+            doc_count: docs,
+        };
+        let docs = 889_227_u64;
+        let generation: Vec<_> = (0..8_u64)
+            .map(|index| dense(index + 1, index * docs, docs))
+            .collect();
+        assert!(
+            fold_doc_count(&generation) > MAX_FOLD_OUTPUT_DOCS,
+            "the whole generation is one fold the engine would refuse"
+        );
+        let runs = plan_capped_merge_runs(&generation, u64::MAX);
+        assert_eq!(runs, vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+        for run in &runs {
+            let folded: Vec<_> = generation
+                .iter()
+                .filter(|segment| run.contains(&segment.segment_id))
+                .copied()
+                .collect();
+            assert!(fold_doc_count(&folded) <= MAX_FOLD_OUTPUT_DOCS, "{run:?}");
+        }
+
+        // The bound is inclusive: exactly the limit folds, one more does not.
+        let half = MAX_FOLD_OUTPUT_DOCS / 2;
+        assert_eq!(
+            plan_capped_merge_runs(&[dense(1, 0, half), dense(2, half, half)], u64::MAX),
+            vec![vec![1, 2]]
+        );
+        assert!(
+            plan_capped_merge_runs(&[dense(1, 0, half), dense(2, half, half + 1)], u64::MAX)
+                .is_empty()
+        );
+
+        // Tombstoned documents keep their postings until compaction, so the
+        // bound counts physical documents, not live ones: two segments whose
+        // live rows are small but whose physical rows sum past the limit stay
+        // apart, including through the comparable-sibling recovery pass.
+        let big = 40_000_000_u64;
+        let live = [(1, big), (2, 1_000), (3, 1_000), (4, big)];
+        let physical = |second: u64| {
+            [
+                dense(1, 0, big),
+                dense(2, big, second),
+                dense(3, big + second, second),
+                dense(4, big + 2 * second, big),
+            ]
+        };
+        assert!(
+            plan_capped_balanced_merge_runs(&live, &physical(half + 1), u64::MAX).is_empty(),
+            "a pair past the posting limit must not fold"
+        );
+        assert_eq!(
+            plan_capped_balanced_merge_runs(&live, &physical(half), u64::MAX),
+            vec![vec![2, 3]],
+            "the same pair within the limit folds"
         );
     }
 
