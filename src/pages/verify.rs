@@ -1675,7 +1675,7 @@ fn check_share_profile(
             evidence,
         );
     };
-    let engine = RedactionEngine::new(profile.to_redaction_config());
+    let engine = RedactionEngine::new(profile.export_redaction_config());
     for &(label, table, column, json) in SHARE_PROFILE_SURFACES {
         let sql = format!("SELECT \"{column}\" FROM \"{table}\" WHERE \"{column}\" IS NOT NULL");
         let mut residual = 0_u64;

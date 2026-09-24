@@ -102,7 +102,7 @@ impl ExportEngine {
     pub fn with_share_profile(mut self, profile: ShareProfile) -> Self {
         self.share = Some(ShareRedaction {
             profile,
-            engine: RedactionEngine::new(profile.to_redaction_config()),
+            engine: RedactionEngine::new(profile.export_redaction_config()),
         });
         self
     }

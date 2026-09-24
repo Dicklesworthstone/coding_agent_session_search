@@ -1573,9 +1573,10 @@ pub enum Commands {
         path_mode: crate::pages::export::PathMode,
 
         /// Share profile applied to every exported text: public (home paths,
-        /// usernames, project names, emails, hostnames, secrets), team (home
-        /// paths, emails, credentials), personal (keys and cloud credentials
-        /// only). Default: public for a plaintext export, team when encrypted.
+        /// usernames, project names, hostnames, emails and other personal
+        /// data), team (home paths and personal data), personal (nothing).
+        /// Credentials are never rewritten; the secret scan rejects them.
+        /// Default: public for a plaintext export, team when encrypted.
         #[arg(long, value_enum)]
         share_profile: Option<crate::pages::profiles::ShareProfile>,
 

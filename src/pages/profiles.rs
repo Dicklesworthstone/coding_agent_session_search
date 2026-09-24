@@ -26,14 +26,14 @@ use crate::pages::redact::RedactionConfig;
 #[serde(rename_all = "snake_case")]
 pub enum ShareProfile {
     /// Maximum privacy - safe for public internet.
-    /// Redacts usernames, paths, project names, emails, hostnames, and all detected secrets.
+    /// Redacts usernames, home paths, project names, hostnames, emails and other personal data.
     Public,
     /// Team/organization sharing - internal refs OK.
-    /// Keeps project context but redacts external credentials and personal info.
+    /// Keeps project context but redacts home paths and personal data.
     #[default]
     Team,
-    /// Personal backup - minimal redaction.
-    /// Only removes critical secrets like private keys and cloud provider credentials.
+    /// Personal backup - no redaction.
+    /// Credentials still block an export, as under every profile.
     Personal,
     /// Manual configuration of all options.
     #[value(skip)]
@@ -62,13 +62,13 @@ impl ShareProfile {
     pub fn description(self) -> &'static str {
         match self {
             Self::Public => {
-                "Maximum privacy for public sharing. Redacts usernames, paths, project names, emails, hostnames, and all detected secrets."
+                "Maximum privacy for public sharing. Redacts usernames, home paths, project names, hostnames, emails and other personal data."
             }
             Self::Team => {
-                "For internal team sharing. Keeps project context but redacts external credentials and personal information."
+                "For internal team sharing. Keeps project context but redacts home paths and personal data."
             }
             Self::Personal => {
-                "Personal backup with minimal redaction. Only removes critical secrets like private keys and API keys."
+                "Personal backup with no redaction. Credentials still block the export, as under every profile."
             }
             Self::Custom => "Configure each redaction option manually for fine-grained control.",
         }
@@ -129,6 +129,18 @@ impl ShareProfile {
             },
             Self::Custom => RedactionConfig::default(),
         }
+    }
+
+    /// The rewriting a Pages export applies for this profile (2l1b0.60):
+    /// identity and personal data only. Credential patterns are dropped so a
+    /// credential stays visible to the staged secret scan, which rejects the
+    /// export, as the profile's `block_on_critical_secrets` intends.
+    pub fn export_redaction_config(self) -> RedactionConfig {
+        let mut config = self.to_redaction_config();
+        config
+            .custom_patterns
+            .retain(|pattern| !crate::pages::patterns::is_credential_pattern(&pattern.name));
+        config
     }
 
     /// Get all available profiles.
@@ -540,6 +552,44 @@ mod tests {
         assert!(public.block_on_critical_secrets);
         assert!(team.block_on_critical_secrets);
         assert!(personal.block_on_critical_secrets);
+    }
+
+    /// 2l1b0.60: an export rewrites identity and personal data but never a
+    /// credential, which must reach the staged secret scan so the export
+    /// fails closed. Negative control: the profile's full pattern list does
+    /// rewrite an AWS key, which is how exports stopped failing closed.
+    #[test]
+    fn export_redaction_leaves_credentials_to_the_secret_scan() {
+        let names = |config: &RedactionConfig| {
+            config
+                .custom_patterns
+                .iter()
+                .map(|pattern| pattern.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let full = names(&ShareProfile::Public.to_redaction_config());
+        assert!(full.iter().any(|name| name == "AWS Access Key ID"));
+
+        let public = names(&ShareProfile::Public.export_redaction_config());
+        for credential in ["AWS Access Key ID", "SSH Private Key", "Database URL"] {
+            assert!(
+                !public.iter().any(|name| name == credential),
+                "{credential}: {public:?}"
+            );
+        }
+        for identity in ["Email Address", "Internal URL", "IP Address"] {
+            assert!(
+                public.iter().any(|name| name == identity),
+                "{identity}: {public:?}"
+            );
+        }
+        // Personal redacts only credentials, so an export rewrites nothing.
+        assert!(
+            ShareProfile::Personal
+                .export_redaction_config()
+                .custom_patterns
+                .is_empty()
+        );
     }
 
     #[test]

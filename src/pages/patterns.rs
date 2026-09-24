@@ -31,6 +31,18 @@ pub enum PatternCategory {
 }
 
 impl PatternCategory {
+    /// Credentials, as opposed to identity or personal data. A Pages export
+    /// leaves these to the staged secret scan, which rejects the export,
+    /// instead of publishing a silently rewritten secret.
+    pub fn is_credential(self) -> bool {
+        matches!(
+            self,
+            PatternCategory::ApiKeys
+                | PatternCategory::PrivateKeys
+                | PatternCategory::ConnectionStrings
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             PatternCategory::ApiKeys => "API Keys & Tokens",
@@ -456,6 +468,14 @@ pub fn patterns_for_personal() -> Vec<CustomPattern> {
         .iter()
         .filter_map(|p| p.to_custom_pattern())
         .collect()
+}
+
+/// Whether a custom pattern named `name` is one of [`ALL_PATTERNS`]'
+/// credential patterns (pattern names are unique).
+pub fn is_credential_pattern(name: &str) -> bool {
+    ALL_PATTERNS
+        .iter()
+        .any(|pattern| pattern.name == name && pattern.category.is_credential())
 }
 
 /// Get patterns by category.
