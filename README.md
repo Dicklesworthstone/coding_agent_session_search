@@ -334,7 +334,7 @@ cass search "auth error handling" --mode hybrid --robot
 - **Auto-Fuzzy Fallback**: On small indexes (up to 10,000 documents by default), an exact search with sparse results is retried with `*term*` wildcards to broaden matches. A visual indicator shows when the fallback is active.
 - **Query History Deduplication**: Recent searches deduplicated to show unique queries; navigate with `Up`/`Down` arrows.
 - **Match Quality Ranking**: New ranking mode (cycle with `F12`) that prioritizes exact matches over wildcard/fuzzy results.
-- **Match Highlighting**: Use `--highlight` to wrap matching terms in snippets with `**bold**` markers in human-readable output. Robot/JSON output does not apply it yet.
+- **Match Highlighting**: Use `--highlight` to wrap matching terms in snippets with `**bold**` markers, in human-readable and robot/JSON output alike.
 
 ### 🖥️ Rich Terminal UI (TUI)
 
@@ -1379,14 +1379,12 @@ cass search "bug fix" --sessions-from today_sessions.txt --robot
 
 ### Match Highlighting
 
-The `--highlight` flag wraps matching terms in `**bold**` markers in human-readable output (the default text output and `--display` formats):
+The `--highlight` flag wraps matching terms in snippets with `**bold**` markers, in human-readable output and in robot/JSON output alike (only the `snippet` field is marked; `content` stays verbatim):
 
 ```bash
-cass search "authentication error" --highlight
-# Snippet: ... **authentication** failed with **error** ...
+cass search "authentication error" --robot --highlight
+# "snippet": "... **authentication** failed with **error** ..."
 ```
-
-Robot/JSON output does not apply `--highlight` yet: snippets come back unmarked (tracked in bead 2l1b0.68).
 
 Highlighting is query-aware: quoted phrases like `"auth error"` highlight as a unit; individual terms highlight separately.
 

@@ -5702,6 +5702,49 @@ fn search_effective_meta_names_the_db_source_and_window_preset() -> Result<(), B
     Ok(())
 }
 
+/// 2l1b0.68: `--highlight` marks robot snippets the way it marks human
+/// output. Negative control: robot mode used to accept the flag and return
+/// the snippet unmarked with exit 0.
+#[test]
+fn search_robot_highlight_marks_json_snippets() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let snippets = |highlight: bool| -> Result<Vec<String>, Box<dyn Error>> {
+        let mut cmd = base_cmd();
+        cmd.args(["search", "hello", "--json", "--limit", "20"]);
+        if highlight {
+            cmd.arg("--highlight");
+        }
+        cmd.args(["--data-dir", data_dir]);
+        let output = cmd.output()?;
+        assert!(output.status.success(), "{output:?}");
+        let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+        Ok(json["hits"]
+            .as_array()
+            .ok_or("hits array")?
+            .iter()
+            .filter_map(|hit| hit["snippet"].as_str().map(str::to_string))
+            .collect())
+    };
+    let plain = snippets(false)?;
+    let marked = snippets(true)?;
+    assert_eq!(plain.len(), marked.len(), "same hits either way");
+    let (plain_hit, marked_hit) = plain
+        .iter()
+        .zip(&marked)
+        .find(|(plain, _)| plain.to_lowercase().contains("hello"))
+        .ok_or("the demo fixture has a snippet containing the term")?;
+    assert!(
+        !plain_hit.contains("**"),
+        "unmarked without --highlight: {plain_hit}"
+    );
+    assert!(
+        marked_hit.to_lowercase().contains("**hello**"),
+        "--highlight marks the term in JSON: {marked_hit}"
+    );
+    assert_eq!(&marked_hit.replace("**", ""), plain_hit, "markers only");
+    Ok(())
+}
+
 /// 2l1b0.68: an auto-corrected invocation lists each correction in
 /// `_meta.effective.auto_corrections`, worded exactly as the stderr note.
 #[test]

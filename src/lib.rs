@@ -32265,7 +32265,7 @@ fn run_cli_search(
     };
 
     // Compute aggregations and create display result based on mode
-    let (aggregations, display_result, total_matches, has_more_results, total_matches_exact) =
+    let (aggregations, mut display_result, total_matches, has_more_results, total_matches_exact) =
         if has_aggregation
             && search_budget
                 .as_ref()
@@ -32669,6 +32669,13 @@ fn run_cli_search(
                 hint: retry_hint,
                 retryable: true,
             });
+        }
+        // 2l1b0.68: --highlight marks robot snippets exactly as it marks the
+        // human output; robot mode used to accept the flag and ignore it.
+        if highlight {
+            for hit in &mut display_result.hits {
+                hit.snippet = highlight_matches(&hit.snippet, query, "**", "**");
+            }
         }
         // Robot output mode (JSON)
         output_robot_results(
