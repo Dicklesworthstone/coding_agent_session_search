@@ -838,12 +838,18 @@ const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 /// else on the box.
 const NO_LIMIT_RAM_DIVISOR: u64 = 16;
 
-/// Above this corpus size, exact Tantivy `Count` collection is not part of the
-/// default top-N path. Common-term counts on multi-million-document indexes can
-/// dominate the query and turn a five-hit search into a full corpus scan; robot
-/// output already reports lower-bound count precision when the exact total is
-/// not available.
-const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
+/// Above this corpus size, exact total counting is not part of the default
+/// top-N path, and a saturated page reports `limit + 1` as a lower bound.
+///
+/// The cap was 50,000 when the lexical engine was Tantivy, whose `Count` over a
+/// common term on a multi-million-document index could dominate the query. On
+/// Quill the count is cheap: on a 1,034,219-document archive (paired runs,
+/// `--limit 10`), exact totals added 0.00-0.10 s CPU to a ~0.8 s search even for
+/// "AGENTS.md" (867,087 matches) and "the" (439,461). Meanwhile the capped
+/// answer was wrong by up to five orders of magnitude ("stale lock": 11 against
+/// 11,915), and agents read `total_matches` as a count. The cap now sits at five
+/// times that archive; `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` still overrides it.
+const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 5_000_000;
 const DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS: usize = 10_000;
 
 fn exact_total_count_max_docs() -> usize {
