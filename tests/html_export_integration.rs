@@ -311,6 +311,81 @@ fn test_encrypted_export_flow() {
     }
 }
 
+/// 2l1b0.67: the plaintext export's default name and title carry the
+/// conversation topic; the encrypted export of the same session must show
+/// neither in its file name nor in its HTML.
+#[test]
+fn test_encrypted_export_hides_topic_in_default_name_and_html() {
+    let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");
+    let session = session_path.to_str().unwrap();
+
+    let plain_dir = TempDir::new().unwrap();
+    let plain = base_cmd()
+        .args([
+            "export-html",
+            session,
+            "--output-dir",
+            plain_dir.path().to_str().unwrap(),
+            "--robot",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_json: Value = serde_json::from_slice(&plain.stdout).unwrap();
+    let plain_title = plain_json["exported"]["title"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_name = plain_json["exported"]["filename"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !plain_title.is_empty(),
+        "fixture must have a title: {plain_json}"
+    );
+    assert!(
+        !plain_name.ends_with("_session.html"),
+        "fixture must produce a topic in its plain default name: {plain_name}"
+    );
+
+    let encrypted_dir = TempDir::new().unwrap();
+    let encrypted = base_cmd()
+        .args([
+            "export-html",
+            session,
+            "--output-dir",
+            encrypted_dir.path().to_str().unwrap(),
+            "--robot",
+            "--encrypt",
+            "--password-stdin",
+        ])
+        .write_stdin("sealed-topic-password\n")
+        .output()
+        .unwrap();
+    assert!(
+        encrypted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypted.stderr)
+    );
+    let encrypted_json: Value = serde_json::from_slice(&encrypted.stdout).unwrap();
+    let encrypted_name = encrypted_json["exported"]["filename"].as_str().unwrap();
+    assert!(
+        encrypted_name.ends_with("_session.html"),
+        "encrypted default name must not carry the topic: {encrypted_name} (plain: {plain_name})"
+    );
+    let html =
+        fs::read_to_string(encrypted_json["exported"]["output_path"].as_str().unwrap()).unwrap();
+    assert!(
+        !html.contains(&plain_title),
+        "the conversation title must not be visible before unlock: {plain_title}"
+    );
+}
+
 #[test]
 fn test_encrypted_export_requires_password() {
     let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");

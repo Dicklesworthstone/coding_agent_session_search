@@ -266,7 +266,116 @@ pub struct TemplateMetadata {
     pub project: Option<String>,
 }
 
+/// Title shown before an encrypted export is unlocked. Nothing derived from
+/// the conversation may appear outside the ciphertext (2l1b0.67).
+pub const ENCRYPTED_PUBLIC_TITLE: &str = "Encrypted conversation";
+
+/// Id of the `<template>` that carries the real header inside the encrypted
+/// payload; the decrypt handler moves it into the page header after unlock.
+pub const SEALED_HEADER_ID: &str = "cass-sealed-header";
+
+/// Inner HTML of the page header: the title and the metadata line.
+fn header_content_html(title: &str, metadata: &TemplateMetadata) -> String {
+    let mut meta_items = Vec::new();
+
+    if let Some(ts) = &metadata.timestamp {
+        let escaped_ts = html_escape(ts);
+        meta_items.push(format!(
+            r#"<span><time datetime="{}">{}</time></span>"#,
+            escaped_ts, escaped_ts
+        ));
+    }
+
+    if let Some(agent) = &metadata.agent {
+        // Use human-readable display name instead of raw slug
+        let display_name = crate::html_export::renderer::agent_display_name(agent);
+        meta_items.push(format!(
+            r#"<span class="header-agent">{}</span>"#,
+            html_escape(display_name)
+        ));
+    }
+
+    if metadata.message_count > 0 {
+        // Show accurate breakdown: human prompts, assistant responses, tool calls.
+        // "577 messages" is misleading when only 20 were human-typed.
+        let count_str = if metadata.human_turns > 0 {
+            format!(
+                "{} prompt{}, {} response{}, {} tool use{}",
+                metadata.human_turns,
+                if metadata.human_turns == 1 { "" } else { "s" },
+                metadata.assistant_msgs,
+                if metadata.assistant_msgs == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                metadata.tool_use_count,
+                if metadata.tool_use_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            )
+        } else {
+            format!("{} messages", metadata.message_count)
+        };
+        meta_items.push(format!(r#"<span>{}</span>"#, count_str));
+    }
+
+    if let Some(duration) = &metadata.duration {
+        meta_items.push(format!(r#"<span>{}</span>"#, html_escape(duration)));
+    }
+
+    if let Some(project) = &metadata.project {
+        // Extract just the project name from full path for cleaner display
+        let display_project = std::path::Path::new(project)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(project);
+        meta_items.push(format!(
+            r#"<span class="header-project">{}</span>"#,
+            html_escape(display_project)
+        ));
+    }
+
+    let meta_html = if meta_items.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"
+                <div class="header-meta">{}</div>"#,
+            meta_items.join("\n                    ")
+        )
+    };
+
+    format!(
+        r#"<h1 class="header-title">{}</h1>{}"#,
+        html_escape(title),
+        meta_html
+    )
+}
+
+/// The real header, sealed inside the encrypted payload. The title is also
+/// carried as an attribute so the decrypt handler can restore
+/// `document.title` and the print footer.
+fn sealed_header_fragment(title: &str, metadata: &TemplateMetadata) -> String {
+    format!(
+        r#"<template id="{SEALED_HEADER_ID}" data-title="{}">{}</template>"#,
+        html_escape(title),
+        header_content_html(title, metadata)
+    )
+}
+
 impl HtmlTemplate {
+    /// The title visible without the password.
+    fn public_title(&self) -> &str {
+        if self.encrypted {
+            ENCRYPTED_PUBLIC_TITLE
+        } else {
+            &self.title
+        }
+    }
+
     /// Generate the complete HTML document.
     pub fn render(&self, options: &ExportOptions) -> String {
         let _started = Instant::now();
@@ -434,7 +543,7 @@ impl HtmlTemplate {
     </script>
 </body>
 </html>"#,
-            title = html_escape(&self.title),
+            title = html_escape(self.public_title()),
             default_theme = default_theme,
             critical_css = critical_css,
             cdn_scripts = cdn_scripts,
@@ -449,80 +558,15 @@ impl HtmlTemplate {
     }
 
     fn render_header(&self) -> String {
-        let mut meta_items = Vec::new();
-
-        if let Some(ts) = &self.metadata.timestamp {
-            let escaped_ts = html_escape(ts);
-            meta_items.push(format!(
-                r#"<span><time datetime="{}">{}</time></span>"#,
-                escaped_ts, escaped_ts
-            ));
-        }
-
-        if let Some(agent) = &self.metadata.agent {
-            // Use human-readable display name instead of raw slug
-            let display_name = crate::html_export::renderer::agent_display_name(agent);
-            meta_items.push(format!(
-                r#"<span class="header-agent">{}</span>"#,
-                html_escape(display_name)
-            ));
-        }
-
-        if self.metadata.message_count > 0 {
-            // Show accurate breakdown: human prompts, assistant responses, tool calls.
-            // "577 messages" is misleading when only 20 were human-typed.
-            let count_str = if self.metadata.human_turns > 0 {
-                format!(
-                    "{} prompt{}, {} response{}, {} tool use{}",
-                    self.metadata.human_turns,
-                    if self.metadata.human_turns == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                    self.metadata.assistant_msgs,
-                    if self.metadata.assistant_msgs == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                    self.metadata.tool_use_count,
-                    if self.metadata.tool_use_count == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                )
-            } else {
-                format!("{} messages", self.metadata.message_count)
-            };
-            meta_items.push(format!(r#"<span>{}</span>"#, count_str));
-        }
-
-        if let Some(duration) = &self.metadata.duration {
-            meta_items.push(format!(r#"<span>{}</span>"#, html_escape(duration)));
-        }
-
-        if let Some(project) = &self.metadata.project {
-            // Extract just the project name from full path for cleaner display
-            let display_project = std::path::Path::new(project)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(project);
-            meta_items.push(format!(
-                r#"<span class="header-project">{}</span>"#,
-                html_escape(display_project)
-            ));
-        }
-
-        let meta_html = if meta_items.is_empty() {
-            String::new()
-        } else {
+        // An encrypted export shows a generic header; the real one is sealed
+        // in the payload (`sealed_header_fragment`) and restored on unlock.
+        let content = if self.encrypted {
             format!(
-                r#"
-                <div class="header-meta">{}</div>"#,
-                meta_items.join("\n                    ")
+                r#"<h1 class="header-title">{}</h1>"#,
+                html_escape(ENCRYPTED_PUBLIC_TITLE)
             )
+        } else {
+            header_content_html(&self.title, &self.metadata)
         };
 
         // Header with terminal-style traffic lights (via CSS ::before)
@@ -531,11 +575,9 @@ impl HtmlTemplate {
             r#"        <!-- Header with terminal-style traffic lights -->
         <header class="header" role="banner">
             <div class="header-content">
-                <h1 class="header-title">{}</h1>{}
+                {content}
             </div>
-        </header>"#,
-            html_escape(&self.title),
-            meta_html
+        </header>"#
         )
     }
 
@@ -587,7 +629,7 @@ impl HtmlTemplate {
         <span class="print-footer-title">{}</span>
         <span class="print-footer-page"></span>
     </div>"#,
-            html_escape(&self.title)
+            html_escape(self.public_title())
         )
     }
 }
@@ -698,8 +740,10 @@ impl HtmlExporter {
                 plaintext_bytes = rendered.len(),
                 "Encrypting rendered HTML"
             );
+            // The real title and header metadata travel inside the ciphertext.
+            let sealed = format!("{}{rendered}", sealed_header_fragment(title, &metadata));
             let encrypted = encryption::encrypt_content(
-                &rendered,
+                &sealed,
                 password,
                 &encryption::EncryptionParams::default(),
             )
@@ -1055,5 +1099,124 @@ mod tests {
         assert!(html.contains("encrypted-content"));
         assert!(html.contains("\"iterations\":600000"));
         assert!(!html.contains("Top secret"));
+    }
+
+    /// 2l1b0.67: an encrypted export used to show the title (the opening
+    /// prompt), the session time, agent, message counts, duration and
+    /// project in plaintext. Nothing derived from the conversation may
+    /// appear outside the ciphertext; the real header is sealed inside it.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_export_hides_title_and_metadata_until_unlock() {
+        use aes_gcm::{
+            Aes256Gcm, Nonce,
+            aead::{Aead, KeyInit},
+        };
+        use base64::Engine;
+        use base64::prelude::BASE64_STANDARD;
+        use ring::pbkdf2;
+
+        let title = "Please fix the allocator bug zqtitle0042";
+        let metadata = TemplateMetadata {
+            timestamp: Some("2026-09-22 23:07 UTC".to_string()),
+            agent: Some("claude_code".to_string()),
+            message_count: 2,
+            human_turns: 1,
+            assistant_msgs: 1,
+            tool_use_count: 0,
+            duration: Some("19m".to_string()),
+            project: Some("/work/zqproject0042".to_string()),
+        };
+        let groups = vec![renderer::MessageGroup::user(renderer::Message {
+            role: "user".to_string(),
+            content: "zqbody0042".to_string(),
+            timestamp: None,
+            tool_call: None,
+            index: None,
+            author: None,
+        })];
+        let exporter = HtmlExporter::with_options(ExportOptions {
+            encrypt: true,
+            ..Default::default()
+        });
+        let passphrase = ["sealed", "header", "test"].join("-");
+        let html = exporter
+            .export_messages(title, &groups, metadata.clone(), Some(&passphrase))
+            .expect("export");
+
+        for leaked in [
+            "zqtitle0042",
+            "zqproject0042",
+            "zqbody0042",
+            "2026-09-22 23:07",
+            "19m",
+            "1 prompt",
+        ] {
+            assert!(
+                !html.contains(leaked),
+                "{leaked:?} is visible without the password"
+            );
+        }
+        assert!(html.contains(&format!("<title>{ENCRYPTED_PUBLIC_TITLE}</title>")));
+        assert!(
+            html.contains(SEALED_HEADER_ID),
+            "decrypt handler must know the id"
+        );
+
+        // Decrypt the payload exactly as the browser does and find the real
+        // header in it.
+        let start_tag = r#"<div id="encrypted-content" hidden>"#;
+        let start = html.find(start_tag).expect("payload element") + start_tag.len();
+        let end = start + html[start..].find("</div>").expect("payload end");
+        let payload_json = html[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).expect("payload json");
+        let decode = |field: &str| {
+            BASE64_STANDARD
+                .decode(payload[field].as_str().expect("payload field"))
+                .expect("base64 field")
+        };
+        let iterations = u32::try_from(payload["iterations"].as_u64().expect("iterations"))
+            .expect("iterations fit in u32");
+        let mut key = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(iterations).expect("non-zero iterations"),
+            &decode("salt"),
+            passphrase.as_bytes(),
+            &mut key,
+        );
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("cipher");
+        let iv = decode("iv");
+        let nonce = Nonce::try_from(iv.as_slice()).expect("12-byte iv");
+        let plaintext = String::from_utf8(
+            cipher
+                .decrypt(&nonce, decode("ciphertext").as_ref())
+                .expect("decrypt"),
+        )
+        .expect("utf8 plaintext");
+
+        assert!(plaintext.starts_with(&format!(r#"<template id="{SEALED_HEADER_ID}""#)));
+        assert!(plaintext.contains("data-title=\"Please fix the allocator bug zqtitle0042\""));
+        assert!(plaintext.contains("zqproject0042"));
+        assert!(plaintext.contains("zqbody0042"));
+    }
+
+    #[test]
+    fn test_plain_export_keeps_title_and_metadata() {
+        let exporter = HtmlExporter::with_options(ExportOptions::default());
+        let metadata = TemplateMetadata {
+            project: Some("/work/zqproject0043".to_string()),
+            ..TemplateMetadata::default()
+        };
+        let html = exporter
+            .export_messages("zqtitle0043 plain", &[], metadata, None)
+            .expect("export");
+        assert!(html.contains("<title>zqtitle0043 plain</title>"));
+        assert!(html.contains(r#"<h1 class="header-title">zqtitle0043 plain</h1>"#));
+        assert!(html.contains("zqproject0043"));
+        assert!(!html.contains(SEALED_HEADER_ID));
     }
 }

@@ -110749,6 +110749,17 @@ fn run_export_html(
 
     let mut final_filename = if let Some(name) = filename {
         name.to_string()
+    } else if encrypt {
+        // An encrypted export is meant to be shared; its default name must not
+        // carry the workspace or the opening prompt that the ciphertext hides
+        // (2l1b0.67). An explicit --filename is honored as given.
+        generate_full_filename(
+            agent_name.as_deref().unwrap_or("cass"),
+            None,
+            session_start,
+            None,
+            None,
+        )
     } else {
         generate_full_filename(
             agent_name.as_deref().unwrap_or("cass"),
