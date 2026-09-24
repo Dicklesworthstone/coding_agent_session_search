@@ -30,6 +30,25 @@ def declaration(source: str, name: str) -> str:
     return matches[0]
 
 
+# APIs that exist only in the full CASS crate. A staged test that uses one can
+# never build here; the registry/CLI module once did and left this lane red
+# behind a bare compile error (bead coding_agent_session_search-2l1b0.62).
+# get_connector_factories is not listed: the staged lib provides the same
+# OpenClaw registry adapter for connectors::openclaw's own unit tests.
+FULL_CRATE_ONLY = ("assert_cmd::", "cargo_bin!(")
+
+
+def refuse_full_crate_tests(tests: list[Path]) -> None:
+    for path in tests:
+        found = [token for token in FULL_CRATE_ONLY if token in path.read_text(encoding="utf-8")]
+        if found:
+            raise SystemExit(
+                f"{path.name} uses full-crate APIs ({', '.join(found)}), which this slim "
+                "consumer crate cannot build; put those tests in their own integration target "
+                "(as tests/connector_openclaw_registry_cli.rs does)"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qualify-feature", action="store_true")
@@ -52,6 +71,7 @@ def main() -> None:
     if cargo is None:
         raise SystemExit("cargo is required")
     test = root / "tests/connector_openclaw_sqlite.rs"
+    refuse_full_crate_tests([test, root / "tests/connector_openclaw.rs"])
     registry = (root / "src/connectors/mod.rs").read_text(encoding="utf-8")
     seam = "(name, openclaw::with_wal_freshness(name, factory))"
     if registry.count(seam) != 1:

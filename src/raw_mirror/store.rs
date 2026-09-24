@@ -33,9 +33,14 @@ struct RawMirrorFileLockGuard {
     file: File,
 }
 
+// Locks here use std's `File` locking: it reports contention as
+// `TryLockError::WouldBlock` on every platform, whereas fs2 surfaces Windows
+// contention as a raw ERROR_LOCK_VIOLATION that no `ErrorKind` check matches
+// (2l1b0.62). Both take the same flock/LockFileEx lock, so a lock held through
+// fs2 by the indexer still excludes these.
 impl Drop for RawMirrorFileLockGuard {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -864,11 +869,10 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
                 path.display()
             )
         })?;
-        let relative_path = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
+        // The path was just proven canonical, so report the canonical
+        // `manifests/<id>.json` form capture reports use. `strip_prefix`
+        // would render `manifests\<id>.json` on Windows (2l1b0.62).
+        let relative_path = raw_mirror_manifest_relative_path(&parsed_manifest.manifest_id);
         manifests.push(RawMirrorPruneManifest {
             manifest_id: parsed_manifest.manifest_id,
             manifest_blake3,
@@ -1310,7 +1314,7 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
     let file = options
         .open(&lock_path)
         .with_context(|| format!("open raw mirror mutation lock {}", lock_path.display()))?;
-    fs2::FileExt::lock_exclusive(&file)
+    file.lock()
         .with_context(|| format!("acquire raw mirror mutation lock {}", lock_path.display()))?;
 
     let opened_metadata = file.metadata().with_context(|| {
@@ -1325,7 +1329,7 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
         || !path_metadata.is_file()
         || !same_source_identity(&opened_metadata, &path_metadata)
     {
-        let _ = fs2::FileExt::unlock(&file);
+        let _ = file.unlock();
         return Err(anyhow!(
             "raw mirror mutation lock {} changed identity while being acquired",
             lock_path.display()
@@ -1358,15 +1362,15 @@ fn try_acquire_index_run_lock_for_prune(data_dir: &Path) -> Result<RawMirrorFile
     let file = options
         .open(&lock_path)
         .with_context(|| format!("open index-run lock {}", lock_path.display()))?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match file.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(anyhow!(
-                "refusing raw mirror prune because an index run acquired {}: {error}",
+                "refusing raw mirror prune because an index run acquired {}",
                 lock_path.display()
             ));
         }
-        Err(error) => {
+        Err(std::fs::TryLockError::Error(error)) => {
             return Err(error)
                 .with_context(|| format!("acquire index-run lock {}", lock_path.display()));
         }
@@ -1380,7 +1384,7 @@ fn try_acquire_index_run_lock_for_prune(data_dir: &Path) -> Result<RawMirrorFile
         || !path_metadata.is_file()
         || !same_source_identity(&opened_metadata, &path_metadata)
     {
-        let _ = fs2::FileExt::unlock(&file);
+        let _ = file.unlock();
         return Err(anyhow!(
             "refusing raw mirror prune because index-run lock {} changed identity while being acquired",
             lock_path.display()
@@ -5968,6 +5972,16 @@ mod tests {
         cache_raw_mirror_blob_record(second_key.clone(), second_record.clone());
 
         let source_key = raw_mirror_blob_source_key(&second_key);
+        if cfg!(not(unix)) {
+            // Stored blobs have no stable file identity or change time on this
+            // platform, so the capture cache must stay off rather than trust
+            // mtime alone; this test used to assume unix (2l1b0.62).
+            let cached = BLOB_CAPTURE_CACHE
+                .get()
+                .and_then(|cache| cache.lock().ok()?.get(&source_key).cloned());
+            assert_eq!(cached, None);
+            return;
+        }
         let cache = BLOB_CAPTURE_CACHE.get().expect("cache initialized");
         let guard = cache.lock().expect("cache lock");
         let cached = guard.get(&source_key).expect("latest source cache entry");
