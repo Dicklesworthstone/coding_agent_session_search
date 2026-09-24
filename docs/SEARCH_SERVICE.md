@@ -68,7 +68,10 @@ processed sequentially, so backpressure does not create an in-process request
 queue. Without `--mcp`, this is a CASS JSON-lines protocol, not JSON-RPC.
 The MCP adapter described below uses the same reader and bounds.
 
-Every request requires an unsigned 64-bit `id`. Five operations are always available:
+Every request requires an unsigned 64-bit `id`. Nine operations exist. Four are
+enabled by startup flags: `view` and `view_batch` need `--db`, `semantic_search`
+needs `--semantic-embedder` with `--data-dir` and `--db`, and `refine` needs
+`--reranker-model` (all described below). The other five are always available:
 
 ```json
 {"op":"status","id":1}
@@ -387,6 +390,13 @@ Without `--mcp`, send:
 
 ```json
 {"op":"view","id":5,"source_path":"/history/session.jsonl","source_id":"local","conversation_id":42,"message_index":13,"context":1}
+```
+
+To read several hits in one round trip, `view_batch` takes 1 to 8 of the same
+selections (more, or none, is `invalid_request`):
+
+```json
+{"op":"view_batch","id":6,"views":[{"source_path":"/history/session.jsonl","source_id":"local","conversation_id":42,"message_index":13,"context":1}]}
 ```
 
 With MCP, call `cass_view` using the same arguments without `op` or `id`.
