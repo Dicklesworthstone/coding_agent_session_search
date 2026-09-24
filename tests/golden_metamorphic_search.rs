@@ -78,11 +78,11 @@ fn assert_golden(name: &str, actual: &str) {
     let golden_path = golden_dir().join(name);
     // Golden files end in one newline (the repository JSON style since
     // 2cc52516); the serializer adds none.
-    let actual = &format!("{}\n", actual.trim_end_matches('\n'));
+    let actual = format!("{}\n", actual.trim_end_matches('\n'));
 
     if std::env::var("UPDATE_GOLDENS").is_ok() {
         std::fs::create_dir_all(golden_path.parent().unwrap()).expect("create golden dir");
-        std::fs::write(&golden_path, actual).expect("write golden");
+        std::fs::write(&golden_path, &actual).expect("write golden");
         eprintln!("[GOLDEN] Updated: {}", golden_path.display());
         return;
     }
@@ -97,7 +97,7 @@ fn assert_golden(name: &str, actual: &str) {
 
     if actual != expected {
         let actual_path = golden_path.with_extension("json.actual");
-        std::fs::write(&actual_path, actual).expect("write .actual");
+        std::fs::write(&actual_path, &actual).expect("write .actual");
         panic!(
             "GOLDEN MISMATCH: {name}\n\
              Expected: {}\n\
