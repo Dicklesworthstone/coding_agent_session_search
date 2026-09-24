@@ -1803,6 +1803,8 @@ fn validate_serialized_config_metadata(value: &Value) -> Result<()> {
             "kdf_defaults",
             "payload",
             "key_slots",
+            // Slot-id high-water mark written by key add/revoke (2l1b0.61).
+            "next_slot_id",
         ],
         "config",
     )?;
