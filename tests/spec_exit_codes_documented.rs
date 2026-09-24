@@ -1,21 +1,20 @@
-//! INV-cass-6 — every exit code emitted by a `CliError` construction must
-//! appear in the documented exit-code table.
+//! INV-cass-6 — the exit codes cass emits and the exit codes it documents must
+//! be the same set.
 //!
-//! Regression guard for a real defect shipped 2026-05-25: a doctor quarantine
-//! I/O path constructed `CliError { code: 73, kind: "io", .. }`. Code 73 is not
-//! in the documented table (0-15, 20-24), so agents branching on the numeric
-//! exit code received an undocumented value. The fix changed it to `code: 14`
-//! (the documented `io | mapping` code); this test prevents recurrence.
+//! Regression guard for two real defects:
+//! - 2026-05-25: a doctor quarantine I/O path constructed
+//!   `CliError { code: 73, kind: "io", .. }`, an undocumented code (fixed to 14).
+//! - 2026-09-23 reality check (bead coding_agent_session_search-2l1b0.58):
+//!   `cass index` aborts a stalled run with `process::exit(70)` and an
+//!   interrupted `sources setup` exits 130, yet neither code was documented,
+//!   because this guard only scanned `CliError` literals and compared them
+//!   with a hand-mirrored list that had drifted from `capabilities`.
 //!
-//! The check is intentionally one-directional: it asserts
-//! `emitted ⊆ documented`. The reverse (every documented code is emitted) is
-//! NOT asserted — code 8 ("partial result") is documented but currently has no
-//! emission site, which is a known, separately-tracked doc/impl gap, not a
-//! safety problem. Shipping an *undocumented* code is the dangerous direction,
-//! and that is what this guards.
-//!
-//! Source of truth for the documented set: `cass robot-docs exit-codes`
-//! (mirrored here as `DOCUMENTED_EXIT_CODES`).
+//! Emitted set: every `CliError { code: N, kind: .. }` and every
+//! `process::exit(N)` in the scanned sources. Documented set: the real
+//! binary's `cass capabilities --json` `exit_codes`, which agents read.
+//! Both directions are asserted: an undocumented emitted code, and a
+//! documented code nothing emits, are both failures.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -34,12 +33,41 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     }
 }
 
-/// The documented exit-code table (`cass robot-docs exit-codes`).
-/// 0-9 are the core semantic codes; 10-15 are domain-specific (branch on
-/// `err.kind`, not the number); 20-24 are model-acquisition/IO codes.
-const DOCUMENTED_EXIT_CODES: &[i32] = &[
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 24,
-];
+/// The documented exit codes, read from the real binary's
+/// `cass capabilities --json` (`exit_codes[].code`, where a range like
+/// `"20-21"` names every code in it).
+fn documented_exit_codes() -> Result<BTreeSet<i32>, Box<dyn Error>> {
+    let home = tempfile::TempDir::new()?;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cass"))
+        .args(["capabilities", "--json"])
+        .env("HOME", home.path())
+        .env("CASS_DATA_DIR", home.path().join("cass-data"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .output()?;
+    ensure(
+        output.status.success(),
+        format!(
+            "cass capabilities --json failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let entries = payload["exit_codes"]
+        .as_array()
+        .ok_or_else(|| test_error("capabilities has no exit_codes array"))?;
+    let mut codes = BTreeSet::new();
+    for entry in entries {
+        let code = entry["code"]
+            .as_str()
+            .ok_or_else(|| test_error(format!("exit code entry without a code: {entry}")))?;
+        let (first, last) = code.split_once('-').unwrap_or((code, code));
+        for value in first.parse::<i32>()?..=last.parse::<i32>()? {
+            codes.insert(value);
+        }
+    }
+    Ok(codes)
+}
 
 /// Every source file that constructs `CliError { code: N, kind: .. }`.
 /// Embedded at compile time so the test has no filesystem dependency at run
@@ -85,27 +113,79 @@ fn emitted_cli_error_codes(src: &str) -> BTreeSet<i32> {
     codes
 }
 
+/// Every literal `process::exit(N)`: exits that bypass `CliError` entirely
+/// (the index-stall abort, an interrupted sources setup).
+fn emitted_process_exit_codes(src: &str) -> BTreeSet<i32> {
+    src.match_indices("process::exit(")
+        .filter_map(|(start, needle)| {
+            let rest = &src[start + needle.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() || !rest[digits.len()..].starts_with(')') {
+                return None;
+            }
+            digits.parse::<i32>().ok()
+        })
+        .collect()
+}
+
+fn emitted_exit_codes() -> BTreeSet<i32> {
+    SOURCES
+        .iter()
+        .flat_map(|(_, src)| {
+            let mut codes = emitted_cli_error_codes(src);
+            codes.extend(emitted_process_exit_codes(src));
+            codes
+        })
+        .collect()
+}
+
 #[test]
 fn every_emitted_exit_code_is_documented() -> TestResult {
-    let documented: BTreeSet<i32> = DOCUMENTED_EXIT_CODES.iter().copied().collect();
-
-    let mut undocumented: BTreeSet<i32> = BTreeSet::new();
-    for (_path, src) in SOURCES {
-        for code in emitted_cli_error_codes(src) {
-            if !documented.contains(&code) {
-                undocumented.insert(code);
-            }
-        }
-    }
+    let documented = documented_exit_codes()?;
+    let undocumented: BTreeSet<i32> = emitted_exit_codes()
+        .into_iter()
+        .filter(|code| !documented.contains(code))
+        .collect();
+    eprintln!("[exit-codes] documented={documented:?} undocumented={undocumented:?}");
 
     ensure(
         undocumented.is_empty(),
         format!(
-            "CliError emits undocumented exit code(s) {undocumented:?}. Every emitted code must be in \
-         the documented table (cass robot-docs exit-codes: 0-15, 20-24). Either add the code to \
-         the documented table + ERROR_CODES.md, or fix the construction site to use a documented \
-         code. (Regression guard for the shipped `code: 73` defect.)"
+            "cass emits undocumented exit code(s) {undocumented:?}. Every emitted code must be in \
+         `cass capabilities --json` exit_codes (and the robot-docs exit-codes, README and AGENTS \
+         tables). Either document the code or fix the site to use a documented one. (Guards the \
+         shipped `code: 73` and the undocumented 70/130 exits.)"
         ),
+    )
+}
+
+/// The reverse direction: a documented code that nothing emits is a promise
+/// agents cannot rely on (the old "8 = partial search result"). Success (0)
+/// needs no emission site.
+#[test]
+fn every_documented_exit_code_is_emitted() -> TestResult {
+    let emitted = emitted_exit_codes();
+    let unemitted: BTreeSet<i32> = documented_exit_codes()?
+        .into_iter()
+        .filter(|code| *code != 0 && !emitted.contains(code))
+        .collect();
+    eprintln!("[exit-codes] emitted={emitted:?} unemitted={unemitted:?}");
+    ensure(
+        unemitted.is_empty(),
+        format!(
+            "capabilities documents exit code(s) {unemitted:?} that no scanned source emits; \
+         remove them from the contract or point this scan at the emitting file"
+        ),
+    )
+}
+
+#[test]
+fn process_exit_extractor_reads_only_literal_codes() -> TestResult {
+    let sample = "std::process::exit(70);\nprocess::exit(code);\nstd::process::exit(130)\nexit(9);";
+    let found = emitted_process_exit_codes(sample);
+    ensure(
+        found == BTreeSet::from([70, 130]),
+        format!("expected the two literal process exits only, found {found:?}"),
     )
 }
 

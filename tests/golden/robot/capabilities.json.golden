@@ -3507,9 +3507,9 @@
     },
     {
       "code": "4",
-      "meaning": "network error",
-      "retryable": "yes",
-      "agent_action": "Check connectivity or remote source configuration, then retry."
+      "meaning": "I/O failure or unsafe operation refused",
+      "retryable": "maybe",
+      "agent_action": "Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23."
     },
     {
       "code": "5",
@@ -3519,9 +3519,9 @@
     },
     {
       "code": "6",
-      "meaning": "incompatible version",
+      "meaning": "required input missing",
       "retryable": "no",
-      "agent_action": "Upgrade cass or the calling client before retrying."
+      "agent_action": "Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun."
     },
     {
       "code": "7",
@@ -3531,9 +3531,9 @@
     },
     {
       "code": "8",
-      "meaning": "partial result",
+      "meaning": "partial result (sources sync only)",
       "retryable": "yes",
-      "agent_action": "Increase timeout or page through remaining results."
+      "agent_action": "Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead."
     },
     {
       "code": "9",
@@ -3600,6 +3600,18 @@
       "meaning": "I/O during model verify/install",
       "retryable": "maybe",
       "agent_action": "Fix filesystem permissions or disk space, then retry."
+    },
+    {
+      "code": "70",
+      "meaning": "index stalled and aborted",
+      "retryable": "yes",
+      "agent_action": "Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start."
+    },
+    {
+      "code": "130",
+      "meaning": "interrupted (SIGINT)",
+      "retryable": "yes",
+      "agent_action": "Rerun the command; cass sources setup --resume continues an interrupted setup."
     }
   ],
   "env_vars": [

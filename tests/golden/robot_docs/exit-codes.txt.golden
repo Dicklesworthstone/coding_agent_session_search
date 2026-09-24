@@ -1,11 +1,11 @@
 exit-codes:
- 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown
+ 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 io|refused-unsafe | 5 data-corrupt | 6 input-required | 7 lock/busy | 8 partial (sources sync) | 9 unknown
  10 config|timeout | 11 config | 12 source|ssh | 13 mapping|not_found | 14 io|mapping | 15 semantic-unavailable|embedder-unavailable
- 20-21 model | 22 io | 23 download | 24 io
+ 20-21 model | 22 io | 23 download | 24 io | 70 index-stalled (cass index abort) | 130 interrupted (SIGINT)
  NOTE: codes >= 10 cover domain-specific failures (sources/models/semantic/analytics).
        Use `err.kind` from the JSON envelope as the canonical identifier — kinds are
        kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,
-       ambiguous-source, timeout, config, lock-busy, network, model, download, io).
+       ambiguous-source, timeout, config, lock-busy, model, download, io).
        Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.
        `cass archive`: 2 logical-archive-usage | 5 logical-archive-integrity | 7 logical-archive-busy (retryable) | 14 logical-archive-io (retryable) | 9 logical-archive-error.
        For doctor JSON, prefer `operation_outcome.kind` and `operation_outcome.exit_code_kind` for no-op/partial/blocked/refused/incomplete repair decisions.

@@ -1191,7 +1191,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 }
 ```
 
-**Kind names** are kebab-case (e.g. `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`). Agents that branch on `err.kind` should treat them as stable identifiers. The full set (~50 kinds as of 0.3.x) is defined in `src/lib.rs`; the canonical way to discover a kind programmatically is to trigger the condition and inspect `err.kind` from the JSON envelope.
+**Kind names** are kebab-case (e.g. `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`). Agents that branch on `err.kind` should treat them as stable identifiers. The full set (about 90 kinds) is defined in `src/model/cli_error_kind.rs`; the canonical way to discover a kind programmatically is to trigger the condition and inspect `err.kind` from the JSON envelope.
 
 **Exit codes** follow a semantic convention:
 | Code | Meaning | Typical action |
@@ -1200,9 +1200,9 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 1 | Health check failed | Run `cass index --full` |
 | 2 | Usage error | Fix syntax (hint provided) |
 | 3 | Index/DB missing | Run `cass index --full` (retryable: true) |
-| 4 | Network error | Check connectivity |
+| 4 | I/O failure or unsafe operation refused (not a network code) | Branch on `err.kind`: fix path/permissions/space for `io`/`output-not-writable`; follow the hint for `refused-unsafe` |
 | 5 | Data corruption | Run `cass doctor check --json`; repair or restore the canonical SQLite archive before indexing |
-| 6 | Incompatible version | Update cass |
+| 6 | Required input missing (password, resume command) | Supply the input (e.g. `--password-stdin`) and rerun |
 | 7 | Lock/busy | Retry later |
 | 8 | Partial result (`sources sync` only: some sources had path failures) | Inspect per-path errors in the JSON output and retry the failed sources |
 | 9 | Unknown error | Check `retryable` flag |
@@ -1216,8 +1216,10 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 22 | I/O during model handling | Retry |
 | 23 | Model download | Retry or use `--from-file` |
 | 24 | I/O during model verify/install | Retry |
+| 70 | `cass index` stalled and aborted (kind `index-stalled` envelope on stderr) | Inspect `cass status --json`, then rerun `cass index` |
+| 130 | Interrupted (SIGINT) | Rerun; `cass sources setup --resume` continues an interrupted setup |
 
-Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`, and `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` is the other exception: when the remaining budget cannot admit semantic setup or dispatch, search fails with exit 10, kind `timeout`, `retryable: true`, and a `semantic_budget checkpoint=...` message, rather than returning an empty or lexical result. Hybrid (explicit or default) instead falls back to lexical and reports `semantic_budget_limited`.
+Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`, and `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` is the other exception: when the remaining budget cannot admit semantic setup or dispatch, search fails with exit 10, kind `timeout`, `retryable: true`, and a `semantic_budget checkpoint=...` message, rather than returning an empty or lexical result. Hybrid (explicit or default) instead falls back to lexical and reports `semantic_budget_limited`.
 
 **Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
@@ -1484,7 +1486,7 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 | `--fields minimal\|summary\|<list>` | Reduce payload size |
 | `--max-content-length N` | Truncate content fields to N chars |
 | `--max-tokens N` | Apply an approximate token budget to robot output |
-| `--timeout N` | Timeout in milliseconds. On expiry `search`/`pack` still exit 0 and emit `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`; `--robot-format sessions` fails with exit 10, kind `timeout` |
+| `--timeout N` | Timeout in milliseconds. On expiry `search`/`pack` still exit 0 and emit `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`; `--robot-format sessions` fails with exit 10, kind `timeout` |
 | `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
 | `--request-id ID` | Echoed in response for correlation |
 | `--aggregate agent,workspace,date` | Server-side aggregations |

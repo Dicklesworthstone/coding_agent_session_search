@@ -766,9 +766,9 @@ Returns in <50ms on a healthy archive (the archive probe is the same strict, mut
 | 1 | Health check failed | Yes — inspect `recommended_action` |
 | 2 | Usage/parsing error | No — fix syntax |
 | 3 | Index/DB missing | Yes — run `cass index --full` |
-| 4 | Network error | Yes — check connectivity |
+| 4 | I/O failure or unsafe operation refused (not a network code) | Maybe — branch on `err.kind` (`io`, `output-not-writable`, `refused-unsafe`) |
 | 5 | Data corruption | Yes — inspect health/status, then rebuild derived assets if recommended |
-| 6 | Incompatible version | No — update cass |
+| 6 | Required input missing (password, resume command) | No — supply the input (e.g. `--password-stdin`) |
 | 7 | Lock/busy | Yes — retry later |
 | 8 | Partial result (`sources sync` only: some sources had path failures) | Yes — inspect per-path errors, retry failed sources |
 | 9 | Unknown error | Maybe |
@@ -782,10 +782,12 @@ Returns in <50ms on a healthy archive (the archive probe is the same strict, mut
 | 22 | I/O during model handling | Maybe |
 | 23 | Download failure | Yes — retry or use `--from-file` |
 | 24 | I/O during model verify/install | Maybe |
+| 70 | `cass index` stalled and aborted (kind `index-stalled` envelope on stderr) | Yes — inspect `cass status --json`, rerun `cass index` |
+| 130 | Interrupted (SIGINT) | Yes — rerun; `cass sources setup --resume` continues setup |
 
-Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`; `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` also fails with exit 10, kind `timeout`, retryable, when the budget cannot admit semantic setup or dispatch (ds7uy.4.1); hybrid falls back to lexical with `semantic_budget_limited`.
+Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`; `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` also fails with exit 10, kind `timeout`, retryable, when the budget cannot admit semantic setup or dispatch (ds7uy.4.1); hybrid falls back to lexical with `semantic_budget_limited`.
 
-**Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`, `model`, `download`, `io`). The full set (~50 kinds) lives in `src/lib.rs`.
+**Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `model`, `download`, `io`). The full set (about 90 kinds) lives in `src/model/cli_error_kind.rs`.
 
 ### Multi-Machine Search Setup
 

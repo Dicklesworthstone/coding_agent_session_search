@@ -26636,13 +26636,13 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Schemas => render_schema_docs(),
         RobotTopic::ExitCodes => vec![
             "exit-codes:".to_string(),
-            " 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown".to_string(),
+            " 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 io|refused-unsafe | 5 data-corrupt | 6 input-required | 7 lock/busy | 8 partial (sources sync) | 9 unknown".to_string(),
             " 10 config|timeout | 11 config | 12 source|ssh | 13 mapping|not_found | 14 io|mapping | 15 semantic-unavailable|embedder-unavailable".to_string(),
-            " 20-21 model | 22 io | 23 download | 24 io".to_string(),
+            " 20-21 model | 22 io | 23 download | 24 io | 70 index-stalled (cass index abort) | 130 interrupted (SIGINT)".to_string(),
             " NOTE: codes >= 10 cover domain-specific failures (sources/models/semantic/analytics).".to_string(),
             "       Use `err.kind` from the JSON envelope as the canonical identifier — kinds are".to_string(),
             "       kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,".to_string(),
-            "       ambiguous-source, timeout, config, lock-busy, network, model, download, io).".to_string(),
+            "       ambiguous-source, timeout, config, lock-busy, model, download, io).".to_string(),
             "       Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.".to_string(),
             "       `cass archive`: 2 logical-archive-usage | 5 logical-archive-integrity | 7 logical-archive-busy (retryable) | 14 logical-archive-io (retryable) | 9 logical-archive-error.".to_string(),
             "       For doctor JSON, prefer `operation_outcome.kind` and `operation_outcome.exit_code_kind` for no-op/partial/blocked/refused/incomplete repair decisions.".to_string(),
@@ -94549,9 +94549,9 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
         ),
         exit_code_capability(
             "4",
-            "network error",
-            "yes",
-            "Check connectivity or remote source configuration, then retry.",
+            "I/O failure or unsafe operation refused",
+            "maybe",
+            "Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23.",
         ),
         exit_code_capability(
             "5",
@@ -94561,9 +94561,9 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
         ),
         exit_code_capability(
             "6",
-            "incompatible version",
+            "required input missing",
             "no",
-            "Upgrade cass or the calling client before retrying.",
+            "Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun.",
         ),
         exit_code_capability(
             "7",
@@ -94573,9 +94573,9 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
         ),
         exit_code_capability(
             "8",
-            "partial result",
+            "partial result (sources sync only)",
             "yes",
-            "Increase timeout or page through remaining results.",
+            "Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead.",
         ),
         exit_code_capability(
             "9",
@@ -94642,6 +94642,18 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
             "I/O during model verify/install",
             "maybe",
             "Fix filesystem permissions or disk space, then retry.",
+        ),
+        exit_code_capability(
+            "70",
+            "index stalled and aborted",
+            "yes",
+            "Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start.",
+        ),
+        exit_code_capability(
+            "130",
+            "interrupted (SIGINT)",
+            "yes",
+            "Rerun the command; cass sources setup --resume continues an interrupted setup.",
         ),
     ]
 }
