@@ -7592,28 +7592,33 @@ impl CassApp {
             return None;
         }
         self.first_run_index_probed_at = Some(now);
-        match self.open_search_service() {
-            Ok(true) => {
-                self.first_run_index_started_at = None;
-                self.status = "Index ready: search is live".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::success(
-                        "Index ready: search is live",
-                    ));
-                return Some(ftui::Cmd::msg(CassMsg::SearchRequested));
-            }
-            Ok(false) => {}
-            Err(message) => {
-                // A generation mid-publish can fail to open; keep waiting.
-                self.status = message;
-                return Some(Self::delayed_tick(FIRST_RUN_INDEX_POLL));
-            }
-        }
         let maintenance =
             crate::search::asset_state::read_search_maintenance_snapshot(&self.data_dir);
         let progress = crate::search::tantivy::index_dir(&self.data_dir)
             .ok()
             .and_then(|path| crate::lexical_rebuild_progress_note(&path));
+        // Go live only once the first index run has released its lock. An
+        // index that opens while the run still holds it can be a generation
+        // the run has not filled yet, and a search against it found nothing.
+        if !maintenance.active {
+            match self.open_search_service() {
+                Ok(true) => {
+                    self.first_run_index_started_at = None;
+                    self.status = "Index ready: search is live".to_string();
+                    self.toast_manager
+                        .push(crate::ui::components::toast::Toast::success(
+                            "Index ready: search is live",
+                        ));
+                    return Some(ftui::Cmd::msg(CassMsg::SearchRequested));
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    // A generation mid-publish can fail to open; keep waiting.
+                    self.status = message;
+                    return Some(Self::delayed_tick(FIRST_RUN_INDEX_POLL));
+                }
+            }
+        }
         let running = match (progress, maintenance.active) {
             (Some(note), _) => Some(format!("Indexing your agent history: {note}")),
             (None, true) => Some(format!(
@@ -16252,11 +16257,24 @@ impl super::ftui_adapter::Model for CassApp {
             // Request state load on startup.
             ftui::Cmd::msg(CassMsg::StateLoadRequested)
         };
+        let mut cmds = vec![startup];
         if self.first_run_index_started_at.is_some() {
             // Start polling the first-run index (2l1b0.56).
-            ftui::Cmd::batch(vec![startup, Self::delayed_tick(FIRST_RUN_INDEX_POLL)])
+            cmds.push(Self::delayed_tick(FIRST_RUN_INDEX_POLL));
+        }
+        // Deliver the background update check the moment it finishes. It was
+        // polled only on Tick, and an idle TUI never ticks, so the banner
+        // waited for the first keypress (2l1b0.56).
+        if let Some(rx) = self.update_check_rx.take() {
+            cmds.push(ftui::Cmd::task(move || match rx.recv() {
+                Ok(Some(info)) => CassMsg::UpdateCheckCompleted(info),
+                _ => CassMsg::Tick,
+            }));
+        }
+        if cmds.len() == 1 {
+            cmds.remove(0)
         } else {
-            startup
+            ftui::Cmd::batch(cmds)
         }
     }
 
@@ -19975,29 +19993,7 @@ impl super::ftui_adapter::Model for CassApp {
                 if self.peek_badge_until.is_some_and(|t| now > t) {
                     self.peek_badge_until = None;
                 }
-                // Poll update-check channel once per tick.
-                let mut update_check_done = false;
-                let mut update_info_ready: Option<UpdateInfo> = None;
-                if let Some(rx) = self.update_check_rx.as_ref() {
-                    match rx.try_recv() {
-                        Ok(info) => {
-                            update_check_done = true;
-                            update_info_ready = info;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            update_check_done = true;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    }
-                }
-                if update_check_done {
-                    self.update_check_rx = None;
-                }
-
                 let mut cmds = Vec::new();
-                if let Some(info) = update_info_ready {
-                    cmds.push(ftui::Cmd::msg(CassMsg::UpdateCheckCompleted(info)));
-                }
                 if let Some(cmd) = self.poll_first_run_index(now) {
                     cmds.push(cmd);
                 }
@@ -27943,33 +27939,35 @@ mod tests {
         assert!(app.status.contains("TEST mode: would launch self-update"));
     }
 
+    /// 2l1b0.56: the update check result reaches the TUI without any input.
+    /// Negative control: it used to be polled only on Tick, and an idle TUI
+    /// never ticks, so init returned no command that could deliver it.
     #[test]
-    fn tick_polls_update_channel_and_dispatches_completion() {
+    fn init_delivers_the_update_check_without_waiting_for_input() {
         let mut app = CassApp::default();
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Some(sample_update_info()))
             .expect("send update info to test channel");
         app.update_check_rx = Some(rx);
 
-        let msgs = extract_msgs(app.update(CassMsg::Tick));
-        let mut completed_info: Option<UpdateInfo> = None;
-        for msg in msgs {
-            match msg {
-                CassMsg::UpdateCheckCompleted(info) => completed_info = Some(info),
-                CassMsg::ToastTick => {}
-                _ => {}
-            }
-        }
+        let cmds = match app.init() {
+            ftui::Cmd::Batch(cmds) => cmds,
+            other => vec![other],
+        };
+        assert!(app.update_check_rx.is_none(), "init takes the receiver");
+        let delivered = cmds
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                ftui::Cmd::Task(_, task) => Some(task()),
+                _ => None,
+            })
+            .find_map(|msg| match msg {
+                CassMsg::UpdateCheckCompleted(info) => Some(info),
+                _ => None,
+            })
+            .expect("init schedules a task that delivers the update check");
 
-        assert!(
-            completed_info.is_some(),
-            "tick should dispatch update completion"
-        );
-        assert!(app.update_check_rx.is_none(), "receiver should be consumed");
-
-        if let Some(info) = completed_info {
-            let _ = app.update(CassMsg::UpdateCheckCompleted(info));
-        }
+        let _ = app.update(CassMsg::UpdateCheckCompleted(delivered));
         assert!(app.update_banner_visible());
     }
 
