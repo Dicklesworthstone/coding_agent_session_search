@@ -1937,79 +1937,29 @@ For opening many files without navigating away:
 
 ### The Six Ranking Modes
 
-Cycle through modes with `F12`:
+Cycle through modes with `F12` (or `Alt+R`) in the TUI. The search engine returns hits in its own relevance order; the mode then re-orders the results the TUI has loaded (the first page of up to 250 hits, plus every further page you load), so the whole loaded list always follows one order. Ranking modes are TUI-only; robot search returns engine order.
 
-1. **Recent Heavy** (default): Strongly favors recent conversations
-   - Score = `text_relevance × 0.3 + recency × 0.7`
-   - Best for: "What was I working on?"
+1. **Recent Heavy**: Score = `relevance × 0.3 + recency × 0.7`. Best for: "What was I working on?"
 
-2. **Balanced**: Equal weight to relevance and recency
-   - Score = `text_relevance × 0.5 + recency × 0.5`
-   - Best for: General-purpose search
+2. **Balanced** (default): Score = `relevance × 0.5 + recency × 0.5`. Best for general-purpose search.
 
-3. **Relevance**: Prioritizes text match quality
-   - Score = `text_relevance × 0.8 + recency × 0.2`
-   - Best for: "Find the best explanation of X"
+3. **Relevance**: Score = `relevance × 0.8 + recency × 0.2`. Best for "find the best explanation of X".
 
-4. **Match Quality**: Penalizes fuzzy/wildcard matches
-   - Score = `text_relevance × 0.7 + recency × 0.2 + match_exactness × 0.1`
-   - Best for: Precise technical searches
+4. **Match Quality**: exact matches first, then prefix, suffix, substring, wildcard, and finally automatic wildcard-fallback matches; within each class, the Relevance score. Best for precise technical searches.
 
-5. **Date Newest**: Pure chronological order (newest first)
-   - Ignores relevance scoring entirely
-   - Best for: "Show me all recent activity"
+5. **Date Newest**: newest first by message time. Best for "show me recent activity".
 
-6. **Date Oldest**: Pure reverse chronological order (oldest first)
-   - Ignores relevance scoring entirely
-   - Best for: "When did I first work on this?"
+6. **Date Oldest**: oldest first. Best for "when did I first work on this?"
+
+Undated hits sort last in the date modes. Hits with equal scores keep the engine's order. With an empty query, cass browses by date instead of searching; Date Oldest browses oldest first and every other mode newest first.
 
 ### Score Components
 
-- **Text Relevance (BM25)**: Quill's implementation of Okapi BM25, considering:
-  - Term frequency in document
-  - Inverse document frequency across corpus
-  - Document length normalization
+- **Relevance**: the engine's score (BM25 for lexical search, fused rank for hybrid), min-max normalized over the loaded hits: the best loaded hit is 1.0 and the weakest 0.0 (all 1.0 when every score ties).
 
-- **Recency**: Exponential decay from current time
-  - Documents from today: ~1.0
-  - Documents from last week: ~0.7
-  - Documents from last month: ~0.3
+- **Recency**: exponential decay from now with a 14-day half-life, `0.5 ^ (age_days / 14)`: 1.0 today, about 0.71 after a week, 0.5 after two weeks, about 0.23 after a month. Undated hits get 0.
 
-- **Match Exactness**: Bonus for exact matches vs wildcards
-  - Exact phrase: 1.0
-  - Prefix match: 0.8
-  - Suffix/Substring: 0.5
-  - Fuzzy fallback: 0.3
-
-### Blended Scoring Formula
-
-The final score combines all components using mode-specific weights:
-
-```
-Final_Score = BM25_Score × Match_Quality + α × Recency_Factor
-```
-
-**Alpha (α) by Ranking Mode**:
-| Mode | α Value | Effect |
-|------|---------|--------|
-| Recent Heavy | 1.0 | Recency dominates |
-| Balanced | 0.4 | Moderate recency boost |
-| Relevance Heavy | 0.1 | BM25 dominates |
-| Match Quality | 0.0 | Pure text matching |
-| Date Newest/Oldest | N/A | Pure chronological sort |
-
-**Match Quality Factors**:
-| Match Type | Factor | Applied When |
-|------------|--------|--------------|
-| Exact | 1.0 | `"exact phrase"` |
-| Prefix | 0.9 | `auth*` |
-| Suffix | 0.8 | `*tion` |
-| Substring | 0.6 | `*config*` |
-| Implicit Wildcard | 0.4 | Auto-fallback expansion |
-
-**Recency Factor**: `timestamp / max_timestamp` normalized to [0, 1].
-
-This formula ensures that "Recent Heavy" mode (default) surfaces your most recent work, while "Relevance Heavy" finds the best explanations regardless of age.
+The formulas live in `src/ui/ranking.rs`, and the tests in that file and in `tests/ranking.rs` exercise the same function the TUI calls.
 
 ---
 

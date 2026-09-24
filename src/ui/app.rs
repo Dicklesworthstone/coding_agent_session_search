@@ -3187,7 +3187,7 @@ fn smart_timestamp(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 /// Normalize a raw timestamp (seconds or milliseconds) to seconds.
-fn ts_to_secs(ts: i64) -> i64 {
+pub(super) fn ts_to_secs(ts: i64) -> i64 {
     if ts.unsigned_abs() >= 10_000_000_000 {
         ts / 1000
     } else {
@@ -7380,6 +7380,16 @@ impl CassApp {
     fn push_undo(&mut self, description: &'static str) {
         let entry = self.capture_undo_state(description);
         self.undo_history.push(entry);
+    }
+
+    /// Order the loaded results for the active ranking mode (F12). Engine
+    /// order is only the input: before 2l1b0.53 every mode displayed it.
+    fn apply_ranking(&mut self) {
+        crate::ui::ranking::rank_hits(
+            &mut self.results,
+            self.ranking_mode,
+            chrono::Utc::now().timestamp(),
+        );
     }
 
     /// Re-group results into panes using the current `grouping_mode`.
@@ -17192,6 +17202,9 @@ impl super::ftui_adapter::Model for CassApp {
                     if backend_returned < page_size {
                         self.search_has_more = false;
                     }
+                    // A loaded page joins the ranked window, so the whole
+                    // loaded set keeps one order.
+                    self.apply_ranking();
                     self.regroup_panes();
                     self.trace_search_results_applied(
                         generation,
@@ -17224,10 +17237,12 @@ impl super::ftui_adapter::Model for CassApp {
                 self.suggestions = suggestions;
                 self.wildcard_fallback = wildcard_fallback;
 
-                // Store results and group into panes using current mode.
+                // Store results, order them for the ranking mode, and group
+                // into panes using the current grouping mode.
                 self.results = hits;
                 self.search_backend_offset = self.results.len();
                 self.search_has_more = self.results.len() >= page_size;
+                self.apply_ranking();
                 self.regroup_panes();
                 self.trace_search_results_applied(generation, pass, elapsed_ms, self.results.len());
 
@@ -17524,10 +17539,12 @@ impl super::ftui_adapter::Model for CassApp {
                     RankingMode::DateNewest => RankingMode::DateOldest,
                     RankingMode::DateOldest => RankingMode::RecentHeavy,
                 };
+                // Reorder what is loaded at once (2l1b0.53).
+                self.apply_ranking();
+                self.regroup_panes();
                 self.dirty_since = Some(Instant::now());
-                // Fix #79: re-fetch results from backend so ranking mode
-                // changes are reflected (especially for empty-query date
-                // browsing where sort order matters).
+                // Fix #79: also re-fetch, because an empty-query date browse
+                // is ordered by the backend query itself.
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
             CassMsg::ContextWindowCycled => {
@@ -42494,6 +42511,57 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             app.reveal_anim_start.is_some(),
             "reveal start timestamp should be recorded"
         );
+    }
+
+    /// 2l1b0.53: F12 used to re-run the same search and show engine order
+    /// again for any non-empty query. Arriving results follow the active
+    /// mode, and cycling the mode reorders what is loaded at once.
+    #[test]
+    fn ranking_modes_reorder_loaded_results_for_a_non_empty_query() {
+        let mut app = CassApp::default();
+        app.query = "auth".into();
+        app.ranking_mode = RankingMode::RelevanceHeavy;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut old_strong = make_hit(1, "/old-strong");
+        old_strong.score = 10.0;
+        old_strong.created_at = Some(now_ms - 120 * 86_400_000);
+        let mut new_weak = make_hit(2, "/new-weak");
+        new_weak.score = 4.0;
+        new_weak.created_at = Some(now_ms);
+        let mut undated = make_hit(3, "/undated");
+        undated.score = 1.0;
+        undated.created_at = None;
+        // Engine order is deliberately not the Relevance Heavy order's
+        // reverse, so both the arrival and the cycle are observable.
+        let _ = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: app.search_page_size.max(1),
+            hits: vec![new_weak, undated, old_strong],
+            elapsed_ms: 1,
+            suggestions: Vec::new(),
+            wildcard_fallback: false,
+            append: false,
+        });
+        let paths = |app: &CassApp| {
+            app.results
+                .iter()
+                .map(|hit| hit.source_path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&app), ["/old-strong", "/new-weak", "/undated"]);
+
+        // F12 twice: Relevance Heavy -> Match Quality -> Date Newest.
+        let _ = app.update(CassMsg::RankingModeCycled);
+        let _ = app.update(CassMsg::RankingModeCycled);
+        assert_eq!(app.ranking_mode, RankingMode::DateNewest);
+        assert_eq!(paths(&app), ["/new-weak", "/old-strong", "/undated"]);
+        let pane_paths: Vec<&str> = app.panes[0]
+            .hits
+            .iter()
+            .map(|hit| hit.source_path.as_str())
+            .collect();
+        assert_eq!(pane_paths, ["/new-weak", "/old-strong", "/undated"]);
     }
 
     #[test]
