@@ -3254,6 +3254,14 @@ schemas: (auto-generated from contract)
         - semantic_fallback: object
         - token_budget: object
         - total_matches: integer
+      - effective: object
+        - auto_corrections: array
+        - command: string
+        - db_path: string
+        - db_path_source: string
+        - filters: object
+        - query: string
+        - time_window: object
       - elapsed_ms: integer
       - explanation_cards: array
       - fallback_reason: ?

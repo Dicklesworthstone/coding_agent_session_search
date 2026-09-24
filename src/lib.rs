@@ -337,6 +337,21 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+
+    /// How argv was interpreted before dispatch; filled by `parse_cli`.
+    #[arg(skip)]
+    pub interpretation: InvocationInterpretation,
+}
+
+/// What `parse_cli` changed or inferred about the invocation, so robot
+/// output can echo it under `_meta.effective` instead of leaving it on
+/// stderr only (2l1b0.68).
+#[derive(Debug, Clone, Default)]
+pub struct InvocationInterpretation {
+    /// Every auto-correction applied to argv, in the wording stderr uses.
+    pub corrections: Vec<String>,
+    /// `--db` was absent from argv and its value came from `CASS_DB_PATH`.
+    pub db_from_env: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -6983,8 +6998,8 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
     // First normalization pass (global flags lift)
     let (normalized_args, parse_note) = normalize_args(raw_args.clone());
 
-    let (cli, heuristic_note) = match Cli::try_parse_from(&normalized_args) {
-        Ok(cli) => (cli, None),
+    let (mut cli, heuristic_note, parsed_args) = match Cli::try_parse_from(&normalized_args) {
+        Ok(cli) => (cli, None, normalized_args),
         Err(err) => {
             // Let clap handle help/version natively (exit 0, print to stdout)
             use clap::error::ErrorKind;
@@ -7007,7 +7022,7 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
             if let Some((recovered_args, note)) = heuristic_parse_recovery(&err, &normalized_args) {
                 // Try parsing again with recovered args
                 match Cli::try_parse_from(&recovered_args) {
-                    Ok(cli) => (cli, Some(note)),
+                    Ok(cli) => (cli, Some(note), recovered_args),
                     Err(retry_err) => {
                         // Check again for help/version in case recovered args triggered it
                         if matches!(
@@ -7047,6 +7062,21 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
             }
         }
     };
+
+    // `--db` and `CASS_DB_PATH` fill the same field and only the matcher
+    // knows which one supplied it.
+    if cli.db.is_some() {
+        cli.interpretation.db_from_env = Cli::command()
+            .try_get_matches_from(&parsed_args)
+            .ok()
+            .and_then(|matches| matches.value_source("db"))
+            == Some(clap::parser::ValueSource::EnvVariable);
+    }
+    cli.interpretation.corrections = [parse_note.as_deref(), heuristic_note.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
 
     Ok(ParsedCli {
         cli,
@@ -7701,6 +7731,7 @@ async fn execute_cli(
                         eff_mode,
                         semantic_opts,
                         refresh,
+                        &cli.interpretation,
                     )?;
                 }
                 Commands::Pack {
@@ -27196,6 +27227,11 @@ fn write_trace_line(
 pub struct TimeFilter {
     pub since: Option<i64>,
     pub until: Option<i64>,
+    /// The flag that set `since` (`--days 7`, `--since 2026-09-01`, ...),
+    /// echoed in `_meta.effective.time_window`.
+    pub since_from: Option<String>,
+    /// The flag that set `until`.
+    pub until_from: Option<String>,
 }
 
 /// Semantic search options from CLI flags (bd-3bbv)
@@ -27387,31 +27423,52 @@ impl TimeFilter {
             .single()
             .unwrap_or(now);
 
-        let (since, until) = if today {
-            (Some(today_start.timestamp_millis()), None)
+        let (since, until, preset) = if today {
+            (
+                Some(today_start.timestamp_millis()),
+                None,
+                Some("--today".to_string()),
+            )
         } else if yesterday {
             let yesterday_start = today_start - Duration::days(1);
             (
                 Some(yesterday_start.timestamp_millis()),
                 Some(today_start.timestamp_millis()),
+                Some("--yesterday".to_string()),
             )
         } else if week {
             let week_ago = now - Duration::days(7);
-            (Some(week_ago.timestamp_millis()), None)
+            (
+                Some(week_ago.timestamp_millis()),
+                None,
+                Some("--week".to_string()),
+            )
         } else if let Some(d) = days {
             let days_ago = now - Duration::days(i64::from(d));
-            (Some(days_ago.timestamp_millis()), None)
+            (
+                Some(days_ago.timestamp_millis()),
+                None,
+                Some(format!("--days {d}")),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
+        let mut since_from = since.and(preset.clone());
+        let mut until_from = until.and(preset);
 
         // Explicit --since/--until override the convenience flags.
         let since = match since_str {
-            Some(raw) => Some(parse_search_time_bound("--since", raw, TimeBound::Since)?),
+            Some(raw) => {
+                since_from = Some(format!("--since {raw}"));
+                Some(parse_search_time_bound("--since", raw, TimeBound::Since)?)
+            }
             None => since,
         };
         let until = match until_str {
-            Some(raw) => Some(parse_search_time_bound("--until", raw, TimeBound::Until)?),
+            Some(raw) => {
+                until_from = Some(format!("--until {raw}"));
+                Some(parse_search_time_bound("--until", raw, TimeBound::Until)?)
+            }
             None => until,
         };
         if let (Some(since), Some(until)) = (since, until)
@@ -27423,7 +27480,12 @@ impl TimeFilter {
             ));
         }
 
-        Ok(TimeFilter { since, until })
+        Ok(TimeFilter {
+            since,
+            until,
+            since_from,
+            until_from,
+        })
     }
 }
 
@@ -31013,6 +31075,7 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
     refresh: bool,
+    interpretation: &InvocationInterpretation,
 ) -> CliResult<()> {
     use crate::search::model_manager::{
         load_hash_semantic_context, load_hash_semantic_context_strict, load_semantic_context,
@@ -31033,6 +31096,17 @@ fn run_cli_search(
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let refresh_db_override = db_override.clone();
+    let db_path_source = if db_override.is_some() {
+        if interpretation.db_from_env {
+            "env:CASS_DB_PATH"
+        } else {
+            "--db"
+        }
+    } else if data_dir_override.is_some() {
+        "--data-dir"
+    } else {
+        default_data_dir_with_source().1
+    };
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
     // Resolve robot mode before reading any user-supplied session scope so a
@@ -31106,6 +31180,15 @@ fn run_cli_search(
             requested: filters.session_paths.len(),
             matched: matched_session_paths,
         });
+    let effective = search_effective_interpretation(
+        query,
+        &db_path,
+        db_path_source,
+        &time_filter,
+        &filters,
+        sessions_from.as_ref().map(|_| filters.session_paths.len()),
+        interpretation,
+    );
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
     let mut limit_val = *limit;
@@ -32602,6 +32685,7 @@ fn run_cli_search(
             search_ms,
             rerank_ms,
             sessions_filter_stats,
+            effective,
         )?;
     } else if display_result.hits.is_empty() {
         // GH#414: when the --sessions-from filter provably selected zero
@@ -35536,6 +35620,46 @@ impl SessionsFilterStats {
     }
 }
 
+/// `_meta.effective` (2l1b0.68): what this search actually ran, so a caller
+/// can check the interpretation instead of trusting it. It names the
+/// database and what chose its path, the resolved time window with the flag
+/// behind each bound, the filters as parsed, and every argv auto-correction.
+/// The parsed query tree is left to `--explain` until cass's parse matches
+/// the engine's (2l1b0.52); echoing it now would misreport the query.
+fn search_effective_interpretation(
+    query: &str,
+    db_path: &Path,
+    db_path_source: &str,
+    time_filter: &TimeFilter,
+    filters: &crate::search::query::SearchFilters,
+    sessions_from_paths: Option<usize>,
+    interpretation: &InvocationInterpretation,
+) -> serde_json::Value {
+    let mut agents: Vec<&str> = filters.agents.iter().map(String::as_str).collect();
+    agents.sort_unstable();
+    let mut workspaces: Vec<&str> = filters.workspaces.iter().map(String::as_str).collect();
+    workspaces.sort_unstable();
+    serde_json::json!({
+        "command": "search",
+        "query": query,
+        "db_path": db_path.display().to_string(),
+        "db_path_source": db_path_source,
+        "time_window": {
+            "since_ms": time_filter.since,
+            "since_from": time_filter.since_from,
+            "until_ms": time_filter.until,
+            "until_from": time_filter.until_from,
+        },
+        "filters": {
+            "agents": agents,
+            "workspaces": workspaces,
+            "source": filters.source_filter.to_string(),
+            "sessions_from_paths": sessions_from_paths,
+        },
+        "auto_corrections": interpretation.corrections,
+    })
+}
+
 /// Output search results in robot-friendly format
 #[allow(clippy::too_many_arguments, unused_variables)]
 fn output_robot_results(
@@ -35577,6 +35701,8 @@ fn output_robot_results(
     rerank_ms: u64,
     // GH#414: present iff --sessions-from was supplied.
     sessions_filter: Option<SessionsFilterStats>,
+    // 2l1b0.68: `_meta.effective`, from `search_effective_interpretation`.
+    effective: serde_json::Value,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -36179,6 +36305,7 @@ fn output_robot_results(
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
                     "explanation_cards": explanation_cards_json.clone(),
+                    "effective": effective.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -36328,6 +36455,7 @@ fn output_robot_results(
                         "query_plan": query_plan_json.clone(),
                         "cursor_manifest": cursor_manifest_json.clone(),
                         "explanation_cards": explanation_cards_json.clone(),
+                        "effective": effective.clone(),
                     }
                 });
                 if let Some(state) = state_meta
@@ -36536,6 +36664,7 @@ fn output_robot_results(
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
                     "explanation_cards": explanation_cards_json.clone(),
+                    "effective": effective.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -36708,6 +36837,7 @@ fn output_robot_results(
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
                     "explanation_cards": explanation_cards_json.clone(),
+                    "effective": effective.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -99771,6 +99901,41 @@ fn response_schema_budget_block() -> serde_json::Value {
     ])
 }
 
+fn response_schema_search_effective() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, and argv auto-corrections.",
+        "properties": {
+            "command": { "type": "string" },
+            "query": { "type": "string" },
+            "db_path": { "type": "string" },
+            "db_path_source": {
+                "type": "string",
+                "enum": ["--db", "env:CASS_DB_PATH", "--data-dir", "env:CASS_DATA_DIR", "env:XDG_DATA_HOME", "default"]
+            },
+            "time_window": {
+                "type": "object",
+                "properties": {
+                    "since_ms": { "type": ["integer", "null"] },
+                    "since_from": { "type": ["string", "null"] },
+                    "until_ms": { "type": ["integer", "null"] },
+                    "until_from": { "type": ["string", "null"] }
+                }
+            },
+            "filters": {
+                "type": "object",
+                "properties": {
+                    "agents": { "type": "array", "items": { "type": "string" } },
+                    "workspaces": { "type": "array", "items": { "type": "string" } },
+                    "source": { "type": "string" },
+                    "sessions_from_paths": { "type": ["integer", "null"] }
+                }
+            },
+            "auto_corrections": { "type": "array", "items": { "type": "string" } }
+        }
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -99818,6 +99983,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         ("query_plan", response_schema_query_plan()),
         ("cursor_manifest", response_schema_cursor_manifest()),
         ("explanation_cards", response_schema_explanation_cards()),
+        ("effective", response_schema_search_effective()),
         ("timing", response_schema_search_timing()),
         (
             "tokens_estimated",
@@ -108225,22 +108391,32 @@ fn same_directory(a: &Path, b: &Path) -> bool {
 }
 
 pub fn default_data_dir() -> PathBuf {
+    default_data_dir_with_source().0
+}
+
+/// The default data dir and what chose it: `env:CASS_DATA_DIR`,
+/// `env:XDG_DATA_HOME`, or `default` (the platform data dir).
+pub(crate) fn default_data_dir_with_source() -> (PathBuf, &'static str) {
     if let Ok(dir) = dotenvy::var("CASS_DATA_DIR") {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+            return (PathBuf::from(trimmed), "env:CASS_DATA_DIR");
         }
     }
     if let Ok(dir) = dotenvy::var("XDG_DATA_HOME") {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("coding-agent-search");
+            return (
+                PathBuf::from(trimmed).join("coding-agent-search"),
+                "env:XDG_DATA_HOME",
+            );
         }
     }
-    directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
+    let dir = directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
         .map(|p| p.data_dir().to_path_buf())
         .or_else(|| dirs::home_dir().map(|h| h.join(".coding-agent-search")))
-        .unwrap_or_else(|| PathBuf::from("./data"))
+        .unwrap_or_else(|| PathBuf::from("./data"));
+    (dir, "default")
 }
 
 #[cfg(test)]

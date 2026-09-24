@@ -31996,6 +31996,93 @@
                 ]
               }
             },
+            "effective": {
+              "type": "object",
+              "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, and argv auto-corrections.",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "db_path_source": {
+                  "type": "string",
+                  "enum": [
+                    "--db",
+                    "env:CASS_DB_PATH",
+                    "--data-dir",
+                    "env:CASS_DATA_DIR",
+                    "env:XDG_DATA_HOME",
+                    "default"
+                  ]
+                },
+                "time_window": {
+                  "type": "object",
+                  "properties": {
+                    "since_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "since_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "until_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "until_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "agents": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "workspaces": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "sessions_from_paths": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "auto_corrections": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
             "timing": {
               "type": "object",
               "properties": {

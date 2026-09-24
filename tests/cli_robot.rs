@@ -5588,6 +5588,144 @@ fn robot_mode_auto_correction_emits_teaching_note_on_stderr() -> Result<(), Box<
     Ok(())
 }
 
+fn search_effective_meta(cmd: &mut Command) -> Result<(Value, String), Box<dyn Error>> {
+    let output = cmd.env("TZ", "UTC").output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "search should succeed; stderr: {stderr}"
+    );
+    let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+    let effective = json["_meta"]["effective"].clone();
+    assert!(
+        effective.is_object(),
+        "--robot-meta must carry _meta.effective; _meta keys: {:?}",
+        json["_meta"]
+            .as_object()
+            .map(|m| m.keys().collect::<Vec<_>>())
+    );
+    Ok((effective, stderr))
+}
+
+/// 2l1b0.68: `_meta.effective` echoes what search actually ran. Every
+/// expected value here comes from outside cass: the fixture path, a UTC
+/// epoch computed by hand, and the flags as typed. Negative control: before
+/// 2l1b0.68 `_meta.effective` did not exist, so the first assertion fails.
+#[test]
+fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let (effective, _) = search_effective_meta(base_cmd().args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--limit",
+        "1",
+        "--agent",
+        "codex",
+        "--agent",
+        "claude_code",
+        "--since",
+        "2026-01-01",
+        "--source",
+        "local",
+        "--data-dir",
+        data_dir,
+    ]))?;
+    assert_eq!(effective["command"], "search");
+    assert_eq!(effective["query"], "hello");
+    assert_eq!(
+        effective["db_path"].as_str(),
+        Some(
+            Path::new(data_dir)
+                .join("agent_search.db")
+                .to_str()
+                .ok_or("non-utf8 path")?
+        )
+    );
+    assert_eq!(effective["db_path_source"], "--data-dir");
+    // 2026-01-01T00:00:00Z.
+    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
+    assert!(effective["time_window"]["until_ms"].is_null());
+    assert!(effective["time_window"]["until_from"].is_null());
+    assert_eq!(
+        effective["filters"]["agents"],
+        serde_json::json!(["claude_code", "codex"])
+    );
+    assert_eq!(effective["filters"]["workspaces"], serde_json::json!([]));
+    assert_eq!(effective["filters"]["source"], "local");
+    assert!(effective["filters"]["sessions_from_paths"].is_null());
+    assert_eq!(effective["auto_corrections"], serde_json::json!([]));
+    Ok(())
+}
+
+/// 2l1b0.68: the database path's source distinguishes `--db`,
+/// `CASS_DB_PATH` and the data dir, and a preset window names its flag on
+/// both bounds it sets.
+#[test]
+fn search_effective_meta_names_the_db_source_and_window_preset() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let db = Path::new(data_dir).join("agent_search.db");
+    let db = db.to_str().ok_or("non-utf8 path")?;
+
+    let (by_flag, _) = search_effective_meta(base_cmd().args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--db",
+        db,
+        "--yesterday",
+    ]))?;
+    assert_eq!(by_flag["db_path"], db);
+    assert_eq!(by_flag["db_path_source"], "--db");
+    assert_eq!(by_flag["time_window"]["since_from"], "--yesterday");
+    assert_eq!(by_flag["time_window"]["until_from"], "--yesterday");
+    let since = by_flag["time_window"]["since_ms"]
+        .as_i64()
+        .ok_or("--yesterday sets since")?;
+    let until = by_flag["time_window"]["until_ms"]
+        .as_i64()
+        .ok_or("--yesterday sets until")?;
+    assert_eq!(until - since, 86_400_000, "--yesterday spans one UTC day");
+
+    let (by_env, _) = search_effective_meta(
+        base_cmd()
+            .args(["search", "hello", "--json", "--robot-meta", "--days", "3"])
+            .env("CASS_DB_PATH", db),
+    )?;
+    assert_eq!(by_env["db_path"], db);
+    assert_eq!(by_env["db_path_source"], "env:CASS_DB_PATH");
+    assert_eq!(by_env["time_window"]["since_from"], "--days 3");
+    assert!(by_env["time_window"]["until_from"].is_null());
+    Ok(())
+}
+
+/// 2l1b0.68: an auto-corrected invocation lists each correction in
+/// `_meta.effective.auto_corrections`, worded exactly as the stderr note.
+#[test]
+fn search_effective_meta_lists_the_stderr_auto_corrections() -> Result<(), Box<dyn Error>> {
+    let (effective, stderr) = search_effective_meta(base_cmd().args([
+        "find",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--data-dir",
+        shared_search_demo_data(),
+    ]))?;
+    let noted: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("note: auto-corrected: "))
+        .collect();
+    assert!(
+        !noted.is_empty(),
+        "`find` is corrected to `search`: {stderr}"
+    );
+    assert_eq!(effective["auto_corrections"], serde_json::json!(noted));
+    Ok(())
+}
+
 /// 2l1b0.51: a flag typo on an exact subcommand must never run a different
 /// subcommand. Before the fix `cass status --jsn` ran `stats` instead (on an
 /// empty data dir: exit 3, "Database not found") and reported it only as a
