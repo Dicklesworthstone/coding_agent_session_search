@@ -907,6 +907,37 @@ pub fn run_doctor_rebuild_canonical_fts(
             Some("Re-run the dry-run; do not treat this repair as complete."),
         ));
     }
+    // GH #497 follow-up: exact parity is verified, so the "shadow may be
+    // half-rebuilt" marker (left by a failed/skipped index repair or by a
+    // size retirement) no longer describes this archive. Clear it here, or
+    // `cass status` keeps reporting `fallback_fts_repair.pending` until the
+    // next full index run.
+    let repair_pending_cleared = match storage.read_fallback_fts_repair_pending() {
+        Ok(Some(_)) => {
+            storage
+                .record_fallback_fts_repair_pending(None)
+                .map_err(|e| {
+                    storage_error(
+                        format!(
+                            "clearing the fallback FTS repair-pending marker after a verified repair: {e:#}"
+                        ),
+                        Some(
+                            "The shadow itself was repaired and verified; re-run the same command to clear the stale marker.",
+                        ),
+                    )
+                })?;
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            return Err(storage_error(
+                format!("reading the fallback FTS repair-pending marker after repair: {e:#}"),
+                Some(
+                    "The shadow itself was repaired and verified; re-run the same command to clear the stale marker.",
+                ),
+            ));
+        }
+    };
     let (repair_kind, inserted_rows) = match repair {
         FtsConsistencyRepair::AlreadyHealthy { .. } => ("already_healthy", 0),
         FtsConsistencyRepair::IncrementalCatchUp { inserted_rows, .. } => {
@@ -925,6 +956,7 @@ pub fn run_doctor_rebuild_canonical_fts(
         "repair_kind": repair_kind,
         "inserted_rows": inserted_rows,
         "segments_optimized": segments_optimized,
+        "repair_pending_marker_cleared": repair_pending_cleared,
         "parity_before": fts_parity_json(&before),
         "parity_after": fts_parity_json(&after),
         "mutated_asset_class": "canonical_fts5_shadow",

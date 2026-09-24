@@ -3248,6 +3248,10 @@ fn gh497_oversized_residue_retires_successfully_and_settles() {
         unbounded["parity_after"]["status"], "healthy",
         "{unbounded}"
     );
+    assert_eq!(
+        unbounded["repair_pending_marker_cleared"], true,
+        "{unbounded}"
+    );
     let storage = SqliteStorage::open_readonly(&db_path).unwrap();
     let raw = storage.raw();
     let ddl: String = raw
@@ -3275,7 +3279,28 @@ fn gh497_oversized_residue_retires_successfully_and_settles() {
         not_viable_markers, 0,
         "a viable rebuild clears the retirement marker"
     );
+    // The retirement also recorded the repair-pending marker that `cass
+    // status` reports as `index.fallback_fts_repair.pending`; a verified
+    // healthy rebuild must clear it too, or status keeps reporting a pending
+    // repair for a shadow doctor just rebuilt.
+    let pending_markers: i64 = raw
+        .query("SELECT COUNT(*) FROM meta WHERE key = 'fts_fallback_repair_pending'")
+        .unwrap()[0]
+        .get_typed(0)
+        .unwrap();
+    assert_eq!(
+        pending_markers, 0,
+        "a verified healthy rebuild clears the repair-pending marker"
+    );
     storage.close_without_checkpoint().unwrap();
+
+    let status = cass(&["status", "--json"], "0");
+    assert!(status.status.success(), "status: {}", describe(&status));
+    let status = json(&status);
+    assert!(
+        status["index"].get("fallback_fts_repair").is_none(),
+        "status must not report a pending FTS repair after doctor rebuilt the shadow: {status}"
+    );
 }
 
 fn seed_fts_liveness_sessions(home: &std::path::Path) {
