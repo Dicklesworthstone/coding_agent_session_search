@@ -25,7 +25,7 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
-| [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-19 | Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages |
+| v0.9.0 | not yet released | Cargo.toml is at 0.9.0; no v0.9.0 tag or GitHub Release exists yet. Planned scope: sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages |
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
@@ -57,7 +57,7 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   of a 2.1M-message archive
   ([ff6d6485](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ff6d6485)).
 
-## [v0.9.0] -- 2026-09-19
+## [v0.9.0] -- not yet released (Cargo.toml version; no tag or GitHub Release yet)
 
 ### Added
 
