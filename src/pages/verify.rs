@@ -9,7 +9,7 @@ use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -21,6 +21,9 @@ use super::encrypt::{
 };
 #[cfg(test)]
 use super::errors::DecryptError;
+use super::profiles::ShareProfile;
+use super::redact::RedactionEngine;
+use crate::franken_sync::compat::RowExt;
 use std::fmt;
 
 /// Maximum chunk file size (GitHub Pages hard limit)
@@ -136,6 +139,8 @@ pub struct VerifyChecks {
     pub size_limits: CheckResult,
     pub integrity: CheckResult,
     pub no_secrets_in_site: CheckResult,
+    /// A plaintext archive holds no value its declared share profile removes.
+    pub share_profile: CheckResult,
 }
 
 impl VerifyChecks {
@@ -147,7 +152,22 @@ impl VerifyChecks {
             && self.size_limits.passed
             && self.integrity.passed
             && self.no_secrets_in_site.passed
+            && self.share_profile.passed
     }
+}
+
+/// What verification established about a bundle's share profile (2l1b0.60).
+///
+/// An encrypted bundle records its profile inside the payload, which
+/// verification cannot open, so only plaintext archives are rescanned.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShareProfileEvidence {
+    /// Profile recorded in the plaintext archive's `export_meta`.
+    pub declared: Option<String>,
+    /// Whether every exported text surface was rescanned with that profile's rules.
+    pub rescanned: bool,
+    /// Values those rules would still rewrite, counted per surface; never the values.
+    pub residual: BTreeMap<String, u64>,
 }
 
 /// Complete verification result
@@ -157,6 +177,8 @@ pub struct VerifyResult {
     pub status: String,
     /// Individual check results
     pub checks: VerifyChecks,
+    /// Share profile declared by, and rescanned in, a plaintext archive
+    pub share_profile: ShareProfileEvidence,
     /// Warning messages (non-fatal issues)
     pub warnings: Vec<String>,
     /// Total site size in bytes
@@ -179,7 +201,7 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
         println!("Verifying bundle at: {}", site_dir.display());
     }
 
-    let warnings = Vec::new();
+    let mut warnings = Vec::new();
 
     // Check 1: Required files
     if verbose {
@@ -225,6 +247,12 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
     }
     let no_secrets_in_site = check_no_secrets(&site_dir);
 
+    // Check 7: Share profile (plaintext archives only)
+    if verbose {
+        println!("  Checking share-profile redaction...");
+    }
+    let (share_profile_check, share_profile) = check_share_profile(&site_dir, &mut warnings);
+
     // Calculate total site size
     let site_size_bytes = calculate_dir_size(&site_dir)?;
 
@@ -235,6 +263,7 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
         size_limits,
         integrity,
         no_secrets_in_site,
+        share_profile: share_profile_check,
     };
 
     let status = if checks.all_passed() {
@@ -246,6 +275,7 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
     Ok(VerifyResult {
         status,
         checks,
+        share_profile,
         warnings,
         site_size_bytes,
     })
@@ -262,6 +292,7 @@ fn failed_check_details(verification: &VerifyResult) -> String {
             "no_secrets_in_site",
             &verification.checks.no_secrets_in_site,
         ),
+        ("share_profile", &verification.checks.share_profile),
     ]
     .into_iter()
     .filter(|(_, check)| !check.passed)
@@ -1533,6 +1564,173 @@ fn calculate_dir_size(dir: &Path) -> Result<u64> {
 }
 
 /// Print verification result in human-readable format
+/// Text surfaces a Pages export redacts, as (label, table, column, holds JSON).
+/// Both FTS tables are rescanned too: a value left in the search index is as
+/// public as one left in the message it indexes.
+const SHARE_PROFILE_SURFACES: &[(&str, &str, &str, bool)] = &[
+    ("conversations.title", "conversations", "title", false),
+    (
+        "conversations.workspace",
+        "conversations",
+        "workspace",
+        false,
+    ),
+    (
+        "conversations.source_path",
+        "conversations",
+        "source_path",
+        false,
+    ),
+    (
+        "conversations.metadata_json",
+        "conversations",
+        "metadata_json",
+        true,
+    ),
+    ("messages.content", "messages", "content", false),
+    (
+        "messages.attachment_refs",
+        "messages",
+        "attachment_refs",
+        true,
+    ),
+    ("snippets.file_path", "snippets", "file_path", false),
+    ("snippets.snippet_text", "snippets", "snippet_text", false),
+    ("messages_fts.content", "messages_fts", "content", false),
+    (
+        "messages_code_fts.content",
+        "messages_code_fts",
+        "content",
+        false,
+    ),
+];
+
+/// Rescan a plaintext archive with the share profile it declares (2l1b0.60).
+///
+/// Fails when the archive declares a profile verification cannot check, or
+/// when that profile's rules would still rewrite an exported value; the
+/// residual is reported as counts per surface, never the values. Workspaces
+/// are rescanned as plain text because project-name anonymization is a
+/// mapping, not a pattern. The home-path and username rules use the verifying
+/// account's home directory, so they catch the exporting account's paths when
+/// the exporting account verifies, as every export does before it reports
+/// success. What this check cannot read is a warning; the payload checks own
+/// structural failures.
+fn check_share_profile(
+    site_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> (CheckResult, ShareProfileEvidence) {
+    let mut evidence = ShareProfileEvidence::default();
+    let config = File::open(site_dir.join("config.json"))
+        .map_err(anyhow::Error::from)
+        .and_then(|file| {
+            Ok(serde_json::from_reader::<_, ArchiveConfig>(
+                BufReader::new(file),
+            )?)
+        });
+    // An encrypted archive records its profile inside the payload.
+    let Ok(ArchiveConfig::Unencrypted(config)) = config else {
+        return (CheckResult::pass(), evidence);
+    };
+    let relative = Path::new(&config.payload.path);
+    let payload = site_dir.join(relative);
+    if !validate_payload_path(&mut Vec::new(), "payload.path", relative)
+        || !fs::symlink_metadata(&payload).is_ok_and(|meta| meta.file_type().is_file())
+    {
+        return (CheckResult::pass(), evidence);
+    }
+    let conn = match super::open_existing_sqlite_db(&payload) {
+        Ok(conn) => conn,
+        Err(error) => {
+            warnings.push(format!(
+                "share profile not checked: the plaintext payload could not be opened ({error:#})"
+            ));
+            return (CheckResult::pass(), evidence);
+        }
+    };
+    let declared = conn
+        .query_row("SELECT value FROM export_meta WHERE key = 'share_profile'")
+        .ok()
+        .and_then(|row| row.get_typed::<String>(0).ok());
+    let Some(declared) = declared else {
+        warnings.push(
+            "the plaintext archive records no share profile, so it was exported without \
+             share-profile redaction of usernames, hostnames and home paths"
+                .to_string(),
+        );
+        return (CheckResult::pass(), evidence);
+    };
+    evidence.declared = Some(declared.clone());
+    let Some(profile) = [
+        ShareProfile::Public,
+        ShareProfile::Team,
+        ShareProfile::Personal,
+    ]
+    .into_iter()
+    .find(|profile| profile.label() == declared) else {
+        return (
+            CheckResult::fail(format!(
+                "archive declares share profile '{declared}', which verification cannot check"
+            )),
+            evidence,
+        );
+    };
+    let engine = RedactionEngine::new(profile.to_redaction_config());
+    for &(label, table, column, json) in SHARE_PROFILE_SURFACES {
+        let sql = format!("SELECT \"{column}\" FROM \"{table}\" WHERE \"{column}\" IS NOT NULL");
+        let mut residual = 0_u64;
+        let scanned = conn.query_with_params_for_each(&sql, &[], |row| {
+            residual += residual_values(&engine, &row.get_typed::<String>(0)?, json);
+            Ok(())
+        });
+        if let Err(error) = scanned {
+            return (
+                CheckResult::fail(format!(
+                    "could not rescan {label} for the '{declared}' share profile: {error}"
+                )),
+                evidence,
+            );
+        }
+        if residual > 0 {
+            evidence.residual.insert(label.to_string(), residual);
+        }
+    }
+    evidence.rescanned = true;
+    if evidence.residual.is_empty() {
+        return (CheckResult::pass(), evidence);
+    }
+    let surfaces = evidence
+        .residual
+        .iter()
+        .map(|(surface, count)| format!("{surface} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        CheckResult::fail(format!(
+            "values the '{declared}' share profile removes remain in {surfaces}"
+        )),
+        evidence,
+    )
+}
+
+/// How many values in `text` the engine would still rewrite. JSON is rescanned
+/// by string value, as the export redacted it; text that does not parse is
+/// rescanned whole.
+fn residual_values(engine: &RedactionEngine, text: &str, json: bool) -> u64 {
+    fn walk(engine: &RedactionEngine, node: &Value) -> u64 {
+        match node {
+            Value::String(text) => u64::from(!engine.redact_text(text).changes.is_empty()),
+            Value::Array(items) => items.iter().map(|item| walk(engine, item)).sum(),
+            Value::Object(fields) => fields.values().map(|item| walk(engine, item)).sum(),
+            _ => 0,
+        }
+    }
+    if json && let Ok(value) = serde_json::from_str::<Value>(text) {
+        return walk(engine, &value);
+    }
+    u64::from(!engine.redact_text(text).changes.is_empty())
+}
+
 pub fn print_result(result: &VerifyResult, verbose: bool) {
     let status_icon = if result.status == "valid" {
         "✓"
@@ -1556,6 +1754,15 @@ pub fn print_result(result: &VerifyResult, verbose: bool) {
     print_check("  Size limits", &result.checks.size_limits, verbose);
     print_check("  Integrity", &result.checks.integrity, verbose);
     print_check("  No secrets", &result.checks.no_secrets_in_site, verbose);
+    print_check("  Share profile", &result.checks.share_profile, verbose);
+    if let Some(profile) = &result.share_profile.declared {
+        let scope = if result.share_profile.rescanned {
+            "rescanned"
+        } else {
+            "not rescanned"
+        };
+        println!("\nShare profile: {profile} ({scope})");
+    }
 
     if !result.warnings.is_empty() {
         println!("\nWarnings:");

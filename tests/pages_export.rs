@@ -7,7 +7,8 @@ mod tests {
         ExportEngine, ExportFilter, PathMode, run_pages_export,
     };
     use coding_agent_search::pages::profiles::ShareProfile;
-    use std::path::Path;
+    use coding_agent_search::pages::verify::verify_bundle;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn setup_source_db(path: &Path) -> Result<()> {
@@ -1123,6 +1124,132 @@ mod tests {
             )?)?;
             assert!(metadata["cwd"].is_string(), "{label}: {metadata}");
         }
+        Ok(())
+    }
+
+    /// Export `source` under `profile` into a plaintext site directory that
+    /// carries just the config and payload the share-profile check reads.
+    fn plaintext_site(source: &Path, root: &Path, profile: ShareProfile) -> Result<PathBuf> {
+        let site = root.join(format!("{}-site", profile.label()));
+        std::fs::create_dir_all(site.join("payload"))?;
+        let payload = site.join("payload/data.db");
+        let filter = ExportFilter {
+            agents: None,
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Full,
+        };
+        ExportEngine::new(source, &payload, filter)
+            .with_share_profile(profile)
+            .execute(|_, _| {}, None)?;
+        let config = serde_json::json!({
+            "encrypted": false,
+            "version": "1.0.0",
+            "payload": {
+                "path": "payload/data.db",
+                "format": "sqlite",
+                "size_bytes": std::fs::metadata(&payload)?.len(),
+            },
+        });
+        std::fs::write(site.join("config.json"), config.to_string())?;
+        Ok(site)
+    }
+
+    /// Write straight into the exported payload, as a hand edit would.
+    fn tamper(site: &Path, sql: &str) -> Result<()> {
+        let conn = open_franken_db(&site.join("payload/data.db"))?;
+        conn.execute(sql)?;
+        conn.close()?;
+        Ok(())
+    }
+
+    /// 2l1b0.60: `cass pages --verify` reports the profile a plaintext archive
+    /// declares and fails when a value that profile removes is present, on any
+    /// surface including the FTS index. Negative controls: before this check,
+    /// verification never opened the payload, so every tampered bundle below
+    /// passed; and a value the declared profile keeps (a hostname under
+    /// team) must not fail it.
+    #[test]
+    fn verify_rescans_a_plaintext_bundle_with_its_declared_share_profile() -> Result<()> {
+        let home = directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("no home directory"))?;
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        setup_share_profile_source(&source_path, &home)?;
+
+        let public = plaintext_site(&source_path, temp_dir.path(), ShareProfile::Public)?;
+        let clean = verify_bundle(&public, false)?;
+        assert!(
+            clean.checks.share_profile.passed,
+            "{:?}",
+            clean.checks.share_profile
+        );
+        assert_eq!(clean.share_profile.declared.as_deref(), Some("public"));
+        assert!(clean.share_profile.rescanned);
+        assert!(clean.share_profile.residual.is_empty());
+
+        tamper(
+            &public,
+            "UPDATE messages SET content = content || ' cc alice@example.com'",
+        )?;
+        tamper(
+            &public,
+            "INSERT INTO messages_code_fts (content) VALUES ('curl https://build.internal.example/x')",
+        )?;
+        let leaked = verify_bundle(&public, false)?;
+        assert!(!leaked.checks.share_profile.passed);
+        assert_eq!(
+            leaked.share_profile.residual.keys().collect::<Vec<_>>(),
+            ["messages.content", "messages_code_fts.content"],
+            "{:?}",
+            leaked.share_profile
+        );
+        let details = leaked.checks.share_profile.details.unwrap_or_default();
+        assert!(
+            details.contains("'public'") && !details.contains("alice@"),
+            "the failure names surfaces and counts, never values: {details}"
+        );
+
+        // Team keeps hostnames but removes email addresses.
+        let team = plaintext_site(&source_path, temp_dir.path(), ShareProfile::Team)?;
+        tamper(
+            &team,
+            "UPDATE messages SET content = content || ' via https://build.internal.example'",
+        )?;
+        let kept = verify_bundle(&team, false)?;
+        assert!(kept.checks.share_profile.passed, "{:?}", kept.share_profile);
+        tamper(
+            &team,
+            "UPDATE conversations SET title = title || ' (alice@example.com)'",
+        )?;
+        let removed = verify_bundle(&team, false)?;
+        assert_eq!(
+            removed.share_profile.residual.keys().collect::<Vec<_>>(),
+            ["conversations.title"]
+        );
+
+        // A profile verification cannot check fails; no profile only warns.
+        tamper(
+            &team,
+            "UPDATE export_meta SET value = 'custom' WHERE key = 'share_profile'",
+        )?;
+        let unknown = verify_bundle(&team, false)?;
+        assert!(!unknown.checks.share_profile.passed);
+        assert!(!unknown.share_profile.rescanned);
+        tamper(&team, "DELETE FROM export_meta WHERE key = 'share_profile'")?;
+        let undeclared = verify_bundle(&team, false)?;
+        assert!(undeclared.checks.share_profile.passed);
+        assert_eq!(undeclared.share_profile.declared, None);
+        assert!(
+            undeclared
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("records no share profile")),
+            "{:?}",
+            undeclared.warnings
+        );
         Ok(())
     }
 
