@@ -470,7 +470,7 @@ cass sources setup
 4. **Installs cass** on remotes that don't have it (optional)
 5. **Indexes** existing sessions on remotes (optional)
 6. **Configures** `sources.toml` with correct paths and mappings
-7. **Prints the sync command** (`cass sources sync`) for you to run; the wizard does not run the sync itself
+7. **Syncs** the configured remotes by running `cass sources sync` right after configuration (skipped with `--skip-sync` or `--dry-run`; `--json` setup defers it and reports the command to run)
 
 **Wizard options:**
 
@@ -563,7 +563,7 @@ raw receipts or inventories to public issues: they contain machine identities.
 
 #### Remote Installation Methods
 
-When the wizard installs `cass` on remote machines, it chooses one method in this priority order and reports a failure rather than falling through to the next:
+When the wizard installs `cass` on remote machines, it tries every viable method in this priority order, falling through to the next when one fails; setup fails only when all of them do, and the error lists each attempt:
 
 | Priority | Method | Speed | Requirements |
 |----------|--------|-------|--------------|
@@ -617,7 +617,7 @@ The setup wizard automatically discovers SSH hosts from your configuration:
 | **Session Count** | How many conversations exist? |
 | **System Info** | OS, architecture, disk space, memory |
 
-**Probe Caching**: Results are cached for 5 minutes to speed up repeated setup attempts. Cache clears automatically on expiry.
+Each setup run probes every selected host afresh; probe results are not cached between runs.
 
 #### Manual Setup
 
@@ -733,7 +733,7 @@ agents = ["claude_code"]
 | `type` | Connection type: `ssh` or `local` |
 | `host` | SSH host (`user@hostname`) |
 | `paths` | Paths to sync (supports `~` expansion) |
-| `sync_schedule` | `manual`, `hourly`, or `daily` |
+| `sync_schedule` | `manual`, `hourly`, or `daily`. Only the jobs installed by `cass schedule install` run it; without them it is a label and syncs happen when you run `cass sources sync` |
 | `path_mappings` | Rewrite remote paths to local equivalents |
 
 #### CLI Commands
@@ -782,44 +782,46 @@ cass sources agents exclude openclaw --keep-indexed-data
 
 #### Sync Engine Internals
 
-The sync engine uses rsync over SSH for efficient delta transfers, with automatic SFTP fallback:
+The sync engine uses rsync over SSH for efficient delta transfers and falls back to other transports when rsync is unavailable:
 
 **Transfer Methods** (auto-detected):
 | Method | When Used | Characteristics |
 |--------|-----------|-----------------|
 | **rsync** | rsync available on both ends | Delta transfers, compression, progress stats |
-| **SFTP** | rsync unavailable | Full file transfers via SSH native protocol |
+| **WSL rsync** | Windows without native rsync, WSL with rsync installed | Runs `wsl rsync` |
+| **scp** | rsync unavailable | Full file copies through the system `scp`, inheriting the OpenSSH agent, keys and `~/.ssh/config` |
+| **SFTP** | the fallbacks above unavailable | Full file transfers via the SSH native protocol |
 
 **Safety Guarantees**:
-- **Additive-only syncs**: rsync runs WITHOUT `--delete` flag—remote deletions never propagate locally
-- **No overwrite risk**: Existing local files are only updated if remote is newer
-- **Atomic operations**: Failed transfers don't leave partial files
+- **Additive-only syncs**: rsync runs WITHOUT `--delete`, so remote deletions never propagate locally.
+- **Local copies follow the remote**: rsync runs with `-a` and without `-u`, so a local mirror file that differs from the remote is overwritten, even when the local copy is newer. The mirror is a copy of the remote, not a place to edit sessions.
+- **Interrupted transfers resume**: `--partial` keeps a partly transferred file under its final name so the next sync continues it. A failed sync can therefore leave a truncated file until the next sync completes.
 
 **Transfer Configuration**:
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | Connection timeout | 10s | Fail fast on unreachable hosts |
-| Transfer timeout | 5 min | Allow large initial syncs |
+| Transfer timeout | 300 s of I/O inactivity | rsync `--timeout` aborts a transfer that stalls this long; there is no wall-clock limit on a transfer that keeps moving |
 | Compression | Enabled | Reduce bandwidth for text-heavy sessions |
 | Partial transfers | Enabled | Resume interrupted syncs |
 
 **rsync Flags Used**:
 ```
 -avz --links --safe-links --stats --partial [--protect-args | --secluded-args] --timeout 300 \
-  -e "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+  -e "ssh [-F $CASS_SSH_CONFIG] -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes"
 ```
-Where `-avz` = archive mode + verbose + compression. `--protect-args`/`--secluded-args` is auto-detected per remote rsync version (omitted when the remote rejects it), and `--timeout` carries the transfer timeout in seconds.
+Where `-avz` = archive mode + verbose + compression. `--protect-args`/`--secluded-args` is auto-detected per remote rsync version (omitted when the remote rejects it), and `--timeout` carries the transfer timeout in seconds. `StrictHostKeyChecking=yes` means a host whose key is not already in `known_hosts` fails with "Host key verification failed". Connect once with plain `ssh <host>` and accept the key, or add it with `ssh-keyscan`, before the first sync.
 
 **Data Flow**:
 ```
 Remote: ~/.claude/projects/
     ↓ (rsync over SSH)
-Local: ~/.local/share/coding-agent-search/remotes/<source>/<path>/
+Local: ~/.local/share/coding-agent-search/remotes/<source>/mirror/<path>_<hash>/
     ↓ (connector scan)
 Index: agent_search.db + index/v9-quill/
 ```
 
-Where `<path>` is a filesystem-safe version of the remote path (e.g., `.claude_projects`).
+Where `<path>` is a filesystem-safe version of the remote path (e.g. `.claude_projects`), and `<hash>` is an FNV-1a hash of the original path in hex, so `foo/bar` and `foo_bar` never collide.
 
 Sessions from remotes are indexed alongside local sessions, with provenance tracking to identify origin.
 
@@ -857,8 +859,11 @@ Remote sessions display with a source indicator (e.g., `[laptop]`) in the result
 
 Each conversation tracks its origin:
 - `source_id`: Machine identifier (e.g., "laptop", "workstation")
-- `source_kind`: `local` or `remote`
+- `origin_kind`: `local` or `remote`
+- `origin_host`: the remote host label, absent for local sessions
 - `workspace_original`: Original path on the remote machine (before path mapping)
+
+`--fields provenance` selects exactly `source_id`, `origin_kind` and `origin_host`.
 
 These fields appear in JSON/robot output and enable filtering:
 ```bash
@@ -2531,7 +2536,7 @@ An index that is always a little behind is the most common complaint about any l
 | Layer | What | When it runs | Enable |
 |-------|------|--------------|--------|
 | **Stale-on-read catch-up** | `search`, `pack`, and TUI launch check index freshness. If the index is stale (> 30 min), partial, or has pending sessions, a *detached* incremental `cass index --background` is spawned in its own process group and the current results are returned immediately. The next search is fresh. | On demand, at most once per 5 min per data dir (`CASS_AUTO_REFRESH_COOLDOWN_SECS`). Never for data dirs under the OS temp dir, and never for `search --no-maintenance`. A catch-up that ends without advancing the index is not respawned blindly: 1 h, then 6 h between attempts, and three failures trip the breaker until any run completes. | On by default. `CASS_AUTO_REFRESH=0` disables globally. `--robot-meta` reports `index_freshness.auto_refresh.{outcome,trigger,pid,consecutive_failures,detail}`. |
-| **OS scheduler** (`cass schedule install`) | launchd LaunchAgents (macOS) or systemd user timers (Linux): an **incremental** job every 15 min and a **nightly** job (03:00) that performs a full source census with conditional lexical rebuilding, then one bounded `models backfill --scheduled` worker per tier (fast/hash always; quality/MiniLM when installed). Due remote-source syncs run first. Priority is delegated to the OS (`ProcessType=Background`/`Nice`/`LowPriorityIO`, `Nice=19`/`IOSchedulingClass=idle`/`CPUSchedulingPolicy=idle`). | On the timer, even when no cass process is running; survives reboots (`Persistent=true` / launchd). | `cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-nightly] [--no-semantic] [--dry-run]`; `cass schedule status`; `cass schedule uninstall`. |
+| **OS scheduler** (`cass schedule install`) | launchd LaunchAgents (macOS) or systemd user timers (Linux): an **incremental** job every 15 min and a **nightly** job (03:00) that performs a full source census with conditional lexical rebuilding, then one bounded `models backfill --scheduled` worker per tier (fast/hash always; quality/MiniLM when installed). Due remote-source syncs run first. Priority is delegated to the OS: launchd jobs set `Nice=15` only, without `ProcessType=Background` or `LowPriorityIO` (background I/O throttling starved scheduled indexing on macOS). systemd units set `Nice=19`, `IOSchedulingClass=idle` and `CPUSchedulingPolicy=idle`. | On the timer, even when no cass process is running; survives reboots (`Persistent=true` / launchd). | `cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-nightly] [--no-semantic] [--dry-run]`; `cass schedule status`; `cass schedule uninstall`. |
 | **Resident daemon timer** | The warm-model daemon (`cass daemon`, auto-spawned by semantic/hybrid searches) can also kick an incremental background index while it is resident. | Every `CASS_DAEMON_INDEX_INTERVAL_SECS` seconds while the daemon lives (it exits after its idle timeout). | Off by default; `CASS_DAEMON_INDEX_INTERVAL_SECS=900` recommended. |
 
 Idle awareness: scheduled work skips a run when the machine is under severe load (Linux `/proc/loadavg` + PSI; macOS `sysctl vm.loadavg`). On macOS you can additionally require the console to have been idle — `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS=600` makes the nightly job and scheduled semantic backfill wait until nobody has touched the keyboard for ten minutes (the gate fails open where idle time is unavailable). Foreground `cass index` is never gated.
