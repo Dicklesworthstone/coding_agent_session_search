@@ -337,7 +337,7 @@ cass search "auth error handling" --mode hybrid --robot
 - **Auto-Fuzzy Fallback**: On small indexes (up to 10,000 documents by default), an exact search with sparse results is retried with `*term*` wildcards to broaden matches. A visual indicator shows when the fallback is active.
 - **Query History Deduplication**: Recent searches deduplicated to show unique queries; navigate with `Up`/`Down` arrows.
 - **Match Quality Ranking**: New ranking mode (cycle with `F12`) that prioritizes exact matches over wildcard/fuzzy results.
-- **Match Highlighting**: Use `--highlight` to wrap matching terms in snippets with `**bold**` markers, in human-readable and robot/JSON output alike.
+- **Match Highlighting**: Snippets mark the terms the engine matched with `**bold**`, in human-readable and robot/JSON output alike; `--highlight` also marks the query terms' other occurrences, never marking a term twice.
 
 ### 🖥️ Rich Terminal UI (TUI)
 
@@ -1383,7 +1383,7 @@ cass search "bug fix" --sessions-from today_sessions.txt --robot
 
 ### Match Highlighting
 
-The `--highlight` flag wraps matching terms in snippets with `**bold**` markers, in human-readable output and in robot/JSON output alike (only the `snippet` field is marked; `content` stays verbatim):
+Snippets always mark the terms the search engine matched with `**bold**`, in human-readable output and in robot/JSON output alike. The `--highlight` flag also marks the query terms' remaining literal occurrences and leaves already-marked text alone, so no term gets two pairs of marks. Only the `snippet` field is marked; `content` stays verbatim:
 
 ```bash
 cass search "authentication error" --robot --highlight
@@ -1518,7 +1518,7 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 | `--dry-run` | Validate query without executing |
 | `--no-maintenance` | Strict read-only search: never refresh, join, or spawn lexical maintenance, never auto-repair the archive while opening it, and never auto-spawn the daemon (conflicts with `--refresh` and `--daemon`) |
 | `--source <source>` | Filter by source: `local`, `remote`, `all`, or specific source ID |
-| `--highlight` | Highlight matching terms in output |
+| `--highlight` | Also mark query-term occurrences the engine left unmarked (snippets always mark matched terms with `**`) |
 
 ### Index Flags Reference
 

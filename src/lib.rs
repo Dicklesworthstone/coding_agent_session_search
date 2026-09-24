@@ -602,7 +602,7 @@ pub enum Commands {
         /// Timeout in milliseconds. Returns partial results and error if exceeded.
         #[arg(long)]
         timeout: Option<u64>,
-        /// Highlight matching terms in snippets with **bold** markers (text and JSON output)
+        /// Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)
         #[arg(long)]
         highlight: bool,
         /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
@@ -26277,6 +26277,7 @@ fn highlight_matches(text: &str, query: &str, start_mark: &str, end_mark: &str) 
         // avoid slicing bugs when Unicode case-folding changes string length.
         let (lower_result, lower_starts, orig_ranges) = lowercase_with_map(&result);
         let lower_term = term.to_lowercase();
+        let marked = marked_spans(&result, start_mark, end_mark);
         let mut new_result = String::new();
         let mut last_end = 0;
 
@@ -26290,6 +26291,15 @@ fn highlight_matches(text: &str, query: &str, start_mark: &str, end_mark: &str) 
 
             // Skip if this overlaps with a previous highlight (from a longer term)
             if orig_start < last_end {
+                continue;
+            }
+            // Skip text that is already marked: the search engine wraps the
+            // terms it matched in `**`, and wrapping them again printed
+            // `****term****` (2l1b0.68).
+            if marked
+                .iter()
+                .any(|&(start, end)| orig_start < end && orig_end > start)
+            {
                 continue;
             }
             // Append text before this match
@@ -26306,6 +26316,50 @@ fn highlight_matches(text: &str, query: &str, start_mark: &str, end_mark: &str) 
     }
 
     result
+}
+
+/// Byte ranges of `text` already enclosed by `start_mark ... end_mark`,
+/// markers included, pairing each opening mark with the next closing one.
+fn marked_spans(text: &str, start_mark: &str, end_mark: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while let Some(open) = text[cursor..].find(start_mark) {
+        let open = cursor + open;
+        let body = open + start_mark.len();
+        let Some(close) = text[body..].find(end_mark) else {
+            break;
+        };
+        let end = body + close + end_mark.len();
+        spans.push((open, end));
+        cursor = end;
+    }
+    spans
+}
+
+#[cfg(test)]
+mod highlight_matches_tests {
+    use super::highlight_matches;
+
+    #[test]
+    fn engine_marked_terms_are_not_marked_twice() {
+        // The engine marks the first occurrence; --highlight marks the rest.
+        assert_eq!(
+            highlight_matches("a **hello** b Hello", "hello", "**", "**"),
+            "a **hello** b **Hello**"
+        );
+        // Negative: the old implementation printed `a ****hello**** b **Hello**`.
+        assert!(!highlight_matches("**hello** world", "hello world", "**", "**").contains("****"));
+        // A shorter term inside an already-marked longer word stays untouched.
+        assert_eq!(
+            highlight_matches("**hello** there", "hell", "**", "**"),
+            "**hello** there"
+        );
+        // Other marker styles still mark engine-marked terms in their own style.
+        assert_eq!(
+            highlight_matches("**hello**", "hello", ">>>", "<<<"),
+            "**>>>hello<<<**"
+        );
+    }
 }
 
 /// Extract meaningful search terms from a query string

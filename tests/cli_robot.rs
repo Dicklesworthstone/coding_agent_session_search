@@ -5702,9 +5702,10 @@ fn search_effective_meta_names_the_db_source_and_window_preset() -> Result<(), B
     Ok(())
 }
 
-/// 2l1b0.68: `--highlight` marks robot snippets the way it marks human
-/// output. Negative control: robot mode used to accept the flag and return
-/// the snippet unmarked with exit 0.
+/// 2l1b0.68: robot snippets carry the engine's `**` marks on matched terms
+/// with or without `--highlight`; the flag marks remaining literal
+/// occurrences and never marks a term twice. Negative control: applying the
+/// flag to robot output first printed `****hello****`.
 #[test]
 fn search_robot_highlight_marks_json_snippets() -> Result<(), Box<dyn Error>> {
     let data_dir = shared_search_demo_data();
@@ -5734,14 +5735,18 @@ fn search_robot_highlight_marks_json_snippets() -> Result<(), Box<dyn Error>> {
         .find(|(plain, _)| plain.to_lowercase().contains("hello"))
         .ok_or("the demo fixture has a snippet containing the term")?;
     assert!(
-        !plain_hit.contains("**"),
-        "unmarked without --highlight: {plain_hit}"
+        plain_hit.to_lowercase().contains("**hello**"),
+        "the engine marks matched terms without --highlight: {plain_hit}"
     );
     assert!(
-        marked_hit.to_lowercase().contains("**hello**"),
-        "--highlight marks the term in JSON: {marked_hit}"
+        marked_hit.to_lowercase().contains("**hello**") && !marked_hit.contains("****"),
+        "--highlight keeps one pair of marks per term: {marked_hit}"
     );
-    assert_eq!(&marked_hit.replace("**", ""), plain_hit, "markers only");
+    assert_eq!(
+        marked_hit.replace("**", ""),
+        plain_hit.replace("**", ""),
+        "markers only"
+    );
     Ok(())
 }
 

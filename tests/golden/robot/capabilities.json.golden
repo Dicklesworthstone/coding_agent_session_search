@@ -708,7 +708,7 @@
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
+          "description": "Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [

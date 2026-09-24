@@ -4505,13 +4505,14 @@ fn analytics_validate_fix_refuses_when_source_schema_is_missing() {
     );
 }
 
+/// 2l1b0.68: help no longer advertises the removed `--force`.
 #[test]
-fn analytics_rebuild_help_shows_force_flag() {
+fn analytics_rebuild_help_omits_the_removed_force_flag() {
     let mut cmd = simple_cmd();
     cmd.args(["analytics", "rebuild", "--help"]);
     cmd.assert()
         .success()
-        .stdout(contains("--force"))
+        .stdout(contains("--force").not())
         .stdout(contains("--json"));
 }
 
