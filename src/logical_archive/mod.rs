@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use coding_agent_search::franken_sync::FrankenError;
 use coding_agent_search::search::archive_rebuild::ArchiveIndexPlan;
 
 #[derive(Parser)]
@@ -166,13 +167,26 @@ fn require_private_acknowledgement(include_private: bool, message: &str) -> Resu
 /// Exit code, kebab-case error kind and retryability for a failed archive
 /// command: usage 2, integrity 5, busy 7, I/O 14 (retryable, like every other
 /// cass `io` kind), anything else 9. Classification is by error type, never by
-/// message text, so a path that happens to contain "usage" stays I/O.
+/// message text, so a path that happens to contain "usage" stays I/O. Busy
+/// covers both the destination lock and a source database that stayed locked
+/// past its busy timeout (an index run writing it, say); both clear on retry.
 pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
     let has = |matches: fn(&(dyn std::error::Error + 'static)) -> bool| error.chain().any(matches);
     if has(|cause| cause.is::<ArchiveUsageError>()) {
         return (2, "logical-archive-usage", false);
     }
-    if has(|cause| cause.is::<ArchiveBusyError>()) {
+    if has(|cause| {
+        cause.is::<ArchiveBusyError>()
+            || cause.downcast_ref::<FrankenError>().is_some_and(|error| {
+                matches!(
+                    error,
+                    FrankenError::Busy
+                        | FrankenError::BusyRecovery
+                        | FrankenError::BusySnapshot { .. }
+                        | FrankenError::DatabaseLocked { .. }
+                )
+            })
+    }) {
         return (7, "logical-archive-busy", true);
     }
     if has(|cause| cause.is::<std::io::Error>()) {
@@ -336,4 +350,47 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
     println!("{receipt}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classified(error: FrankenError) -> (i32, &'static str, bool) {
+        classify_failure(
+            &anyhow::Error::new(error)
+                .context("cannot open source archive read-only; no repair was attempted"),
+        )
+    }
+
+    #[test]
+    fn a_locked_source_database_is_busy_and_retryable() {
+        let busy = (7, "logical-archive-busy", true);
+        assert_eq!(classified(FrankenError::Busy), busy);
+        assert_eq!(classified(FrankenError::BusyRecovery), busy);
+        assert_eq!(
+            classified(FrankenError::BusySnapshot {
+                conflicting_pages: "2".into()
+            }),
+            busy
+        );
+        assert_eq!(
+            classified(FrankenError::DatabaseLocked {
+                path: PathBuf::from("agent_search.db")
+            }),
+            busy
+        );
+        // Negative: a corrupt source is not something a retry clears.
+        assert_eq!(
+            classified(FrankenError::DatabaseCorrupt {
+                detail: "bad page".into()
+            }),
+            (9, "logical-archive-error", false)
+        );
+        // Negative: nor is a type mismatch; only lock contention is busy.
+        assert_eq!(
+            classified(FrankenError::DatatypeMismatch),
+            (9, "logical-archive-error", false)
+        );
+    }
 }

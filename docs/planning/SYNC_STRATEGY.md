@@ -12,9 +12,11 @@ conflict, not a merge. See [the command and wire contract](../LOGICAL_ARCHIVE.md
 This updates the implementation status, not the acceptance evidence below.
 Native final-source tests, interruption/platform qualification and measured
 large-archive resource bounds remain required; authored tests and a targeted CI
-workflow are not passing-test receipts. Cross-schema migration, merging,
-automatic search-asset rebuilding and ordinary root-command discovery are not
-supplied by these slices. Do not treat these source additions as closing
+workflow are not passing-test receipts. Import can rebuild lexical search on
+request (`--rebuild-index`) and restore a v20 archive into v21 through the one
+reviewed bridge (`--allow-compatible-schema`). Any other cross-schema migration,
+merging, automatic search-asset rebuilding and ordinary root-command discovery
+are not supplied by these slices. Do not treat these source additions as closing
 `coding_agent_session_search-2l1b0.34`.
 
 ## Scope decision — 2026-09-17
@@ -41,7 +43,9 @@ below are proposals, not CLI compatibility promises.
 ## Source of Truth
 
 - Canonical data lives in SQLite (`agent_search.db`), accessed through FrankenSQLite.
-- Lexical and semantic indexes are derived assets and must be rebuilt after import.
+- Lexical and semantic indexes are derived assets and must be rebuilt after import;
+  `cass archive import --rebuild-index` rebuilds lexical search as part of the
+  import, and semantic assets are rebuilt separately.
 - A logical export is an explicit snapshot for interchange/inspection, not a
   second runtime database. A full-fidelity export contains private session data.
 
@@ -99,7 +103,8 @@ below are proposals, not CLI compatibility promises.
 ## Failure Handling
 
 - Locked/busy source or destination: stop at the deadline with a non-zero,
-  actionable error; do not retry indefinitely.
+  actionable error; do not retry indefinitely. Both report exit 7,
+  `logical-archive-busy`, `retryable: true`.
 - Unknown schema, malformed/truncated/oversized records, duplicate conflicting
   identities or digest failure: retain prior output/destination, report record
   location without echoing private bodies, and publish nothing partial.
