@@ -844,7 +844,7 @@ const NO_LIMIT_RAM_DIVISOR: u64 = 16;
 /// The cap was 50,000 when the lexical engine was Tantivy, whose `Count` over a
 /// common term on a multi-million-document index could dominate the query. On
 /// Quill the count is cheap: on a 1,034,219-document archive (paired runs,
-/// `--limit 10`), exact totals added 0.00-0.10 s CPU to a ~0.8 s search even for
+/// `--limit 10`), exact totals added 0.00-0.11 s CPU to a ~0.8 s search even for
 /// "AGENTS.md" (867,087 matches) and "the" (439,461). Meanwhile the capped
 /// answer was wrong by up to five orders of magnitude ("stale lock": 11 against
 /// 11,915), and agents read `total_matches` as a count. The cap now sits at five

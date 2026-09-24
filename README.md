@@ -1384,6 +1384,53 @@ cass search "TODO" --robot --robot-meta --limit 20 --cursor "eyJ..."
 
 Cursors are opaque tokens encoding the pagination state. They remain valid as long as the index isn't rebuilt.
 
+### Match Counts: Exact or Lower Bound
+
+`total_matches` answers "how many messages match?", but it is exact only when
+cass can afford to count. Every search fetches one hit beyond `--limit` to learn
+whether another page exists. When the page is full and the index is larger than
+`CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` documents, cass skips the full count
+and reports that `limit + 1` as a lower bound. Below the threshold it counts
+every match.
+
+| Build | Threshold | `stale lock` with `--limit 10` on a 1,034,219-document index |
+|-------|-----------|---------------------------------------------------------------|
+| v0.9.0 and earlier | 50,000 documents | `total_matches: 11` |
+| Current (unreleased) | 5,000,000 documents | `total_matches: 11915` |
+
+`--robot-meta` says which kind of number you got:
+
+```bash
+cass search "stale lock" --robot --robot-meta --limit 10 \
+  | jq '{total_matches, precision: ._meta.cursor_manifest.count_precision, why: ._meta.cursor_manifest.count_reason}'
+# → {"total_matches": 11915, "precision": "exact", "why": "total_matches is exact; no extra recount was needed"}
+# A lower bound reads "precision": "lower_bound".
+```
+
+**Why the threshold moved.** The 50,000 cap dates from the Tantivy engine,
+where counting a common term over millions of documents could dominate the
+query. The Quill engine counts cheaply. Paired runs on that 1,034,219-document
+archive, capped against exact (`--limit 10`, read-only, CPU time):
+
+| Query | Exact total | Extra CPU for the exact count |
+|-------|-------------|-------------------------------|
+| `stale lock` | 11,915 | ~0.00-0.04 s |
+| `cargo build` | 24,944 | ~0.01-0.03 s |
+| `the` | 439,461 | ~0.03-0.05 s |
+| `AGENTS.md` | 867,087 | ~0.06-0.11 s |
+
+Each search cost about 0.8 s of CPU either way. The capped answer, meanwhile,
+was wrong by up to five orders of magnitude, and agents read `total_matches` as
+a count. The default now covers five times that archive; set
+`CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS=0` to never count exactly, or raise it
+for a larger archive.
+
+**Aggregations have their own window.** `--aggregate` buckets are computed over
+the top `max(1000, limit + offset)` hits, so bucket counts on a large archive
+describe the best-ranked thousand matches, not the whole corpus. Use an exact
+`total_matches` for "how many", and aggregations for "how are the top hits
+distributed".
+
 ### Request Correlation
 
 For debugging and logging, attach a request ID:
@@ -2549,6 +2596,68 @@ cass schedule status --json
 cass search "auth" --robot --robot-meta | jq '._meta.index_freshness.auto_refresh'
 ```
 
+### When the Index Is Missing: Repair Without Blocking the Search
+
+Stale-on-read catch-up handles an index that is *behind*. A search can also find
+the lexical index *missing or unusable*: a first run, a rebuild that never
+finished, a schema change. The search then has three choices: answer from what
+exists, rebuild before answering, or refuse. cass picks by the size of the job
+and by who is asking.
+
+| Situation | What `cass search` does |
+|-----------|------------------------|
+| A readable index exists but its checkpoint metadata is stale | Searches the existing index and leaves the heavy repair to an index run |
+| No usable index, and the archive is within the inline repair budget (`CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES`, default 1 GiB, database plus WAL) | Rebuilds from SQLite inline, then answers. Robot callers get a bounded refusal instead when the ingest-quarantine circuit breaker is active |
+| No usable index, and the archive is over that budget | Refuses with exit 5 `maintenance-required` **and starts a detached `cass index --full --background`**; the error hint names its pid |
+| Robot caller, existing index whose incomplete checkpoint the cheap metadata refresh cannot reconcile | Refuses with exit 5 `checkpoint_incomplete` and starts the matching background run (`--full` above the size budget, plain `cass index` below it) |
+| A rebuild is already running and no searchable generation exists | Robot callers get exit 7 `index-busy` immediately, with `N of M conversations processed` when the rebuild has recorded progress. Human callers wait up to `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` (30 s) for it to publish |
+
+**Why the search never runs a large rebuild itself.** A rebuild inside the
+search process lives only as long as that process, and an agent's search is
+almost always wrapped in a timeout: cass's own robot budget, or the agent
+harness's command limit. On a large archive the rebuild commits nothing until
+its first batch completes, so a killed rebuild keeps no progress. On one real
+11 GB archive, a search-driven rebuild reached 160 of 4,324 conversations in
+30 seconds (19 of them spent waiting on the in-flight byte budget) with
+`committed_offset` still 0 when the search's budget ended it. The next search
+started again from zero. Telling the agent to run `cass index --full` itself
+failed the same way, because that command ran under the same timeout. The index
+never converged. A detached child in its own process group survives the search,
+so the rebuild finishes and the next search answers.
+
+**What the caller sees.** The hint says what cass did and what to do next, so an
+agent never has to guess whether to run maintenance itself:
+
+```json
+{"error": {"code": 5, "kind": "maintenance-required",
+  "message": "Automatic lexical repair was not started after detecting searchable lexical metadata missing: ...",
+  "hint": "cass started `cass index --full --json --background` as a detached process (pid 62704) to rebuild the search index. Retry this search after it finishes; `cass status --json` shows its progress under .rebuild. Do not run `cass index --full --json` yourself meanwhile: it would exit 7 (index-busy).",
+  "retryable": true}}
+```
+
+When no child is started, the hint says why: a run already holds the index
+lock; a recent spawn is still inside its cooldown (it may still be starting, or
+it failed, with the log path); earlier spawns failed and the breaker backed off
+or tripped (with the failure detail); `CASS_AUTO_REFRESH=0`; or the spawn itself
+failed. Those hints name the foreground command and warn that it needs a process
+that is not killed by a short timeout.
+
+**Guard rails.** The handoff reuses the stale-on-read machinery, so the same
+limits apply: one spawner at a time (a file lock), the 5-minute cooldown, the
+failure breaker (1 h, then 6 h, tripped after three failures), and the
+`index-run.lock` that keeps two indexers from ever running together. Data dirs
+under the OS temp dir and `TUI_HEADLESS` harnesses never spawn, and
+`search --no-maintenance` never spawns anything. Under `--timeout`, a wait for an
+active rebuild stops at nine tenths of the time remaining, so the caller
+receives the `index-busy` verdict rather than an empty timed-out result.
+
+**Measured end to end** (release build, an isolated data dir with 30 sessions,
+lexical index moved aside, inline budget forced to one byte): the search
+answered in 0.09 s with the spawned pid in its hint, the background index
+published about 10 s later, and the next search reported all 60 matching
+messages (50 returned at `--limit 50`). With `CASS_AUTO_REFRESH=0` the same sequence never recovered within
+180 s, which is the behaviour every large archive had before.
+
 ## 🔍 Deep Dive: Internals
 
 ### The TUI Engine (Elm Architecture on FrankenTUI)
@@ -3231,7 +3340,77 @@ All configuration writes follow the same temp-file-then-rename pattern, ensuring
 - Network interruptions during model download won't leave broken installations
 - Concurrent processes won't see partially-written files
 
+### Secret Redaction at Index Time
 
+Agent transcripts are full of credentials: keys pasted into prompts, tokens
+echoed by tool output, `.env` files read into context. With the default
+`CASS_INDEX_REDACTION=full`, cass scrubs them from every persisted message,
+title, snippet and metadata blob before anything reaches SQLite or the lexical
+index, so search results, exports and robot output never repeat them. (The
+original session files and the raw-mirror blobs keep the raw text on the same
+disk; redaction protects the queryable surfaces, not disk-at-rest secrecy.)
+
+**What is recognized.** Thirteen pattern families: AWS access key IDs, AWS
+secret keys and session tokens in assignment context, GitHub tokens (classic and
+fine-grained), OpenAI and Anthropic API keys, `Bearer` tokens, JWTs, PEM/OpenSSH/PGP
+private-key blocks, database connection URLs (Postgres, MySQL, MongoDB, Redis,
+AMQP; the whole URL, since it may carry a password), generic `password=` /
+`api_key:` / `secret=` style assignments, Slack tokens, and Stripe live keys.
+JSON metadata is also redacted by field name: values under keys such as
+`passphrase`, `authorization`, `cookie`, or anything ending in `password`,
+`token`, `secret` or `apikey` are replaced whatever they look like.
+
+**How it runs.** Redaction sits on the ingest hot path, since it touches every
+message, so it is built in three layers:
+
+1. **One prefilter pass.** All patterns are compiled into a single `RegexSet`.
+   One scan per string reports which patterns could match; a string with no
+   candidates (the vast majority) is returned untouched without allocating.
+2. **Targeted replacement.** Only the flagged patterns run their own
+   `replace_all` pass, in a fixed order, replacing each match with `[REDACTED]`.
+3. **A content-addressed memo.** Transcripts repeat themselves (boilerplate
+   system prompts, replayed tool output, salvage re-imports), so candidate-bearing
+   strings are memoized per worker, keyed by a BLAKE3 hash of the content plus a
+   fingerprint of the pattern list. Changing any pattern changes the
+   fingerprint, so a stale cached answer can never be reused. Clean strings
+   bypass the cache entirely, and inputs over 64 KiB are never cached
+   (`CASS_REDACT_MEMO_CAPACITY` sets the entry cap).
+
+A frozen copy of the original algorithm lives in the test suite, and a 512-case
+property test requires the plain path and the memoized path (on both a cache
+miss and a cache hit) to produce byte-identical output to it. The memoized JSON
+path has its own equivalence test against the uncached one over nested shapes.
+
+**Why the patterns use ASCII word boundaries.** Rust's `regex` crate runs a
+`RegexSet` on a fast lazy DFA, but a Unicode word boundary (`\b`) is something
+that DFA cannot evaluate once the haystack contains a non-ASCII byte. It then
+falls back to the PikeVM, a far slower NFA simulation. Real transcripts are full
+of non-ASCII text (emoji, CJK, box-drawing characters in tool output), so every
+such message paid the slow path. The patterns now use `(?-u:\b)`, the ASCII
+word boundary, which the DFA handles.
+
+This cannot weaken redaction. Every boundary in these patterns sits next to an
+ASCII word character, and ASCII word characters are a subset of Unicode word
+characters. So wherever a Unicode boundary exists, an ASCII boundary exists too,
+and the ASCII patterns match everything the Unicode ones did. The only
+difference is a token glued directly to a non-ASCII letter (`凭据ghp_…`): a
+Unicode boundary sees two word characters and no boundary, so the old patterns
+missed that token, while the ASCII form redacts it.
+
+Measured on 593 MiB of real session text (3.1 million strings, 79,870 of them
+containing non-ASCII), with the same regex version cass ships:
+
+| Word boundary | Prefilter throughput | Pattern matches |
+|---------------|----------------------|-----------------|
+| Unicode `\b` | 9.8-10.6 MiB/s | baseline |
+| ASCII `(?-u:\b)` | 261-284 MiB/s | identical on all 3.1M strings |
+
+In an A/B incremental index on two identical clones of a 2.1-million-message
+archive (10 minutes each, run one after the other), the ASCII build committed
+53,155 new messages on 10.1 CPU-minutes, against 7,028 on 12.8 CPU-minutes for
+the Unicode build: about 9.5 times the ingest throughput per CPU second. A unit
+test rejects any secret pattern that reintroduces a Unicode `\b`, so the cliff
+cannot quietly come back.
 
 ## 📦 Installer Strategy
 
@@ -3393,6 +3572,10 @@ Update check state is stored in the data directory:
 | `CASS_QUILL_QUERY_FUEL_BUDGET` | Quill default (10000000) | Escape hatch for Quill's deterministic per-query work ceiling (GH #441). Zero or unparseable values keep the engine default. When fuel runs out on a hybrid query the lexical leg is dropped, the semantic leg still answers, and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only queries return an actionable hint. The durable fix for fuel exhaustion is a consolidated index (an incremental `cass index` folds fragmented generations in its maintenance pass; `--full` rebuilds from scratch), and cass now publishes Quill snapshots only on its own commits (no per-second visibility seals), which is what let segment counts grow into the hundreds on append-only archives |
 | `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES` | 1073741824 (1 GiB) | Maximum estimated output per lexical merge run, including the covered document-ID range. Oversized singleton segments remain unmerged. This is a merge-planning limit, not a total-process RSS ceiling. Positive byte values accept underscores; zero or invalid values keep the default. Independently of this cap, a merge run never holds more than 4,194,304 documents (Quill's per-term posting limit), and Quill's own tier merge is disabled, so archives with several million messages rebuild into several segments (GH #498). |
 | `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` | unset | Skips the free-space preflight that `cass index --full` / `--force-rebuild` runs before starting. The requirement is `max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)`, where the lexical figure counts only the live published index. Merge-retired segments, retained publish backups and a failed rebuild's leftover `.rebuild-staging` generation are reported but not doubled. Query it before a run with `cass doctor --json \| jq .storage_pressure.full_rebuild_readiness`, which shows `required_bytes`, `available_bytes`, `shortfall_bytes` and each input (GH #496). Set to `1` only when you know the disk can hold the rebuild. |
+| `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` | 5000000 (50000 in v0.9.0 and earlier) | Largest index (in documents) for which a full result page still reports an exact `total_matches`; above it the count is `limit + 1`, a lower bound (`_meta.cursor_manifest.count_precision` says which). `0` disables exact counting. See *Match Counts: Exact or Lower Bound* |
+| `CASS_SEARCH_BUDGET_MS` | 120000 | Default robot-mode search budget when `--timeout` is not given. A search that runs out of it exits 0 with `budget.timed_out: true`, which means "no complete answer", not "no matches" |
+| `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` | 30000 | How long a human-mode search, or a robot search whose index is still readable, waits for an active lexical rebuild before returning exit 7 `index-busy`. With `--timeout`, the wait also stops at nine tenths of the time remaining. A robot search with no searchable generation does not wait |
+| `CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES` | 1073741824 (1 GiB) | Largest archive (database plus WAL) that a search may repair inline; plain `cass index` compares the database file alone against the same value to decide whether to defer the authoritative lexical repair to `--full`. Over it, search refuses with `maintenance-required` and starts a detached `cass index --full --background` (see *When the Index Is Missing*) |
 | **Semantic Search** | | |
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash`, `minilm`, or explicit `multilingual-minilm` |
 | `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |

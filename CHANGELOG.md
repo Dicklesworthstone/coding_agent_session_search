@@ -33,16 +33,18 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
-- **Search no longer rebuilds or strands a missing lexical index.** When search
-  needs a repair it will not run inline, it starts a detached
-  `cass index --full --background` and names the pid in the error hint; a robot
-  search during a first build returns exit 7 `index-busy` with progress at once.
-  Previously every search restarted the rebuild and its own timeout killed it,
-  so a large archive's index never converged
+- **Search no longer strands a missing or unusable lexical index on a large
+  archive.** When search needs a repair it will not run inline (the archive is
+  over the inline repair budget, or a robot caller faces `checkpoint_incomplete`),
+  it starts a detached `cass index --full --background` and names the pid in the
+  error hint; a small archive still repairs inline as before. A robot search
+  during a first build returns exit 7 `index-busy` with progress at once.
+  Previously nothing built the index: an agent's own `cass index --full` died
+  with its command timeout and every retry started from zero
   ([76306c0c](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/76306c0c)).
 - **`total_matches` is exact up to 5M documents** (was 50k). On a 1M-document
   archive the capped value read 11 for a term with 11,915 matches; exact counts
-  cost 0.00-0.10 s CPU there
+  cost 0.00-0.11 s CPU there
   ([1ca2503e](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/1ca2503e)).
 
 ### Performance
