@@ -345,13 +345,13 @@ Powered by [FrankenTUI (ftui)](https://github.com/Dicklesworthstone/frankentui) 
 
 - **Three-Pane Layout**: Filter bar (top), scrollable results (left), and syntax-highlighted details (right).
 - **Multi-Line Result Display**: Each result shows location and up to 3 lines of context; alternating stripes improve scanability.
-- **Live Status**: Footer shows real-time indexing progress—agent discovery count during scanning, then item progress with sparkline visualization (e.g., `📦 Indexing 150/2000 (7%) ▁▂▄▆█`)—plus active filters.
+- **Live Status**: Footer shows real-time indexing progress—agent discovery count during scanning, then item progress as a progress bar labelled `Indexing 150/2000 (7%)`—plus active filters.
 - **Multi-Open Queue**: Queue multiple results with `Ctrl+Enter`, then open all in your editor with `Ctrl+O`. Confirmation prompt for large batches (≥12 items).
 - **Find-in-Detail**: Press `/` to search within the detail pane; matches highlighted with `n`/`N` navigation.
 - **Mouse Support**: Click to select results, scroll panes, or clear filters.
 - **Theming**: Adaptive Dark/Light modes with role-colored messages (User/Assistant/System). Presets include dark, light, high-contrast, and accessible variants.
 - **Ranking Modes**: Cycle through `recent`/`balanced`/`relevance`/`quality` with `F12`; quality mode penalizes fuzzy matches.
-- **Analytics Dashboard**: 7 views (Dashboard, Explorer, Heatmap, Breakdowns, Tools, Plans, Coverage) with interactive charts, KPI tiles, and drill-down filtering. Toggle with `Alt+A`.
+- **Analytics Dashboard**: 7 views (Dashboard, Explorer, Heatmap, Breakdowns, Tools, Plans, Coverage) with interactive charts, KPI tiles, and drill-down filtering. Open with `Alt+A`; `Esc` returns to search.
 - **Inline Mode**: Run `cass tui --inline` to keep terminal scrollback intact. The UI anchors to a region of the terminal while logs scroll normally. Configure with `--ui-height <rows>` and `--anchor top|bottom`.
 - **Macro Recording**: Capture input sessions with `cass tui --record-macro session.macro` for reproducible bug reports and workflow automation. Events are saved as human-readable JSONL with full timing data.
 - **Asciicast Recording**: Capture reproducible TUI demos and bug repro artifacts with `cass tui --asciicast demo.cast`.
@@ -1781,7 +1781,7 @@ When an exact query's first page returns fewer than 3 results (or fewer than a s
 | `F1` / `Alt+?` | Toggle help screen |
 | `F2` / `Alt+T` | Next theme (cycles all 19 presets) |
 | `Shift+F2` / `Alt+Shift+T` | Previous theme |
-| `Ctrl+B` | Toggle border style (rounded/plain) |
+| `Ctrl+B` | Toggle border style (rounded/square) |
 | `Ctrl+P` / `Alt+P` | Open the command palette |
 | `Ctrl+S` | Toggle the stats bar |
 | `Ctrl+Shift+S` | Open the sources management surface |
@@ -1905,7 +1905,7 @@ The detail pane has six tabs, cycled with `Tab`:
 | **Messages** | Full conversation with markdown rendering | Reading full context |
 | **Snippets** | Keyword-extracted summaries | Quick scanning |
 | **Raw** | Unformatted JSON/text | Debugging, copying exact content |
-| **Json** | Syntax-highlighted JSON with a collapsible tree | Inspecting structured payloads |
+| **Json** | Syntax-highlighted, pretty-printed JSON (static; no collapsible tree) | Inspecting structured payloads |
 | **Analytics** | Per-session token timeline, tool calls, message stats | Understanding one session |
 | **Export** | Export actions and filename previews (HTML/Markdown) | Sharing a session |
 
@@ -2265,15 +2265,15 @@ Each agent type (Claude, Codex, Cursor, etc.) also receives a subtle tint, makin
 
 ### Adaptive Borders
 
-Border decorations automatically adapt to terminal width:
+Border decorations adapt to terminal width and to render pressure:
 
-| Width | Style | Example |
-|-------|-------|---------|
-| **Narrow** (<80 cols) | Minimal Unicode | `│ content │` |
-| **Normal** (80-120) | Rounded corners | `╭─ content ─╮` |
-| **Wide** (>120) | Full decorations | Double-line headers |
+| Condition | Style | Example |
+|-----------|-------|---------|
+| Narrow (<80 cols) | Square box-drawing | `┌─ content ─┐` |
+| 80 cols and wider | Rounded corners | `╭─ content ─╮` |
+| Frame budget under pressure | Square, then no borders | `┌─┐`, then none |
 
-Toggle between rounded Unicode and plain ASCII borders with `Ctrl+B`.
+There is no double-line tier. `Ctrl+B` toggles between rounded and square Unicode borders; both are box-drawing characters, not ASCII.
 
 ---
 
@@ -2536,7 +2536,7 @@ flowchart LR
 - **Non-Blocking**: The indexer runs in a background thread. You can search while it works.
 - **Parallel Discovery**: Connector detection and scanning run in parallel across all CPU cores using rayon, significantly reducing startup time when multiple agents are installed.
 - **Watch Mode** (`cass index --watch`, foreground): Uses file system watchers (`notify`) to detect changes in agent logs. When you save a file or an agent replies, `cass` re-indexes just that conversation. The TUI does **not** start a watcher on its own; see *Keeping the Index Fresh* below for what runs automatically.
-- **Real-Time Progress**: The TUI footer updates in real-time showing discovered agent count and conversation totals with sparkline visualization (e.g., "📦 Indexing 150/2000 (7%) ▁▂▄▆█").
+- **Real-Time Progress**: The TUI footer updates in real-time showing discovered agent count and conversation totals as a progress bar labelled "Indexing 150/2000 (7%)" (a spinner with the phase name while the total is still unknown).
 
 ### Keeping the Index Fresh (Automatic)
 
@@ -2983,7 +2983,7 @@ cass
 - **Modes**:
     - `F2`: Next theme (`Shift+F2` previous; 19 presets).
     - `F12`: Cycle ranking mode (recent → balanced → relevance → quality → newest → oldest).
-    - `Ctrl+B`: Toggle rounded/plain borders.
+    - `Ctrl+B`: Toggle rounded/square borders.
 - **Actions**:
     - `Enter`: Open selected result in contextual detail modal (defaults to Messages tab).
     - `Enter` with no selected hit: submit query behavior (no-op if empty).
