@@ -44,7 +44,6 @@ use crate::franken_sync::compat::{
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use frankensearch::index::VectorIndex as FsVectorIndex;
-use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
@@ -505,15 +504,17 @@ fn source_file_has_active_advisory_lock(path: &Path) -> bool {
     let Ok(file) = OpenOptions::new().read(true).open(path) else {
         return false;
     };
-    match file.try_lock_exclusive() {
+    // std's File::try_lock reports another holder as WouldBlock on every
+    // platform; with fs2, Windows contention was a raw ERROR_LOCK_VIOLATION
+    // that matched nothing here, so a file a writer held looked unlocked
+    // (2l1b0.74).
+    match file.try_lock() {
         Ok(()) => {
-            let _ = FileExt::unlock(&file);
+            let _ = file.unlock();
             false
         }
-        Err(error) => matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        ),
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(error)) => error.kind() == std::io::ErrorKind::Interrupted,
     }
 }
 
@@ -6919,15 +6920,23 @@ fn acquire_index_run_lock_with_job_kind(
         .open(&lock_path)
         .with_context(|| format!("opening index-run lock file {}", lock_path.display()))?;
 
-    if let Err(err) = file.try_lock_exclusive() {
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+    // std's File::try_lock reports contention as WouldBlock on every platform;
+    // fs2 surfaced Windows contention as raw ERROR_LOCK_VIOLATION, so a second
+    // `cass index` there got a generic error instead of the index-busy (exit 7)
+    // contract that error_chain_indicates_active_cass_index keys on
+    // (2l1b0.74). Same flock/LockFileEx lock, so fs2 holders still exclude it.
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
             anyhow::bail!(
                 "another cass index process already holds {}",
                 lock_path.display()
             );
         }
-        return Err(err)
-            .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(err)
+                .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
+        }
     }
 
     let now_ms = FrankenStorage::now_millis();
@@ -49252,6 +49261,47 @@ mod tests {
             "a fresh burst is critical; got {}",
             summary.status
         );
+        Ok(())
+    }
+
+    /// 2l1b0.74: the index-run lock and the source advisory-lock probe now use
+    /// std File locking. A holder that took the lock through fs2 (an older
+    /// cass, or any fs2 caller) must still read as busy, and a free lock as
+    /// free: on Linux both are flock, on Windows both are LockFileEx.
+    #[test]
+    fn std_lock_probes_see_an_fs2_holder_as_busy() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("agent_search.db");
+        let lock_path = data_dir.join("index-run.lock");
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&holder)?;
+
+        let error = acquire_index_run_lock(&data_dir, &db_path, SearchMaintenanceMode::Index)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a held index-run lock must refuse a second run"))?;
+        let rendered = format!("{error:#}");
+        anyhow::ensure!(
+            rendered.contains("another cass index process already holds"),
+            "contention must keep the index-busy message: {rendered}"
+        );
+        anyhow::ensure!(
+            source_file_has_active_advisory_lock(&lock_path),
+            "a file another handle holds must read as locked"
+        );
+
+        fs2::FileExt::unlock(&holder)?;
+        anyhow::ensure!(
+            !source_file_has_active_advisory_lock(&lock_path),
+            "a released file must read as unlocked"
+        );
+        let _guard = acquire_index_run_lock(&data_dir, &db_path, SearchMaintenanceMode::Index)?;
         Ok(())
     }
 
