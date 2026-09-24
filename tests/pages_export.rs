@@ -6,6 +6,7 @@ mod tests {
     use coding_agent_search::pages::export::{
         ExportEngine, ExportFilter, PathMode, run_pages_export,
     };
+    use coding_agent_search::pages::profiles::ShareProfile;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -907,6 +908,7 @@ mod tests {
             Some("not-a-time".to_string()),
             None,
             PathMode::Relative,
+            ShareProfile::Public,
             false,
         )
         .expect_err("invalid --since should fail");
@@ -931,11 +933,202 @@ mod tests {
             Some("2025-01-02".to_string()),
             Some("2025-01-01".to_string()),
             PathMode::Relative,
+            ShareProfile::Public,
             false,
         )
         .expect_err("reversed time range should fail");
 
         assert!(err.to_string().contains("Invalid time range"));
         Ok(())
+    }
+
+    /// A source archive whose workspace, title, source path, metadata,
+    /// message body and snippet carry the running user's real home path, an
+    /// email address and an internal hostname — the values share profiles
+    /// exist to strip (2l1b0.60).
+    fn setup_share_profile_source(path: &Path, home: &str) -> Result<()> {
+        let conn = open_franken_db(path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+            CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                message_count INTEGER,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER,
+                model TEXT
+            );
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
+                snippet_text TEXT NOT NULL
+            );
+            "#,
+        )?;
+        let project = format!("{home}/share-profile-project");
+        let metadata = serde_json::json!({ "cwd": project, "owner": "alice@example.com" });
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
+        conn.execute_compat(
+            "INSERT INTO workspaces (id, path) VALUES (1, ?1)",
+            fparams![project.as_str()],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count, metadata_json)
+             VALUES (1, 1, 1, ?1, ?2, 1700000000000, 1, ?3)",
+            fparams![
+                format!("Deploy notes from {project}"),
+                format!("{project}/.claude/session.jsonl"),
+                metadata.to_string()
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
+             VALUES (1, 1, 0, 'user', ?1, 1700000000000)",
+            fparams![format!(
+                "ssh to https://build.internal.example:8443/ci as alice@example.com, then edit {project}/src/main.rs"
+            )],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+             VALUES (1, ?1, 1, 1, 'rust', '// ask alice@example.com')",
+            fparams![format!("{project}/src/main.rs")],
+        )?;
+        Ok(())
+    }
+
+    /// Every exported text, including both FTS indexes' stored content.
+    fn exported_text(conn: &Connection) -> Result<String> {
+        let mut haystack = all_text_cells(conn)?;
+        for table in ["messages_fts", "messages_code_fts"] {
+            let rows: Vec<String> = conn.query_map_collect(
+                &format!("SELECT content FROM {table}"),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
+            )?;
+            for row in rows {
+                haystack.push_str(&row);
+                haystack.push('\n');
+            }
+        }
+        Ok(haystack)
+    }
+
+    /// 2l1b0.60: each share profile removes exactly its preset's values from
+    /// every exported surface, and export_meta records the profile with
+    /// per-kind counts but no raw value. Negative control: before profiles
+    /// were wired into the export, the public bundle kept the home path,
+    /// the email address and the hostname verbatim.
+    #[test]
+    fn share_profiles_redact_every_exported_surface_by_preset() -> Result<()> {
+        let home = directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("no home directory"))?;
+        assert!(home.len() > 1, "the fixture needs a real home path: {home}");
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        setup_share_profile_source(&source_path, &home)?;
+
+        // (profile, home path removed, email removed, hostname removed)
+        for (profile, strips_home, strips_email, strips_host) in [
+            (ShareProfile::Public, true, true, true),
+            (ShareProfile::Team, true, true, false),
+            (ShareProfile::Personal, false, false, false),
+        ] {
+            let output_path = temp_dir.path().join(format!("{}.db", profile.label()));
+            let filter = ExportFilter {
+                agents: None,
+                workspaces: None,
+                since: None,
+                until: None,
+                path_mode: PathMode::Full,
+            };
+            let stats = ExportEngine::new(&source_path, &output_path, filter)
+                .with_share_profile(profile)
+                .execute(|_, _| {}, None)?;
+            assert_eq!(stats.messages_processed, 1);
+
+            let conn = open_franken_db(&output_path)?;
+            let text = exported_text(&conn)?;
+            let label = profile.label();
+            assert_eq!(
+                !text.contains(&format!("{home}/share-profile-project")),
+                strips_home,
+                "{label}: home path"
+            );
+            assert_eq!(
+                !text.contains("alice@example.com"),
+                strips_email,
+                "{label}: email"
+            );
+            assert_eq!(
+                !text.contains("build.internal.example"),
+                strips_host,
+                "{label}: hostname"
+            );
+
+            assert_eq!(
+                query_string(
+                    &conn,
+                    "SELECT value FROM export_meta WHERE key='share_profile'"
+                )?,
+                label
+            );
+            let counts: serde_json::Value = serde_json::from_str(&query_string(
+                &conn,
+                "SELECT value FROM export_meta WHERE key='share_redactions'",
+            )?)?;
+            for (kind, expected) in [
+                ("home_path", strips_home),
+                ("email", strips_email),
+                ("hostname", strips_host),
+            ] {
+                assert_eq!(
+                    counts
+                        .get(kind)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        > 0,
+                    expected,
+                    "{label}: share_redactions.{kind} in {counts}"
+                );
+            }
+            let meta = query_string(&conn, "SELECT group_concat(value, ' ') FROM export_meta")?;
+            assert!(
+                !meta.contains(&home) && !meta.contains("alice@"),
+                "{label}: export_meta must hold counts, not values: {meta}"
+            );
+            // Metadata stays valid JSON after its string values are redacted.
+            let metadata: serde_json::Value = serde_json::from_str(&query_string(
+                &conn,
+                "SELECT metadata_json FROM conversations WHERE id=1",
+            )?)?;
+            assert!(metadata["cwd"].is_string(), "{label}: {metadata}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unchosen_share_profile_defaults_to_strictest_for_plaintext() {
+        assert_eq!(ShareProfile::default_for(false), ShareProfile::Public);
+        assert_eq!(ShareProfile::default_for(true), ShareProfile::Team);
     }
 }

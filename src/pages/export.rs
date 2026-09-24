@@ -5,6 +5,8 @@ use super::{
 };
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
 use crate::franken_sync::{Connection, Row as FrankenRow, params};
+use crate::pages::profiles::ShareProfile;
+use crate::pages::redact::RedactionEngine;
 use crate::pages::summary::ExclusionSet;
 use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
@@ -46,7 +48,18 @@ pub struct ExportEngine {
     output_path: PathBuf,
     filter: ExportFilter,
     exclusions: ExclusionSet,
+    share: Option<ShareRedaction>,
 }
+
+/// The share profile an export applies to every text it copies (2l1b0.60).
+struct ShareRedaction {
+    profile: ShareProfile,
+    engine: RedactionEngine,
+}
+
+/// Redactions applied per kind (`home_path`, `username`, ...); recorded in
+/// `export_meta` as counts only, never the values.
+type RedactionCounts = std::collections::BTreeMap<&'static str, u64>;
 
 #[derive(Debug)]
 pub struct ExportStats {
@@ -69,6 +82,7 @@ impl ExportEngine {
             output_path: output_path.to_path_buf(),
             filter,
             exclusions: ExclusionSet::new(),
+            share: None,
         }
     }
 
@@ -79,6 +93,85 @@ impl ExportEngine {
     pub fn with_exclusions(mut self, exclusions: ExclusionSet) -> Self {
         self.exclusions = exclusions;
         self
+    }
+
+    /// Redact every exported text with `profile`'s preset: conversation
+    /// titles, workspace and source paths, metadata values, message bodies
+    /// (and the search indexes built from them), attachment references and
+    /// snippets. The profile and per-kind counts land in `export_meta`.
+    pub fn with_share_profile(mut self, profile: ShareProfile) -> Self {
+        self.share = Some(ShareRedaction {
+            profile,
+            engine: RedactionEngine::new(profile.to_redaction_config()),
+        });
+        self
+    }
+
+    fn share_redact<'a>(
+        &self,
+        value: &'a str,
+        workspace: bool,
+        counts: &mut RedactionCounts,
+    ) -> std::borrow::Cow<'a, str> {
+        let Some(share) = &self.share else {
+            return std::borrow::Cow::Borrowed(value);
+        };
+        let redacted = if workspace {
+            share.engine.redact_workspace(value)
+        } else {
+            share.engine.redact_text(value)
+        };
+        if redacted.changes.is_empty() {
+            return std::borrow::Cow::Borrowed(value);
+        }
+        for change in &redacted.changes {
+            *counts.entry(change.kind.label()).or_default() += 1;
+        }
+        std::borrow::Cow::Owned(redacted.output)
+    }
+
+    /// Redact the string values of a JSON document, keeping it valid JSON;
+    /// text that does not parse is redacted as plain text.
+    fn share_redact_json(&self, value: &str, counts: &mut RedactionCounts) -> String {
+        if self.share.is_none() {
+            return value.to_string();
+        }
+        fn walk(engine: &ExportEngine, node: &mut Value, counts: &mut RedactionCounts) {
+            match node {
+                Value::String(text) => {
+                    let redacted = match engine.share_redact(text, false, counts) {
+                        std::borrow::Cow::Owned(redacted) => Some(redacted),
+                        std::borrow::Cow::Borrowed(_) => None,
+                    };
+                    if let Some(redacted) = redacted {
+                        *text = redacted;
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        walk(engine, item, counts);
+                    }
+                }
+                Value::Object(map) => {
+                    for item in map.values_mut() {
+                        walk(engine, item, counts);
+                    }
+                }
+                _ => {}
+            }
+        }
+        match serde_json::from_str::<Value>(value) {
+            Ok(mut document) => {
+                let before: u64 = counts.values().sum();
+                walk(self, &mut document, counts);
+                if counts.values().sum::<u64>() == before {
+                    value.to_string()
+                } else {
+                    document.to_string()
+                }
+            }
+            Err(_) => self.share_redact(value, false, counts).into_owned(),
+        }
     }
 
     pub fn execute<F>(&self, progress: F, running: Option<Arc<AtomicBool>>) -> Result<ExportStats>
@@ -367,6 +460,7 @@ impl ExportEngine {
 
                 let mut processed = 0;
                 let mut msg_processed = 0;
+                let mut redactions = RedactionCounts::new();
 
                 for (
                     id,
@@ -393,6 +487,21 @@ impl ExportEngine {
                     // verbatim — a "hidden metadata" bundle previously kept
                     // every exact local workspace path here.
                     let transformed_workspace = self.transform_workspace(workspace);
+                    // 2l1b0.60: the share profile applies after the path
+                    // policy, to every text the bundle carries.
+                    let shared_workspace = transformed_workspace
+                        .as_deref()
+                        .map(|value| self.share_redact(value, true, &mut redactions).into_owned());
+                    let shared_path = self
+                        .share_redact(&transformed_path, false, &mut redactions)
+                        .into_owned();
+                    let shared_title = title.as_deref().map(|value| {
+                        self.share_redact(value, false, &mut redactions)
+                            .into_owned()
+                    });
+                    let shared_metadata = metadata_json
+                        .as_deref()
+                        .map(|value| self.share_redact_json(value, &mut redactions));
 
                     tx.execute_compat(
                     "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
@@ -400,13 +509,13 @@ impl ExportEngine {
                     params![
                         *id,
                         agent.as_str(),
-                        transformed_workspace.as_deref(),
-                        title.as_deref(),
-                        transformed_path.as_str(),
+                        shared_workspace.as_deref(),
+                        shared_title.as_deref(),
+                        shared_path.as_str(),
                         *started_at,
                         *ended_at,
                         *message_count,
-                        metadata_json.as_deref()
+                        shared_metadata.as_deref()
                     ],
                 )?;
 
@@ -445,7 +554,12 @@ impl ExportEngine {
                             .or_else(|| derive_message_model(extra_json.as_deref()));
                         let resolved_attachment_refs =
                             normalize_optional_text(attachment_refs.clone())
-                                .or_else(|| derive_attachment_refs(extra_json.as_deref()));
+                                .or_else(|| derive_attachment_refs(extra_json.as_deref()))
+                                .map(|refs| self.share_redact_json(&refs, &mut redactions));
+                        // The search indexes are built from the same redacted
+                        // text, so the bundle's FTS cannot find what the
+                        // message body no longer shows.
+                        let content = self.share_redact(content, false, &mut redactions);
 
                         tx.execute_compat(
                             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
@@ -455,7 +569,7 @@ impl ExportEngine {
                                 *id,
                                 *idx,
                                 role.as_str(),
-                                content.as_str(),
+                                &*content,
                                 *created_at,
                                 *updated_at,
                                 resolved_model.as_deref(),
@@ -466,11 +580,11 @@ impl ExportEngine {
                         // Populate FTS
                         tx.execute_compat(
                             "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, content.as_str()],
+                            params![*source_message_id, &*content],
                         )?;
                         tx.execute_compat(
                             "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, content.as_str()],
+                            params![*source_message_id, &*content],
                         )?;
 
                         // 5. Migrate Snippets for this message (bd-4x92)
@@ -496,13 +610,16 @@ impl ExportEngine {
                             // 019i2: snippet file paths follow the same path
                             // policy as source paths (relative strips the
                             // workspace; hash/basename obfuscate).
-                            let fpath = fpath
-                                .as_deref()
-                                .map(|path| self.transform_path(path, workspace));
+                            let fpath = fpath.as_deref().map(|path| {
+                                let path = self.transform_path(path, workspace);
+                                self.share_redact(&path, false, &mut redactions)
+                                    .into_owned()
+                            });
+                            let stext = self.share_redact(&stext, false, &mut redactions);
                             tx.execute_compat(
                                 "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
                                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                params![*source_message_id, fpath, start, end, lang, stext.as_str()],
+                                params![*source_message_id, fpath, start, end, lang, &*stext],
                             )?;
                         }
 
@@ -526,6 +643,18 @@ impl ExportEngine {
                     "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
                     params![exported_at.as_str()],
                 )?;
+                // 2l1b0.60: which share profile shaped this bundle and how
+                // many values of each kind it rewrote (counts, not values).
+                if let Some(share) = &self.share {
+                    tx.execute_compat(
+                        "INSERT INTO export_meta (key, value) VALUES ('share_profile', ?1)",
+                        params![share.profile.label()],
+                    )?;
+                    tx.execute_compat(
+                        "INSERT INTO export_meta (key, value) VALUES ('share_redactions', ?1)",
+                        params![serde_json::to_string(&redactions)?],
+                    )?;
+                }
 
                 Ok((processed, msg_processed))
             })();
@@ -2672,6 +2801,7 @@ pub fn run_pages_export(
     since: Option<String>,
     until: Option<String>,
     path_mode: PathMode,
+    share_profile: ShareProfile,
     dry_run: bool,
 ) -> Result<()> {
     if dry_run {
@@ -2688,6 +2818,7 @@ pub fn run_pages_export(
         since,
         until,
         path_mode,
+        share_profile,
         |current, total| {
             if total > 0 && current % 100 == 0 {
                 use std::io::Write;
@@ -2716,6 +2847,7 @@ pub fn export_pages_database_verified<F, V, T>(
     since: Option<String>,
     until: Option<String>,
     path_mode: PathMode,
+    share_profile: ShareProfile,
     progress: F,
     verifier: V,
 ) -> Result<(ExportStats, T)>
@@ -2748,7 +2880,8 @@ where
         path_mode,
     };
 
-    let engine = ExportEngine::new(&db_path, &output_path, filter);
+    let engine =
+        ExportEngine::new(&db_path, &output_path, filter).with_share_profile(share_profile);
     engine.execute_verified(progress, None, verifier)
 }
 

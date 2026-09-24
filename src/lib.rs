@@ -1556,6 +1556,13 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = crate::pages::export::PathMode::Relative)]
         path_mode: crate::pages::export::PathMode,
 
+        /// Share profile applied to every exported text: public (home paths,
+        /// usernames, project names, emails, hostnames, secrets), team (home
+        /// paths, emails, credentials), personal (keys and cloud credentials
+        /// only). Default: public for a plaintext export, team when encrypted.
+        #[arg(long, value_enum)]
+        share_profile: Option<crate::pages::profiles::ShareProfile>,
+
         /// Deployment target: local, github, cloudflare
         #[arg(long, value_enum)]
         target: Option<PagesDeployTarget>,
@@ -7929,6 +7936,7 @@ async fn execute_cli(
                     since,
                     until,
                     path_mode,
+                    share_profile,
                     target,
                     project,
                     branch,
@@ -7992,6 +8000,9 @@ async fn execute_cli(
                         }
                         if let Some(api_token) = api_token.as_ref() {
                             pages_config.deployment.api_token = Some(api_token.to_string());
+                        }
+                        if let Some(profile) = share_profile {
+                            pages_config.bundle.share_profile = Some(profile);
                         }
 
                         let cli_cf_creds_provided = account_id.is_some() || api_token.is_some();
@@ -8375,6 +8386,10 @@ async fn execute_cli(
                                 since.clone(),
                                 until.clone(),
                                 path_mode,
+                                // --export-only writes a plaintext database.
+                                share_profile.unwrap_or(
+                                    crate::pages::profiles::ShareProfile::default_for(false),
+                                ),
                                 |_current, _total| {},
                                 |staged_db_path| {
                                     let scan = crate::pages::secret_scan::scan_staged_export_database(
@@ -8504,6 +8519,9 @@ async fn execute_cli(
                         }
                         if no_encryption {
                             wizard.set_no_encryption(true);
+                        }
+                        if let Some(profile) = share_profile {
+                            wizard.set_share_profile(profile);
                         }
                         if let Some(target) = target {
                             wizard.set_deploy_target(target.to_wizard_target());
@@ -95955,7 +95973,8 @@ fn run_config_based_export(
     // be encrypted, bundled, or deployed. Non-interactive config exports are
     // fail-closed: callers may suppress reviewed false positives with the
     // existing allowlist inputs, but cannot silently approve live findings.
-    let export_engine = crate::pages::export::ExportEngine::new(db_path, &export_db_path, filter);
+    let export_engine = crate::pages::export::ExportEngine::new(db_path, &export_db_path, filter)
+        .with_share_profile(wizard_state.effective_share_profile());
 
     let running = Arc::new(AtomicBool::new(true));
     let secret_scan_config = crate::pages::secret_scan::SecretScanConfig::from_inputs(

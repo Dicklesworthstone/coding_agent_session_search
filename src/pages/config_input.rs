@@ -24,7 +24,8 @@
 //!   "bundle": {
 //!     "title": "Team Archive",
 //!     "description": "Encrypted cass export",
-//!     "hide_metadata": false
+//!     "hide_metadata": false,
+//!     "share_profile": "team"
 //!   },
 //!   "deployment": {
 //!     "target": "local",
@@ -43,6 +44,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use super::export::PathMode;
+use super::profiles::ShareProfile;
 use super::wizard::{DeployTarget, WizardState};
 use crate::ui::time_parser::parse_time_input;
 
@@ -238,6 +240,12 @@ pub struct BundleConfig {
     /// Hide workspace/agent metadata in UI.
     #[serde(default)]
     pub hide_metadata: bool,
+
+    /// Share profile applied to every exported text: public, team or
+    /// personal. Absent: public for an unencrypted export, team when
+    /// encrypted (2l1b0.60).
+    #[serde(default)]
+    pub share_profile: Option<ShareProfile>,
 }
 
 impl Default for BundleConfig {
@@ -246,6 +254,7 @@ impl Default for BundleConfig {
             title: default_title(),
             description: default_description(),
             hide_metadata: false,
+            share_profile: None,
         }
     }
 }
@@ -476,6 +485,14 @@ impl PagesConfig {
             }
         }
 
+        if self.bundle.share_profile == Some(ShareProfile::Custom) {
+            errors.push(
+                "bundle.share_profile 'custom' takes per-rule options that config input does not \
+                 accept; choose public, team or personal."
+                    .to_string(),
+            );
+        }
+
         // Validate deployment target
         let target = self.normalized_target();
         if self.deployment.output_dir.trim().is_empty() {
@@ -673,6 +690,7 @@ impl PagesConfig {
             title: self.bundle.title.clone(),
             description: self.bundle.description.clone(),
             hide_metadata: self.bundle.hide_metadata,
+            share_profile: self.bundle.share_profile,
             target,
             output_dir: PathBuf::from(&self.deployment.output_dir),
             repo_name: self.deployment.repo.clone(),
@@ -735,7 +753,8 @@ pub fn example_config() -> &'static str {
   "bundle": {
     "title": "My Archive",
     "description": "Encrypted cass export",
-    "hide_metadata": false
+    "hide_metadata": false,
+    "share_profile": "team"
   },
   "deployment": {
     "target": "local",
@@ -773,6 +792,43 @@ mod tests {
         assert_eq!(config.filters.agents, vec!["claude-code", "codex"]);
         assert_eq!(config.bundle.title, "My Archive");
         assert_eq!(config.deployment.target, "local");
+        assert_eq!(config.bundle.share_profile, Some(ShareProfile::Team));
+    }
+
+    /// 2l1b0.60: bundle.share_profile reaches the export state; absent, the
+    /// export falls back to public for plaintext and team when encrypted;
+    /// custom and unknown names are refused rather than silently ignored.
+    #[test]
+    fn share_profile_config_reaches_the_export_and_refuses_unusable_values() {
+        let mut config = config_with_password();
+        let state = config.to_wizard_state(PathBuf::from("/tmp/a.db")).unwrap();
+        assert_eq!(state.share_profile, None);
+        assert_eq!(state.effective_share_profile(), ShareProfile::Team);
+
+        config.encryption.no_encryption = true;
+        config.encryption.i_understand_risks = true;
+        let state = config.to_wizard_state(PathBuf::from("/tmp/a.db")).unwrap();
+        assert_eq!(state.effective_share_profile(), ShareProfile::Public);
+
+        config.bundle.share_profile = Some(ShareProfile::Personal);
+        let state = config.to_wizard_state(PathBuf::from("/tmp/a.db")).unwrap();
+        assert_eq!(state.effective_share_profile(), ShareProfile::Personal);
+        assert!(config.validate().valid, "{:?}", config.validate().errors);
+
+        config.bundle.share_profile = Some(ShareProfile::Custom);
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("bundle.share_profile 'custom'")),
+            "{:?}",
+            result.errors
+        );
+
+        let unknown = r#"{"bundle": {"share_profile": "everyone"}}"#;
+        assert!(serde_json::from_str::<PagesConfig>(unknown).is_err());
     }
 
     // Tests for `include_attachments` config field removed: the flag was

@@ -6,6 +6,7 @@ use coding_agent_search::model::types::{
 use coding_agent_search::pages::bundle::{BundleBuilder, BundleConfig};
 use coding_agent_search::pages::encrypt::EncryptionEngine;
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
+use coding_agent_search::pages::profiles::ShareProfile;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::Value;
 use std::fs;
@@ -136,7 +137,9 @@ fn main() -> Result<()> {
         until: None,
         path_mode: PathMode::Relative,
     };
-    let export_engine = ExportEngine::new(&db_path, &export_db_path, filter);
+    // Measure what an encrypted production export runs, redaction included.
+    let export_engine = ExportEngine::new(&db_path, &export_db_path, filter)
+        .with_share_profile(ShareProfile::default_for(true));
     let export_stats = export_engine.execute(|_, _| {}, None)?;
 
     eprintln!("[perf-bundle] encrypting export...");

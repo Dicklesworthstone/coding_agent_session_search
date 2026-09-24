@@ -20,7 +20,9 @@ use crate::pages::patterns::{patterns_for_personal, patterns_for_public, pattern
 use crate::pages::redact::RedactionConfig;
 
 /// Pre-configured privacy profile for sharing sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ShareProfile {
     /// Maximum privacy - safe for public internet.
@@ -34,10 +36,18 @@ pub enum ShareProfile {
     /// Only removes critical secrets like private keys and cloud provider credentials.
     Personal,
     /// Manual configuration of all options.
+    #[value(skip)]
     Custom,
 }
 
 impl ShareProfile {
+    /// The profile an export gets when none was chosen (2l1b0.60): a
+    /// plaintext export can be read by anyone who obtains it, so it gets the
+    /// strictest preset; an encrypted one is read by password holders.
+    pub fn default_for(encrypted: bool) -> Self {
+        if encrypted { Self::Team } else { Self::Public }
+    }
+
     /// Human-readable name of the profile.
     pub fn name(self) -> &'static str {
         match self {
