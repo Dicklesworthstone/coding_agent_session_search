@@ -582,6 +582,61 @@ fn test_cli_export_with_options() {
     );
 }
 
+/// 2l1b0.59/.68: `--include-tools` and `--show-timestamps` default to true and
+/// can be turned off with `=false`. Negative control: before the fix both
+/// were set-true flags, `--include-tools=false` failed to parse, and no CLI
+/// input could reach the exporter's include_tools/show_timestamps=false paths.
+#[test]
+fn test_cli_export_tools_and_timestamps_can_be_turned_off() {
+    let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");
+    let export = |extra: &[&str]| -> String {
+        let tmp = TempDir::new().unwrap();
+        let mut args = vec![
+            "export-html",
+            session_path.to_str().unwrap(),
+            "--output-dir",
+            tmp.path().to_str().unwrap(),
+            "--robot",
+        ];
+        args.extend_from_slice(extra);
+        let output = base_cmd().args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{:?}: {}",
+            extra,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        fs::read_to_string(json["exported"]["output_path"].as_str().unwrap()).unwrap()
+    };
+
+    let defaults = export(&[]);
+    assert!(
+        defaults.contains("<button class=\"tool-badge"),
+        "the fixture's tool calls render by default"
+    );
+    assert!(
+        defaults.contains("<time class=\"message-time\""),
+        "timestamps render by default"
+    );
+    let bare = export(&["--include-tools", "--show-timestamps"]);
+    assert!(
+        bare.contains("<button class=\"tool-badge")
+            && bare.contains("<time class=\"message-time\""),
+        "a bare flag keeps its default of true"
+    );
+
+    let without = export(&["--include-tools=false", "--show-timestamps=false"]);
+    assert!(
+        !without.contains("<button class=\"tool-badge"),
+        "--include-tools=false omits tool calls"
+    );
+    assert!(
+        !without.contains("<time class=\"message-time\""),
+        "--show-timestamps=false hides timestamps"
+    );
+}
+
 #[test]
 fn test_cli_export_no_cdn() {
     let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");

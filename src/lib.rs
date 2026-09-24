@@ -1419,12 +1419,28 @@ pub enum Commands {
         #[arg(long)]
         password_stdin: bool,
 
-        /// Include tool calls in export (default: true)
-        #[arg(long, default_value_t = true)]
+        /// Include tool calls in the export; `--include-tools=false` omits
+        /// them (default: true)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
         include_tools: bool,
 
-        /// Show message timestamps
-        #[arg(long, default_value_t = true)]
+        /// Show message timestamps; `--show-timestamps=false` hides them
+        /// (default: true)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
         show_timestamps: bool,
 
         /// Disable CDN references (fully offline, larger file)
