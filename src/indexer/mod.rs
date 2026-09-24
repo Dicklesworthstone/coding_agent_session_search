@@ -17747,7 +17747,16 @@ fn run_index_inner(
                 report_analytics_heartbeat();
             };
             let check_analytics_stop = || check_legacy_omp_analytics_stop(opts.progress.as_ref());
-            let _ = storage
+            // 2l1b0.75: the phase gets its own writer connection. Ingest and
+            // repair commit through ephemeral writers, which can leave this
+            // long-lived handle with an execution visibility ahead of its
+            // pager's publication. fsqlite 0.4.4 then refuses every BEGIN on
+            // it ("opened pager visibility N predates connection execution
+            // visibility M"), and no retry clears that. A connection opened
+            // now loads the current publication.
+            let analytics_writer = FrankenStorage::open_writer(&opts.db_path)
+                .with_context(|| "opening a writer for the legacy OMP analytics rebuild")?;
+            let rebuilt = analytics_writer
                 .rebuild_legacy_omp_analytics_with_progress(
                     Some(&report_analytics_progress),
                     Some(&report_analytics_heartbeat),
@@ -17755,7 +17764,12 @@ fn run_index_inner(
                 )
                 .with_context(|| {
                     "rebuilding legacy OMP analytics after lexical publication with resumable progress"
-                })?;
+                });
+            let closed = analytics_writer
+                .close()
+                .with_context(|| "closing the legacy OMP analytics writer");
+            let _ = rebuilt?;
+            closed?;
             if let (Some(progress), Some((phase, current, total, total_is_final))) =
                 (opts.progress.as_ref(), prior_progress)
             {
