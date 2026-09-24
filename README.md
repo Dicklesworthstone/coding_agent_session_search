@@ -3481,6 +3481,8 @@ Update check state is stored in `update_state.json` in the data directory:
 | `CASS_DATA_DIR` | Platform default | Override data directory |
 | `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Same as `--db` (the flag wins): path of the canonical database. When it lies outside the data dir, derived assets (lexical index, checkpoints, locks) follow its directory unless `--data-dir` is given |
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
+| `CASS_OUTPUT_FORMAT` | unset | `json`, `jsonl`, `compact`, `sessions` or `toon` makes robot output the default, as if `--robot-format` were given |
+| `CASS_SSH_CONFIG` | unset | SSH config file passed as `ssh -F <path>` for remote sources (cass also sets `BatchMode=yes` and `StrictHostKeyChecking=yes`) |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `536870912` | Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available |
@@ -3524,7 +3526,10 @@ Update check state is stored in `update_state.json` in the data directory:
 | **Search & Cache** | | |
 | `CASS_CACHE_SHARD_CAP` | 256 | Per-shard LRU cache entries |
 | `CASS_CACHE_TOTAL_CAP` | 2048 | Total cached search hits |
-| `CASS_CACHE_BYTE_CAP` | 10485760 | Cache byte limit (10MB) |
+| `CASS_CACHE_BYTE_CAP` | available memory / 128, clamped to 64 MiB–2 GiB | Search-hit cache byte limit; `0` disables the byte guard |
+| `CASS_CACHE_EVICTION_POLICY` | `lru` | Cache eviction policy: `lru` or `s3-fifo` |
+| `CASS_SEARCH_BUDGET_MS` | 120000 | Robot search time budget; on expiry search exits 0 with `budget.timed_out` |
+| `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS` | 10000 | Automatic wildcard fallback for sparse results runs only on indexes with at most this many documents; `0` disables it |
 | `CASS_WARM_DEBOUNCE_MS` | 120 | Warm-up search debounce |
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
 | `CASS_QUILL_QUERY_FUEL_BUDGET` | Quill default (10000000) | Escape hatch for Quill's deterministic per-query work ceiling (GH #441). Zero or unparseable values keep the engine default. When fuel runs out on a hybrid query the lexical leg is dropped, the semantic leg still answers, and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only queries return an actionable hint. The durable fix for fuel exhaustion is a consolidated index (an incremental `cass index` folds fragmented generations in its maintenance pass; `--full` rebuilds from scratch), and cass now publishes Quill snapshots only on its own commits (no per-second visibility seals), which is what let segment counts grow into the hundreds on append-only archives |
@@ -3545,8 +3550,7 @@ Update check state is stored in `update_state.json` in the data directory:
 | `TUI_HEADLESS` | unset | Disable interactive features |
 | `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
 | `CASS_DISABLE_ANIMATIONS` | unset | Disable UI animations |
-| `EDITOR` | `$VISUAL` or `vi` | External editor command |
-| `EDITOR_LINE_FLAG` | `+` | Line number flag (e.g., `+42`) |
+| `EDITOR` | then `$VISUAL`, then `code` | External editor command (line-number flags are chosen per editor) |
 | **Updates** | | |
 | `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | unset | Disable update notifications |
 | **Connector Overrides** | | |
@@ -3558,11 +3562,11 @@ Update check state is stored in `update_state.json` in the data directory:
 | `OMP_PROFILE` | unset | Active OMP profile; takes precedence over `PI_PROFILE` |
 | `PI_PROFILE` | unset | Legacy OMP profile selector when `OMP_PROFILE` is unset |
 | `PI_CONFIG_DIR` | `.omp` | Home-relative OMP config directory name |
-| `XDG_DATA_HOME` | platform default | OMP XDG data root (`$XDG_DATA_HOME/omp`) when present |
+| `XDG_DATA_HOME` | platform default | OMP XDG data root (`$XDG_DATA_HOME/omp`) when present; also moves cass's own data dir to `$XDG_DATA_HOME/coding-agent-search` when `CASS_DATA_DIR` is unset |
 | `CASS_MUSE_DATA_ROOT` | `~/.local/share/muse` | Muse Code data root |
 | `CODEX_HOME` | `~/.codex` | Codex data directory |
-| `GEMINI_HOME` | `~/.gemini` | Gemini CLI directory |
-| `OPENCODE_STORAGE_ROOT` | (scans home) | OpenCode storage |
+| `GEMINI_HOME` | `~/.gemini/tmp` | Gemini CLI session directory |
+| `OPENCODE_STORAGE_ROOT` | XDG data dir, XDG config dir, then `~/.local/share/opencode/storage` | OpenCode storage (fixed candidates; no home scan) |
 | `CHATGPT_ENCRYPTION_KEY` | unset | Base64-encoded AES key for ChatGPT v2/v3 |
 
 ---
