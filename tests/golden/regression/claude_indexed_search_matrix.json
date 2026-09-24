@@ -8,12 +8,16 @@
     {
       "source_path": "[TEST_HOME]/.claude/projects/-test-project/agent-test123.jsonl",
       "line_number": 1,
-      "agent": "claude_code"
+      "agent": "claude_code",
+      "source_id": "local",
+      "conversation_id": 1
     },
     {
       "source_path": "[TEST_HOME]/.claude/projects/-test-project/agent-test123.jsonl",
       "line_number": 2,
-      "agent": "claude_code"
+      "agent": "claude_code",
+      "source_id": "local",
+      "conversation_id": 1
     }
   ],
   "max_tokens": null,

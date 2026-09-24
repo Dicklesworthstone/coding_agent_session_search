@@ -50,6 +50,9 @@ fn assert_golden(name: &str, actual: &str) {
         .join("golden")
         .join("regression")
         .join(name);
+    // Golden files end in one newline (the repository JSON style since
+    // 2cc52516); the serializer adds none.
+    let actual = &format!("{}\n", actual.trim_end_matches('\n'));
 
     if std::env::var_os("UPDATE_GOLDENS").is_some() {
         fs::create_dir_all(golden_path.parent().expect("golden parent"))
