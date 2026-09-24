@@ -4,6 +4,23 @@
 **Status:** Contract for implementation beads
 **Date:** 2026-05-08
 
+> **Implementation status (checked 2026-09-24 against `cass pack --help` and
+> src/lib.rs; bead 2l1b0.59).** This contract is the target; these parts
+> differ from the shipped command, and the implementation work is tracked by
+> 2l1b0.20:
+> - Not implemented: `--approximate`, `--redaction <policy>` and its
+>   `pack-invalid-redaction-policy` error. Redaction is fixed (index-time
+>   secret redaction), not selectable per pack.
+> - `--freshness-window <duration>` shipped as `--freshness-window-seconds <n>`.
+> - Timeouts do not exit 8 (`partial-result`) or 10 (`timeout`): pack exits 0
+>   and reports `budget.timed_out: true` with `skipped_sections` and a `retry`
+>   command in the top-level `budget` block (as `search` does).
+> - `--explain-selection` adds a `selection` object to each evidence item;
+>   there is no top-level `selection_debug`.
+> - `pack-no-evidence` is defined as a kind but never raised. The shipped way
+>   to fail on an empty pack is `--require-evidence`, which exits 13 with kind
+>   `not-found`. `pack-budget-too-small` is raised as described below.
+
 This document defines the first implementation contract for `cass pack`: a
 robot-first command that turns existing indexed session evidence into a compact,
 cited handoff artifact for agents and humans. The feature is deterministic and
