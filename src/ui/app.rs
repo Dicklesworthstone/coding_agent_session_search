@@ -4796,6 +4796,48 @@ fn match_mode_token(mode: MatchMode) -> &'static str {
     }
 }
 
+/// The query a search runs in prefix match mode (F9): every bare word of two
+/// or more characters also matches as a prefix (`auth` → `auth*`). Quoted
+/// phrases, `AND`/`OR`/`NOT`, negated (`-x`) and field (`a:b`) terms, and
+/// terms that already carry a wildcard are left as typed. One-character
+/// words stay exact because a one-letter prefix expands to most of the index.
+fn prefix_match_query(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut word = String::new();
+    let mut in_quotes = false;
+    let flush = |word: &mut String, out: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        let bare = !matches!(word.as_str(), "AND" | "OR" | "NOT")
+            && !word.starts_with('-')
+            && !word.contains([':', '*', '"'])
+            && word.chars().count() >= 2
+            && word.chars().next_back().is_some_and(char::is_alphanumeric);
+        out.push_str(word);
+        if bare {
+            out.push('*');
+        }
+        word.clear();
+    };
+    for ch in query.chars() {
+        if in_quotes {
+            out.push(ch);
+            in_quotes = ch != '"';
+        } else if ch == '"' && word.is_empty() {
+            in_quotes = true;
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        } else {
+            word.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 fn context_window_token(window: ContextWindow) -> &'static str {
     match window {
         ContextWindow::Small => "S",
@@ -4871,6 +4913,8 @@ fn sparkline_from_values(values: &[f64], max_width: usize) -> String {
 pub struct SavedView {
     pub slot: u8,
     pub label: Option<String>,
+    /// Search query at save time; loading the view restores it (2l1b0.55).
+    pub query: String,
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
     pub created_from: Option<i64>,
@@ -7152,7 +7196,13 @@ impl CassApp {
             SearchPass::Upgrade | SearchPass::Pagination => self.search_page_size.max(1),
         };
         SearchParams {
-            query: self.query.clone(),
+            // F9 match mode applies here, the one place every search path
+            // (direct, progressive, pagination) takes its query from; the
+            // input box keeps what the user typed (2l1b0.55).
+            query: match self.match_mode {
+                MatchMode::Standard => self.query.clone(),
+                MatchMode::Prefix => prefix_match_query(&self.query),
+            },
             filters: self.filters.clone(),
             pass,
             mode: self.search_mode,
@@ -14872,6 +14922,8 @@ struct PersistedSavedView {
     slot: u8,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    query: String,
     #[serde(default)]
     agents: Vec<String>,
     #[serde(default)]
@@ -15131,6 +15183,7 @@ fn persisted_state_file_from_state(state: &PersistedState) -> PersistedStateFile
             PersistedSavedView {
                 slot: view.slot,
                 label: view.label.clone(),
+                query: view.query.clone(),
                 agents: view.agents.iter().cloned().collect(),
                 workspaces: view.workspaces.iter().cloned().collect(),
                 created_from: view.created_from,
@@ -15198,6 +15251,7 @@ fn persisted_state_from_file(file: PersistedStateFile) -> PersistedState {
             Some(SavedView {
                 slot: view.slot,
                 label: view.label.filter(|s| !s.trim().is_empty()),
+                query: view.query,
                 agents: view
                     .agents
                     .into_iter()
@@ -19732,6 +19786,7 @@ impl super::ftui_adapter::Model for CassApp {
                 let view = SavedView {
                     slot,
                     label: preserved_label,
+                    query: self.query.clone(),
                     agents: self.filters.agents.clone(),
                     workspaces: self.filters.workspaces.clone(),
                     created_from: self.filters.created_from,
@@ -19765,6 +19820,8 @@ impl super::ftui_adapter::Model for CassApp {
                 use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(view) = self.saved_views.iter().find(|v| v.slot == slot).cloned() {
                     self.push_undo("Load saved view");
+                    self.query = view.query.clone();
+                    self.cursor_pos = self.query.len();
                     self.filters.agents = view.agents.clone();
                     self.filters.workspaces = view.workspaces.clone();
                     self.filters.created_from = view.created_from;
@@ -25110,6 +25167,7 @@ mod tests {
             saved_views: vec![SavedView {
                 slot: 3,
                 label: Some("triage".to_string()),
+                query: "auth timeout".to_string(),
                 agents,
                 workspaces,
                 created_from: Some(1000),
@@ -25156,6 +25214,8 @@ mod tests {
         assert_eq!(loaded.saved_views[0].slot, 3);
         assert_eq!(loaded.saved_views[0].grouping_mode, ResultsGrouping::Flat);
         assert_eq!(loaded.saved_views[0].label.as_deref(), Some("triage"));
+        // 2l1b0.55: the query survives the save/load round trip.
+        assert_eq!(loaded.saved_views[0].query, "auth timeout");
         assert!(matches!(
             loaded.saved_views[0].source_filter,
             SourceFilter::SourceId(ref id) if id == "remote-buildbox"
@@ -25192,6 +25252,7 @@ mod tests {
             saved_views: vec![SavedView {
                 slot: 1,
                 label: None,
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,
@@ -26704,6 +26765,7 @@ mod tests {
         app.saved_views.push(SavedView {
             slot: 7,
             label: None,
+            query: String::new(),
             agents: HashSet::new(),
             workspaces: HashSet::new(),
             created_from: None,
@@ -26716,6 +26778,61 @@ mod tests {
         let _ = app.update(CassMsg::ViewLoaded(7));
 
         assert!(matches!(app.filters.source_filter, SourceFilter::Local));
+    }
+
+    #[test]
+    fn prefix_match_query_widens_only_bare_words() {
+        assert_eq!(
+            prefix_match_query(r#"auth "exact phrase" -skip OR c zq00 agent:codex foo*"#),
+            r#"auth* "exact phrase" -skip OR c zq00* agent:codex foo*"#
+        );
+        assert_eq!(prefix_match_query(""), "");
+        assert_eq!(prefix_match_query("  réseau  "), "  réseau*  ");
+        assert_eq!(prefix_match_query("NOT x AND yy"), "NOT x AND yy*");
+    }
+
+    /// 2l1b0.55: F9 toggled a PFX/STD status token while every search ran the
+    /// typed query unchanged.
+    #[test]
+    fn match_mode_changes_the_query_a_search_runs() {
+        let mut app = CassApp::default();
+        app.query = "zq00 auth".to_string();
+        assert_eq!(app.match_mode, MatchMode::Standard);
+        assert_eq!(
+            app.build_search_params(SearchPass::Interactive, 0).query,
+            "zq00 auth"
+        );
+        let _ = app.update(CassMsg::MatchModeCycled);
+        assert_eq!(app.match_mode, MatchMode::Prefix);
+        assert_eq!(
+            app.build_search_params(SearchPass::Upgrade, 0).query,
+            "zq00* auth*"
+        );
+        assert_eq!(app.query, "zq00 auth", "the input keeps what was typed");
+    }
+
+    /// 2l1b0.55: README says a saved view stores the search query; it stored
+    /// only filters, ranking and grouping, so loading a view kept whatever
+    /// query was typed at the time.
+    #[test]
+    fn saved_view_restores_its_query() {
+        let mut app = CassApp::default();
+        app.query = "auth timeout".to_string();
+        app.cursor_pos = app.query.len();
+        let _ = app.update(CassMsg::ViewSaved(4));
+        assert_eq!(
+            app.saved_views
+                .iter()
+                .find(|view| view.slot == 4)
+                .map(|view| view.query.as_str()),
+            Some("auth timeout")
+        );
+
+        app.query = "something else".to_string();
+        app.cursor_pos = 3;
+        let _ = app.update(CassMsg::ViewLoaded(4));
+        assert_eq!(app.query, "auth timeout");
+        assert_eq!(app.cursor_pos, "auth timeout".len());
     }
 
     #[test]
@@ -37787,6 +37904,7 @@ not jsonl",
             SavedView {
                 slot: 1,
                 label: Some("One".to_string()),
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,
@@ -37798,6 +37916,7 @@ not jsonl",
             SavedView {
                 slot: 2,
                 label: Some("Two".to_string()),
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,
@@ -37809,6 +37928,7 @@ not jsonl",
             SavedView {
                 slot: 3,
                 label: Some("Three".to_string()),
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,

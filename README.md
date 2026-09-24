@@ -1814,7 +1814,7 @@ Launch-time flags: `cass tui --refresh` (alias `--catch-up`) runs an incremental
 |-----|--------|
 | `F7` / `Alt+C` | Cycle context window size: S → M → L → XL |
 | `Ctrl+Space` | Momentary "peek" to XL context |
-| `F9` | Toggle match mode: prefix (default) ↔ standard |
+| `F9` | Toggle match mode: standard (default) ↔ prefix, where every bare word of 2+ characters also matches as a prefix (`auth` → `auth*`; phrases, operators and wildcards are left as typed) |
 | `F12` / `Alt+R` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
 | `Alt+F` | Cycle result grouping: agent → conversation → workspace → flat |
 | `Alt+S` | Cycle search mode (lexical / semantic / hybrid) |
