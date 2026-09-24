@@ -229,7 +229,7 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 
 ### ⚡ Instant Search (Sub-60ms Latency)
 - **"Search-as-you-type"**: Results update instantly with every keystroke.
-- **Edge N-Gram Indexing**: We frontload the work by pre-computing prefix matches (e.g., "cal" -> "calculate") during indexing, trading disk space for O(1) lookup speed at query time.
+- **Edge N-Gram Indexing**: We frontload the work by pre-computing prefix matches (e.g., "cal" -> "calculate") during indexing: 2–20 character prefixes of every word in titles and in the first 4 KiB of each message, trading disk space for fast lookup at query time.
 - **Smart Tokenization**: Handles `snake_case` ("my_var" matches "my" and "var"), hyphenated terms, and code symbols (`c++`, `foo.bar`) correctly.
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 - **One-shot CLI overhead**: the sub-60ms figure is the engine query. A one-shot `cass search --robot` currently spends roughly a second in archive open and integrity preflight on a ~10 GB archive; `--robot-meta` reports that separately as `_meta.timing.other_ms`, while `search_ms` stays in the tens of milliseconds.
@@ -331,10 +331,10 @@ cass search "auth error handling" --mode hybrid --robot
   - `foo*` - Prefix match (finds "foobar", "foo123")
   - `*foo` - Suffix match (finds "barfoo", "configfoo")
   - `*foo*` - Substring match (finds "afoob", "configuration")
-- **Auto-Fuzzy Fallback**: When exact searches return sparse results, automatically retries with `*term*` wildcards to broaden matches. Visual indicator shows when fallback is active.
+- **Auto-Fuzzy Fallback**: On small indexes (up to 10,000 documents by default), an exact search with sparse results is retried with `*term*` wildcards to broaden matches. A visual indicator shows when the fallback is active.
 - **Query History Deduplication**: Recent searches deduplicated to show unique queries; navigate with `Up`/`Down` arrows.
 - **Match Quality Ranking**: New ranking mode (cycle with `F12`) that prioritizes exact matches over wildcard/fuzzy results.
-- **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms in snippets with `**bold**` markers (text and JSON output alike; search has no HTML output).
+- **Match Highlighting**: Use `--highlight` to wrap matching terms in snippets with `**bold**` markers in human-readable output. Robot/JSON output does not apply it yet.
 
 ### 🖥️ Rich Terminal UI (TUI)
 
@@ -1298,7 +1298,7 @@ cass search "TODO" --agent claude --robot --aggregate workspace
 | `agent` | Group by agent type (claude_code, codex, cursor, etc.) |
 | `workspace` | Group by workspace/project path |
 | `date` | Group by date (YYYY-MM-DD) |
-| `match_type` | Group by match quality (exact, prefix, fuzzy) |
+| `match_type` | Group by match type (`exact`, `prefix`, `suffix`, `substring`, `wildcard`, `implicit_wildcard`); one search has one type, so this shows a single bucket unless the wildcard fallback replaced the hits |
 
 **Response Format**:
 ```json
@@ -1379,13 +1379,14 @@ cass search "bug fix" --sessions-from today_sessions.txt --robot
 
 ### Match Highlighting
 
-The `--highlight` flag wraps matching terms for visual/programmatic identification:
+The `--highlight` flag wraps matching terms in `**bold**` markers in human-readable output (the default text output and `--display` formats):
 
 ```bash
-cass search "authentication error" --robot --highlight
-# Snippets come back with **authentication** and **error** bold-wrapped,
-# in text and in JSON output alike (search has no HTML output format).
+cass search "authentication error" --highlight
+# Snippet: ... **authentication** failed with **error** ...
 ```
+
+Robot/JSON output does not apply `--highlight` yet: snippets come back unmarked (tracked in bead 2l1b0.68).
 
 Highlighting is query-aware: quoted phrases like `"auth error"` highlight as a unit; individual terms highlight separately.
 
@@ -1678,18 +1679,18 @@ Wrap terms in double quotes for exact phrase matching:
 | `"cannot read property"` | Exact JavaScript error message |
 | `"def test_"` | Function definitions starting with test_ |
 
-Phrases respect word order and proximity. Useful for error messages, code patterns, and specific terminology.
+Phrases match their words adjacent and in order (no slop). Useful for error messages, code patterns, and specific terminology.
 
 ### Wildcard Patterns
 
 | Pattern | Type | Matches | Performance |
 |---------|------|---------|-------------|
 | `auth*` | Prefix | "auth", "authentication", "authorize" | Fast (uses edge n-grams) |
-| `*tion` | Suffix | "authentication", "function", "exception" | Slower (regex scan) |
-| `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (full regex) |
-| `test_*` | Prefix | "test_user", "test_auth", "test_helpers" | Fast |
+| `*tion` | Suffix | "authentication", "function", "exception" | Slower (term-dictionary expansion) |
+| `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (term-dictionary expansion) |
+| `test_*` | Prefix on `test` | anything whose token starts with "test" | Fast |
 
-**Tip**: Prefix wildcards (`foo*`) are optimized via pre-computed edge n-grams. Suffix and substring wildcards fall back to regex and are slower on large indexes.
+**Tip**: Prefix wildcards (`foo*`) use edge n-grams computed at index time: prefixes of 2–20 characters of every alphanumeric word, taken from titles and from the first 4 KiB of each message. Suffix and substring wildcards expand over the index's term dictionary, at most 16,384 terms per pattern; a pattern matching more terms fails rather than scanning. The tokenizer splits on anything that is not a letter or digit: `test_*` is a prefix match on `test`, `c++` searches for `c`, and `foo.bar` means `foo` AND `bar` anywhere in the message, not the literal string. Phrases (`"..."`) match adjacent words in order (slop 0).
 
 ### Query Modifiers
 
@@ -1740,21 +1741,26 @@ cass search "error" --since yesterday --until now
 
 ### Match Types
 
-Search results include a `match_type` indicator:
+Search results include a `match_type` indicator. It describes the query, not each hit: every hit of a search carries the type of the least precise pattern in the query (e.g. `auth* *tion` stamps `suffix` on all hits).
 
-| Type | Meaning | Score Boost |
-|------|---------|-------------|
-| `exact` | Query terms found verbatim | Highest |
-| `prefix` | Matched via prefix expansion (e.g., `auth*`) | High |
-| `suffix` | Matched via suffix pattern | Medium |
-| `substring` | Matched via substring pattern | Lower |
-| `fuzzy` | Auto-fallback match when exact results sparse | Lowest |
+| Type | Meaning | Match Quality order |
+|------|---------|---------------------|
+| `exact` | No wildcards: exact terms (and edge n-gram prefixes) | 1 |
+| `prefix` | Trailing wildcard (`auth*`) | 2 |
+| `suffix` | Leading wildcard (`*tion`) | 3 |
+| `substring` | Both sides (`*config*`) | 4 |
+| `wildcard` | Inner wildcard (`f*o`) | 5 |
+| `implicit_wildcard` | Automatic wildcard fallback on a sparse exact search | 6 |
+
+Relevance scores carry no boost for the match type; only the TUI's Match Quality ranking mode (`F12`) orders by it.
 
 ### Auto-Fuzzy Fallback
 
-When an exact query returns fewer than 3 results, `cass` automatically retries with wildcard expansion:
+When an exact query's first page returns fewer than 3 results (or fewer than a smaller `--limit`), `cass` retries with wildcard expansion:
 - `auth` → `*auth*`
-- Results are flagged with `wildcard_fallback: true` in robot mode
+- It runs only on indexes with at most 10,000 documents (`CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS`; `0` disables it), so on a typical real archive it does not run.
+- It skips queries that already use wildcards, boolean operators or phrases, and zero-hit queries containing a token longer than 16 characters.
+- The wildcard results replace the exact ones only when they find more hits; robot mode then reports `_meta.wildcard_fallback: true` (a single boolean; nothing says why a fallback did not run)
 - TUI shows a "fuzzy" indicator in the status bar
 
 ---
