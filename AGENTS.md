@@ -159,11 +159,11 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `clap` | CLI argument parsing with derive macros |
 | `serde` + `serde_json` | Serialization |
 | `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend |
-| `rusqlite` | SQLite database (bundled) — legacy, retained during frankensqlite migration |
+| `rusqlite` | Dev-dependency only: C-SQLite interop fixtures in tests. Production never links it (historical salvage uses the external `sqlite3` CLI) |
 | `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion |
 | `franken_agent_detection` | Agent session auto-detection across 15+ providers |
 | `frankentorch` (via `frankensearch`) | Pure-Rust native MiniLM embeddings and reranking |
-| `hnsw_rs` | HNSW approximate nearest neighbors |
+| `frankenhnsw` (via `frankensearch`) | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
 | `ftui` + `ftui-extras` | FrankenTUI terminal interface |
 | `toon` | Terminal rendering library |
@@ -176,7 +176,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `aes-gcm` + `ring` + `pbkdf2` + `argon2` | Encryption (ChatGPT conversations, HTML export) |
 | `ssh2` | SFTP fallback for multi-machine sync |
 | `dialoguer` | Interactive terminal prompts (setup wizard) |
-| `syntect` | Syntax highlighting |
+| `ftui-extras` (`syntax` feature) | Syntax highlighting |
 | `thiserror` | Ergonomic error type derivation |
 | `tracing` | Structured logging and diagnostics |
 | `unicode-normalization` | NFC text canonicalization |
@@ -203,19 +203,17 @@ release candidate until those gates pass.
 SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
 (GH#477); upstream recovery, compiler, and package gates passed. CASS consumer
 runtime qualification remains pending.
-The table below is historical during this transition; its GH#411-open statement
-is superseded by upstream closure. The published SQLite 0.4.1 includes the
-GH#462 reserved-page WAL repair, but damaged-archive recovery remains unproven.
-SQLite 0.4.4 adds durable pending-freelist repairs. The strict family guard
-requires uniform 0.4.4 registry versions. The September 17 publication blocker
-is resolved; the historical table below does not describe the current lockfile.
+The published SQLite 0.4.1 includes the GH#462 reserved-page WAL repair, but
+damaged-archive recovery remains unproven. SQLite 0.4.4 adds durable
+pending-freelist repairs. The strict family guard requires uniform 0.4.4
+registry versions.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.18` (owner-requested update 2026-09-07; release commit `1600766ca698dae99b6018474bc8c150ece4a82d`, 42 commits since 0.3.17). Adds parameterized rowid IN-list seeks (GH#415/cass#382), read-only WAL byte/timestamp preservation, reader-registration error propagation, I/O buffer lifetime fixes, and WAL-mode transition and scalar-query corrections. The async facade and asupersync requirement remain unchanged. Retains 0.3.17's incremental WAL-tail folding, reserved lock-byte/freelist repair (GH#410), FTS metadata/visibility fixes (GH#408), prefix-BM25 ranking and prepared-read cleanup, plus 0.3.16's GH#405 FTS5 savepoint undo log and GH#406 incremental content-backed INSERT. 0.3.15 was evaluated and not adopted; historical evidence remains in bead gh382-fsqlite-pin. This update does not prove repair of the owner's existing archive corruption, and upstream GH#411 mixed-engine concurrent-WAL safety remains unresolved. `build.rs` enforces the exact version for the whole fsqlite family. |
-| `franken-agent-detection` | crates.io `=0.2.3` (2026-09-07; the Antigravity connector probes the IDE store `~/.gemini/antigravity` as well as the `agy` CLI store with `ide/<uuid>` provenance (cass#454), Claude Code detection honors `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` (cass#448), Codex token usage is read from real rollouts, Claude tool results survive as `role:"tool"` messages, Cursor/OpenCode mirrors dedupe, the 100 MB scan cap applies everywhere, Shelley discovery names the canonical database path like scan, and the Shelley connector, FAD#22 source-boundary seam, and chatgpt/omp injection seams are now published. CASS enables the `devin` feature for visible local sessions in `~/.local/share/devin/cli/sessions.db` (override `CASS_DEVIN_DATA_ROOT`); cloud-only Devin history remains out of scope. Retains 0.2.2's cursor/antigravity/grok scan-root scoping and aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes; aligned with fsqlite 0.3.x + asupersync 0.4.x) |
-| `asupersync` | `=0.4.10` (crates.io; publishes `Cx::is_cancelled`, required by Quill 0.2.3; runtime validation is pending. fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable.) |
-| `frankensearch` | crates.io `=0.4.3` / Quill `0.2.3` (cass#453). Segment collection uses retirement-receipt age so subsequent publication does not restart the grace period; `Cx::is_cancelled` comes from Asupersync `0.4.10`. Preserves the explicit multilingual MiniLM embedding space, Windows Quill publication, `cass-compat` → `lexical-tantivy` differential oracle, pure-Rust `native` embeddings, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission and generation-pinned hydration. Registry `0.3.2` is a stale same-version twin without quill/cass-compat/native, so exact pins remain required. Frankentorch resolves as `frankentorch-*`, HNSW as `frankenhnsw 0.3.5`, and Tantivy as `=0.26.1`. RUSTSEC-2026-0253 on Tantivy's lru requires a panicking key destructor under `catch_unwind`; Tantivy's cache keys are trivially droppable. |
+| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.4` (tag v0.4.4 = `9d3d98778a372aba95d76d05c5c974ac0238c96a`); `build.rs` refuses a mixed family. Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477) and 0.4.4's durable pending-freelist repairs. CASS runtime qualification of 0.4.4 is pending. Known defect: a long-lived connection can be left refusing every BEGIN after other connections commit (2l1b0.75) |
+| `franken-agent-detection` | crates.io `=0.3.0` |
+| `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x requires) |
+| `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.1`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.3.1 lacks the GH#499 tombstone-domain fix (hotfix 0.3.2 unpublished, 2l1b0.49) |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
