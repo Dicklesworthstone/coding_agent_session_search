@@ -39988,10 +39988,15 @@ fn doctor_top_level_operation_outcome(
     }
 
     if !fix_requested {
+        // Same routing as the safe-auto-run report's next_exact_command
+        // (#374): `--fix` only runs derived cleanup, so a failing archive or
+        // source-authority check must not be told to run it. The owner's
+        // leaked-page archive got `cass doctor --fix` here while its own
+        // check said "reconstruct from verified authority" (2l1b0.73).
         let next_command = if not_initialized {
             Some("cass index --full".to_string())
         } else {
-            Some("cass doctor --fix --json".to_string())
+            Some(doctor_read_only_next_command(checks))
         };
         return doctor_operation_outcome_with_details(
             DoctorOperationOutcomeKind::OkReadOnlyDiagnosed,
@@ -70971,9 +70976,46 @@ mod doctor_asset_taxonomy_tests {
             DoctorOperationOutcomeKind::OkReadOnlyDiagnosed
         );
         assert_eq!(read_only.data_loss_risk, DoctorDataLossRisk::High);
+        // 2l1b0.73: `--fix` runs derived cleanup only, so a failing archive
+        // check must be routed to the repair planner, as the safe-auto-run
+        // report already did (#374). This assertion used to pin `--fix`.
         assert_eq!(
             read_only.next_command.as_deref(),
-            Some("cass doctor --fix --json")
+            Some("cass doctor repair --dry-run --json")
+        );
+        let derived_only = doctor_check_report(
+            "lock_file",
+            "fail",
+            "stale index-run lock left by a dead process",
+            true,
+            false,
+        );
+        let derived_read_only = doctor_top_level_operation_outcome(
+            std::slice::from_ref(&derived_only),
+            false,
+            1,
+            0,
+            false,
+            &post_repair_probes,
+            None,
+        );
+        assert_eq!(
+            derived_read_only.next_command.as_deref(),
+            Some("cass doctor --fix --json"),
+            "failures the safe auto-fix path handles still point at --fix"
+        );
+        let uninitialized = doctor_top_level_operation_outcome(
+            std::slice::from_ref(&archive_risk),
+            false,
+            1,
+            0,
+            true,
+            &post_repair_probes,
+            None,
+        );
+        assert_eq!(
+            uninitialized.next_command.as_deref(),
+            Some("cass index --full")
         );
 
         let fully_fixed =
