@@ -110,7 +110,7 @@ a long JSONL record in an agent prompt.
 **Lexical publish durability (atomic-swap)**
 - Every lexical publish is an atomic renameat2(RENAME_EXCHANGE) on Linux, or a parked-rename + restore-on-failure dance elsewhere. Readers never see a half-torn index — they see either the old or the new generation, never a mix. See `src/indexer/mod.rs::publish_staged_lexical_index`.
 - The prior-live generation is retained under `<data_dir>/index/.lexical-publish-backups/<dated>/` for a bounded retention window. Default cap is `1` (keep just the most-recent prior generation for one-step rollback); override via the `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION` env var (`0` disables retention entirely, higher N keeps deeper history). Pruning runs after every successful publish and emits structured `tracing::info!` events with `freed_bytes` + `retention_limit` for observability.
-- Crash recovery is automatic: a crash between the atomic swap and the retain-rename is handled by `recover_or_finalize_interrupted_lexical_publish_backup` on the next startup, which moves any orphaned canonical sidecar (`.<name>.publish-in-progress.bak`) into `.lexical-publish-backups/` before the next publish lands.
+- Crash recovery is automatic: a crash between the atomic swap and the retain-rename is handled by `recover_or_finalize_interrupted_lexical_publish_backup` at the start of the next lexical publish or rebuild (not at process startup), which moves any orphaned canonical sidecar (`.<name>.publish-in-progress.bak`) into `.lexical-publish-backups/` before the next publish lands.
 
 **Quarantine, GC, and the doctor/diag surface**
 - Corrupt or failed-validation assets are quarantined rather than auto-deleted. `cass diag --json --quarantine` enumerates every quarantined artifact (failed seed bundles, retained publish backups, quarantined lexical generations) with `size_bytes`, `age_seconds`, `safe_to_gc`, and a human-readable `gc_reason`. The `safe_to_gc` flag is **advisory** — it reflects retention policy + cleanup dry-run eligibility and is not wired to any automatic deletion path.
@@ -2040,7 +2040,7 @@ The same conversation content can appear multiple times due to:
 
 `cass` uses a multi-layer deduplication strategy:
 
-1. **Message identity**: messages are keyed by `UNIQUE(conversation_id, idx)` and inserted with `INSERT OR IGNORE`, so re-indexing the same file never stores a message twice
+1. **Message identity**: messages are keyed by `UNIQUE(conversation_id, idx)`. Appends to a known conversation use `INSERT OR IGNORE`, and a new conversation's batched `INSERT` has the same unique index as its backstop, so re-indexing the same file never stores a message twice
    - No content hash is persisted for this; BLAKE3 content hashes are computed in memory only, as merge fingerprints when an updated file is reconciled against stored rows
 
 2. **Conversation identity**: conversations are keyed by `UNIQUE(source_id, agent_id, external_id)`
@@ -2431,7 +2431,7 @@ classDiagram
 
 ### The Pipeline
 1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 26 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build).
-2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation. Production writes use single-writer `BEGIN IMMEDIATE` transactions; an experimental opt-in parallel persist path (`CASS_INDEXER_BEGIN_CONCURRENT=1`, off by default) exists but is not the default.
+2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation. cass turns on the engine's concurrent mode (`PRAGMA fsqlite.concurrent_mode = ON`), so a plain `BEGIN` runs as `BEGIN CONCURRENT`. Indexing still has one writer at a time, because `index-run.lock` admits a single indexer. `BEGIN IMMEDIATE` appears only in the daemon job queue and in logical-archive import/migrate. An experimental opt-in parallel persist path (`CASS_INDEXER_BEGIN_CONCURRENT=1`, off by default) exists but is not the default.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
  * **Prefix Fields**: `title_prefix` and `content_prefix` use **Index-Time Edge N-Grams** (not stored on disk to save space) for instant prefix matching.
@@ -2479,7 +2479,7 @@ flowchart LR
  end
 
  subgraph "Storage + Search"
- S1["frankensqlite (WAL)\nSource of Truth\nBEGIN IMMEDIATE\nMigrations"]:::pastel3
+ S1["frankensqlite (WAL)\nSource of Truth\nBEGIN CONCURRENT\nMigrations"]:::pastel3
  T1["frankensearch\nBM25 + Semantic\nRRF Fusion\nReranking"]:::pastel4
  end
 
@@ -2648,12 +2648,15 @@ graph TD
  Background -->|Result Msg| Runtime
 ```
 
-### Append-Only Storage Strategy
-Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`, powered by frankensqlite) as an **append-only log** for conversations:
+### Storage Strategy
+Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`, powered by frankensqlite) as the source of truth for conversations. History grows by insertion, and rows change only where the source changed:
 
-- **Immutable History**: When an agent adds a message to a conversation, we don't update the existing row. We insert the new message linked to the conversation ID.
-- **Deduplication**: Messages are keyed by `UNIQUE(conversation_id, idx)` and inserted with `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice; BLAKE3 content hashes are used only in memory as merge fingerprints.
-- **Versioning**: A `_schema_migrations` table and strict migration path (21 versioned migrations at HEAD; see *Database Schema Migrations*) ensure that upgrades are safe and atomic.
+- **Messages are inserted, not rewritten**: when an agent adds a message to a conversation, cass inserts a new row linked to the conversation ID. There are exceptions:
+  - A Codebuff/Freebuff message whose content or metadata changed under the same native ID is updated in place.
+  - Conversation rows are updated as they grow: end time, last message index, token summaries, title and metadata.
+  - Deduplication, `forget` and purge delete rows.
+- **Deduplication**: messages are keyed by `UNIQUE(conversation_id, idx)`. New conversations are written with batched plain `INSERT`s, with the unique index as the backstop. Appends to a known conversation use `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice. BLAKE3 content hashes are used only in memory, as merge fingerprints.
+- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v21, so a new database records versions 13–21. The v1–v12 SQL is compiled only into tests.
 
 ---
 
@@ -2800,17 +2803,13 @@ Each file system event is routed to the appropriate connector:
 
 ### State Tracking
 
-Watch mode maintains `watch_state.json`:
+Watch mode maintains `watch_state.json`, one scan watermark (ms) per connector under a short connector code (`cd` Claude, `cx` Codex, `gm` Gemini, ...):
 
 ```json
-{
-  "last_scan_ts": 1699900000000,
-  "watched_paths": [
-    "~/.claude/projects",
-    "~/.codex/sessions"
-  ]
-}
+{"v":1,"m":{"cd":1699900000000,"cx":1699900000000}}
 ```
+
+The global `last_scan_ts` and `last_indexed_at` watermarks live in the SQLite `meta` table, not in this file.
 
 ### Incremental Safety
 
