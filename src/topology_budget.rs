@@ -118,11 +118,11 @@ impl TopologyPlannerDefaults {
     }
 
     pub(crate) fn from_current_process() -> Self {
+        Self::from_current_process_with(effective_memory_snapshot())
+    }
+
+    fn from_current_process_with(memory: MemorySnapshot) -> Self {
         let pipeline = crate::indexer::lexical_rebuild_pipeline_settings_snapshot();
-        let memory = read_meminfo_snapshot(Path::new("/proc/meminfo")).unwrap_or(MemorySnapshot {
-            total_bytes: None,
-            available_bytes: None,
-        });
         Self::conservative(
             pipeline.available_parallelism,
             pipeline.reserved_cores,
@@ -135,20 +135,33 @@ impl TopologyPlannerDefaults {
     }
 }
 
+/// GH #496: the memory the planner sizes from. These are the host figures
+/// clamped to the tightest limit on the process's cgroup chain (systemd
+/// `MemoryMax`, container limits), the same probes the indexer's own defaults
+/// use. Reading host `/proc/meminfo` here made `status` report host RAM under
+/// a cap, and sized the planner's cache and in-flight caps for memory the
+/// process may not use.
+fn effective_memory_snapshot() -> MemorySnapshot {
+    MemorySnapshot {
+        total_bytes: crate::indexer::responsiveness::total_memory_bytes(),
+        available_bytes: crate::indexer::responsiveness::available_memory_bytes(),
+    }
+}
+
 pub(crate) fn inspect_host_topology_budget() -> TopologyBudgetPlan {
-    let defaults = TopologyPlannerDefaults::from_current_process();
+    inspect_host_topology_budget_with(effective_memory_snapshot())
+}
+
+fn inspect_host_topology_budget_with(memory: MemorySnapshot) -> TopologyBudgetPlan {
+    let defaults = TopologyPlannerDefaults::from_current_process_with(memory);
     #[cfg(target_os = "linux")]
     {
-        let memory = read_meminfo_snapshot(Path::new("/proc/meminfo")).unwrap_or(MemorySnapshot {
-            total_bytes: None,
-            available_bytes: None,
-        });
         topology_budget_for_sysfs(Path::new("/sys"), memory, defaults)
     }
     #[cfg(not(target_os = "linux"))]
     {
         fallback_plan(
-            fallback_topology(None, defaults.available_parallelism),
+            fallback_topology(Some(memory), defaults.available_parallelism),
             defaults,
             "linux sysfs topology is unavailable on this platform".to_string(),
         )
@@ -817,6 +830,29 @@ mod tests {
         assert_eq!(
             plan.advisory_budgets.cache_cap_bytes,
             plan.current_defaults.cache_cap_bytes
+        );
+    }
+
+    #[test]
+    fn host_topology_budget_sizes_from_the_memory_it_is_given() {
+        // GH #496: production hands the host planner the cgroup-clamped
+        // probes. The planner must report and size from that figure, not
+        // re-read host /proc/meminfo: under a 16 GiB cap on a big host,
+        // status showed host RAM and the caches were sized for it.
+        let capped = inspect_host_topology_budget_with(memory(16, 12));
+        let roomy = inspect_host_topology_budget_with(memory(256, 224));
+        assert_eq!(capped.topology.memory_total_bytes, Some(16 * GIB));
+        assert_eq!(capped.topology.memory_available_bytes, Some(12 * GIB));
+        assert_eq!(roomy.topology.memory_total_bytes, Some(256 * GIB));
+        assert_eq!(
+            capped.current_defaults.cache_cap_bytes,
+            default_cache_cap_for_available(Some(12 * GIB))
+        );
+        assert!(
+            capped.advisory_budgets.cache_cap_bytes <= roomy.advisory_budgets.cache_cap_bytes,
+            "a capped process must not get a larger cache than a roomy one: {} > {}",
+            capped.advisory_budgets.cache_cap_bytes,
+            roomy.advisory_budgets.cache_cap_bytes
         );
     }
 
