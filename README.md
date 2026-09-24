@@ -1819,7 +1819,7 @@ Launch-time flags: `cass tui --refresh` (alias `--catch-up`) runs an incremental
 | `F9` | Toggle match mode: standard (default) ↔ prefix, where every bare word of 2+ characters also matches as a prefix (`auth` → `auth*`; phrases, operators and wildcards are left as typed) |
 | `F12` / `Alt+R` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
 | `Alt+F` | Cycle result grouping: agent → conversation → workspace → flat |
-| `Alt+S` | Cycle search mode (lexical / semantic / hybrid) |
+| `Alt+S` | Cycle search mode (lexical / semantic / hybrid). Without an installed model (or vector index) the status line says results stay lexical and names the command: `cass models install` (offline `--from-file <dir>`) or `cass index --semantic`; nothing downloads on its own |
 | `Ctrl+D` | Cycle density: Compact → Cozy → Spacious |
 | `Ctrl+1`..`Ctrl+9` | Save the current view to slot N |
 | `Shift+1`..`Shift+9` | Load the view from slot N |

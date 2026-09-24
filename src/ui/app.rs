@@ -4797,6 +4797,34 @@ fn match_mode_token(mode: MatchMode) -> &'static str {
     }
 }
 
+/// What the user must do for semantic or hybrid search to use the model, or
+/// `None` when it already can (or is being prepared). Until then those modes
+/// return lexical results. cass never downloads a model without an explicit
+/// command, so this names the command (2l1b0.66).
+fn semantic_mode_guidance(availability: &SemanticAvailability) -> Option<String> {
+    use SemanticAvailability as S;
+    match availability {
+        S::Ready { .. }
+        | S::HashFallback
+        | S::Downloading { .. }
+        | S::Verifying
+        | S::IndexBuilding { .. }
+        | S::UpdateAvailable { .. } => None,
+        S::NotInstalled | S::NeedsConsent | S::ModelMissing { .. } => Some(
+            "results stay lexical until the MiniLM model is installed: run `cass models install` \
+             (offline: `cass models install --from-file <dir>`)"
+                .to_string(),
+        ),
+        S::IndexMissing { .. } | S::IndexStale { .. } => Some(format!(
+            "results stay lexical ({}): run `cass index --semantic`",
+            availability.summary()
+        )),
+        S::Disabled { .. } | S::DatabaseUnavailable { .. } | S::LoadFailed { .. } => {
+            Some(format!("results stay lexical ({})", availability.summary()))
+        }
+    }
+}
+
 /// The query a search runs in prefix match mode (F9): every bare word of two
 /// or more characters also matches as a prefix (`auth` → `auth*`). Quoted
 /// phrases, `AND`/`OR`/`NOT`, negated (`-x`) and field (`a:b`) terms, and
@@ -17780,6 +17808,15 @@ impl super::ftui_adapter::Model for CassApp {
                     search_mode_str(self.search_mode),
                     shortcuts::SEARCH_MODE
                 );
+                // Semantic and hybrid fall back to lexical silently when the
+                // model or vectors are missing; say so, with the command,
+                // because cass never downloads a model on its own (2l1b0.66).
+                if self.search_mode != SearchMode::Lexical
+                    && let Some(guidance) = semantic_mode_guidance(&self.semantic_availability)
+                {
+                    self.status.push_str(": ");
+                    self.status.push_str(&guidance);
+                }
                 self.dirty_since = Some(Instant::now());
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
@@ -26793,6 +26830,50 @@ mod tests {
         assert_eq!(prefix_match_query(""), "");
         assert_eq!(prefix_match_query("  réseau  "), "  réseau*  ");
         assert_eq!(prefix_match_query("NOT x AND yy"), "NOT x AND yy*");
+    }
+
+    /// 2l1b0.66: with no model installed, Alt+S to semantic or hybrid only
+    /// said "Search mode: semantic" while results silently stayed lexical;
+    /// nothing in the TUI named `cass models install`.
+    #[test]
+    fn semantic_mode_without_a_model_names_the_install_command() {
+        let mut app = CassApp::default();
+        app.semantic_availability = SemanticAvailability::NotInstalled;
+        assert_eq!(app.search_mode, SearchMode::Lexical);
+
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert_eq!(app.search_mode, SearchMode::Semantic);
+        assert!(app.status.contains("cass models install"), "{}", app.status);
+        assert!(app.status.contains("--from-file"), "{}", app.status);
+
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert_eq!(app.search_mode, SearchMode::Hybrid);
+        assert!(app.status.contains("cass models install"), "{}", app.status);
+
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert_eq!(app.search_mode, SearchMode::Lexical);
+        assert!(
+            !app.status.contains("cass models install"),
+            "{}",
+            app.status
+        );
+
+        // Ready (or an explicit hash choice) needs no guidance.
+        app.semantic_availability = SemanticAvailability::HashFallback;
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert!(
+            !app.status.contains("results stay lexical"),
+            "{}",
+            app.status
+        );
+
+        // Missing vectors point at the index command, not the model install.
+        app.semantic_availability = SemanticAvailability::IndexMissing {
+            index_path: PathBuf::from("/data/vector_index"),
+        };
+        let guidance = semantic_mode_guidance(&app.semantic_availability).unwrap();
+        assert!(guidance.contains("cass index --semantic"), "{guidance}");
+        assert!(!guidance.contains("models install"), "{guidance}");
     }
 
     /// 2l1b0.55: F9 toggled a PFX/STD status token while every search ran the
