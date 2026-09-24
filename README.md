@@ -240,7 +240,10 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
   already-running local embedding daemon (including a socket selected with
   `CASS_DAEMON_SOCKET`) and only initialize the installed in-process model if
   daemon inference fails. Pass `--daemon` to permit auto-spawning a missing
-  daemon, or `--no-daemon` to force direct inference. `--fast-only` stays in
+  daemon in human-mode searches (robot/JSON searches never spawn one, even
+  with `--daemon`, because their bounded budget cannot wait for a daemon to
+  start; start `cass daemon` yourself first), or `--no-daemon` to force
+  direct inference. `--fast-only` stays in
   the deterministic hash-vector space. Each data directory gets a distinct
   default socket and owner-private pinned key; fresh handshake, health,
   embedding, batch, and rerank challenges authenticate the exact response and
@@ -1168,8 +1171,8 @@ LLMs have context limits. `cass` provides multiple levers to control output size
 
 | Flag | Effect |
 |------|--------|
-| `--fields minimal` | Only `source_path`, `line_number`, `agent` |
-| `--fields summary` | Adds `title`, `score` |
+| `--fields minimal` | Only `source_path`, `line_number`, `agent`, `source_id`, `conversation_id` |
+| `--fields summary` | `minimal` plus `title`, `score` |
 | `--fields score,title,snippet` | Custom field selection |
 | `--max-content-length 500` | Truncate long fields (UTF-8 safe, adds "...") |
 | `--max-tokens 2000` | Soft budget (~4 chars/token); adjusts truncation dynamically |
@@ -1219,7 +1222,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 2 | Usage error | Fix syntax (hint provided) |
 | 3 | Index/DB missing | Run `cass index --full` (retryable: true) |
 | 4 | I/O failure or unsafe operation refused (not a network code) | Branch on `err.kind`: fix path/permissions/space for `io`/`output-not-writable`; follow the hint for `refused-unsafe` |
-| 5 | Data corruption | Run `cass doctor check --json`; repair or restore the canonical SQLite archive before indexing |
+| 5 | Data corruption, or maintenance required | Inspect `cass health --json` / `cass status --json` / `cass doctor --json` and follow `recommended_action`: usually rebuild derived assets (`maintenance-required`, `checkpoint_incomplete` start that rebuild themselves); only a canonical-archive failure needs repair or restore |
 | 6 | Required input missing (password, resume command) | Supply the input (e.g. `--password-stdin`) and rerun |
 | 7 | Lock/busy | Retry later |
 | 8 | Partial result (`sources sync` only: some sources had path failures) | Inspect per-path errors in the JSON output and retry the failed sources |
@@ -1401,7 +1404,7 @@ cass search "TODO" --robot --robot-meta --limit 20
 cass search "TODO" --robot --robot-meta --limit 20 --cursor "eyJ..."
 ```
 
-Cursors are opaque tokens encoding the pagination state. They remain valid as long as the index isn't rebuilt.
+A cursor is base64 JSON `{"offset": N, "limit": M}`: a plain page position, not a snapshot. Any index change between pages (a new session indexed, a rebuild, a `forget`) shifts the ranking, so the next page can skip or repeat hits. Page quickly, or fix the window with `--until` when you need stable pages.
 
 ### Match Counts: Exact or Lower Bound
 
@@ -1456,7 +1459,8 @@ For debugging and logging, attach a request ID:
 
 ```bash
 cass search "bug" --robot --request-id "req-12345"
-# → { "hits": [...], "_meta": { "request_id": "req-12345" } }
+# → { "request_id": "req-12345", "hits": [...], ... }
+#   (top level always; also under _meta.request_id with --robot-meta)
 ```
 
 ### Idempotent Operations
@@ -1474,7 +1478,9 @@ Debug why a search returned unexpected results:
 
 ```bash
 cass search "auth*" --robot --explain
-# → Includes parsed query AST, term expansion, cost estimates
+# → Adds "explanation": the sanitized query, flat lists of its terms, phrases and
+#   operators (not a tree), the query type and index strategy, a low/medium/high cost
+#   class, a filter summary and warnings. Wildcards are reported, not expanded.
 
 cass search "auth error" --robot --dry-run
 # → Validates query syntax without executing
@@ -1619,7 +1625,7 @@ cass introspect --json
  | Flag | Purpose |
  |------------------|--------------------------------------------------------|
  | --robot / --json | Machine-readable JSON output (required!) |
- | --fields minimal | Reduce payload: source_path, line_number, agent only |
+ | --fields minimal | Reduce payload: source_path, line_number, agent, source_id, conversation_id |
  | pack --max-tokens N | Budget a cited handoff pack |
  | --limit N | Cap result count |
  | --agent NAME | Filter to specific agent (claude, codex, cursor, etc.) |
@@ -2367,9 +2373,9 @@ Toasts feature:
 ## 🏎️ Performance Engineering: Caching & Warming
 To achieve sub-60ms latency on large datasets, `cass` implements a multi-tier caching strategy in `src/search/query.rs`:
 
-1. **Sharded LRU Cache**: The `prefix_cache` is split into shards (default 256 entries each) to reduce mutex contention during concurrent reads/writes from the async searcher.
+1. **Sharded LRU Cache**: The `prefix_cache` is organized into shards (default 256 entries each) that bound per-prefix memory; all shards sit behind one `Mutex`, so the sharding limits size, not lock contention. The cache lives in the searching process: it pays off in the TUI, where each keystroke re-queries, and not for one-shot CLI searches, which start with an empty cache.
 2. **Bloom Filter Pre-checks**: Each cached hit stores a 64-bit Bloom filter mask of its content tokens. When a user types more characters, we check the mask first. If the new token isn't in the mask, we reject the cache entry immediately without a string comparison.
-3. **Predictive Warming**: A background `WarmJob` thread watches the input. When the user pauses typing, it triggers a lightweight query against the lexical reader to pre-load relevant index segments into the OS page cache.
+3. **Predictive Warming**: In the TUI, a background `WarmJob` thread watches the input. When the user pauses typing, it runs a lightweight query against the lexical reader to pre-load relevant index segments into the OS page cache. One-shot CLI searches run with warming disabled.
 
 ## 🔌 The Connector Interface (Polymorphism)
 The system is designed for extensibility via the `Connector` trait (`src/connectors/mod.rs`). This allows `cass` to treat disparate log formats as a uniform stream of events.

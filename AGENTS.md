@@ -717,7 +717,7 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 | Flag | Purpose |
 |------|---------|
 | `--robot` / `--json` | Machine-readable JSON output (required!) |
-| `--fields minimal` | Reduce payload: `source_path`, `line_number`, `agent` only |
+| `--fields minimal` | Reduce payload: `source_path`, `line_number`, `agent`, `source_id`, `conversation_id` |
 | `--limit N` | Cap result count |
 | `--agent NAME` | Filter to specific agent (claude, codex, cursor, etc.) |
 | `--days N` | Limit to recent N days |
