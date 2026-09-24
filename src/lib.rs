@@ -2931,12 +2931,10 @@ pub enum AnalyticsCommand {
         budget_ms: u64,
     },
     /// Rebuild / backfill analytics rollup tables with progress output
+    /// (always rebuilds; fresh rollups are not skipped)
     Rebuild {
         #[command(flatten)]
         common: AnalyticsCommon,
-        /// Force full rebuild even if rollups appear fresh
-        #[arg(long)]
-        force: bool,
         /// Which analytics track to rebuild: message-level rollups (a),
         /// token-level rollups (b), or both (all)
         #[arg(long, value_enum, default_value_t = AnalyticsTrack::A)]
@@ -18276,11 +18274,9 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
         AnalyticsCommand::Tokens { common, group_by } => {
             run_analytics_tokens(common, *group_by, db_path.as_ref())?
         }
-        AnalyticsCommand::Rebuild {
-            common,
-            force,
-            track,
-        } => run_analytics_rebuild(common, *force, *track, db_path.as_ref())?,
+        AnalyticsCommand::Rebuild { common, track } => {
+            run_analytics_rebuild(common, *track, db_path.as_ref())?
+        }
         AnalyticsCommand::Tools {
             common,
             group_by,
@@ -19226,7 +19222,6 @@ fn acquire_analytics_maintenance_lock(
 /// Rebuild Track A (optionally windowed) and/or the full Track B ledger rollups.
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
-    _force: bool,
     track: AnalyticsTrack,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
@@ -19635,7 +19630,7 @@ mod analytics_filter_validation_tests {
         windowed.days = Some(2);
 
         for track in [AnalyticsTrack::A, AnalyticsTrack::All] {
-            let payload = run_analytics_rebuild(&windowed, false, track, Some(&db_path))
+            let payload = run_analytics_rebuild(&windowed, track, Some(&db_path))
                 .unwrap_or_else(|e| panic!("{track:?}: {}", e.message));
             let has_ms = payload.get("since_ms").is_some();
             let has_day = payload.get("since_day_id").is_some();
@@ -19648,13 +19643,12 @@ mod analytics_filter_validation_tests {
             assert_eq!(SqliteStorage::day_id_from_millis(ms), day, "{payload}");
         }
 
-        let err =
-            run_analytics_rebuild(&windowed, false, AnalyticsTrack::B, Some(&db_path)).unwrap_err();
+        let err = run_analytics_rebuild(&windowed, AnalyticsTrack::B, Some(&db_path)).unwrap_err();
         assert_eq!(err.code, 2);
         assert!(err.message.contains("--track b"), "{}", err.message);
 
         // No window requested => never advertised, whichever track ran.
-        let payload = run_analytics_rebuild(&common(), false, AnalyticsTrack::All, Some(&db_path))
+        let payload = run_analytics_rebuild(&common(), AnalyticsTrack::All, Some(&db_path))
             .unwrap_or_else(|e| panic!("{}", e.message));
         assert!(payload.get("since_ms").is_none(), "{payload}");
         assert!(payload.get("since_day_id").is_none(), "{payload}");
@@ -27055,7 +27049,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  data.overall_elapsed_ms: u64".into(),
         "  data.wal_checkpoint: string ('completed' | 'failed') — the rebuild closes with a".into(),
         "                  WAL checkpoint so the next opener replays nothing".into(),
-        "  --force: rebuild even when rollups appear fresh".into(),
+        "  Always rebuilds; fresh rollups are not skipped (there is no --force).".into(),
         String::new(),
         "### analytics validate".into(),
         "  data.summary: { errors, warnings, drift_entries, buckets_checked, buckets_total }".into(),
@@ -27088,7 +27082,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  exit 9 + retryable=true: transient DB lock/busy — retry after 1s".into(),
         "  exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first".into(),
         "  exit 3: no database — run 'cass index --full' to create it".into(),
-        "  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop".into(),
+        "  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --json' for a manual rebuild loop".into(),
         String::new(),
         "## Common Workflows".into(),
         "  # Quick health check".into(),
@@ -27103,7 +27097,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  # Validation + remediation loop".into(),
         "  cass analytics validate --json | jq '.data.summary'".into(),
         "  # If errors: rebuild then re-validate".into(),
-        "  cass analytics rebuild --force --json && cass analytics validate --json".into(),
+        "  cass analytics rebuild --json && cass analytics validate --json".into(),
     ]
 }
 

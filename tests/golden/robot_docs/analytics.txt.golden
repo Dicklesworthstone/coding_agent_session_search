@@ -101,7 +101,7 @@ analytics:
   data.overall_elapsed_ms: u64
   data.wal_checkpoint: string ('completed' | 'failed') — the rebuild closes with a
                   WAL checkpoint so the next opener replays nothing
-  --force: rebuild even when rollups appear fresh
+  Always rebuilds; fresh rollups are not skipped (there is no --force).
 
 ### analytics validate
   data.summary: { errors, warnings, drift_entries, buckets_checked, buckets_total }
@@ -134,7 +134,7 @@ analytics:
   exit 9 + retryable=true: transient DB lock/busy — retry after 1s
   exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first
   exit 3: no database — run 'cass index --full' to create it
-  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop
+  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --json' for a manual rebuild loop
 
 ## Common Workflows
   # Quick health check
@@ -149,4 +149,4 @@ analytics:
   # Validation + remediation loop
   cass analytics validate --json | jq '.data.summary'
   # If errors: rebuild then re-validate
-  cass analytics rebuild --force --json && cass analytics validate --json
+  cass analytics rebuild --json && cass analytics validate --json

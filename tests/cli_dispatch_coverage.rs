@@ -3208,7 +3208,7 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
             vec!["analytics", "models", "--group-by", "month"],
         ),
         ("analytics/incidents", vec!["analytics", "incidents"]),
-        ("analytics/rebuild", vec!["analytics", "rebuild", "--force"]),
+        ("analytics/rebuild", vec!["analytics", "rebuild"]),
         ("analytics/validate", vec!["analytics", "validate", "--fix"]),
     ];
 
@@ -4515,20 +4515,23 @@ fn analytics_rebuild_help_shows_force_flag() {
         .stdout(contains("--json"));
 }
 
+/// 2l1b0.68: `analytics rebuild` always rebuilds, so the former `--force`
+/// (parsed, then ignored) is gone rather than accepted as a silent no-op.
 #[test]
-fn analytics_rebuild_parses_force_and_json_flags() {
-    let cli = parse_cli_ok(
+fn analytics_rebuild_parses_json_and_rejects_force() {
+    let err = parse_cli_err(
         ["cass", "analytics", "rebuild", "--force", "--json"],
-        "parse analytics rebuild with force+json",
+        "analytics rebuild --force must be rejected",
+    );
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+
+    let cli = parse_cli_ok(
+        ["cass", "analytics", "rebuild", "--json"],
+        "parse analytics rebuild with json",
     );
 
     match cli.command {
-        Some(Commands::Analytics(AnalyticsCommand::Rebuild {
-            common,
-            force,
-            track,
-        })) => {
-            assert!(force, "--force should be true");
+        Some(Commands::Analytics(AnalyticsCommand::Rebuild { common, track })) => {
             assert!(common.json, "--json should be true");
             assert_eq!(
                 track,
