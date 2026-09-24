@@ -4,12 +4,14 @@
 
 Scope: local `main` at `71759163` (origin/main `aaa4424a` plus SageSnow's
 unpushed dhfzn commit). Read all 1,353 lines of AGENTS.md, all 3,598 lines of
-README.md and the dated sections of this plan. Seven read-only audits checked
-about 650 README, AGENTS and contract-doc claims against the code, each cited to
+README.md and this plan's 2026-09-21 to 09-23 sections (the
+09-04 and 09-01 sections by heading only). Seven read-only audits checked
+about 900 README, AGENTS and contract-doc claims (~480 README/AGENTS claims and
+~420 contract-doc promises) against the code, each cited to
 file:line; the load-bearing findings were re-verified by hand or by running a
 binary. Runtime evidence came from:
 - a release build of `71759163` (SHA-256 `937cf325448051a6…c97d`);
-- a 94-step journey on a synthetic real-format corpus (365 conversations,
+- a 76-step journey (54 correctness checks) on a synthetic real-format corpus (365 conversations,
   6,617 messages; Claude Code, Codex, Gemini, Aider, Pi-Agent), run on the
   released v0.8.0 binary and on HEAD;
 - the owner's live archive, read-only, and two quiescent copies of it;
@@ -26,16 +28,20 @@ vision:
 
 1. **It has not worked for its owner for 41 days, but HEAD can fix that.**
    - The owner's live archive holds 2,715 conversations and 3,683,202 messages
-     in 16.9 GB. It was last indexed on 2026-08-14. The live Quill generation
-     serves 568,527 documents, the rebuild checkpoint is incomplete, and no
-     scheduler is installed.
+     in 16.9 GB, less than half of the owner's actual history. It was last
+     indexed on 2026-08-14. The live Quill generation serves 568,527
+     documents, the rebuild checkpoint is incomplete, and no scheduler is
+     installed.
    - At 21:18 tonight a `lexical_refresh` by an older binary was OOM-killed at
      16.1 GB inside a 16 GB scope. Its governor reported headroom against
      97 GB of *host* memory.
    - On a copy of that archive under the same 16 GB cap, HEAD finished the
      resumed rebuild (2,715/2,715 conversations, 2,222,489 docs) in about
-     10 minutes. It was pinned at the cap the whole time, and ~15 GB of its
-     RSS lies outside what the governor controls (`.72`).
+     10 minutes. It then ingested the owner's full history (7,940
+     conversations, 8.3M messages; the live archive only ever held 3.68M)
+     in about an hour without dying. It was pinned at the cap the whole
+     time, ~15 GB of its RSS lies outside what the governor controls, and
+     it wrote 120 GB. Its final rebuild needs 82 GB of free disk (`.72`).
    - The canonical file fails the engine's own integrity check: about 1M
      orphaned pages. Every row is still readable, but no repair path exists
      (`.73`).
@@ -74,7 +80,8 @@ vision:
 | Archive shape (read-only copy) | median 246 messages per conversation, p90 2,450, max 307,036 (706 MB of text) in one Codex rollout; the next largest hold 238,975, 125,453 and 111,115 messages; 5.34 GB of content in total |
 | C SQLite `quick_check(1000000)` on a quiescent copy | 0 "2nd reference" errors: the 09-03 double references recorded in `scohn` are gone. 32 "free space corruption" lines (known fsqlite dialect). ≥999,968 "never used" pages (the check stopped at its 1M-error limit) in a 4,137,946-page file whose freelist holds 3,826 pages |
 | HEAD `doctor check`, full page probe, on a copy (73 s) | `database` fails: "frankensqlite integrity_check: database disk image is malformed: page 8196 is never used (2715 conversations, 3683202 messages)". `archive-db-corrupt`, data-loss risk high, `safe_for_auto_repair:false`, all archive-wide collectors deferred. `next_command` is still `cass doctor --fix`, and `doctor repair --dry-run` produces no plan |
-| HEAD `index --background` on a copy, `systemd-run -p MemoryMax=16G` | rebuild resumed from 507 and finished 2,715/2,715 conversations (2,222,489 docs) in ~10 min. Controller `pressure_limited` / `below_emergency_reserve`, in-flight ~0.5 GB, but RSS 15.4–16.5 GB and the scope pinned at its 16 GiB peak. The source scan that followed kept ingesting newly discovered sessions: 4,596 conversations by 23:13, 38 min in, RSS ~16.4 GB, not killed. The final outcome is recorded on `.72` |
+| HEAD `index --background` on a copy, `systemd-run -p MemoryMax=16G` | rebuild resumed from 507 and finished 2,715/2,715 conversations (2,222,489 docs) in ~10 min. Controller `pressure_limited` / `below_emergency_reserve`, in-flight ~0.5 GB, but RSS 15.4–16.5 GB and the scope pinned at its 16 GiB peak. The source scan then ingested the owner's missing history in 61 min, never killed: 7,940 conversations and 8,297,810 messages (Codex alone 6,429 / 6.57M). The live archive had only ever captured 3.68M of them. The canonical DB grew from 16.9 to ~35 GB and `bytes_written` was 120 GB. The run then exited 14 after 71 min: the post-scan authoritative lexical rebuild needs 82.3 GB of free disk and 79.0 GB was available (my scratch copies had consumed it). The message says "index refused to start". The new messages are therefore canonical-only until a rebuild runs (`.72` comment) |
+| Read-only searches on the rebuilt copy (`--no-maintenance`, 2.2M docs, host loaded by the concurrent scan) | 7 queries (common term, phrase, `--since`, `--agent`, default hybrid): 2.3–2.5 s wall per one-shot command (5.0 s cold). Of that, `search_ms` is 190–250 ms and `other_ms` ~2.2 s (open and preflight). `--days 7` returned 0 hits without error; this is inconclusive for #499, because the scan's newer sessions were not yet published. Indicative only |
 | HEAD logical `archive export` → `verify` → `import` of a copy | export 3,737,204 records (all 3,683,202 messages) into 11.3 GB in 304 s; verify passed in 37 s. Import without flags refuses the v20 archive; with `--allow-compatible-schema`, the migrating import streams at ~210–230 MB/min using ~94 MB RSS (3.0 GB written after 14 min). The restored database's integrity result is recorded on `.73` |
 | Synthetic e2e, v0.8.0 → HEAD | 50/54 on HEAD. The misses: `forget` leak (real), encrypted-export plaintext title (real, also in v0.8.0), and two harness artifacts (the missing-index envelope correctly goes to stderr; `--fields summary` omits `created_at`, while the `--days 7` filter is correct with full fields). Full index 61.7 s → 22.6 s; exact-token search p50 wall 180 → 136 ms (engine 80 → 55 ms). Host load was 17–40 and there was no A/A control, so these timings are indicative only, not a performance claim |
 | Full lib gate at `71759163` (`/data/tmp/cass-gate.IsJbqy`) | source-identity 0, fmt 0, **clippy 101** (`from_current_process` never used, topology_budget.rs:120), **lib 101: 7,842 passed / 9 failed / 45 ignored** in 148.9 s, ubs 1. Failures: 3 ANN WAL tests (`ds7uy.3.3`), `nohx1`, `962e8`, `fqt9s` watch backlog, and two untracked ones, now `.70` (a global panic-injection race between parallel rebuild tests) and `.71` (gh470 daemon progress) |
@@ -117,8 +124,8 @@ vision:
 | `.67` | 1 | encrypted `export-html` shows the first prompt and session metadata in plaintext | `.25` |
 | `.68` | 1 | ambition: no silent substitution. Echo the effective interpretation in `_meta` and add a metamorphic search-semantics oracle | |
 | `.69` | 2 | ambition: generate the exit-code, env, connector and dependency tables from the code registries | |
-| `.70` | 1 | lib suite nondeterministic: global panic injections leak between parallel tests | |
-| `.71` | 1 | lib test `gh470_daemon_progress…` red: the worker skips message id −1 | |
+| `.70` | 1 | lib suite nondeterministic: global panic injections leak between parallel tests | `.25` |
+| `.71` | 1 | lib test `gh470_daemon_progress…` red: the worker skips message id −1 | `.25` |
 | `.72` | 0 | ambition: the indexer lives at the memory cap. Govern resident memory, not only in-flight bytes; chunk giant conversations | |
 | `.73` | 1 | ambition: orphaned pages in the owner archive; no repair plan exists, and `next_command` contradicts the check | |
 
@@ -195,7 +202,7 @@ Ambition record:
     locality) as oracles for the wrong-answer class;
   - lossless logical reconstruction as the repair primitive.
 
-Refinement record (five passes over the new beads):
+Refinement record (six passes over the new beads):
 1. **Test and log standard.** Every new bead received two acceptance criteria:
    real-binary tests with E2E_LOGGING_SCHEMA logs plus a negative case that
    fails on `71759163`, and a gate receipt plus strict UBS.
@@ -209,7 +216,9 @@ Refinement record (five passes over the new beads):
    resurrect a forgotten session, so the defect is a leak *window*. Known
    failures got receipt comments (`fqt9s`, `nohx1`, `ds7uy.3.3`, `962e8`); the
    two untracked failures became `.70`/`.71`.
-5. **Consistency.** No further change was needed. `br dep cycles` is empty and
+5. **Consistency.** Release certification (`.25`) needs a green full lib
+   suite, so `.70` and `.71` became blockers of `.25`. A sixth pass found
+   nothing further. `br dep cycles` is empty and
    `bv --robot-triage` ranks `.49` and `.50` as the top two picks.
 
 This is not proof that every gap was found. Historical plans were read by the
@@ -241,8 +250,8 @@ audits, not re-read by me line by line.
      live, and bv skips its priority-mismatch and duplicate checks above
      2,000 issues (the tracker holds 2,294).
 4. **Would the open beads close the gap?** Not before this pass. Twenty-five
-   gaps had no bead: 19 found by the audits, 2 lib failures and 4 from the
-   ambition rounds. With them, the graph covers every gap found tonight.
+   gaps had no bead: 19 found by the audits and the e2e run, 2 lib
+   failures and 4 from the ambition rounds. With them, the graph covers every gap found tonight.
    Closure still requires shipping a release and an operator action on the
    live archive, and neither is a bead that closes itself.
 5. **Vision goals with no bead before this pass.**
