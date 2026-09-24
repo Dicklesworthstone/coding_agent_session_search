@@ -1,6 +1,6 @@
 # Robot Mode Guide (cass)
 
-Updated: 2026-05-09
+Updated: 2026-09-24
 
 ## TL;DR (copy/paste)
 - First command: `cass triage --json` (follow `next_command` when present)
@@ -16,7 +16,9 @@ Updated: 2026-05-09
 - Paginate: use `_meta.next_cursor` → `cass search "query" --robot --cursor <value>`
 - Budget tokens: `--max-tokens 200 --robot-meta`
 - Minimal fields: `--fields minimal` (path,line,agent)
-- Freshness and fallback hints: `--robot-meta` (adds search mode, semantic refinement, lexical fallback reason, index freshness, and warnings)
+- Freshness and fallback hints: `--robot-meta` (adds search mode, semantic refinement, lexical fallback reason, index freshness, the effective interpretation of the request, and warnings)
+- Timeouts: an expired search or pack exits 0 with `hits: []` and `budget.timed_out: true`; always read `budget` before treating an empty result as "no matches"
+- Busy index: exit 7 (`err.kind="index-busy"`) is retryable; cass rebuilds missing or unusable indexes in a detached background process, never inside your search
 - View source: `cass view <path> -n <line> --json`
 - Health: `cass health --json` or `cass state --json`
 - Incident mining: `cass analytics incidents --limit 10 --json`
@@ -34,7 +36,7 @@ Updated: 2026-05-09
 | Pagination | pass `_meta.next_cursor` back via `--cursor` |
 | Limit output fields | `--fields minimal` or comma list (`source_path,line_number,agent,title`) |
 | Truncate content | `--max-content-length 400` or budgeted `--max-tokens 200` |
-| Metadata | `--robot-meta` (elapsed_ms, cache stats, index freshness, cursor, warnings) |
+| Metadata | `--robot-meta` (elapsed_ms, search mode and fallback, cache stats, index freshness, cursor, effective interpretation, warnings) |
 | Health snapshot | `cass state --json` (alias `status`) |
 | Capabilities | `cass capabilities --json` (static workflows, mistake recoveries, commands, flags, env vars, exit codes, limits) |
 | Introspection | `cass introspect --json` (schemas for responses) |
@@ -47,11 +49,18 @@ Updated: 2026-05-09
 - Treat `next_command` / `recommended_commands[]` from triage as the exact next-command contract. Health/status expose the same readiness recommendations for narrower probes. `recommended_action` is the human-readable summary; do not run repair commands by habit when cass is already rebuilding or when lexical fallback is an expected state.
 
 ## Response shapes (robot)
+`cass introspect --json` (`response_schemas`) is the authoritative, golden-pinned
+schema for every shape below; the lists name the fields agents branch on.
+
 - Search:
-  - top-level: `query, limit, offset, count, total_matches, hits, cursor, hits_clamped, request_id`
-  - `_meta` (with `--robot-meta`): `elapsed_ms, search_mode, requested_search_mode, mode_defaulted, semantic_refinement, fallback_tier, fallback_reason, wildcard_fallback, cache_stats{hits,misses,shortfall}, tokens_estimated, max_tokens, next_cursor, hits_clamped, state{index, database}, index_freshness`
-  - `_warning` present when index is stale (age/pending sessions)
-  - `aggregations` present when `--aggregate` is used
+  - top-level: `query, limit, offset, count, total_matches, hits, max_tokens, request_id, cursor, hits_clamped, budget{elapsed_ms,budget_ms,timed_out,skipped_sections,recommended_next_probe}`
+  - `sessions_filter` present with `--sessions-from`; `aggregations` with `--aggregate`; `explanation` with `--explain`; `suggestions` when cass has query suggestions
+  - `_meta` (with `--robot-meta`): `elapsed_ms, search_mode, requested_search_mode, mode_defaulted, fallback_tier, fallback_reason, semantic_refinement, refinement_level, semantic_fallback_reason, lexical_degrade_reason, wildcard_fallback, cache_stats, timing, tokens_estimated, max_tokens, request_id, next_cursor, hits_clamped, query_plan, cursor_manifest, explanation_cards, effective, state{index, database}, index_freshness`
+  - `_meta` may also carry `search_completeness` (quarantined conversations excluded), `storage_integrity`, `timeout_ms`/`timed_out`/`partial_results` (with `--timeout`), `ann_stats` or `ann_unavailable_reason` (with `--approximate`)
+  - `_meta.effective` echoes how cass interpreted the request: `db_path` and `db_path_source` (`--db`, `env:CASS_DB_PATH`, `--data-dir`, `env:CASS_DATA_DIR`, `env:XDG_DATA_HOME`, or `default`), `time_window{since_ms,since_from,until_ms,until_from}` (the `_from` fields name the flag, such as `--today` or `--days 7`), `filters{agents,workspaces,source,sessions_from_paths}`, and `auto_corrections` (the same notes printed on stderr)
+  - `_meta.lexical_degrade_reason` is `query_fuel_exhausted` when a hybrid search dropped its lexical leg because the query hit the per-query work ceiling; otherwise null
+  - `_meta.index_freshness.auto_refresh` reports the stale-on-read catch-up: `outcome` is `spawned`, `disabled`, `index_run_active`, `cooldown`, `guard_busy`, `spawn_failed`, `backed_off` or `tripped`, plus `trigger`
+  - `_warning` (with `--robot-meta`) present when the index is stale (age/pending sessions)
 - Pack:
   - top-level: `schema_version, query, _meta, limits, realized, health, freshness, pack, evidence, omitted, privacy, warnings`
   - `evidence[]`: redacted excerpt, citation, selection reason/score, token cost, roles, matched terms, and redactions
@@ -67,7 +76,9 @@ Updated: 2026-05-09
 ## Flags worth knowing
 - `--fields minimal|summary|<list>`: reduce payload size
 - `--max-content-length N` / `--max-tokens N`: truncate per-field / by budget
-- `--robot-format json|jsonl|compact`: choose encoding
+- `--robot-format json|jsonl|compact|sessions|toon`: choose encoding (`sessions` prints one `source_path` per line for chaining into `--sessions-from`; `toon` is Token-Optimized Object Notation)
+- `--timeout N` (ms): search budget; defaults to `CASS_SEARCH_BUDGET_MS`, else 120000
+- `--no-maintenance`: strict read-only search that never refreshes a checkpoint, joins lexical maintenance, or spawns catch-up work (conflicts with `--refresh` and `--daemon`)
 - `--request-id ID`: echoed in results/meta; good for correlation
 - Time filters: `--today --yesterday --week --days N --since DATE --until DATE`
 - Aggregations: `--aggregate agent,workspace,date,match_type`
@@ -184,10 +195,14 @@ cass search "panic" --robot --fields minimal --robot-meta \
 - Nonzero `freshness.stale_evidence_count` → check `health.recommended_action`, rerun with a tighter `--freshness-policy strict`, or refresh/index if status recommends it.
 - Pack warning `semantic_fallback_lexical` → evidence is lexical-only; install/backfill semantic assets only if semantic recall is required for this handoff.
 - `--require-evidence` with no matches → JSON error envelope with `err.kind="not-found"`; broaden the query or remove the requirement.
-- Empty results but expected matches → try `--aggregate agent,workspace` to confirm ingest; check `watch_state.json` pending
+- Empty results but expected matches → first check `budget.timed_out` (an expired budget also returns `hits: []`), then `_meta.effective` (database, time window and filters as cass applied them), then `--aggregate agent,workspace` to confirm ingest and `cass status --json` `pending.sessions` for unindexed sessions
+- Exit 7 `index-busy` → another index run holds the lock, or a rebuild is running with no searchable generation yet (the message reports `N of M conversations processed`); retry later instead of starting your own `cass index --full`
+- Error hint names a background rebuild (a pid, or "already rebuilding") → a detached `cass index` is repairing a missing or unusable lexical index; poll `cass status --json` (`.rebuild`) and retry the search when it finishes, without running `cass index` yourself meanwhile. If the hint says automatic rebuilds are disabled, backed off or stopped, run the command it names in a process that a short timeout will not kill
+- `_meta.lexical_degrade_reason="query_fuel_exhausted"` → the query exceeded the per-query lexical work ceiling; narrow wildcards or add filters
 - JSON parsing errors → use `--robot-format compact` to avoid pretty whitespace issues
 
 ## Change log (robot-facing)
+- 2026-09-24: Documented `_meta.effective`, the search `budget` envelope and timeout contract, `index-busy` and background rebuild handoffs, `auto_refresh` outcomes, `lexical_degrade_reason`, and the `sessions`/`toon` robot formats.
 - 2026-04-22: Documented hybrid-default search, lexical self-heal expectations, semantic fail-open metadata, and health/status readiness contract.
 - 0.1.30: `_meta.index_freshness` + `_warning` in search robot output; capabilities limits enforced; cursor/request-id exposed.
 
