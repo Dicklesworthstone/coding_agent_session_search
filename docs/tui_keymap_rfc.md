@@ -506,6 +506,11 @@ Actions: Copy selected paths, Copy selected content, Open selected in editor, Ex
 
 #### 1.12 Consent Dialog (semantic model download)
 
+Removed (2l1b0.66). Nothing ever opened it: model acquisition became the
+explicit `cass models install` step, and Alt+S into semantic or hybrid with
+no model now says to run it (`--from-file <dir>` offline). The table records
+the original design only.
+
 | Key | Action | Notes |
 |---|---|---|
 | `d` / `D` | Start model download (~23MB) | |

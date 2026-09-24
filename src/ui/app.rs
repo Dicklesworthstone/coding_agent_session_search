@@ -169,7 +169,6 @@ pub mod focus_ids {
     pub const COMMAND_PALETTE: FocusId = 10;
     pub const HELP_OVERLAY: FocusId = 11;
     pub const EXPORT_MODAL: FocusId = 12;
-    pub const CONSENT_DIALOG: FocusId = 13;
     pub const BULK_MODAL: FocusId = 14;
     pub const SAVED_VIEWS_MODAL: FocusId = 15;
     pub const SOURCE_FILTER_MENU: FocusId = 16;
@@ -179,7 +178,6 @@ pub mod focus_ids {
     pub const GROUP_PALETTE: u32 = 100;
     pub const GROUP_HELP: u32 = 101;
     pub const GROUP_EXPORT: u32 = 102;
-    pub const GROUP_CONSENT: u32 = 103;
     pub const GROUP_BULK: u32 = 104;
     pub const GROUP_SAVED_VIEWS: u32 = 105;
     pub const GROUP_SOURCE_FILTER: u32 = 106;
@@ -5383,8 +5381,6 @@ pub struct CassApp {
     pub saved_view_rename_mode: bool,
     /// Rename buffer used while editing saved view labels.
     pub saved_view_rename_buffer: String,
-    /// Whether the consent dialog (model download) is visible.
-    pub show_consent_dialog: bool,
     /// Semantic search availability state.
     pub semantic_availability: SemanticAvailability,
     /// Whether the source filter popup menu is open.
@@ -5676,7 +5672,6 @@ impl Default for CassApp {
             saved_view_drag: None,
             saved_view_rename_mode: false,
             saved_view_rename_buffer: String::new(),
-            show_consent_dialog: false,
             semantic_availability: SemanticAvailability::NotInstalled,
             source_filter_menu_open: false,
             source_filter_menu_selection: 0,
@@ -5871,11 +5866,6 @@ impl CassApp {
                 .with_group(GROUP_EXPORT),
         );
         g.insert(
-            FocusNode::new(CONSENT_DIALOG, Rect::new(15, 8, 50, 8))
-                .with_tab_index(-1)
-                .with_group(GROUP_CONSENT),
-        );
-        g.insert(
             FocusNode::new(BULK_MODAL, Rect::new(20, 5, 40, 10))
                 .with_tab_index(-1)
                 .with_group(GROUP_BULK),
@@ -5905,8 +5895,6 @@ impl CassApp {
             .create_group(GROUP_HELP, vec![HELP_OVERLAY]);
         self.focus_manager
             .create_group(GROUP_EXPORT, vec![EXPORT_MODAL]);
-        self.focus_manager
-            .create_group(GROUP_CONSENT, vec![CONSENT_DIALOG]);
         self.focus_manager
             .create_group(GROUP_BULK, vec![BULK_MODAL]);
         self.focus_manager
@@ -6564,7 +6552,6 @@ impl CassApp {
             && !self.show_bulk_modal
             && !self.show_saved_views_modal
             && !self.show_export_modal
-            && !self.show_consent_dialog
             && !self.source_filter_menu_open
             && !self.command_palette.is_visible()
     }
@@ -6573,7 +6560,6 @@ impl CassApp {
         if self.show_export_modal
             || self.show_bulk_modal
             || self.show_saved_views_modal
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible()
             || self.show_help
@@ -13169,72 +13155,6 @@ impl CassApp {
         }
     }
 
-    /// Render the semantic model consent dialog overlay.
-    fn render_consent_overlay(
-        &self,
-        frame: &mut super::ftui_adapter::Frame,
-        area: Rect,
-        styles: &StyleContext,
-    ) {
-        let dialog_w = 68u16.min(area.width.saturating_sub(2));
-        let dialog_h = 9u16.min(area.height.saturating_sub(2));
-        if dialog_w < 28 || dialog_h < 6 {
-            return;
-        }
-
-        let dialog_x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-        let dialog_area = Rect::new(dialog_x, dialog_y, dialog_w, dialog_h);
-
-        let bg_style = styles.style(style_system::STYLE_PANE_BASE);
-        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
-        let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
-        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
-        let key_style = styles.style(style_system::STYLE_KBD_KEY);
-
-        // Clear background — use draw_rect_filled to overwrite both characters
-        // and styles (Block::style only sets bg without clearing foreground text).
-        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
-        frame.draw_rect_filled(dialog_area, ftui::Cell::from_char(' ').with_bg(bg_color));
-        let outer = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title("Enable semantic search?")
-            .title_alignment(Alignment::Left)
-            .style(border_style);
-        let inner = outer.inner(dialog_area);
-        outer.render(dialog_area, frame);
-        if inner.is_empty() {
-            return;
-        }
-
-        let lines = vec![
-            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                "Semantic/Hybrid mode needs a local embedding model download.".to_string(),
-                text_style,
-            )]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[D]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Download model (recommended)".to_string(), text_style),
-            ]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[H]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(
-                    " Use hash fallback (no download)".to_string(),
-                    text_style,
-                ),
-            ]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[Esc]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Cancel for now".to_string(), muted_style),
-            ]),
-        ];
-        Paragraph::new(ftui::text::Text::from_lines(lines))
-            .style(text_style)
-            .wrap(ftui::text::WrapMode::Word)
-            .render(inner, frame);
-    }
-
     /// Render the saved views manager popup centered on screen.
     fn render_saved_views_overlay(
         &self,
@@ -14625,24 +14545,6 @@ pub enum CassMsg {
     },
     /// Export failed.
     ExportFailed(String),
-
-    // -- Consent dialog (semantic model download) -------------------------
-    /// Open the consent dialog.
-    ConsentDialogOpened,
-    /// Close the consent dialog.
-    ConsentDialogClosed,
-    /// User accepted model download.
-    ModelDownloadAccepted,
-    /// Model download progress update.
-    ModelDownloadProgress { bytes_downloaded: u64, total: u64 },
-    /// Model download completed.
-    ModelDownloadCompleted,
-    /// Model download failed.
-    ModelDownloadFailed(String),
-    /// User cancelled the active download.
-    ModelDownloadCancelled,
-    /// User accepted hash mode fallback (no ML model).
-    HashModeAccepted,
 
     // -- Source filter menu ------------------------------------------------
     /// Toggle the source filter popup menu.
@@ -16394,20 +16296,6 @@ impl super::ftui_adapter::Model for CassApp {
                 if ke.modifiers.contains(super::ftui_adapter::Modifiers::ALT)
         );
         if raw_alt_update_shortcut && !self.can_handle_update_shortcuts() {
-            return ftui::Cmd::none();
-        }
-
-        // Consent dialog intercepts D/H keys and blocks other query input
-        if self.show_consent_dialog
-            && let CassMsg::QueryChanged(ref text) = msg
-        {
-            if text.eq_ignore_ascii_case("d") {
-                return self.update(CassMsg::ModelDownloadAccepted);
-            }
-            if text.eq_ignore_ascii_case("h") {
-                return self.update(CassMsg::HashModeAccepted);
-            }
-            // Ignore other query input while consent dialog is open
             return ftui::Cmd::none();
         }
 
@@ -19354,145 +19242,6 @@ impl super::ftui_adapter::Model for CassApp {
                 })
             }
 
-            // -- Consent dialog -----------------------------------------------
-            CassMsg::ConsentDialogOpened => {
-                self.show_consent_dialog = true;
-                self.focus_manager.push_trap(focus_ids::GROUP_CONSENT);
-                self.focus_manager.focus(focus_ids::CONSENT_DIALOG);
-                ftui::Cmd::none()
-            }
-            CassMsg::ConsentDialogClosed => {
-                self.show_consent_dialog = false;
-                self.focus_manager.pop_trap();
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadAccepted => {
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::Downloading {
-                    progress_pct: 0,
-                    bytes_downloaded: 0,
-                    total_bytes: 0,
-                };
-                self.status = "Starting semantic model download...".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::info(
-                        "Starting semantic model download...",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadProgress {
-                bytes_downloaded,
-                total,
-            } => {
-                // Respect explicit non-download semantic modes and ignore stale
-                // download lifecycle events that may arrive out of order.
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                let progress_pct = bytes_downloaded
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .map_or(0, |pct| pct.min(100));
-                let progress_pct = u8::try_from(progress_pct).unwrap_or(100);
-                self.semantic_availability = SemanticAvailability::Downloading {
-                    progress_pct,
-                    bytes_downloaded,
-                    total_bytes: total,
-                };
-                if total > 0 {
-                    let done_mb = bytes_downloaded as f64 / 1_048_576.0;
-                    let total_mb = total as f64 / 1_048_576.0;
-                    self.status = format!(
-                        "Downloading semantic model: {progress_pct}% ({done_mb:.1}/{total_mb:.1} MB)"
-                    );
-                } else {
-                    self.status = format!("Downloading semantic model: {bytes_downloaded} bytes");
-                }
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadCompleted => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::Ready {
-                    embedder_id:
-                        crate::search::fastembed_embedder::FastEmbedder::embedder_id_static()
-                            .to_string(),
-                };
-                self.status = "Semantic model ready. Run `cass index --semantic` to build or refresh vector search data.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::success(
-                        "Semantic model download complete",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadFailed(err) => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::NotInstalled;
-                self.status = format!("Model download failed: {err}");
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::error(format!(
-                        "Model download failed: {err}"
-                    )));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadCancelled => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::NotInstalled;
-                self.status =
-                    "Model download cancelled. Semantic search remains disabled.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::warning(
-                        "Model download cancelled",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::HashModeAccepted => {
-                // User chose hash embedder fallback instead of downloading ML model.
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::HashFallback;
-                self.status = "Using hash embedder fallback for semantic mode.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::info(
-                        "Hash embedder fallback enabled",
-                    ));
-                ftui::Cmd::none()
-            }
-
             // -- Source filter menu -------------------------------------------
             CassMsg::SourceFilterMenuToggled => {
                 if self.source_filter_menu_open {
@@ -21392,11 +21141,6 @@ impl super::ftui_adapter::Model for CassApp {
                 ) {
                     return ftui::Cmd::msg(CassMsg::ViewStackPopped);
                 }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                    return ftui::Cmd::none();
-                }
                 if self.show_inspector {
                     self.show_inspector = false;
                     if self.inspector_state.is_active() {
@@ -22794,7 +22538,6 @@ impl super::ftui_adapter::Model for CassApp {
             || self.show_detail_modal
             || self.show_help
             || self.show_inspector
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible();
         if modal_visible && apply_style {
@@ -22910,10 +22653,6 @@ impl super::ftui_adapter::Model for CassApp {
 
         if self.source_filter_menu_open {
             self.render_source_filter_menu_overlay(frame, area, &styles);
-        }
-
-        if self.show_consent_dialog {
-            self.render_consent_overlay(frame, area, &styles);
         }
 
         // ── Help overlay ─────────────────────────────────────────────
@@ -24645,134 +24384,12 @@ mod tests {
         assert!(!app.show_detail_modal);
         assert!(!app.show_export_modal);
         assert!(!app.show_bulk_modal);
-        assert!(!app.show_consent_dialog);
         assert!(!app.source_filter_menu_open);
         assert_eq!(app.source_filter_menu_selection, 0);
         assert!(app.available_source_ids.is_empty());
         assert!(app.selected.is_empty());
         assert!(app.saved_views.is_empty());
         assert!(app.query_history.is_empty());
-    }
-
-    #[test]
-    fn model_download_accepted_closes_consent_and_sets_downloading_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ConsentDialogOpened);
-        assert!(app.show_consent_dialog);
-
-        let _ = app.update(CassMsg::ModelDownloadAccepted);
-
-        assert!(!app.show_consent_dialog);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Downloading {
-                progress_pct: 0,
-                bytes_downloaded: 0,
-                total_bytes: 0
-            }
-        ));
-        assert!(app.status.contains("Starting semantic model download"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_progress_updates_downloading_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadProgress {
-            bytes_downloaded: 50,
-            total: 100,
-        });
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Downloading {
-                progress_pct: 50,
-                bytes_downloaded: 50,
-                total_bytes: 100
-            }
-        ));
-        assert!(app.status.contains("50%"));
-    }
-
-    #[test]
-    fn model_download_completed_sets_ready_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadCompleted);
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Ready { .. }
-        ));
-        assert!(app.status.contains("Semantic model ready"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_failed_sets_not_installed_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadFailed("network timeout".to_string()));
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::NotInstalled
-        ));
-        assert!(app.status.contains("network timeout"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn hash_mode_accept_sets_hash_fallback_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ConsentDialogOpened);
-        assert!(app.show_consent_dialog);
-
-        let _ = app.update(CassMsg::HashModeAccepted);
-
-        assert!(!app.show_consent_dialog);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert!(app.status.contains("hash embedder fallback"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_events_do_not_override_hash_fallback() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::HashModeAccepted);
-        let status_after_hash = app.status.clone();
-
-        let _ = app.update(CassMsg::ModelDownloadProgress {
-            bytes_downloaded: 10,
-            total: 100,
-        });
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadCompleted);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadFailed("late failure".to_string()));
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadCancelled);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
     }
 
     #[test]
