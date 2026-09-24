@@ -29,6 +29,32 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
+## [Unreleased]
+
+### Fixed
+
+- **Search no longer rebuilds or strands a missing lexical index.** When search
+  needs a repair it will not run inline, it starts a detached
+  `cass index --full --background` and names the pid in the error hint; a robot
+  search during a first build returns exit 7 `index-busy` with progress at once.
+  Previously every search restarted the rebuild and its own timeout killed it,
+  so a large archive's index never converged
+  ([76306c0c](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/76306c0c)).
+- **`total_matches` is exact up to 5M documents** (was 50k). On a 1M-document
+  archive the capped value read 11 for a term with 11,915 matches; exact counts
+  cost 0.00-0.10 s CPU there
+  ([1ca2503e](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/1ca2503e)).
+
+### Performance
+
+- **Secret redaction ~26x faster on real text.** Unicode `\b` in the secret
+  patterns forced the regex engine off its DFA for every message containing a
+  non-ASCII byte; the patterns now use ASCII boundaries, which redact at least
+  as much. Measured 10 → 261-284 MiB/s on 593 MiB of session text, and 9.5x
+  more messages ingested per CPU-second in an A/B incremental index on a clone
+  of a 2.1M-message archive
+  ([ff6d6485](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ff6d6485)).
+
 ## [v0.9.0] -- 2026-09-19
 
 ### Added
