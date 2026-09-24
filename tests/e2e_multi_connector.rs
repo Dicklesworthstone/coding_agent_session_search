@@ -151,6 +151,196 @@ fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
     assert_eq!(messages(), 2, "a native-ID edit must not append a message");
 }
 
+/// GH #499 (bead 2l1b0.49): once an incremental run tombstones a row inside a
+/// sealed Quill segment, every date-filtered search failed with "posting
+/// cursor invariant failed: Boolean children belong to different segment
+/// domains" (exit 9) on frankensearch-quill 0.3.1. The indexer tombstones on
+/// the revised-native-message path, so a Codebuff edit reproduces it. Twelve
+/// messages keep the tombstone density under the engine's compaction
+/// threshold, and the window covers only some of them: a window over every
+/// row lowers to a whole-segment match and never reached the bug.
+#[test]
+fn gh499_date_window_after_a_native_revision_tombstones_a_sealed_segment() {
+    use coding_agent_search::search::{quill_bridge, tantivy};
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+    use std::time::{Duration, SystemTime};
+
+    /// Tombstones and segments summed over every Quill MANIFEST under
+    /// `root`: a single generation or each shard of a federated bundle.
+    fn manifest_totals(root: &Path) -> (u64, usize) {
+        let mut totals = (0, 0);
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            if dir.join("MANIFEST").is_file()
+                && let Some(live) = quill_bridge::manifest_live_doc_count(&dir)
+            {
+                totals.0 += live.tombstones;
+                totals.1 += live.segments;
+            }
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        totals
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let chat = home.join(".config/manicode/projects/window/chats/2026-08-01T12-00-00.000Z");
+    fs::create_dir_all(&chat).unwrap();
+    let transcript = chat.join("chat-messages.json");
+    // Message i is dated 2026-08-(i+1); message 5 is the one revised.
+    let write_transcript = |revised: bool, modified: SystemTime| {
+        let records: Vec<Value> = (0..12)
+            .map(|i| {
+                let text = if i == 5 && revised {
+                    format!("windowmsg{i} gh499marker revisedanswer")
+                } else {
+                    format!("windowmsg{i} gh499marker originalanswer{i}")
+                };
+                json!({
+                    "id": format!("native-{i}"),
+                    "variant": if i % 2 == 0 { "user" } else { "ai" },
+                    "content": text,
+                    "timestamp": format!("2026-08-{:02}T12:00:00.000Z", i + 1),
+                })
+            })
+            .collect();
+        fs::write(&transcript, serde_json::to_vec(&records).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    };
+    write_transcript(false, SystemTime::now() - Duration::from_secs(3600));
+
+    let command = || {
+        let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .env("TZ", "UTC")
+            .current_dir(&home)
+            .timeout(Duration::from_secs(180));
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command
+    };
+    let index = |args: &[&str]| {
+        let started = std::time::Instant::now();
+        let output = command().args(args).output().unwrap();
+        eprintln!(
+            "{}",
+            json!({"step": "index", "args": args, "exit": output.status.code(),
+                   "elapsed_ms": started.elapsed().as_millis()})
+        );
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    index(&["index", "--full", "--json"]);
+    write_transcript(true, SystemTime::now());
+    index(&["index", "--json"]);
+
+    let index_root = tantivy::expected_index_dir(&data);
+    let (tombstones, segments) = manifest_totals(&index_root);
+    eprintln!(
+        "{}",
+        json!({"step": "manifest", "root": index_root, "tombstones": tombstones,
+               "segments": segments})
+    );
+    assert!(
+        tombstones > 0,
+        "the fixture needs a tombstone in a sealed segment ({segments} segments)"
+    );
+
+    let output = command()
+        .args([
+            "search",
+            "gh499marker",
+            "--agent",
+            "codebuff",
+            "--since",
+            "2026-08-04",
+            "--until",
+            "2026-08-09",
+            "--mode",
+            "lexical",
+            "--robot",
+            "--limit",
+            "50",
+            "--no-maintenance",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "{}",
+        json!({"step": "search", "exit": output.status.code(), "stderr_tail":
+               stderr.lines().rev().take(3).collect::<Vec<_>>()})
+    );
+    assert!(
+        output.status.success(),
+        "a date-filtered search over a tombstoned segment must succeed: {stderr}"
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let contents: Vec<&str> = payload["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["content"].as_str().unwrap_or_default())
+        .collect();
+    let messages: BTreeSet<usize> = contents
+        .iter()
+        .filter_map(|content| {
+            let start = content.find("windowmsg")? + "windowmsg".len();
+            content[start..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    eprintln!("{}", json!({"step": "hits", "messages": messages}));
+    // 2026-08-04 through 2026-08-09 are messages 3..=8.
+    assert_eq!(
+        messages,
+        (3..=8).collect::<BTreeSet<usize>>(),
+        "{contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("revisedanswer")),
+        "the live replacement is served: {contents:?}"
+    );
+    assert!(
+        !contents
+            .iter()
+            .any(|content| content.contains("originalanswer5")),
+        "the tombstoned row is not: {contents:?}"
+    );
+}
+
 /// Generated rolling windows use the reporter-confirmed Grok Bot 0.44.0
 /// envelope and chat fields (GH447 comment 5592555144). They exercise CASS
 /// ingestion, not a live macOS application or complete cloud history.
