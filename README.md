@@ -943,9 +943,9 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass auth error --json` | `cass search "auth error" --json` | Unquoted robot-mode query words folded into search |
 | `cass search --agent codex --limit 5 auth error --json` | `cass search "auth error" --agent codex --limit 5 --json` | Query moved before leading search filters |
 | `cass view --path session.jsonl --line 42 --json` | `cass view session.jsonl --line 42 --json` | Named path option converted to required positional path |
-| `cass view session.jsonl --line-number 42 --json` | `cass view session.jsonl --line 42 --json` | Search result field name accepted as a line alias |
-| `cass view session.jsonl line_number=42 --json` | `cass view session.jsonl --line 42 --json` | Search result field assignment accepted as a line option |
-| `cass view source_path=session.jsonl source_id=local line_number=42 --json` | `cass view session.jsonl --source local --line 42 --json` | Search hit field bundle accepted as a follow-up command |
+| `cass view session.jsonl --line-number 42 --json` | `cass view session.jsonl --line 42 --json` | Legacy alias for `--line`; still reads raw file line 42 |
+| `cass view session.jsonl line_number=42 --json` | `cass view session.jsonl --message-index 42 --json` | A pasted search-hit field selects canonical message 42, not raw line 42 |
+| `cass view source_path=session.jsonl source_id=local line_number=42 --json` | `cass view session.jsonl --source local --message-index 42 --json` | Search hit field bundle accepted as a follow-up command (add `conversation_id` when the file holds several conversations) |
 | `cass search "auth" --format json` | `cass search "auth" --robot-format json` | Familiar format spelling converted to robot format |
 | `cass search "auth" --output json` | `cass search "auth" --robot-format json` | Familiar output spelling converted to robot format |
 | `cass help search --json` | `cass robot-docs commands` | Structured help intent routed to the machine-readable command reference |
@@ -964,7 +964,7 @@ The CLI applies multiple normalization layers:
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
-5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
+5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `session` → `sessions`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`rootcause`/`summarize`/`summarise` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `diagnose`/`debug`/`check` → `diag`; `caps`/`cap` → `capabilities`; `inspect`/`intro` → `introspect`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
 6. **Robot-docs topic shorthands**: non-command topics such as `commands`, `schemas`, `examples`, `exit-codes`, and `quickstart` become `robot-docs <topic>` instead of falling through to search; command topics such as `doctor` and `sources` use structured help (`cass help doctor --json`, `cass sources --help --json`). Bare `cass guide` is reserved for the guided-operations planner; use `cass robot-docs guide` for the robot-docs walkthrough.
 7. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
 8. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
@@ -977,14 +977,14 @@ The CLI applies multiple normalization layers:
 15. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
 16. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
 17. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
-18. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
-19. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
+18. **Drill-down line aliases**: `--line-number`, `--line_number` and `line=42` become `--line` (a raw file line)
+19. **Search-hit fields**: `line_number=42` pasted from a search hit becomes `--message-index 42` (the canonical message ordinal the hit names), and a `source_path=... source_id=... line_number=...` bundle becomes the canonical path, `--source` and `--message-index` form for follow-up `view`/`expand` commands
 20. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
 21. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
 22. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
 23. **Global flag hoisting**: Position-independent flag handling
 
-When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax. In robot/JSON mode the same information is emitted as one `note: auto-corrected: <note>` line per correction on stderr, so stdout stays data-only.
+When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax. In robot/JSON mode the same information is emitted as one `note: auto-corrected: <note>` line per correction on stderr (at most two: the normalization note and the typo-recovery note), so stdout stays data-only. Robot-mode notes are printed only when the command succeeds; a failing command's stderr is its single JSON error envelope. The same notes appear in search output under `_meta.effective.auto_corrections` with `--robot-meta`.
 
 ### Structured Output Formats
 
