@@ -166,7 +166,10 @@ RUN_DOCS_TRUTH=0
 UBS_FILES=()
 # Each entry is `<test-binary>` or `<test-binary>:<filter words>`; the filter
 # is passed after `--` so one admission can run only the tests a change touches.
-INTEGRATION_TESTS=(cli_robot bookmarks_cli)
+# search_metamorphic is the set-algebra oracle for search semantics (terms,
+# Boolean grammar, time windows; bead 2l1b0.68): a wrong-answer regression
+# there is invisible to every golden.
+INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic)
 while [ $# -gt 0 ]; do
     case "$1" in
         --lib-filter) LIB_FILTER="$2"; shift 2 ;;
