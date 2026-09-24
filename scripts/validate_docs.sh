@@ -425,14 +425,18 @@ check_flags() {
         log_fail "cass --help printed no flags from $binary"
         return
     fi
-    declare -A help_cache=()
-    flags_for_path() {
-        local path="$1"
-        if [[ -z "${help_cache[$path]+x}" ]]; then
-            # shellcheck disable=SC2086
-            help_cache[$path]=$("$binary" $path --help 2>/dev/null | grep -o -E -- '--[a-z][a-z0-9-]+' | sort -u)
-        fi
-        printf '%s\n' "${help_cache[$path]}"
+    # Filled in this shell, never inside a pipeline: a function on the left of
+    # `|` runs in a subshell, so the cache used to be rebuilt for every flag.
+    # The exit status is kept so a crashing `--help` is reported as a crash,
+    # not as a README flag that clap does not accept.
+    declare -A help_cache=() help_status=()
+    cache_help_for_path() {
+        local path="$1" out rc=0
+        [[ -n "${help_cache[$path]+x}" ]] && return 0
+        # shellcheck disable=SC2086
+        out=$("$binary" $path --help 2>/dev/null) || rc=$?
+        help_status[$path]=$rc
+        help_cache[$path]=$(printf '%s\n' "$out" | grep -o -E -- '--[a-z][a-z0-9-]+' | sort -u || true)
     }
     local missing=0 checked=0 line path token flag
     # README lines that deliberately show WRONG spellings (the auto-correction
@@ -467,10 +471,15 @@ check_flags() {
                 log_warn "README mentions \`cass $flag\` without a command; cannot check it against --help"
                 continue
             fi
-            if flags_for_path "$path" | grep -q -x -- "$flag"; then
+            cache_help_for_path "$path"
+            if grep -q -x -- "$flag" <<<"${help_cache[$path]}"; then
                 continue
             fi
-            log_fail "README shows \`cass $path $flag\` but \`cass $path --help\` does not list $flag"
+            if [[ "${help_status[$path]}" != 0 ]]; then
+                log_fail "\`cass $path --help\` exited ${help_status[$path]}, so README's \`cass $path $flag\` could not be checked"
+            else
+                log_fail "README shows \`cass $path $flag\` but \`cass $path --help\` does not list $flag"
+            fi
             missing=$((missing + 1))
         done < <(printf '%s\n' "$line" | grep -o -E -- '--[a-z][a-z0-9-]+' | sort -u)
     done < <(grep -E '(^|[^a-z])cass ' "$readme" \
