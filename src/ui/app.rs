@@ -15730,6 +15730,15 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                 let shift = key.modifiers.contains(Modifiers::SHIFT);
 
                 match key.code {
+                    // -- Copy content (before force quit) -------------------------
+                    // Ctrl+Shift+C must be matched before the Ctrl+C arm: with
+                    // the quit arm first, the documented "copy content" chord
+                    // quit the TUI on every terminal that reports Shift
+                    // (2l1b0.54). Terminals that report the shifted letter
+                    // send 'C'.
+                    KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
+                    KeyCode::Char('C') if ctrl => CassMsg::CopyContent,
+
                     // -- Force quit -----------------------------------------------
                     KeyCode::Char('c') if ctrl => CassMsg::ForceQuit,
 
@@ -15907,7 +15916,8 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('Y') if ctrl => CassMsg::CopyQuery,
                     KeyCode::Char('y') if ctrl && shift => CassMsg::CopyQuery,
                     KeyCode::Char('y') if ctrl => CassMsg::CopyPath,
-                    KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
+                    // Ctrl+Shift+C (CopyContent) is matched above the Ctrl+C
+                    // force-quit arm.
 
                     // -- Peek XL --------------------------------------------------
                     KeyCode::Char(' ') if ctrl => CassMsg::PeekToggled,
@@ -24635,6 +24645,26 @@ mod tests {
         );
 
         assert!(matches!(CassMsg::from(event), CassMsg::CopyQuery));
+    }
+
+    /// 2l1b0.54: the documented "copy content" chord used to hit the Ctrl+C
+    /// force-quit arm first and exit the TUI. Plain Ctrl+C still quits.
+    #[test]
+    fn event_mapping_ctrl_shift_c_copies_content_instead_of_quitting() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        let shifted_lower = Event::Key(
+            KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL | Modifiers::SHIFT),
+        );
+        assert!(matches!(CassMsg::from(shifted_lower), CassMsg::CopyContent));
+
+        let shifted_upper = Event::Key(
+            KeyEvent::new(KeyCode::Char('C')).with_modifiers(Modifiers::CTRL | Modifiers::SHIFT),
+        );
+        assert!(matches!(CassMsg::from(shifted_upper), CassMsg::CopyContent));
+
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL));
+        assert!(matches!(CassMsg::from(plain), CassMsg::ForceQuit));
     }
 
     #[test]
