@@ -712,10 +712,10 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 **Error codes:**
 | Code | Kind | Description |
 |------|------|-------------|
-| 3 | session_not_found | Session file doesn't exist |
-| 4 | output_not_writable | Cannot write to output directory |
-| 5 | encryption_error | Encryption failed |
-| 6 | password_required | --encrypt used without password |
+| 3 | session-not-found | Session file doesn't exist |
+| 4 | output-not-writable / invalid-filename | Cannot write to the output directory, or `--filename` is unusable |
+| 5 | export-failed | Rendering or encrypting the HTML failed |
+| 6 | password-required / password-read-error | `--encrypt` without a password, or `--password-stdin` could not be read |
 | 9 | opencode-parse / opencode-sqlite-parse / indexed-session-required / empty-session | Session could not be parsed, is not an indexed conversation or JSONL/OpenCode session, or has no messages |
 
 ### Key Flags
