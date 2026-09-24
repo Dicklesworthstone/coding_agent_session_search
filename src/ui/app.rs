@@ -26456,7 +26456,8 @@ mod tests {
     fn semantic_mode_without_a_model_names_the_install_command() {
         let mut app = CassApp::default();
         app.semantic_availability = SemanticAvailability::NotInstalled;
-        assert_eq!(app.search_mode, SearchMode::Lexical);
+        // The TUI starts in hybrid; begin the cycle from lexical.
+        app.search_mode = SearchMode::Lexical;
 
         let _ = app.update(CassMsg::SearchModeCycled);
         assert_eq!(app.search_mode, SearchMode::Semantic);
@@ -43227,8 +43228,9 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     fn focus_graph_initialized_with_nodes() {
         let app = CassApp::default();
         let g = app.focus_manager.graph();
-        // 3 primary + 8 modal nodes = 11
-        assert!(g.node_count() >= 11, "got {}", g.node_count());
+        // 3 primary + 7 modal nodes = 10 (the unreachable consent dialog and
+        // its node were removed under 2l1b0.66)
+        assert!(g.node_count() >= 10, "got {}", g.node_count());
         assert!(g.get(focus_ids::SEARCH_BAR).is_some());
         assert!(g.get(focus_ids::RESULTS_LIST).is_some());
         assert!(g.get(focus_ids::DETAIL_PANE).is_some());
