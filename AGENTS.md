@@ -667,6 +667,14 @@ cass robot-docs guide         # LLM-optimized docs
 | Grok Build | `grok.rs` | ACP updates JSONL |
 | Goose | `goose.rs` | SQLite (`sessions.db`, v1.20+) / legacy per-session JSONL |
 | Muse Code | `muse.rs` | JSONL |
+| Prime Agent | FAD `prime_agent` | JSONL |
+| Grok Bot | FAD `grok_bot` (feature `grok-bot`) | local rolling chat replica |
+| Codebuff / Freebuff | FAD `codebuff` (feature `codebuff`) | Manicode chat JSON |
+| Devin CLI | FAD `devin` (feature `devin`) | SQLite (`sessions.db`) |
+| Shelley | FAD `shelley` (feature `shelley`) | SQLite |
+| Kiro CLI | FAD `kiro` | event-log JSONL + JSON snapshot |
+
+All 32 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
 
 ### HTML Export (Robot Mode)
 
