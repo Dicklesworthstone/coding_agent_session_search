@@ -1,6 +1,17 @@
 # Error Codes Reference
 
-This document lists all error codes that may appear when using CASS (Coding Agent Session Search) and provides guidance for resolution.
+> **Status (checked 2026-09-24; bead 2l1b0.59).** The `E1xxx`–`E5xxx` codes
+> below are defined for the Pages export and viewer in `src/pages/errors.rs`,
+> but no user-facing path displays them today: `error_code()` is called only
+> from that module's tests. The messages, causes and resolutions below remain
+> accurate guidance for the same failures. CLI errors are identified instead
+> by the process exit code plus the kebab-case `err.kind` in the JSON error
+> envelope. The exit codes are listed by `cass robot-docs exit-codes` and
+> under `exit_codes` in `cass capabilities --json`; the kind vocabulary (about
+> 95 values) lives in `src/model/cli_error_kind.rs`. Branch on `err.kind`,
+> never on an `E` code.
+
+This document describes the Pages export error cases and provides guidance for resolution.
 
 ## Error Code Format
 
