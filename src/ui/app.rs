@@ -214,7 +214,8 @@ fn take_raw_event() -> Option<super::ftui_adapter::Event> {
 pub const BULK_ACTIONS: [&str; 4] = [
     "Open all in editor",
     "Copy all paths",
-    "Export as JSON",
+    // Copies to the clipboard; it never wrote a file (2l1b0.54).
+    "Copy as JSON",
     "Clear selection",
 ];
 
@@ -16581,8 +16582,11 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     return ftui::Cmd::none();
                 }
-                CassMsg::QuerySubmitted => {
-                    // Enter in the modal executes the selected action.
+                // Enter in the modal executes the selected action. The key
+                // converts to DetailOpened, so matching only QuerySubmitted
+                // left Enter opening the detail view behind the menu
+                // (2l1b0.54).
+                CassMsg::QuerySubmitted | CassMsg::DetailOpened => {
                     let idx = self.bulk_action_idx;
                     return self.update(CassMsg::BulkActionExecuted { action_index: idx });
                 }
@@ -36436,6 +36440,24 @@ not jsonl",
         let _ = app.update(CassMsg::SelectionMoved { delta: -1 });
         let _ = app.update(CassMsg::SelectionMoved { delta: -1 });
         assert_eq!(app.bulk_action_idx, 0);
+    }
+
+    /// 2l1b0.54: Enter in the bulk-actions menu arrives as DetailOpened, and
+    /// the menu only listened for QuerySubmitted, so Enter opened the detail
+    /// view behind the menu instead of running the highlighted action.
+    #[test]
+    fn bulk_menu_enter_runs_the_highlighted_action() {
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::SelectAllToggled);
+        app.show_bulk_modal = true;
+        app.bulk_action_idx = 3; // Clear selection
+        let _ = app.update(CassMsg::DetailOpened);
+        assert!(app.selected.is_empty(), "Enter must run Clear selection");
+        assert!(app.status.contains("Cleared 3"), "{}", app.status);
+        assert!(
+            !app.show_detail_modal,
+            "Enter must not open the detail view"
+        );
     }
 
     #[test]
