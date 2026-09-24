@@ -125,7 +125,7 @@ because of that day:
 We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (dated nightly pinned by `rust-toolchain.toml`)
-- **Dependency versions:** Wildcard constraints (`*`) for all crates
+- **Dependency versions:** Caret minimums resolved through the committed `Cargo.lock`. The SQLite family, Asupersync, Frankensearch, FAD, FrankenTUI and toon use exact `=` pins (see the dependency source contract below). `sysinfo`, `libc` and the dev-only `tokenizers` use `*`
 - **Configuration:** Cargo.toml only (single-crate project, no workspace)
 - **Unsafe code:** Forbidden as a general tool. Tightly scoped, narrowly audited `unsafe` is allowed only where it is unavoidable (e.g., the few Rust 2024 `std::env::set_var`/`remove_var` calls at controlled startup/teardown, or unavoidable FFI with no safe wrapper). Unsafe cross-thread connection wrappers and unjustified `Send`/`Sync` impls remain prohibited and must be UBS-gated.
 
