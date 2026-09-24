@@ -45,6 +45,17 @@ files; the three owned files stay scanned.
 - #369 bead `cb0gl`: closed on its probe.
 - #483: the conv-192 stall no longer reproduces on `main` (reporter's retest); what blocked them was #498.
 
+**Later on 2026-09-23:**
+- **TUI residuals fixed** (`7aa102c8`, `2gy3y`). Seven `ui::app` tests had relied on the same-path fallback that #493 removed. Their fixtures now build a canonical cached detail for the selected hit; `ui::app::tests` passes 1024/1024 and no assertion changed.
+- **Rebuild fast-path test fixed** (`6f86acc8`, `fqt9s` item 2). It now proves the completed-checkpoint fast path over a real generation instead of planting a checkpoint that #494 correctly refuses.
+- **Lock breadcrumb fixed** (`24366433`, `7qirz`). `index-run.lock` now names `index:scan` and `lexical:rebuild`. The #483/#497 reporter had seen a finished preflight step named for a whole 42-minute pass.
+- **#496 headroom fixed** (`149ee210`, `ztlqc`). The full-rebuild headroom preflight doubled a failed rebuild's leftover `.rebuild-staging` generation, locking a 13.4 GB archive out of its retry. The requirement is now documented, and it can be queried through `cass doctor --json` (`storage_pressure.full_rebuild_readiness`).
+- **Diagnosed, not fixed:**
+  - `nohx1`: frankensearch-index 0.3.1 `append_batch` tombstones superseded main rows, so the fixture's byte-equality check is stale.
+  - `2l1b0.46`: a `--full` run's own ingest invalidates its checkpoint fingerprint; this needs a prefix-based resume proof.
+  - `kfem7`: the gh439 slow-repair test stalls before its first breadcrumb on a pressured worker. It fails 3/3 after `89e053f3` and passed once before, but that commit's code cannot reach the path. The lock snapshot points to acquisition blocked in `sync_all()`.
+- **Duplicate avoided late.** My #497 retirement fix lost a race with `89e053f3`. I dropped my unpushed commit and closed its bead as superseded.
+
 ## Assessment: 2026-09-22 evening (execution pass, SageSnow)
 
 This section supersedes current-state statements below. The midday assessment
