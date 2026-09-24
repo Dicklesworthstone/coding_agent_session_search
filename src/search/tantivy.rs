@@ -4140,4 +4140,88 @@ mod tests {
             "two conversations × two messages each ⇒ four lexical docs"
         );
     }
+
+    /// GH #499 (2l1b0.49): a date-filtered search over a sealed segment that
+    /// holds a tombstone. Under frankensearch-quill 0.3.1 the numeric window
+    /// was scored on the segment's at-seal rows while the term leaf used its
+    /// live rows, and cass reported "posting cursor invariant failed: Boolean
+    /// children belong to different segment domains" (exit 9) for every
+    /// `--days`/`--since` search on a long-lived index. Quill 0.3.2 carries
+    /// the fix. The window deliberately excludes one row: a window over every
+    /// row lowers to a whole-segment match and would pass on the old engine.
+    #[test]
+    fn gh499_date_window_over_a_tombstoned_sealed_segment() {
+        let message = |idx: i64, created_at: i64, content: &str| NormalizedMessage {
+            idx,
+            role: "user".to_string(),
+            author: None,
+            created_at: Some(created_at),
+            content: content.to_string(),
+            extra: Value::Null,
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let dir = TempDir::new().expect("temp dir");
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("gh499".to_string()),
+            title: Some("window".to_string()),
+            workspace: None,
+            source_path: dir.path().join("gh499.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: Value::Null,
+            messages: vec![
+                message(0, 100, "window early"),
+                message(1, 500, "window middle"),
+                message(2, 900, "window late"),
+            ],
+        };
+        let index_dir = dir.path().join("index");
+        let mut idx = TantivyIndex::open_or_create(&index_dir).expect("idx");
+        idx.add_conversation(&conversation).expect("seed");
+        idx.commit().expect("seal the first segment");
+
+        // Re-ingesting a message under its stable identity tombstones the
+        // sealed row, as an incremental index run does.
+        let edited = message(1, 500, "window middle, edited");
+        let replacement =
+            cass_document_for_message(&cass_doc_context(&conversation, None), &edited)
+                .expect("replacement document");
+        idx.upsert_prebuilt_documents_slice(&[replacement])
+            .expect("upsert");
+        idx.commit().expect("publish the replacement");
+
+        let live = crate::search::quill_bridge::manifest_live_doc_count(&index_dir)
+            .expect("published manifest");
+        assert!(
+            live.tombstones > 0 && live.segments >= 2,
+            "the fixture needs a tombstone in a sealed segment: {live:?}"
+        );
+
+        let client = crate::search::query::SearchClient::open(&index_dir, None)
+            .expect("open search client")
+            .expect("index present");
+        let filters = crate::search::query::SearchFilters {
+            created_from: Some(400),
+            created_to: Some(1_000),
+            ..Default::default()
+        };
+        let hits = client
+            .search(
+                "window",
+                filters,
+                10,
+                0,
+                crate::search::query::FieldMask::FULL,
+            )
+            .expect("a date-filtered search over a tombstoned segment must succeed");
+        let mut stamps: Vec<i64> = hits.iter().filter_map(|hit| hit.created_at).collect();
+        stamps.sort_unstable();
+        assert_eq!(stamps, vec![500, 900], "{hits:?}");
+        assert!(
+            hits.iter().any(|hit| hit.content.contains("edited")),
+            "the live replacement is served, not the tombstoned row: {hits:?}"
+        );
+    }
 }

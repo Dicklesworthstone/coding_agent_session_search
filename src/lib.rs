@@ -30529,10 +30529,9 @@ fn empty_search_result() -> crate::search::query::SearchResult {
 fn lexical_engine_invariant_hint(error: &anyhow::Error) -> Option<String> {
     crate::search::quill_bridge::is_engine_invariant_failure(error).then(|| {
         "the lexical engine rejected this query on the current index generation, and \
-         retrying fails the same way. Date filters (--days/--since/--until) over an index \
-         segment that holds deleted rows are the known trigger (GH #499): run \
-         'cass index --full --force-rebuild' to publish a clean generation, or search \
-         without the date filter"
+         retrying fails the same way. Run 'cass index --full --force-rebuild' to publish a \
+         clean generation, and report the query with `cass --version` if it recurs (GH #499 \
+         was one such engine defect, fixed in frankensearch-quill 0.3.2)"
             .to_string()
     })
 }
