@@ -10,7 +10,7 @@ This document describes performance characteristics, benchmarks, and optimizatio
 |-----------|--------|--------------|-------|
 | Simple term search | < 100ms | 10K+ conversations | Single word queries |
 | Prefix wildcard (`foo*`) | < 100ms | 10K+ conversations | Edge n-gram optimized |
-| Suffix wildcard (`*bar`) | < 500ms | 10K+ conversations | Requires scan |
+| Suffix wildcard (`*bar`) | < 500ms | 10K+ conversations | Expands matching terms from the term dictionary (at most 16,384) |
 | Boolean queries | < 500ms | 10K+ conversations | AND/OR combinations |
 | Complex queries | < 2s | 10K+ conversations | Nested boolean + wildcards |
 
@@ -132,13 +132,13 @@ rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-baseline-target cargo benc
 Cryptographic operation benchmarks:
 
 - **argon2id_minimal**: Fast Argon2id with minimal parameters (dev/testing)
-- **argon2id_production**: Production-grade Argon2id parameters
+- **argon2id_production** (`derive_key`): Production-grade Argon2id parameters
 - **argon2id_memory_scaling**: Memory cost vs. performance tradeoffs
 - **aes_gcm_encrypt**: AES-256-GCM encryption at various payload sizes
 - **aes_gcm_decrypt**: AES-256-GCM decryption at various payload sizes
 - **aes_gcm_roundtrip**: Full encrypt + decrypt cycle
 - **hkdf_extract**: HKDF key extraction
-- **hkdf_expand**: HKDF key expansion
+- **hkdf_extract_expand** (`hkdf_extract_expand_32`): HKDF extraction plus expansion to a 32-byte key
 - **chunked_encrypt**: Large payload chunked encryption
 
 ### db_perf.rs
@@ -146,7 +146,7 @@ Cryptographic operation benchmarks:
 Database operation benchmarks:
 
 - **db_open**: SQLite database open time
-- **db_open_with_data**: Open time with existing data
+- **db_open_with_1k_convs**: Open time with 1,000 existing conversations
 - **db_open_readonly**: Read-only mode open time
 - **insert_conversation**: Single conversation insertion
 - **insert_batch**: Batch conversation insertion
@@ -155,7 +155,7 @@ Database operation benchmarks:
 - **list_agents**: Agent listing performance
 - **list_workspaces**: Workspace listing performance
 - **fts_rebuild**: FTS5 index rebuild time
-- **daily_histogram**: Daily statistics query
+- **daily_histogram_30_days**: Daily statistics query over 30 days
 - **session_count_range**: Session counting in date range
 - **db_scaling**: Performance scaling with corpus size
 
@@ -166,23 +166,27 @@ Export and compression benchmarks:
 - **compress_levels**: DEFLATE at levels 1, 6, 9
 - **compress_scaling**: Compression with varying data sizes
 - **decompress**: Decompression performance
-- **compress_data_types**: Compressible vs. random vs. mixed data
+- **compress_data_types** (`compressible`, `random`, `mixed`): Compressible vs. random vs. mixed data
 - **chunked_compress**: Large file chunked compression
 - **streaming_compress**: Incremental streaming compression
-- **roundtrip**: Full compress + decompress cycle
+- **compress_roundtrip**: Full compress + decompress cycle
 - **json_serialize**: JSON serialization of conversation data
-- **msgpack_serialize**: MessagePack binary serialization
+- **msgpack_serialize** / **msgpack_deserialize**: MessagePack binary serialization and parsing
 
 ### search_perf.rs
 
 Search operation benchmarks:
 
 - **hash_embed_1000_docs**: Hash-based document embedding
-- **hash_embed_batch**: Batch embedding performance
+- **hash_embed_batch_100**: Batch embedding performance
 - **canonicalize_long_message**: Text canonicalization
 - **canonicalize_with_code**: Code block canonicalization
+- **canonicalize_scaling**: Canonicalization at increasing message sizes
+- **search_empty_query**: Empty-query search overhead; runs only when the default data directory already has a lexical index, and reads it
+- **vector_index_search_10k** / **vector_index_search_50k** / **vector_index_search_50k_filtered** / **vector_index_search_50k_loaded**: Top-k search over 384-dimension F16 vector indexes of 10k and 50k entries, with a filter, and loaded from disk
 - **vector_search_scaling**: Vector search at various corpus sizes
-- **rrf_fusion**: Rank reciprocal fusion performance
+- **dot_product_f32** / **dot_product_f16** / **dot_product_f16_throughput**: Vector dot-product kernels
+- **rrf_fusion_100_results** / **rrf_fusion_50pct_overlap**: Reciprocal rank fusion performance
 - **answer_pack_candidate_hydration**: Search hit to answer-pack candidate conversion at 64 / 512 / 2,048 candidates
 - **answer_pack_planner_scaling**: Planner selection, freshness, dedupe, omitted-item accounting, and token-budget utilization
 - **answer_pack_renderers**: JSON pretty, JSON compact, and Markdown rendering cost for selected evidence
@@ -225,12 +229,24 @@ Guidelines:
 
 ### runtime_perf.rs
 
-Full runtime benchmarks:
+Indexing and search runtime benchmarks:
 
-- **cold_start**: Application cold start time
-- **warm_search**: Search with warm cache
-- **concurrent_search**: Parallel search performance
-- **memory_pressure**: Performance under memory pressure
+- **index_small_batch**: Persist 10 conversations of 10 messages into SQLite and the lexical index, then commit
+- **search_latency**: One-term search over 40 conversations of 12 messages
+- **dot_product_scalar** / **dot_product_simd**: Scalar vs. SIMD dot product
+- **wildcard_exact_match** / **wildcard_prefix_pattern** / **wildcard_suffix_pattern** / **wildcard_substring_pattern** / **wildcard_suffix_common**: Wildcard query shapes
+- **wildcard_large_dataset** (`exact`, `prefix`, `suffix`, `substring`): The same shapes on a larger corpus
+- **concurrent_indexing** (`generate_100_convs_parallel`, `generate_100_convs_sequential`): Builds 100 in-memory conversations with and without rayon; nothing is written or indexed
+- **rapid_sequential** (`10_queries_sequential`, `refinement_sequence`): Back-to-back queries as a user types
+- **search_scaling** (`50_convs`, `200_convs`, `500_convs`): Search latency by corpus size
+
+### Other suites
+
+- **index_perf.rs**: Full indexing of an empty corpus, redaction, streaming vs. batch ingest, Codex scan preflight, semantic embedding, sharded vs. monolithic FSVI build/open/search, ingest responsiveness and card defaults.
+- **search_latency_e2e.rs**: End-to-end warm search, prefix typing, filtered search and ranking modes.
+- **cache_micro.rs**: Prefix-cache hits, typing forward/backspace, mixed keystrokes, cold queries and agent-filtered search.
+- **integration_regression.rs**: Storage open, insert, append, query and concurrent-write regressions, comparing the persist path with direct inserts.
+- **redaction_perf.rs**: Hand-rolled timing (no Criterion) of the redaction hot path over fixture conversations; `cargo bench --bench redaction_perf`.
 
 ## Optimization Recommendations
 
@@ -245,7 +261,7 @@ Full runtime benchmarks:
 
 1. **Tune cache sizes**: Set `CASS_CACHE_TOTAL_CAP` based on available memory
 2. **Use byte limits**: Set `CASS_CACHE_BYTE_CAP` to prevent unbounded growth
-3. **Monitor memory**: Use `cass health --json` to check memory usage
+3. **Monitor memory**: cass does not report its own memory use. `cass status --json` → `topology_budget` shows host memory and the derived cache and in-flight byte budgets; measure process RSS with OS tools (for example `/usr/bin/time -v`)
 
 ### Database Performance
 
@@ -265,8 +281,8 @@ Full runtime benchmarks:
 |----------|---------|---------|
 | `CASS_CACHE_SHARD_CAP` | 256 | Max entries per cache shard |
 | `CASS_CACHE_TOTAL_CAP` | 2048 | Total cache entry limit |
-| `CASS_CACHE_BYTE_CAP` | 0 (disabled) | Total cache byte limit |
-| `CASS_PARALLEL_SEARCH` | 10000 | Threshold for parallel vector search |
+| `CASS_CACHE_BYTE_CAP` | available memory / 128, clamped to 64 MiB–2 GiB | Total cache byte limit; `0` disables the byte guard |
+| `CASS_PARALLEL_SEARCH` | `true` | Boolean: parallel vector search on or off |
 | `CASS_WARM_DEBOUNCE_MS` | 120 | Debounce for warm worker |
 
 ## Profiling
@@ -306,7 +322,10 @@ rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-flamegraph-target cargo flamegra
 
 ## Baseline Results
 
-Results from CI on standard hardware (8 cores, 32GB RAM):
+Historical results recorded with v0.1.57 on an 8-core, 32 GB host. They have not
+been re-measured since, and some IDs have changed (the current ID for
+`list_conversations/100` is `list_conversations/limit_100`). The Benchmarks CI
+workflow is currently disabled, so no current CI baseline exists:
 
 ```
 argon2id_minimal        [147.2 µs]
