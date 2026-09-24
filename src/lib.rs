@@ -62525,8 +62525,38 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
     }
 }
 
+/// fs2 reports a contended try-lock as its `lock_contended_error()`:
+/// EWOULDBLOCK on unix, but raw ERROR_LOCK_VIOLATION on Windows, which no
+/// `ErrorKind` matches, so an active doctor lock read as unavailable
+/// (2l1b0.74).
 fn doctor_lock_probe_error_is_active(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::WouldBlock
+        || (err.raw_os_error().is_some()
+            && err.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
+#[cfg(test)]
+mod doctor_lock_probe_error_tests {
+    use super::*;
+
+    /// fs2's own contended error must read as an active lock on every
+    /// platform (on Windows it is raw ERROR_LOCK_VIOLATION, not WouldBlock),
+    /// and unrelated failures must not (2l1b0.74).
+    #[test]
+    fn contended_lock_error_is_active_and_other_errors_are_not() {
+        assert!(doctor_lock_probe_error_is_active(
+            &fs2::lock_contended_error()
+        ));
+        assert!(doctor_lock_probe_error_is_active(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!doctor_lock_probe_error_is_active(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!doctor_lock_probe_error_is_active(&std::io::Error::other(
+            "permission denied"
+        )));
+    }
 }
 
 fn doctor_acquire_mutation_lock(

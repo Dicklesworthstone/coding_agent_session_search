@@ -524,8 +524,34 @@ fn doctor_lock_file_pid_is_current_process(file: &fs::File) -> bool {
     doctor_lock_metadata_pid_is_current_process(&raw)
 }
 
+/// fs2 reports a contended try-lock as its `lock_contended_error()`:
+/// EWOULDBLOCK on unix, but raw ERROR_LOCK_VIOLATION on Windows, which no
+/// `ErrorKind` matches, so a held doctor lock read as not held (2l1b0.74).
 fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::WouldBlock
+        || (err.raw_os_error().is_some()
+            && err.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
+#[cfg(test)]
+mod doctor_mutation_lock_error_tests {
+    use super::*;
+
+    /// fs2's own contended error must read as a held doctor lock on every
+    /// platform (on Windows it is raw ERROR_LOCK_VIOLATION, not WouldBlock),
+    /// and unrelated failures must not (2l1b0.74).
+    #[test]
+    fn contended_lock_error_is_active_and_other_errors_are_not() {
+        assert!(doctor_mutation_lock_error_is_active(
+            &fs2::lock_contended_error()
+        ));
+        assert!(!doctor_mutation_lock_error_is_active(
+            &std::io::Error::from(std::io::ErrorKind::NotFound)
+        ));
+        assert!(!doctor_mutation_lock_error_is_active(
+            &std::io::Error::other("permission denied")
+        ));
+    }
 }
 
 fn acquire_doctor_mutation_db_open_guard(

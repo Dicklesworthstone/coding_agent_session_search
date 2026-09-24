@@ -11,7 +11,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use coding_agent_search::franken_sync::compat::{OpenFlags, RowExt, open_with_flags};
 use coding_agent_search::franken_sync::{Connection, FrankenError, SqliteValue};
-use fs2::FileExt;
 
 use super::codec::{self, Cell, Completion, Header, Record, Table, Validator};
 
@@ -67,9 +66,12 @@ impl DestinationLock {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match FileExt::try_lock_exclusive(&file) {
+            // std's try_lock reports contention as WouldBlock on every
+            // platform; fs2 surfaced Windows contention as raw
+            // ERROR_LOCK_VIOLATION, which failed instead of waiting (2l1b0.74).
+            match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(std::fs::TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         return Err(super::ArchiveBusyError(
                             "logical archive destination remained locked for five seconds".into(),
@@ -78,7 +80,7 @@ impl DestinationLock {
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(error) => {
+                Err(std::fs::TryLockError::Error(error)) => {
                     return Err(anyhow::Error::new(error)
                         .context("cannot acquire logical archive destination lock"));
                 }

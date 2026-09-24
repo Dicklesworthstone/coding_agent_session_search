@@ -1065,16 +1065,18 @@ fn acquire_export_publish_guard(final_path: &Path) -> Result<ExportPublishGuard>
                 lock_path.display()
             )
         })?;
-    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+    // std's try_lock reports contention as WouldBlock on every platform; fs2
+    // surfaced Windows contention as raw ERROR_LOCK_VIOLATION (2l1b0.74).
+    match lock_file.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(std::fs::TryLockError::WouldBlock) => {
             bail!(
                 "another Pages export is already publishing to {}; lock contention at {}",
                 final_path.display(),
                 lock_path.display()
             );
         }
-        Err(error) => {
+        Err(std::fs::TryLockError::Error(error)) => {
             return Err(error).with_context(|| {
                 format!(
                     "failed acquiring Pages export publish lock {} for {}",

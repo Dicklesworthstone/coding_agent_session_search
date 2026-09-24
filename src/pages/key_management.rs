@@ -277,14 +277,16 @@ fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard>
             )
         })?;
 
-    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+    // std's try_lock reports contention as WouldBlock on every platform; fs2
+    // surfaced Windows contention as raw ERROR_LOCK_VIOLATION (2l1b0.74).
+    match lock_file.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
             "another Pages key mutation is already active for {}; lock contention at {}",
             target.live_root.display(),
             target.lock_path.display()
         ),
-        Err(error) => {
+        Err(std::fs::TryLockError::Error(error)) => {
             return Err(error).with_context(|| {
                 format!(
                     "failed acquiring Pages key-mutation lock {}",
