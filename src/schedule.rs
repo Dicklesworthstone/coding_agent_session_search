@@ -840,14 +840,16 @@ fn run_step(
     // (`sources sync`, `models status`) have no `--data-dir` flag and fall
     // back to the platform default otherwise — which would silently target
     // the wrong archive when `schedule run --data-dir` names a custom one.
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(args)
         .envs(environment.iter().copied())
         .stdin(Stdio::null())
         .env("CASS_INDEX_NO_PROGRESS_EVENTS", "1")
         .env("CASS_AUTO_REFRESH", "0")
-        .env("CASS_DATA_DIR", data_dir)
-        .output();
+        .env("CASS_DATA_DIR", data_dir);
+    crate::indexer::background_refresh::cap_malloc_arenas_for_background_child(&mut command);
+    let output = command.output();
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     match output {
         Ok(output) => {
