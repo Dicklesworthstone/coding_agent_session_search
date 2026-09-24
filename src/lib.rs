@@ -6411,15 +6411,21 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
 /// parade` executed it). Adversarial-review finding F1 on GH #367.
 const SIDE_EFFECT_EXACT_ONLY_COMMANDS: &[&str] = &["forget", "upgrade"];
 
+/// Nearest canonical subcommand for a mistyped first argument.
+///
+/// An argument that already names a canonical subcommand is never a typo:
+/// when clap rejects `cass status --jsn` for its flag, the subcommand must
+/// stay `status`. Returning the nearest *other* command here made recovery
+/// run `stats` (and `import` for `export`) with exit 0 and only a stderr
+/// note (2l1b0.51).
 fn closest_top_level_command(arg: &str) -> Option<&'static str> {
     let lower = arg.to_ascii_lowercase();
-    if lower.len() < 3 {
+    if lower.len() < 3 || CANONICAL_TOP_LEVEL_COMMANDS.contains(&lower.as_str()) {
         return None;
     }
     CANONICAL_TOP_LEVEL_COMMANDS
         .iter()
         .copied()
-        .filter(|candidate| candidate != &lower)
         .filter(|candidate| !SIDE_EFFECT_EXACT_ONLY_COMMANDS.contains(candidate))
         .map(|candidate| (candidate, strsim::levenshtein(&lower, candidate)))
         .filter(|(_, distance)| *distance <= 2)
@@ -6576,6 +6582,73 @@ mod canonical_top_level_command_tests {
         assert!(CANONICAL_TOP_LEVEL_COMMANDS.contains(&"upgrade"));
         assert!(looks_like_top_level_command_or_typo("forget"));
         assert!(looks_like_top_level_command_or_typo("upgrade"));
+    }
+
+    /// 2l1b0.51: an exact subcommand is never a typo. Before the fix every
+    /// canonical command within Levenshtein 2 of another one was rerouted
+    /// (status→stats, stats→status, export→import, …) whenever clap
+    /// rejected the invocation for an unrelated flag typo.
+    #[test]
+    fn exact_canonical_commands_are_never_rerouted() {
+        let mut attracted_pairs = Vec::new();
+        for command in CANONICAL_TOP_LEVEL_COMMANDS {
+            for other in CANONICAL_TOP_LEVEL_COMMANDS {
+                if command != other && strsim::levenshtein(command, other) <= 2 {
+                    attracted_pairs.push((*command, *other));
+                }
+            }
+            assert_eq!(
+                closest_top_level_command(command),
+                None,
+                "`cass {command}` must keep its own subcommand"
+            );
+            assert_eq!(
+                closest_top_level_command(&command.to_ascii_uppercase()),
+                None,
+                "`cass {}` must keep its own subcommand",
+                command.to_ascii_uppercase()
+            );
+        }
+        // The fixture only means something while near-collisions exist.
+        assert!(
+            attracted_pairs.contains(&("status", "stats")),
+            "{attracted_pairs:?}"
+        );
+        assert!(
+            attracted_pairs.contains(&("export", "import")),
+            "{attracted_pairs:?}"
+        );
+        // Genuine typos still recover (bead a0z1v).
+        assert_eq!(closest_top_level_command("serach"), Some("search"));
+        assert_eq!(closest_top_level_command("helth"), Some("health"));
+    }
+
+    /// 2l1b0.51, end to end through the recovery layer: a flag typo on an
+    /// exact subcommand corrects only the flag.
+    #[test]
+    fn flag_typo_on_exact_subcommand_keeps_the_subcommand() {
+        for (command, expected_flag) in [
+            ("status", "--json"),
+            ("stats", "--json"),
+            ("export", "--json"),
+        ] {
+            let args = ["cass", command, "--jsn"].map(str::to_string);
+            let error = Cli::try_parse_from(&args).expect_err("--jsn is not a flag");
+            let (corrected, note) =
+                heuristic_parse_recovery(&error, &args).expect("flag typo is recoverable");
+            assert_eq!(
+                corrected[1], command,
+                "subcommand changed: {corrected:?} ({note})"
+            );
+            assert!(
+                corrected.iter().any(|arg| arg == expected_flag),
+                "{corrected:?}"
+            );
+            assert!(
+                !note.contains("subcommand typo"),
+                "no subcommand correction may be reported: {note}"
+            );
+        }
     }
 
     #[test]
@@ -7619,7 +7692,7 @@ async fn execute_cli(
                             week,
                             since.as_deref(),
                             until.as_deref(),
-                        ),
+                        )?,
                         aggregate,
                         explain,
                         dry_run,
@@ -7694,7 +7767,7 @@ async fn execute_cli(
                             week,
                             since.as_deref(),
                             until.as_deref(),
-                        ),
+                        )?,
                         source,
                         sessions_from,
                         eff_mode,
@@ -9601,6 +9674,28 @@ fn run_forget_command(
         });
     }
 
+    // The lexical index lives next to the canonical DB (the agent-purge path
+    // resolves it the same way).
+    let data_dir = db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_data_dir);
+    if apply && let Some(active_index) = active_index_run_details(&data_dir, &db_path) {
+        return Err(CliError {
+            code: 7,
+            kind: "lock-busy",
+            message: format!(
+                "refusing to apply forget while an index run is active in {}",
+                active_index.data_dir.display()
+            ),
+            hint: Some(
+                "Wait for indexing/watch work to finish, then rerun `cass forget --apply`."
+                    .to_string(),
+            ),
+            retryable: true,
+        });
+    }
+
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 5,
         kind: "forget",
@@ -9622,21 +9717,56 @@ fn run_forget_command(
             retryable: false,
         })?;
 
-    // After an actual deletion, rebuild derived assets so search/analytics stay
-    // consistent (mirrors the agent-purge path). The lexical index also
-    // self-heals on next search, but rebuilding FTS now keeps DB-resident
-    // surfaces correct.
-    if apply && report.conversations_deleted > 0 {
-        if let Err(e) = storage.rebuild_fts() {
-            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
+    // After an actual deletion every derived surface that stores message text
+    // or counts must stop serving the forgotten conversations, exactly as on
+    // the agent-purge path. The Quill documents carry stored content, so
+    // until the lexical generation is rebuilt a plain search kept returning
+    // the forgotten text (2l1b0.50). Failures are typed errors: a warning
+    // with exit 0 would report success while the text stays searchable.
+    let remaining_conversations = if apply && report.conversations_deleted > 0 {
+        let derived_error = |kind: CliErrorKind, surface: &str, error: anyhow::Error| {
+            CliError {
+            code: 5,
+            kind: kind.kind_str(),
+            message: format!(
+                "forgot {} conversation(s) but failed to rebuild {surface}: {error}",
+                report.conversations_deleted
+            ),
+            hint: Some(
+                "The canonical rows are already deleted; run 'cass index --full' to rebuild derived search data."
+                    .to_string(),
+            ),
+            retryable: false,
         }
-        if let Err(e) = storage.rebuild_analytics() {
-            tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
-        }
-        if let Err(e) = storage.rebuild_daily_stats() {
-            tracing::warn!(error = %e, "forget: failed to rebuild daily stats after deletion");
-        }
-    }
+        };
+        storage
+            .rebuild_fts()
+            .map_err(|e| derived_error(CliErrorKind::ArchiveFtsRebuild, "the FTS fallback", e))?;
+        storage.rebuild_analytics().map_err(|e| {
+            derived_error(
+                CliErrorKind::ArchiveAnalyticsRebuild,
+                "analytics rollups",
+                e,
+            )
+        })?;
+        storage
+            .rebuild_daily_stats()
+            .map_err(|e| derived_error(CliErrorKind::ArchiveDailyStatsRebuild, "daily stats", e))?;
+        storage.rebuild_token_daily_stats().map_err(|e| {
+            derived_error(
+                CliErrorKind::ArchiveTokenDailyStatsRebuild,
+                "token daily stats",
+                e,
+            )
+        })?;
+        Some(
+            storage.total_conversation_count().map_err(|e| {
+                derived_error(CliErrorKind::ArchiveCount, "the conversation count", e)
+            })?,
+        )
+    } else {
+        None
+    };
 
     // WS-B.5 (z2uon): an applied forget deletes rows and rewrites FTS,
     // analytics and daily-stats tables; close through the checkpointing path
@@ -9652,6 +9782,21 @@ fn run_forget_command(
             "forget: final WAL checkpoint did not complete"
         );
         eprintln!("Warning: final WAL checkpoint after forget did not complete: {err:#}");
+    }
+
+    if let Some(remaining_conversations) = remaining_conversations {
+        crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
+            .map_err(|e| CliError {
+                code: 5,
+                kind: CliErrorKind::LexicalRebuild.kind_str(),
+                message: format!(
+                    "forgot {} conversation(s) but failed to rebuild the lexical search index, \
+                     which may still return their text: {e}",
+                    report.conversations_deleted
+                ),
+                hint: Some("Run 'cass index --full' to rebuild lexical search data.".to_string()),
+                retryable: false,
+            })?;
     }
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -27223,6 +27368,11 @@ fn unverifiable_daemon_composition_preserves_the_verified_local_embedding_space(
 }
 
 impl TimeFilter {
+    /// Resolve the search/pack time window.
+    ///
+    /// An explicit `--since`/`--until` that cannot be parsed is a usage
+    /// error; it used to be dropped silently, so a typo ran an unfiltered
+    /// query with exit 0 (2l1b0.64).
     pub fn new(
         days: Option<u32>,
         today: bool,
@@ -27230,7 +27380,7 @@ impl TimeFilter {
         week: bool,
         since_str: Option<&str>,
         until_str: Option<&str>,
-    ) -> Self {
+    ) -> CliResult<Self> {
         use chrono::{Datelike, Duration, Local, TimeZone};
 
         let now = Local::now();
@@ -27257,12 +27407,79 @@ impl TimeFilter {
             (None, None)
         };
 
-        // Explicit --since/--until override convenience flags when they parse successfully
-        let since = since_str.and_then(parse_datetime_str).or(since);
-        let until = until_str.and_then(parse_datetime_str).or(until);
+        // Explicit --since/--until override the convenience flags.
+        let since = match since_str {
+            Some(raw) => Some(parse_search_time_bound("--since", raw, TimeBound::Since)?),
+            None => since,
+        };
+        let until = match until_str {
+            Some(raw) => Some(parse_search_time_bound("--until", raw, TimeBound::Until)?),
+            None => until,
+        };
+        if let (Some(since), Some(until)) = (since, until)
+            && since > until
+        {
+            return Err(CliError::usage(
+                "the time window is empty because --since is later than --until",
+                Some("Choose an --until value at or after --since.".into()),
+            ));
+        }
 
-        TimeFilter { since, until }
+        Ok(TimeFilter { since, until })
     }
+}
+
+/// Which end of a time window a user-supplied value bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeBound {
+    Since,
+    Until,
+}
+
+fn parse_search_time_bound(flag: &str, raw: &str, bound: TimeBound) -> CliResult<i64> {
+    parse_time_bound(raw, bound).ok_or_else(|| {
+        CliError::usage(
+            format!("could not parse {flag} value {raw:?}"),
+            Some(
+                "Use an ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS), a US date (MM/DD/YYYY), \
+                 a keyword (now/today/yesterday), a relative offset (-7d, -24h, 30m) or a unix \
+                 timestamp."
+                    .into(),
+            ),
+        )
+    })
+}
+
+/// Parse a `--since`/`--until` value. A value that names a whole local day
+/// (a date without a time, `today`, `yesterday`) starts at local midnight as
+/// `--since` and ends at the day's last millisecond as `--until`, so
+/// `--until 2026-09-01` includes September 1 (README "Flexible Time
+/// Input"). Every other form is an instant and is used as-is.
+fn parse_time_bound(raw: &str, bound: TimeBound) -> Option<i64> {
+    let start = parse_datetime_str(raw)?;
+    if bound == TimeBound::Since || !names_whole_local_day(raw) {
+        return Some(start);
+    }
+    let day = chrono::DateTime::from_timestamp_millis(start)?
+        .with_timezone(&chrono::Local)
+        .date_naive();
+    let next_day = day.succ_opt()?.and_hms_opt(0, 0, 0)?;
+    let next_start = match chrono::TimeZone::from_local_datetime(&chrono::Local, &next_day) {
+        chrono::LocalResult::Single(local) | chrono::LocalResult::Ambiguous(local, _) => {
+            local.timestamp_millis()
+        }
+        chrono::LocalResult::None => return Some(start),
+    };
+    Some(next_start - 1)
+}
+
+fn names_whole_local_day(raw: &str) -> bool {
+    use chrono::NaiveDate;
+    let value = raw.trim().to_ascii_lowercase();
+    matches!(value.as_str(), "today" | "yesterday")
+        || ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y"]
+            .iter()
+            .any(|format| NaiveDate::parse_from_str(&value, format).is_ok())
 }
 
 fn parse_datetime_str(s: &str) -> Option<i64> {
@@ -27292,6 +27509,90 @@ fn parse_datetime_str(s: &str) -> Option<i64> {
     }
 
     crate::ui::time_parser::parse_time_input(s)
+}
+
+#[cfg(test)]
+mod search_time_filter_tests {
+    use super::*;
+
+    const DAY_MS: i64 = 86_400_000;
+
+    /// 2l1b0.64: an unparseable explicit bound used to be dropped, so the
+    /// search ran unfiltered with exit 0.
+    #[test]
+    fn unparseable_bounds_are_usage_errors() {
+        for (since, until) in [(Some("2026-13-01"), None), (None, Some("not-a-date"))] {
+            let error = TimeFilter::new(None, false, false, false, since, until)
+                .expect_err("an unparseable bound must not be ignored");
+            assert_eq!(error.code, 2, "{error:?}");
+            assert_eq!(error.kind, "usage", "{error:?}");
+            let flag = if since.is_some() {
+                "--since"
+            } else {
+                "--until"
+            };
+            assert!(error.message.contains(flag), "{error:?}");
+        }
+    }
+
+    /// README: a date-only `--until` includes the named day.
+    #[test]
+    fn date_only_until_covers_the_whole_local_day() {
+        for raw in ["2026-07-15", "2026/07/15", "07/15/2026", "07-15-2026"] {
+            let start = parse_time_bound(raw, TimeBound::Since).expect("date parses");
+            let end = parse_time_bound(raw, TimeBound::Until).expect("date parses");
+            assert_eq!(end - start, DAY_MS - 1, "{raw}");
+        }
+        let window = TimeFilter::new(None, false, false, false, None, Some("2026-07-15"))
+            .expect("valid bound");
+        let noon = parse_datetime_str("2026-07-15T12:00:00").expect("instant parses");
+        assert!(
+            window.until.is_some_and(|until| until >= noon),
+            "noon on the named day must be inside --until 2026-07-15"
+        );
+        let previous_day = TimeFilter::new(None, false, false, false, None, Some("2026-07-14"))
+            .expect("valid bound");
+        assert!(
+            previous_day.until.is_some_and(|until| until < noon),
+            "noon on the next day must be outside --until 2026-07-14"
+        );
+    }
+
+    #[test]
+    fn instants_and_relative_bounds_are_unchanged() {
+        let instant = "2026-07-15T12:00:00";
+        assert_eq!(
+            parse_time_bound(instant, TimeBound::Until),
+            parse_datetime_str(instant)
+        );
+        let relative_since = parse_time_bound("-7d", TimeBound::Since).expect("relative parses");
+        let relative_until = parse_time_bound("-7d", TimeBound::Until).expect("relative parses");
+        assert!((relative_until - relative_since).abs() < 60_000);
+    }
+
+    #[test]
+    fn inverted_window_is_a_usage_error() {
+        let error = TimeFilter::new(
+            None,
+            false,
+            false,
+            false,
+            Some("2026-07-16"),
+            Some("2026-07-15"),
+        )
+        .expect_err("empty window");
+        assert_eq!(error.kind, "usage");
+        let same_day = TimeFilter::new(
+            None,
+            false,
+            false,
+            false,
+            Some("2026-07-15"),
+            Some("2026-07-15"),
+        )
+        .expect("a single-day window is valid");
+        assert!(same_day.since < same_day.until);
+    }
 }
 
 /// Compute aggregations from search hits

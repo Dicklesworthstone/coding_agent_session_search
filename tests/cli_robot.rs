@@ -5588,6 +5588,76 @@ fn robot_mode_auto_correction_emits_teaching_note_on_stderr() -> Result<(), Box<
     Ok(())
 }
 
+/// 2l1b0.51: a flag typo on an exact subcommand must never run a different
+/// subcommand. Before the fix `cass status --jsn` ran `stats` instead (on an
+/// empty data dir: exit 3, "Database not found") and reported it only as a
+/// stderr note. Negative control: the `stats` payload keys never appear.
+#[test]
+fn flag_typo_on_exact_subcommand_runs_that_subcommand() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let data_dir = tmp.path().join("data");
+    let output = base_cmd()
+        .args(["status", "--jsn"])
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("HOME", tmp.path())
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("to 'stats'"),
+        "status must not be rerouted to stats; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let payload: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
+        format!("expected one JSON document on stdout ({error}); stdout={stdout} stderr={stderr}")
+    })?;
+    assert!(
+        payload.get("initialized").is_some() && payload.get("index").is_some(),
+        "expected the status payload, got {payload}"
+    );
+    assert!(
+        payload.get("by_agent").is_none(),
+        "the stats payload must not be returned for `status`: {payload}"
+    );
+    Ok(())
+}
+
+/// 2l1b0.64: an unparseable `--since`/`--until` used to be dropped, so the
+/// search ran unfiltered with exit 0 (or, on an empty data dir, failed later
+/// with exit 3 missing-index). It is a usage error before anything opens.
+#[test]
+fn unparseable_time_bound_is_a_usage_error() -> Result<(), Box<dyn Error>> {
+    for (subcommand, flag, value) in [
+        ("search", "--since", "2026-13-01"),
+        ("search", "--until", "yesterdayish"),
+        ("pack", "--since", "not-a-date"),
+    ] {
+        let tmp = TempDir::new()?;
+        let output = base_cmd()
+            .args([subcommand, "anything", flag, value, "--json"])
+            .env("CASS_DATA_DIR", tmp.path().join("data"))
+            .env("HOME", tmp.path())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{subcommand} {flag} {value}: expected exit 2; stderr: {stderr}"
+        );
+        let envelope_line = stderr
+            .lines()
+            .find(|line| line.trim_start().starts_with("{\"error\""))
+            .ok_or_else(|| format!("no error envelope on stderr: {stderr}"))?;
+        let envelope: Value = serde_json::from_str(envelope_line.trim())?;
+        assert_eq!(envelope["error"]["kind"], "usage", "{envelope}");
+        let message = envelope["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(flag),
+            "message must name {flag}: {message}"
+        );
+    }
+    Ok(())
+}
+
 /// Subcommand alias: query → search
 #[test]
 fn subcommand_alias_query_to_search() {

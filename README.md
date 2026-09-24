@@ -951,7 +951,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass search --limt 5` | `cass search --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
-1. **Flag typo correction**: Long flag names within Levenshtein distance 2 are auto-corrected (e.g. `--limt` → `--limit`). *Subcommand typos are NOT fuzzy-corrected* — use one of the documented aliases instead (see layer 5 below). A typo that isn't a known alias will produce a clap usage error with the canonical form in the hint.
+1. **Typo correction**: when parsing fails, long flag names within Levenshtein distance 2 of a known flag are corrected (e.g. `--limt` → `--limit`), and a first word within distance 2 of a subcommand is corrected to it (e.g. `serach` → `search`). A word that already names a subcommand is never changed, so `cass status --jsn` runs `status --json`. `forget` and `upgrade` are reached only by exact spelling.
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
@@ -1700,9 +1700,10 @@ cass search "authentication" --agent codex --workspace myproject --week
 | **Unix Millis** | `1732579200000` | Milliseconds (auto-detected) |
 
 **Intelligent Heuristics**:
-- Numbers >10 digits are treated as milliseconds, otherwise seconds
-- Two-digit years are expanded (24 → 2024)
-- Date-only inputs default to midnight start or 23:59:59 end
+- Numbers of 100,000,000,000 (10^11) or more are milliseconds; smaller numbers are seconds
+- Years are written in full (`2024`, not `24`)
+- A value that names a whole day (a date without a time, `today`, `yesterday`) starts at local midnight as `--since` and runs through the day's last millisecond as `--until`, so `--until 2024-01-31` includes January 31
+- For `search` and `pack`, a `--since`/`--until` value that cannot be parsed, or a `--since` later than `--until`, is a usage error (exit 2, kind `usage`); it is never silently ignored
 
 ```bash
 # All equivalent for "last week"
