@@ -1478,12 +1478,12 @@ pub fn key_add_password(
     // Unlock with current password to get DEK
     let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
-    // Create new slot (use max ID + 1 since IDs are stable after revocation)
-    // If no slots exist, start at 0; otherwise use max + 1
-    let slot_id = next_key_slot_id(&config.key_slots)?;
+    // IDs are part of the slot's AAD binding and are never reused.
+    let slot_id = next_key_slot_id(&config)?;
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
 
     config.key_slots.push(new_slot);
+    config.next_slot_id = Some(u16::from(slot_id) + 1);
     publish_key_config_mutation(&guard, &config, None, false)?;
 
     info!(slot_id, "Added password key slot");
@@ -1506,25 +1506,36 @@ pub fn key_add_recovery(
     // Generate recovery secret
     let secret = RecoverySecret::generate();
 
-    // Create new slot (use max ID + 1 since IDs are stable after revocation)
-    // If no slots exist, start at 0; otherwise use max + 1
-    let slot_id = next_key_slot_id(&config.key_slots)?;
+    // IDs are part of the slot's AAD binding and are never reused.
+    let slot_id = next_key_slot_id(&config)?;
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
     config.key_slots.push(new_slot);
+    config.next_slot_id = Some(u16::from(slot_id) + 1);
     publish_key_config_mutation(&guard, &config, Some(secret.as_bytes()), false)?;
 
     info!(slot_id, "Added recovery key slot");
     Ok((slot_id, secret))
 }
 
-fn next_key_slot_id(key_slots: &[KeySlot]) -> Result<u8> {
-    match key_slots.iter().map(|s| s.id).max() {
-        Some(max_id) => max_id.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("Cannot add more key slots: maximum slot ID (255) reached")
-        }),
-        None => Ok(0),
-    }
+/// The export's slot-id high-water mark: one past every id it has ever held,
+/// including revoked ones recorded in `next_slot_id`.
+fn slot_id_high_water(config: &EncryptionConfig) -> u16 {
+    config
+        .key_slots
+        .iter()
+        .map(|slot| u16::from(slot.id) + 1)
+        .max()
+        .unwrap_or(0)
+        .max(config.next_slot_id.unwrap_or(0))
+}
+
+/// Id for a new slot. RECOVERY.md promises revoked ids are never reused, so
+/// this is the high-water mark, not `max(live ids) + 1`: revoking the highest
+/// slot and adding another used to hand its id out again (2l1b0.61).
+fn next_key_slot_id(config: &EncryptionConfig) -> Result<u8> {
+    u8::try_from(slot_id_high_water(config))
+        .map_err(|_| anyhow::anyhow!("Cannot add more key slots: maximum slot ID (255) reached"))
 }
 
 /// Revoke a key slot
@@ -1568,6 +1579,9 @@ pub fn key_revoke(
         .unwrap_or(false);
 
     // Remove the slot (keeping IDs stable - they're part of the AAD binding)
+    // and record the high-water mark first, so the revoked id (possibly the
+    // highest one) is never handed out again.
+    config.next_slot_id = Some(slot_id_high_water(&config));
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
     let has_recovery_slot = config
         .key_slots
@@ -1691,6 +1705,8 @@ pub fn key_rotate(
                     .collect(),
             },
             key_slots: new_slots.clone(),
+            // Rotation mints a new export id and DEK: a fresh id space.
+            next_slot_id: None,
         };
         write_json_pretty(&staged_site_dir.join("config.json"), &new_config)?;
         let manifest = crate::pages::bundle::generate_integrity_manifest(&staged_site_dir)?;
@@ -3024,6 +3040,7 @@ mod tests {
                 files: vec!["payload/chunk-00000.bin".to_string()],
             },
             key_slots: Vec::new(),
+            next_slot_id: None,
         };
         let progress_calls = Cell::new(0);
 
@@ -3346,12 +3363,48 @@ mod tests {
         let mut config = load_config(&archive_dir).unwrap();
         config.key_slots[0].id = u8::MAX;
 
-        let err = next_key_slot_id(&config.key_slots).unwrap_err();
+        let err = next_key_slot_id(&config).unwrap_err();
 
         assert_eq!(
             err.to_string(),
             "Cannot add more key slots: maximum slot ID (255) reached"
         );
+    }
+
+    /// 2l1b0.61: RECOVERY.md promises revoked slot ids are never reused, but
+    /// the next id was `max(live ids) + 1`, so revoking the highest slot and
+    /// adding another handed its id out again.
+    #[test]
+    fn revoked_highest_slot_id_is_never_reused() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let first = key_add_password(&archive_dir, "test-password", "password-a").unwrap();
+        let second = key_add_password(&archive_dir, "test-password", "password-b").unwrap();
+        assert_eq!(second, first + 1);
+
+        key_revoke(&archive_dir, "test-password", second).unwrap();
+        let after_revoke = load_config(&archive_dir).unwrap();
+        assert!(after_revoke.key_slots.iter().all(|slot| slot.id != second));
+        assert_eq!(after_revoke.next_slot_id, Some(u16::from(second) + 1));
+
+        let third = key_add_password(&archive_dir, "test-password", "password-c").unwrap();
+        assert_ne!(third, second, "a revoked slot id was handed out again");
+        assert_eq!(third, second + 1);
+        let config = load_config(&archive_dir).unwrap();
+        assert!(unwrap_dek_with_password(&config, "password-b").is_err());
+        assert!(unwrap_dek_with_password(&config, "password-c").is_ok());
+        // The persisted high-water mark is a known config field to verify.
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    /// A config no key mutation has touched has no high-water mark; the next
+    /// id is derived from the live slots, and the mark is written from then on.
+    #[test]
+    fn next_slot_id_is_derived_for_configs_without_a_high_water_mark() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let config = load_config(&archive_dir).unwrap();
+        assert_eq!(config.next_slot_id, None);
+        let live_max = config.key_slots.iter().map(|slot| slot.id).max().unwrap();
+        assert_eq!(next_key_slot_id(&config).unwrap(), live_max + 1);
     }
 
     #[test]

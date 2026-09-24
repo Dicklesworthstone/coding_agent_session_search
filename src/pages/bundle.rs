@@ -3141,6 +3141,7 @@ mod tests {
                 nonce: BASE64_STANDARD.encode([0u8; 12]),
                 argon2_params: Some(crate::pages::encrypt::Argon2Params::default()),
             }],
+            next_slot_id: None,
         }
     }
 
@@ -3207,6 +3208,7 @@ mod tests {
                 files: Vec::new(),
             },
             key_slots: Vec::new(),
+            next_slot_id: None,
         };
 
         let backup = master_key_backup_json(&config, "2026-04-25T19:08:00Z".to_string());

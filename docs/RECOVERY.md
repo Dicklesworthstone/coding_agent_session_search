@@ -246,8 +246,8 @@ Symptoms:
 
 Recovery steps:
 
-1. **Check for backup:** Look for `config.json.bak` or version control
-2. **Restore from backup:** Copy backup over corrupted file
+1. **Check for a copy:** cass does not write a `config.json` backup, so look in your own backups or version control
+2. **Restore from backup:** Copy the backup over the corrupted file
 3. **If no backup:** Archive is likely unrecoverable without config.json
 
 Prevention: Always keep backups of encrypted archives.
@@ -305,7 +305,7 @@ Before relying on an archive:
 
 - [ ] Password unlocks archive
 - [ ] Recovery key unlocks archive
-- [ ] `cass pages verify` passes
+- [ ] `cass pages --verify ./bundle` passes
 - [ ] Backup copy exists and is verified
 - [ ] Recovery secret stored securely offline
 
@@ -313,7 +313,7 @@ Before relying on an archive:
 
 ## Troubleshooting
 
-### Error: "Invalid password or no matching key slot"
+### Error: "The password you entered is incorrect." / "No matching key slot found for the provided credentials."
 
 **Causes:**
 - Typo in password
@@ -331,7 +331,7 @@ Before relying on an archive:
 
 **Solution:** Add another slot first, then revoke
 
-### Error: "Cannot revoke slot used for authentication"
+### Error: "Cannot revoke slot N used for authentication. Use a different password."
 
 **Cause:** Trying to revoke the slot you authenticated with
 
@@ -349,7 +349,7 @@ Before relying on an archive:
 - Restore config.json from backup
 - Use recovery key if available
 
-### Error: "Chunk authentication failed"
+### Error: "The encrypted archive payload is corrupted or tampered with."
 
 **Cause:** Payload chunk was modified or corrupted
 

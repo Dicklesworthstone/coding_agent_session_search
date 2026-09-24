@@ -138,6 +138,7 @@ mod tests {
                 files: vec!["chunk_0".to_string()],
             },
             key_slots: vec![],
+            next_slot_id: None,
         }
     }
 

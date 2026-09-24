@@ -223,6 +223,11 @@ pub struct EncryptionConfig {
     pub kdf_defaults: Argon2Params,
     pub payload: PayloadMeta,
     pub key_slots: Vec<KeySlot>,
+    /// Lowest key-slot id never handed out in this export. Revoking a slot
+    /// never lowers it, so a revoked id is never reused (2l1b0.61). Absent in
+    /// configs no key mutation has touched; the next add derives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_slot_id: Option<u16>,
 }
 
 pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Result<()> {
@@ -713,6 +718,7 @@ impl EncryptionEngine {
                 files: chunk_files,
             },
             key_slots: self.key_slots.clone(),
+            next_slot_id: None,
         };
 
         // Write config.json

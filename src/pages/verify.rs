@@ -78,6 +78,8 @@ const ENCRYPTED_CONFIG_KEYS: &[&str] = &[
     "kdf_defaults",
     "payload",
     "key_slots",
+    // Slot-id high-water mark written by key add/revoke (2l1b0.61).
+    "next_slot_id",
 ];
 const UNENCRYPTED_CONFIG_KEYS: &[&str] = &["encrypted", "version", "payload", "warning"];
 const ENCRYPTED_PAYLOAD_KEYS: &[&str] = &[
