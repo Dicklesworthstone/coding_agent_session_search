@@ -1245,7 +1245,7 @@ Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `
 
 **Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
-The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path). A lexical query the engine refuses with `posting cursor invariant failed` (kind `search`, exit 9) is `retryable: false`: the same query fails the same way on the same index generation. Date-filtered searches over an index segment that holds deleted rows are the known trigger (GH #499); the hint names the workaround, `cass index --full --force-rebuild`.
+The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path). A lexical query the engine refuses with `posting cursor invariant failed` (kind `search`, exit 9) is `retryable: false`: the same query fails the same way on the same index generation. The hint names the remedy, `cass index --full --force-rebuild`. Date-filtered searches over an index segment that holds deleted rows triggered it before frankensearch-quill 0.3.2 (GH #499).
 
 ### Session Analysis Commands
 
@@ -3624,7 +3624,7 @@ The September 17 FrankenSearch publication blocker is resolved.
 | `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.4` (tag v0.4.4 = `9d3d98778a372aba95d76d05c5c974ac0238c96a`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477) and 0.4.4's durable pending-freelist repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
 | `franken-agent-detection` | crates.io `=0.3.0` |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
-| `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.1`, `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`). Exact pins remain required. |
+| `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.2` (the GH #499 fix, published from the `frankensearch-quill-v0.3.2` hotfix tag), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`). Exact pins remain required. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 

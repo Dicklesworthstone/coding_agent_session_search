@@ -33,6 +33,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **Date-filtered search works on a long-lived index again (GH #499).** Every
+  `--days`/`--since`/`--until` search failed with `posting cursor invariant
+  failed: Boolean children belong to different segment domains` (exit 9) once
+  an incremental run had tombstoned a row in a sealed index segment. The lock
+  now resolves frankensearch-quill 0.3.2, a hotfix of 0.3.1 carrying the
+  engine fix, so no re-index is needed. An engine invariant failure is now also
+  reported `retryable: false`, with `cass index --full --force-rebuild` as the
+  remedy, instead of inviting endless retries.
 - **Search no longer strands a missing or unusable lexical index on a large
   archive.** When search needs a repair it will not run inline (the archive is
   over the inline repair budget, or a robot caller faces `checkpoint_incomplete`),
