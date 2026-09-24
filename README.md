@@ -2944,7 +2944,7 @@ install -m 755 cass ~/.local/bin/cass
 ```bash
 cass
 ```
-*On first run, `cass` performs a full index. You'll see progress in the footer. Search works immediately (falling back to SQLite or partial results until complete).*
+*On first run, `cass` starts a full index in the background (a detached, low-priority `cass index --full` that keeps going if you quit) and shows its progress in the status line. Search goes live, without a restart, as soon as the first index is published. Until then there are no results; if automatic indexing is off (`CASS_AUTO_REFRESH=0`) or cannot start, the status line says so and names `cass index --full`.*
 
 ### 3. Usage
 - **Type to search**: "python error", "refactor auth", "c++".

@@ -5449,6 +5449,11 @@ pub struct CassApp {
     pub search_service: Option<Arc<dyn SearchService>>,
     /// Concrete search service used for live progressive subscriptions.
     progressive_search_service: Option<Arc<TantivySearchService>>,
+    /// When a first-run background index was started (or found running) at
+    /// launch; ticks show its progress and open search once it publishes.
+    first_run_index_started_at: Option<Instant>,
+    /// Last time a tick probed the first-run index.
+    first_run_index_probed_at: Option<Instant>,
     /// Active live-search subscription request, if any.
     live_search_request: Option<LiveSearchRequest>,
 
@@ -5678,6 +5683,8 @@ impl Default for CassApp {
             known_workspaces: None,
             search_service: None,
             progressive_search_service: None,
+            first_run_index_started_at: None,
+            first_run_index_probed_at: None,
             live_search_request: None,
             macro_recorder: None,
             macro_playback: None,
@@ -7380,6 +7387,191 @@ impl CassApp {
     fn push_undo(&mut self, description: &'static str) {
         let entry = self.capture_undo_state(description);
         self.undo_history.push(entry);
+    }
+
+    /// Open the lexical search service over `self.data_dir`, with its
+    /// semantic context. `Ok(false)` means no index exists yet. Runs at launch
+    /// and again when a first-run index publishes, so search goes live
+    /// without a restart (2l1b0.56).
+    fn open_search_service(&mut self) -> Result<bool, String> {
+        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
+        use crate::search::model_manager::{
+            load_hash_semantic_context, load_semantic_context_deferred,
+        };
+
+        let index_path = crate::search::tantivy::index_dir(&self.data_dir)
+            .map_err(|e| format!("Search unavailable: failed to resolve index path ({e})"))?;
+        let client = match crate::search::query::SearchClient::open_with_options(
+            &index_path,
+            Some(&self.db_path),
+            crate::search::query::SearchClientOptions {
+                enable_reload: true,
+                enable_warm: true,
+                strict_read_only: false,
+            },
+        ) {
+            Ok(Some(client)) => Arc::new(client),
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(format!("Search unavailable: failed to open index ({e})")),
+        };
+        let prefer_hash =
+            EmbedderRegistry::new(&self.data_dir).best_available().name == HASH_EMBEDDER;
+        // GH #395: at launch this runs on the main thread BEFORE the first
+        // frame. The deferred loader resolves the model's identity and
+        // artifacts now but initializes the in-process MiniLM lazily on the
+        // first semantic query (which the TUI already runs on a background
+        // task), so a large model or slow disk can never hold the UI at a
+        // blank screen. The CLI's daemon-first path uses the same lazy
+        // embedder.
+        let setup = if prefer_hash {
+            load_hash_semantic_context(&self.data_dir, &self.db_path)
+        } else {
+            load_semantic_context_deferred(&self.data_dir, &self.db_path)
+        };
+        self.semantic_availability = setup.availability.clone();
+        if let Some(context) = setup.context {
+            if let Err(err) = client.set_semantic_artifacts_context(
+                context.embedder,
+                context.artifacts,
+                context.quality_artifact,
+                context.filter_maps,
+                context.roles,
+            ) {
+                tracing::debug!(error = %err, "tui semantic context unavailable");
+                let _ = client.clear_semantic_context();
+            }
+        } else {
+            let _ = client.clear_semantic_context();
+        }
+
+        let service = Arc::new(TantivySearchService::new(Arc::clone(&client)));
+        self.progressive_search_service = Some(Arc::clone(&service));
+        self.search_service = Some(service as Arc<dyn SearchService>);
+        // A first-run index also created the archive the detail views read.
+        if self.db_reader.is_none() && self.db_path.exists() {
+            match crate::storage::sqlite::FrankenStorage::open_readonly(&self.db_path) {
+                Ok(storage) => {
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    {
+                        self.db_reader = Some(Arc::new(storage));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tui could not open the archive for detail views");
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// With no index at launch, start the same detached, low-priority
+    /// `cass index --full --background` child the read paths use (it honors
+    /// index-run.lock and the auto-refresh cooldown and breaker) and return
+    /// the status line to show. Like the stale-on-read refresh it never
+    /// spawns for a scratch data dir or under TUI_HEADLESS (2l1b0.56).
+    fn start_first_run_index(&mut self) -> String {
+        use crate::indexer::background_refresh::{
+            AutoRefreshOutcome, maybe_spawn_background_full_index,
+        };
+        const MANUAL: &str = "Search index not found. Run `cass index --full` to enable search.";
+        if dotenvy::var("TUI_HEADLESS").is_ok()
+            || crate::auto_refresh_is_scratch_data_dir(&self.data_dir)
+        {
+            return MANUAL.to_string();
+        }
+        match maybe_spawn_background_full_index(&self.data_dir, &self.db_path, "tui_first_run") {
+            AutoRefreshOutcome::Spawned { pid, .. } => {
+                self.first_run_index_started_at = Some(Instant::now());
+                format!(
+                    "Indexing your agent history in the background (pid {pid}); search starts when the first index is ready"
+                )
+            }
+            AutoRefreshOutcome::IndexRunActive => {
+                self.first_run_index_started_at = Some(Instant::now());
+                "An index run is in progress; search starts when it publishes".to_string()
+            }
+            AutoRefreshOutcome::Disabled => {
+                format!("{MANUAL} Automatic indexing is off (CASS_AUTO_REFRESH=0).")
+            }
+            AutoRefreshOutcome::Cooldown { remaining_secs } => format!(
+                "{MANUAL} A background index ran moments ago; the next automatic try is in {remaining_secs}s."
+            ),
+            AutoRefreshOutcome::GuardBusy => {
+                format!("{MANUAL} Another cass process is starting an index right now.")
+            }
+            AutoRefreshOutcome::SpawnFailed { error } => {
+                format!("{MANUAL} Automatic indexing could not start: {error}")
+            }
+            AutoRefreshOutcome::BackedOff { remaining_secs, .. } => format!(
+                "{MANUAL} Recent background runs did not finish; the next automatic try is in {remaining_secs}s."
+            ),
+            AutoRefreshOutcome::Tripped { .. } => {
+                format!("{MANUAL} Background indexing keeps failing, so it is paused.")
+            }
+        }
+    }
+
+    /// While the first-run index builds, show its progress; the moment a
+    /// generation is published, open search and run the current query.
+    /// Schedules its own next probe, so it does not depend on other ticks.
+    fn poll_first_run_index(&mut self, now: Instant) -> Option<ftui::Cmd<CassMsg>> {
+        let started = self.first_run_index_started_at?;
+        if self.search_service.is_some() {
+            self.first_run_index_started_at = None;
+            return None;
+        }
+        if self
+            .first_run_index_probed_at
+            .is_some_and(|at| now.duration_since(at) < FIRST_RUN_INDEX_POLL)
+        {
+            return None;
+        }
+        self.first_run_index_probed_at = Some(now);
+        match self.open_search_service() {
+            Ok(true) => {
+                self.first_run_index_started_at = None;
+                self.status = "Index ready: search is live".to_string();
+                self.toast_manager
+                    .push(crate::ui::components::toast::Toast::success(
+                        "Index ready: search is live",
+                    ));
+                return Some(ftui::Cmd::msg(CassMsg::SearchRequested));
+            }
+            Ok(false) => {}
+            Err(message) => {
+                // A generation mid-publish can fail to open; keep waiting.
+                self.status = message;
+                return Some(Self::delayed_tick(FIRST_RUN_INDEX_POLL));
+            }
+        }
+        let maintenance =
+            crate::search::asset_state::read_search_maintenance_snapshot(&self.data_dir);
+        let progress = crate::search::tantivy::index_dir(&self.data_dir)
+            .ok()
+            .and_then(|path| crate::lexical_rebuild_progress_note(&path));
+        let running = match (progress, maintenance.active) {
+            (Some(note), _) => Some(format!("Indexing your agent history: {note}")),
+            (None, true) => Some(format!(
+                "Indexing your agent history ({})",
+                maintenance.phase.as_deref().unwrap_or("scanning sources")
+            )),
+            (None, false) if now.duration_since(started) < FIRST_RUN_INDEX_START_GRACE => {
+                Some("Starting the first index...".to_string())
+            }
+            (None, false) => None,
+        };
+        let Some(running) = running else {
+            // No run holds the lock, nothing was published, and the start
+            // grace has passed: say so instead of waiting forever.
+            self.first_run_index_started_at = None;
+            self.status = format!(
+                "The background index stopped before search was ready; run `cass index --full` (log: {})",
+                crate::indexer::background_refresh::log_path(&self.data_dir).display()
+            );
+            return None;
+        };
+        self.status = running;
+        Some(Self::delayed_tick(FIRST_RUN_INDEX_POLL))
     }
 
     /// Order the loaded results for the active ranking mode (F12). Engine
@@ -15703,6 +15895,11 @@ impl SearchService for TantivySearchService {
 
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(8);
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
+/// How often a TUI launched without an index probes the first-run index.
+const FIRST_RUN_INDEX_POLL: Duration = Duration::from_secs(1);
+/// How long the first-run child may take to take the index-run lock before
+/// its absence means it stopped.
+const FIRST_RUN_INDEX_START_GRACE: Duration = Duration::from_secs(20);
 
 /// Minimum distance (in terminal cells) for a drag event to be considered
 /// meaningful. Events with movement below this threshold are discarded to
@@ -16057,7 +16254,7 @@ impl super::ftui_adapter::Model for CassApp {
     type Message = CassMsg;
 
     fn init(&mut self) -> ftui::Cmd<CassMsg> {
-        if self.startup_state_bootstrapped {
+        let startup = if self.startup_state_bootstrapped {
             // Startup already applied persisted state synchronously, so begin
             // initial browse/search immediately instead of showing a transient
             // default frame and waiting for an async state-load task.
@@ -16069,6 +16266,12 @@ impl super::ftui_adapter::Model for CassApp {
         } else {
             // Request state load on startup.
             ftui::Cmd::msg(CassMsg::StateLoadRequested)
+        };
+        if self.first_run_index_started_at.is_some() {
+            // Start polling the first-run index (2l1b0.56).
+            ftui::Cmd::batch(vec![startup, Self::delayed_tick(FIRST_RUN_INDEX_POLL)])
+        } else {
+            startup
         }
     }
 
@@ -19656,6 +19859,16 @@ impl super::ftui_adapter::Model for CassApp {
                 self.index_progress_snapshot = IndexProgressSnapshot::default();
                 self.clear_loading_context(LoadingContext::IndexRefresh);
                 self.status = "Index refresh complete".to_string();
+                // A refresh on a launch without an index creates the first
+                // one: open search now instead of requiring a restart. Test
+                // builds stub the refresh (it indexes nothing), and their
+                // default data dir is the real one, so they open nothing.
+                if !cfg!(test)
+                    && self.search_service.is_none()
+                    && let Err(message) = self.open_search_service()
+                {
+                    self.status = message;
+                }
                 self.toast_manager
                     .push(crate::ui::components::toast::Toast::success(
                         "Index refresh complete",
@@ -19746,6 +19959,8 @@ impl super::ftui_adapter::Model for CassApp {
                 let data_dir = self.data_dir.clone();
                 let db_path = self.db_path.clone();
                 let search_service = self.search_service.clone();
+                let progressive_search_service = self.progressive_search_service.clone();
+                let first_run_index_started_at = self.first_run_index_started_at;
                 let db_reader = self.db_reader.clone();
                 let known_workspaces = self.known_workspaces.clone();
                 let next_state_save_token = self.next_state_save_token;
@@ -19761,6 +19976,8 @@ impl super::ftui_adapter::Model for CassApp {
                     data_dir,
                     db_path,
                     search_service,
+                    progressive_search_service,
+                    first_run_index_started_at,
                     db_reader,
                     known_workspaces,
                     next_state_save_token,
@@ -19933,6 +20150,9 @@ impl super::ftui_adapter::Model for CassApp {
                 let mut cmds = Vec::new();
                 if let Some(info) = update_info_ready {
                     cmds.push(ftui::Cmd::msg(CassMsg::UpdateCheckCompleted(info)));
+                }
+                if let Some(cmd) = self.poll_first_run_index(now) {
+                    cmds.push(cmd);
                 }
                 // Debounced search-as-you-type: if a one-shot timer fires
                 // slightly early, reschedule the remaining debounce window
@@ -23407,80 +23627,22 @@ pub fn run_tui_ftui(
     model.latency_trace = latency_trace.clone();
     model.refresh_theme_config_from_data_dir();
     model.bootstrap_persisted_state();
-    model.search_service = match crate::search::tantivy::index_dir(&data_dir) {
-        Ok(index_path) => match crate::search::query::SearchClient::open_with_options(
-            &index_path,
-            Some(&model.db_path),
-            crate::search::query::SearchClientOptions {
-                enable_reload: true,
-                enable_warm: true,
-                strict_read_only: false,
-            },
-        ) {
-            Ok(Some(client)) => {
-                use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
-                use crate::search::model_manager::{
-                    load_hash_semantic_context, load_semantic_context_deferred,
-                };
-
-                let client = Arc::new(client);
-                let prefer_hash =
-                    EmbedderRegistry::new(&data_dir).best_available().name == HASH_EMBEDDER;
-                // GH #395: this runs on the main thread BEFORE the first frame.
-                // The deferred loader resolves the model's identity and
-                // artifacts now but initializes the in-process MiniLM lazily
-                // on the first semantic query (which the TUI already runs on a
-                // background task), so a large model or slow disk can never
-                // hold the UI at a blank screen. The CLI's daemon-first path
-                // uses the same lazy embedder.
-                let setup = if prefer_hash {
-                    load_hash_semantic_context(&data_dir, &model.db_path)
-                } else {
-                    load_semantic_context_deferred(&data_dir, &model.db_path)
-                };
-                model.semantic_availability = setup.availability.clone();
-
-                if let Some(context) = setup.context {
-                    if let Err(err) = client.set_semantic_artifacts_context(
-                        context.embedder,
-                        context.artifacts,
-                        context.quality_artifact,
-                        context.filter_maps,
-                        context.roles,
-                    ) {
-                        tracing::debug!(error = %err, "tui semantic context unavailable");
-                        let _ = client.clear_semantic_context();
-                    }
-                } else {
-                    let _ = client.clear_semantic_context();
-                }
-
-                let service = Arc::new(TantivySearchService::new(Arc::clone(&client)));
-                model.progressive_search_service = Some(Arc::clone(&service));
-                Some(service as Arc<dyn SearchService>)
-            }
-            Ok(None) => {
-                if model.status.is_empty() {
-                    model.status =
-                        "Search index not found. Run `cass index --full` to enable search."
-                            .to_string();
-                }
-                None
-            }
-            Err(e) => {
-                if model.status.is_empty() {
-                    model.status = format!("Search unavailable: failed to open index ({e})");
-                }
-                None
-            }
-        },
-        Err(e) => {
+    match model.open_search_service() {
+        Ok(true) => {}
+        Ok(false) => {
+            // First run (or a missing index): start indexing instead of
+            // leaving search dead until the user finds `cass index --full`.
+            let message = model.start_first_run_index();
             if model.status.is_empty() {
-                model.status = format!("Search unavailable: failed to resolve index path ({e})");
+                model.status = message;
             }
-            None
         }
-    };
+        Err(message) => {
+            if model.status.is_empty() {
+                model.status = message;
+            }
+        }
+    }
 
     // Quality-first budget profile: favor full visuals and smooth transitions.
     let budget = cass_runtime_budget_config();

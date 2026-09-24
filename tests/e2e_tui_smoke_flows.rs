@@ -672,6 +672,150 @@ fn tui_pty_newer_release_surfaces_as_banner_not_a_blocking_prompt() {
     tracker.complete();
 }
 
+/// 2l1b0.56: README Quickstart says the first `cass` run performs a full
+/// index and search then works. It showed "Search index not found. Run
+/// `cass index --full`" and search stayed dead for the whole session. On a
+/// fresh data dir with a Codex fixture and no manual index, the TUI must
+/// start indexing by itself, say when search is live, and find the fixture.
+#[test]
+fn tui_pty_first_run_indexes_then_searches_without_a_manual_index() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_first_run_indexes_then_searches_without_a_manual_index");
+    // First-run indexing (like stale-on-read refresh) never fires for a data
+    // dir under the OS temp dir, so this fixture lives under the target dir
+    // and the child gets its own TMPDIR.
+    let root = tempfile::Builder::new()
+        .prefix("first-run-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create fixture root outside the OS temp dir");
+    let home = root.path().join("home");
+    let data_dir = root.path().join("cass_data");
+    let codex_home = root.path().join("codex_home");
+    let child_tmp = root.path().join("tmp");
+    for dir in [&home, &data_dir, &codex_home, &child_tmp] {
+        fs::create_dir_all(dir).expect("create fixture dir");
+    }
+    fs::write(
+        data_dir.join("tui_state.json"),
+        r#"{"version":1,"has_seen_help":true,"help_pinned":false}"#,
+    )
+    .expect("seed TUI state");
+    make_codex_fixture(&codex_home);
+    assert!(
+        !data_dir.join("agent_search.db").exists(),
+        "the fixture must start without an archive"
+    );
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 45,
+            cols: 150,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let launch_start = tracker.start("pty_first_run", Some("Launching TUI on an empty data dir"));
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    tui_cmd.cwd(home.to_string_lossy().as_ref());
+    for (key, value) in [
+        ("HOME", home.as_path()),
+        ("XDG_DATA_HOME", root.path()),
+        ("XDG_CONFIG_HOME", root.path()),
+        ("CASS_DATA_DIR", data_dir.as_path()),
+        ("CODEX_HOME", codex_home.as_path()),
+        ("TMPDIR", child_tmp.as_path()),
+    ] {
+        tui_cmd.env(key, value.to_string_lossy().as_ref());
+    }
+    tui_cmd.env("CASS_TUI_RUNTIME", "ftui");
+    tui_cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    tui_cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    tui_cmd.env("NO_COLOR", "1");
+    tui_cmd.env("CASS_RESPECT_NO_COLOR", "1");
+    tui_cmd.env("TERM", "xterm-256color");
+    for inherited in [
+        "TUI_HEADLESS",
+        "CASS_AUTO_REFRESH",
+        "CASS_AUTO_REFRESH_COOLDOWN_SECS",
+    ] {
+        tui_cmd.env_remove(inherited);
+    }
+    let mut tui_child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+
+    let search_live = wait_for_rendered_output(&captured, Duration::from_secs(150), |screen| {
+        screen.contains("Index ready")
+    });
+    let ready_ms = launch_start.elapsed().as_millis();
+    let mut found_fixture = false;
+    if search_live {
+        send_key_sequence(&mut *writer, b"hello");
+        thread::sleep(Duration::from_millis(120));
+        send_key_sequence(&mut *writer, b"\r");
+        found_fixture = wait_for_rendered_output(
+            &captured,
+            Duration::from_secs(15),
+            rendered_contains_hello_fixture_content,
+        );
+    }
+    let (tui_status, _esc_presses) =
+        quit_tui_with_escape(&mut *writer, &mut *tui_child, 8, Duration::from_millis(180));
+    tracker.end(
+        "pty_first_run",
+        Some("first-run index observed and TUI quit"),
+        launch_start,
+    );
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_first_run_output.raw", &trace, &raw);
+    eprintln!(
+        "[first_run] trace={trace} search_live={search_live} ready_ms={ready_ms} found_fixture={found_fixture} archive={} exit={tui_status}",
+        data_dir.join("agent_search.db").exists()
+    );
+
+    // Let the detached indexer finish before the fixture root is removed.
+    let lock_path = data_dir.join("index-run.lock");
+    let settle = Instant::now();
+    while settle.elapsed() < Duration::from_secs(60) {
+        let released = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map(|file| file.try_lock().is_ok())
+            .unwrap_or(true);
+        if released {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    assert!(
+        search_live,
+        "the TUI never reported search live after launching on an empty data dir: {}",
+        truncate_output(&raw, 2000)
+    );
+    assert!(
+        found_fixture,
+        "search went live but the fixture was not found: {}",
+        truncate_output(&raw, 2000)
+    );
+    assert!(
+        tui_status.success(),
+        "ftui process exited unsuccessfully: {tui_status}"
+    );
+    tracker.complete();
+}
+
 #[test]
 fn tui_pty_help_overlay_open_close_flow() {
     let _guard_lock = tui_flow_guard();

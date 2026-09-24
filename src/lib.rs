@@ -22731,8 +22731,9 @@ fn maybe_auto_refresh_index_after_read(
 }
 
 /// True when `data_dir` lives under the platform temp dir (or `CASS_DATA_DIR`
-/// explicitly points at one). Auto-refresh never fires there.
-fn auto_refresh_is_scratch_data_dir(data_dir: &Path) -> bool {
+/// explicitly points at one). Auto-refresh never fires there, and neither
+/// does the TUI's first-run index.
+pub(crate) fn auto_refresh_is_scratch_data_dir(data_dir: &Path) -> bool {
     let temp = std::env::temp_dir();
     let canon_temp = std::fs::canonicalize(&temp).unwrap_or(temp);
     let canon_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
@@ -28172,7 +28173,7 @@ fn describe_background_lexical_repair(
 
 /// Progress of the lexical rebuild recorded under `index_path`, for messages
 /// that tell a caller how far an active rebuild has come.
-fn lexical_rebuild_progress_note(index_path: &Path) -> Option<String> {
+pub(crate) fn lexical_rebuild_progress_note(index_path: &Path) -> Option<String> {
     let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(index_path)
         .ok()
         .flatten()?;
