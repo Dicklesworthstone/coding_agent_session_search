@@ -986,7 +986,9 @@ Every command supports machine-readable output:
 cass search "error" --robot
 
 # Streaming JSONL: one hit per line. Add --robot-meta to prepend a
-# _meta header line (elapsed_ms, next_cursor, state, index_freshness).
+# {budget, _meta} header line (elapsed_ms, next_cursor, state, index_freshness).
+# The header also appears without --robot-meta when the search timed out
+# (budget.timed_out), returned did-you-mean suggestions, --aggregate or --explain.
 cass search "error" --robot-format jsonl               # hits only
 cass search "error" --robot-format jsonl --robot-meta  # 1 _meta header + hits
 

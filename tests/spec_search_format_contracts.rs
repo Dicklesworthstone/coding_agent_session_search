@@ -177,6 +177,45 @@ fn jsonl_every_line_is_independent_valid_json_without_robot_meta() -> TestResult
     Ok(())
 }
 
+/// 2l1b0.58: README promises `--robot-format jsonl` is hits only unless
+/// `--robot-meta` is given. Every search has a budget and the header was
+/// gated on `budget_ms > 0`, so a `{budget, _meta}` line always led the
+/// output and a line-per-hit consumer counted it as a hit.
+#[test]
+fn jsonl_without_robot_meta_is_hits_only() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let stdout = run_search(&data_dir, &["hello", "--robot-format", "jsonl"])?;
+    let lines = output_lines(&stdout);
+    ensure(!lines.is_empty(), "the demo fixture must match `hello`")?;
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        ensure(
+            value.get("_meta").is_none() && value.get("budget").is_none(),
+            format!("jsonl without --robot-meta printed a header line: {line}"),
+        )?;
+        ensure(
+            value.get("source_path").is_some(),
+            format!("every jsonl line must be a hit: {line}"),
+        )?;
+    }
+
+    // Positive control: asking for metadata still leads with the header.
+    let with_meta = run_search(
+        &data_dir,
+        &["hello", "--robot-format", "jsonl", "--robot-meta"],
+    )?;
+    let first_line = output_lines(&with_meta)
+        .first()
+        .copied()
+        .ok_or_else(|| test_error("jsonl --robot-meta printed nothing"))?;
+    let first: serde_json::Value = serde_json::from_str(first_line)?;
+    ensure(
+        first.get("_meta").is_some(),
+        format!("--robot-meta must lead with the _meta header: {first_line}"),
+    )
+}
+
 #[test]
 fn compact_format_is_exactly_one_line_of_valid_json() -> TestResult {
     let tmp = TempDir::new()?;

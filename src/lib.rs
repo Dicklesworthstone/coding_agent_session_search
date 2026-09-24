@@ -35943,12 +35943,12 @@ fn output_robot_results(
     };
 
     // Clamp hits to token budget if provided (approx 4 chars per token)
+    // Must match the JSONL header condition in the output match below.
     let jsonl_meta_emitted = matches!(format, RobotFormat::Jsonl)
         && (include_meta
             || !aggregations.is_empty()
             || !result.suggestions.is_empty()
             || explanation.is_some()
-            || budget.budget_ms > 0
             || budget.timed_out);
     let estimate_tokens = max_tokens.is_some() || include_meta || jsonl_meta_emitted;
     let (mut filtered_hits, tokens_estimated, hits_clamped) =
@@ -36282,12 +36282,15 @@ fn output_robot_results(
             let stdout = std::io::stdout();
             let mut out = BufWriter::new(stdout.lock());
 
-            // JSONL: one object per line, optional _meta header
+            // JSONL: one hit per line, preceded by a {budget, _meta} header
+            // only when something asked for it or the budget ran out. Every
+            // search has a budget, so gating on `budget_ms > 0` printed the
+            // header always, and a line-per-hit consumer read it as a hit
+            // (README: "jsonl # hits only"; 2l1b0.58).
             if include_meta
                 || agg_json.is_some()
                 || !result.suggestions.is_empty()
                 || explanation.is_some()
-                || budget.budget_ms > 0
                 || budget.timed_out
             {
                 let mut meta = serde_json::json!({
