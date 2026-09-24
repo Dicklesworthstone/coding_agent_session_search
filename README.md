@@ -2243,13 +2243,12 @@ Cycle through 19 built-in theme presets with `F2`:
 
 ### WCAG Accessibility
 
-All theme colors are validated against WCAG (Web Content Accessibility Guidelines) contrast requirements:
+Every theme preset is checked in the test suite against WCAG contrast ratios, with these floors:
 
-- **Text on backgrounds**: Minimum 4.5:1 contrast ratio (AA standard)
-- **Large text/headers**: Minimum 3:1 contrast ratio
-- **Interactive elements**: Clear visual distinction from content
+- **Body text on the background**: at least 3:1, and 2.5:1 on raised surfaces
+- **Selected rows, muted text, focused borders**: at least 3:1
 
-The theming engine calculates relative luminance and contrast ratios at runtime to ensure readability across all color combinations.
+These floors are below WCAG AA's 4.5:1 for body text, so cass does not claim AA conformance. At runtime, role and status badges pick whichever candidate foreground has the highest contrast against their background.
 
 ### Role-Aware Message Styling
 
@@ -2338,18 +2337,17 @@ Bookmarks are stored separately from the main index:
 
 | Type | Icon | Auto-Dismiss | Use Case |
 |------|------|--------------|----------|
-| **Info** | ℹ️ | 3 seconds | Status updates, tips |
-| **Success** | ✓ | 2 seconds | Operations completed |
-| **Warning** | ⚠ | 4 seconds | Non-critical issues |
-| **Error** | ✗ | 6 seconds | Failures requiring attention |
+| **Info** | `i` | 3 seconds | Status updates, tips |
+| **Success** | `*` | 2 seconds | Operations completed |
+| **Warning** | `!` | 4 seconds | Non-critical issues |
+| **Error** | `x` | 6 seconds | Failures requiring attention |
 
 ### Behavior
 
-- **Non-Blocking**: Toasts appear in a corner without stealing focus
+- **Non-Blocking**: Toasts appear in the top-right corner without stealing focus (the position is fixed; there is no setting for it)
 - **Auto-Dismiss**: Each type has an appropriate display duration
 - **Message Coalescing**: Duplicate messages show a count badge instead of stacking
-- **Configurable Position**: Toasts can appear in any corner (default: top-right)
-- **Maximum Visible**: Limited to 3-5 visible toasts to prevent screen clutter
+- **Maximum Visible**: At most 5 toasts at once to prevent screen clutter
 
 ### Visual Design
 
@@ -2362,12 +2360,12 @@ Toasts feature:
 
 | Trigger | Toast |
 |---------|-------|
-| Index rebuild complete | ✓ "Index rebuilt: 2,500 conversations" |
-| Export complete | ✓ "Exported to conversation.md" |
-| Copy to clipboard | ✓ "Copied to clipboard" |
-| Search timeout | ⚠ "Search timed out, showing partial results" |
-| Connector error | ✗ "Failed to scan ChatGPT: encrypted files" |
-| Update available | ℹ️ "Version 0.5.0 available" |
+| Bulk copy of selected paths | `*` "Copied 3 paths" |
+| Bulk export | `*` "Exported 3 items as JSON" |
+| Copy failure | `x` "Copy failed: ..." |
+| Slow search | "Slow search: 1840ms" |
+| Semantic refinement failure | "Refinement failed: ..." |
+| Saved views | `*` "Renamed slot 2", `!` "Slot 4 is empty" |
 
 ---
 
@@ -2648,7 +2646,7 @@ The interactive interface (`src/ui/app.rs`) uses **FrankenTUI (ftui)**, a Rust T
 1. **Model (CassApp)**: A monolithic struct tracks the entire UI state (search query, cursor position, scroll offsets, active filters, cached details, animation state).
 2. **Update**: Each event (key, mouse, tick, resize) maps to a `CassMsg` variant. The `update()` function produces `Cmd` effects (async tasks, ticks, quit).
 3. **View**: The `view()` function renders the current state to an ftui `Frame`. The runtime diff engine minimizes terminal writes using Bayesian strategy selection.
-4. **Adaptive Budget**: A 16ms (60fps) frame budget with PID-controlled degradation automatically simplifies rendering (borders, animations) when frame times exceed budget.
+4. **Adaptive Budget**: A 120 ms total frame budget (render 24 ms, present 12 ms, diff 6 ms; frames are never skipped) with PID-controlled degradation automatically simplifies rendering (borders, animations) when frame times exceed budget.
 5. **Background Tasks**: Search queries, indexing, and analytics run on background threads via `Cmd::Task`, with results delivered as messages.
 
 ```mermaid
