@@ -5369,7 +5369,9 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 #[cfg(test)]
-                                lexical_rebuild_shard_build_injected_panic_hook();
+                                lexical_rebuild_shard_build_injected_panic_hook(
+                                    &work.shard_index_path,
+                                );
                                 build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
                                     &work.shard_index_path,
                                     &work.packets,
@@ -5485,7 +5487,7 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 #[cfg(test)]
-                                lexical_rebuild_shard_merge_injected_panic_hook();
+                                lexical_rebuild_shard_merge_injected_panic_hook(&work.output_path);
                                 crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
                                     &work.output_path,
                                     &input_paths,
@@ -21780,44 +21782,78 @@ impl Drop for StreamingByteReservation<'_> {
     }
 }
 
-/// Test-only panic injection for the page-prep worker panic-containment
-/// regression test (#288). Armed by the test immediately before sending a
-/// work item; consumed (and disarmed) by the first
-/// `prepare_lexical_rebuild_page_work` call that observes it.
+/// Test-only panic injection for the worker panic-containment regression
+/// tests (#282/#288). A test arms an injection for its own temp directory;
+/// only a worker whose database or output path lies inside that directory
+/// consumes it. A process-global flag let a rebuild running in any parallel
+/// test consume the injection, so the arming test saw no panic and the other
+/// test died of it (2l1b0.70).
 #[cfg(test)]
-static LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+struct ScopedPanicInjection(std::sync::Mutex<Option<PathBuf>>);
 
 #[cfg(test)]
-fn lexical_rebuild_page_prep_injected_panic_hook() {
-    if LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild page-prep panic for the #288 regression test");
+impl ScopedPanicInjection {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    fn arm(&self, scope: &Path) {
+        let mut armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *armed = Some(scope.to_path_buf());
+    }
+
+    fn fire_if_armed_for(&self, path: &Path, message: &str) {
+        let mut armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if armed
+            .as_deref()
+            .is_some_and(|scope| path.starts_with(scope))
+        {
+            *armed = None;
+            drop(armed);
+            panic!("{message}");
+        }
     }
 }
 
-/// Test-only panic injection for the shard-build worker panic-containment
-/// regression test (#282/#288). Armed by the test before sending shard-build
-/// work; consumed by the first build attempt inside the worker's catch_unwind.
 #[cfg(test)]
-static LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+static LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC: ScopedPanicInjection = ScopedPanicInjection::new();
 
 #[cfg(test)]
-fn lexical_rebuild_shard_build_injected_panic_hook() {
-    if LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild shard-build panic for the #282 regression test");
-    }
+fn lexical_rebuild_page_prep_injected_panic_hook(db_path: &Path) {
+    LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.fire_if_armed_for(
+        db_path,
+        "injected lexical rebuild page-prep panic for the #288 regression test",
+    );
 }
 
-/// Test-only panic injection for the shard-merge worker panic-containment
-/// regression test (#282). Armed by the test before sending a merge job;
-/// consumed by the first merge attempt inside the worker's catch_unwind.
 #[cfg(test)]
-static LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+static LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC: ScopedPanicInjection =
+    ScopedPanicInjection::new();
 
 #[cfg(test)]
-fn lexical_rebuild_shard_merge_injected_panic_hook() {
-    if LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild shard-merge panic for the #282 regression test");
-    }
+fn lexical_rebuild_shard_build_injected_panic_hook(shard_index_path: &Path) {
+    LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.fire_if_armed_for(
+        shard_index_path,
+        "injected lexical rebuild shard-build panic for the #282 regression test",
+    );
+}
+
+#[cfg(test)]
+static LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC: ScopedPanicInjection =
+    ScopedPanicInjection::new();
+
+#[cfg(test)]
+fn lexical_rebuild_shard_merge_injected_panic_hook(output_path: &Path) {
+    LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.fire_if_armed_for(
+        output_path,
+        "injected lexical rebuild shard-merge panic for the #282 regression test",
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -21830,8 +21866,6 @@ fn prepare_lexical_rebuild_page_work(
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     work: LexicalRebuildPagePrepWork,
 ) -> Result<LexicalRebuildSequencedPreparedPage> {
-    #[cfg(test)]
-    lexical_rebuild_page_prep_injected_panic_hook();
     let sequence = work.sequence;
     let conversation_ids = work
         .conversation_page
@@ -22082,6 +22116,8 @@ fn spawn_lexical_rebuild_page_prep_workers(
                             // the producer observes a result and aborts loudly.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                                 || {
+                                    #[cfg(test)]
+                                    lexical_rebuild_page_prep_injected_panic_hook(&worker_db_path);
                                     prepare_lexical_rebuild_page_work(
                                         &mut storage,
                                         worker_source_map.as_ref(),
@@ -47860,6 +47896,30 @@ mod tests {
     /// parked forever at `result_rx.recv()` — exactly the reporter's
     /// all-parked thread dump (queue_depth=0, active_page_prep_jobs=0,
     /// inflight=0).
+    /// 2l1b0.70: an armed injection fires only for work inside its scope and
+    /// only once. With the former process-global flag, a rebuild in another
+    /// test (a different temp directory) consumed it.
+    #[test]
+    fn scoped_panic_injection_fires_only_inside_its_scope() {
+        let injection = ScopedPanicInjection::new();
+        let armed = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        injection.arm(armed.path());
+
+        injection.fire_if_armed_for(&other.path().join("agent_search.db"), "must not fire");
+
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            injection.fire_if_armed_for(&armed.path().join("agent_search.db"), "fired in scope");
+        }));
+        assert!(
+            fired.is_err(),
+            "an injection armed for this scope must fire"
+        );
+
+        // Consumed: a second worker in the same scope proceeds normally.
+        injection.fire_if_armed_for(&armed.path().join("agent_search.db"), "must not fire twice");
+    }
+
     #[test]
     #[serial]
     fn page_prep_worker_panic_surfaces_as_error_result_instead_of_parking_producer() {
@@ -47887,7 +47947,7 @@ mod tests {
         )
         .unwrap();
 
-        LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.arm(tmp.path());
         work_tx
             .send(LexicalRebuildPagePrepWork {
                 sequence: 0,
@@ -47951,7 +48011,7 @@ mod tests {
         );
 
         let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.arm(tmp.path());
         work_tx
             .send(LexicalRebuildShardBuildWork {
                 shard: LexicalShardPlanShard {
@@ -48008,7 +48068,7 @@ mod tests {
         let handles = spawn_lexical_rebuild_shard_merge_workers(worker_count, job_rx, msg_tx);
 
         let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.arm(tmp.path());
         job_tx
             .send(LexicalRebuildShardMergeJob {
                 output_level: 3,
