@@ -3522,7 +3522,7 @@ Update check state is stored in the data directory:
 |----------|---------|-------------|
 | **Core** | | |
 | `CASS_DATA_DIR` | Platform default | Override data directory |
-| `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Override database path |
+| `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Same as `--db` (the flag wins): path of the canonical database. When it lies outside the data dir, derived assets (lexical index, checkpoints, locks) follow its directory unless `--data-dir` is given |
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |

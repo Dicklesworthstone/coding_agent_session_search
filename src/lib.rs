@@ -293,8 +293,10 @@ pub struct Cli {
     /// points outside the default data dir, derived assets (lexical index,
     /// raw-mirror, checkpoints, locks) follow it into the db file's parent
     /// directory, so a scratch `--db` is fully isolated from the live
-    /// install (#403). An explicit `--data-dir` still wins.
-    #[arg(long)]
+    /// install (#403). An explicit `--data-dir` still wins. `CASS_DB_PATH`
+    /// sets the same value when the flag is absent (2l1b0.57: it was
+    /// documented in README, robot-docs and capabilities but never read).
+    #[arg(long, env = "CASS_DB_PATH")]
     pub db: Option<PathBuf>,
 
     /// Deterministic machine-first help (wide, no TUI)

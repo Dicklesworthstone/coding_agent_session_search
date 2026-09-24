@@ -5621,6 +5621,55 @@ fn flag_typo_on_exact_subcommand_runs_that_subcommand() -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// 2l1b0.57: `CASS_DB_PATH` was advertised (README, robot-docs env,
+/// capabilities) but never read, so commands silently used the default
+/// archive. It now means exactly `--db`: the archive it names is opened and
+/// derived assets follow its directory (#403).
+#[test]
+fn cass_db_path_env_selects_the_archive_like_db_flag() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+    let empty = TempDir::new()?;
+    let status_with = |db_env: Option<&Path>| -> Result<Value, Box<dyn Error>> {
+        let mut cmd = base_cmd();
+        cmd.args(["status", "--json"])
+            .env("CASS_DATA_DIR", empty.path())
+            .env("HOME", empty.path())
+            .env_remove("CASS_DB_PATH");
+        if let Some(db) = db_env {
+            cmd.env("CASS_DB_PATH", db);
+        }
+        let output = cmd.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(serde_json::from_str(stdout.trim()).map_err(|error| {
+            format!(
+                "status stdout is not JSON ({error}): {stdout}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?)
+    };
+
+    // Control: without the variable, status reads the empty data dir.
+    let default_status = status_with(None)?;
+    assert_eq!(
+        default_status["initialized"], false,
+        "control must see the empty data dir: {default_status}"
+    );
+
+    let db_path = fixture.path().join("agent_search.db");
+    let env_status = status_with(Some(&db_path))?;
+    assert_eq!(
+        env_status["initialized"], true,
+        "CASS_DB_PATH must open the fixture archive: {env_status}"
+    );
+    let reported_dir = env_status["data_dir"].as_str().unwrap_or_default();
+    assert_eq!(
+        Path::new(reported_dir).canonicalize()?,
+        fixture.path().canonicalize()?,
+        "derived assets must follow the CASS_DB_PATH directory (#403): {env_status}"
+    );
+    Ok(())
+}
+
 /// 2l1b0.64: an unparseable `--since`/`--until` used to be dropped, so the
 /// search ran unfiltered with exit 0 (or, on an empty data dir, failed later
 /// with exit 3 missing-index). It is a usage error before anything opens.
