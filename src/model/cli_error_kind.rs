@@ -91,13 +91,11 @@ pub enum ErrorKind {
     IdempotencyMismatch,
     Index,
     IndexBusy,
-    IndexMissing,
     IndexedSessionRequired,
     InvalidAgent,
     InvalidFilename,
     InvalidLine,
     Io,
-    IoError,
     LexicalRebuild,
     /// Snake-case wire literal (legacy): `lexical_generation`.
     LexicalGeneration,
@@ -154,7 +152,6 @@ pub enum ErrorKind {
     TuiResetState,
     Unknown,
     UnknownAgent,
-    UpdateCheck,
     Usage,
     WriteFailed,
 }
@@ -199,13 +196,11 @@ impl ErrorKind {
             Self::IdempotencyMismatch => "idempotency-mismatch",
             Self::Index => "index",
             Self::IndexBusy => "index-busy",
-            Self::IndexMissing => "index-missing",
             Self::IndexedSessionRequired => "indexed-session-required",
             Self::InvalidAgent => "invalid-agent",
             Self::InvalidFilename => "invalid-filename",
             Self::InvalidLine => "invalid-line",
             Self::Io => "io",
-            Self::IoError => "io-error",
             Self::LexicalRebuild => "lexical-rebuild",
             Self::LexicalGeneration => "lexical_generation",
             Self::LexicalShard => "lexical_shard",
@@ -259,7 +254,6 @@ impl ErrorKind {
             Self::TuiResetState => "tui-reset-state",
             Self::Unknown => "unknown",
             Self::UnknownAgent => "unknown-agent",
-            Self::UpdateCheck => "update-check",
             Self::Usage => "usage",
             Self::WriteFailed => "write-failed",
         }
@@ -303,13 +297,11 @@ impl ErrorKind {
             "idempotency-mismatch" => Self::IdempotencyMismatch,
             "index" => Self::Index,
             "index-busy" => Self::IndexBusy,
-            "index-missing" => Self::IndexMissing,
             "indexed-session-required" => Self::IndexedSessionRequired,
             "invalid-agent" => Self::InvalidAgent,
             "invalid-filename" => Self::InvalidFilename,
             "invalid-line" => Self::InvalidLine,
             "io" => Self::Io,
-            "io-error" => Self::IoError,
             "lexical-rebuild" => Self::LexicalRebuild,
             "lexical_generation" => Self::LexicalGeneration,
             "lexical_shard" => Self::LexicalShard,
@@ -363,7 +355,6 @@ impl ErrorKind {
             "tui-reset-state" => Self::TuiResetState,
             "unknown" => Self::Unknown,
             "unknown-agent" => Self::UnknownAgent,
-            "update-check" => Self::UpdateCheck,
             "usage" => Self::Usage,
             "write-failed" => Self::WriteFailed,
             _ => return None,
@@ -407,13 +398,11 @@ impl ErrorKind {
             Self::IdempotencyMismatch,
             Self::Index,
             Self::IndexBusy,
-            Self::IndexMissing,
             Self::IndexedSessionRequired,
             Self::InvalidAgent,
             Self::InvalidFilename,
             Self::InvalidLine,
             Self::Io,
-            Self::IoError,
             Self::LexicalRebuild,
             Self::LexicalGeneration,
             Self::LexicalShard,
@@ -467,7 +456,6 @@ impl ErrorKind {
             Self::TuiResetState,
             Self::Unknown,
             Self::UnknownAgent,
-            Self::UpdateCheck,
             Self::Usage,
             Self::WriteFailed,
         ]
@@ -529,11 +517,13 @@ mod tests {
     /// drift immediately at CI time.
     #[test]
     fn variant_count_matches_audited_lib_rs_kind_literals() {
-        // 95 unique kinds after background indexing's deferred storage
-        // migration repair adds `migration-repair-pending` (GH #450). If
-        // lib.rs grows a new kind, bump this count AND add the variant +
+        // 92 unique kinds: GH #450 added `migration-repair-pending` (95), then
+        // 2l1b0.58 folded the duplicate spellings `index-missing` into
+        // `missing-index` and `io-error` into `io`, and dropped `update-check`,
+        // whose only producer (the pre-TUI update prompt) 2l1b0.56 removed.
+        // If lib.rs grows a new kind, bump this count AND add the variant +
         // arms above.
-        const AUDITED_KIND_COUNT: usize = 95;
+        const AUDITED_KIND_COUNT: usize = 92;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,

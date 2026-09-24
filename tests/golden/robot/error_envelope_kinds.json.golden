@@ -2,7 +2,7 @@
   "_meta": {
     "description": "Canonical error kind taxonomy for cass robot-mode error envelopes",
     "rule": "All err.kind values MUST be kebab-case per AGENTS.md",
-    "total_kinds": 90,
+    "total_kinds": 87,
     "regenerate": "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope"
   },
   "kinds": {
@@ -161,11 +161,6 @@
         7
       ]
     },
-    "index-missing": {
-      "exit_codes": [
-        3
-      ]
-    },
     "indexed-session-required": {
       "exit_codes": [
         9
@@ -188,17 +183,12 @@
     },
     "io": {
       "exit_codes": [
+        1,
         9,
         14,
         15,
         22,
         24
-      ]
-    },
-    "io-error": {
-      "exit_codes": [
-        1,
-        14
       ]
     },
     "lexical-rebuild": {
@@ -459,11 +449,6 @@
     "unknown-agent": {
       "exit_codes": [
         3
-      ]
-    },
-    "update-check": {
-      "exit_codes": [
-        9
       ]
     },
     "usage": {

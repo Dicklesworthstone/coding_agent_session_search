@@ -257,7 +257,7 @@ fn check() -> Result<(), String> {
         failures.push(format!("--force should rebuild to native_valid: {forced}"));
     }
 
-    // 5. An unpublished tier is refused with the index-missing envelope.
+    // 5. An unpublished tier is refused with the missing-index envelope.
     let out = run(
         &fixture,
         "build_hnsw_quality_missing",

@@ -137,7 +137,7 @@ fn error_kind_exit_codes_do_not_leak_from_adjacent_producers() {
             message: err.to_string(),
         })?.ok_or_else(|| CliError {
             code: 3,
-            kind: CliErrorKind::IndexMissing.kind_str(),
+            kind: CliErrorKind::MissingIndex.kind_str(),
         })?;
         let first = CliError {
             code: 9,
@@ -153,8 +153,8 @@ fn error_kind_exit_codes_do_not_leak_from_adjacent_producers() {
     assert_eq!(
         serde_json::to_value(extract_kind_exit_codes_from_source(source)).unwrap(),
         serde_json::json!({
-            "index-missing": [3],
             "io": [9, 14],
+            "missing-index": [3],
             "selftest": [1, 2],
             "storage": [5],
         })

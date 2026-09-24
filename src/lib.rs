@@ -20156,7 +20156,7 @@ async fn import_chatgpt_export(
     if !export_path.exists() {
         return Err(CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Export file not found: {}", export_path.display()),
             hint: Some(
                 "Provide the path to conversations.json from ChatGPT web export \
@@ -20193,7 +20193,7 @@ async fn import_chatgpt_export(
     let conv_dir = base_dir.join("conversations-web-export");
     std::fs::create_dir_all(&conv_dir).map_err(|e| CliError {
         code: 1,
-        kind: CliErrorKind::IoError.kind_str(),
+        kind: CliErrorKind::Io.kind_str(),
         message: format!("Failed to create output directory: {e}"),
         hint: None,
         retryable: false,
@@ -20202,7 +20202,7 @@ async fn import_chatgpt_export(
     // Read and parse export file
     let content = std::fs::read_to_string(export_path).map_err(|e| CliError {
         code: 1,
-        kind: CliErrorKind::IoError.kind_str(),
+        kind: CliErrorKind::Io.kind_str(),
         message: format!("Failed to read export file: {e}"),
         hint: None,
         retryable: false,
@@ -20233,21 +20233,21 @@ async fn import_chatgpt_export(
         // Write individual conversation file
         let mut file = std::fs::File::create(&filepath).map_err(|e| CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to write {}: {e}", filepath.display()),
             hint: None,
             retryable: false,
         })?;
         serde_json::to_writer(&mut file, conv).map_err(|e| CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to serialize conversation: {e}"),
             hint: None,
             retryable: false,
         })?;
         file.flush().map_err(|e| CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to flush: {e}"),
             hint: None,
             retryable: false,
@@ -117431,7 +117431,7 @@ fn run_sources_artifact_manifest(
     let manifest_path = if write {
         let path = manifest.save(&index_path).map_err(|e| CliError {
             code: 14,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to write lexical artifact evidence manifest: {e:#}"),
             hint: Some("Check that the index directory is writable.".to_string()),
             retryable: true,
@@ -122006,7 +122006,7 @@ fn run_models_build_hnsw(
         })?
         .ok_or_else(|| CliError {
             code: 3,
-            kind: CliErrorKind::IndexMissing.kind_str(),
+            kind: CliErrorKind::MissingIndex.kind_str(),
             message: format!(
                 "no semantic manifest under {}; nothing is published to accelerate",
                 data_dir.display()
@@ -122033,7 +122033,7 @@ fn run_models_build_hnsw(
     .filter(|record| record.ready)
     .ok_or_else(|| CliError {
         code: 3,
-        kind: CliErrorKind::IndexMissing.kind_str(),
+        kind: CliErrorKind::MissingIndex.kind_str(),
         message: format!(
             "no published {} semantic artifact in the manifest",
             tier.as_str()
@@ -122483,7 +122483,7 @@ fn run_models_backfill_batch(
     if !db_path.is_file() {
         return Err(CliError {
             code: 3,
-            kind: CliErrorKind::IndexMissing.kind_str(),
+            kind: CliErrorKind::MissingIndex.kind_str(),
             message: format!("cass database not found: {}", db_path.display()),
             hint: Some("Run 'cass index --full' before semantic backfill".into()),
             retryable: true,
