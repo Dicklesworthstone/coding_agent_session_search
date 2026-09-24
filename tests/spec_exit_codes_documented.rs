@@ -179,6 +179,59 @@ fn every_documented_exit_code_is_emitted() -> TestResult {
     )
 }
 
+/// Codes in the first markdown table after `heading` (rows `| N | ...` or
+/// `| N-M | ...`), stopping at the first line after the table.
+fn markdown_table_codes(doc: &str, heading: &str) -> Result<BTreeSet<i32>, Box<dyn Error>> {
+    let start = doc
+        .find(heading)
+        .ok_or_else(|| test_error(format!("heading not found: {heading}")))?;
+    let mut codes = BTreeSet::new();
+    let mut in_table = false;
+    for line in doc[start..].lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.starts_with('|') {
+            in_table = true;
+            let cell = trimmed
+                .trim_start_matches('|')
+                .split('|')
+                .next()
+                .unwrap_or("");
+            let cell = cell.trim();
+            let (first, last) = cell.split_once('-').unwrap_or((cell, cell));
+            if let (Ok(first), Ok(last)) = (first.parse::<i32>(), last.parse::<i32>()) {
+                codes.extend(first..=last);
+            }
+        } else if in_table {
+            break;
+        }
+    }
+    Ok(codes)
+}
+
+/// The human tables agents also read must list exactly the codes
+/// `capabilities` documents. They drifted separately before: README and
+/// AGENTS kept "4 = network" and "6 = incompatible version" and lacked 70
+/// and 130 (2l1b0.58 / 2l1b0.69).
+#[test]
+fn readme_and_agents_exit_code_tables_match_capabilities() -> TestResult {
+    let documented = documented_exit_codes()?;
+    for (name, doc, heading) in [
+        (
+            "README.md",
+            include_str!("../README.md"),
+            "**Exit codes** follow a semantic convention",
+        ),
+        ("AGENTS.md", include_str!("../AGENTS.md"), "### Exit Codes"),
+    ] {
+        let table = markdown_table_codes(doc, heading)?;
+        ensure(
+            table == documented,
+            format!("{name} exit-code table {table:?} differs from capabilities {documented:?}"),
+        )?;
+    }
+    Ok(())
+}
+
 #[test]
 fn process_exit_extractor_reads_only_literal_codes() -> TestResult {
     let sample = "std::process::exit(70);\nprocess::exit(code);\nstd::process::exit(130)\nexit(9);";
