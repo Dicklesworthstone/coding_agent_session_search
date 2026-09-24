@@ -1221,7 +1221,7 @@ Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `
 
 **Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
-The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path).
+The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path). A lexical query the engine refuses with `posting cursor invariant failed` (kind `search`, exit 9) is `retryable: false`: the same query fails the same way on the same index generation. Date-filtered searches over an index segment that holds deleted rows are the known trigger (GH #499); the hint names the workaround, `cass index --full --force-rebuild`.
 
 ### Session Analysis Commands
 

@@ -30380,6 +30380,53 @@ fn empty_search_result() -> crate::search::query::SearchResult {
     }
 }
 
+/// Remedy for a lexical query the engine refused with a posting-cursor
+/// invariant failure, or `None` for every other failure. That refusal belongs
+/// to the published generation, not the moment: retrying the same query
+/// against the same segments fails the same way, so an envelope carrying this
+/// hint must also say `retryable: false` (GH #499, where agents following the
+/// contract retried a date-filtered search forever).
+fn lexical_engine_invariant_hint(error: &anyhow::Error) -> Option<String> {
+    crate::search::quill_bridge::is_engine_invariant_failure(error).then(|| {
+        "the lexical engine rejected this query on the current index generation, and \
+         retrying fails the same way. Date filters (--days/--since/--until) over an index \
+         segment that holds deleted rows are the known trigger (GH #499): run \
+         'cass index --full --force-rebuild' to publish a clean generation, or search \
+         without the date filter"
+            .to_string()
+    })
+}
+
+#[cfg(test)]
+mod lexical_engine_invariant_hint_tests {
+    use super::*;
+
+    /// GH #499: the reporter's exact envelope message gets the remedy (and
+    /// therefore `retryable: false` at every call site); fuel exhaustion and
+    /// reader faults keep their existing, retryable handling.
+    #[test]
+    fn only_a_cursor_invariant_failure_gets_the_non_retryable_remedy() {
+        let invariant = anyhow::anyhow!(
+            "executing a Quill lexical query: posting cursor invariant failed: Boolean \
+             children belong to different segment domains"
+        );
+        let hint = lexical_engine_invariant_hint(&invariant)
+            .expect("the #499 engine failure must carry a remedy");
+        assert!(hint.contains("cass index --full --force-rebuild"), "{hint}");
+        assert!(hint.contains("retrying fails the same way"), "{hint}");
+
+        for other in [
+            anyhow::anyhow!(
+                "executing a Quill lexical query: query fuel exhausted after 10/10 units"
+            ),
+            anyhow::anyhow!("opening the Quill CASS reader: manifest missing"),
+            anyhow::anyhow!("database is locked"),
+        ] {
+            assert_eq!(lexical_engine_invariant_hint(&other), None, "{other}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_search_operation(
     client: std::sync::Arc<crate::search::query::SearchClient>,
@@ -30412,6 +30459,8 @@ fn execute_search_operation(
                 // degrade to, so name the two real remedies instead of a bare
                 // engine error.
                 let fuel_exhausted = crate::search::quill_bridge::is_query_fuel_exhausted(&error);
+                let invariant_hint = lexical_engine_invariant_hint(&error);
+                let retryable = invariant_hint.is_none();
                 let hint = if fuel_exhausted {
                     Some(format!(
                         "the lexical engine hit its per-query work ceiling (usually a long, \
@@ -30424,14 +30473,14 @@ fn execute_search_operation(
                         crate::search::quill_bridge::cass_quill_config().query_fuel_budget
                     ))
                 } else {
-                    None
+                    invariant_hint
                 };
                 CliError {
                     code: 9,
                     kind: CliErrorKind::Search.kind_str(),
                     message: format!("search failed: {error}"),
                     hint,
-                    retryable: true,
+                    retryable,
                 }
             })?,
         SearchMode::Semantic => {
@@ -30536,14 +30585,17 @@ fn execute_search_operation(
                             search_sparse_threshold,
                             field_mask,
                         )
-                        .map_err(|fallback_error| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({error}); lexical fallback failed: {fallback_error}"
-                            ),
-                            hint: None,
-                            retryable: true,
+                        .map_err(|fallback_error| {
+                            let invariant_hint = lexical_engine_invariant_hint(&fallback_error);
+                            CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!(
+                                    "hybrid search failed ({error}); lexical fallback failed: {fallback_error}"
+                                ),
+                                retryable: invariant_hint.is_none(),
+                                hint: invariant_hint,
+                            }
                         })?
                 } else if message.contains("unavailable") || message.contains("no embedder") {
                     return Err(CliError {
@@ -30557,15 +30609,18 @@ fn execute_search_operation(
                         retryable: false,
                     });
                 } else {
+                    let invariant_hint = lexical_engine_invariant_hint(&error);
                     return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("hybrid search failed: {error}"),
-                        hint: Some(
-                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: true,
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint.or_else(|| {
+                            Some(
+                                "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                    .to_string(),
+                            )
+                        }),
                     });
                 }
             }
@@ -31771,12 +31826,15 @@ fn run_cli_search(
                     search_sparse_threshold,
                     field_mask,
                 )
-                .map_err(|e| CliError {
-                    code: 9,
-                    kind: CliErrorKind::Search.kind_str(),
-                    message: format!("search failed: {e}"),
-                    hint: None,
-                    retryable: true,
+                .map_err(|e| {
+                    let invariant_hint = lexical_engine_invariant_hint(&e);
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("search failed: {e}"),
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint,
+                    }
                 })?,
             SearchMode::Semantic => {
                 // The former `semantic` Cargo feature (and its `-baseline`
@@ -31887,14 +31945,17 @@ fn run_cli_search(
                             search_sparse_threshold,
                             field_mask,
                         )
-                        .map_err(|fallback_err| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
-                            ),
-                            hint: None,
-                            retryable: true,
+                        .map_err(|fallback_err| {
+                            let invariant_hint = lexical_engine_invariant_hint(&fallback_err);
+                            CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!(
+                                    "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                                ),
+                                retryable: invariant_hint.is_none(),
+                                hint: invariant_hint,
+                            }
                         })?
                     } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                         return Err(CliError {
@@ -31908,15 +31969,18 @@ fn run_cli_search(
                         retryable: false,
                     });
                     } else {
+                        let invariant_hint = lexical_engine_invariant_hint(&e);
                         return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("hybrid search failed: {e}"),
-                        hint: Some(
-                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: true,
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint.or_else(|| {
+                            Some(
+                                "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                    .to_string(),
+                            )
+                        }),
                     });
                     }
                 }
@@ -33066,15 +33130,18 @@ fn run_cli_pack(
                     FieldMask::FULL,
                 )
                 .map_err(|error| {
+                    let invariant_hint = lexical_engine_invariant_hint(&error);
                     CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("pack search failed: {error}"),
-                        hint: Some(
-                            "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                                .to_string(),
-                        ),
-                        retryable: true,
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint.or_else(|| {
+                            Some(
+                                "Try `cass search <query> --robot --robot-meta` to inspect the search path."
+                                    .to_string(),
+                            )
+                        }),
                     }
                 })
         };

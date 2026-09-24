@@ -57,6 +57,21 @@ pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("query fuel exhausted"))
 }
 
+/// Whether `error` is Quill's posting-cursor invariant refusal
+/// (`ArgusError::CursorInvariant`), anywhere in its context chain. Unlike a
+/// busy or cancelled query, this failure belongs to the published
+/// generation: the same query over the same segments fails the same way every
+/// time (GH #499: a date-filtered Boolean over a sealed segment that holds
+/// tombstones), so callers must not report it as retryable.
+#[must_use]
+pub fn is_engine_invariant_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("posting cursor invariant failed")
+    })
+}
+
 /// Engine configuration every CASS reader and writer opens with.
 ///
 /// Two deliberate departures from `QuillConfig::default()`:
@@ -2999,6 +3014,45 @@ mod tests {
         let wrapped = inner.context("executing a Quill lexical query");
         assert!(is_query_fuel_exhausted(&wrapped));
         assert!(!is_query_fuel_exhausted(&anyhow!(
+            "opening the Quill CASS reader: manifest missing"
+        )));
+    }
+
+    /// GH #499: the invariant classifier is keyed to the engine's own Display
+    /// text, so an upstream rewording fails here instead of quietly turning a
+    /// deterministic failure back into a retryable one. Fuel exhaustion,
+    /// cancellation, and reader faults must stay outside the class.
+    #[test]
+    fn cursor_invariant_failure_is_recognised_from_the_engine_display() {
+        use frankensearch::quill::QuillIndexError;
+        use frankensearch::quill::argus::ArgusError;
+
+        let engine_error = |error: ArgusError| {
+            anyhow!(
+                "executing a Quill lexical query: {}",
+                QuillIndexError::from(error)
+            )
+        };
+        let invariant = engine_error(ArgusError::CursorInvariant(
+            "Boolean children belong to different segment domains",
+        ));
+        assert!(is_engine_invariant_failure(&invariant));
+        assert!(!is_query_fuel_exhausted(&invariant));
+
+        let fuel = engine_error(ArgusError::QueryFuelExhausted {
+            budget: 10,
+            consumed: 10,
+            segments_touched: 1,
+            dictionary_blocks: 0,
+            posting_blocks: 10,
+            position_docs: 0,
+        });
+        assert!(is_query_fuel_exhausted(&fuel));
+        assert!(!is_engine_invariant_failure(&fuel));
+        assert!(!is_engine_invariant_failure(&engine_error(
+            ArgusError::QueryCancelled { phase: "collect" }
+        )));
+        assert!(!is_engine_invariant_failure(&anyhow!(
             "opening the Quill CASS reader: manifest missing"
         )));
     }
