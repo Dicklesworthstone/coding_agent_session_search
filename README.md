@@ -3435,19 +3435,25 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 
 1. **Background Check**: On TUI startup, a background thread queries GitHub releases
 2. **Rate Limiting**: Checks run at most once per hour to avoid API rate limits
-3. **Non-Blocking**: Update checks never slow down TUI startup or search operations
+3. **Non-Blocking**: Update checks never slow down TUI startup or search operations; nothing is asked before the TUI draws
 4. **Offline-Safe**: Failed network requests are silently ignored
 
 ### Update Notifications
 
-When a new version is available, a notification appears in the TUI with:
-- Current version vs. available version
-- Release highlights (from GitHub release notes)
-- Options: **Update Now** | **Skip This Version** | **Remind Later**
+When a new version is available, a one-line banner appears at the top of the TUI:
+
+```
+Update v<current> -> v<latest> | Alt+U upgrade | Alt+N notes | Alt+I ignore | Esc dismiss
+```
+
+- **Alt+U** arms the upgrade; press **Alt+U** again to confirm
+- **Alt+N** opens the release page in your browser
+- **Alt+I** skips this version
+- **Esc** hides the banner for this session
 
 ### Self-Update Installation
 
-Selecting "Update Now" runs the same verified installer used for initial installation:
+Confirming **Alt+U** runs the same verified installer used for initial installation:
 
 macOS/Linux:
 
@@ -3468,26 +3474,23 @@ The update process:
 
 ### Skip Version
 
-If you're not ready to update, "Skip This Version" records the skipped version in persistent state. That specific version won't trigger notifications again, but future versions will.
+If you're not ready to update, **Alt+I** records the skipped version in persistent state. That specific version won't trigger notifications again, but future versions will.
 
 ### Disable Update Checks
 
-For automated environments or personal preference:
+For automated environments or personal preference, set any of these:
 
 ```bash
-# Environment variable
-export CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1
-
-# Or for fully headless operation
-export TUI_HEADLESS=1
+export CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1   # or CASS_SKIP_UPDATE=1
+# Checks are also off when CI or TUI_HEADLESS is set
 ```
 
 ### State Persistence
 
-Update check state is stored in the data directory:
-- `last_update_check`: Timestamp of last check (for rate limiting)
-- `skipped_version`: Version user chose to skip
-- Both are reset on manual update or by deleting `tui_state.json`
+Update check state is stored in `update_state.json` in the data directory:
+- `last_check_ts`: Unix timestamp of the last successful check (for rate limiting)
+- `skipped_version`: Version you chose to skip
+- Delete `update_state.json` to reset both
 
 ---
 

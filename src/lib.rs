@@ -7344,15 +7344,10 @@ async fn execute_cli(
                 )
                 .init();
 
-            maybe_prompt_for_update(matches!(command, Commands::Tui { once: true, .. }))
-                .await
-                .map_err(|e| CliError {
-                    code: 9,
-                    kind: CliErrorKind::UpdateCheck.kind_str(),
-                    message: format!("update check failed: {e}"),
-                    hint: None,
-                    retryable: false,
-                })?;
+            // No update check here: the TUI runs its own in a background
+            // thread and surfaces it as a dismissible banner. A pre-TUI
+            // check awaited the network and then blocked on a stdin prompt
+            // before the first frame (2l1b0.56).
             if let Commands::Tui {
                 once,
                 reset_state,
@@ -108316,45 +108311,6 @@ fn count_indexed_session_paths(
     }
     let _ = conn.close_without_checkpoint_sync();
     complete.then_some(matched)
-}
-
-async fn maybe_prompt_for_update(once: bool) -> Result<()> {
-    if once
-        || dotenvy::var("CI").is_ok()
-        || dotenvy::var("TUI_HEADLESS").is_ok()
-        || dotenvy::var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT").is_ok()
-        || !io::stdin().is_terminal()
-    {
-        return Ok(());
-    }
-
-    let Some(update_info) = crate::update_check::check_for_updates(env!("CARGO_PKG_VERSION")).await
-    else {
-        return Ok(());
-    };
-
-    if !update_info.should_show() {
-        return Ok(());
-    }
-
-    println!(
-        "A newer version is available: current v{}, latest {}. Update now? (y/N): ",
-        env!("CARGO_PKG_VERSION"),
-        update_info.tag_name
-    );
-    print!("> ");
-    io::stdout().flush().ok();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return Ok(());
-    }
-    if !matches!(input.trim(), "y" | "Y") {
-        return Ok(());
-    }
-
-    info!(target: "update", "starting self-update to {}", update_info.tag_name);
-    crate::update_check::run_self_update(&update_info.tag_name);
 }
 
 // ============================================================================

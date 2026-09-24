@@ -17,7 +17,9 @@
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::fs;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -551,6 +553,122 @@ fn tui_pty_launch_quit_and_terminal_cleanup() {
         );
     }
 
+    tracker.complete();
+}
+
+/// Serve one fixed GitHub "latest release" response per connection.
+fn spawn_release_endpoint(tag: &str) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind release endpoint");
+    let addr = listener.local_addr().expect("release endpoint address");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let served = Arc::clone(&requests);
+    let body = format!(
+        r#"{{"tag_name":"{tag}","html_url":"https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/{tag}"}}"#
+    );
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            served.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (addr, requests)
+}
+
+/// 2l1b0.56: an interactive launch used to await the release check and then
+/// block on an "Update now? (y/N)" stdin prompt before the TUI drew, and that
+/// pre-TUI check spent the hourly slot the in-TUI banner needs. With a newer
+/// release available, the TUI must reach its own update banner without any
+/// pre-TUI prompt.
+#[test]
+fn tui_pty_newer_release_surfaces_as_banner_not_a_blocking_prompt() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_newer_release_surfaces_as_banner_not_a_blocking_prompt");
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+    let (endpoint, requests) = spawn_release_endpoint("v99.0.0");
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let launch_start = tracker.start(
+        "pty_update_banner",
+        Some("Launching TUI with a newer release"),
+    );
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    apply_ftui_env(&mut tui_cmd, &env);
+    // Every switch that disables update checks must be absent, or neither the
+    // old prompt nor the banner would run and the test would prove nothing.
+    for disabled in [
+        "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT",
+        "CASS_SKIP_UPDATE",
+        "TUI_HEADLESS",
+        "CI",
+    ] {
+        tui_cmd.env_remove(disabled);
+    }
+    tui_cmd.env("CASS_UPDATE_API_BASE_URL", format!("http://{endpoint}"));
+    let mut tui_child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+
+    let saw_banner = wait_for_rendered_output(&captured, Duration::from_secs(20), |screen| {
+        // Both the top-strip banner and the status line name the target.
+        screen.contains("-> v99.0.0")
+    });
+    let rendered = {
+        let data = captured.lock().expect("capture lock");
+        strip_terminal_control_sequences(&data)
+    };
+    let (tui_status, _esc_presses) =
+        quit_tui_with_escape(&mut *writer, &mut *tui_child, 8, Duration::from_millis(180));
+    tracker.end(
+        "pty_update_banner",
+        Some("update banner observed and TUI quit"),
+        launch_start,
+    );
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_update_banner_output.raw", &trace, &raw);
+    eprintln!(
+        "[update_banner] trace={trace} release_requests={} saw_banner={saw_banner} exit={tui_status}",
+        requests.load(Ordering::SeqCst)
+    );
+
+    assert!(
+        !rendered.contains("Update now? (y/N)"),
+        "a blocking pre-TUI update prompt appeared: {}",
+        truncate_output(&raw, 1500)
+    );
+    assert!(
+        saw_banner,
+        "the TUI never showed its update banner for v99.0.0 (release requests: {}): {}",
+        requests.load(Ordering::SeqCst),
+        truncate_output(&raw, 1500)
+    );
+    assert!(
+        tui_status.success(),
+        "ftui process exited unsuccessfully: {tui_status}"
+    );
     tracker.complete();
 }
 
