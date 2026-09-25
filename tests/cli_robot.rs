@@ -9229,3 +9229,82 @@ fn broken_stdout_pipe_terminates_via_sigpipe_not_abort() {
         "expected quiet SIGPIPE termination on a closed stdout pipe, got {status:?}"
     );
 }
+
+/// uojcg.7.1: a search filtered to one workspace that comes back empty used to
+/// read exactly like "nothing matches". A trailing slash, a case difference or
+/// a moved checkout now carries a `zero_result_diagnosis` naming the indexed
+/// workspace; a correct filter carries none.
+#[test]
+fn workspace_filtered_empty_search_explains_the_filter() {
+    const INDEXED: &str = "/data/projects/coding_agent_session_search";
+    let data_dir = shared_search_demo_data();
+    let search = |workspace: &str| -> Value {
+        let out = base_cmd()
+            .args([
+                "search",
+                "hello",
+                "--json",
+                "--limit",
+                "3",
+                "--workspace",
+                workspace,
+                "--data-dir",
+                data_dir,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        serde_json::from_slice(&out.stdout).expect("search JSON")
+    };
+
+    let exact = search(INDEXED);
+    assert!(
+        !exact["hits"].as_array().expect("hits array").is_empty(),
+        "the indexed workspace must match: {exact}"
+    );
+    assert!(
+        exact.get("zero_result_diagnosis").is_none(),
+        "a search with hits carries no diagnosis: {exact}"
+    );
+
+    for (filter, match_kind) in [
+        (format!("{INDEXED}/"), "path_normalized"),
+        (INDEXED.to_uppercase(), "case_insensitive"),
+        (
+            "/elsewhere/coding_agent_session_search".to_string(),
+            "basename_moved",
+        ),
+    ] {
+        let near = search(&filter);
+        assert!(
+            near["hits"].as_array().expect("hits array").is_empty(),
+            "{filter} must not match the indexed workspace: {near}"
+        );
+        let diagnosis = &near["zero_result_diagnosis"];
+        assert_eq!(
+            diagnosis["diagnosis"], "workspace_filter_likely_wrong",
+            "{filter}: {near}"
+        );
+        assert_eq!(
+            diagnosis["candidate_workspaces"][0]["workspace"], INDEXED,
+            "{filter}: {near}"
+        );
+        assert_eq!(
+            diagnosis["candidate_workspaces"][0]["match_kind"], match_kind,
+            "{filter}: {near}"
+        );
+        assert!(
+            diagnosis["suggested_rerun"]
+                .as_str()
+                .is_some_and(|rerun| rerun.contains(INDEXED)),
+            "{filter}: {near}"
+        );
+    }
+
+    let unrelated = search("/nowhere/at/all");
+    assert_eq!(
+        unrelated["zero_result_diagnosis"]["diagnosis"], "workspace_not_indexed",
+        "{unrelated}"
+    );
+}

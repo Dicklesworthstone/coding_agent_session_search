@@ -33160,6 +33160,13 @@
             "additionalProperties": true
           }
         },
+        "zero_result_diagnosis": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
         "explanation": {
           "type": [
             "object",
