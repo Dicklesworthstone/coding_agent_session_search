@@ -8898,6 +8898,14 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How many conversations the published lexical generation was certified
+/// against: its completed rebuild checkpoint for this database, if any.
+fn completed_lexical_checkpoint_conversations(index_path: &Path, db_path: &Path) -> Option<usize> {
+    let state = load_lexical_rebuild_state(index_path).ok().flatten()?;
+    (state.completed && crate::stored_path_identity_matches(&state.db.db_path, db_path))
+        .then_some(state.db.total_conversations)
+}
+
 fn load_lexical_rebuild_state(index_path: &Path) -> Result<Option<LexicalRebuildState>> {
     let path = lexical_rebuild_state_path(index_path);
     let bytes = match fs::read(&path) {
@@ -16980,6 +16988,25 @@ fn run_index_inner(
         );
     } else {
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
+    }
+    // 2l1b0.79: rows deleted outside the indexer (a forget, dedup or agent
+    // purge whose own lexical rebuild failed or was interrupted) keep their
+    // documents in the published generation, and the incremental scan never
+    // revisits them. The indexer never deletes conversations, so fewer
+    // canonical conversations than the completed checkpoint was certified
+    // against means deleted text is still live: rebuild from canonical rows.
+    if !tantivy_requires_rebuild
+        && let Some(checkpoint_conversations) =
+            completed_lexical_checkpoint_conversations(&index_path, &opts.db_path)
+        && initial_canonical_sessions_before_salvage < checkpoint_conversations
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            canonical_conversations = initial_canonical_sessions_before_salvage,
+            checkpoint_conversations,
+            "canonical conversations were deleted since the lexical generation was certified; rebuilding it"
+        );
+        tantivy_requires_rebuild = true;
     }
     complete_preflight_phase!();
     let mut needs_rebuild = legacy_omp_upgrade.lexical_rebuild_required
