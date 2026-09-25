@@ -61080,10 +61080,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("cass");
         fs::create_dir_all(&data_dir).unwrap();
-        let selected = tmp.path().join("selected/amp");
-        let missed = selected.join("thread-missed.json");
+        // The lost source is a Claude Code session because Claude honors the
+        // mtime watermark. Amp cannot show the loss: FAD re-reads every Amp
+        // thread on every scan (Amp never bumps mtimes), so any retry would
+        // recover it and the negative control below would be vacuous.
+        let selected = tmp.path().join("selected/claude");
+        let missed = selected.join("projects/overflow/session-missed.jsonl");
         let unrelated = tmp.path().join("unrelated/amp/thread-other.json");
-        write_watch_lexical_source(&missed, "thread-missed", "overflowrecoveryneedle");
+        fs::create_dir_all(missed.parent().unwrap()).unwrap();
+        fs::write(
+            &missed,
+            r#"{"type":"user","timestamp":"2023-11-14T22:13:20.100Z","sessionId":"session-missed","message":{"role":"user","content":"overflowrecoveryneedle"}}
+"#,
+        )
+        .unwrap();
         write_watch_lexical_source(&unrelated, "thread-other", "overflowpreservedneedle");
         fs::File::options()
             .write(true)
@@ -61107,8 +61117,8 @@ mod tests {
         let preserved_ids = watch_lexical_search_ids(&index_path, "overflowpreservedneedle");
         assert_eq!(preserved_rows.len(), 1);
         assert_eq!(preserved_ids.len(), 1);
-        let roots = [(ConnectorKind::Amp, ScanRoot::local(selected.clone()))];
-        let state = Mutex::new(HashMap::from([(ConnectorKind::Amp, i64::MAX / 4)]));
+        let roots = [(ConnectorKind::Claude, ScanRoot::local(selected.clone()))];
+        let state = Mutex::new(HashMap::from([(ConnectorKind::Claude, i64::MAX / 4)]));
 
         // A directory-only incremental retry does not recover the lost event:
         // both the event watermark and directory mtime postdate this source.
