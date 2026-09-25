@@ -52,6 +52,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   returning them, and that a dry run leaves every derived asset
   byte-identical. Known issue: semantic search does not yet recover after a
   forget; `cass index --semantic` (even `--full`) leaves it unavailable.
+- **`cass doctor` advertises the exit codes it actually returns.**
+  `--emit-capabilities` listed 5 as `concurrency-lost`, but doctor exits 5
+  with kind `doctor` when failed checks remain. It never listed 7
+  `index-busy` (a repair blocked by an operation lock), and it listed 1, 6
+  and 73, which nothing returns. Robot-docs said findings exit 1; they exit
+  0, and the payload's `operation_outcome.exit_code_kind` names them. Archive
+  export, support-bundle and baseline I/O failures exited 4, which is the
+  global network code; they now exit 14 `io` like every other I/O failure.
 - **Date-filtered search works on a long-lived index again (GH #499).** Every
   `--days`/`--since`/`--until` search failed with `posting cursor invariant
   failed: Boolean children belong to different segment domains` (exit 9) once

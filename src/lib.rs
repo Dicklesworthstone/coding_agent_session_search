@@ -44397,9 +44397,10 @@ const CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT: &str =
 const CASS_TEST_DOCTOR_RENAME_FAILURE: &str = "CASS_TEST_DOCTOR_RENAME_FAILURE";
 const DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS: u64 = 500;
 /// World-class-doctor pass-4: lowered from 1 hour to 5 minutes per the
-/// safety-envelope hardening pass. Two `cass doctor --fix` runs racing in the
-/// same wall-clock window now resolve via `concurrency-lost` (exit 5) instead
-/// of one stale lock blocking the other for an hour.
+/// safety-envelope hardening pass, so a stale lock stops blocking repairs
+/// after 5 minutes instead of an hour. While the holder is live, a second
+/// `cass doctor --fix` reports repair-blocked (exit 7 `index-busy` when failed
+/// checks remain).
 ///
 /// The stale-detection threshold is the lock-metadata `started_at_ms` /
 /// `updated_at_ms` age in ms.
@@ -57905,18 +57906,23 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
             {"name": "promote_candidate_archive", "op_kind": "atomic-swap", "since_pass": 0},
             {"name": "restore_from_backup", "op_kind": "atomic-swap", "since_pass": 0}
         ],
+        // Exactly the (code, kind) pairs doctor and its subcommands return
+        // (2l1b0.58). Findings without a failed check exit 0; the payload's
+        // operation_outcome.exit_code_kind names them. Failed checks exit 5
+        // `doctor`; a repair blocked by an operation lock exits 7 `index-busy`.
         "exit_codes": [
             {"code": 0, "kind": "success", "retryable_via_kind_branch": false},
-            {"code": 1, "kind": "health-failure", "retryable_via_kind_branch": true},
             {"code": 2, "kind": "usage", "retryable_via_kind_branch": false},
             {"code": 3, "kind": "repair-failure", "retryable_via_kind_branch": false},
             {"code": 4, "kind": "refused-unsafe", "retryable_via_kind_branch": false},
-            {"code": 5, "kind": "concurrency-lost", "retryable_via_kind_branch": true},
-            {"code": 6, "kind": "online-required", "retryable_via_kind_branch": true},
+            {"code": 4, "kind": "output-not-writable", "retryable_via_kind_branch": false},
+            {"code": 5, "kind": "doctor", "retryable_via_kind_branch": true},
+            {"code": 5, "kind": "data-corruption", "retryable_via_kind_branch": false},
+            {"code": 7, "kind": "index-busy", "retryable_via_kind_branch": true},
             {"code": 9, "kind": "internal", "retryable_via_kind_branch": false},
+            {"code": 10, "kind": "config", "retryable_via_kind_branch": false},
             {"code": 13, "kind": "not-found", "retryable_via_kind_branch": false},
-            {"code": 14, "kind": "io", "retryable_via_kind_branch": true},
-            {"code": 73, "kind": "cannot-create-output", "retryable_via_kind_branch": true}
+            {"code": 14, "kind": "io", "retryable_via_kind_branch": true}
         ],
         "data_paths": [
             {"path_kind": "data_dir", "default": "~/.local/share/coding-agent-search/", "writable_by_doctor": true},
@@ -58189,7 +58195,7 @@ fn run_doctor_archive_export_impl(
         "blocked"
     } else {
         doctor_forensic_create_private_dir_all(target_root).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to create archive export target: {err}"),
             hint: Some("Choose a writable target on a filesystem with enough space.".to_string()),
@@ -58229,7 +58235,7 @@ fn run_doctor_archive_export_impl(
         });
         doctor_write_private_json_artifact(&manifest_path, &manifest, "archive export manifest")
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking target filesystem health.".to_string()),
@@ -58247,7 +58253,7 @@ fn run_doctor_archive_export_impl(
         let event_path = doctor_archive_export_event_log_path(target_root);
         doctor_write_private_json_artifact(&event_path, &event_log, "archive export event log")
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking target filesystem health.".to_string()),
@@ -58272,14 +58278,14 @@ fn run_doctor_archive_export_impl(
             "archive export receipt",
         )
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking target filesystem health.".to_string()),
             retryable: true,
         })?;
         sync_directory(target_root).map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking target filesystem health.".to_string()),
@@ -59164,14 +59170,14 @@ fn doctor_support_bundle_include_sensitive_attachments(
             retryable: false,
         })?;
         doctor_forensic_create_private_dir_all(parent).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to create sensitive attachment bundle directory: {err}"),
             hint: Some("Choose a writable cass data directory and retry.".to_string()),
             retryable: true,
         })?;
         let copied = std::fs::copy(source_path, &target_path).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to copy sensitive attachment into support bundle: {err}"),
             hint: Some(
@@ -59181,7 +59187,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
         })?;
         if copied != metadata.len() {
             return Err(CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message: "sensitive attachment copy byte count mismatch".to_string(),
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59190,7 +59196,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
         }
         sync_file(&target_path, "support bundle sensitive attachment").map_err(|message| {
             CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59198,7 +59204,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
             }
         })?;
         sync_directory(parent).map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59220,7 +59226,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
                 },
             )
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59450,21 +59456,21 @@ fn run_doctor_support_bundle_impl(
 
     let root = doctor_support_bundle_root(&data_dir);
     doctor_forensic_bundle_root_is_safe(&data_dir, &root).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Use a normal cass data directory; support bundles must stay under [cass-data]/doctor/support-bundles.".to_string()),
         retryable: false,
     })?;
     doctor_forensic_create_private_dir_all(&root).map_err(|err| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message: format!("failed to create doctor support bundle root: {err}"),
         hint: Some("Choose a writable cass data directory and retry.".to_string()),
         retryable: true,
     })?;
     doctor_forensic_bundle_root_is_safe(&data_dir, &root).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Use a normal cass data directory; support bundles must stay under [cass-data]/doctor/support-bundles.".to_string()),
@@ -59492,7 +59498,7 @@ fn run_doctor_support_bundle_impl(
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 return Err(CliError {
-                    code: 4,
+                    code: 14,
                     kind: "io",
                     message: format!("failed to allocate support bundle directory: {err}"),
                     hint: Some("Choose a writable cass data directory and retry.".to_string()),
@@ -59503,7 +59509,7 @@ fn run_doctor_support_bundle_impl(
     }
     if !allocated {
         return Err(CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!(
                 "failed to allocate unique support bundle under {}",
@@ -59536,7 +59542,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59559,7 +59565,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59579,7 +59585,7 @@ fn run_doctor_support_bundle_impl(
         .unwrap_or(serde_json::Value::Null),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59599,7 +59605,7 @@ fn run_doctor_support_bundle_impl(
         ),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59619,7 +59625,7 @@ fn run_doctor_support_bundle_impl(
         ),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59640,7 +59646,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59664,7 +59670,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59686,7 +59692,7 @@ fn run_doctor_support_bundle_impl(
             value,
         )
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59709,7 +59715,7 @@ fn run_doctor_support_bundle_impl(
                 value,
             )
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59749,7 +59755,7 @@ fn run_doctor_support_bundle_impl(
             diff,
         )
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59800,21 +59806,21 @@ fn run_doctor_support_bundle_impl(
     });
     doctor_write_private_json_artifact(&manifest_path, &manifest_value, "support bundle manifest")
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
             retryable: true,
         })?;
     sync_directory(&bundle_dir).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
         retryable: true,
     })?;
     sync_directory(&root).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59822,14 +59828,14 @@ fn run_doctor_support_bundle_impl(
     })?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest_path).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to reread support bundle manifest: {err}"),
             hint: Some("Retry after checking filesystem health.".to_string()),
             retryable: true,
         })?)
         .map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to parse written support bundle manifest: {err}"),
             hint: Some("Retry after checking filesystem health.".to_string()),

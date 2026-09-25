@@ -53,12 +53,17 @@ subcommands do — always pass `--json` or `--robot`).
 
 Exit codes:
 
-  0   healthy — no findings
-  1   findings present, no `--fix` was passed; inspect `recommended_action`
+  0   no failed check. Findings may still be present: read `status`,
+      `issues_found` and `operation_outcome.exit_code_kind` (health-failure
+      means diagnosed issues), then `recommended_action`
   4   refused-unsafe — a precondition failed; inspect `checks[].name` for which
-  5   concurrency-lost — another doctor is running; retry after the lock's
-      `started_at_ms` exceeds 5 minutes of staleness (the documented heartbeat
-      threshold)
+  5   doctor — failed checks remain; the full report is still on stdout and
+      `operation_outcome.exit_code_kind` says health-failure or repair-failure
+  7   index-busy — a repair was blocked by an active operation lock; read
+      `operation_state.owners` and retry after that owner finishes
+
+`cass doctor --emit-capabilities --json` lists every (code, kind) pair doctor
+and its subcommands return.
 
 ## Plan a repair (no mutation)
 
@@ -177,11 +182,14 @@ Per AGENTS.md and the world-class-doctor safety envelope (S1-S12):
   * Auto-update goldens. Reports the diff; operator owns regeneration.
   * Touch .env, rust-toolchain.toml, scripts/git-hooks/pre-push.sh.
   * Make network calls offline. `--online` is opt-in.
-  * Run while another doctor is running. Exit 5 (concurrency-lost).
+  * Repair while another doctor repair holds the mutation lock. The outcome
+    is repair-blocked (exit 7 index-busy while failed checks remain).
 
 ## Common gotchas
 
-* Two `cass doctor --fix` invocations race → the second exits 5 and waits.
+* Two `cass doctor --fix` invocations race → the second mutates nothing,
+  reports `operation_outcome.kind` repair-blocked and exits 7 (index-busy)
+  while failed checks remain; rerun it after the first finishes.
 * `cass doctor undo <run-id>` against a run created by an older cass version
   may fail — the actions.jsonl schema is versioned; bump implies undo
   refusal.

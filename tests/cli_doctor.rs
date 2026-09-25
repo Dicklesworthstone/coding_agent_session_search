@@ -656,6 +656,151 @@ fn doctor_json_fails_when_full_integrity_check_finds_archive_corruption() {
     assert_eq!(payload["needs_rebuild"].as_bool(), Some(true));
 }
 
+/// 2l1b0.58: every (code, kind) doctor returns is advertised by
+/// `--emit-capabilities`, and robot-docs doctor documents no other code.
+/// Before the fix the table advertised 5 as `concurrency-lost` while doctor
+/// exits 5 with kind `doctor`, and it advertised 1, 6 and 73, which nothing
+/// returns; robot-docs said findings exit 1.
+#[test]
+fn doctor_exit_codes_match_the_advertised_contract() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let data_dir_arg = data_dir.to_str().expect("utf8");
+    let run = |step: &str, args: &[&str]| {
+        let started = std::time::Instant::now();
+        let output = cass_cmd(test_home)
+            .args(args)
+            .output()
+            .expect("run cass doctor");
+        eprintln!(
+            "{}",
+            json!({
+                "test": "doctor_exit_codes_match_the_advertised_contract",
+                "step": step,
+                "command": args,
+                "exit": output.status.code(),
+                "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            })
+        );
+        output
+    };
+
+    let capabilities = run(
+        "emit-capabilities",
+        &["doctor", "--emit-capabilities", "--json"],
+    );
+    assert!(capabilities.status.success(), "emit-capabilities failed");
+    let envelope: Value =
+        serde_json::from_slice(&capabilities.stdout).expect("emit-capabilities json");
+    let advertised: Vec<(i64, String)> = envelope["exit_codes"]
+        .as_array()
+        .expect("exit_codes array")
+        .iter()
+        .map(|entry| {
+            (
+                entry["code"].as_i64().expect("exit code"),
+                entry["kind"].as_str().expect("exit kind").to_string(),
+            )
+        })
+        .collect();
+    let assert_advertised = |code: i64, kind: &str| {
+        assert!(
+            advertised.iter().any(|(c, k)| *c == code && k == kind),
+            "doctor returned exit {code} kind {kind}, which --emit-capabilities does not advertise: {advertised:?}"
+        );
+    };
+
+    // Findings without a failed check exit 0 and are named in the payload.
+    let empty = run(
+        "check empty data dir",
+        &["doctor", "--json", "--data-dir", data_dir_arg],
+    );
+    assert_eq!(empty.status.code(), Some(0), "empty data dir");
+    let payload: Value = serde_json::from_slice(&empty.stdout).expect("doctor json");
+    assert_eq!(
+        payload["operation_outcome"]["exit_code_kind"], "health-failure",
+        "an empty data dir has findings: {payload:#}"
+    );
+    assert_advertised(0, "success");
+
+    // Error envelopes: a malformed run id is usage, nothing to undo is not-found.
+    for (step, run_id, code) in [
+        ("undo malformed id", "not-a-run-id", 2),
+        ("undo with no runs", "latest", 13),
+    ] {
+        let output = run(
+            step,
+            &[
+                "doctor",
+                "--undo",
+                run_id,
+                "--json",
+                "--data-dir",
+                data_dir_arg,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(code), "{step}");
+        let error = doctor_error_json(&output.stderr);
+        assert_eq!(
+            test_error_code(&error),
+            Some(i64::from(code)),
+            "{step}: {error:#}"
+        );
+        assert_advertised(
+            i64::from(code),
+            test_error_kind(&error).expect("error kind"),
+        );
+    }
+
+    // A failed check exits 5; the full report stays on stdout.
+    fs::write(
+        data_dir.join("agent_search.db"),
+        b"not a sqlite database\n".repeat(8),
+    )
+    .expect("write garbage canonical db");
+    let failed = run(
+        "check garbage db",
+        &["doctor", "--json", "--data-dir", data_dir_arg],
+    );
+    assert_eq!(failed.status.code(), Some(5), "garbage canonical db");
+    let payload: Value = serde_json::from_slice(&failed.stdout).expect("doctor json on failure");
+    assert!(
+        payload["failures"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0),
+        "exit 5 must come with failed checks: {payload:#}"
+    );
+    assert_advertised(5, "doctor");
+
+    // robot-docs doctor documents only advertised codes.
+    let docs = run("robot-docs doctor", &["robot-docs", "doctor"]);
+    assert!(docs.status.success(), "robot-docs doctor failed");
+    let docs = String::from_utf8(docs.stdout).expect("utf8 robot-docs");
+    let documented: Vec<i64> = docs
+        .lines()
+        .skip_while(|line| line.trim() != "Exit codes:")
+        .skip(1)
+        .take_while(|line| !line.starts_with("## "))
+        .filter_map(|line| {
+            let rest = line.strip_prefix("  ")?;
+            rest.starts_with(|c: char| c.is_ascii_digit())
+                .then(|| rest.split_whitespace().next()?.parse().ok())?
+        })
+        .collect();
+    assert!(
+        !documented.is_empty(),
+        "robot-docs doctor has no exit codes"
+    );
+    for code in documented {
+        assert!(
+            advertised.iter().any(|(c, _)| *c == code),
+            "robot-docs doctor documents exit {code}, which --emit-capabilities does not advertise"
+        );
+    }
+}
+
 #[test]
 fn doctor_fix_force_rebuild_refuses_archive_risk_rebuild_without_plan_fingerprint() {
     let temp = tempfile::tempdir().expect("tempdir");
