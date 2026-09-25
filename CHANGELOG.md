@@ -60,6 +60,11 @@ tracked.
   `regression_behavioral::aider_detect_must_not_scan_recursively` and
   `agent_detection_completeness::devin_file_override_watch_...` (index-busy
   race; 2 of 3 isolated re-runs passed).
+- Wall-clock deadline tests in `spec_search_format_contracts`
+  (`timed_out_search_trust_projection_is_shed_without_discarding_hits`,
+  `timed_out_search_meta_preserves_completed_hits_and_names_metadata_gaps`)
+  failed on I/O-saturated gate hosts at the release commit and passed in
+  some isolated re-runs; they assert a sub-4.2 s end-to-end budget.
 
 ### Changed (contract)
 
