@@ -11,7 +11,10 @@
 //!
 //! The Boolean grammar (bead 2l1b0.52) is checked the same way, over fixed
 //! cases and over seeded random expressions: NOT binds tightest, then AND,
-//! then OR, and parentheses group. Every search logs one JSON line to stderr.
+//! then OR, and parentheses group. For the random expressions the grouping
+//! `_meta.effective.query_structure` echoes must be what was searched:
+//! searching it returns the same hits, and it echoes itself. Every search logs
+//! one JSON line to stderr.
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,6 +65,15 @@ impl Corpus {
     /// Message ids a lexical search returns, after checking that no automatic
     /// wildcard fallback widened the result.
     fn search(&self, query: &str, extra: &[&str]) -> TestResult<BTreeSet<usize>> {
+        Ok(self.search_with_meta(query, extra)?.0)
+    }
+
+    /// `search`, plus the response's `_meta`.
+    fn search_with_meta(
+        &self,
+        query: &str,
+        extra: &[&str],
+    ) -> TestResult<(BTreeSet<usize>, Value)> {
         let started = Instant::now();
         let mut cmd = self.cmd();
         cmd.args([
@@ -113,10 +125,11 @@ impl Corpus {
                 "event": "search", "query": query, "extra": extra, "exit": 0,
                 "hits": ids.len(), "total_matches": payload["total_matches"],
                 "lexical_degrade_reason": payload["_meta"]["lexical_degrade_reason"],
+                "query_structure": payload["_meta"]["effective"]["query_structure"],
                 "elapsed_ms": elapsed_ms,
             })
         );
-        Ok(ids)
+        Ok((ids, payload["_meta"].clone()))
     }
 
     /// The `--dry-run` explanation of `query`: no index is touched.
@@ -540,10 +553,29 @@ fn generated_boolean_queries_match_set_algebra() -> TestResult {
         if !expected.is_empty() && expected.len() < all.len() {
             informative += 1;
         }
-        let got = corpus.search(&query, &[])?;
+        let (got, meta) = corpus.search_with_meta(&query, &[])?;
         if let Err(err) = assert_same(&format!("case {case}: {query} = {expr:?}"), &got, &expected)
         {
             failures.push(err.to_string());
+        }
+        // Echo (2l1b0.68): the grouping `_meta.effective` reports is the one
+        // searched. Searching it returns the same hits, and it echoes itself.
+        let structure = meta["effective"]["query_structure"]
+            .as_str()
+            .ok_or_else(|| format!("case {case}: no query_structure echoed for {query}"))?
+            .to_string();
+        let (echo_hits, echo_meta) = corpus.search_with_meta(&structure, &[])?;
+        if echo_hits != got {
+            failures.push(format!(
+                "case {case}: searching the echoed {structure:?} returned {echo_hits:?}, \
+                 but {query:?} returned {got:?}"
+            ));
+        }
+        if echo_meta["effective"]["query_structure"] != structure.as_str() {
+            failures.push(format!(
+                "case {case}: the echoed {structure:?} is not a fixpoint: it echoes {}",
+                echo_meta["effective"]["query_structure"]
+            ));
         }
     }
     assert!(
