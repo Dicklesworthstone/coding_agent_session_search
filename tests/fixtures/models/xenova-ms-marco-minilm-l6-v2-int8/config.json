@@ -1,6 +1,8 @@
 {
   "_name_or_path": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-  "architectures": ["BertForSequenceClassification"],
+  "architectures": [
+    "BertForSequenceClassification"
+  ],
   "attention_probs_dropout_prob": 0.1,
   "classifier_dropout": null,
   "gradient_checkpointing": false,
