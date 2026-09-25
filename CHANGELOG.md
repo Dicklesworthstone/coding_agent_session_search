@@ -41,6 +41,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   now notices the new index, opens it, and drops results cached from the
   old one. After a forget, the open TUI stops showing the forgotten
   conversation.
+- **The Pages viewer accepts a typed recovery key.** RECOVERY.md and the
+  bundle's recovery.html tell a reader who lost the password to choose "Use
+  Recovery Key" and enter the secret, but the unlock screen only offered a QR
+  scanner, so someone holding only the text `cass pages key add-recovery`
+  prints could not unlock. The screen now has a "Use Recovery Key" form that
+  sends the typed secret through the same worker unlock path as a scanned QR
+  code.
 - **Claude Code prompts typed while the agent is mid-turn are searchable
   (GH #500).** Claude Code saves them as `queued_command` attachments, which
   the connector dropped. franken-agent-detection 0.3.1 indexes person-typed
