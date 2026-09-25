@@ -33,6 +33,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const FORGOTTEN_MARKER: &str = "forgetmarkeralpha";
 const KEPT_MARKER: &str = "keepmarkerbeta";
+const SIBLING_MARKER: &str = "siblingmarkerdelta";
+const LATE_MARKER: &str = "latemarkergamma";
 /// The forgotten rollout's session id, which appears in every rendering of it.
 const FORGOTTEN_SESSION: &str = "forget-a";
 
@@ -348,6 +350,25 @@ fn forget_apply_removes_forgotten_conversations_from_every_search_surface() -> T
             return Err(format!("{surface}: the catch-up lost the unrelated conversation").into());
         }
     }
+
+    // A conversation ingested after the forget is found on every surface, and
+    // the rescan it triggers neither re-ingests the forgotten source (2l1b0.50
+    // tombstones) nor lets its messages, which may reuse the freed top ids,
+    // hide behind a surviving semantic watermark (2l1b0.78).
+    let codex_home = archive.home.path().join(".codex");
+    let late = write_codex_rollout(&codex_home, "late-c", LATE_MARKER)?;
+    let late_str = late.to_str().ok_or("non-utf8 fixture path")?;
+    archive.index(&["--semantic", "--embedder", "hash"])?;
+    for (surface, args) in SURFACES {
+        let hits = archive.search_hits(LATE_MARKER, args)?;
+        if !hits.iter().any(|(path, _)| path == late_str) {
+            return Err(
+                format!("{surface}: a post-forget conversation is missing: {hits:?}").into(),
+            );
+        }
+        assert_forgotten_absent(surface, &hits)?;
+        assert_forgotten_absent(surface, &archive.search_hits(FORGOTTEN_MARKER, args)?)?;
+    }
     Ok(())
 }
 
@@ -429,6 +450,25 @@ fn a_forgotten_source_stays_forgotten_until_the_file_changes() -> TestResult {
                 format!("index {extra:?} re-ingested an unchanged source: {hits:?}").into(),
             );
         }
+    }
+
+    // A new sibling session makes the connector rescan the directory and
+    // re-read the forgotten, unchanged source. Before forget tombstones the
+    // rescan ingested it as a new conversation again (2l1b0.50).
+    let codex_home = archive.home.path().join(".codex");
+    let sibling = write_codex_rollout(&codex_home, "sibling-d", SIBLING_MARKER)?;
+    let sibling_str = sibling.to_str().ok_or("non-utf8 fixture path")?;
+    archive.index(&[])?;
+    let hits = archive.search_hit_paths(FORGOTTEN_MARKER)?;
+    if !hits.is_empty() {
+        return Err(format!("a sibling rescan re-ingested a forgotten source: {hits:?}").into());
+    }
+    if !archive
+        .search_hit_paths(SIBLING_MARKER)?
+        .iter()
+        .any(|path| path == sibling_str)
+    {
+        return Err("the new sibling session was not indexed".into());
     }
 
     // A source that changes after forget is ingested again, whole: forget

@@ -56,6 +56,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   (`lexical-shard`, `failed-seed-bundle-file`, `retained-publish-backup`).
   `artifact_kind` in status, diag and doctor quarantine output keeps its
   snake_case values. The kind-taxonomy test no longer exempts underscores.
+- **A forgotten session stays forgotten when its neighbors change.**
+  `cass forget --apply` deleted the canonical rows, but the next index run
+  triggered by any new session in the same directory re-read the forgotten,
+  unchanged source and ingested it as a new conversation, bringing the text
+  back into search. Forget now records each forgotten source's size and
+  modification time (schema v22, `forgotten_sources`), and ingest skips a
+  source that is unchanged since then. A source its agent appends to later is
+  still ingested again, whole, and its record is cleared.
 - **A plain `cass index` finishes a purge that was interrupted.** When
   `forget`, `dedup --apply` or an agent purge deleted canonical rows but its
   lexical rebuild failed or was killed, the deleted text stayed searchable and

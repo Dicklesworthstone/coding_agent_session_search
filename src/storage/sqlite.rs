@@ -18,7 +18,7 @@ use frankensqlite::AsyncConnection as FrankenAsyncConnection;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -4007,7 +4007,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
@@ -4721,6 +4721,18 @@ const MIGRATION_V21: &str = r"
 -- stored in each index entry supplies conversations.id without a table read.
 CREATE INDEX IF NOT EXISTS idx_conversations_context
 ON conversations(started_at DESC, workspace_id, agent_id);
+";
+
+const MIGRATION_V22: &str = r"
+-- `cass forget --apply` tombstones (2l1b0.50): the forgotten source file's size
+-- and modification time. Scans skip an unchanged source; a changed one is
+-- ingested again and its tombstone is removed.
+CREATE TABLE IF NOT EXISTS forgotten_sources (
+    source_path TEXT PRIMARY KEY,
+    size_bytes INTEGER,
+    mtime_ms INTEGER,
+    forgotten_at_ms INTEGER NOT NULL
+);
 ";
 
 /// Row from the embedding_jobs table.
@@ -6375,6 +6387,7 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (19, "conversation_external_lookup", MIGRATION_V19),
     (20, "conversation_external_tail_lookup", MIGRATION_V20),
     (21, "conversation_context_index", MIGRATION_V21),
+    (22, "forgotten_sources", MIGRATION_V22),
 ];
 
 /// Run each pending migration through its own single-migration runner so an
@@ -7284,6 +7297,11 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         ],
         sql: CURRENT_SCHEMA_REPAIR_MESSAGE_METRICS_SQL,
     },
+    SchemaRepairBatch {
+        name: "forgotten_sources",
+        tables: &["forgotten_sources"],
+        sql: MIGRATION_V22,
+    },
 ];
 
 fn current_schema_repair_batches_for_missing_tables(
@@ -7317,7 +7335,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 21] = [
+const MIGRATION_NAMES: [(i64, &str); 22] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -7339,6 +7357,7 @@ const MIGRATION_NAMES: [(i64, &str); 21] = [
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
     (21, "conversation_context_index"),
+    (22, "forgotten_sources"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -7475,6 +7494,10 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     (
         "usage_models_daily",
         "SELECT day_id FROM usage_models_daily LIMIT 1;",
+    ),
+    (
+        "forgotten_sources",
+        "SELECT source_path FROM forgotten_sources LIMIT 1;",
     ),
 ];
 
@@ -10821,6 +10844,47 @@ impl FrankenStorage {
     /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
     /// operator) so the semantics are portable and deterministic across the
     /// frankensqlite backend.
+    /// Tombstones written by `cass forget --apply` (2l1b0.50), by source path.
+    pub fn forgotten_source_stamps(&self) -> Result<HashMap<String, SourceFileStamp>> {
+        let rows: Vec<(String, Option<i64>, Option<i64>)> = self.conn.query_map_collect(
+            "SELECT source_path, size_bytes, mtime_ms FROM forgotten_sources",
+            fparams![],
+            |row| {
+                Ok((
+                    row.get_typed::<String>(0)?,
+                    row.get_typed::<Option<i64>>(1)?,
+                    row.get_typed::<Option<i64>>(2)?,
+                ))
+            },
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, size_bytes, mtime_ms)| {
+                (
+                    path,
+                    SourceFileStamp {
+                        size_bytes,
+                        mtime_ms,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Drops the tombstones of forgotten sources that changed since the
+    /// forget, so their next ingest is permanent.
+    pub fn clear_forgotten_sources(&self, paths: &[String]) -> Result<()> {
+        let mut tx = self.conn.transaction()?;
+        for path in paths {
+            tx.execute_compat(
+                "DELETE FROM forgotten_sources WHERE source_path = ?1",
+                fparams![path.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn forget_conversations_by_source_glob(
         &self,
         pattern: &str,
@@ -10849,13 +10913,15 @@ impl FrankenStorage {
 
         let mut matched_ids: Vec<i64> = Vec::new();
         let mut sample_paths: Vec<String> = Vec::new();
+        let mut matched_paths: BTreeSet<String> = BTreeSet::new();
         for (id, source_path) in rows {
             let Some(path) = source_path else { continue };
             if glob.matches(&path) {
                 matched_ids.push(id);
                 if sample_paths.len() < 20 {
-                    sample_paths.push(path);
+                    sample_paths.push(path.clone());
                 }
+                matched_paths.insert(path);
             }
         }
 
@@ -10913,6 +10979,23 @@ impl FrankenStorage {
             fparams![],
         )?;
         clear_semantic_embed_watermark_after_deletion(&tx)?;
+        // Tombstone every forgotten source so a later scan (triggered by any
+        // sibling change) does not ingest it again while it is unchanged.
+        let forgotten_at_ms = Self::now_millis();
+        for path in &matched_paths {
+            let stamp = SourceFileStamp::of(Path::new(path));
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO forgotten_sources
+                     (source_path, size_bytes, mtime_ms, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                fparams![
+                    path.as_str(),
+                    stamp.size_bytes,
+                    stamp.mtime_ms,
+                    forgotten_at_ms
+                ],
+            )?;
+        }
         tx.commit()?;
 
         Ok(ForgetConversationsResult {
@@ -22888,6 +22971,31 @@ pub struct ForgetConversationsResult {
     pub conversations_deleted: usize,
     /// Bounded (<= 20) sample of matched source paths, for operator review.
     pub sample_source_paths: Vec<String>,
+}
+
+/// A source file's size and modification time, as `cass forget` recorded it
+/// in `forgotten_sources` (2l1b0.50). `None` fields mean the file was absent
+/// or its metadata unreadable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceFileStamp {
+    pub size_bytes: Option<i64>,
+    pub mtime_ms: Option<i64>,
+}
+
+impl SourceFileStamp {
+    pub fn of(path: &Path) -> Self {
+        let Ok(metadata) = fs::metadata(path) else {
+            return Self::default();
+        };
+        Self {
+            size_bytes: i64::try_from(metadata.len()).ok(),
+            mtime_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok()),
+        }
+    }
 }
 
 /// A single PRE-EXISTING duplicate conversation pair detected by
@@ -43852,6 +43960,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             Some(max_message_id),
             "a dry run must not invalidate semantic assets"
         );
+        assert!(
+            storage.forgotten_source_stamps().unwrap().is_empty(),
+            "a dry run must not tombstone anything"
+        );
 
         // Apply: deletes the two subagent conversations, keeps the top-level one.
         let applied = storage
@@ -43869,6 +43981,30 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         storage
             .set_last_embedded_message_id(max_message_id)
             .unwrap();
+        // 2l1b0.50: each forgotten source is tombstoned with its file stamp
+        // (these fixture paths do not exist, so the stamp is empty).
+        let tombstones = storage.forgotten_source_stamps().unwrap();
+        assert_eq!(
+            tombstones
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "/home/u/.claude/projects/p/sess-1/subagents/agent-aaa.jsonl",
+                "/home/u/.claude/projects/p/sess-2/subagents/agent-bbb.jsonl",
+            ])
+        );
+        assert!(
+            tombstones
+                .values()
+                .all(|stamp| *stamp == SourceFileStamp::default())
+        );
+        storage
+            .clear_forgotten_sources(&[
+                "/home/u/.claude/projects/p/sess-1/subagents/agent-aaa.jsonl".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(storage.forgotten_source_stamps().unwrap().len(), 1);
 
         // An empty pattern is rejected; a non-matching glob is a clean no-op.
         assert!(

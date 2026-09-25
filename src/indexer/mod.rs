@@ -32350,7 +32350,7 @@ pub mod persist {
     use crate::search::tantivy::TantivyIndex;
     #[cfg(test)]
     use crate::sources::provenance::{Source, SourceKind};
-    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
+    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome, SourceFileStamp};
 
     /// Replay the capped canonical conversation after persistence. Callers map
     /// changed message indices onto this packet only after its canonical prefix
@@ -34426,6 +34426,57 @@ pub mod persist {
         Ok(())
     }
 
+    /// `cass forget --apply` tombstones (2l1b0.50). A connector rescan (any
+    /// sibling change can trigger one) re-reads a forgotten source, and to
+    /// ingest it is a new conversation. Drop conversations whose forgotten
+    /// source is unchanged since the forget; a changed source is ingested
+    /// again, whole, and loses its tombstone. `None` when nothing is dropped.
+    fn retain_unforgotten_conversations(
+        storage: &FrankenStorage,
+        convs: &[NormalizedConversation],
+    ) -> Result<Option<Vec<NormalizedConversation>>> {
+        let tombstones = storage.forgotten_source_stamps()?;
+        if tombstones.is_empty() {
+            return Ok(None);
+        }
+        let mut keep = Vec::with_capacity(convs.len());
+        let mut changed = Vec::new();
+        for conv in convs {
+            let path = conv.source_path.to_string_lossy();
+            let forgotten_and_unchanged = match tombstones.get(path.as_ref()) {
+                None => false,
+                Some(stamp) if *stamp == SourceFileStamp::of(&conv.source_path) => true,
+                Some(_) => {
+                    changed.push(path.into_owned());
+                    false
+                }
+            };
+            if forgotten_and_unchanged {
+                tracing::debug!(
+                    source_path = %conv.source_path.display(),
+                    "skipping a conversation from a source forgotten by `cass forget`"
+                );
+            }
+            keep.push(!forgotten_and_unchanged);
+        }
+        if !changed.is_empty() {
+            changed.sort();
+            changed.dedup();
+            storage.clear_forgotten_sources(&changed)?;
+        }
+        if keep.iter().all(|kept| *kept) {
+            return Ok(None);
+        }
+        Ok(Some(
+            convs
+                .iter()
+                .zip(keep)
+                .filter(|(_, kept)| *kept)
+                .map(|(conv, _)| conv.clone())
+                .collect(),
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
@@ -34438,6 +34489,14 @@ pub mod persist {
         heartbeat: PersistHeartbeat<'_>,
         source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
     ) -> Result<PersistBatchOutcome> {
+        let retained;
+        let convs = match retain_unforgotten_conversations(storage, convs)? {
+            Some(kept) => {
+                retained = kept;
+                retained.as_slice()
+            }
+            None => convs,
+        };
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
         }
