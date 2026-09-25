@@ -42565,6 +42565,58 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert_eq!(pane_paths, ["/new-weak", "/old-strong", "/undated"]);
     }
 
+    /// 2l1b0.53: a page loaded under Date Newest joins one global order
+    /// instead of landing below the first page in engine order.
+    #[test]
+    fn a_page_loaded_under_date_newest_joins_one_global_order() {
+        let mut app = CassApp::default();
+        app.query = "auth".into();
+        app.ranking_mode = RankingMode::DateNewest;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let dated = |id, path: &str, age_days: i64| {
+            let mut hit = make_hit(id, path);
+            hit.created_at = Some(now_ms - age_days * 86_400_000);
+            hit
+        };
+        let paths = |app: &CassApp| {
+            app.results
+                .iter()
+                .map(|hit| hit.source_path.clone())
+                .collect::<Vec<_>>()
+        };
+        let _ = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: 2,
+            hits: vec![dated(1, "/day-30", 30), dated(2, "/day-10", 10)],
+            elapsed_ms: 1,
+            suggestions: Vec::new(),
+            wildcard_fallback: false,
+            append: false,
+        });
+        assert_eq!(paths(&app), ["/day-10", "/day-30"]);
+
+        // Page 2, in engine order, holds a hit older and one newer than the
+        // whole first page.
+        let _ = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Pagination,
+            requested_limit: 2,
+            hits: vec![dated(3, "/day-40", 40), dated(4, "/day-1", 1)],
+            elapsed_ms: 1,
+            suggestions: Vec::new(),
+            wildcard_fallback: false,
+            append: true,
+        });
+        assert_eq!(paths(&app), ["/day-1", "/day-10", "/day-30", "/day-40"]);
+        let pane_paths: Vec<&str> = app.panes[0]
+            .hits
+            .iter()
+            .map(|hit| hit.source_path.as_str())
+            .collect();
+        assert_eq!(pane_paths, ["/day-1", "/day-10", "/day-30", "/day-40"]);
+    }
+
     #[test]
     fn search_completed_small_result_set_clears_reveal_sequence() {
         let mut app = CassApp::default();
