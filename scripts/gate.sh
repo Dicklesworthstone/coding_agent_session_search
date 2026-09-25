@@ -168,8 +168,10 @@ UBS_FILES=()
 # is passed after `--` so one admission can run only the tests a change touches.
 # search_metamorphic is the set-algebra oracle for search semantics (terms,
 # Boolean grammar, time windows; bead 2l1b0.68): a wrong-answer regression
-# there is invisible to every golden.
-INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic)
+# there is invisible to every golden. pages_bundle holds the Pages viewer's
+# safety checks (CSP, sanitizer, crypto worker, auth expiry, service worker);
+# 20 of them sat red for days because no gate ran the target (2l1b0.77).
+INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic pages_bundle)
 while [ $# -gt 0 ]; do
     case "$1" in
         --lib-filter) LIB_FILTER="$2"; shift 2 ;;
