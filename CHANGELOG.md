@@ -40,6 +40,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   version keep their old rows; `cass index --full` picks up their queued
   prompts. 0.3.1 also honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family
   connectors (GH #486) and caps session reads while reading.
+- **Semantic search comes back after `forget`, `dedup --apply` and
+  `sources agents exclude`.** Deleting canonical rows left the semantic embed
+  watermark covering them, so every later `cass index --semantic` (even with
+  `--full`) took the "nothing new to embed" shortcut and never re-certified
+  the vector index: semantic search stayed `semantic-unavailable` for good
+  (the v0.9.0 known issue). Because SQLite reuses freed message ids, messages
+  ingested afterwards could also be skipped or resolve to the deleted text's
+  vectors. Deletions now drop the watermark, so the next
+  `cass index --semantic` re-embeds from the canonical rows.
 - **A plain `cass index` finishes a purge that was interrupted.** When
   `forget`, `dedup --apply` or an agent purge deleted canonical rows but its
   lexical rebuild failed or was killed, the deleted text stayed searchable and

@@ -7833,6 +7833,18 @@ fn cursor_workspace_attribution_is_authoritative(
 
 /// Reconcile only the provider-owned attribution fields. A missing workspace
 /// in an ordinary partial packet must never erase a known association.
+/// Canonical rows were deleted (forget, dedup, agent purge). Their vectors
+/// stay in the semantic artifact and SQLite reuses the freed top message ids,
+/// so a watermark that covers them lets `cass index --semantic` take the #394
+/// skip forever: the tier is never re-certified, and a reused id would resolve
+/// to the deleted text's vector. Dropping the watermark sends the next semantic
+/// run through the full re-embed, the same invalidation the reconcilers below
+/// apply on identity changes (2l1b0.78).
+fn clear_semantic_embed_watermark_after_deletion(tx: &FrankenTransaction<'_>) -> Result<()> {
+    tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+    Ok(())
+}
+
 fn franken_reconcile_cursor_workspace(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
@@ -10785,6 +10797,7 @@ impl FrankenStorage {
                )",
             fparams![agent_id],
         )?;
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
 
         Ok(AgentArchivePurgeResult {
@@ -10899,6 +10912,7 @@ impl FrankenStorage {
             &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
             fparams![],
         )?;
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
 
         Ok(ForgetConversationsResult {
@@ -11027,6 +11041,7 @@ impl FrankenStorage {
             // so there is nothing conversation-scoped to delete there.
             tx.execute_compat("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
         }
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
 
         // The derived FTS shadow rows for the dropped messages are now stale.
@@ -26132,6 +26147,11 @@ mod tests {
         assert_eq!(conv_count(&storage), 2, "two rows seeded");
         assert_eq!(msg_count(&storage), 4, "two messages per row");
 
+        let max_message_id = storage.max_message_id().unwrap().unwrap();
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
+
         // Dry-run: detects the pair, mutates nothing.
         let dry = storage
             .collapse_external_id_prefix_duplicates(true)
@@ -26144,6 +26164,11 @@ mod tests {
         assert_eq!(dry.pairs[0].keep_external_id, "-proj/abc.jsonl");
         assert_eq!(conv_count(&storage), 2, "dry-run must not delete rows");
         assert_eq!(msg_count(&storage), 4, "dry-run must not delete messages");
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id),
+            "dry-run must not invalidate semantic assets"
+        );
 
         // Apply: drops the prefixed twin + its 2 messages; keeps canonical.
         let applied = storage
@@ -26154,6 +26179,8 @@ mod tests {
         assert_eq!(applied.messages_affected, 2);
         assert_eq!(conv_count(&storage), 1, "twin row dropped");
         assert_eq!(msg_count(&storage), 2, "twin's messages dropped");
+        // 2l1b0.78: the twin's vectors remain in the semantic artifact.
+        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
 
         let surviving: String = storage
             .conn
@@ -43672,10 +43699,24 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
         seed_conversation(&storage, "openclaw", "purge-target");
         seed_conversation(&storage, "codex", "keep-target");
+        let max_message_id = storage.max_message_id().unwrap().unwrap();
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
+
+        // An agent with no archived rows purges nothing and keeps the watermark.
+        let noop = storage.purge_agent_archive_data("cursor").unwrap();
+        assert_eq!(noop.conversations_deleted, 0);
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id)
+        );
 
         let purge = storage.purge_agent_archive_data("openclaw").unwrap();
         assert_eq!(purge.conversations_deleted, 1);
         assert_eq!(purge.messages_deleted, 2);
+        // 2l1b0.78: the purged messages' vectors remain in the semantic artifact.
+        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
 
         storage.rebuild_fts().unwrap();
         storage.rebuild_analytics().unwrap();
@@ -43791,6 +43832,11 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.total_conversation_count().unwrap(), 3);
 
         let glob = "**/subagents/*.jsonl";
+        // A semantic embed watermark that covers the whole corpus.
+        let max_message_id = storage.max_message_id().unwrap().unwrap();
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
 
         // Dry-run: reports matches, deletes nothing.
         let dry = storage
@@ -43801,6 +43847,11 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(dry.messages_matched, 2);
         assert_eq!(dry.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 3);
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id),
+            "a dry run must not invalidate semantic assets"
+        );
 
         // Apply: deletes the two subagent conversations, keeps the top-level one.
         let applied = storage
@@ -43812,6 +43863,12 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
         // The surviving top-level session's message is intact.
         assert_eq!(storage.total_message_count().unwrap(), 1);
+        // 2l1b0.78: the deleted messages' vectors are still in the semantic
+        // artifact, so the watermark that covered them must not survive.
+        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
 
         // An empty pattern is rejected; a non-matching glob is a clean no-op.
         assert!(
@@ -43825,6 +43882,11 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(none.conversations_matched, 0);
         assert_eq!(none.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id),
+            "a no-op forget must not force a semantic re-embed"
+        );
     }
 
     /// Regression for cass#202: a `Connection` dropped mid-transaction can

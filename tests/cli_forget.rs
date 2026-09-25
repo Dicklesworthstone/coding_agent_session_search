@@ -6,10 +6,11 @@
 //! store message content, so a plain search kept returning the forgotten text
 //! until some later `cass index` rebuilt the index.
 //!
-//! Forget does not rewrite semantic vectors. The semantic assets no longer
-//! match the database afterwards, so explicit semantic search fails closed
-//! (`semantic-unavailable`), and every semantic hit is hydrated from its
-//! canonical row anyway; the surface test proves no surface leaks.
+//! Forget does not rewrite semantic vectors; it drops the semantic embed
+//! watermark. Explicit semantic search then fails closed
+//! (`semantic-unavailable`) until `cass index --semantic` re-embeds from the
+//! canonical rows; the surface test proves no surface leaks meanwhile and
+//! that the catch-up restores semantic search.
 //!
 //! Each step logs one JSON line on stderr: step, command, exit code, elapsed.
 
@@ -308,9 +309,8 @@ fn forget_apply_removes_forgotten_conversations_from_every_search_surface() -> T
     }
 
     // The semantic assets predate the deletion, so explicit semantic search
-    // may fail closed (exit 15); every surface that answers must answer
-    // without the forgotten conversation. Restoring semantic search after a
-    // deletion is tracked separately: `cass index --semantic` does not.
+    // fails closed (exit 15) until the semantic catch-up below; every surface
+    // that answers must answer without the forgotten conversation.
     let assert_forgotten_absent = |surface: &str, hits: &[(String, String)]| -> TestResult {
         match hits
             .iter()
@@ -336,6 +336,17 @@ fn forget_apply_removes_forgotten_conversations_from_every_search_surface() -> T
     }
     if archive.pack(FORGOTTEN_MARKER)?.contains(FORGOTTEN_SESSION) {
         return Err("pack still carries the forgotten conversation".into());
+    }
+
+    // 2l1b0.78: the command the semantic error names restores every surface,
+    // still without the forgotten conversation. Before the fix it took the
+    // watermark skip and left semantic search unavailable forever.
+    archive.index(&["--semantic", "--embedder", "hash"])?;
+    for (surface, args) in SURFACES {
+        assert_forgotten_absent(surface, &archive.search_hits(FORGOTTEN_MARKER, args)?)?;
+        if archive.search_hits(KEPT_MARKER, args)?.is_empty() {
+            return Err(format!("{surface}: the catch-up lost the unrelated conversation").into());
+        }
     }
     Ok(())
 }
