@@ -41,6 +41,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   Reranking under a budget no longer spawns it either. `_meta.effective.daemon`
   reports `use_existing`, `auto_spawn_requested` and `auto_spawn`, so
   `--daemon` on a robot search is visible as requested but not applied.
+- **`cass forget` says what it removes and how a failed purge is finished.**
+  Its help and README row now state that source files are kept: an unchanged
+  source stays forgotten across `cass index` and `cass index --full`, but a
+  source its agent appends to later is indexed again, whole. When the lexical
+  rebuild fails after the canonical rows are deleted, forget exits 5
+  (`lexical-rebuild`) with a `cass index --full` hint. Tests now prove that
+  lexical, hybrid and `pack` stop returning forgotten conversations, that
+  explicit semantic search fails closed (`semantic-unavailable`) rather than
+  returning them, and that a dry run leaves every derived asset
+  byte-identical. Known issue: semantic search does not yet recover after a
+  forget; `cass index --semantic` (even `--full`) leaves it unavailable.
 - **Date-filtered search works on a long-lived index again (GH #499).** Every
   `--days`/`--since`/`--until` search failed with `posting cursor invariant
   failed: Boolean children belong to different segment domains` (exit 9) once

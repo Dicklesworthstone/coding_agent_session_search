@@ -1665,7 +1665,8 @@ pub enum Commands {
     Quarantine(QuarantineCommand),
     /// Prune an already-indexed subset of conversations by source-path glob
     /// (dry-run by default; `--apply` to commit). Removes matching rows from the
-    /// canonical DB and rebuilds derived search/analytics assets.
+    /// canonical DB and rebuilds derived search/analytics assets. Source files
+    /// are kept: a source that changes afterwards is indexed again.
     Forget {
         /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
         #[arg(long = "source-glob")]
@@ -9846,18 +9847,38 @@ fn run_forget_command(
     }
 
     if let Some(remaining_conversations) = remaining_conversations {
-        crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
-            .map_err(|e| CliError {
-                code: 5,
-                kind: CliErrorKind::LexicalRebuild.kind_str(),
-                message: format!(
-                    "forgot {} conversation(s) but failed to rebuild the lexical search index, \
-                     which may still return their text: {e}",
-                    report.conversations_deleted
-                ),
-                hint: Some("Run 'cass index --full' to rebuild lexical search data.".to_string()),
-                retryable: false,
-            })?;
+        // Test failpoint: proves a failed purge is a typed error and that
+        // `cass index --full` finishes it. A plain incremental index does
+        // not: it never revisits documents whose rows were deleted.
+        let rebuilt = if dotenvy::var("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE")
+            .is_ok_and(|value| value == "1")
+        {
+            Err(anyhow::anyhow!(
+                "injected by CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE"
+            ))
+        } else {
+            crate::indexer::rebuild_tantivy_from_db(
+                &db_path,
+                &data_dir,
+                remaining_conversations,
+                None,
+            )
+        };
+        rebuilt.map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::LexicalRebuild.kind_str(),
+            message: format!(
+                "forgot {} conversation(s) but failed to rebuild the lexical search index, \
+                 which may still return their text: {e}",
+                report.conversations_deleted
+            ),
+            hint: Some(
+                "Run 'cass index --full': it rebuilds the lexical index from the canonical \
+                 database, which no longer holds the forgotten conversations."
+                    .to_string(),
+            ),
+            retryable: false,
+        })?;
     }
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
