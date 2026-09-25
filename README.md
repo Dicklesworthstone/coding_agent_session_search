@@ -3605,7 +3605,7 @@ The manifests and lockfile pin the entire SQLite family used by CASS (including
 `fsqlite-types`) at `=0.4.4`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
-archive. `franken-agent-detection =0.3.0` is published. SQLite `0.4.2` adds
+archive. `franken-agent-detection =0.3.1` is published. SQLite `0.4.2` adds
 explicit derived WAL-index recovery for read-only opens (GH#477); its
 upstream recovery, compiler, and package gates passed. All 25 SQLite packages
 are now published at 0.4.4, which adds durable pending-freelist repairs.
@@ -3624,7 +3624,7 @@ The September 17 FrankenSearch publication blocker is resolved.
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.4` (tag v0.4.4 = `9d3d98778a372aba95d76d05c5c974ac0238c96a`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477) and 0.4.4's durable pending-freelist repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
-| `franken-agent-detection` | crates.io `=0.3.0` |
+| `franken-agent-detection` | crates.io `=0.3.1` |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
 | `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.4` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, published from the `frankensearch-quill-v0.3.4` hotfix tag), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |

@@ -150,10 +150,14 @@ const CONTRACTS: &[DependencyContract] = &[
         // encode identically.
         // The 0.3.0 candidate moves SQLite connectors onto the same 0.4.x
         // engine and 0.5.x runtime as CASS; publication must precede adoption.
+        // 0.3.1 (2026-09-25) indexes Claude Code prompts typed mid-turn
+        // (queued_command attachments, cass#500), honors CASS_EXCLUDE_PATHS in
+        // the Codex and Pi-family connectors (cass#486), and caps session
+        // reads while reading.
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.0",
+        expected_version: "0.3.1",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[

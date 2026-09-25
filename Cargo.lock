@@ -836,7 +836,7 @@ dependencies = [
  "arrayvec",
  "assert_cmd",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bloomfilter",
  "bytemuck",
@@ -1903,9 +1903,9 @@ dependencies = [
 
 [[package]]
 name = "franken-agent-detection"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c699c647f2c6edd7335c3c468ab03e2f0fd3b0dd5d0c47f657f4c6c46058acfd"
+checksum = "8be1c95928a3f0cd09f46df707b737b5e5988f19f6f5dcadf4e97580a5ee6f50"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -140,7 +140,7 @@ bytemuck = "1.25.0"
 frankensearch = { version = "=0.6.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 # Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
 # Keep both readers unconditional, including --no-default-features builds.
-franken-agent-detection = { version = "=0.3.0", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff"] }
+franken-agent-detection = { version = "=0.3.1", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

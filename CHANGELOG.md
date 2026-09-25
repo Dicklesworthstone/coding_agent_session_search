@@ -33,6 +33,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **Claude Code prompts typed while the agent is mid-turn are searchable
+  (GH #500).** Claude Code saves them as `queued_command` attachments, which
+  the connector dropped. franken-agent-detection 0.3.1 indexes person-typed
+  ones as user messages in transcript order. Sessions indexed before this
+  version keep their old rows; `cass index --full` picks up their queued
+  prompts. 0.3.1 also honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family
+  connectors (GH #486) and caps session reads while reading.
 - **A plain `cass index` finishes a purge that was interrupted.** When
   `forget`, `dedup --apply` or an agent purge deleted canonical rows but its
   lexical rebuild failed or was killed, the deleted text stayed searchable and

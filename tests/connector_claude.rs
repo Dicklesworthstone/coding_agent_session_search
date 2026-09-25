@@ -96,6 +96,55 @@ fn claude_connector_parses_jsonl_format() {
     );
 }
 
+/// GH #500: a prompt typed while the agent is mid-turn is saved as a
+/// `queued_command` attachment, not a `type:"user"` record. Person-typed ones
+/// (origin.kind "human", or no origin in older builds) are user messages in
+/// transcript order; relayed (peer), meta and task-notification ones are not.
+#[test]
+fn claude_connector_indexes_prompts_queued_mid_turn() {
+    let dir = create_claude_temp();
+    let projects = dir.path().join("fixture-claude/projects/test-proj");
+    fs::create_dir_all(&projects).unwrap();
+    let file = projects.join("session.jsonl");
+
+    let sample = r#"{"type":"user","cwd":"/workspace","sessionId":"sess-q","message":{"role":"user","content":"please audit the zebra module"},"timestamp":"2026-09-24T10:00:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Auditing now."}]},"timestamp":"2026-09-24T10:00:05.000Z"}
+{"type":"attachment","sessionId":"sess-q","timestamp":"2026-09-24T10:00:07.000Z","attachment":{"type":"queued_command","prompt":"also check the quokkatypedmidturn cache","commandMode":"prompt","origin":{"kind":"human"}}}
+{"type":"attachment","sessionId":"sess-q","timestamp":"2026-09-24T10:00:08.000Z","attachment":{"type":"queued_command","prompt":"legacynoorigin prompt text","commandMode":"prompt"}}
+{"type":"attachment","sessionId":"sess-q","timestamp":"2026-09-24T10:00:09.000Z","attachment":{"type":"queued_command","prompt":"peerrelayedprompt text","commandMode":"prompt","origin":{"kind":"peer"}}}
+{"type":"attachment","sessionId":"sess-q","timestamp":"2026-09-24T10:00:10.000Z","isMeta":true,"attachment":{"type":"queued_command","prompt":"metaqueuedprompt text","commandMode":"prompt"}}
+{"type":"attachment","sessionId":"sess-q","timestamp":"2026-09-24T10:00:11.000Z","attachment":{"type":"queued_command","prompt":"<task-notification>tasknotifyprompt</task-notification>","commandMode":"task-notification"}}
+{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Checked the cache too."}]},"timestamp":"2026-09-24T10:00:20.000Z"}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    let conn = ClaudeCodeConnector::new();
+    let ctx = ScanContext {
+        data_dir: dir.path().join("fixture-claude"),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
+    let convs = conn.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+    let messages: Vec<(&str, &str)> = convs[0]
+        .messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.as_str()))
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            ("user", "please audit the zebra module"),
+            ("assistant", "Auditing now."),
+            ("user", "also check the quokkatypedmidturn cache"),
+            ("user", "legacynoorigin prompt text"),
+            ("assistant", "Checked the cache too."),
+        ],
+        "only person-typed queued prompts are indexed, in transcript order"
+    );
+}
+
 /// Test JSONL format with type:message entries (role hints)
 #[test]
 fn claude_connector_parses_message_type_entries() {
