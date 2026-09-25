@@ -33,6 +33,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **A plain `cass index` finishes a purge that was interrupted.** When
+  `forget`, `dedup --apply` or an agent purge deleted canonical rows but its
+  lexical rebuild failed or was killed, the deleted text stayed searchable and
+  `cass status` stayed stale through any number of incremental runs; only
+  `--full` repaired it. The incremental preflight now sees that the canonical
+  archive holds fewer conversations than the lexical generation was
+  certified against and rebuilds it from the canonical rows.
 - **Robot semantic and hybrid searches set up semantics once, inside their
   budget.** The bounded setup worker ran, and then the same setup ran again
   on the main thread: the cost was paid twice, the second time outside the

@@ -341,7 +341,7 @@ fn forget_apply_removes_forgotten_conversations_from_every_search_surface() -> T
 }
 
 #[test]
-fn a_failed_lexical_purge_is_a_typed_error_and_index_full_completes_it() -> TestResult {
+fn a_failed_lexical_purge_is_a_typed_error_and_the_next_index_completes_it() -> TestResult {
     let (archive, forgotten) = indexed_archive(&[])?;
     let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
 
@@ -378,15 +378,27 @@ fn a_failed_lexical_purge_is_a_typed_error_and_index_full_completes_it() -> Test
         return Err("the canonical rows must stay deleted after a failed purge".into());
     }
 
-    // The hinted `cass index --full` finishes the purge from the canonical
-    // rows (an incremental run never revisits deleted rows' documents).
-    archive.index(&["--full"])?;
+    // 2l1b0.79: a plain incremental `cass index` finishes the purge. Its
+    // preflight sees fewer canonical conversations than the lexical
+    // checkpoint was certified against and rebuilds from the canonical rows.
+    // Before, it never revisited the deleted rows' documents and status
+    // stayed stale with the forgotten text searchable.
+    archive.index(&[])?;
     let after = archive.search_hit_paths(FORGOTTEN_MARKER)?;
     if !after.is_empty() {
-        return Err(format!("index --full left the forgotten text searchable: {after:?}").into());
+        return Err(format!("the next index left the forgotten text searchable: {after:?}").into());
     }
     if archive.search_hit_paths(KEPT_MARKER)?.is_empty() {
         return Err("the repairing index lost the unrelated conversation".into());
+    }
+    let status = archive.succeed("status", &["status", "--json"])?;
+    let status: Value = serde_json::from_slice(&status.stdout)?;
+    if status["index"]["stale"] != false {
+        return Err(format!(
+            "lexical index still stale after the repair: {}",
+            status["index"]
+        )
+        .into());
     }
     Ok(())
 }
