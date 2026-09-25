@@ -35,13 +35,6 @@ fn error_kind_rs_path() -> PathBuf {
         .join("cli_error_kind.rs")
 }
 
-const LEGACY_SNAKE_CASE_KIND_EXEMPTIONS: &[&str] = &[
-    "failed_seed_bundle_file",
-    "lexical_generation",
-    "lexical_shard",
-    "retained_publish_backup",
-];
-
 fn extract_kind_str_mappings() -> BTreeMap<String, (String, usize)> {
     let source =
         std::fs::read_to_string(error_kind_rs_path()).expect("read src/model/cli_error_kind.rs");
@@ -167,7 +160,7 @@ fn error_kinds_are_strictly_kebab_case() {
     let mut violations = Vec::new();
 
     for (kind, lines) in &kinds {
-        if kind.contains('_') && !LEGACY_SNAKE_CASE_KIND_EXEMPTIONS.contains(&kind.as_str()) {
+        if kind.contains('_') {
             violations.push(format!(
                 "  {kind} (lines: {lines:?}) — contains underscore, should be: {}",
                 kind.replace('_', "-")

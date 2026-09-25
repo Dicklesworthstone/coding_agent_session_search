@@ -49,6 +49,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   ingested afterwards could also be skipped or resolve to the deleted text's
   vectors. Deletions now drop the watermark, so the next
   `cass index --semantic` re-embeds from the canonical rows.
+- **Every robot error kind is kebab-case.** The lexical artifact-manifest
+  error reported `err.kind` `lexical_generation`, borrowing the quarantine
+  `artifact_kind` spelling. It is now `lexical-generation`, and the three
+  other borrowed spellings in the typed kind vocabulary moved with it
+  (`lexical-shard`, `failed-seed-bundle-file`, `retained-publish-backup`).
+  `artifact_kind` in status, diag and doctor quarantine output keeps its
+  snake_case values. The kind-taxonomy test no longer exempts underscores.
 - **A plain `cass index` finishes a purge that was interrupted.** When
   `forget`, `dedup --apply` or an agent purge deleted canonical rows but its
   lexical rebuild failed or was killed, the deleted text stayed searchable and

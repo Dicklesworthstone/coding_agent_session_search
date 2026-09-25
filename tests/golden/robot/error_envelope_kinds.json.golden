@@ -191,12 +191,12 @@
         24
       ]
     },
-    "lexical-rebuild": {
+    "lexical-generation": {
       "exit_codes": [
         5
       ]
     },
-    "lexical_generation": {
+    "lexical-rebuild": {
       "exit_codes": [
         5
       ]

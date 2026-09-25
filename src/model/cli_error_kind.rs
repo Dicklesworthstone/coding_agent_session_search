@@ -7,10 +7,11 @@
 //!
 //! - typo a kind ("db_error" vs "db-error") without compiler error,
 //! - introduce a new kind that shadows an existing one,
-//! - use inconsistent casing (the existing literal set already has
-//!   4 snake_case stragglers — `failed_seed_bundle_file`,
-//!   `lexical_generation`, `lexical_shard`, `retained_publish_backup`
-//!   — alongside the canonical kebab-case majority).
+//! - use inconsistent casing (the literal set had 4 snake_case
+//!   stragglers — `failed_seed_bundle_file`, `lexical_generation`,
+//!   `lexical_shard`, `retained_publish_backup` — borrowed from the
+//!   quarantine `artifact_kind` vocabulary; since 2l1b0.58 every error
+//!   kind is kebab-case and only `artifact_kind` keeps snake_case).
 //!
 //! That inconsistency caused 3 real duplicates pinned by bead `al19b`.
 //!
@@ -20,10 +21,7 @@
 //! 1. enumerates every kind currently emitted by `src/lib.rs`
 //!    (audited at landing time via `grep -oE 'kind: "[a-z_-]+"'`),
 //! 2. exposes a `kind_str()` accessor that returns the canonical
-//!    kebab-case (or, for the four snake_case stragglers, the exact
-//!    legacy literal — preserving wire compatibility with golden
-//!    tests + downstream agents until those four are migrated in a
-//!    separate slice),
+//!    kebab-case wire string,
 //! 3. exposes a `from_kind_str()` lookup so JSON-mode consumers
 //!    (and golden tests) can round-trip the kind cleanly.
 //!
@@ -38,16 +36,9 @@
 //! # Variant naming
 //!
 //! Variants use Rust's standard CamelCase. The mapping to the
-//! wire-format string is held by `kind_str()` rather than by
-//! `#[serde(rename = "...")]` because the four snake_case stragglers
-//! cannot be auto-generated from CamelCase by serde's
-//! `rename_all = "kebab-case"` (e.g. `LexicalGeneration` would
-//! serialize as `lexical-generation`, breaking the existing
-//! `kind: "lexical_generation"` wire contract). The audit golden
-//! test pins both the kebab-case canonical kinds AND the snake_case
-//! exemptions so a future cleanup slice that migrates the four
-//! stragglers to kebab-case has an explicit place to flip the
-//! contract.
+//! wire-format string is held explicitly by `kind_str()`, and the audit
+//! golden test (tests/golden_error_envelope.rs) requires every emitted
+//! kind to be kebab-case with no exemptions.
 
 use serde::{Deserialize, Serialize};
 
@@ -185,7 +176,7 @@ impl ErrorKind {
             Self::EmptySession => "empty-session",
             Self::EncodeJson => "encode-json",
             Self::ExportFailed => "export-failed",
-            Self::FailedSeedBundleFile => "failed_seed_bundle_file",
+            Self::FailedSeedBundleFile => "failed-seed-bundle-file",
             Self::FileCreate => "file-create",
             Self::FileNotFound => "file-not-found",
             Self::FileOpen => "file-open",
@@ -202,8 +193,8 @@ impl ErrorKind {
             Self::InvalidLine => "invalid-line",
             Self::Io => "io",
             Self::LexicalRebuild => "lexical-rebuild",
-            Self::LexicalGeneration => "lexical_generation",
-            Self::LexicalShard => "lexical_shard",
+            Self::LexicalGeneration => "lexical-generation",
+            Self::LexicalShard => "lexical-shard",
             Self::LineNotFound => "line-not-found",
             Self::LineOutOfRange => "line-out-of-range",
             Self::Local => "local",
@@ -231,7 +222,7 @@ impl ErrorKind {
             Self::RepairError => "repair-error",
             Self::ResumeEmptyCommand => "resume-empty-command",
             Self::ResumeExecFailed => "resume-exec-failed",
-            Self::RetainedPublishBackup => "retained_publish_backup",
+            Self::RetainedPublishBackup => "retained-publish-backup",
             Self::Schedule => "schedule",
             Self::Search => "search",
             Self::SemanticBackfill => "semantic-backfill",
@@ -286,7 +277,7 @@ impl ErrorKind {
             "empty-session" => Self::EmptySession,
             "encode-json" => Self::EncodeJson,
             "export-failed" => Self::ExportFailed,
-            "failed_seed_bundle_file" => Self::FailedSeedBundleFile,
+            "failed-seed-bundle-file" => Self::FailedSeedBundleFile,
             "file-create" => Self::FileCreate,
             "file-not-found" => Self::FileNotFound,
             "file-open" => Self::FileOpen,
@@ -303,8 +294,8 @@ impl ErrorKind {
             "invalid-line" => Self::InvalidLine,
             "io" => Self::Io,
             "lexical-rebuild" => Self::LexicalRebuild,
-            "lexical_generation" => Self::LexicalGeneration,
-            "lexical_shard" => Self::LexicalShard,
+            "lexical-generation" => Self::LexicalGeneration,
+            "lexical-shard" => Self::LexicalShard,
             "line-not-found" => Self::LineNotFound,
             "line-out-of-range" => Self::LineOutOfRange,
             "local" => Self::Local,
@@ -332,7 +323,7 @@ impl ErrorKind {
             "repair-error" => Self::RepairError,
             "resume-empty-command" => Self::ResumeEmptyCommand,
             "resume-exec-failed" => Self::ResumeExecFailed,
-            "retained_publish_backup" => Self::RetainedPublishBackup,
+            "retained-publish-backup" => Self::RetainedPublishBackup,
             "schedule" => Self::Schedule,
             "search" => Self::Search,
             "semantic-backfill" => Self::SemanticBackfill,
@@ -533,25 +524,34 @@ mod tests {
         );
     }
 
-    /// Pin the four legacy snake_case stragglers explicitly so a
-    /// future "rename to kebab-case" cleanup slice has a single place
-    /// to flip the contract. Pinning them here also surfaces an
-    /// accidental flip-back from kebab-case to snake_case.
+    /// 2l1b0.58: the four kinds that borrowed the quarantine
+    /// `artifact_kind` spelling are kebab-case like every other error
+    /// kind, and the old snake_case spellings no longer parse as error
+    /// kinds (they remain `artifact_kind` values only).
     #[test]
-    fn snake_case_stragglers_preserve_legacy_wire_format() {
-        assert_eq!(
-            ErrorKind::FailedSeedBundleFile.kind_str(),
-            "failed_seed_bundle_file"
-        );
-        assert_eq!(
-            ErrorKind::LexicalGeneration.kind_str(),
-            "lexical_generation"
-        );
-        assert_eq!(ErrorKind::LexicalShard.kind_str(), "lexical_shard");
-        assert_eq!(
-            ErrorKind::RetainedPublishBackup.kind_str(),
-            "retained_publish_backup"
-        );
+    fn former_snake_case_kinds_are_kebab_case() {
+        for (kind, wire, legacy) in [
+            (
+                ErrorKind::FailedSeedBundleFile,
+                "failed-seed-bundle-file",
+                "failed_seed_bundle_file",
+            ),
+            (
+                ErrorKind::LexicalGeneration,
+                "lexical-generation",
+                "lexical_generation",
+            ),
+            (ErrorKind::LexicalShard, "lexical-shard", "lexical_shard"),
+            (
+                ErrorKind::RetainedPublishBackup,
+                "retained-publish-backup",
+                "retained_publish_backup",
+            ),
+        ] {
+            assert_eq!(kind.kind_str(), wire);
+            assert_eq!(ErrorKind::from_kind_str(wire), Some(kind));
+            assert_eq!(ErrorKind::from_kind_str(legacy), None);
+        }
     }
 
     /// Unknown kinds return None (not a default Unknown variant);
