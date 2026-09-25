@@ -66290,7 +66290,9 @@ mod tests {
                 ),
                 "{configured_name}: watch/quarantine must use the configured connector"
             );
-            if matches!(configured_name, "codex" | "omp" | "pi_agent") {
+            // copilot: CASS widens detection to VS Code's native chat stores,
+            // so its detect() legitimately differs where such stores exist.
+            if matches!(configured_name, "codex" | "omp" | "pi_agent" | "copilot") {
                 assert!(
                     !std::ptr::fn_addr_eq(configured_factory, upstream_factory),
                     "{configured_name}: cass must install its own adapter, not the upstream one"
