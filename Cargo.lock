@@ -2098,9 +2098,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-quill"
-version = "0.3.2"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2d038cc5767a28cb87711e7ae6e08be7272c6e6e16540de050e001940a7f087"
+checksum = "96036d7df045669638139f2f689608128ce67aabdd910844a114fdf580f6026a"
 dependencies = [
  "ahash",
  "arc-swap",

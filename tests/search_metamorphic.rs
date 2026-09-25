@@ -8,8 +8,12 @@
 //! exactly the messages inside it. These relations do not depend on any one
 //! expected answer, so a regression in the grammar, the filters or the
 //! engine shows up as a set difference, printed per query.
+//!
+//! The Boolean grammar (bead 2l1b0.52) is checked the same way, over fixed
+//! cases and over seeded random expressions: NOT binds tightest, then AND,
+//! then OR, and parentheses group. Every search logs one JSON line to stderr.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
@@ -73,7 +77,15 @@ impl Corpus {
         ])
         .args(extra);
         let output = cmd.output()?;
+        let elapsed_ms = started.elapsed().as_millis();
         if !output.status.success() {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "search", "query": query, "extra": extra,
+                    "exit": output.status.code(), "elapsed_ms": elapsed_ms,
+                })
+            );
             return Err(format!(
                 "search {query:?} {extra:?} exited {:?}: {}",
                 output.status.code(),
@@ -96,11 +108,40 @@ impl Corpus {
             ids.insert(id);
         }
         eprintln!(
-            "[metamorphic] query={query:?} extra={extra:?} hits={} elapsed_ms={}",
-            ids.len(),
-            started.elapsed().as_millis()
+            "{}",
+            json!({
+                "event": "search", "query": query, "extra": extra, "exit": 0,
+                "hits": ids.len(), "total_matches": payload["total_matches"],
+                "lexical_degrade_reason": payload["_meta"]["lexical_degrade_reason"],
+                "elapsed_ms": elapsed_ms,
+            })
         );
         Ok(ids)
+    }
+
+    /// The `--dry-run` explanation of `query`: no index is touched.
+    fn explain(&self, query: &str) -> TestResult<Value> {
+        let output = self
+            .cmd()
+            .args(["search", query, "--dry-run", "--robot"])
+            .output()?;
+        eprintln!(
+            "{}",
+            json!({"event": "dry_run", "query": query, "exit": output.status.code()})
+        );
+        if !output.status.success() {
+            return Err(format!(
+                "dry run {query:?} exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(serde_json::from_slice::<Value>(&output.stdout)?["explanation"].clone())
+    }
+
+    fn all(&self) -> BTreeSet<usize> {
+        self.messages.iter().map(|message| message.id).collect()
     }
 
     fn with_term(&self, term: &str) -> BTreeSet<usize> {
@@ -248,7 +289,7 @@ fn assert_same(label: &str, got: &BTreeSet<usize>, expected: &BTreeSet<usize>) -
 #[test]
 fn every_term_matches_exactly_its_messages() -> TestResult {
     let corpus = corpus();
-    let all: BTreeSet<usize> = corpus.messages.iter().map(|message| message.id).collect();
+    let all = corpus.all();
     for term in TERMS {
         let expected = corpus.with_term(term);
         assert!(
@@ -317,11 +358,11 @@ fn time_windows_are_exact_and_nested() -> TestResult {
     Ok(())
 }
 
-/// README documents NOT > AND > OR precedence and parentheses. The Quill CASS
-/// grammar binds OR tighter than AND and ignores parentheses, so these fail
-/// until bead 2l1b0.52 lands the documented grammar upstream.
+/// README documents NOT > AND > OR precedence and parentheses (2l1b0.52).
+/// The legacy grammar bound OR tighter than AND and read parentheses as word
+/// characters, so the mixed cases here fail on 71759163; they include the
+/// bead's reproductions with an absent term.
 #[test]
-#[ignore = "fails until 2l1b0.52: Quill's CASS grammar binds OR tighter and ignores parentheses"]
 fn precedence_and_parentheses_follow_the_documented_grammar() -> TestResult {
     let corpus = corpus();
     let (k, l, m) = (
@@ -329,16 +370,189 @@ fn precedence_and_parentheses_follow_the_documented_grammar() -> TestResult {
         corpus.with_term("limeword"),
         corpus.with_term("mangoword"),
     );
-    let l_and_m: BTreeSet<usize> = l.intersection(&m).copied().collect();
-    let k_or_l: BTreeSet<usize> = k.union(&l).copied().collect();
-    assert_same(
-        "kiwiword OR limeword AND mangoword",
-        &corpus.search("kiwiword OR limeword AND mangoword", &[])?,
-        &k.union(&l_and_m).copied().collect(),
-    )?;
-    assert_same(
-        "(kiwiword OR limeword) AND mangoword",
-        &corpus.search("(kiwiword OR limeword) AND mangoword", &[])?,
-        &k_or_l.intersection(&m).copied().collect(),
-    )
+    let union = |a: &BTreeSet<usize>, b: &BTreeSet<usize>| -> BTreeSet<usize> {
+        a.union(b).copied().collect()
+    };
+    let both = |a: &BTreeSet<usize>, b: &BTreeSet<usize>| -> BTreeSet<usize> {
+        a.intersection(b).copied().collect()
+    };
+    let cases = [
+        (
+            "kiwiword OR limeword AND mangoword",
+            union(&k, &both(&l, &m)),
+        ),
+        ("kiwiword OR limeword mangoword", union(&k, &both(&l, &m))),
+        (
+            "kiwiword || limeword && mangoword",
+            union(&k, &both(&l, &m)),
+        ),
+        (
+            "(kiwiword OR limeword) AND mangoword",
+            both(&union(&k, &l), &m),
+        ),
+        ("(kiwiword OR limeword) mangoword", both(&union(&k, &l), &m)),
+        ("kiwiword OR limeword AND nonexistentword", k.clone()),
+        ("(kiwiword AND nonexistentword) OR limeword", l.clone()),
+        ("NOT NOT kiwiword", k.clone()),
+        (
+            "mangoword -(kiwiword OR limeword)",
+            m.difference(&union(&k, &l)).copied().collect(),
+        ),
+        // Recovered, not rejected: an unclosed group closes at the end.
+        (
+            "kiwiword AND (limeword OR mangoword",
+            both(&k, &union(&l, &m)),
+        ),
+    ];
+    for (query, expected) in &cases {
+        assert_same(query, &corpus.search(query, &[])?, expected)?;
+    }
+
+    // --explain shows the grouping searched and records the recovery.
+    let explanation = corpus.explain("kiwiword AND (limeword OR mangoword")?;
+    assert_eq!(
+        explanation["parsed"]["structure"],
+        "kiwiword AND (limeword OR mangoword)"
+    );
+    let warnings = explanation["warnings"]
+        .as_array()
+        .ok_or("explanation has no warnings array")?;
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning == "1 unclosed '(' closed at the end of the query"),
+        "missing recovery warning: {warnings:?}"
+    );
+    Ok(())
+}
+
+/// A generated Boolean expression and its set-algebra meaning (2l1b0.52).
+#[derive(Debug)]
+enum Expr {
+    Term(&'static str),
+    Not(Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
+}
+
+impl Expr {
+    fn generate(rng: &mut u64, depth: usize) -> Self {
+        let roll = next_random(rng) % 10;
+        if depth == 0 || roll < 3 {
+            return Self::Term(TERMS[(next_random(rng) % TERMS.len() as u64) as usize]);
+        }
+        let children = |rng: &mut u64| -> Vec<Self> {
+            let count = 2 + (next_random(rng) % 2) as usize;
+            (0..count).map(|_| Self::generate(rng, depth - 1)).collect()
+        };
+        match roll {
+            3 | 4 => Self::Not(Box::new(Self::generate(rng, depth - 1))),
+            5..=7 => Self::And(children(rng)),
+            _ => Self::Or(children(rng)),
+        }
+    }
+
+    fn eval(&self, corpus: &Corpus) -> BTreeSet<usize> {
+        match self {
+            Self::Term(term) => corpus.with_term(term),
+            Self::Not(inner) => corpus
+                .all()
+                .difference(&inner.eval(corpus))
+                .copied()
+                .collect(),
+            Self::And(children) => children
+                .iter()
+                .map(|child| child.eval(corpus))
+                .reduce(|left, right| left.intersection(&right).copied().collect())
+                .unwrap_or_default(),
+            Self::Or(children) => children
+                .iter()
+                .map(|child| child.eval(corpus))
+                .reduce(|left, right| left.union(&right).copied().collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Query text that the documented grammar parses back into `self`, with
+    /// the operator spelling (AND, `&&` or implied; OR or `||`; NOT or `-`)
+    /// and any optional grouping chosen by `rng`.
+    fn render(&self, rng: &mut u64) -> String {
+        match self {
+            Self::Term(term) => (*term).to_string(),
+            Self::Not(inner) => {
+                let operand = inner.render_operand(rng, true);
+                if matches!(**inner, Self::Not(_)) || next_random(rng).is_multiple_of(2) {
+                    format!("NOT {operand}")
+                } else {
+                    format!("-{operand}")
+                }
+            }
+            Self::And(children) => {
+                let separator = [" AND ", " && ", " "][(next_random(rng) % 3) as usize];
+                children
+                    .iter()
+                    .map(|child| child.render_operand(rng, matches!(child, Self::Or(_))))
+                    .collect::<Vec<_>>()
+                    .join(separator)
+            }
+            Self::Or(children) => {
+                let separator = [" OR ", " || "][(next_random(rng) % 2) as usize];
+                children
+                    .iter()
+                    .map(|child| child.render_operand(rng, false))
+                    .collect::<Vec<_>>()
+                    .join(separator)
+            }
+        }
+    }
+
+    /// `self` as an operand: a compound expression is parenthesized when
+    /// precedence requires it, and at random otherwise.
+    fn render_operand(&self, rng: &mut u64, required: bool) -> String {
+        let compound = matches!(self, Self::And(_) | Self::Or(_));
+        let text = self.render(rng);
+        if compound && (required || next_random(rng).is_multiple_of(2)) {
+            format!("({text})")
+        } else {
+            text
+        }
+    }
+}
+
+/// Seeded random expressions over the five terms, in every operator
+/// spelling, with required and redundant grouping and with complements: the
+/// real binary returns exactly the set algebra's answer for each.
+#[test]
+fn generated_boolean_queries_match_set_algebra() -> TestResult {
+    let corpus = corpus();
+    let all = corpus.all();
+    let mut rng = 0x0052_21B0_u64;
+    let mut informative = 0;
+    let mut failures = Vec::new();
+    for case in 0..40 {
+        let expr = Expr::generate(&mut rng, 3);
+        let mut query = expr.render_operand(&mut rng, false);
+        // A leading `-` would reach the argument parser as a flag.
+        if query.starts_with('-') {
+            query = format!("({query})");
+        }
+        let expected = expr.eval(corpus);
+        if !expected.is_empty() && expected.len() < all.len() {
+            informative += 1;
+        }
+        let got = corpus.search(&query, &[])?;
+        if let Err(err) = assert_same(&format!("case {case}: {query} = {expr:?}"), &got, &expected)
+        {
+            failures.push(err.to_string());
+        }
+    }
+    assert!(
+        informative >= 20,
+        "too few informative cases: {informative} of 40"
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n").into())
+    }
 }

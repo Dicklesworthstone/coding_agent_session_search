@@ -36,9 +36,9 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 - **Date-filtered search works on a long-lived index again (GH #499).** Every
   `--days`/`--since`/`--until` search failed with `posting cursor invariant
   failed: Boolean children belong to different segment domains` (exit 9) once
-  an incremental run had tombstoned a row in a sealed index segment. The lock
-  now resolves frankensearch-quill 0.3.2, a hotfix of 0.3.1 carrying the
-  engine fix, so no re-index is needed. An engine invariant failure is now also
+  an incremental run had tombstoned a row in a sealed index segment. The
+  engine fix shipped in frankensearch-quill 0.3.2, a hotfix of 0.3.1, and the
+  lock now resolves 0.3.4, which carries it, so no re-index is needed. An engine invariant failure is now also
   reported `retryable: false`, with `cass index --full --force-rebuild` as the
   remedy, instead of inviting endless retries.
 - **Search no longer strands a missing or unusable lexical index on a large
@@ -54,6 +54,24 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   archive the capped value read 11 for a term with 11,915 matches; exact counts
   cost 0.00-0.11 s CPU there
   ([1ca2503e](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/1ca2503e)).
+- **Boolean queries follow the documented grammar.** NOT binds tightest, then
+  AND (explicit, `&&`, or implied between words), then OR (`OR`, `||`), and
+  parentheses group. The engine used to bind OR tighter than AND and read
+  parentheses as part of a word, so `a OR b AND c` meant `(a OR b) AND c`
+  and `(a AND x) OR b` returned nothing. The lock resolves
+  frankensearch-quill 0.3.4, which carries the grammar; the SQLite fallback
+  lanes apply the same grammar. `(` groups only at the start of a word, so
+  `foo(bar)` stays one term, and an unclosed `(` closes at the end of the
+  query. `--explain` and `--dry-run` show the grouping searched in
+  `parsed.structure` and warn when parentheses were recovered.
+- **`(a OR b) AND c` no longer misses results after an index merge.** On an
+  index that `cass index` had merged (every staged rebuild and most long-lived
+  archives), a disjunction under a conjunction could silently drop matches:
+  the engine's union answered a skip request from exhausted children
+  instead of its buffer. Under the old grammar every mixed query such as
+  `auth OR login error` took this shape. frankensearch-quill 0.3.4 fixes it;
+  the metamorphic search oracle (tests/search_metamorphic.rs) found it, and a
+  layout-sweep engine test pins it.
 
 ### Performance
 
