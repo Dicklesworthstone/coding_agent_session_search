@@ -1590,9 +1590,14 @@ fn expand_requires_path_and_line() {
 fn expand_help_shows_options() {
     let mut cmd = simple_cmd();
     cmd.args(["expand", "--help"]);
+    // Since #493 (aa5d5068) expand is described by its two coordinate systems
+    // instead of "messages around": a hit's canonical ordinal or a raw line.
     cmd.assert()
         .success()
-        .stdout(contains("messages around"))
+        .stdout(contains(
+            "Expand a search hit with --message-index, or inspect raw JSONL with --line",
+        ))
+        .stdout(contains("--message-index"))
         .stdout(contains("--line"))
         .stdout(contains("--context"))
         .stdout(contains("--json"));

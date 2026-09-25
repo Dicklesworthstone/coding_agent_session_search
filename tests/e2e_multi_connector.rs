@@ -483,10 +483,15 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
                 let view = command(home, &data, &root, streaming)
                     .args(["view"])
                     .arg(&path)
+                    // A search hit's line_number is the canonical message
+                    // ordinal; since #493 (5173f7db) follow-ups name it with
+                    // --message-index, and --line is only a physical JSONL line.
                     .args([
+                        "--source",
+                        hits[0]["source_id"].as_str().unwrap(),
                         "--conversation-id",
                         &conversation_id.to_string(),
-                        "--line",
+                        "--message-index",
                         &hits[0]["line_number"].as_u64().unwrap().to_string(),
                         "--json",
                     ])

@@ -263,9 +263,19 @@ fn missing_and_corrupt_sidecars_fall_back_without_rewriting_artifacts() -> TestR
             .search_with_ann(1, None, full_width())?;
         assert_eq!(ids(&batch), [1]);
         assert_eq!(batch.score_kind(), SemanticScoreKind::Exact);
+        // A missing receipt makes the sidecar pair unavailable. A corrupted
+        // graph whose byte length no longer equals the receipt's declared
+        // length is refused by the metadata preflight before any graph bytes
+        // are read (a27f5456), and names that disagreement.
+        let expected_reason = if missing_receipt {
+            AnnFallbackReason::SidecarUnavailable
+        } else {
+            AnnFallbackReason::ReceiptMismatch
+        };
         assert_eq!(
             batch.execution()[0].fallback_reason,
-            Some(AnnFallbackReason::SidecarUnavailable)
+            Some(expected_reason),
+            "missing_receipt={missing_receipt}"
         );
         assert_eq!(fs::read(&path)?, graph_before);
         assert_eq!(fs::metadata(&path)?.modified()?, modified_before);

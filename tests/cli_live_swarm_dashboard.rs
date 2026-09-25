@@ -72,8 +72,8 @@ impl Fixture {
             .env("CASS_DATA_DIR", &self.data)
             .env("CASS_AUTO_REFRESH", "0")
             .env("CASS_SEMANTIC_ENABLED", "0")
-            .args(["--data-dir"])
-            .arg(&self.data)
+            // `--data-dir` is not a global flag (swarm commands take the data
+            // dir from CASS_DATA_DIR above; see 0bef5fa7 for the sibling harness).
             .args(["swarm", "dashboard"])
             .args(args)
             .output()?;

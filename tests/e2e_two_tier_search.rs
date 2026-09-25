@@ -358,13 +358,38 @@ fn two_tier_progressive_search_correctness() {
                 "initial results should be sorted by descending score"
             );
 
+            // Since 2d203d55 the initial page is the first k of the bounded
+            // fast candidate pool (max(k, max_refinement_docs)), ordered by
+            // score and then by message identity. A direct k=5 fast search can
+            // cut equal-score ties differently, so compare with the pool.
             let fast_query = fast_embedder.embed_sync(query).expect("embed fast query");
-            let expected_initial = index.search_fast(&fast_query, 5);
+            let pool_limit = config.max_refinement_docs.max(5).min(index.len());
+            let pool = index.search_fast(&fast_query, pool_limit);
             let actual_ids: Vec<usize> = results.iter().map(|r| r.idx).collect();
-            let expected_ids: Vec<usize> = expected_initial.iter().map(|r| r.idx).collect();
+            let expected_ids: Vec<usize> = pool.iter().take(5).map(|r| r.idx).collect();
             assert_eq!(
                 actual_ids, expected_ids,
-                "initial phase should mirror direct fast-tier search"
+                "initial phase should be the head of the fast candidate pool; initial={results:?} pool={pool:?}"
+            );
+            assert!(
+                results.windows(2).all(|pair| pair[0].score > pair[1].score
+                    || (pair[0].score == pair[1].score
+                        && (pair[0].message_id, pair[0].idx) < (pair[1].message_id, pair[1].idx))),
+                "equal-score initial results must be ordered by message identity: {results:?}"
+            );
+            // Every scored document the direct k=5 search returns above the
+            // tie boundary must still lead the initial page.
+            let direct = index.search_fast(&fast_query, 5);
+            let boundary = direct.last().map_or(f32::NEG_INFINITY, |r| r.score);
+            let direct_above: Vec<usize> = direct
+                .iter()
+                .filter(|r| r.score > boundary)
+                .map(|r| r.idx)
+                .collect();
+            assert_eq!(
+                &actual_ids[..direct_above.len()],
+                direct_above.as_slice(),
+                "strictly better fast hits must not be displaced by ties: initial={results:?} direct={direct:?}"
             );
         }
         other => panic!("expected Initial phase, got {:?}", other),
@@ -389,26 +414,33 @@ fn two_tier_progressive_search_correctness() {
                 "refined results should be sorted by descending score"
             );
 
+            // Since 2d203d55 quality candidates are retrieved independently
+            // across the whole index (so a document the fast tier missed can
+            // still be recovered) and fused with the fast pool by weighted
+            // reciprocal rank. With quality_weight = 1.0 the fast ranks carry
+            // no weight, so the refined page is exactly the head of the
+            // independent quality ranking.
             let quality_query = quality_embedder
                 .embed_sync(query)
                 .expect("embed quality query");
-            let fast_query = fast_embedder.embed_sync(query).expect("embed fast query");
-            let fast_candidates = index.search_fast(&fast_query, 5);
-            let candidate_indices: Vec<usize> = fast_candidates.iter().map(|r| r.idx).collect();
-            let quality_scores =
-                index.quality_scores_for_indices(&quality_query, &candidate_indices);
-            let mut expected_pairs: Vec<(usize, f32)> =
-                candidate_indices.into_iter().zip(quality_scores).collect();
-            expected_pairs.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
+            let quality_limit = config.max_refinement_docs.min(index.len());
+            let quality_ranked = index.search_quality(&quality_query, quality_limit);
             let actual_ids: Vec<usize> = results.iter().map(|r| r.idx).collect();
-            let expected_ids: Vec<usize> = expected_pairs.into_iter().map(|(idx, _)| idx).collect();
+            let expected_ids: Vec<usize> = quality_ranked.iter().take(5).map(|r| r.idx).collect();
             assert_eq!(
                 actual_ids, expected_ids,
-                "with full quality weight, refined phase should rerank the fast candidate set by quality score"
+                "with full quality weight, the refined page is the head of the independent quality ranking; refined={results:?} quality={quality_ranked:?}"
+            );
+            let fast_query = fast_embedder.embed_sync(query).expect("embed fast query");
+            let fast_top: Vec<usize> = index
+                .search_fast(&fast_query, 5)
+                .iter()
+                .map(|r| r.idx)
+                .collect();
+            assert!(
+                actual_ids.iter().any(|idx| !fast_top.contains(idx)),
+                "this fixture's refined page must recover a document outside the fast top-5 \
+                 (independent quality retrieval): refined={actual_ids:?} fast={fast_top:?}"
             );
         }
         SearchPhase::RefinementFailed { error } => {
