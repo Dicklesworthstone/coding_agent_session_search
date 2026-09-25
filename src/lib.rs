@@ -45012,7 +45012,7 @@ fn build_doctor_full_rebuild_readiness(
     }
     if projection.rebuild_staging_bytes > 0 {
         notes.push(format!(
-            "{} bytes of an interrupted or failed rebuild's staged generation sit under index/ (the .rebuild-staging directory) and are not doubled: the next `cass index --full` resumes into them or clears them before starting over.",
+            "{} bytes of an interrupted or failed rebuild's staged generation sit under index/ (the .rebuild-staging directory) and are subtracted from the requirement: the next `cass index --full` resumes into them or clears them before starting over, so that space comes back to the rebuild.",
             projection.rebuild_staging_bytes
         ));
     }
@@ -103033,7 +103033,10 @@ mod response_schema_tests {
             .find(|note| note.contains(".rebuild-staging"))
             .expect("rebuild-staging note (GH #496)");
         assert!(staging_note.contains("32000000000 bytes"), "{staging_note}");
-        assert!(staging_note.contains("not doubled"), "{staging_note}");
+        assert!(
+            staging_note.contains("subtracted from the requirement"),
+            "{staging_note}"
+        );
         assert!(
             blocked
                 .notes

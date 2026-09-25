@@ -21101,7 +21101,7 @@ fn required_index_headroom_bytes(
 /// `lexical_index_bytes` is the LIVE lexical footprint (see
 /// [`LexicalIndexFootprint::live_bytes`]).
 pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
-    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)";
+    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)";
 
 /// The inputs and result of the full-rebuild headroom rule, so `doctor` can
 /// report the same requirement `index --full` / `--force-rebuild` enforces.
@@ -21130,8 +21130,9 @@ pub(crate) struct FullRebuildHeadroomProjection {
     pub(crate) retained_backup_bytes: u64,
     /// A previous rebuild's staged scratch generation
     /// ([`LexicalIndexFootprint::rebuild_staging_bytes`]). The next rebuild
-    /// resumes into it or clears it first; excluded from `required_bytes`
-    /// (GH #496: doubling it locked a failed large rebuild out of its retry).
+    /// resumes into it or clears it first, so those bytes are already paid
+    /// for: they are subtracted from `required_bytes` (GH #496: doubling them
+    /// locked a failed large rebuild out of its retry; GH #498 left 32 GB).
     pub(crate) rebuild_staging_bytes: u64,
 }
 
@@ -21163,9 +21164,15 @@ pub(crate) fn full_rebuild_headroom_projection(
 ) -> FullRebuildHeadroomProjection {
     let db_bundle_bytes = database_bundle_size_bytes(db_path);
     let footprint = lexical_index_footprint(data_dir);
+    // A leftover staged generation occupies disk the rebuild gets back: a
+    // resume continues writing into it, and a from-zero restart clears it
+    // before writing. Either way the new generation's bytes already on disk
+    // (or about to be freed) are not needed a second time, so they are
+    // credited against the requirement rather than merely left out of it.
     let projected = db_bundle_bytes
         .saturating_mul(2)
-        .saturating_add(footprint.live_bytes.saturating_mul(2));
+        .saturating_add(footprint.live_bytes.saturating_mul(2))
+        .saturating_sub(footprint.rebuild_staging_bytes);
     FullRebuildHeadroomProjection {
         required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
         floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
@@ -52345,12 +52352,13 @@ mod tests {
         );
     }
 
-    /// GH #496: a failed or interrupted rebuild's staged generation is
-    /// reported but not doubled into the requirement. The next rebuild
-    /// resumes into it or clears it first; doubling it locked a large archive
-    /// out of the retry (13.4 GB archive: 67.8 GB required, 64.7 GB free).
+    /// GH #496 / #498: a failed or interrupted rebuild's staged generation
+    /// is reported and credited against the requirement. The next rebuild
+    /// resumes into it or clears it first, so its bytes come back; doubling
+    /// it locked a large archive out of the retry (13.4 GB archive: 67.8 GB
+    /// required, 64.7 GB free, 32 GB of it the #498 leftover).
     #[test]
-    fn full_rebuild_headroom_does_not_double_a_leftover_rebuild_staging_generation() {
+    fn full_rebuild_headroom_credits_a_leftover_rebuild_staging_generation() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let db_path = data_dir.join("agent_search.db");
@@ -52391,14 +52399,27 @@ mod tests {
 
         let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
         assert_eq!(projection.rebuild_staging_bytes, staged);
-        assert_eq!(
-            projection.required_bytes, projection_before.required_bytes,
-            "a leftover staged generation must not raise the requirement"
-        );
+        // db(300 MiB)*2 clears the 512 MiB floor even after the 96 MiB credit,
+        // so the requirement is exactly 2*db + 2*live - staging.
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + after.live_bytes * 2
+            projection.db_bundle_bytes * 2 + after.live_bytes * 2 - staged
         );
+        assert_eq!(
+            projection.required_bytes + staged,
+            projection_before.required_bytes,
+            "the staged bytes are credited one-for-one against the requirement"
+        );
+
+        // The credit never takes the requirement below the absolute floor.
+        let huge = staging.join("seg-00000000000001ff.fslx");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 * 1024)
+            .unwrap();
+        let floored = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert!(floored.rebuild_staging_bytes > floored.db_bundle_bytes * 2);
+        assert_eq!(floored.required_bytes, INDEX_MIN_FREE_SPACE_BYTES);
     }
 
     /// An unreadable MANIFEST must make the walk conservative: every byte in
