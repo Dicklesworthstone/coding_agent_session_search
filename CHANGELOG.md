@@ -16,8 +16,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 ---
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
-binary release, through the 2026-09-10 v0.8.0 binary release and the unreleased
-2026-09-16 follow-ups. Earlier version entries retain their existing scope.
+binary release, through the 2026-09-10 v0.8.0 binary release and the
+2026-09-25 v0.9.0 binary release. Earlier version entries retain their existing scope.
 Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
@@ -25,14 +25,89 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
-| v0.9.0 | not yet released | Cargo.toml is at 0.9.0; no v0.9.0 tag or GitHub Release exists yet. Planned scope: sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages |
+| [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-25 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64. Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages, large-archive index and FTS repair fixes |
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
-## [Unreleased]
+## [v0.9.0] -- 2026-09-25
+
+Cargo.toml moved to 0.9.0 on 2026-09-18; the release was cut on 2026-09-25.
+This section lists what landed after that version bump; the section below it
+covers the work up to the bump.
+
+### Known open at release
+
+These tests were red in at least one release-candidate full-suite run and ship
+knowingly. None covers a fix in this release; Beads ids name where each is
+tracked.
+
+- Deterministic in every run: `ann_shards::wal_tests` (3 tests) and
+  `semantic::unchanged::...tombstoned_vector_image` (FSVI v2 / native ANN
+  contract under older fixtures, 962e8),
+  `message_topk_integration::wal_exact_large_requests_...` (nohx1), and
+  `sources::probe::...share_deadline...` (an optional-command deadline
+  assertion in the remote-source probe script; not yet filed).
+- `watch_notification_backlog_overflow_...` and
+  `gh473_preflight::writer_preflight_contention_regression` (fqt9s): red in
+  earlier runs; the watch test's negative control was reworked on
+  2026-09-25 (41af9387).
+- Run-to-run flakes under host load, each passing when re-run alone:
+  `gh477_readonly_openers_recover_only_derived_wal_index` (vpsls),
+  `search_service::admission::exact_slot_count_...`,
+  `semantic::artifacts::checkpoint_tests::restoring_checkpoint_...`,
+  `storage::sqlite::tests::insert_conversations_batched_flushes_large_fts_batches`,
+  `search_service::canonical::tests::canonical_batch_...`,
+  `regression_behavioral::aider_detect_must_not_scan_recursively` and
+  `agent_detection_completeness::devin_file_override_watch_...` (index-busy
+  race; 2 of 3 isolated re-runs passed).
+
+### Changed (contract)
+
+- An explicit `--mode semantic` search whose remaining robot budget cannot
+  admit semantic setup or dispatch fails with exit 10, kind `timeout`,
+  retryable, instead of exiting 0 with an empty semantic envelope. Lexical
+  hits are never substituted. Hybrid searches still demote to lexical with
+  `semantic_budget_limited` ([c3ac835a](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/c3ac835a)).
+- `cass archive` errors have distinct exit codes and kinds: 2 usage,
+  5 integrity, 7 busy (retryable), 14 I/O (retryable), 9 other. Every archive
+  error used to exit 2 ([0c2cab13](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/0c2cab13)).
+- `cass view` / `expand` follow a search hit with `--message-index` (the
+  hit's `line_number`, a canonical message ordinal); `--line` addresses only
+  a physical JSONL line and no longer substitutes archived content. Payloads
+  name `coordinate_space` and `content_source`, and `cass introspect`
+  describes them (#493, [5173f7db](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5173f7db), [73995e20](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/73995e20)).
+- An index run that could not read a source (for example a rollout with no
+  parseable record) keeps what it committed but exits 9, retryable, naming the
+  incomplete scan ([80b68f76](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/80b68f76)).
 
 ### Fixed
 
+- **`cass index --full` on multi-million-document archives no longer fails at
+  `checkpoint_after_fold`** with "posting validation limit exceeded"; every
+  lexical fold stays within the per-term posting limit
+  (#498, [da06837c](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/da06837c)).
+- **The full-rebuild disk check no longer locks a failed large rebuild out of
+  its retry.** A failed rebuild's leftover `.rebuild-staging` generation is no
+  longer doubled (#496, [149ee210](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/149ee210)) and is now credited against
+  the requirement, since the next rebuild resumes into it or clears it first:
+  `max(512 MiB, 2*db + 2*lexical - staging)` ([060807c5](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/060807c5)).
+- **`cass doctor --rebuild-canonical-fts --yes` settles an oversized FTS
+  shadow.** Retiring it is reported as a completed repair (exit 0, not 13),
+  an already retired archive is not rewritten, the interrupted-artifact
+  cleanup is named, and the repair-pending marker is cleared after a verified
+  rebuild so `cass status` stops reporting a pending repair
+  (#495, #497, [89e053f3](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/89e053f3), [71b72ed2](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/71b72ed2)).
+- **macOS: a wedged `footprint(1)` can no longer stall indexing.** Every OS
+  telemetry probe (`footprint`, `ps`, `sysctl`, `vm_stat`, `ioreg`) now has a
+  3 s deadline, after which it is killed and treated as unavailable; a
+  footprint timeout switches process memory to the `ps` fallback for the rest
+  of the run. Before, `cass index` sat at 0% CPU until the stall watchdog
+  aborted it (exit 70) ([8c9ba0b0](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8c9ba0b0)).
+- **GitHub Copilot Chat history kept only in VS Code's native stores is
+  indexed.** Detection now also recognises `workspaceStorage/*/chatSessions`,
+  the empty-window and transferred session stores and legacy `state.vscdb`
+  sessions; before, the connector was never run for such users
+  ([cc16f0aa](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/cc16f0aa)).
 - **Robot semantic and hybrid searches set up semantics once, inside their
   budget.** The bounded setup worker ran, and then the same setup ran again
   on the main thread: the cost was paid twice, the second time outside the
@@ -119,9 +194,9 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   with one bounded merge every few minutes. On a clone of a real archive the
   same catch-up added 5.71M messages in 1 h 50 min instead of 1.76M in 5 h 12 min.
 
-## [v0.9.0] -- not yet released (Cargo.toml version; no tag or GitHub Release yet)
+### Through the 2026-09-18 version bump
 
-### Added
+#### Added
 
 - **Sharded native ANN semantic search.** Semantic retrieval is now served from
   an immutable, owner-backed sharded reader. Complete ordered shard cohorts are
@@ -163,7 +238,7 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   generated remote-sync sources. Grok Bot keeps its own provider identity
   and native message IDs (#415, #447).
 
-### Fixed
+#### Fixed
 
 - Incremental lexical merges combine similarly sized segments, avoiding repeated
   rewrites of a large segment for each small append while preserving merge caps (#479).
