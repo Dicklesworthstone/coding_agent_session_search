@@ -38559,6 +38559,32 @@
         "archive_only": {
           "type": "boolean"
         },
+        "coordinate_space": {
+          "type": "string",
+          "enum": [
+            "file_line",
+            "message_index"
+          ]
+        },
+        "content_source": {
+          "type": "string",
+          "enum": [
+            "file",
+            "archive"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "integer"
+        },
+        "target_message_index": {
+          "type": "integer"
+        },
+        "total_messages": {
+          "type": "integer"
+        },
         "budget": {
           "type": "object",
           "properties": {
@@ -38596,8 +38622,46 @@
               "number": {
                 "type": "integer"
               },
+              "file_line": {
+                "type": "integer"
+              },
+              "message_index": {
+                "type": "integer"
+              },
+              "coordinate_space": {
+                "type": "string",
+                "enum": [
+                  "file_line",
+                  "message_index"
+                ]
+              },
+              "content_source": {
+                "type": "string",
+                "enum": [
+                  "file",
+                  "archive"
+                ]
+              },
+              "message_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "conversation_id": {
+                "type": "integer"
+              },
+              "source_id": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string"
+              },
               "content": {
                 "type": "string"
+              },
+              "is_target": {
+                "type": "boolean"
               },
               "highlighted": {
                 "type": "boolean"

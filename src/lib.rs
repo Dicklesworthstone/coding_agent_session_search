@@ -101097,6 +101097,16 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 // source file is gone/stale and content came from the archive.
                 "source_exists": { "type": "boolean" },
                 "archive_only": { "type": "boolean" },
+                // #493 (5173f7db, aa5d5068): every view names the coordinate
+                // system it was addressed in and where its text came from.
+                // `--line` reads the physical file; `--message-index` reads
+                // the canonical archive message ordinal.
+                "coordinate_space": { "type": "string", "enum": ["file_line", "message_index"] },
+                "content_source": { "type": "string", "enum": ["file", "archive"] },
+                "source_id": { "type": "string" },
+                "conversation_id": { "type": "integer" },
+                "target_message_index": { "type": "integer" },
+                "total_messages": { "type": "integer" },
                 "budget": response_schema_budget_block(),
                 "lines": {
                     "type": "array",
@@ -101105,7 +101115,16 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                         "properties": {
                             "line": { "type": "integer" },
                             "number": { "type": "integer" },
+                            "file_line": { "type": "integer" },
+                            "message_index": { "type": "integer" },
+                            "coordinate_space": { "type": "string", "enum": ["file_line", "message_index"] },
+                            "content_source": { "type": "string", "enum": ["file", "archive"] },
+                            "message_id": { "type": ["integer", "null"] },
+                            "conversation_id": { "type": "integer" },
+                            "source_id": { "type": "string" },
+                            "role": { "type": "string" },
                             "content": { "type": "string" },
+                            "is_target": { "type": "boolean" },
                             "highlighted": { "type": "boolean" }
                         }
                     }
