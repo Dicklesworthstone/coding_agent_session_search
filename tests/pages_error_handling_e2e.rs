@@ -900,7 +900,7 @@ fn browser_lock_terminates_in_flight_crypto_before_reinitializing() {
         .expect("successful unlock should remain a bounded helper")
         .0;
     let clear_password_offset = unlock_success_body
-        .find("elements.passwordInput.value = '';")
+        .find("elements.passwordInput.value = \"\";")
         .expect("a successful unlock must erase the password input");
     let persist_session_offset = unlock_success_body
         .find("persistSession(data.dek);")
