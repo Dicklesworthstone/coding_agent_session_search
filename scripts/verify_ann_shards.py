@@ -13,12 +13,22 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 
 def once(text: str, old: str, new: str) -> str:
     if text.count(old) != 1:
         raise ValueError(f"Expected one extraction anchor: {old!r}")
     return text.replace(old, new, 1)
+
+
+def locked_version(root: Path, name: str) -> str:
+    """The version CASS's own lockfile resolves, so the harness links the same crate."""
+    lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+    versions = {package["version"] for package in lock["package"] if package["name"] == name}
+    if len(versions) != 1:
+        raise ValueError(f"Expected one locked {name} version, got {sorted(versions)}")
+    return versions.pop()
 
 
 def mirror_module_tree(module: Path, destination: Path) -> list[Path]:
@@ -79,10 +89,15 @@ def main() -> None:
         "mod search { #[path = " + json.dumps(str(reporting))
         + "] pub mod ann_index;\npub mod vector_index {\n" + directory + "\n",
     )
+    # ann_index.rs imports `frankensearch::index` at module scope, where a
+    # crate-root alias module is not in scope. Link the real upstream facade
+    # (see the manifest below) instead, so every `frankensearch::` path
+    # resolves exactly as it does in CASS.
     source = once(
         source,
-        "mod frankensearch { pub mod core {",
-        "mod frankensearch { pub mod index { pub use frankensearch_index::*; } pub mod core {",
+        "// Namespace aliases point at the real upstream trait, not a fixture trait.\n"
+        "mod frankensearch { pub mod core { pub use frankensearch_core::filter; } }\n",
+        "",
     )
     source = once(
         source,
@@ -113,9 +128,15 @@ def main() -> None:
         line for line in manifest.splitlines()
         if line.startswith("frankensearch-index =")
     )
+    facade = (
+        "frankensearch = { path = " + json.dumps(str(upstream / "frankensearch"))
+        + ', default-features = false, features = ["ann"] }'
+    )
     manifest = once(
         manifest, old,
-        old.replace("default-features = false", 'default-features = false, features = ["ann"]'),
+        old.replace("default-features = false", 'default-features = false, features = ["ann"]')
+        + "\n" + facade
+        + f'\nwalkdir = "={locked_version(root, "walkdir")}"',
     )
     manifest_path.write_text(
         manifest + '\n[dependencies.serde]\nversion = "1"\nfeatures = ["derive"]\n'
