@@ -2062,6 +2062,20 @@ pub(crate) fn validate_fts_messages_integrity_for_async_connection(
 /// operations"), so the surgery shells to the `sqlite3` CLI — the same
 /// production pattern `scrub_staged_derived_fts_metadata_via_sqlite3` uses
 /// for staged-seed sqlite_master repair.
+/// Error for a failed launch of the external `sqlite3` CLI. A host without it
+/// (Windows by default, minimal containers) used to see only "No such file or
+/// directory"; say which tool is missing and what needed it (2l1b0.65).
+fn sqlite3_cli_launch_error(error: std::io::Error, action: &str) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!(
+            "{action} needs the sqlite3 command-line tool, which is not installed or not on \
+             PATH; install sqlite3 and retry"
+        )
+    } else {
+        anyhow::Error::new(error).context(format!("launching sqlite3 for {action}"))
+    }
+}
+
 pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> Result<()> {
     let dedupe_sql = "PRAGMA writable_schema = ON;
          DELETE FROM sqlite_master
@@ -2079,10 +2093,13 @@ pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> 
         if disable_defensive {
             command.arg(".dbconfig defensive off");
         }
-        command.arg(dedupe_sql).output().with_context(|| {
-            format!(
-                "running sqlite3 duplicate fts schema-row repair for {}",
-                db_path.display()
+        command.arg(dedupe_sql).output().map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "the duplicate fts schema-row repair of {}",
+                    db_path.display()
+                ),
             )
         })
     };
@@ -3215,10 +3232,13 @@ fn recover_historical_bundle_via_sqlite3(
         .arg(".recover")
         .stdout(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
-                "launching sqlite3 .recover for historical bundle {}",
-                bundle.root_path.display()
+        .map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "recovering historical bundle {}",
+                    bundle.root_path.display()
+                ),
             )
         })?;
     let recover_stdout = recover
@@ -3230,10 +3250,10 @@ fn recover_historical_bundle_via_sqlite3(
         .arg(&recovered_db)
         .stdin(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
-                "launching sqlite3 importer for recovered bundle {}",
-                recovered_db.display()
+        .map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!("importing recovered bundle {}", recovered_db.display()),
             )
         })?;
 
@@ -3408,10 +3428,13 @@ fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Resul
         if disable_defensive {
             command.arg(".dbconfig defensive off");
         }
-        command.arg(scrub_sql).output().with_context(|| {
-            format!(
-                "running sqlite3 staged FTS metadata scrub for {}",
-                staged_db_path.display()
+        command.arg(scrub_sql).output().map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "the staged FTS metadata scrub of {}",
+                    staged_db_path.display()
+                ),
             )
         })
     };
@@ -23279,6 +23302,31 @@ mod tests {
             eprintln!("SKIPPED {test}: the sqlite3 CLI is not installed on this host");
         }
         available
+    }
+
+    #[test]
+    fn sqlite3_cli_launch_error_names_the_missing_tool() {
+        let missing = sqlite3_cli_launch_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            "recovering historical bundle /tmp/x",
+        );
+        let message = format!("{missing:#}");
+        assert!(
+            message.contains("needs the sqlite3 command-line tool")
+                && message.contains("recovering historical bundle /tmp/x"),
+            "{message}"
+        );
+
+        let denied = sqlite3_cli_launch_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            "importing recovered bundle /tmp/y",
+        );
+        let message = format!("{denied:#}");
+        assert!(
+            message.contains("launching sqlite3 for importing recovered bundle /tmp/y")
+                && !message.contains("not installed"),
+            "{message}"
+        );
     }
 
     struct EnvGuard {

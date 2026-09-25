@@ -32668,6 +32668,40 @@ fn run_cli_search(
         None
     };
 
+    // uojcg.7.1: explain an empty search filtered to one workspace. The probes
+    // run only on that empty path, inside the remaining robot budget.
+    let zero_result_diagnosis = if display_result.hits.is_empty()
+        && filters.workspaces.len() == 1
+        && !skipped_sections.iter().any(|section| section == "search")
+    {
+        let probe_client = Arc::clone(&client);
+        let probe_query = query.to_string();
+        let probe_filters = filters.clone();
+        let probe_db_path = db_path.clone();
+        let probe =
+            move || -> CliResult<Option<crate::search::zero_result_diagnosis::ZeroResultReport>> {
+                Ok(diagnose_empty_workspace_search(
+                    &probe_client,
+                    &probe_query,
+                    &probe_filters,
+                    field_mask,
+                    &probe_db_path,
+                ))
+            };
+        match search_budget.as_ref() {
+            Some(budget) if budget.is_healthy() => {
+                run_read_only_search_worker(budget.remaining_ms(), probe)
+                    .ok()
+                    .flatten()
+                    .flatten()
+            }
+            Some(_) => None,
+            None => probe().ok().flatten(),
+        }
+    } else {
+        None
+    };
+
     // Bead v6vuz: captured before the output chain because `warning` and
     // `effective_robot` are conditionally moved into the robot branch below.
     let is_human_search = effective_robot.is_none();
@@ -32807,6 +32841,7 @@ fn run_cli_search(
             rerank_ms,
             sessions_filter_stats,
             effective,
+            zero_result_diagnosis.as_ref(),
         )?;
     } else if display_result.hits.is_empty() {
         // GH#414: when the --sessions-from filter provably selected zero
@@ -32824,6 +32859,27 @@ fn run_cli_search(
             );
         } else {
             eprintln!("No results found.");
+        }
+        if let Some(report) = &zero_result_diagnosis {
+            use crate::search::zero_result_diagnosis::ZeroResultDiagnosis;
+            let note = match report.diagnosis {
+                ZeroResultDiagnosis::WorkspaceFilterLikelyWrong => {
+                    "The --workspace filter matches no indexed workspace exactly, but a close one exists."
+                }
+                ZeroResultDiagnosis::WorkspaceNotIndexed => {
+                    "The --workspace filter matches no indexed workspace, and the query has hits elsewhere."
+                }
+                ZeroResultDiagnosis::WorkspaceHasNoMatch => {
+                    "The workspace is indexed; the query has hits in other workspaces but not in this one."
+                }
+                ZeroResultDiagnosis::SourceIdFilter | ZeroResultDiagnosis::GenuineNoMatch => "",
+            };
+            if !note.is_empty() {
+                eprintln!("{note}");
+            }
+            if let Some(rerun) = &report.suggested_rerun {
+                eprintln!("Hint: {rerun}");
+            }
         }
     } else if let Some(display) = display_format {
         // Human-readable display formats
@@ -35834,6 +35890,8 @@ fn output_robot_results(
     sessions_filter: Option<SessionsFilterStats>,
     // 2l1b0.68: `_meta.effective`, from `search_effective_interpretation`.
     effective: serde_json::Value,
+    // uojcg.7.1: present iff an empty search was filtered to one workspace.
+    zero_result_diagnosis: Option<&crate::search::zero_result_diagnosis::ZeroResultReport>,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -36373,6 +36431,16 @@ fn output_robot_results(
                 }
             }
 
+            // uojcg.7.1: why an empty, workspace-filtered search is empty.
+            if let (Some(report), serde_json::Value::Object(map)) =
+                (zero_result_diagnosis, &mut payload)
+            {
+                map.insert(
+                    "zero_result_diagnosis".to_string(),
+                    serde_json::to_value(report).unwrap_or_default(),
+                );
+            }
+
             // Add suggestions if present. When the --sessions-from filter
             // provably matched zero indexed sessions, the query is
             // demonstrably not the cause of an empty result, so the
@@ -36747,6 +36815,16 @@ fn output_robot_results(
                 }
             }
 
+            // uojcg.7.1: why an empty, workspace-filtered search is empty.
+            if let (Some(report), serde_json::Value::Object(map)) =
+                (zero_result_diagnosis, &mut payload)
+            {
+                map.insert(
+                    "zero_result_diagnosis".to_string(),
+                    serde_json::to_value(report).unwrap_or_default(),
+                );
+            }
+
             // Add suggestions if present. When the --sessions-from filter
             // provably matched zero indexed sessions, the query is
             // demonstrably not the cause of an empty result, so the
@@ -36918,6 +36996,16 @@ fn output_robot_results(
                         ),
                     );
                 }
+            }
+
+            // uojcg.7.1: why an empty, workspace-filtered search is empty.
+            if let (Some(report), serde_json::Value::Object(map)) =
+                (zero_result_diagnosis, &mut payload)
+            {
+                map.insert(
+                    "zero_result_diagnosis".to_string(),
+                    serde_json::to_value(report).unwrap_or_default(),
+                );
             }
 
             // Add suggestions if present. When the --sessions-from filter
@@ -100233,6 +100321,13 @@ fn response_schema_search() -> serde_json::Value {
         ("_meta", response_schema_search_meta()),
         ("suggestions", response_schema_opaque_object_array()),
         (
+            "zero_result_diagnosis",
+            serde_json::json!({
+                "type": ["object", "null"],
+                "additionalProperties": true
+            }),
+        ),
+        (
             "explanation",
             serde_json::json!({
                 "type": ["object", "null"],
@@ -108749,6 +108844,62 @@ fn count_indexed_session_paths(
     }
     let _ = conn.close_without_checkpoint_sync();
     complete.then_some(matched)
+}
+
+/// Workspace paths the archive knows about, through the strict read-only
+/// opener. `None` when the database cannot be read quickly.
+fn indexed_workspace_paths(db_path: &Path) -> Option<Vec<String>> {
+    use crate::franken_sync::compat::RowExt;
+    if !db_path.is_file() {
+        return None;
+    }
+    let mut conn =
+        crate::storage::sqlite::open_franken_owner_strict_readonly_connection_with_timeout(
+            db_path,
+            Duration::from_secs(2),
+        )
+        .ok()?;
+    let paths = conn
+        .query_map_collect(
+            "SELECT path FROM workspaces",
+            &[] as &[crate::franken_sync::compat::ParamValue],
+            |row| row.get_typed::<String>(0),
+        )
+        .ok();
+    let _ = conn.close_without_checkpoint_sync();
+    paths
+}
+
+/// uojcg.7.1: a search filtered to one `--workspace` that comes back empty
+/// reads exactly like "nothing matches", so an agent drops a query that a
+/// moved checkout, a `/Users` vs `/home` path, a trailing slash or a case
+/// difference emptied. Check the filter against the indexed workspaces and
+/// probe once without it (lexical, one hit), then say which case this is.
+/// `None` when either probe cannot run; a probe that misses reports a genuine
+/// no-match, never a suggestion.
+fn diagnose_empty_workspace_search(
+    client: &crate::search::query::SearchClient,
+    query: &str,
+    filters: &crate::search::query::SearchFilters,
+    field_mask: crate::search::query::FieldMask,
+    db_path: &Path,
+) -> Option<crate::search::zero_result_diagnosis::ZeroResultReport> {
+    let mut requested = filters.workspaces.iter();
+    let (Some(requested), None) = (requested.next(), requested.next()) else {
+        return None;
+    };
+    let known = indexed_workspace_paths(db_path)?;
+    let mut unfiltered = filters.clone();
+    unfiltered.workspaces.clear();
+    let global_had_hits = !client
+        .search(query, unfiltered, 1, 0, field_mask)
+        .ok()?
+        .is_empty();
+    Some(crate::search::zero_result_diagnosis::diagnose_zero_result(
+        requested,
+        &known,
+        global_had_hits,
+    ))
 }
 
 // ============================================================================

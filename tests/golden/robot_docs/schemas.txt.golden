@@ -3358,6 +3358,7 @@ schemas: (auto-generated from contract)
     - request_id: ?
     - suggestions: array
     - total_matches: integer
+    - zero_result_diagnosis: ?
   selftest:
     - archive_accessed: boolean
     - checks: array
