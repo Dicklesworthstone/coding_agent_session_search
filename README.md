@@ -242,7 +242,8 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
   daemon inference fails. Pass `--daemon` to permit auto-spawning a missing
   daemon in human-mode searches (robot/JSON searches never spawn one, even
   with `--daemon`, because their bounded budget cannot wait for a daemon to
-  start; start `cass daemon` yourself first), or `--no-daemon` to force
+  start; start `cass daemon` yourself first; `_meta.effective.daemon` shows
+  the request and what applied), or `--no-daemon` to force
   direct inference. `--fast-only` stays in
   the deterministic hash-vector space. Each data directory gets a distinct
   default socket and owner-private pinned key; fresh handshake, health,

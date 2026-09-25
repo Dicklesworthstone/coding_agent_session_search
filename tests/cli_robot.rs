@@ -5607,6 +5607,44 @@ fn search_effective_meta(cmd: &mut Command) -> Result<(Value, String), Box<dyn E
     Ok((effective, stderr))
 }
 
+/// 2l1b0.68: a robot search is budgeted and never spawns the warm-model
+/// daemon, so `--daemon` was accepted and silently ignored. `_meta.effective`
+/// now reports the request next to what applied. Negative control: before
+/// this change `_meta.effective.daemon` did not exist.
+#[test]
+fn search_robot_meta_reports_the_daemon_policy() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let daemon_policy = |flag: Option<&str>| -> Result<Value, Box<dyn Error>> {
+        let mut args = vec![
+            "search",
+            "hello",
+            "--json",
+            "--robot-meta",
+            "--limit",
+            "1",
+            "--data-dir",
+            data_dir,
+        ];
+        args.extend(flag);
+        let (effective, _) = search_effective_meta(base_cmd().args(args))?;
+        Ok(effective["daemon"].clone())
+    };
+    assert_eq!(
+        daemon_policy(Some("--daemon"))?,
+        serde_json::json!({"use_existing": true, "auto_spawn_requested": true, "auto_spawn": false}),
+        "--daemon is echoed as requested, and a robot search does not spawn"
+    );
+    assert_eq!(
+        daemon_policy(None)?,
+        serde_json::json!({"use_existing": true, "auto_spawn_requested": false, "auto_spawn": false})
+    );
+    assert_eq!(
+        daemon_policy(Some("--no-daemon"))?,
+        serde_json::json!({"use_existing": false, "auto_spawn_requested": false, "auto_spawn": false})
+    );
+    Ok(())
+}
+
 /// 2l1b0.68: `_meta.effective` echoes what search actually ran. Every
 /// expected value here comes from outside cass: the fixture path, a UTC
 /// epoch computed by hand, and the flags as typed. Negative control: before

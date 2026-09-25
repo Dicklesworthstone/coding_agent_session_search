@@ -57,7 +57,7 @@ schema for every shape below; the lists name the fields agents branch on.
   - `sessions_filter` present with `--sessions-from`; `aggregations` with `--aggregate`; `explanation` with `--explain`; `suggestions` when cass has query suggestions
   - `_meta` (with `--robot-meta`): `elapsed_ms, search_mode, requested_search_mode, mode_defaulted, fallback_tier, fallback_reason, semantic_refinement, refinement_level, semantic_fallback_reason, lexical_degrade_reason, wildcard_fallback, cache_stats, timing, tokens_estimated, max_tokens, request_id, next_cursor, hits_clamped, query_plan, cursor_manifest, explanation_cards, effective, state{index, database}, index_freshness`
   - `_meta` may also carry `search_completeness` (quarantined conversations excluded), `storage_integrity`, `timeout_ms`/`timed_out`/`partial_results` (with `--timeout`), `ann_stats` or `ann_unavailable_reason` (with `--approximate`)
-  - `_meta.effective` echoes how cass interpreted the request: `db_path` and `db_path_source` (`--db`, `env:CASS_DB_PATH`, `--data-dir`, `env:CASS_DATA_DIR`, `env:XDG_DATA_HOME`, or `default`), `time_window{since_ms,since_from,until_ms,until_from}` (the `_from` fields name the flag, such as `--today` or `--days 7`), `filters{agents,workspaces,source,sessions_from_paths}`, and `auto_corrections` (the same notes printed on stderr)
+  - `_meta.effective` echoes how cass interpreted the request: `db_path` and `db_path_source` (`--db`, `env:CASS_DB_PATH`, `--data-dir`, `env:CASS_DATA_DIR`, `env:XDG_DATA_HOME`, or `default`), `time_window{since_ms,since_from,until_ms,until_from}` (the `_from` fields name the flag, such as `--today` or `--days 7`), `filters{agents,workspaces,source,sessions_from_paths}`, `daemon{use_existing,auto_spawn_requested,auto_spawn}` (a robot search uses an already-running warm-model daemon unless `--no-daemon`, and never spawns one: `--daemon` shows as requested with `auto_spawn: false`), and `auto_corrections` (the same notes printed on stderr)
   - `_meta.lexical_degrade_reason` is `query_fuel_exhausted` when a hybrid search dropped its lexical leg because the query hit the per-query work ceiling; otherwise null
   - `_meta.index_freshness.auto_refresh` reports the stale-on-read catch-up: `outcome` is `spawned`, `disabled`, `index_run_active`, `cooldown`, `guard_busy`, `spawn_failed`, `backed_off` or `tripped`, plus `trigger`
   - `_warning` (with `--robot-meta`) present when the index is stale (age/pending sessions)
@@ -202,6 +202,7 @@ cass search "panic" --robot --fields minimal --robot-meta \
 - JSON parsing errors → use `--robot-format compact` to avoid pretty whitespace issues
 
 ## Change log (robot-facing)
+- 2026-09-25: `_meta.effective.daemon`; robot searches configure semantics once, inside their budget, and never spawn the daemon.
 - 2026-09-24: Documented `_meta.effective`, the search `budget` envelope and timeout contract, `index-busy` and background rebuild handoffs, `auto_refresh` outcomes, `lexical_degrade_reason`, and the `sessions`/`toon` robot formats.
 - 2026-04-22: Documented hybrid-default search, lexical self-heal expectations, semantic fail-open metadata, and health/status readiness contract.
 - 0.1.30: `_meta.index_freshness` + `_warning` in search robot output; capabilities limits enforced; cursor/request-id exposed.

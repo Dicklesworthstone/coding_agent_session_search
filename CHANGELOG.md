@@ -33,6 +33,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **Robot semantic and hybrid searches set up semantics once, inside their
+  budget.** The bounded setup worker ran, and then the same setup ran again
+  on the main thread: the cost was paid twice, the second time outside the
+  budget (and again after the worker had timed out), and that path could
+  spawn the warm-model daemon that robot searches must never spawn.
+  Reranking under a budget no longer spawns it either. `_meta.effective.daemon`
+  reports `use_existing`, `auto_spawn_requested` and `auto_spawn`, so
+  `--daemon` on a robot search is visible as requested but not applied.
 - **Date-filtered search works on a long-lived index again (GH #499).** Every
   `--days`/`--since`/`--until` search failed with `posting cursor invariant
   failed: Boolean children belong to different segment domains` (exit 9) once

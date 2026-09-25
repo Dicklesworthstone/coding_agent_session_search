@@ -31271,6 +31271,7 @@ fn run_cli_search(
         &filters,
         sessions_from.as_ref().map(|_| filters.session_paths.len()),
         interpretation,
+        &semantic_opts,
     );
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
@@ -31635,7 +31636,12 @@ fn run_cli_search(
     let setup_budget_snapshot = search_budget.as_ref().map(BudgetSnapshot::capture);
     let budget_action = semantic_budget_action(&mode_meta, setup_budget_snapshot);
     let execute_semantic = match budget_action {
-        SemanticBudgetAction::Execute => semantic_requested,
+        // A budgeted (structured) search already configured semantics on the
+        // bounded worker above, which never spawns a daemon. Repeating the
+        // setup here paid its cost a second time outside the budget, retried
+        // it unbounded after the worker timed out or fell back, and could
+        // spawn the daemon the worker declined to spawn (2l1b0.68).
+        SemanticBudgetAction::Execute => semantic_requested && search_budget.is_none(),
         SemanticBudgetAction::StrictSemanticTimeout => {
             // NearLimit is deliberately a typed timeout here: semantic setup
             // is an indivisible expensive stage, so insufficient remaining
@@ -31656,6 +31662,7 @@ fn run_cli_search(
     };
 
     if execute_semantic {
+        maybe_test_search_worker_delay("CASS_TEST_SEARCH_DIRECT_SEMANTIC_SETUP_SLOW_MS");
         // Use embedder registry for model selection (bd-2mbe).
 
         // Determine which embedder to use
@@ -32183,7 +32190,10 @@ fn run_cli_search(
             #[cfg(unix)]
             {
                 let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
-                let daemon = if semantic_opts.auto_spawn_daemon {
+                // A budgeted (structured) search never spawns a persistent
+                // daemon, for reranking any more than for embedding; it uses
+                // one that is already running (2l1b0.68).
+                let daemon = if semantic_opts.auto_spawn_daemon && search_budget.is_none() {
                     crate::daemon::client::connect_or_spawn_for_embedder(
                         daemon_embedder_id_for_rerank.as_deref().unwrap_or(
                             crate::search::fastembed_embedder::FastEmbedder::embedder_id_static(),
@@ -35716,6 +35726,7 @@ impl SessionsFilterStats {
 /// behind each bound, the filters as parsed, and every argv auto-correction.
 /// The parsed query tree is left to `--explain` until cass's parse matches
 /// the engine's (2l1b0.52); echoing it now would misreport the query.
+#[allow(clippy::too_many_arguments)]
 fn search_effective_interpretation(
     query: &str,
     db_path: &Path,
@@ -35724,6 +35735,7 @@ fn search_effective_interpretation(
     filters: &crate::search::query::SearchFilters,
     sessions_from_paths: Option<usize>,
     interpretation: &InvocationInterpretation,
+    semantic_opts: &SemanticSearchOptions,
 ) -> serde_json::Value {
     let mut agents: Vec<&str> = filters.agents.iter().map(String::as_str).collect();
     agents.sort_unstable();
@@ -35745,6 +35757,14 @@ fn search_effective_interpretation(
             "workspaces": workspaces,
             "source": filters.source_filter.to_string(),
             "sessions_from_paths": sessions_from_paths,
+        },
+        // `--daemon` asks permission to spawn the warm-model daemon. A robot
+        // search is budgeted and never spawns one; it still uses a daemon that
+        // is already running unless `--no-daemon` was given (2l1b0.68).
+        "daemon": {
+            "use_existing": semantic_opts.use_daemon,
+            "auto_spawn_requested": semantic_opts.auto_spawn_daemon,
+            "auto_spawn": false,
         },
         "auto_corrections": interpretation.corrections,
     })
@@ -100000,7 +100020,7 @@ fn response_schema_budget_block() -> serde_json::Value {
 fn response_schema_search_effective() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, and argv auto-corrections.",
+        "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, daemon policy, and argv auto-corrections.",
         "properties": {
             "command": { "type": "string" },
             "query": { "type": "string" },
@@ -100025,6 +100045,15 @@ fn response_schema_search_effective() -> serde_json::Value {
                     "workspaces": { "type": "array", "items": { "type": "string" } },
                     "source": { "type": "string" },
                     "sessions_from_paths": { "type": ["integer", "null"] }
+                }
+            },
+            "daemon": {
+                "type": "object",
+                "description": "Warm-model daemon policy: robot searches use an already-running daemon unless --no-daemon, and never spawn one even with --daemon.",
+                "properties": {
+                    "use_existing": { "type": "boolean" },
+                    "auto_spawn_requested": { "type": "boolean" },
+                    "auto_spawn": { "type": "boolean" }
                 }
             },
             "auto_corrections": { "type": "array", "items": { "type": "string" } }

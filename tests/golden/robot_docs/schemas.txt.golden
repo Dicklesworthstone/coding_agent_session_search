@@ -3257,6 +3257,7 @@ schemas: (auto-generated from contract)
       - effective: object
         - auto_corrections: array
         - command: string
+        - daemon: object
         - db_path: string
         - db_path_source: string
         - filters: object

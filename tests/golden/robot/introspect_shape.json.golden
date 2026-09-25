@@ -60595,6 +60595,46 @@
                                     }
                                   }
                                 },
+                                "daemon": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "use_existing": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "auto_spawn_requested": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "auto_spawn": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
                                 "auto_corrections": {
                                   "type": "object",
                                   "properties": {
