@@ -31594,6 +31594,18 @@
             "wildcard_fallback": {
               "type": "boolean"
             },
+            "wildcard_fallback_skipped": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "index_over_automatic_limit",
+                "automatic_retry_disabled",
+                "long_query_term",
+                null
+              ]
+            },
             "cache_stats": {
               "type": "object",
               "properties": {

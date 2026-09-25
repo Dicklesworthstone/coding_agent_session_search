@@ -27,6 +27,7 @@ fn client(connection: Option<SearchSqliteConnection>) -> SearchClient {
         semantic: Mutex::new(None),
         last_tantivy_total_count: Mutex::new(None),
         last_lexical_degrade_reason: Mutex::new(None),
+        last_wildcard_fallback_skip: Mutex::new(None),
     }
 }
 

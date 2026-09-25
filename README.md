@@ -1766,7 +1766,7 @@ When an exact query's first page returns fewer than 3 results (or fewer than a s
 - `auth` → `*auth*`
 - It runs only on indexes with at most 10,000 documents (`CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS`; `0` disables it), so on a typical real archive it does not run.
 - It skips queries that already use wildcards, boolean operators or phrases, and zero-hit queries containing a token longer than 16 characters.
-- The wildcard results replace the exact ones only when they find more hits; robot mode then reports `_meta.wildcard_fallback: true` (a single boolean; nothing says why a fallback did not run)
+- The wildcard results replace the exact ones only when they find more hits; robot mode then reports `_meta.wildcard_fallback: true`. When a sparse result did not get the retry, `_meta.wildcard_fallback_skipped` says why: `index_over_automatic_limit` (the index is over the document cap), `automatic_retry_disabled` (the cap is `0`) or `long_query_term`; add explicit wildcards to run it anyway
 - TUI shows a "fuzzy" indicator in the status bar
 
 ---

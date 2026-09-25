@@ -3409,11 +3409,29 @@ pub struct SearchClient {
     /// `_meta.lexical_degrade_reason` so an agent can tell "no lexical hits"
     /// from "lexical was skipped because the engine ran out of query fuel".
     last_lexical_degrade_reason: Mutex<Option<&'static str>>,
+    /// Why the most recent `search_with_fallback` did not run the automatic
+    /// `*term*` retry its sparse result would otherwise get (`None` when the
+    /// retry ran or did not apply). Robot metadata surfaces it as
+    /// `_meta.wildcard_fallback_skipped` (2l1b0.68): above 10,000 documents
+    /// the retry used to turn off without a trace.
+    last_wildcard_fallback_skip: Mutex<Option<&'static str>>,
 }
 
 /// `_meta.lexical_degrade_reason` value when Quill's query-fuel ceiling was
 /// hit on the lexical leg of a hybrid search (GH #441).
 pub const LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
+
+/// `_meta.wildcard_fallback_skipped` value when the index holds more documents
+/// than `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS` (default 10,000).
+pub const WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX: &str = "index_over_automatic_limit";
+
+/// `_meta.wildcard_fallback_skipped` value when
+/// `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS=0` turned the retry off.
+pub const WILDCARD_FALLBACK_SKIPPED_DISABLED: &str = "automatic_retry_disabled";
+
+/// `_meta.wildcard_fallback_skipped` value when a zero-hit query has a term
+/// longer than the automatic retry accepts.
+pub const WILDCARD_FALLBACK_SKIPPED_LONG_TERM: &str = "long_query_term";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchClientOptions {
@@ -4573,6 +4591,7 @@ impl SearchClient {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         }))
     }
 
@@ -7292,6 +7311,7 @@ impl SearchClient {
         sparse_threshold: usize,
         field_mask: FieldMask,
     ) -> Result<SearchResult> {
+        self.record_wildcard_fallback_skip(None);
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
@@ -7320,7 +7340,12 @@ impl SearchClient {
         {
             // Either we have enough results, query already has wildcards,
             // query uses boolean/phrases, or query is empty.
-            if is_sparse && !automatic_wildcard_allowed {
+            if is_sparse
+                && !automatic_wildcard_allowed
+                && !query_has_wildcards
+                && !has_boolean_or_phrase
+                && !query.trim().is_empty()
+            {
                 tracing::debug!(
                     query,
                     returned_hits = hits.len(),
@@ -7328,6 +7353,13 @@ impl SearchClient {
                     automatic_wildcard_max_docs = automatic_wildcard_fallback_max_docs(),
                     "skipping automatic wildcard fallback on large index"
                 );
+                self.record_wildcard_fallback_skip(Some(
+                    if automatic_wildcard_fallback_max_docs() == 0 {
+                        WILDCARD_FALLBACK_SKIPPED_DISABLED
+                    } else {
+                        WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX
+                    },
+                ));
             }
             // Generate suggestions only if truly zero hits
             let suggestions = if hits.is_empty() && !query.trim().is_empty() {
@@ -7347,6 +7379,7 @@ impl SearchClient {
         }
 
         if should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(query, hits.len()) {
+            self.record_wildcard_fallback_skip(Some(WILDCARD_FALLBACK_SKIPPED_LONG_TERM));
             let suggestions = if hits.is_empty() {
                 self.generate_suggestions(query, &filters)
             } else {
@@ -10609,6 +10642,25 @@ impl SearchClient {
             .and_then(|slot| *slot)
     }
 
+    fn record_wildcard_fallback_skip(&self, reason: Option<&'static str>) {
+        if let Ok(mut slot) = self.last_wildcard_fallback_skip.lock() {
+            *slot = reason;
+        }
+    }
+
+    /// Why the most recent `search_with_fallback` skipped the automatic
+    /// wildcard retry a sparse result would otherwise get, if it did. See
+    /// [`WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX`],
+    /// [`WILDCARD_FALLBACK_SKIPPED_DISABLED`] and
+    /// [`WILDCARD_FALLBACK_SKIPPED_LONG_TERM`] (2l1b0.68).
+    #[must_use]
+    pub fn wildcard_fallback_skipped_reason(&self) -> Option<&'static str> {
+        self.last_wildcard_fallback_skip
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+    }
+
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, searcher_cache, shortfall, reloads, reload_ms_total) =
             self.metrics.snapshot_all();
@@ -10744,6 +10796,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         }
     }
 
@@ -12140,6 +12193,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
@@ -12913,6 +12967,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
@@ -12965,6 +13020,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -13177,6 +13233,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -13719,6 +13776,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13802,6 +13860,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13890,6 +13949,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13994,6 +14054,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let sqlite_hits = client.search_sqlite_fts5(
@@ -14100,6 +14161,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let guard = client
@@ -14220,6 +14282,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         });
         let worker_count = 4;
         let start = Arc::new(std::sync::Barrier::new(worker_count + 1));
@@ -14508,6 +14571,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let guard = client.sqlite_guard()?;
@@ -14676,6 +14740,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let direct_hits = client.search_sqlite_fts5(
             Path::new(":memory:"),
@@ -14814,6 +14879,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let fallback_key = (
@@ -14949,6 +15015,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -15067,6 +15134,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let local_hits = client.browse_by_date(
@@ -15196,6 +15264,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let remote_hits = client.search(
@@ -15358,6 +15427,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -16110,6 +16180,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -16183,6 +16254,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let contents = |query: &str| -> Result<HashSet<String>> {
             Ok(client
@@ -16290,6 +16362,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -16386,6 +16459,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16830,6 +16904,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16904,6 +16979,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16994,6 +17070,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -17112,6 +17189,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -17199,6 +17277,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -17293,6 +17372,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17377,6 +17457,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17461,6 +17542,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17546,6 +17628,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17669,6 +17752,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -17798,6 +17882,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17861,6 +17946,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17917,6 +18003,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -17959,6 +18046,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/tmp/cass-workspace".into());
@@ -18024,6 +18112,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let filters = SearchFilters::default();
 
@@ -18067,6 +18156,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -18280,6 +18370,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -19648,6 +19739,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -19742,6 +19834,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -19788,6 +19881,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -20864,6 +20958,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -21097,6 +21192,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -21239,6 +21335,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Hit-key tuple: (source_path, line_number) is the stable
@@ -22084,6 +22181,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -22124,6 +22222,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();

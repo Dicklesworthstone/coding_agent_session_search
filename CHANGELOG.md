@@ -31,6 +31,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## [Unreleased]
 
+### Added
+
+- **Robot search says why the automatic wildcard retry did not run.** A
+  sparse lexical result is retried as `*term*`, but only on indexes of at most
+  10,000 documents (`CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS`) and not for
+  zero-hit queries with a token over 16 characters. On a typical archive the
+  retry was therefore skipped with nothing in the output to say so. `--robot-meta`
+  now reports `_meta.wildcard_fallback_skipped`: `index_over_automatic_limit`,
+  `automatic_retry_disabled` (cap `0`) or `long_query_term`, or null when the
+  retry ran or did not apply.
+
 ### Fixed
 
 - **An open TUI keeps searching after the index is rebuilt.** A rebuild

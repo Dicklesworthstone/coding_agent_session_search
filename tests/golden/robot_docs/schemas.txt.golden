@@ -3337,6 +3337,7 @@ schemas: (auto-generated from contract)
         - search_ms: integer
       - tokens_estimated: ?
       - wildcard_fallback: boolean
+      - wildcard_fallback_skipped: ?
     - _timeout: ?
     - _warning: ?
     - aggregations: ?

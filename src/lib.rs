@@ -30789,6 +30789,7 @@ fn execute_search_operation(
         },
     };
     mode_meta.lexical_degrade_reason = client.lexical_degrade_reason();
+    mode_meta.wildcard_fallback_skipped = client.wildcard_fallback_skipped_reason();
     Ok((result, mode_meta))
 }
 
@@ -35184,6 +35185,10 @@ struct SearchModeMeta {
     /// GH #441: set when a hybrid search dropped its lexical leg (for example
     /// `query_fuel_exhausted`) and answered from the semantic leg alone.
     lexical_degrade_reason: Option<&'static str>,
+    /// 2l1b0.68: why a sparse lexical result did not get the automatic
+    /// wildcard retry (`index_over_automatic_limit`, `automatic_retry_disabled`,
+    /// `long_query_term`).
+    wildcard_fallback_skipped: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35315,6 +35320,7 @@ impl SearchModeMeta {
             quality_tier_refined: true,
             semantic_work_completed: true,
             lexical_degrade_reason: None,
+            wildcard_fallback_skipped: None,
         }
     }
 
@@ -36482,6 +36488,7 @@ fn output_robot_results(
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
+                    "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "cache_stats": {
                         "hits": result.cache_stats.cache_hits,
                         "misses": result.cache_stats.cache_miss,
@@ -36638,6 +36645,7 @@ fn output_robot_results(
                         "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                         "wildcard_fallback": result.wildcard_fallback,
+                        "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                         "cache_stats": {
                             "hits": result.cache_stats.cache_hits,
                             "misses": result.cache_stats.cache_miss,
@@ -36865,6 +36873,7 @@ fn output_robot_results(
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
+                    "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
                     "request_id": request_id,
@@ -37048,6 +37057,7 @@ fn output_robot_results(
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
+                    "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
                     "request_id": request_id,
@@ -100218,6 +100228,20 @@ fn response_schema_search_meta() -> serde_json::Value {
         (
             "wildcard_fallback",
             serde_json::json!({ "type": "boolean" }),
+        ),
+        // 2l1b0.68: why a sparse lexical result did not get the automatic
+        // wildcard retry, which used to turn off without a trace.
+        (
+            "wildcard_fallback_skipped",
+            serde_json::json!({
+                "type": ["string", "null"],
+                "enum": [
+                    "index_over_automatic_limit",
+                    "automatic_retry_disabled",
+                    "long_query_term",
+                    null
+                ],
+            }),
         ),
         ("cache_stats", response_schema_search_cache_stats()),
         ("query_plan", response_schema_query_plan()),
