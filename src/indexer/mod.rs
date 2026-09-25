@@ -16057,6 +16057,74 @@ fn detect_for_local_scan(
     local_connector_roots.is_none().then(detect)
 }
 
+/// GH #489: `CASS_EXCLUDE_PATHS` is comma/newline-delimited, but a PATH-style
+/// list (`/a/x:/b/y`) is an easy mistake. The scan policy
+/// (`connectors::codex::path_policy`) parses it as one nonexistent path that
+/// excludes nothing, so the sources the operator meant to skip are still
+/// scanned. Name the entries that look like that. An entry only qualifies when
+/// every colon-separated piece is itself an absolute or home-relative path and
+/// the whole entry does not exist, so Windows drive paths (`C:\x`) and real
+/// names containing `:` never warn.
+fn colon_separated_exclusion_warning(value: &str) -> Option<String> {
+    let suspicious: Vec<&str> = value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|entry| {
+            let mut pieces = entry.split(':');
+            let looks_like_list = entry.contains(':')
+                && pieces.all(|piece| piece.starts_with('/') || piece.starts_with("~/"));
+            looks_like_list && !Path::new(entry).exists()
+        })
+        .collect();
+    (!suspicious.is_empty()).then(|| {
+        format!(
+            "CASS_EXCLUDE_PATHS separates entries with commas or newlines, not colons; \
+             these entries do not exist and exclude nothing: {}. Use a comma, e.g. {}",
+            suspicious.join(", "),
+            suspicious[0].replace(':', ",")
+        )
+    })
+}
+
+#[cfg(test)]
+mod colon_separated_exclusion_warning_tests {
+    use super::colon_separated_exclusion_warning;
+
+    #[test]
+    fn colon_separated_exclusions_are_named_with_a_comma_suggestion() {
+        let warning = colon_separated_exclusion_warning(
+            "/data/old-codex/a.jsonl:/data/old-codex/b.jsonl,~/x:~/y",
+        )
+        .expect("PATH-style lists must warn");
+        assert!(warning.contains("/data/old-codex/a.jsonl:/data/old-codex/b.jsonl"));
+        assert!(warning.contains("~/x:~/y"));
+        assert!(warning.contains("/data/old-codex/a.jsonl,/data/old-codex/b.jsonl"));
+    }
+
+    #[test]
+    fn well_formed_and_drive_style_exclusions_do_not_warn() -> std::io::Result<()> {
+        assert_eq!(colon_separated_exclusion_warning(""), None);
+        assert_eq!(colon_separated_exclusion_warning("/a/x,/b/y\n~/z"), None);
+        // Windows drive paths and a relative piece are not colon-separated lists.
+        assert_eq!(
+            colon_separated_exclusion_warning(r"C:\Users\me\.codex"),
+            None
+        );
+        assert_eq!(colon_separated_exclusion_warning("/a/x:relative"), None);
+        // A real path whose name contains ':' exists, so it is not a mistake.
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir()?;
+            let odd = root.path().join("a:");
+            std::fs::create_dir(&odd)?;
+            let entry = format!("{}/b", odd.display());
+            std::fs::create_dir(&entry)?;
+            assert_eq!(colon_separated_exclusion_warning(&entry), None);
+        }
+        Ok(())
+    }
+}
+
 fn run_index_inner(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -16064,9 +16132,10 @@ fn run_index_inner(
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
-    if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS").ok().and_then(|value| {
-        crate::connectors::codex::path_policy::colon_separated_exclusion_warning(&value)
-    }) {
+    if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS")
+        .ok()
+        .and_then(|value| colon_separated_exclusion_warning(&value))
+    {
         tracing::warn!("{warning}");
     }
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
