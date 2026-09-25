@@ -26667,6 +26667,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_BACKGROUND_IONICE_CLASS=<N>         ionice class for `cass index --background` on Linux (default 3 = idle)".to_string(),
             "  CASS_DAEMON_INDEX_INTERVAL_SECS=<N>      resident daemon spawns an incremental background index every N s (default 0 = off)".to_string(),
             "  CASS_SCHEDULE_MAX_BACKFILL_BATCHES=<N>   cap on semantic backfill batches per nightly `cass schedule run` (default 200)".to_string(),
+            "  CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS=<N> longest severe load may skip scheduled incremental runs since the last completed one (default 10800; 0 = no limit)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS=<N>  require console idle time before scheduled backfill/nightly jobs (default 0 = off; macOS only, fails open)".to_string(),
             "  CASS_RESPONSIVENESS_DISABLE=1            pin indexer fan-out at 100% (skip governor)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_CAPACITY_PCT=<N> floor for governor shrink (default 25, range 10..100)".to_string(),
@@ -95140,6 +95141,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_SCHEDULE_MAX_BACKFILL_BATCHES",
             Some("200"),
             "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute.",
+        ),
+        env_var_capability(
+            "CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS",
+            Some("10800"),
+            "Longest severe machine load may keep skipping scheduled incremental runs, measured from the last incremental run that completed; past it the run goes ahead at scheduler priority. 0 = skip for load without limit.",
         ),
         env_var_capability(
             "CASS_INDEX_STALL_DETECT_SECS",

@@ -3809,6 +3809,11 @@
       "description": "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute."
     },
     {
+      "name": "CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS",
+      "default": "10800",
+      "description": "Longest severe machine load may keep skipping scheduled incremental runs, measured from the last incremental run that completed; past it the run goes ahead at scheduler priority. 0 = skip for load without limit."
+    },
+    {
       "name": "CASS_INDEX_STALL_DETECT_SECS",
       "default": "120",
       "description": "Seconds without measured phase progress before cass index emits diagnostics; 0 disables detection."

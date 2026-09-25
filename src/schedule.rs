@@ -20,6 +20,10 @@
 //! `IOSchedulingClass=idle` + `CPUSchedulingPolicy=idle`. Each job step is a
 //! child `cass` process, so the normal `index-run.lock` / exit-7 `index-busy`
 //! contract protects against a human running `cass index` at the same moment.
+//! Severe machine load skips a run, but an incremental run is skipped for load
+//! only until `CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS` (default 3 h) have passed
+//! since the last completed one; a busy development machine would otherwise
+//! never refresh its index.
 //!
 //! Everything the job does is recorded under `<data_dir>/schedule/`:
 //! `state.json` (last run per job), `runs.jsonl` (append-only history), and
@@ -907,14 +911,98 @@ fn skipped_step(name: &str, reason: impl Into<String>) -> StepReport {
     }
 }
 
+/// Longest an incremental run may be skipped for machine load, measured from
+/// the last incremental run that completed (`CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS`,
+/// `0` = skip for load without limit).
+const DEFAULT_MAX_LOAD_DEFERRAL_SECS: u64 = 3 * 60 * 60;
+
+/// How far back into `runs.jsonl` the gate looks for the last completed run.
+const RUN_HISTORY_TAIL_BYTES: u64 = 512 * 1024;
+
+fn max_load_deferral() -> Option<std::time::Duration> {
+    let secs = dotenvy::var("CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_LOAD_DEFERRAL_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Whether a report is an incremental run whose index step ran and succeeded.
+fn completed_incremental_run(report: &JobReport) -> bool {
+    report.job == ScheduleJob::Incremental
+        && report.ok
+        && report.skipped_reason.is_none()
+        && report
+            .steps
+            .iter()
+            .any(|step| step.name == "index" && step.ok && step.skipped_reason.is_none())
+}
+
+/// When the last completed incremental run finished, from the tail of
+/// `runs.jsonl`. Unreadable or malformed lines are ignored.
+fn last_completed_incremental_ms(data_dir: &Path) -> Option<i64> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut file = File::open(runs_log_path(data_dir)).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(RUN_HISTORY_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    // A seek into the middle of a line leaves a partial first line; it fails to
+    // parse and is skipped like any other malformed line.
+    tail.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<JobReport>(line).ok())
+        .find(completed_incremental_run)
+        .map(|report| report.finished_ms)
+}
+
+/// Whether load may still defer an incremental run. A developer machine that
+/// runs builds all day sits above the severe-load line for hours, and skipping
+/// every firing left the index stale indefinitely while each skip recorded a
+/// successful run. The indexer already yields under pressure (`Nice`, and its
+/// governor drops to its capacity floor), so past the deferral bound the run
+/// goes ahead. With no completed run on record the index has never been
+/// refreshed by the scheduler, so there is nothing fresh to protect.
+fn load_may_defer(
+    last_completed_ms: Option<i64>,
+    now_ms: i64,
+    max_deferral: Option<std::time::Duration>,
+) -> bool {
+    let Some(max_deferral) = max_deferral else {
+        return true;
+    };
+    let Some(last_completed_ms) = last_completed_ms else {
+        return false;
+    };
+    let max_ms = i64::try_from(max_deferral.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(last_completed_ms) < max_ms
+}
+
 /// Decide whether a scheduled job should run now, and why not.
-pub fn job_gate(job: ScheduleJob) -> Option<String> {
+pub fn job_gate(job: ScheduleJob, data_dir: &Path) -> Option<String> {
     let pressure = responsiveness::machine_pressure_now();
     if pressure.severe {
-        return Some(format!(
-            "machine under severe load (load/core={:?}, psi={:?}); skipping this run",
-            pressure.load_per_core, pressure.psi_cpu_some_avg10
-        ));
+        let defer = match job {
+            ScheduleJob::Nightly => true,
+            ScheduleJob::Incremental => load_may_defer(
+                last_completed_incremental_ms(data_dir),
+                now_ms(),
+                max_load_deferral(),
+            ),
+        };
+        if defer {
+            return Some(format!(
+                "machine under severe load (load/core={:?}, psi={:?}); skipping this run",
+                pressure.load_per_core, pressure.psi_cpu_some_avg10
+            ));
+        }
+        info!(
+            load_per_core = ?pressure.load_per_core,
+            "severe load, but the last completed incremental run is older than the load-deferral bound; running at scheduler priority"
+        );
     }
     if matches!(job, ScheduleJob::Nightly) {
         let gate = responsiveness::user_idle_gate();
@@ -931,7 +1019,7 @@ pub fn job_gate(job: ScheduleJob) -> Option<String> {
 /// Execute one job end-to-end. Admitted runs persist their report, treating
 /// persistence errors as failures. Admission refusals do not clobber an owner.
 pub fn run_job(job: ScheduleJob, cfg: &RunConfig) -> JobReport {
-    run_job_with_gate(job, cfg, job_gate(job))
+    run_job_with_gate(job, cfg, job_gate(job, &cfg.data_dir))
 }
 
 /// `--force`: run even when the load / console-idle gates would skip.
@@ -1745,6 +1833,92 @@ mod tests {
         assert!(loaded.last_nightly.is_none());
         let history = std::fs::read_to_string(runs_log_path(dir.path())).unwrap();
         assert_eq!(history.lines().count(), 2);
+    }
+
+    fn index_run_report(job: ScheduleJob, finished_ms: i64, index_ok: bool) -> JobReport {
+        JobReport {
+            job,
+            started_ms: finished_ms - 1,
+            finished_ms,
+            ok: index_ok,
+            skipped_reason: None,
+            steps: vec![StepReport {
+                name: if job == ScheduleJob::Nightly {
+                    "index-full"
+                } else {
+                    "index"
+                }
+                .to_string(),
+                argv: Vec::new(),
+                exit_code: Some(if index_ok { 0 } else { 70 }),
+                ok: index_ok,
+                duration_ms: 1,
+                skipped_reason: None,
+                result: None,
+                stderr_tail: None,
+            }],
+            pressure: None,
+            user_idle: None,
+        }
+    }
+
+    #[test]
+    fn load_deferral_is_bounded_by_the_last_completed_run() {
+        let hour = std::time::Duration::from_secs(3600);
+        let now = 10 * 3_600_000;
+        // Recent completed run: load may still defer.
+        assert!(load_may_defer(Some(now - 3_600_000), now, Some(3 * hour)));
+        // Past the bound: the run goes ahead.
+        assert!(!load_may_defer(
+            Some(now - 3 * 3_600_000),
+            now,
+            Some(3 * hour)
+        ));
+        // Never completed: nothing fresh to protect.
+        assert!(!load_may_defer(None, now, Some(3 * hour)));
+        // 0 = the old unbounded skip.
+        assert!(load_may_defer(None, now, None));
+        assert!(load_may_defer(Some(0), now, None));
+    }
+
+    #[test]
+    fn last_completed_incremental_run_ignores_skips_failures_nightlies_and_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(last_completed_incremental_ms(dir.path()), None);
+
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Incremental, 100, true),
+        )
+        .unwrap();
+        let mut skipped = index_run_report(ScheduleJob::Incremental, 200, true);
+        skipped.skipped_reason = Some("machine under severe load".to_string());
+        skipped.steps.clear();
+        append_run(dir.path(), &skipped).unwrap();
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Incremental, 300, false),
+        )
+        .unwrap();
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Nightly, 400, true),
+        )
+        .unwrap();
+        let mut history = OpenOptions::new()
+            .append(true)
+            .open(runs_log_path(dir.path()))
+            .unwrap();
+        writeln!(history, "{{not json").unwrap();
+
+        assert_eq!(last_completed_incremental_ms(dir.path()), Some(100));
+
+        append_run(
+            dir.path(),
+            &index_run_report(ScheduleJob::Incremental, 500, true),
+        )
+        .unwrap();
+        assert_eq!(last_completed_incremental_ms(dir.path()), Some(500));
     }
 
     #[test]
