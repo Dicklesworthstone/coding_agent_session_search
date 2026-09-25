@@ -96,6 +96,112 @@ static MACOS_PROCESS_MEMORY_SAMPLE: LazyLock<Mutex<MacosProcessMemorySample>> =
         })
     });
 
+/// Wall-clock bound for one OS telemetry probe (`footprint`, `ps`, `sysctl`,
+/// `vm_stat`, `ioreg`). Each normally answers in milliseconds. A probe that
+/// has not answered by then is killed with its process group and treated as
+/// "telemetry unavailable", which every caller already handles.
+///
+/// Observed on a Mac whose `footprint`/`sample` service had wedged: every
+/// `footprint --pid` call hung forever, and `cass index` sat at 0% CPU in
+/// `Command::output()` until the stall watchdog aborted it (exit 70).
+#[cfg(any(test, target_os = "macos"))]
+const OS_TELEMETRY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Largest stdout/stderr accepted from one telemetry probe. `ioreg -c
+/// IOHIDSystem` is the largest at a few hundred KiB.
+#[cfg(any(test, target_os = "macos"))]
+const OS_TELEMETRY_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Outcome of one bounded telemetry probe.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug)]
+enum TelemetryProbe {
+    /// The command exited within the deadline (any status).
+    Completed(std::process::Output),
+    /// The deadline passed; the command and its process group were killed.
+    TimedOut,
+    /// The command could not be spawned or its output could not be read.
+    Failed,
+}
+
+/// Run a telemetry command with no stdin, captured output, its own process
+/// group, and a hard wall-clock deadline. Never blocks past `timeout` on the
+/// child itself: a hung command is killed (SIGKILL to its group) and reaped.
+#[cfg(any(test, target_os = "macos"))]
+fn run_bounded_telemetry_probe(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> TelemetryProbe {
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::sources::configure_child_process_group(&mut command);
+    let Ok(child) = command.spawn() else {
+        return TelemetryProbe::Failed;
+    };
+    match crate::sources::wait_for_child_output_with_limit(
+        child,
+        timeout,
+        Some(OS_TELEMETRY_PROBE_MAX_OUTPUT_BYTES),
+    ) {
+        Ok(Some(output)) => TelemetryProbe::Completed(output),
+        Ok(None) => TelemetryProbe::TimedOut,
+        Err(_) => TelemetryProbe::Failed,
+    }
+}
+
+/// Successful stdout of a bounded telemetry probe, or `None` when the probe
+/// failed, exited nonzero, or timed out.
+#[cfg(target_os = "macos")]
+fn bounded_telemetry_stdout(command: std::process::Command) -> Option<String> {
+    match run_bounded_telemetry_probe(command, OS_TELEMETRY_PROBE_TIMEOUT) {
+        TelemetryProbe::Completed(output) if output.status.success() => {
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Set once `footprint(1)` has timed out in this process. A wedged
+/// `footprint` service stays wedged, so later samples go straight to the
+/// `ps` RSS fallback instead of paying the probe deadline on every tick.
+#[cfg(target_os = "macos")]
+static FOOTPRINT_PROBE_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Physical footprint through `probe`, honouring and maintaining the
+/// `disabled` circuit breaker. Separated from the `footprint` command so the
+/// timeout policy is testable on every platform.
+#[cfg(any(test, target_os = "macos"))]
+fn phys_footprint_bytes_via_probe(
+    disabled: &std::sync::atomic::AtomicBool,
+    probe: impl FnOnce() -> TelemetryProbe,
+) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    if disabled.load(Ordering::Relaxed) {
+        return None;
+    }
+    match probe() {
+        TelemetryProbe::Completed(output) if output.status.success() => {
+            macos_phys_footprint_bytes_from_output(&String::from_utf8_lossy(&output.stdout))
+        }
+        TelemetryProbe::Completed(_) | TelemetryProbe::Failed => None,
+        TelemetryProbe::TimedOut => {
+            if !disabled.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    timeout_ms = OS_TELEMETRY_PROBE_TIMEOUT.as_millis() as u64,
+                    "footprint(1) did not answer within its deadline; using ps RSS for process memory from now on"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Fallback process-wide in-flight byte ceiling for responsiveness-governed
 /// maintenance work when memory telemetry is unavailable.
 const DEFAULT_MAX_INFLIGHT_BYTES: usize = 512 * 1024 * 1024;
@@ -577,14 +683,9 @@ fn read_loadavg() -> Option<f32> {
 /// Fallback for [`read_loadavg`]: `sysctl -n vm.loadavg` prints `{ 1.23 1.45 1.50 }`.
 #[cfg(target_os = "macos")]
 fn read_loadavg_via_sysctl() -> Option<f32> {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    macos_loadavg_1m_from_sysctl(&String::from_utf8_lossy(&output.stdout))
+    let mut command = std::process::Command::new("sysctl");
+    command.args(["-n", "vm.loadavg"]);
+    macos_loadavg_1m_from_sysctl(&bounded_telemetry_stdout(command)?)
 }
 
 /// Parse the 1-minute field out of `sysctl -n vm.loadavg` output
@@ -609,14 +710,9 @@ pub(crate) fn macos_loadavg_1m_from_sysctl(raw: &str) -> Option<f32> {
 pub(crate) fn user_idle_seconds() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("ioreg")
-            .args(["-c", "IOHIDSystem", "-d", "4", "-r"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        macos_hid_idle_seconds_from_ioreg(&String::from_utf8_lossy(&output.stdout))
+        let mut command = std::process::Command::new("ioreg");
+        command.args(["-c", "IOHIDSystem", "-d", "4", "-r"]);
+        macos_hid_idle_seconds_from_ioreg(&bounded_telemetry_stdout(command)?)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1711,11 +1807,7 @@ pub(crate) fn available_memory_bytes() -> Option<u64> {
     // memory) so the throttle actually engages.
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("vm_stat").output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
+        let text = bounded_telemetry_stdout(std::process::Command::new("vm_stat"))?;
         macos_available_memory_bytes_from_vm_stat(&text)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1733,14 +1825,9 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&output.stdout)
+        let mut command = std::process::Command::new("sysctl");
+        command.args(["-n", "hw.memsize"]);
+        bounded_telemetry_stdout(command)?
             .trim()
             .parse::<u64>()
             .ok()
@@ -1797,28 +1884,20 @@ pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn read_macos_process_phys_footprint_bytes() -> Option<u64> {
-    let pid = std::process::id().to_string();
-    let output = std::process::Command::new("/usr/bin/footprint")
-        .args(["--pid", &pid, "--noCategories", "--format", "bytes"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    macos_phys_footprint_bytes_from_output(&String::from_utf8_lossy(&output.stdout))
+    phys_footprint_bytes_via_probe(&FOOTPRINT_PROBE_DISABLED, || {
+        let pid = std::process::id().to_string();
+        let mut command = std::process::Command::new("/usr/bin/footprint");
+        command.args(["--pid", &pid, "--noCategories", "--format", "bytes"]);
+        run_bounded_telemetry_probe(command, OS_TELEMETRY_PROBE_TIMEOUT)
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn read_macos_process_rss_bytes() -> Option<u64> {
     let pid = std::process::id().to_string();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    macos_rss_kib_to_bytes(&String::from_utf8_lossy(&output.stdout))
+    let mut command = std::process::Command::new("ps");
+    command.args(["-o", "rss=", "-p", &pid]);
+    macos_rss_kib_to_bytes(&bounded_telemetry_stdout(command)?)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2164,6 +2243,127 @@ mod tests {
     fn macos_rss_parser_converts_kib_to_bytes() {
         assert_eq!(macos_rss_kib_to_bytes("  204800\n"), Some(204800 * 1024));
         assert_eq!(macos_rss_kib_to_bytes("not-a-number"), None);
+    }
+
+    /// A telemetry command that never answers (the wedged `footprint`
+    /// service) must come back as `TimedOut` near the deadline, with the
+    /// child's whole process group killed, instead of blocking the caller.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_telemetry_probe_kills_a_hung_command_at_its_deadline() {
+        let marker = tempfile::tempdir().unwrap();
+        let grandchild_pid = marker.path().join("grandchild.pid");
+        let mut command = std::process::Command::new("sh");
+        // The grandchild inherits the pipes; only a group kill ends it.
+        command.args([
+            "-c",
+            &format!("sleep 60 & echo $! > '{}'; wait", grandchild_pid.display()),
+        ]);
+        let started = std::time::Instant::now();
+        // Long enough for the shell to record the grandchild's pid first.
+        let outcome = run_bounded_telemetry_probe(command, Duration::from_millis(1500));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, TelemetryProbe::TimedOut),
+            "hung probe must report TimedOut, got {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "probe must return near its deadline, took {elapsed:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(&grandchild_pid)
+            .expect("grandchild pid recorded")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // `kill -0` fails once the grandchild is gone (killed and reaped
+            // by init after its parent group was SIGKILLed).
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {pid} of the timed-out probe is still alive"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Positive control: a prompt command completes with its real output
+    /// and exit status, so the deadline does not swallow good telemetry.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_telemetry_probe_returns_prompt_output() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'phys_footprint: 4096 B\\n'; exit 0"]);
+        let outcome = run_bounded_telemetry_probe(command, Duration::from_secs(10));
+        assert!(
+            matches!(&outcome, TelemetryProbe::Completed(output) if output.status.success()),
+            "prompt probe must complete successfully, got {outcome:?}"
+        );
+        if let TelemetryProbe::Completed(output) = outcome {
+            assert_eq!(
+                macos_phys_footprint_bytes_from_output(&String::from_utf8_lossy(&output.stdout)),
+                Some(4096)
+            );
+        }
+        let missing = std::process::Command::new("/nonexistent/cass-telemetry-probe");
+        assert!(matches!(
+            run_bounded_telemetry_probe(missing, Duration::from_secs(10)),
+            TelemetryProbe::Failed
+        ));
+    }
+
+    /// After one timeout the footprint path is disabled for the process:
+    /// later samples must not spawn (and wait on) the wedged tool again.
+    #[test]
+    fn footprint_timeout_disables_later_probes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let disabled = AtomicBool::new(false);
+        let calls = AtomicUsize::new(0);
+        let timed_out = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            TelemetryProbe::TimedOut
+        };
+        assert_eq!(phys_footprint_bytes_via_probe(&disabled, timed_out), None);
+        assert!(
+            disabled.load(Ordering::SeqCst),
+            "a timeout trips the breaker"
+        );
+        assert_eq!(phys_footprint_bytes_via_probe(&disabled, timed_out), None);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a tripped breaker must not run the probe again"
+        );
+
+        // A failed (not hung) probe does not trip the breaker, and a healthy
+        // probe still yields the parsed footprint.
+        let healthy = AtomicBool::new(false);
+        assert_eq!(
+            phys_footprint_bytes_via_probe(&healthy, || TelemetryProbe::Failed),
+            None
+        );
+        assert!(!healthy.load(Ordering::SeqCst));
+        #[cfg(unix)]
+        {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "printf 'phys_footprint: 8192 B\\n'"]);
+            assert_eq!(
+                phys_footprint_bytes_via_probe(&healthy, || run_bounded_telemetry_probe(
+                    command,
+                    Duration::from_secs(10)
+                )),
+                Some(8192)
+            );
+        }
     }
 
     #[test]
