@@ -281,6 +281,10 @@ fn grok_bot_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(grok::GrokBotConnector::new())
 }
 
+fn copilot_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(copilot::CopilotConnector::new())
+}
+
 /// Return connector factories with CASS-specific wrappers applied.
 ///
 /// Codex passes through CASS's enrichment wrapper so modern `function_call`
@@ -288,6 +292,8 @@ fn grok_bot_connector_factory() -> Box<dyn Connector + Send> {
 /// provenance adapter, and Pi Agent passes through the OMP identity boundary
 /// that prevents broad explicit roots from indexing the same store twice.
 /// OpenClaw passes through its native-store WAL and state-directory adapter.
+/// Copilot passes through a detection widening that also recognises VS Code's
+/// native chat stores, which the upstream scanner reads but never detected.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     franken_agent_detection::get_connector_factories()
@@ -299,6 +305,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
                 "omp" => omp_connector_factory as ConnectorFactory,
                 "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
                 "grok_bot" => grok_bot_connector_factory as ConnectorFactory,
+                "copilot" => copilot_connector_factory as ConnectorFactory,
                 _ => factory,
             };
             (name, openclaw::with_wal_freshness(name, factory))
