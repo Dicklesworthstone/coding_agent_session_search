@@ -3262,6 +3262,8 @@ schemas: (auto-generated from contract)
         - db_path_source: string
         - filters: object
         - query: string
+        - query_recoveries: array
+        - query_structure: ?
         - time_window: object
       - elapsed_ms: integer
       - explanation_cards: array

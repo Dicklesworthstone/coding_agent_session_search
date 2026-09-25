@@ -5645,6 +5645,51 @@ fn search_robot_meta_reports_the_daemon_policy() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// 2l1b0.68: `_meta.effective` echoes how the lexical engine groups the
+/// query and the parentheses it recovered. The expected groupings are written
+/// by hand from the documented precedence (NOT > AND > OR). Negative control:
+/// before this change neither field existed, and the legacy grammar read
+/// `hello OR world tool` as `(hello OR world) AND tool`.
+#[test]
+fn search_robot_meta_echoes_the_query_grouping() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let reading = |query: &str| -> Result<(Value, Value), Box<dyn Error>> {
+        let (effective, _) = search_effective_meta(base_cmd().args([
+            "search",
+            query,
+            "--json",
+            "--robot-meta",
+            "--limit",
+            "1",
+            "--data-dir",
+            data_dir,
+        ]))?;
+        Ok((
+            effective["query_structure"].clone(),
+            effective["query_recoveries"].clone(),
+        ))
+    };
+    assert_eq!(
+        reading("hello OR world tool")?,
+        (
+            serde_json::json!("hello OR (world AND tool)"),
+            serde_json::json!([])
+        )
+    );
+    assert_eq!(
+        reading("hello AND (world OR tool")?,
+        (
+            serde_json::json!("hello AND (world OR tool)"),
+            serde_json::json!(["1 unclosed '(' closed at the end of the query"])
+        )
+    );
+    assert_eq!(
+        reading("hello")?,
+        (serde_json::json!("hello"), serde_json::json!([]))
+    );
+    Ok(())
+}
+
 /// 2l1b0.68: `_meta.effective` echoes what search actually ran. Every
 /// expected value here comes from outside cass: the fixture path, a UTC
 /// epoch computed by hand, and the flags as typed. Negative control: before

@@ -1365,6 +1365,38 @@ fn render_query_structure(expr: &CassBoolExpr<String>) -> String {
     }
 }
 
+/// How the lexical engine reads a query. `--explain` shows it as
+/// `parsed.structure` and warnings; robot search echoes it in
+/// `_meta.effective` (2l1b0.52, 2l1b0.68).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryReading {
+    /// Operand grouping with every compound group parenthesized, e.g.
+    /// `a OR (b AND c)`; `None` for a query without operands.
+    pub structure: Option<String>,
+    /// Parentheses recovered instead of rejected, e.g. `1 unclosed '('
+    /// closed at the end of the query`.
+    pub recoveries: Vec<String>,
+}
+
+/// Read `query` with the grammar the lexical engine applies.
+pub fn read_query(query: &str) -> QueryReading {
+    let tokens = cass_bool_tokens(query);
+    let structure = CassBoolParser::parse(&tokens, |token: &FsCassQueryToken| {
+        Ok(match token {
+            FsCassQueryToken::Term(text) => Some(text.clone()),
+            FsCassQueryToken::Phrase(text) => Some(format!("\"{text}\"")),
+            FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => None,
+        })
+    })
+    .ok()
+    .flatten()
+    .map(|expr| render_query_structure(&expr));
+    QueryReading {
+        structure,
+        recoveries: group_recovery_warnings(&tokens),
+    }
+}
+
 /// `--explain` warnings for parentheses the grammar recovers instead of
 /// rejecting, read the way the lexical engine reads them: an unclosed `(`
 /// closes at the end of the query and an empty `()` is skipped.
@@ -1519,17 +1551,8 @@ impl QueryExplanation {
         // a query can contain both an explicit connector and a later implicit
         // one (`foo AND bar baz`).
         parsed.implicit_and = uses_implicit_and;
-        let structure_tokens = cass_bool_tokens(query);
-        parsed.structure = CassBoolParser::parse(&structure_tokens, |token: &FsCassQueryToken| {
-            Ok(match token {
-                FsCassQueryToken::Term(text) => Some(text.clone()),
-                FsCassQueryToken::Phrase(text) => Some(format!("\"{text}\"")),
-                FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => None,
-            })
-        })
-        .ok()
-        .flatten()
-        .map(|expr| render_query_structure(&expr));
+        let reading = read_query(query);
+        parsed.structure = reading.structure;
 
         // Determine query type
         let query_type = Self::classify_query(&parsed, filters, &sanitized);
@@ -1545,7 +1568,7 @@ impl QueryExplanation {
 
         // Generate warnings
         let mut warnings = Self::generate_warnings(&parsed, &sanitized, filters);
-        warnings.extend(group_recovery_warnings(&structure_tokens));
+        warnings.extend(reading.recoveries);
 
         Self {
             original_query: query.to_string(),

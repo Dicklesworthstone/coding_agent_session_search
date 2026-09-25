@@ -32024,13 +32024,27 @@
             },
             "effective": {
               "type": "object",
-              "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, daemon policy, and argv auto-corrections.",
+              "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, daemon policy, argv auto-corrections, and how the lexical engine groups the query.",
               "properties": {
                 "command": {
                   "type": "string"
                 },
                 "query": {
                   "type": "string"
+                },
+                "query_structure": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+                },
+                "query_recoveries": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
                 },
                 "db_path": {
                   "type": "string"

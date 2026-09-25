@@ -41,6 +41,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   now reports `_meta.wildcard_fallback_skipped`: `index_over_automatic_limit`,
   `automatic_retry_disabled` (cap `0`) or `long_query_term`, or null when the
   retry ran or did not apply.
+- **Robot search echoes how the query was grouped.** `_meta.effective` gains
+  `query_structure`, the operand grouping the lexical engine applies with
+  every compound group parenthesized (`a OR b c` reads as
+  `a OR (b AND c)`), and `query_recoveries`, the parentheses it recovered
+  instead of rejecting. Until now only `--explain` showed the grouping.
 
 ### Fixed
 

@@ -1014,13 +1014,13 @@ cass search "error" --robot --robot-meta
 # What the search actually ran (--robot-meta): check this instead of trusting the flags
 cass search "error" --robot --robot-meta --days 7 | jq '._meta.effective'
 # → { "command": "search", "query": "error",
+#     "query_structure": "error",           // how the engine groups operands: `a OR b c` -> "a OR (b AND c)"
+#     "query_recoveries": [],               // e.g. "1 unclosed '(' closed at the end of the query"
 #     "db_path": "/home/you/.local/share/coding-agent-search/agent_search.db",
 #     "db_path_source": "default",          // --db | env:CASS_DB_PATH | --data-dir | env:CASS_DATA_DIR | env:XDG_DATA_HOME | default
 #     "time_window": { "since_ms": 1758067200000, "since_from": "--days 7", "until_ms": null, "until_from": null },
 #     "filters": { "agents": [], "workspaces": [], "source": "all", "sessions_from_paths": null },
 #     "auto_corrections": [] }              // each argv correction, worded like its stderr note
-#   The parsed query tree is under --explain; it is not echoed here yet because
-#   cass's parse and the engine's can still differ for mixed AND/OR.
 
 # Per-hit trust verdict (advisory; --robot-meta only)
 cass search "error" --robot --robot-meta
@@ -1507,7 +1507,7 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 |------|---------|
 | `--robot` / `--json` | JSON output (pretty-printed) |
 | `--robot-format jsonl\|compact` | Streaming or single-line JSON |
-| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness, `lexical_degrade_reason`: `"query_fuel_exhausted"` or null, and `effective`: the database, time window, filters and auto-corrections the search actually used) |
+| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness, `lexical_degrade_reason`: `"query_fuel_exhausted"` or null, `wildcard_fallback_skipped`: why a sparse result got no automatic wildcard retry, and `effective`: the database, time window, filters, auto-corrections and query grouping the search actually used) |
 | `--fields minimal\|summary\|<list>` | Reduce payload size |
 | `--max-content-length N` | Truncate content fields to N chars |
 | `--max-tokens N` | Apply an approximate token budget to robot output |

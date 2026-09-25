@@ -60469,6 +60469,39 @@
                                     }
                                   }
                                 },
+                                "query_structure": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "query_recoveries": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "db_path": {
                                   "type": "object",
                                   "properties": {

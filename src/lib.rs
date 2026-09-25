@@ -35806,9 +35806,10 @@ impl SessionsFilterStats {
 /// `_meta.effective` (2l1b0.68): what this search actually ran, so a caller
 /// can check the interpretation instead of trusting it. It names the
 /// database and what chose its path, the resolved time window with the flag
-/// behind each bound, the filters as parsed, and every argv auto-correction.
-/// The parsed query tree is left to `--explain` until cass's parse matches
-/// the engine's (2l1b0.52); echoing it now would misreport the query.
+/// behind each bound, the filters as parsed, every argv auto-correction, and
+/// how the lexical engine groups the query, with any parentheses it recovered
+/// (the reading `--explain` shows; cass's parse matches the engine's since
+/// 2l1b0.52).
 #[allow(clippy::too_many_arguments)]
 fn search_effective_interpretation(
     query: &str,
@@ -35824,9 +35825,12 @@ fn search_effective_interpretation(
     agents.sort_unstable();
     let mut workspaces: Vec<&str> = filters.workspaces.iter().map(String::as_str).collect();
     workspaces.sort_unstable();
+    let reading = crate::search::query::read_query(query);
     serde_json::json!({
         "command": "search",
         "query": query,
+        "query_structure": reading.structure,
+        "query_recoveries": reading.recoveries,
         "db_path": db_path.display().to_string(),
         "db_path_source": db_path_source,
         "time_window": {
@@ -100145,10 +100149,19 @@ fn response_schema_budget_block() -> serde_json::Value {
 fn response_schema_search_effective() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, daemon policy, and argv auto-corrections.",
+        "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, daemon policy, argv auto-corrections, and how the lexical engine groups the query.",
         "properties": {
             "command": { "type": "string" },
             "query": { "type": "string" },
+            "query_structure": {
+                "type": ["string", "null"],
+                "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+            },
+            "query_recoveries": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
+            },
             "db_path": { "type": "string" },
             "db_path_source": {
                 "type": "string",
