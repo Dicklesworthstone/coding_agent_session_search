@@ -1337,6 +1337,43 @@ impl QuillCassIndex {
         Ok(merged || compacted)
     }
 
+    /// At most one bounded merge, for use while a streaming ingest is running.
+    ///
+    /// Every concat merge is a publish, and every publish re-verifies each
+    /// live segment's bytes, so [`Self::optimize_if_idle`] — which folds every
+    /// planned run and then compacts — costs one full verification per run.
+    /// Run mid-ingest on a multi-gigabyte generation, that loop held the
+    /// consumer for more than ten minutes. This folds only the planned run
+    /// that removes the most segments (normally the tail the run's own
+    /// commits left), under the same threshold and cooldown, and leaves the
+    /// rest to the post-run fold.
+    ///
+    /// Returns whether a merge ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the merge itself fails.
+    pub fn fold_largest_small_run(&mut self, now_ms: i64) -> Result<bool> {
+        let segments = self.segment_count();
+        if !self.merge_status(segments, now_ms).should_merge() {
+            return Ok(false);
+        }
+        let profile = self.published_segment_profile()?;
+        let fold_profile = self.published_segment_fold_profile()?;
+        let Some(run) = plan_capped_balanced_merge_runs(
+            &profile,
+            &fold_profile,
+            lexical_merge_max_output_bytes(),
+        )
+        .into_iter()
+        .max_by_key(Vec::len) else {
+            return Ok(false);
+        };
+        self.concat_merge_run(&run)?;
+        self.note_merged(now_ms);
+        Ok(true)
+    }
+
     /// Fold the published segments into as few as the merge-output byte cap
     /// allows, regardless of the idle policy, then reclaim tombstones.
     ///
@@ -2941,6 +2978,54 @@ mod tests {
             "the hollow successor is a later generation"
         );
         assert_eq!(index.doc_count().expect("engine count"), 0);
+    }
+
+    /// The streaming-ingest fold merges one run per call and then honours the
+    /// cooldown, so a mid-run call costs at most one extra publish.
+    #[test]
+    fn fold_largest_small_run_merges_one_run_then_cools_down() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let sessions = 5_u64;
+        for session in 0..sessions {
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            index
+                .add_cass_documents(&[sample(&format!("s{session}"), 0, "session alpha")])
+                .expect("index session documents");
+            index.commit().expect("commit session");
+        }
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let before = published_segment_count(&index);
+        assert!(before >= 5, "each session leaves a segment, got {before}");
+
+        assert!(
+            index
+                .fold_largest_small_run(1_700_000_000_000)
+                .expect("fold")
+        );
+        let after = published_segment_count(&index);
+        assert!(after < before, "{after} segments after folding {before}");
+        assert_eq!(index.doc_count().expect("doc count"), sessions);
+
+        // Enough later commits to clear the merge threshold, so only the
+        // cooldown can hold the next fold back.
+        for late in 0..CASS_MERGE_SEGMENT_THRESHOLD {
+            index
+                .add_cass_documents(&[sample(&format!("late{late}"), 0, "late session alpha")])
+                .expect("index late documents");
+            index.commit().expect("commit late");
+        }
+        let grown = published_segment_count(&index);
+        assert!(
+            grown >= CASS_MERGE_SEGMENT_THRESHOLD,
+            "got {grown} segments"
+        );
+        assert!(
+            !index
+                .fold_largest_small_run(1_700_000_000_001)
+                .expect("fold inside cooldown"),
+            "a call inside the cooldown must not merge"
+        );
+        assert_eq!(published_segment_count(&index), grown);
     }
 
     /// #441: one writer session per open leases fresh docid blocks, so every

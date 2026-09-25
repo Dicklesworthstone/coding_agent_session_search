@@ -1603,6 +1603,12 @@ impl TantivyIndex {
         self.inner.optimize_if_idle(now_unix_millis())
     }
 
+    /// At most one bounded segment merge; see
+    /// [`QuillCassIndex::fold_largest_small_run`].
+    pub fn fold_largest_small_run(&mut self) -> Result<bool> {
+        self.inner.fold_largest_small_run(now_unix_millis())
+    }
+
     /// Force immediate segment merge and wait for completion.
     /// Use sparingly - blocks until merge finishes.
     pub fn force_merge(&mut self) -> Result<()> {

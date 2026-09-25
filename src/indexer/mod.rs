@@ -14389,6 +14389,115 @@ fn streaming_consumer_commit_interval() -> Duration {
     Duration::from_secs(scaled.max(1))
 }
 
+/// Minimum spacing between segment-fold attempts inside one streaming run.
+const STREAMING_FOLD_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The next streaming commit waits at least this many times as long as the
+/// last one took, so publishing costs at most about a fifth of consumer time.
+const STREAMING_COMMIT_COST_MULTIPLE: u32 = 4;
+
+/// Upper bound on the cost-derived commit interval, so a slow publish cannot
+/// hold freshly ingested sessions out of search for long.
+const STREAMING_COMMIT_MAX_PACED_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Effective streaming commit interval given what the last commit cost.
+///
+/// Every Quill publish re-verifies each live segment, including an xxh3 pass
+/// over its full bytes, so a commit costs time proportional to the whole
+/// lexical index, not to what it adds. On a 2-8M-message archive a commit
+/// took 3-12 s, and with the fixed 5 s interval the consumer spent most of a
+/// catch-up re-verifying unchanged segments while producers waited on
+/// backpressure. Pacing by measured cost keeps small indexes at the base
+/// cadence (their commits take milliseconds) and bounds the verification
+/// share on large ones.
+fn paced_streaming_commit_interval(base: Duration, last_commit_cost: Duration) -> Duration {
+    base.max(
+        last_commit_cost
+            .saturating_mul(STREAMING_COMMIT_COST_MULTIPLE)
+            .min(STREAMING_COMMIT_MAX_PACED_INTERVAL),
+    )
+}
+
+/// Commit cadence and segment-fold bookkeeping for one streaming run.
+struct StreamingCommitPacer {
+    last_commit: std::time::Instant,
+    last_commit_cost: Duration,
+    last_fold_attempt: Option<std::time::Instant>,
+}
+
+impl StreamingCommitPacer {
+    fn new() -> Self {
+        Self {
+            last_commit: std::time::Instant::now(),
+            last_commit_cost: Duration::ZERO,
+            last_fold_attempt: None,
+        }
+    }
+
+    /// Whether enough ingest time has passed since the last commit ended.
+    fn due(&self) -> bool {
+        self.last_commit.elapsed()
+            >= paced_streaming_commit_interval(
+                streaming_consumer_commit_interval(),
+                self.last_commit_cost,
+            )
+    }
+
+    /// Commit, then fold small segments when due, then restart the interval.
+    /// The fold is a publish too, so its time counts toward the pacing cost.
+    fn commit(&mut self, t_index: Option<&mut TantivyIndex>) {
+        if let Some(t_index) = t_index {
+            let started = std::time::Instant::now();
+            match t_index.commit() {
+                Ok(()) => {
+                    tracing::debug!(
+                        commit_ms = started.elapsed().as_millis() as u64,
+                        "incremental commit completed"
+                    );
+                    self.fold_small_segments(t_index);
+                }
+                Err(error) => tracing::warn!(%error, "incremental commit failed"),
+            }
+            self.last_commit_cost = started.elapsed();
+        }
+        self.last_commit = std::time::Instant::now();
+    }
+
+    /// Fold the small segment tail during a long streaming run.
+    ///
+    /// Every commit publishes a few small segments, and every publish
+    /// re-verifies each live segment's term dictionary. A long catch-up that
+    /// only folded after the run ended grew one generation past 3,000 segments,
+    /// so each publish got slower as the run went on and every search opened
+    /// during it paid for the whole pile. This runs at most one merge
+    /// (`fold_largest_small_run`), gated by the segment threshold and a 300 s
+    /// cooldown, so it costs about one extra publish a few times per long run;
+    /// the full fold still runs after the run ends. A pass that folds nothing
+    /// does not restart that cooldown, so attempts are also spaced by
+    /// [`STREAMING_FOLD_ATTEMPT_INTERVAL`].
+    fn fold_small_segments(&mut self, t_index: &mut TantivyIndex) {
+        if lexical_post_run_maintenance_skipped_for_test()
+            || self
+                .last_fold_attempt
+                .is_some_and(|at| at.elapsed() < STREAMING_FOLD_ATTEMPT_INTERVAL)
+        {
+            return;
+        }
+        self.last_fold_attempt = Some(std::time::Instant::now());
+        match t_index.fold_largest_small_run() {
+            Ok(true) => tracing::info!(
+                segments = t_index.segment_count(),
+                "folded lexical segments during streaming ingest"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                error = %format!("{error:#}"),
+                "segment merge during streaming ingest failed; continuing with the unmerged generation"
+            ),
+        }
+    }
+}
+
 /// Flat-combining drain in the streaming consumer (Card 3 / `§14.2 Flat
 /// Combining` in the alien graveyard). When enabled, the consumer drains
 /// up to `streaming_combine_max_messages` pending `Batch` messages in one
@@ -14463,7 +14572,7 @@ fn run_streaming_consumer(
     let mut total_conversations = 0usize;
     let mut total_messages = 0usize;
     let mut switched_to_indexing = false;
-    let mut last_commit = std::time::Instant::now();
+    let mut commit_pacer = StreamingCommitPacer::new();
     let index_start = std::time::Instant::now();
     let mut ingest_outcome = NonWatchIngestOutcome::default();
     // Streaming ingest intentionally defers connection-local WAL
@@ -14678,15 +14787,10 @@ fn run_streaming_consumer(
                 // CASS_STREAMING_CONSUMER_COMMIT_SECS); under responsiveness
                 // pressure it is scaled down so the writer hold time and
                 // buffered memory both shrink in lockstep with the rest of
-                // the pipeline.
-                if last_commit.elapsed() >= streaming_consumer_commit_interval() {
-                    if let Some(t_index) = t_index.as_deref_mut() {
-                        if let Err(e) = t_index.commit() {
-                            tracing::warn!("incremental commit failed: {}", e);
-                        } else {
-                            tracing::debug!("incremental commit completed");
-                        }
-                    }
+                // the pipeline. It never drops below a multiple of what the
+                // last commit cost (see `paced_streaming_commit_interval`).
+                if commit_pacer.due() {
+                    commit_pacer.commit(t_index.as_deref_mut());
                     // Do not advance the legacy global `last_scan_ts` from a
                     // partial streaming run: a later connector scan error would
                     // make that global watermark unsafe for legacy fallback.
@@ -14697,7 +14801,6 @@ fn run_streaming_consumer(
                             "preserving streaming incremental last_scan_ts because scan exclusions or active source skips are active"
                         );
                     }
-                    last_commit = std::time::Instant::now();
                 }
 
                 tracing::info!(
@@ -14789,13 +14892,8 @@ fn run_streaming_consumer(
                     });
                 stats.conversations += count;
                 stats.messages += messages;
-                if last_commit.elapsed() >= streaming_consumer_commit_interval() {
-                    if let Some(index) = t_index.as_deref_mut()
-                        && let Err(error) = index.commit()
-                    {
-                        tracing::warn!(%error, "incremental commit failed");
-                    }
-                    last_commit = std::time::Instant::now();
+                if commit_pacer.due() {
+                    commit_pacer.commit(t_index.as_deref_mut());
                 }
                 if completion_written {
                     tracing::info!(
@@ -52044,6 +52142,22 @@ mod tests {
     /// `rounds` single-document commits, then fold them into one segment so
     /// the folded inputs sit on disk unreferenced by the MANIFEST (#453).
     fn plant_merged_quill_index(data_dir: &Path, rounds: u64) -> PathBuf {
+        let (index_path, mut index) = plant_unmerged_quill_index(data_dir, rounds);
+        index.force_merge().expect("force merge");
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "merge must leave one live segment"
+        );
+        index_path
+    }
+
+    /// Build a real Quill index at the data dir's expected lexical path with
+    /// `rounds` single-document commits, left unmerged.
+    fn plant_unmerged_quill_index(
+        data_dir: &Path,
+        rounds: u64,
+    ) -> (PathBuf, crate::search::quill_bridge::QuillCassIndex) {
         use crate::search::quill_bridge::QuillCassIndex;
         use frankensearch::quill::cass::CassDocument;
 
@@ -52069,13 +52183,74 @@ mod tests {
                 .expect("index batch");
             index.commit().expect("commit batch");
         }
-        index.force_merge().expect("force merge");
+        (index_path, index)
+    }
+
+    #[test]
+    fn streaming_commit_interval_is_paced_by_commit_cost() {
+        let base = Duration::from_secs(5);
         assert_eq!(
-            index.segment_count(),
-            1,
-            "merge must leave one live segment"
+            paced_streaming_commit_interval(base, Duration::ZERO),
+            base,
+            "cheap commits keep the base cadence"
         );
-        index_path
+        assert_eq!(
+            paced_streaming_commit_interval(base, Duration::from_millis(900)),
+            base
+        );
+        assert_eq!(
+            paced_streaming_commit_interval(base, Duration::from_secs(10)),
+            Duration::from_secs(40),
+            "a 10 s publish is followed by at least 40 s of ingest"
+        );
+        assert_eq!(
+            paced_streaming_commit_interval(base, Duration::from_secs(3600)),
+            STREAMING_COMMIT_MAX_PACED_INTERVAL
+        );
+        assert_eq!(
+            paced_streaming_commit_interval(Duration::from_secs(600), Duration::from_secs(10)),
+            Duration::from_secs(600),
+            "an operator's longer base interval still wins"
+        );
+    }
+
+    /// A long streaming catch-up used to fold segments only after the run
+    /// ended, so every periodic publish re-verified an ever-growing pile. The
+    /// consumer's commit now folds the small tail too, at most once per
+    /// `STREAMING_FOLD_ATTEMPT_INTERVAL`.
+    #[test]
+    fn streaming_commit_folds_small_segments_at_most_once_per_interval() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let (index_path, planted) = plant_unmerged_quill_index(data_dir.path(), 6);
+        let planted_segments = planted.segment_count();
+        drop(planted);
+        assert!(
+            planted_segments >= 6,
+            "each committed round must leave a segment, got {planted_segments}"
+        );
+        let mut t_index = TantivyIndex::open_or_create(&index_path).expect("open lexical index");
+
+        let mut pacer = StreamingCommitPacer::new();
+        pacer.last_fold_attempt = Some(std::time::Instant::now());
+        pacer.commit(Some(&mut t_index));
+        assert_eq!(
+            t_index.segment_count(),
+            planted_segments,
+            "a fold attempted inside the spacing interval must be skipped"
+        );
+
+        pacer.last_fold_attempt = None;
+        pacer.commit(Some(&mut t_index));
+        assert!(
+            pacer.last_fold_attempt.is_some(),
+            "the attempt must be recorded"
+        );
+        assert!(
+            t_index.segment_count() < planted_segments,
+            "the small segments must be folded, still {} of {planted_segments}",
+            t_index.segment_count()
+        );
+        assert_eq!(t_index.doc_count().expect("doc count"), 6);
     }
 
     /// #453: the headroom projection doubles only the live lexical bytes.

@@ -64,6 +64,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   more messages ingested per CPU-second in an A/B incremental index on a clone
   of a 2.1M-message archive
   ([ff6d6485](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ff6d6485)).
+- **Large incremental catch-ups no longer slow down as they run.** Every lexical
+  publish re-verifies all live segments, so it costs time in proportion to the
+  whole index. The streaming indexer committed every 5 s and folded segments
+  only after the run: a big catch-up re-hashed gigabytes of unchanged segments
+  several times a minute and grew one generation past 3,000 segments. Commits
+  are now paced by their measured cost (the next waits at least 4x as long as
+  the last took, capped at 120 s), and the run folds its small segment tail
+  with one bounded merge every few minutes. On a clone of a real archive the
+  same catch-up added 5.71M messages in 1 h 50 min instead of 1.76M in 5 h 12 min.
 
 ## [v0.9.0] -- not yet released (Cargo.toml version; no tag or GitHub Release yet)
 
