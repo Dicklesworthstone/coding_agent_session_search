@@ -10214,18 +10214,35 @@ fn expected_live_lexical_doc_count_delta(
     {
         return Ok(None);
     }
-    // Live conversations only, like the full scan (orphaned rows are never indexed).
+    // Conversations touched since the memo: a rowid range over the new message
+    // rows only. This used to JOIN conversations in the same statement, and
+    // fsqlite's join path materialized every message row (content included)
+    // before filtering: on an 8M-message archive it ran for 20+ minutes at
+    // index startup and again in the post-run checkpoint refresh, where the
+    // stall watchdog killed runs that had finished their work (exit 70).
     let touched: Vec<i64> = storage
         .raw()
         .query_map_collect(
-            "SELECT DISTINCT m.conversation_id FROM messages m \
-             JOIN conversations c ON c.id = m.conversation_id WHERE m.id > ?1",
+            "SELECT DISTINCT conversation_id FROM messages WHERE id > ?1",
             &[ParamValue::from(old.max_message_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations touched since the expected lexical docs memo")?;
     let mut expected_docs = cached.expected_docs;
     for conversation_id in touched {
+        // Live conversations only, like the full scan (orphaned rows are never
+        // indexed): a point lookup per touched conversation.
+        let live: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+                &[ParamValue::from(conversation_id)],
+                |row: &crate::franken_sync::Row| row.get_typed(0),
+            )
+            .context("checking a touched conversation for the expected lexical docs memo")?;
+        if live == 0 {
+            continue;
+        }
         let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
         let is_new = |message: &crate::model::types::Message| {
             message.id.is_none_or(|id| id > old.max_message_id)
@@ -12415,6 +12432,18 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     state.committed_meta_fingerprint = committed_meta_fingerprint;
     state.updated_at_ms = FrankenStorage::now_millis();
     persist_lexical_rebuild_state(index_path, &state)
+}
+
+/// 5ajer: the final checkpoint refresh runs after the scan has parked every
+/// counter at `current == total`, and it can recount the expected lexical docs
+/// (database work that reports no progress). Grant it the finalize-class grace
+/// the other post-publish steps get, so the stall watchdog cannot kill a run
+/// whose ingest has already finished.
+fn grant_final_checkpoint_refresh_grace(progress: Option<&Arc<IndexingProgress>>) {
+    if let Some(progress) = progress {
+        progress.finalizing.store(true, Ordering::Relaxed);
+        progress.tick_activity();
+    }
 }
 
 fn refresh_completed_lexical_rebuild_checkpoint(
@@ -18540,6 +18569,7 @@ fn run_index_inner(
         // would silently drop the newly-ingested sessions from search). When
         // Tantivy is really behind, the refresh no-ops and search keeps
         // deferring; the real escalation there is a full rebuild, named below.
+        grant_final_checkpoint_refresh_grace(opts.progress.as_ref());
         if let Err(err) =
             refresh_completed_lexical_rebuild_checkpoint(&storage, &opts.db_path, &opts.data_dir)
         {
@@ -18575,6 +18605,7 @@ fn run_index_inner(
             "skipping final lexical checkpoint refresh because this incremental run made no canonical changes and started from a matching completed checkpoint"
         );
     } else {
+        grant_final_checkpoint_refresh_grace(opts.progress.as_ref());
         refresh_completed_lexical_rebuild_checkpoint_for_final_state(
             &mut storage,
             &opts.db_path,
@@ -54354,6 +54385,18 @@ mod tests {
         insert(conversation_id, 70, "user", "one more append");
         assert_eq!(cached(), full());
         assert_eq!(sidecar().delta_generations, 1);
+
+        // Orphaned rows are never indexed: an appended message whose
+        // conversation row does not exist must not count, and it is still an
+        // append (5ajer: the delta filters it with a point lookup, not a JOIN).
+        storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
+        insert(conversation_id + 1_000_000, 0, "user", "orphaned evidence");
+        assert_eq!(cached(), full());
+        assert_eq!(
+            sidecar().delta_generations,
+            2,
+            "an orphan append still takes the delta path"
+        );
         storage
             .raw()
             .execute_compat(
