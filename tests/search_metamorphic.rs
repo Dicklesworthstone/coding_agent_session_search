@@ -588,3 +588,77 @@ fn generated_boolean_queries_match_set_algebra() -> TestResult {
         Err(failures.join("\n").into())
     }
 }
+
+/// Deletion (2l1b0.68): `cass forget --apply` on one session removes exactly
+/// that session's messages. Every term's hit set equals the reference minus
+/// the forgotten session, so the forget neither leaks forgotten messages nor
+/// loses anyone else's. Forget changes the archive, so this relation builds a
+/// private corpus instead of sharing the one the other relations read.
+#[test]
+fn forgetting_a_session_removes_exactly_its_messages() -> TestResult {
+    const FORGOTTEN: usize = 7;
+    let corpus = build_corpus()?;
+    let forgotten: BTreeSet<usize> = (0..MESSAGES_PER_SESSION)
+        .map(|index| FORGOTTEN * 100 + index)
+        .collect();
+    // Negative control: the session contributes term hits before the forget,
+    // so the relation below can fail.
+    let mut before = BTreeSet::new();
+    for term in TERMS {
+        before.extend(corpus.search(term, &[])?.intersection(&forgotten).copied());
+    }
+    if before.is_empty() {
+        return Err("the forgotten session had no term hits before the forget".into());
+    }
+
+    let source = corpus
+        .home
+        .join(".codex/sessions/2026/08")
+        .join(format!("{:02}", FORGOTTEN + 1))
+        .join(format!(
+            "rollout-2026-08-{:02}T00-00-00-meta{FORGOTTEN:02}.jsonl",
+            FORGOTTEN + 1
+        ));
+    let output = corpus
+        .cmd()
+        .args(["forget", "--source-glob"])
+        .arg(&source)
+        .args(["--apply", "--json"])
+        .output()?;
+    eprintln!(
+        "{}",
+        json!({"event": "forget", "session": FORGOTTEN, "exit": output.status.code()})
+    );
+    if !output.status.success() {
+        return Err(format!("forget failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    if report["conversations_deleted"] != 1 {
+        return Err(format!("expected one forgotten conversation: {report}").into());
+    }
+
+    for term in TERMS {
+        let expected: BTreeSet<usize> = corpus
+            .with_term(term)
+            .difference(&forgotten)
+            .copied()
+            .collect();
+        assert_same(
+            &format!("{term} after forgetting session {FORGOTTEN}"),
+            &corpus.search(term, &[])?,
+            &expected,
+        )?;
+    }
+    for id in &forgotten {
+        let hits = corpus.search(&format!("msgid{id}"), &[])?;
+        if !hits.is_empty() {
+            return Err(format!("forgotten message {id} is still found: {hits:?}").into());
+        }
+    }
+    let kept = (FORGOTTEN + 1) * 100 + 3;
+    assert_same(
+        "a kept neighbour's own message",
+        &corpus.search(&format!("msgid{kept}"), &[])?,
+        &BTreeSet::from([kept]),
+    )
+}
