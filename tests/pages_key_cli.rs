@@ -201,7 +201,14 @@ fn a_printed_recovery_secret_unlocks_the_archive_in_the_viewer_worker() {
     let secret = added["recovery_secret"]
         .as_str()
         .unwrap_or_else(|| panic!("add-recovery printed no secret: {added}"));
+    assert_viewer_worker_unlocks(&bundle, secret, None);
+}
 
+/// The viewer's own crypto worker, run under Node (see the test above), must
+/// refuse `refused` (default: `secret` with its first character changed),
+/// unlock with `secret` as the recovery-key form posts it, and decrypt the
+/// fixture's plaintext with the key it returns.
+fn assert_viewer_worker_unlocks(bundle: &Path, secret: &str, refused: Option<&str>) {
     let script = r#"
         import { readFile } from 'node:fs/promises';
         import { readFileSync } from 'node:fs';
@@ -229,8 +236,9 @@ fn a_printed_recovery_secret_unlocks_the_archive_in_the_viewer_worker() {
             return messages.find((m) => m.requestId === data.requestId && m.type !== 'PROGRESS');
         };
 
-        const altered = (secret[0] === 'A' ? 'B' : 'A') + secret.slice(1);
-        const refused = await request({ type: 'UNLOCK_RECOVERY', recoverySecret: altered, config, requestId: 1 });
+        const refusedSecret = process.env.CASS_REFUSED_SECRET
+            || (secret[0] === 'A' ? 'B' : 'A') + secret.slice(1);
+        const refused = await request({ type: 'UNLOCK_RECOVERY', recoverySecret: refusedSecret, config, requestId: 1 });
         if (refused?.type !== 'UNLOCK_FAILED') {
             throw new Error(`a wrong recovery key was not refused: ${JSON.stringify(refused)}`);
         }
@@ -251,10 +259,15 @@ fn a_printed_recovery_secret_unlocks_the_archive_in_the_viewer_worker() {
     "#;
     // No --experimental-default-type: Node 24 removed it, and the worker has no
     // import/export, so it loads the same as CommonJS or as a module.
-    let output = std::process::Command::new("node")
-        .args(["--input-type=module", "--eval", script])
+    let mut node = std::process::Command::new("node");
+    node.args(["--input-type=module", "--eval", script])
         .env("CASS_SITE_DIR", bundle.join("site"))
         .env("CASS_RECOVERY_SECRET", secret)
+        .env_remove("CASS_REFUSED_SECRET");
+    if let Some(refused) = refused {
+        node.env("CASS_REFUSED_SECRET", refused);
+    }
+    let output = node
         .output()
         .expect("run the viewer crypto worker under node");
     assert!(
@@ -264,6 +277,54 @@ fn a_printed_recovery_secret_unlocks_the_archive_in_the_viewer_worker() {
         String::from_utf8_lossy(&output.stderr)
     );
     eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+}
+
+/// 2l1b0.61: `key rotate --keep-recovery` through the real binary
+/// re-encrypts under a fresh key and prints a new recovery secret. That
+/// secret unlocks the rotated archive in the viewer worker, and the secret
+/// printed before the rotation is refused (the negative: a rotation that kept
+/// the old recovery slot would admit it).
+#[test]
+fn a_rotated_archive_unlocks_with_its_new_recovery_secret_only() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path();
+    let bundle = encrypted_bundle(home);
+    let secret_from = |output: std::process::Output, verb: &str| -> String {
+        assert!(
+            output.status.success(),
+            "{verb} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = json(&output);
+        value["recovery_secret"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{verb} printed no recovery secret: {value}"))
+            .to_string()
+    };
+
+    let before = secret_from(
+        cass(home)
+            .args(["pages", "key", "add-recovery", "--archive"])
+            .arg(&bundle)
+            .args(["--password-stdin", "--json"])
+            .write_stdin(format!("{PASSWORD}\n"))
+            .output()
+            .expect("key add-recovery"),
+        "add-recovery",
+    );
+    let after = secret_from(
+        cass(home)
+            .args(["pages", "key", "rotate", "--keep-recovery", "--archive"])
+            .arg(&bundle)
+            .args(["--password-stdin", "--json"])
+            .write_stdin(format!("{PASSWORD}\nrotated password 77\n"))
+            .output()
+            .expect("key rotate --keep-recovery"),
+        "rotate --keep-recovery",
+    );
+    assert_ne!(before, after, "rotation must mint a new recovery secret");
+    assert_viewer_worker_unlocks(&bundle, &after, Some(&before));
 }
 
 /// A password verb without `--password-stdin` and without a terminal must
