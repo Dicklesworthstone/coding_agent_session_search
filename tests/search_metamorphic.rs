@@ -4,8 +4,9 @@
 //! times. Every query runs through the real `cass` binary (lexical mode,
 //! automatic wildcard fallback off) and its hit set must equal the one a
 //! small set-algebra reference computes: OR is union, AND (explicit or
-//! implicit) is intersection, NOT is difference, and a time window keeps
-//! exactly the messages inside it. These relations do not depend on any one
+//! implicit) is intersection, NOT is difference, a time window keeps exactly
+//! the messages inside it, and a workspace filter keeps exactly the messages
+//! of that workspace's sessions. These relations do not depend on any one
 //! expected answer, so a regression in the grammar, the filters or the
 //! engine shows up as a set difference, printed per query.
 //!
@@ -34,11 +35,17 @@ const MESSAGES_PER_SESSION: usize = 10;
 const DAY0_SECS: i64 = 1_785_542_400;
 const DAY_SECS: i64 = 86_400;
 
-/// One generated message: its id, UTC timestamp (seconds) and terms.
+/// Session `s` works in `WORKSPACES[s % 2]`; neither path is a prefix of the
+/// other, so a workspace filter cannot match both by accident.
+const WORKSPACES: [&str; 2] = ["/work/alpha", "/work/beta"];
+
+/// One generated message: its id, UTC timestamp (seconds), terms and the
+/// workspace of its session.
 struct Message {
     id: usize,
     at_secs: i64,
     terms: BTreeSet<&'static str>,
+    workspace: &'static str,
 }
 
 struct Corpus {
@@ -172,6 +179,14 @@ impl Corpus {
             .map(|message| message.id)
             .collect()
     }
+
+    fn in_workspace(&self, workspace: &str) -> BTreeSet<usize> {
+        self.messages
+            .iter()
+            .filter(|message| message.workspace == workspace)
+            .map(|message| message.id)
+            .collect()
+    }
 }
 
 fn message_id(content: &str) -> Option<usize> {
@@ -205,8 +220,9 @@ fn write_session(codex_home: &Path, session: usize, messages: &mut Vec<Message>)
         .join(format!("{:02}", session + 1));
     fs::create_dir_all(&dir)?;
     let name = format!("meta{session:02}");
+    let workspace = WORKSPACES[session % WORKSPACES.len()];
     let mut lines = vec![format!(
-        r#"{{"timestamp":"{}","type":"session_meta","payload":{{"id":"{name}","cwd":"/work/metamorphic","cli_version":"0.42.0"}}}}"#,
+        r#"{{"timestamp":"{}","type":"session_meta","payload":{{"id":"{name}","cwd":"{workspace}","cli_version":"0.42.0"}}}}"#,
         rfc3339(day)
     )];
     let mut rng =
@@ -239,7 +255,12 @@ fn write_session(codex_home: &Path, session: usize, messages: &mut Vec<Message>)
             rfc3339(at_secs),
             words.join(" ")
         ));
-        messages.push(Message { id, at_secs, terms });
+        messages.push(Message {
+            id,
+            at_secs,
+            terms,
+            workspace,
+        });
     }
     fs::write(
         dir.join(format!(
@@ -367,6 +388,34 @@ fn time_windows_are_exact_and_nested() -> TestResult {
             }
             previous_since = Some(got);
         }
+    }
+    Ok(())
+}
+
+/// Filters narrow (2l1b0.68): `--workspace W` keeps exactly the messages of
+/// W's sessions for every term, a strict subset of the unfiltered answer, and
+/// the two workspaces together give the unfiltered answer back. A filter
+/// that was accepted but ignored (the silent-substitution class) returns
+/// the whole set and fails.
+#[test]
+fn workspace_filters_keep_exactly_their_sessions() -> TestResult {
+    let corpus = corpus();
+    for term in TERMS {
+        let all = corpus.with_term(term);
+        let mut union = BTreeSet::new();
+        for workspace in WORKSPACES {
+            let expected: BTreeSet<usize> = all
+                .intersection(&corpus.in_workspace(workspace))
+                .copied()
+                .collect();
+            if expected.is_empty() || expected == all {
+                return Err(format!("{term}: {workspace} does not split the answer").into());
+            }
+            let got = corpus.search(term, &["--workspace", workspace])?;
+            assert_same(&format!("{term} --workspace {workspace}"), &got, &expected)?;
+            union.extend(got);
+        }
+        assert_same(&format!("{term} across both workspaces"), &union, &all)?;
     }
     Ok(())
 }
