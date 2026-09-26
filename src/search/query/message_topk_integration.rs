@@ -465,6 +465,21 @@ fn adaptive_exact_messages_resolve_large_tie_cohorts_without_source_mutation() {
 
 // These fixtures exercise the shared exact driver, independently of the native
 // ANN delta lane. Reopen after durable append so the owner retains the WAL view.
+/// The main file's records as (doc id, vector, tombstoned), read through the
+/// index rather than as bytes.
+fn main_records(path: &Path) -> Vec<(String, Vec<f32>, bool)> {
+    let index = FsVectorIndex::open(path).unwrap();
+    (0..index.record_count())
+        .map(|record| {
+            (
+                index.doc_id_at(record).unwrap().to_string(),
+                index.vector_at_f32(record).unwrap(),
+                index.is_deleted(record),
+            )
+        })
+        .collect()
+}
+
 fn retained_wal_artifact(
     path: &Path,
     main: &[(String, [f32; 2])],
@@ -472,6 +487,7 @@ fn retained_wal_artifact(
 ) -> SemanticIndexArtifact {
     drop(artifact(path, main));
     let original_main = std::fs::read(path).unwrap();
+    let before = main_records(path);
     if !updates.is_empty() {
         let mut writer = FsVectorIndex::open_writer(path).unwrap();
         let updates = updates
@@ -481,7 +497,30 @@ fn retained_wal_artifact(
         writer.append_batch(&updates).unwrap();
         assert!(writer.wal_record_count() > 0);
     }
-    assert_eq!(std::fs::read(path).unwrap(), original_main);
+    // Appends go to the WAL and leave the main file byte-identical, except
+    // that an update superseding a main record makes the pinned engine
+    // tombstone that record in place (frankensearch-index append_batch).
+    // Every main record then keeps its id and vector, and exactly the
+    // superseded ones are tombstoned (nohx1).
+    let superseded: HashSet<&str> = updates
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .filter(|id| main.iter().any(|(main_id, _)| main_id == id))
+        .collect();
+    if superseded.is_empty() {
+        assert_eq!(std::fs::read(path).unwrap(), original_main);
+    } else {
+        let after = main_records(path);
+        assert_eq!(after.len(), before.len());
+        for ((id, vector, was_deleted), (id_after, vector_after, deleted)) in
+            before.iter().zip(&after)
+        {
+            assert_eq!(id, id_after);
+            assert_eq!(vector, vector_after);
+            assert!(!was_deleted, "{id} was tombstoned before the append");
+            assert_eq!(*deleted, superseded.contains(id.as_str()), "{id}");
+        }
+    }
     SemanticIndexArtifact::open(path, None).unwrap()
 }
 
