@@ -36,9 +36,12 @@ const TEST_RECOVERY_SECRET: &[u8] = b"test-recovery-secret-32-bytes!!";
 // =============================================================================
 
 fn run_node_module_assertions(script: &str) -> std::io::Result<Output> {
+    // `--experimental-detect-module` loads the ES-module assets as modules on
+    // Node 20.10+ and is a no-op where detection is the default (22.7+).
+    // Node 24 removed `--experimental-default-type` and rejects it.
     Command::new("node")
         .args([
-            "--experimental-default-type=module",
+            "--experimental-detect-module",
             "--input-type=module",
             "--eval",
             script,

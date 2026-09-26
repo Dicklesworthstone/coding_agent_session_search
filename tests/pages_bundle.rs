@@ -29,9 +29,12 @@ mod tests {
     }
 
     fn run_node_module_assertions(script: &str) -> Result<()> {
+        // `--experimental-detect-module` loads the ES-module assets as modules
+        // on Node 20.10+ and is a no-op where detection is the default
+        // (22.7+). Node 24 removed `--experimental-default-type`.
         let output = Command::new("node")
             .args([
-                "--experimental-default-type=module",
+                "--experimental-detect-module",
                 "--input-type=module",
                 "--eval",
                 script,
