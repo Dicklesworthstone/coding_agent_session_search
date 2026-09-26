@@ -153,11 +153,13 @@ const CONTRACTS: &[DependencyContract] = &[
         // 0.3.1 (2026-09-25) indexes Claude Code prompts typed mid-turn
         // (queued_command attachments, cass#500), honors CASS_EXCLUDE_PATHS in
         // the Codex and Pi-family connectors (cass#486), and caps session
-        // reads while reading.
+        // reads while reading. 0.3.2 (2026-09-26) lets CASS set that Codex
+        // rollout read cap, which 0.3.1 fixed at 100 MiB regardless of
+        // CASS_CODEX_MAX_SOURCE_BYTES.
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.1",
+        expected_version: "0.3.2",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[

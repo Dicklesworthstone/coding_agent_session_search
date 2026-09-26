@@ -274,6 +274,11 @@ pub(super) fn scan(
     );
     // Resolve once, before discovery or callbacks can perform any work.
     let limits = ScanLimits::from_env()?;
+    // Since franken-agent-detection 0.3.1 the primary rollout reader applies
+    // its own admission budget (100 MiB by default) and refused every larger
+    // rollout as invalid data after this policy had admitted it. Hand it the
+    // same policy.
+    franken_agent_detection::connectors::codex::set_codex_rollout_byte_budget(limits.jsonl_bytes);
     let admission = ScanAdmission {
         exclusions: ScanExclusions::from_env(),
         limits,

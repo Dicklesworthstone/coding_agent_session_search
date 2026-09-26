@@ -1903,9 +1903,9 @@ dependencies = [
 
 [[package]]
 name = "franken-agent-detection"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8be1c95928a3f0cd09f46df707b737b5e5988f19f6f5dcadf4e97580a5ee6f50"
+checksum = "1e1a7fe8c1103475e8384e55ba01962a8f51c022c994b8c2dee041fdae5b2861"
 dependencies = [
  "aes-gcm",
  "anyhow",
