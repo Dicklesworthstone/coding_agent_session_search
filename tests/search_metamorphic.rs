@@ -662,3 +662,62 @@ fn forgetting_a_session_removes_exactly_its_messages() -> TestResult {
         &BTreeSet::from([kept]),
     )
 }
+
+/// The same relations through the SQLite FTS5 lane (2l1b0.68), which answers
+/// when no lexical index is readable. A client opened on the canonical
+/// database with no index directory, read-only so the shared corpus is not
+/// repaired underneath the other relations, must return each term's exact
+/// message set and set-algebra answers for two-term OR and AND. NOT and
+/// precedence on the SQLite lanes are tracked by uvii3 and not asserted here.
+#[test]
+fn the_fts5_lane_answers_the_same_term_sets() -> TestResult {
+    use coding_agent_search::search::query::{
+        FieldMask, SearchClient, SearchClientOptions, SearchFilters,
+    };
+    let corpus = corpus();
+    let client = SearchClient::open_with_options(
+        &corpus.data_dir.join("no-lexical-index"),
+        Some(&corpus.data_dir.join("agent_search.db")),
+        SearchClientOptions {
+            enable_reload: false,
+            enable_warm: false,
+            strict_read_only: true,
+        },
+    )?
+    .ok_or("no SQLite search client over the canonical database")?;
+    if client.has_tantivy() {
+        return Err("the client opened a lexical index; the FTS5 lane is not under test".into());
+    }
+    let ids = |query: &str| -> TestResult<BTreeSet<usize>> {
+        let mut ids = BTreeSet::new();
+        for hit in client.search(query, SearchFilters::default(), 1000, 0, FieldMask::FULL)? {
+            ids.insert(
+                message_id(&hit.content)
+                    .ok_or_else(|| format!("hit without a msgid token: {:?}", hit.content))?,
+            );
+        }
+        eprintln!(
+            "{}",
+            json!({"event": "fts5_search", "query": query, "hits": ids.len()})
+        );
+        Ok(ids)
+    };
+    for term in TERMS {
+        assert_same(
+            &format!("fts5 {term}"),
+            &ids(term)?,
+            &corpus.with_term(term),
+        )?;
+    }
+    let (k, l) = (corpus.with_term("kiwiword"), corpus.with_term("limeword"));
+    assert_same(
+        "fts5 kiwiword OR limeword",
+        &ids("kiwiword OR limeword")?,
+        &k.union(&l).copied().collect(),
+    )?;
+    assert_same(
+        "fts5 kiwiword limeword",
+        &ids("kiwiword limeword")?,
+        &k.intersection(&l).copied().collect(),
+    )
+}
