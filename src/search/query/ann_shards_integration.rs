@@ -8,7 +8,7 @@ use frankensearch::index::HnswConfig;
 
 fn client(connection: Option<SearchSqliteConnection>) -> SearchClient {
     SearchClient {
-        reader: None,
+        reader: LexicalReaderSlot::default(),
         sqlite: Mutex::new(connection),
         sqlite_path: None,
         strict_read_only: true,

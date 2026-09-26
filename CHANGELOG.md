@@ -33,6 +33,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **An open TUI keeps searching after the index is rebuilt.** A rebuild
+  (`cass forget`, `dedup --apply`, an agent purge, `cass index --full`, the
+  background repair) publishes a new index in place of the old one. A TUI
+  that was already open then failed every search with "Keeper generation N
+  identifies two different MANIFEST images" until it was restarted. Search
+  now notices the new index, opens it, and drops results cached from the
+  old one. After a forget, the open TUI stops showing the forgotten
+  conversation.
 - **Claude Code prompts typed while the agent is mid-turn are searchable
   (GH #500).** Claude Code saves them as `queued_command` attachments, which
   the connector dropped. franken-agent-detection 0.3.1 indexes person-typed

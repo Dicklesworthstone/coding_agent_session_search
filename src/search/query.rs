@@ -3385,10 +3385,7 @@ impl FsLexicalRead for CassProgressiveLexicalAdapter {
 }
 
 pub struct SearchClient {
-    reader: Option<(
-        frankensearch::quill::QuillSearchIndex,
-        crate::search::quill_bridge::QuillCassFields,
-    )>,
+    reader: LexicalReaderSlot,
     sqlite: Mutex<Option<SearchSqliteConnection>>,
     sqlite_path: Option<PathBuf>,
     strict_read_only: bool,
@@ -3913,6 +3910,51 @@ struct FederatedIndexReader {
 
 static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// The single-directory lexical reader and the path it was opened from.
+///
+/// A lexical rebuild publishes a new index lineage by exchanging the whole
+/// directory, which in-place catch-up cannot follow. The slot lets a
+/// reloading client (the TUI) open the path again and swap the reader in
+/// instead of failing every later search.
+#[derive(Default)]
+struct LexicalReaderSlot {
+    index_path: Option<PathBuf>,
+    current: RwLock<
+        Option<(
+            frankensearch::quill::QuillSearchIndex,
+            crate::search::quill_bridge::QuillCassFields,
+        )>,
+    >,
+}
+
+impl LexicalReaderSlot {
+    fn new(
+        index_path: PathBuf,
+        reader: Option<(
+            frankensearch::quill::QuillSearchIndex,
+            crate::search::quill_bridge::QuillCassFields,
+        )>,
+    ) -> Self {
+        Self {
+            index_path: Some(index_path),
+            current: RwLock::new(reader),
+        }
+    }
+
+    fn get(
+        &self,
+    ) -> Option<(
+        frankensearch::quill::QuillSearchIndex,
+        crate::search::quill_bridge::QuillCassFields,
+    )> {
+        self.current.read().clone()
+    }
+
+    fn is_some(&self) -> bool {
+        self.current.read().is_some()
+    }
+}
 static SEARCH_CLIENT_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static SEARCHER_RELOAD_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
@@ -3932,22 +3974,37 @@ impl Drop for ReloadInFlightGuard {
     }
 }
 
+/// Refresh `readers` in place on a bounded worker. `Ok(true)` when a
+/// directory was republished as a new index lineage and must be opened again
+/// (see [`crate::search::quill_bridge::refresh_reader_or_detect_republish`]).
 fn reload_index_readers_bounded(
     readers: Vec<frankensearch::quill::QuillSearchIndex>,
     reload_in_flight: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<bool> {
+    let republished = Arc::new(AtomicBool::new(false));
+    let worker_republished = Arc::clone(&republished);
     run_reload_bounded(
         move || {
-            readers
-                .iter()
-                .try_for_each(|reader| {
-                    crate::search::quill_bridge::refresh_reader(reader).map(|_| ())
-                })
-                .map_err(|error| error.to_string())
+            for reader in &readers {
+                match crate::search::quill_bridge::refresh_reader_or_detect_republish(reader) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        tracing::info!(
+                            index = %reader.path().display(),
+                            reason,
+                            "lexical index was republished; reopening it"
+                        );
+                        worker_republished.store(true, Ordering::SeqCst);
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok(())
         },
         reload_in_flight,
         *SEARCHER_RELOAD_TIMEOUT,
-    )
+    )?;
+    Ok(republished.load(Ordering::SeqCst))
 }
 
 fn run_reload_bounded<F>(
@@ -4500,7 +4557,7 @@ impl SearchClient {
         }
 
         Ok(Some(Self {
-            reader: tantivy,
+            reader: LexicalReaderSlot::new(index_path, tantivy),
             sqlite: Mutex::new(None),
             sqlite_path,
             strict_read_only: options.strict_read_only,
@@ -4575,9 +4632,13 @@ impl SearchClient {
 
         // Invalidate prefix cache if the index has been updated since last search.
         // This must happen BEFORE the cache check below to avoid serving stale results.
-        if let Some((reader, _)) = &self.reader {
-            self.maybe_reload_reader(reader)?;
-            self.track_generation(reader.keeper_generation());
+        if let Some((reader, _)) = self.reader.get() {
+            // A reload may reopen a republished index, so track the reader
+            // that is current afterwards.
+            self.maybe_reload_reader(&reader)?;
+            if let Some((reader, _)) = self.reader.get() {
+                self.track_generation(reader.keeper_generation());
+            }
         } else if let Some(readers) = self.federated_readers()
             && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?
         {
@@ -4646,7 +4707,7 @@ impl SearchClient {
         };
 
         // Tantivy is the primary high-performance engine.
-        if let Some((reader, fields)) = &self.reader {
+        if let Some((reader, fields)) = self.reader.get() {
             tracing::info!(
                 backend = "tantivy",
                 query = sanitized,
@@ -4655,8 +4716,8 @@ impl SearchClient {
                 "search_start"
             );
             let (hits, tantivy_total_count) = self.search_tantivy(
-                reader,
-                fields,
+                &reader,
+                &fields,
                 query,
                 &sanitized,
                 filters.clone(),
@@ -4690,8 +4751,8 @@ impl SearchClient {
                         "retrying lexical fetch due to dedup or session-path shortfall"
                     );
                     let (retry_hits, retry_total_count) = self.search_tantivy(
-                        reader,
-                        fields,
+                        &reader,
+                        &fields,
                         query,
                         &sanitized,
                         filters.clone(),
@@ -7614,20 +7675,30 @@ impl SearchClient {
 
         let reload_started = Instant::now();
         let cached_generation = self.federated_generation_signature(readers);
-        if let Err(error) = reload_index_readers_bounded(
+        let republished = match reload_index_readers_bounded(
             readers.iter().map(|shard| shard.reader.clone()).collect(),
             Arc::clone(&self.metrics.reload_in_flight),
         ) {
-            self.metrics
-                .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                    cache_hit: true,
-                    cached_generation: Some(self.federated_generation_signature(readers)),
-                    current_generation: self.federated_generation_signature(readers),
-                    reload_attempted: true,
-                    reload_succeeded: false,
-                    served_fallback: false,
-                });
-            return Err(error);
+            Ok(republished) => republished,
+            Err(error) => {
+                self.metrics
+                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
+                        cache_hit: true,
+                        cached_generation: Some(self.federated_generation_signature(readers)),
+                        current_generation: self.federated_generation_signature(readers),
+                        reload_attempted: true,
+                        reload_succeeded: false,
+                        served_fallback: false,
+                    });
+                return Err(error);
+            }
+        };
+        if republished {
+            self.reopen_republished_lexical_index()?;
+            *guard = Some(Instant::now());
+            return Ok(self
+                .federated_readers()
+                .map(|reopened| self.federated_generation_signature(&reopened)));
         }
         let elapsed = reload_started.elapsed();
         // Rate-limit from completion, not start. A slow successful reload must
@@ -9806,9 +9877,21 @@ fn maybe_spawn_warm_worker(
                 }
                 last_run = now;
                 let reload_started = Instant::now();
-                if let Err(err) = crate::search::quill_bridge::refresh_reader(&reader) {
-                    tracing::warn!(error = ?err, "warm_worker_reload_failed");
-                    continue;
+                match crate::search::quill_bridge::refresh_reader_or_detect_republish(&reader) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        // Its clone of the reader belongs to the old lineage;
+                        // warming it would only warm files that are gone.
+                        tracing::debug!(
+                            reason,
+                            "warm worker stops: its lexical index was republished"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "warm_worker_reload_failed");
+                        continue;
+                    }
                 }
                 let elapsed = reload_started.elapsed();
                 let epoch = reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -10183,7 +10266,7 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 impl SearchClient {
     /// Return the total number of indexed Tantivy documents.
     pub fn total_docs(&self) -> usize {
-        if let Some((reader, _)) = &self.reader {
+        if let Some((reader, _)) = self.reader.get() {
             return usize::try_from(reader.doc_count().unwrap_or(0)).unwrap_or(usize::MAX);
         }
         self.federated_readers()
@@ -10216,20 +10299,26 @@ impl SearchClient {
         {
             let reload_started = Instant::now();
             let cached_generation = reader.keeper_generation();
-            if let Err(error) = reload_index_readers_bounded(
+            let republished = match reload_index_readers_bounded(
                 vec![reader.clone()],
                 Arc::clone(&self.metrics.reload_in_flight),
             ) {
-                self.metrics
-                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                        cache_hit: true,
-                        cached_generation: Some(cached_generation),
-                        current_generation: cached_generation,
-                        reload_attempted: true,
-                        reload_succeeded: false,
-                        served_fallback: false,
-                    });
-                return Err(error);
+                Ok(republished) => republished,
+                Err(error) => {
+                    self.metrics
+                        .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
+                            cache_hit: true,
+                            cached_generation: Some(cached_generation),
+                            current_generation: cached_generation,
+                            reload_attempted: true,
+                            reload_succeeded: false,
+                            served_fallback: false,
+                        });
+                    return Err(error);
+                }
+            };
+            if republished {
+                self.reopen_republished_lexical_index()?;
             }
             let elapsed = reload_started.elapsed();
             // Rate-limit from completion, not start. This keeps a slow reload
@@ -10255,6 +10344,86 @@ impl SearchClient {
                 "tantivy_reader_reload"
             );
         }
+        Ok(())
+    }
+
+    /// Open the index path again after it was republished as a new lineage
+    /// (a rebuild's directory exchange), the way `open_with_options` opens
+    /// it, and swap the readers in. The rebuild can reuse the old generation
+    /// number, so the prefix cache is cleared here rather than left to
+    /// `track_generation`.
+    fn reopen_republished_lexical_index(&self) -> Result<()> {
+        let Some(index_path) = self.reader.index_path.clone() else {
+            return Err(anyhow!(
+                "the lexical index was republished and this search client has no path to reopen it from"
+            ));
+        };
+        type Opened = (
+            Option<frankensearch::quill::QuillSearchIndex>,
+            Option<Vec<FederatedIndexReader>>,
+        );
+        let opened: Arc<Mutex<Option<Opened>>> = Arc::new(Mutex::new(None));
+        let worker_opened = Arc::clone(&opened);
+        run_reload_bounded(
+            move || {
+                let single = crate::search::quill_bridge::open_cass_reader(&index_path).ok();
+                let federated = if single.is_none() {
+                    crate::search::tantivy::open_federated_search_readers(&index_path)
+                        .ok()
+                        .flatten()
+                        .filter(|readers| !readers.is_empty())
+                        .map(|readers| {
+                            readers
+                                .into_iter()
+                                .map(|(reader, fields)| FederatedIndexReader { reader, fields })
+                                .collect::<Vec<_>>()
+                        })
+                } else {
+                    None
+                };
+                if single.is_none() && federated.is_none() {
+                    return Err(format!(
+                        "reopening the republished lexical index at {}: no readable index",
+                        index_path.display()
+                    ));
+                }
+                *worker_opened.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((single, federated));
+                Ok(())
+            },
+            Arc::clone(&self.metrics.reload_in_flight),
+            *SEARCHER_RELOAD_TIMEOUT,
+        )?;
+        let (single, federated) = opened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| anyhow!("the lexical reopen worker returned no readers"))?;
+        *self.reader.current.write() = single.map(|reader| {
+            (
+                reader,
+                crate::search::quill_bridge::QuillCassFields::compiled(),
+            )
+        });
+        match federated {
+            Some(readers) => {
+                FEDERATED_SEARCH_READERS
+                    .write()
+                    .insert(self.cache_namespace.clone(), Arc::new(readers));
+            }
+            None => {
+                FEDERATED_SEARCH_READERS
+                    .write()
+                    .remove(&self.cache_namespace);
+            }
+        }
+        if let Ok(mut cache) = self.prefix_cache.lock() {
+            cache.clear();
+        }
+        *self
+            .last_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         Ok(())
     }
 
@@ -10559,7 +10728,7 @@ mod tests {
 
     fn cass_layer_b_test_client(connection: Option<SearchSqliteConnection>) -> SearchClient {
         SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(connection),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -11955,7 +12124,7 @@ mod tests {
                 )
             });
         let client = SearchClient {
-            reader,
+            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12728,7 +12897,7 @@ mod tests {
     #[test]
     fn cache_skips_complex_queries() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12780,7 +12949,7 @@ mod tests {
     #[test]
     fn cache_prefix_lookup_handles_utf8_boundaries() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12992,7 +13161,7 @@ mod tests {
     #[test]
     fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13534,7 +13703,7 @@ mod tests {
                 (1, 1, 0, 'the error_handler fired', 1);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13617,7 +13786,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13705,7 +13874,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13809,7 +13978,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader,
+            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13915,7 +14084,7 @@ mod tests {
         // Opening via sqlite_guard() must remain read-only. A search path
         // should not trigger heavyweight derived-index repair.
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14035,7 +14204,7 @@ mod tests {
         }
 
         let client = Arc::new(SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14323,7 +14492,7 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14491,7 +14660,7 @@ mod tests {
             ],
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14629,7 +14798,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14764,7 +14933,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14882,7 +15051,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15011,7 +15180,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15173,7 +15342,7 @@ mod tests {
         );
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15925,7 +16094,7 @@ mod tests {
                 (3, 1, 2, 'gamma delta', 3);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15998,7 +16167,7 @@ mod tests {
                 (3, 1, 2, 'plain hauler text', 3);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16105,7 +16274,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16201,7 +16370,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16645,7 +16814,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16719,7 +16888,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16809,7 +16978,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16927,7 +17096,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17014,7 +17183,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17108,7 +17277,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17192,7 +17361,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17276,7 +17445,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17361,7 +17530,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17484,7 +17653,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17613,7 +17782,7 @@ mod tests {
     #[test]
     fn track_generation_clears_cache_on_change() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17676,7 +17845,7 @@ mod tests {
     #[test]
     fn cache_total_cap_evicts_across_shards() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
@@ -17732,7 +17901,7 @@ mod tests {
     #[test]
     fn cache_stats_reflect_metrics() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17774,7 +17943,7 @@ mod tests {
     fn adaptive_query_prewarm_schedules_only_after_hot_prefix_cache_entry() {
         let (tx, rx) = mpsc::unbounded();
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(10, 0)),
@@ -17839,7 +18008,7 @@ mod tests {
 
         let (tx, rx) = mpsc::unbounded();
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(10, byte_cap)),
@@ -17882,7 +18051,7 @@ mod tests {
     fn cache_eviction_count_tracks_evictions() {
         // tiny entry cap (2 entries), no byte cap - forces evictions
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
@@ -18095,7 +18264,7 @@ mod tests {
     fn cache_byte_cap_triggers_eviction() {
         // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
@@ -19463,7 +19632,7 @@ mod tests {
     #[test]
     fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19557,7 +19726,7 @@ mod tests {
     fn search_with_fallback_skips_for_nonzero_offset() -> Result<()> {
         // Even with zero hits, fallback should not run when paginating (offset > 0)
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19603,7 +19772,7 @@ mod tests {
     fn generate_suggestions_limits_and_sets_shortcuts() -> Result<()> {
         // Build a client without backends; suggestions are purely local heuristics
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20679,7 +20848,7 @@ mod tests {
     fn filter_fidelity_cache_key_isolation() {
         // Different filters should have different cache keys
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20912,7 +21081,7 @@ mod tests {
     #[test]
     fn search_sqlite_fts5_returns_empty_when_sqlite_is_unavailable() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -21054,7 +21223,7 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -21899,7 +22068,7 @@ mod tests {
     #[test]
     fn cache_metrics_incremented_on_operations() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -21939,7 +22108,7 @@ mod tests {
     fn cache_shard_name_deterministic() {
         // Verify that shard name generation is deterministic for same filters
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),

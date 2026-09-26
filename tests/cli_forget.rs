@@ -184,6 +184,28 @@ impl Archive {
         self.succeed(&format!("index {}", extra.join(" ")), &args)?;
         Ok(())
     }
+
+    /// Whether `cass status` reports the semantic assets current for the
+    /// canonical database. A hash-only archive has no quality tier, so the
+    /// check is no lexical fallback and a fast tier matching the database.
+    fn semantic_status_is_current(&self) -> TestResult<bool> {
+        let output = self.succeed("status", &["status", "--json"])?;
+        let status: Value = serde_json::from_slice(&output.stdout)?;
+        let semantic = &status["semantic"];
+        eprintln!(
+            "{}",
+            json!({
+                "test": "cli_forget",
+                "step": "status semantic",
+                "status": semantic["status"],
+                "fallback_mode": semantic["fallback_mode"],
+                "fast_tier_current_db_matches": semantic["fast_tier"]["current_db_matches"],
+                "summary": semantic["summary"],
+            })
+        );
+        Ok(semantic["fallback_mode"].is_null()
+            && semantic["fast_tier"]["current_db_matches"] == true)
+    }
 }
 
 /// A real-format Codex rollout (the connector only reads `rollout-*.jsonl`).
@@ -286,7 +308,57 @@ fn forget_apply_removes_forgotten_text_from_lexical_search() -> TestResult {
     if kept.is_empty() {
         return Err("forget removed an unrelated conversation from search".into());
     }
+
+    // Forget removes indexed copies. The raw mirror keeps its verbatim
+    // capture of the source; the README forget row's recipe removes it: move
+    // the source away (a rescan captures an existing source again), then
+    // prune its captures. A later index run must not bring it back.
+    if !raw_mirror_holds(&archive.data_dir, FORGOTTEN_MARKER)? {
+        return Err("the raw mirror never captured the forgotten source".into());
+    }
+    fs::rename(&forgotten, archive.home.path().join("moved-away.jsonl"))?;
+    archive.succeed(
+        "mirror prune",
+        &[
+            "mirror",
+            "prune",
+            "--older-than",
+            "0s",
+            "--safety-hold-down",
+            "0s",
+            "--source-path",
+            forgotten_str,
+            "--apply",
+            "--json",
+        ],
+    )?;
+    archive.index(&[])?;
+    if raw_mirror_holds(&archive.data_dir, FORGOTTEN_MARKER)? {
+        return Err("the raw mirror still holds the forgotten source after the prune".into());
+    }
+    if !raw_mirror_holds(&archive.data_dir, KEPT_MARKER)? {
+        return Err("a source-path mirror prune removed an unrelated capture".into());
+    }
     Ok(())
+}
+
+/// Whether any raw-mirror file under `data_dir` contains `marker`.
+fn raw_mirror_holds(data_dir: &Path, marker: &str) -> TestResult<bool> {
+    let root = data_dir.join("raw-mirror");
+    if !root.exists() {
+        return Ok(false);
+    }
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && fs::read(entry.path())?
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[test]
@@ -339,6 +411,9 @@ fn forget_apply_removes_forgotten_conversations_from_every_search_surface() -> T
     if archive.pack(FORGOTTEN_MARKER)?.contains(FORGOTTEN_SESSION) {
         return Err("pack still carries the forgotten conversation".into());
     }
+    if archive.semantic_status_is_current()? {
+        return Err("status calls the pre-forget semantic assets current".into());
+    }
 
     // 2l1b0.78: the command the semantic error names restores every surface,
     // still without the forgotten conversation. Before the fix it took the
@@ -349,6 +424,9 @@ fn forget_apply_removes_forgotten_conversations_from_every_search_surface() -> T
         if archive.search_hits(KEPT_MARKER, args)?.is_empty() {
             return Err(format!("{surface}: the catch-up lost the unrelated conversation").into());
         }
+    }
+    if !archive.semantic_status_is_current()? {
+        return Err("status still reports stale semantic assets after the catch-up".into());
     }
 
     // A conversation ingested after the forget is found on every surface, and
@@ -483,6 +561,241 @@ fn a_forgotten_source_stays_forgotten_until_the_file_changes() -> TestResult {
     let hits = archive.search_hit_paths(FORGOTTEN_MARKER)?;
     if !hits.iter().any(|path| path == forgotten_str) {
         return Err(format!("a changed source was not re-ingested: {hits:?}").into());
+    }
+    Ok(())
+}
+
+/// `cass dedup --apply` deletes canonical rows too (2l1b0.78). The plain
+/// index run it leads to must restore every surface, keep the canonical row,
+/// and drop the collapsed twin.
+#[test]
+fn every_search_surface_recovers_after_dedup_apply() -> TestResult {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    const CANONICAL_MARKER: &str = "dedupcanonicalepsilon";
+    const TWIN_MARKER: &str = "deduptwinzeta";
+
+    let (archive, _) = indexed_archive(&["--semantic", "--embedder", "hash"])?;
+
+    // The pre-fix duplicate shape (gh #302): a bare canonical row and its
+    // `projects/`-prefixed twin for one source path. Current ingest no longer
+    // writes twins, so they are seeded through the storage API. Distinct
+    // markers tell the two rows apart in search results.
+    let source_path = archive
+        .home
+        .path()
+        .join(".claude/projects/-proj/twin.jsonl");
+    let conversation = |external_id: &str, marker: &str| Conversation {
+        id: None,
+        agent_slug: "claude_code".into(),
+        workspace: Some(PathBuf::from("/work/dedup-test")),
+        external_id: Some(external_id.to_string()),
+        title: Some(format!("dedup {marker}")),
+        source_path: source_path.clone(),
+        started_at: Some(1_790_000_000_000),
+        ended_at: Some(1_790_000_000_100),
+        approx_tokens: None,
+        metadata_json: Value::Null,
+        messages: vec![Message {
+            id: None,
+            idx: 0,
+            role: MessageRole::User,
+            author: Some("user".into()),
+            created_at: Some(1_790_000_000_010),
+            content: format!("please look at {marker} again"),
+            extra_json: Value::Null,
+            snippets: Vec::new(),
+        }],
+        source_id: "local".into(),
+        origin_host: None,
+    };
+    let storage = FrankenStorage::open(&archive.data_dir.join("agent_search.db"))?;
+    let agent_id = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "claude_code".into(),
+        name: "Claude Code".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    storage.insert_conversation_tree(
+        agent_id,
+        None,
+        &conversation("-proj/twin.jsonl", CANONICAL_MARKER),
+    )?;
+    storage.insert_conversation_tree(
+        agent_id,
+        None,
+        &conversation("projects/-proj/twin.jsonl", TWIN_MARKER),
+    )?;
+    drop(storage);
+    archive.index(&["--full", "--semantic", "--embedder", "hash"])?;
+
+    let marker_hits = |marker: &str, args: &[&str]| -> TestResult<bool> {
+        Ok(archive
+            .search_hits(marker, args)?
+            .iter()
+            .any(|(_, content)| content.contains(marker)))
+    };
+    // Negative control: every surface returns both rows before the dedup.
+    for (surface, args) in SURFACES {
+        for marker in [CANONICAL_MARKER, TWIN_MARKER] {
+            if !marker_hits(marker, args)? {
+                return Err(format!("{surface}: {marker} not found before dedup").into());
+            }
+        }
+    }
+
+    let output = archive.succeed("dedup --apply", &["dedup", "--apply", "--json"])?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    if report["conversations_collapsed"] != 1 {
+        return Err(format!("expected one collapsed twin: {report}").into());
+    }
+    if archive.semantic_status_is_current()? {
+        return Err("status calls the pre-dedup semantic assets current".into());
+    }
+
+    archive.index(&["--semantic", "--embedder", "hash"])?;
+    for (surface, args) in SURFACES {
+        if marker_hits(TWIN_MARKER, args)? {
+            return Err(format!("{surface}: the collapsed twin is still returned").into());
+        }
+        if !marker_hits(CANONICAL_MARKER, args)? {
+            return Err(format!("{surface}: the canonical row was lost").into());
+        }
+        if archive.search_hits(KEPT_MARKER, args)?.is_empty() {
+            return Err(format!("{surface}: an unrelated conversation was lost").into());
+        }
+    }
+    if !archive.semantic_status_is_current()? {
+        return Err("status still reports stale semantic assets after the index run".into());
+    }
+    Ok(())
+}
+
+/// The TUI and `cass serve --stdio` keep one lexical reader open across many
+/// searches. A forget run while one is open must not leave the forgotten text
+/// reachable through it: the TUI's reloading client drops it on its next
+/// search, and a serve session, pinned until `reload` by contract
+/// (docs/SEARCH_SERVICE.md), drops it on reload.
+#[test]
+fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestResult {
+    use coding_agent_search::search::query::{
+        FieldMask, SearchClient, SearchClientOptions, SearchFilters,
+    };
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command as StdCommand, Stdio};
+
+    let (archive, forgotten) = indexed_archive(&[])?;
+    let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+
+    // The TUI's client (src/ui/app.rs open_search_service): reload on search,
+    // hits hydrated against the canonical database.
+    let index_path = coding_agent_search::search::tantivy::index_dir(&archive.data_dir)?;
+    let db_path = archive.data_dir.join("agent_search.db");
+    let client = SearchClient::open_with_options(
+        &index_path,
+        Some(&db_path),
+        SearchClientOptions {
+            enable_reload: true,
+            enable_warm: true,
+            strict_read_only: false,
+        },
+    )?
+    .ok_or("the TUI client found no lexical index")?;
+    let client_hits = |query: &str| -> TestResult<Vec<String>> {
+        let hits: Vec<String> = client
+            .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)?
+            .into_iter()
+            .map(|hit| hit.source_path)
+            .collect();
+        eprintln!(
+            "{}",
+            json!({"test": "cli_forget", "step": "tui client search", "query": query, "hits": hits})
+        );
+        Ok(hits)
+    };
+
+    let mut serve = StdCommand::new(cass_bin())
+        .args(["serve", "--stdio", "--data-dir"])
+        .arg(&archive.data_dir)
+        .env("HOME", archive.home.path())
+        .env("CASS_AUTO_REFRESH", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut serve_in = serve.stdin.take().ok_or("no serve stdin")?;
+    let mut serve_out = BufReader::new(serve.stdout.take().ok_or("no serve stdout")?);
+    let mut next_id = 0_u64;
+    let mut serve_request = |op: &str, query: Option<&str>| -> TestResult<Vec<String>> {
+        next_id += 1;
+        let mut request = json!({"op": op, "id": next_id});
+        if let Some(query) = query {
+            request["query"] = json!(query);
+            request["limit"] = json!(10);
+        }
+        writeln!(serve_in, "{request}")?;
+        serve_in.flush()?;
+        let mut line = String::new();
+        serve_out.read_line(&mut line)?;
+        let reply: Value = serde_json::from_str(&line)?;
+        if reply["ok"] != true {
+            return Err(format!("serve {request} failed: {reply}").into());
+        }
+        let hits: Vec<String> = reply["result"]["hits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|hit| hit["source_path"].as_str().unwrap_or_default().to_string())
+            .collect();
+        eprintln!(
+            "{}",
+            json!({"test": "cli_forget", "step": "serve", "request": request, "hits": hits})
+        );
+        Ok(hits)
+    };
+
+    // Negative control: both readers find the marker before the forget.
+    if !client_hits(FORGOTTEN_MARKER)?
+        .iter()
+        .any(|path| path == forgotten_str)
+    {
+        return Err("control: the TUI client did not find the marker before forget".into());
+    }
+    if !serve_request("search", Some(FORGOTTEN_MARKER))?
+        .iter()
+        .any(|path| path == forgotten_str)
+    {
+        return Err("control: the serve session did not find the marker before forget".into());
+    }
+
+    if archive.forget(forgotten_str, true)?["conversations_deleted"] != 1 {
+        return Err("forget did not delete the fixture conversation".into());
+    }
+    // SearchClient rate-limits reloads to one per 300 ms.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let after = client_hits(FORGOTTEN_MARKER)?;
+    if !after.is_empty() {
+        return Err(format!("the open TUI client still returns forgotten text: {after:?}").into());
+    }
+    if client_hits(KEPT_MARKER)?.is_empty() {
+        return Err("the open TUI client lost the unrelated conversation".into());
+    }
+
+    // The pinned session is logged, not judged; reload is the contract.
+    serve_request("search", Some(FORGOTTEN_MARKER))?;
+    serve_request("reload", None)?;
+    let after = serve_request("search", Some(FORGOTTEN_MARKER))?;
+    if !after.is_empty() {
+        return Err(format!("a reloaded serve session returns forgotten text: {after:?}").into());
+    }
+    if serve_request("search", Some(KEPT_MARKER))?.is_empty() {
+        return Err("the reloaded serve session lost the unrelated conversation".into());
+    }
+    serve_request("shutdown", None)?;
+    if !serve.wait()?.success() {
+        return Err("cass serve did not shut down cleanly".into());
     }
     Ok(())
 }

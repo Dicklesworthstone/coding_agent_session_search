@@ -230,6 +230,33 @@ pub fn refresh_reader(reader: &QuillSearchIndex) -> Result<bool> {
         .map_err(|error| anyhow!("refreshing the Quill CASS reader: {error}"))
 }
 
+/// Refresh a reader in place, or report that its directory was republished.
+///
+/// A lexical rebuild publishes by exchanging the whole index directory
+/// (`publish_staged_lexical_index`: `cass index --full`, forget, dedup, agent
+/// purge, the background repair). The path then holds a new index whose
+/// MANIFEST generations restart, and read-only catch-up refuses it as a
+/// generation regression, a reused generation, or a watermark rollback. A
+/// long-lived reader would fail every later search. `Ok(None)` is an in-place
+/// refresh; `Ok(Some(reason))` means the path must be opened again.
+///
+/// # Errors
+///
+/// Returns an error when the current publication cannot be read for any
+/// other reason.
+pub fn refresh_reader_or_detect_republish(reader: &QuillSearchIndex) -> Result<Option<String>> {
+    use frankensearch::quill::{QuillIndexError, SnapshotError};
+    match drive(|cx| async move { reader.refresh(&cx).await }) {
+        Ok(_) => Ok(None),
+        Err(QuillIndexError::Snapshot(
+            error @ (SnapshotError::KeeperGenerationRegression { .. }
+            | SnapshotError::KeeperGenerationCollision { .. }
+            | SnapshotError::KeeperTransition { .. }),
+        )) => Ok(Some(error.to_string())),
+        Err(error) => Err(anyhow!("refreshing the Quill CASS reader: {error}")),
+    }
+}
+
 /// One ranked hit from a Quill lexical search.
 ///
 /// Replaces the incumbent's `LexicalDocHit`, whose `doc_address` was a Tantivy
