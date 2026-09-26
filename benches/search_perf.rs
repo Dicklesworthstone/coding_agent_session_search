@@ -327,6 +327,7 @@ fn pack_bench_render_request(
     limits: PackPlannerLimits,
 ) -> PackRenderRequest {
     PackRenderRequest {
+        effective: None,
         query_text: "checkout failure answer pack freshness".to_string(),
         normalized_query: "checkout failure answer pack freshness".to_string(),
         generated_at_ms: PACK_BENCH_NOW_MS,

@@ -5743,6 +5743,67 @@ fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// 2l1b0.68: `pack` runs a search and echoes what that search ran in
+/// `_meta.effective`, as `search --robot-meta` does, without the search-only
+/// daemon policy. Negative control: before this change pack's `_meta` had no
+/// `effective`, and its own `query.filters` is always empty.
+#[test]
+fn pack_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let output = base_cmd()
+        .args([
+            "pack",
+            "hello OR world tool",
+            "--json",
+            "--agent",
+            "codex",
+            "--agent",
+            "claude_code",
+            "--since",
+            "2026-01-01",
+            "--source",
+            "local",
+            "--data-dir",
+            data_dir,
+        ])
+        .env("TZ", "UTC")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+    let effective = &json["_meta"]["effective"];
+    assert_eq!(effective["command"], "pack", "{effective}");
+    assert_eq!(effective["query"], "hello OR world tool");
+    assert_eq!(effective["query_structure"], "hello OR (world AND tool)");
+    assert_eq!(effective["query_recoveries"], serde_json::json!([]));
+    assert_eq!(
+        effective["db_path"].as_str(),
+        Some(
+            Path::new(data_dir)
+                .join("agent_search.db")
+                .to_str()
+                .ok_or("non-utf8 path")?
+        )
+    );
+    assert_eq!(effective["db_path_source"], "--data-dir");
+    // 2026-01-01T00:00:00Z.
+    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
+    assert_eq!(
+        effective["filters"]["agents"],
+        serde_json::json!(["claude_code", "codex"])
+    );
+    assert_eq!(effective["filters"]["source"], "local");
+    assert!(
+        effective.get("daemon").is_none(),
+        "pack has no daemon policy to echo: {effective}"
+    );
+    Ok(())
+}
+
 /// 2l1b0.68: the database path's source distinguishes `--db`,
 /// `CASS_DB_PATH` and the data dir, and a preset window names its flag on
 /// both bounds it sets.

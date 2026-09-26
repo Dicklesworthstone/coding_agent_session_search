@@ -46,6 +46,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   every compound group parenthesized (`a OR b c` reads as
   `a OR (b AND c)`), and `query_recoveries`, the parentheses it recovered
   instead of rejecting. Until now only `--explain` showed the grouping.
+- **`cass pack --json` echoes what its search ran.** Its `_meta.effective`
+  carries the same object as `search --robot-meta`: the database path and
+  what chose it, the resolved time window, the parsed filters, the query
+  grouping and the argv auto-corrections. Pack's own `query.filters` was
+  always empty, so a pack gave no way to check the filters it applied.
 
 ### Fixed
 

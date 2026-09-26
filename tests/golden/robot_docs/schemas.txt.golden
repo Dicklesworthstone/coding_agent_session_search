@@ -3157,6 +3157,17 @@ schemas: (auto-generated from contract)
     - status: string
   pack:
     - _meta: object
+      - effective: object
+        - auto_corrections: array
+        - command: string
+        - daemon: object
+        - db_path: string
+        - db_path_source: string
+        - filters: object
+        - query: string
+        - query_recoveries: array
+        - query_structure: ?
+        - time_window: object
       - elapsed_ms: integer
       - format: string
       - generated_at_ms: integer

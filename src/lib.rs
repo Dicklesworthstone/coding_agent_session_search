@@ -7830,6 +7830,7 @@ async fn execute_cli(
                         refresh,
                         eff_timeout,
                         wrap,
+                        &cli.interpretation,
                     )?;
                 }
                 Commands::Stats {
@@ -31201,17 +31202,11 @@ fn run_cli_search(
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let refresh_db_override = db_override.clone();
-    let db_path_source = if db_override.is_some() {
-        if interpretation.db_from_env {
-            "env:CASS_DB_PATH"
-        } else {
-            "--db"
-        }
-    } else if data_dir_override.is_some() {
-        "--data-dir"
-    } else {
-        default_data_dir_with_source().1
-    };
+    let db_path_source = effective_db_path_source(
+        db_override.is_some(),
+        data_dir_override.is_some(),
+        interpretation,
+    );
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
     // Resolve robot mode before reading any user-supplied session scope so a
@@ -31286,6 +31281,7 @@ fn run_cli_search(
             matched: matched_session_paths,
         });
     let effective = search_effective_interpretation(
+        "search",
         query,
         &db_path,
         db_path_source,
@@ -31293,7 +31289,7 @@ fn run_cli_search(
         &filters,
         sessions_from.as_ref().map(|_| filters.session_paths.len()),
         interpretation,
-        &semantic_opts,
+        Some(&semantic_opts),
     );
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
@@ -33135,6 +33131,7 @@ fn run_cli_pack(
     refresh: bool,
     timeout_ms: Option<u64>,
     _wrap: WrapConfig,
+    interpretation: &InvocationInterpretation,
 ) -> CliResult<()> {
     use crate::search::pack_planner::{
         PackLexicalReadiness, PackPlanRequest, PackPlannerLimits, PackReadinessSnapshot,
@@ -33275,6 +33272,24 @@ fn run_cli_pack(
             }
         }
     }
+
+    // 2l1b0.68: pack runs a search and echoes what it ran in `_meta.effective`
+    // like `search --robot-meta`, without the search-only daemon policy.
+    let effective = search_effective_interpretation(
+        "pack",
+        query,
+        &db_path,
+        effective_db_path_source(
+            db_override.is_some(),
+            data_dir_override.is_some(),
+            interpretation,
+        ),
+        &time_filter,
+        &filters,
+        sessions_from.as_ref().map(|_| filters.session_paths.len()),
+        interpretation,
+        None,
+    );
 
     let setup = if structured_pack && !hard_deadline_reached {
         let worker_data_dir = data_dir.clone();
@@ -33574,6 +33589,7 @@ fn run_cli_pack(
         hard_deadline_reached,
     );
     let mut render_request = PackRenderRequest {
+        effective: Some(effective),
         query_text: query.to_string(),
         normalized_query: query.trim().to_string(),
         generated_at_ms,
@@ -35810,8 +35826,11 @@ impl SessionsFilterStats {
 /// how the lexical engine groups the query, with any parentheses it recovered
 /// (the reading `--explain` shows; cass's parse matches the engine's since
 /// 2l1b0.52).
+/// `pack` runs the same search and echoes the same object, without the
+/// search-only daemon policy (`semantic_opts: None`).
 #[allow(clippy::too_many_arguments)]
 fn search_effective_interpretation(
+    command: &str,
     query: &str,
     db_path: &Path,
     db_path_source: &str,
@@ -35819,15 +35838,15 @@ fn search_effective_interpretation(
     filters: &crate::search::query::SearchFilters,
     sessions_from_paths: Option<usize>,
     interpretation: &InvocationInterpretation,
-    semantic_opts: &SemanticSearchOptions,
+    semantic_opts: Option<&SemanticSearchOptions>,
 ) -> serde_json::Value {
     let mut agents: Vec<&str> = filters.agents.iter().map(String::as_str).collect();
     agents.sort_unstable();
     let mut workspaces: Vec<&str> = filters.workspaces.iter().map(String::as_str).collect();
     workspaces.sort_unstable();
     let reading = crate::search::query::read_query(query);
-    serde_json::json!({
-        "command": "search",
+    let mut effective = serde_json::json!({
+        "command": command,
         "query": query,
         "query_structure": reading.structure,
         "query_recoveries": reading.recoveries,
@@ -35845,16 +35864,43 @@ fn search_effective_interpretation(
             "source": filters.source_filter.to_string(),
             "sessions_from_paths": sessions_from_paths,
         },
-        // `--daemon` asks permission to spawn the warm-model daemon. A robot
-        // search is budgeted and never spawns one; it still uses a daemon that
-        // is already running unless `--no-daemon` was given (2l1b0.68).
-        "daemon": {
-            "use_existing": semantic_opts.use_daemon,
-            "auto_spawn_requested": semantic_opts.auto_spawn_daemon,
-            "auto_spawn": false,
-        },
         "auto_corrections": interpretation.corrections,
-    })
+    });
+    // `--daemon` asks permission to spawn the warm-model daemon. A robot
+    // search is budgeted and never spawns one; it still uses a daemon that is
+    // already running unless `--no-daemon` was given (2l1b0.68).
+    if let Some(semantic_opts) = semantic_opts
+        && let Some(object) = effective.as_object_mut()
+    {
+        object.insert(
+            "daemon".to_string(),
+            serde_json::json!({
+                "use_existing": semantic_opts.use_daemon,
+                "auto_spawn_requested": semantic_opts.auto_spawn_daemon,
+                "auto_spawn": false,
+            }),
+        );
+    }
+    effective
+}
+
+/// Which input chose the canonical database path, for `_meta.effective`.
+fn effective_db_path_source(
+    db_override: bool,
+    data_dir_override: bool,
+    interpretation: &InvocationInterpretation,
+) -> &'static str {
+    if db_override {
+        if interpretation.db_from_env {
+            "env:CASS_DB_PATH"
+        } else {
+            "--db"
+        }
+    } else if data_dir_override {
+        "--data-dir"
+    } else {
+        default_data_dir_with_source().1
+    }
 }
 
 /// Output search results in robot-friendly format
@@ -100149,7 +100195,7 @@ fn response_schema_budget_block() -> serde_json::Value {
 fn response_schema_search_effective() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, daemon policy, argv auto-corrections, and how the lexical engine groups the query.",
+        "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
         "properties": {
             "command": { "type": "string" },
             "query": { "type": "string" },
@@ -100409,7 +100455,8 @@ fn response_schema_pack() -> serde_json::Value {
                     "elapsed_ms": { "type": "integer" },
                     "partial": { "type": "boolean" },
                     "format": { "type": "string" },
-                    "warnings": { "type": "array", "items": { "type": "string" } }
+                    "warnings": { "type": "array", "items": { "type": "string" } },
+                    "effective": response_schema_search_effective()
                 }
             }),
         ),

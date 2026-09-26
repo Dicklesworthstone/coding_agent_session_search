@@ -31030,6 +31030,122 @@
               "items": {
                 "type": "string"
               }
+            },
+            "effective": {
+              "type": "object",
+              "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "query_structure": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+                },
+                "query_recoveries": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "db_path_source": {
+                  "type": "string",
+                  "enum": [
+                    "--db",
+                    "env:CASS_DB_PATH",
+                    "--data-dir",
+                    "env:CASS_DATA_DIR",
+                    "env:XDG_DATA_HOME",
+                    "default"
+                  ]
+                },
+                "time_window": {
+                  "type": "object",
+                  "properties": {
+                    "since_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "since_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "until_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "until_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "agents": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "workspaces": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "sessions_from_paths": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "daemon": {
+                  "type": "object",
+                  "description": "Warm-model daemon policy: robot searches use an already-running daemon unless --no-daemon, and never spawn one even with --daemon.",
+                  "properties": {
+                    "use_existing": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn_requested": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "auto_corrections": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },
@@ -32024,7 +32140,7 @@
             },
             "effective": {
               "type": "object",
-              "description": "What the search actually ran: database and path source, resolved time window with the flag behind each bound, parsed filters, daemon policy, argv auto-corrections, and how the lexical engine groups the query.",
+              "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
               "properties": {
                 "command": {
                   "type": "string"
