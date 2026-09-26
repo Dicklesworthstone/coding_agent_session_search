@@ -97,6 +97,9 @@ pub enum IngestFailureKind {
     FilenameAssumptionViolated,
     /// The source path exists but could not be read (permissions / I/O).
     UnreadableSource,
+    /// The source is larger than the connector's per-source read budget, so it
+    /// was not indexed; raising the budget admits it on the next run.
+    SourceOverReadBudget,
 }
 
 impl IngestFailureKind {
@@ -111,6 +114,7 @@ impl IngestFailureKind {
             IngestFailureKind::KeychainUnavailable => "keychain-unavailable",
             IngestFailureKind::FilenameAssumptionViolated => "filename-assumption-violated",
             IngestFailureKind::UnreadableSource => "unreadable-source",
+            IngestFailureKind::SourceOverReadBudget => "source-over-read-budget",
         }
     }
 }
@@ -275,6 +279,16 @@ fn classify_kind(
             true, // permissions/IO may be fixed and retried
             SourceIngestDisposition::Skipped,
             format!("{provider} source path could not be read; check permissions, then re-index"),
+        ),
+        IngestFailureKind::SourceOverReadBudget => (
+            IngestSeverity::Error,
+            true, // a larger budget admits it on the next run
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} session file is larger than the per-source read budget and was not \
+                 indexed; raise the budget (Codex: CASS_CODEX_MAX_SOURCE_BYTES, up to 1073741824 \
+                 bytes), then re-index"
+            ),
         ),
     }
 }
@@ -529,6 +543,32 @@ impl ConnectorIngestRun {
             },
         );
         self.diagnostics.push(diagnostic);
+    }
+
+    /// Record a failed connector scan. A Codex scan that stopped only because
+    /// rollouts exceeded the per-source read budget is reported per rejected
+    /// file, with the setting that admits it; it used to surface as one
+    /// "unreadable, check permissions" entry naming the cass data directory.
+    pub fn observe_connector_scan_error(&mut self, fallback_path: &Path, error: &anyhow::Error) {
+        if let Some(over) = crate::connectors::codex::over_budget_sources(error) {
+            for path in &over.sampled_paths {
+                let diagnostic = classify_path(
+                    &self.provider,
+                    path,
+                    IngestFailureKind::SourceOverReadBudget,
+                );
+                self.sources.insert(
+                    path.clone(),
+                    ObservedSource {
+                        disposition: diagnostic.disposition,
+                        malformed: false,
+                    },
+                );
+                self.diagnostics.push(diagnostic);
+            }
+            return;
+        }
+        self.observe_scan_error(fallback_path, error);
     }
 
     #[must_use]
@@ -884,6 +924,7 @@ mod tests {
             IngestFailureKind::KeychainUnavailable,
             IngestFailureKind::FilenameAssumptionViolated,
             IngestFailureKind::UnreadableSource,
+            IngestFailureKind::SourceOverReadBudget,
         ];
         let destructive = ["rm ", "--delete", "--purge", "reset", "drop ", "rm -rf"];
         for kind in kinds {
@@ -1039,6 +1080,7 @@ mod tests {
             IngestFailureKind::FilenameAssumptionViolated,
             IngestFailureKind::UnreadableSource,
             IngestFailureKind::TruncatedSession,
+            IngestFailureKind::SourceOverReadBudget,
         ];
         verify_eq!(
             serde_json::to_value(failure_kinds)?,
@@ -1050,7 +1092,8 @@ mod tests {
                 "keychain-unavailable",
                 "filename-assumption-violated",
                 "unreadable-source",
-                "truncated-session"
+                "truncated-session",
+                "source-over-read-budget"
             ])
         );
         for (k, w) in [
@@ -1074,6 +1117,10 @@ mod tests {
             ),
             (IngestFailureKind::UnreadableSource, "unreadable-source"),
             (IngestFailureKind::TruncatedSession, "truncated-session"),
+            (
+                IngestFailureKind::SourceOverReadBudget,
+                "source-over-read-budget",
+            ),
         ] {
             verify_eq!(k.as_str(), w);
         }

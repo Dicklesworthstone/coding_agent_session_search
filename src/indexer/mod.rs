@@ -14236,7 +14236,7 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_scan_error(&ctx.data_dir, e.to_string());
+                    ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -14368,7 +14368,7 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_scan_error(&root.path, e.to_string());
+                    ingest_diagnostics.observe_connector_scan_error(&root.path, &e);
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
@@ -15673,7 +15673,7 @@ fn run_batch_index_with_connector_factories(
                             // Note: agent was counted as discovered but scan failed
                             // This is acceptable as detection succeeded (agent exists)
                             scan_succeeded = false;
-                            ingest_diagnostics.observe_scan_error(&ctx.data_dir, e.to_string());
+                            ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
                             scan_errors.push(e.to_string());
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }
@@ -15746,7 +15746,7 @@ fn run_batch_index_with_connector_factories(
                             Err(e) => {
                                 scan_succeeded = false;
                                 ingest_diagnostics
-                                .observe_scan_error(&root.path, e.to_string());
+                                .observe_connector_scan_error(&root.path, &e);
                                 scan_errors.push(format!(
                                     "remote scan failed for {}: {}",
                                     root.path.display(),
@@ -29977,7 +29977,7 @@ fn reindex_paths_with_semantic_delta(
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
-                ingest_diagnostics.observe_scan_error(&root.path, e.to_string());
+                ingest_diagnostics.observe_connector_scan_error(&root.path, &e);
                 tracing::debug!(
                     "watch scan failed for {:?} at {}: {}",
                     kind,
