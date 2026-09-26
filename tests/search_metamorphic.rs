@@ -488,6 +488,31 @@ fn agent_filters_keep_exactly_their_sessions() -> TestResult {
 #[test]
 fn precedence_and_parentheses_follow_the_documented_grammar() -> TestResult {
     let corpus = corpus();
+    for (query, expected) in &precedence_cases(corpus) {
+        assert_same(query, &corpus.search(query, &[])?, expected)?;
+    }
+
+    // --explain shows the grouping searched and records the recovery.
+    let explanation = corpus.explain("kiwiword AND (limeword OR mangoword")?;
+    assert_eq!(
+        explanation["parsed"]["structure"],
+        "kiwiword AND (limeword OR mangoword)"
+    );
+    let warnings = explanation["warnings"]
+        .as_array()
+        .ok_or("explanation has no warnings array")?;
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning == "1 unclosed '(' closed at the end of the query"),
+        "missing recovery warning: {warnings:?}"
+    );
+    Ok(())
+}
+
+/// The fixed precedence cases and their set-algebra answers, shared by the
+/// Quill and FTS5 lanes.
+fn precedence_cases(corpus: &Corpus) -> Vec<(&'static str, BTreeSet<usize>)> {
     let (k, l, m) = (
         corpus.with_term("kiwiword"),
         corpus.with_term("limeword"),
@@ -499,7 +524,7 @@ fn precedence_and_parentheses_follow_the_documented_grammar() -> TestResult {
     let both = |a: &BTreeSet<usize>, b: &BTreeSet<usize>| -> BTreeSet<usize> {
         a.intersection(b).copied().collect()
     };
-    let cases = [
+    vec![
         (
             "kiwiword OR limeword AND mangoword",
             union(&k, &both(&l, &m)),
@@ -526,27 +551,7 @@ fn precedence_and_parentheses_follow_the_documented_grammar() -> TestResult {
             "kiwiword AND (limeword OR mangoword",
             both(&k, &union(&l, &m)),
         ),
-    ];
-    for (query, expected) in &cases {
-        assert_same(query, &corpus.search(query, &[])?, expected)?;
-    }
-
-    // --explain shows the grouping searched and records the recovery.
-    let explanation = corpus.explain("kiwiword AND (limeword OR mangoword")?;
-    assert_eq!(
-        explanation["parsed"]["structure"],
-        "kiwiword AND (limeword OR mangoword)"
-    );
-    let warnings = explanation["warnings"]
-        .as_array()
-        .ok_or("explanation has no warnings array")?;
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning == "1 unclosed '(' closed at the end of the query"),
-        "missing recovery warning: {warnings:?}"
-    );
-    Ok(())
+    ]
 }
 
 /// A generated Boolean expression and its set-algebra meaning (2l1b0.52).
@@ -642,6 +647,23 @@ impl Expr {
     }
 }
 
+/// The 40 seeded random expressions both lanes are checked with, as query
+/// text and expression. A leading `-` would reach the argument parser as a
+/// flag, so such a query is parenthesized.
+fn generated_queries() -> Vec<(String, Expr)> {
+    let mut rng = 0x0052_21B0_u64;
+    (0..40)
+        .map(|_| {
+            let expr = Expr::generate(&mut rng, 3);
+            let mut query = expr.render_operand(&mut rng, false);
+            if query.starts_with('-') {
+                query = format!("({query})");
+            }
+            (query, expr)
+        })
+        .collect()
+}
+
 /// Seeded random expressions over the five terms, in every operator
 /// spelling, with required and redundant grouping and with complements: the
 /// real binary returns exactly the set algebra's answer for each.
@@ -649,16 +671,9 @@ impl Expr {
 fn generated_boolean_queries_match_set_algebra() -> TestResult {
     let corpus = corpus();
     let all = corpus.all();
-    let mut rng = 0x0052_21B0_u64;
     let mut informative = 0;
     let mut failures = Vec::new();
-    for case in 0..40 {
-        let expr = Expr::generate(&mut rng, 3);
-        let mut query = expr.render_operand(&mut rng, false);
-        // A leading `-` would reach the argument parser as a flag.
-        if query.starts_with('-') {
-            query = format!("({query})");
-        }
+    for (case, (query, expr)) in generated_queries().into_iter().enumerate() {
         let expected = expr.eval(corpus);
         if !expected.is_empty() && expected.len() < all.len() {
             informative += 1;
@@ -777,10 +792,13 @@ fn forgetting_a_session_removes_exactly_its_messages() -> TestResult {
 /// when no lexical index is readable. A client opened on the canonical
 /// database with no index directory, read-only so the shared corpus is not
 /// repaired underneath the other relations, must return each term's exact
-/// message set and set-algebra answers for two-term OR and AND. NOT and
-/// precedence on the SQLite lanes are tracked by uvii3 and not asserted here.
+/// message set, and the set algebra's answer for two-term OR and AND, the
+/// fixed precedence cases and the same seeded random expressions the Quill
+/// lane is checked with. Queries FTS5 cannot express (standalone NOT,
+/// recovered groups) take the lane's source scan, so both halves of the
+/// SQLite lane are covered.
 #[test]
-fn the_fts5_lane_answers_the_same_term_sets() -> TestResult {
+fn the_fts5_lane_answers_the_same_sets() -> TestResult {
     use coding_agent_search::search::query::{
         FieldMask, SearchClient, SearchClientOptions, SearchFilters,
     };
@@ -829,5 +847,23 @@ fn the_fts5_lane_answers_the_same_term_sets() -> TestResult {
         "fts5 kiwiword limeword",
         &ids("kiwiword limeword")?,
         &k.intersection(&l).copied().collect(),
-    )
+    )?;
+
+    let mut failures = Vec::new();
+    for (query, expected) in precedence_cases(corpus) {
+        if let Err(err) = assert_same(&format!("fts5 {query}"), &ids(query)?, &expected) {
+            failures.push(err.to_string());
+        }
+    }
+    for (case, (query, expr)) in generated_queries().into_iter().enumerate() {
+        let label = format!("fts5 case {case}: {query} = {expr:?}");
+        if let Err(err) = assert_same(&label, &ids(&query)?, &expr.eval(corpus)) {
+            failures.push(err.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n").into())
+    }
 }
