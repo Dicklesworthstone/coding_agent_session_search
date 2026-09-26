@@ -156,6 +156,97 @@ fn exercise(streaming: &str) {
     assert_eq!(cached["cached"], true, "{cached}");
 }
 
+/// Per-source skip decisions from the production trace sink.
+fn source_skips(trace: &Path) -> Vec<bool> {
+    std::fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let event: Value = serde_json::from_str(line).expect("trace JSONL");
+            (event["fields"]["message"] == "source_ingest_observation")
+                .then(|| event["fields"]["skipped"].as_bool().expect("skip flag"))
+        })
+        .collect()
+}
+
+/// GH #489: a rejected rollout keeps every incremental run partial (exit 9),
+/// but it must not make each run re-parse the healthy rollouts beside it.
+fn incremental_runs_stay_partial_without_reparsing(streaming: &str) {
+    let dir = tempfile::tempdir().expect("isolated archive");
+    let home = dir.path();
+    let sessions = home.join(".codex/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let paths = ["a", "b", "c"].map(|name| sessions.join(format!("rollout-{name}.jsonl")));
+    for (i, path) in paths.iter().enumerate() {
+        let rows = [
+            json!({"type":"session_meta","payload":{"id":format!("incremental-{i}"),"cwd":home.join("project")}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("incrementalsentinel{i}z")}]}}),
+        ];
+        std::fs::write(path, format!("{}\n{}\n", rows[0], rows[1])).unwrap();
+    }
+    let mut middle = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths[1])
+        .unwrap();
+    let padding = format!(
+        "{{\"type\":\"fixture_padding\",\"padding\":\"{}\"}}\n",
+        "x".repeat(65536)
+    );
+    while middle.metadata().unwrap().len() <= LIMIT {
+        middle.write_all(padding.as_bytes()).unwrap();
+    }
+    drop(middle);
+    for run in 0..3 {
+        let trace = home.join(format!("trace-{run}.jsonl"));
+        let output = cass(home, streaming)
+            .env(
+                "CASS_TRACE_FILTER",
+                "warn,coding_agent_search::indexer=debug",
+            )
+            .arg("--trace-file")
+            .arg(&trace)
+            .args(["index", "--json", "--data-dir"])
+            .arg(home.join("archive"))
+            .output()
+            .expect("run index command");
+        let result: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("stderr={}", String::from_utf8_lossy(&output.stderr)));
+        assert_eq!(output.status.code(), Some(9), "run {run}: {result}");
+        let codex = result["indexing_stats"]["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "codex")
+            .unwrap()
+            .clone();
+        let detail = codex["error"].as_str().expect("explicit rejected source");
+        assert!(detail.contains("rollout-b.jsonl"), "run {run}: {detail}");
+        // The first run parses all three; later runs re-examine only the
+        // rejected rollout (a size check, no parse) and both neighbors reuse
+        // their committed ledger entries.
+        let mut skips = source_skips(&trace);
+        skips.sort_unstable();
+        let expected = if run == 0 {
+            [false, false, false]
+        } else {
+            [false, true, true]
+        };
+        assert_eq!(skips, expected, "run {run}");
+        assert_searchable(home, streaming, "incrementalsentinel0z", &paths[0]);
+        assert_searchable(home, streaming, "incrementalsentinel2z", &paths[2]);
+    }
+}
+
+#[test]
+fn streaming_incremental_runs_stay_partial_without_reparsing_neighbors() {
+    incremental_runs_stay_partial_without_reparsing("1");
+}
+
+#[test]
+fn batch_incremental_runs_stay_partial_without_reparsing_neighbors() {
+    incremental_runs_stay_partial_without_reparsing("0");
+}
+
 #[test]
 fn streaming_keeps_neighbors_and_reports_partial_without_caching() {
     exercise("1");
