@@ -1,12 +1,12 @@
 //! Metamorphic search-semantics oracle (bead coding_agent_session_search-2l1b0.68).
 //!
-//! A generated Codex corpus has a known term -> message map and known message
-//! times. Every query runs through the real `cass` binary (lexical mode,
+//! A generated corpus of Codex and Claude Code sessions has a known term ->
+//! message map and known message times, workspaces and agents. Every query runs through the real `cass` binary (lexical mode,
 //! automatic wildcard fallback off) and its hit set must equal the one a
 //! small set-algebra reference computes: OR is union, AND (explicit or
 //! implicit) is intersection, NOT is difference, a time window keeps exactly
-//! the messages inside it, and a workspace filter keeps exactly the messages
-//! of that workspace's sessions. These relations do not depend on any one
+//! the messages inside it, and a workspace or agent filter keeps exactly the
+//! messages of that workspace's or agent's sessions. These relations do not depend on any one
 //! expected answer, so a regression in the grammar, the filters or the
 //! engine shows up as a set difference, printed per query.
 //!
@@ -29,7 +29,11 @@ use std::time::Instant;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const TERMS: [&str; 5] = ["kiwiword", "limeword", "mangoword", "plumword", "pearword"];
-const SESSIONS: usize = 18;
+const SESSIONS: usize = 22;
+/// Sessions from this one on are Claude Code sessions; the rest are Codex.
+const CLAUDE_SESSIONS_FROM: usize = 18;
+/// The agent slugs `--agent` filters on.
+const AGENTS: [&str; 2] = ["codex", "claude_code"];
 const MESSAGES_PER_SESSION: usize = 10;
 /// 2026-08-01T00:00:00Z; session `s` happens on day `s`.
 const DAY0_SECS: i64 = 1_785_542_400;
@@ -39,13 +43,14 @@ const DAY_SECS: i64 = 86_400;
 /// other, so a workspace filter cannot match both by accident.
 const WORKSPACES: [&str; 2] = ["/work/alpha", "/work/beta"];
 
-/// One generated message: its id, UTC timestamp (seconds), terms and the
-/// workspace of its session.
+/// One generated message: its id, UTC timestamp (seconds), terms, and the
+/// workspace and agent of its session.
 struct Message {
     id: usize,
     at_secs: i64,
     terms: BTreeSet<&'static str>,
     workspace: &'static str,
+    agent: &'static str,
 }
 
 struct Corpus {
@@ -187,6 +192,14 @@ impl Corpus {
             .map(|message| message.id)
             .collect()
     }
+
+    fn by_agent(&self, agent: &str) -> BTreeSet<usize> {
+        self.messages
+            .iter()
+            .filter(|message| message.agent == agent)
+            .map(|message| message.id)
+            .collect()
+    }
 }
 
 fn message_id(content: &str) -> Option<usize> {
@@ -213,18 +226,24 @@ fn rfc3339(secs: i64) -> String {
         .to_string()
 }
 
-fn write_session(codex_home: &Path, session: usize, messages: &mut Vec<Message>) -> TestResult {
+/// Session `s` is a Codex rollout below `CLAUDE_SESSIONS_FROM` and a Claude
+/// Code session from it on, so agent filters split the corpus.
+fn write_session(home: &Path, session: usize, messages: &mut Vec<Message>) -> TestResult {
     let day = DAY0_SECS + session as i64 * DAY_SECS;
-    let dir = codex_home
-        .join("sessions/2026/08")
-        .join(format!("{:02}", session + 1));
-    fs::create_dir_all(&dir)?;
     let name = format!("meta{session:02}");
     let workspace = WORKSPACES[session % WORKSPACES.len()];
-    let mut lines = vec![format!(
-        r#"{{"timestamp":"{}","type":"session_meta","payload":{{"id":"{name}","cwd":"{workspace}","cli_version":"0.42.0"}}}}"#,
-        rfc3339(day)
-    )];
+    let agent = if session < CLAUDE_SESSIONS_FROM {
+        "codex"
+    } else {
+        "claude_code"
+    };
+    let mut lines = Vec::new();
+    if agent == "codex" {
+        lines.push(format!(
+            r#"{{"timestamp":"{}","type":"session_meta","payload":{{"id":"{name}","cwd":"{workspace}","cli_version":"0.42.0"}}}}"#,
+            rfc3339(day)
+        ));
+    }
     let mut rng =
         0x9E37_79B9_7F4A_7C15_u64 ^ (session as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
     for index in 0..MESSAGES_PER_SESSION {
@@ -245,30 +264,48 @@ fn write_session(codex_home: &Path, session: usize, messages: &mut Vec<Message>)
         };
         let mut words = vec![format!("msgid{id}"), "note".to_string()];
         words.extend(terms.iter().map(|term| (*term).to_string()));
-        let (kind, role) = if index % 2 == 0 {
-            ("input_text", "user")
-        } else {
-            ("text", "assistant")
-        };
-        lines.push(format!(
-            r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"{role}","content":[{{"type":"{kind}","text":"{}"}}]}}}}"#,
-            rfc3339(at_secs),
-            words.join(" ")
-        ));
+        let text = words.join(" ");
+        let user = index % 2 == 0;
+        lines.push(match (agent, user) {
+            ("codex", true) => format!(
+                r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#,
+                rfc3339(at_secs)
+            ),
+            ("codex", false) => format!(
+                r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#,
+                rfc3339(at_secs)
+            ),
+            (_, true) => format!(
+                r#"{{"type":"user","cwd":"{workspace}","sessionId":"{name}","message":{{"role":"user","content":"{text}"}},"timestamp":"{}"}}"#,
+                rfc3339(at_secs)
+            ),
+            (_, false) => format!(
+                r#"{{"type":"assistant","cwd":"{workspace}","sessionId":"{name}","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}},"timestamp":"{}"}}"#,
+                rfc3339(at_secs)
+            ),
+        });
         messages.push(Message {
             id,
             at_secs,
             terms,
             workspace,
+            agent,
         });
     }
-    fs::write(
-        dir.join(format!(
-            "rollout-2026-08-{:02}T00-00-00-{name}.jsonl",
-            session + 1
-        )),
-        lines.join("\n") + "\n",
-    )?;
+    let path = if agent == "codex" {
+        home.join(".codex/sessions/2026/08")
+            .join(format!("{:02}", session + 1))
+            .join(format!(
+                "rollout-2026-08-{:02}T00-00-00-{name}.jsonl",
+                session + 1
+            ))
+    } else {
+        home.join(".claude/projects")
+            .join(workspace.replace('/', "-"))
+            .join(format!("{name}.jsonl"))
+    };
+    fs::create_dir_all(path.parent().ok_or("session path has no parent")?)?;
+    fs::write(path, lines.join("\n") + "\n")?;
     Ok(())
 }
 
@@ -284,7 +321,7 @@ fn build_corpus() -> TestResult<Corpus> {
     fs::create_dir_all(&data_dir)?;
     let mut messages = Vec::new();
     for session in 0..SESSIONS {
-        write_session(&home.join(".codex"), session, &mut messages)?;
+        write_session(&home, session, &mut messages)?;
     }
     let corpus = Corpus {
         _root: root,
@@ -416,6 +453,30 @@ fn workspace_filters_keep_exactly_their_sessions() -> TestResult {
             union.extend(got);
         }
         assert_same(&format!("{term} across both workspaces"), &union, &all)?;
+    }
+    Ok(())
+}
+
+/// Filters narrow (2l1b0.68): `--agent A` keeps exactly the messages of A's
+/// sessions for every term, a strict subset of the unfiltered answer, and
+/// the two agents together give the unfiltered answer back.
+#[test]
+fn agent_filters_keep_exactly_their_sessions() -> TestResult {
+    let corpus = corpus();
+    for term in TERMS {
+        let all = corpus.with_term(term);
+        let mut union = BTreeSet::new();
+        for agent in AGENTS {
+            let expected: BTreeSet<usize> =
+                all.intersection(&corpus.by_agent(agent)).copied().collect();
+            if expected.is_empty() || expected == all {
+                return Err(format!("{term}: {agent} does not split the answer").into());
+            }
+            let got = corpus.search(term, &["--agent", agent])?;
+            assert_same(&format!("{term} --agent {agent}"), &got, &expected)?;
+            union.extend(got);
+        }
+        assert_same(&format!("{term} across both agents"), &union, &all)?;
     }
     Ok(())
 }
