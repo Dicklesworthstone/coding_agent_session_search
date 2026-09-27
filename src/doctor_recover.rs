@@ -140,7 +140,7 @@ fn is_fts5_shadow_open_corruption_error(err: &anyhow::Error) -> bool {
 /// below; when even the deferred open cannot get past the schema reload,
 /// doctor now says so explicitly and routes to the raw-mirror recovery path
 /// instead of repeating the refusal.
-fn is_fts_shadow_schema_level_open_failure(err: &anyhow::Error) -> bool {
+pub(crate) fn is_fts_shadow_schema_level_open_failure(err: &anyhow::Error) -> bool {
     let rendered = format!("{err:#}");
     rendered.contains("fts_messages")
         && (rendered.contains("missing implicit autoindex slot")

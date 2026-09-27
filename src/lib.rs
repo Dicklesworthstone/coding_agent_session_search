@@ -20897,6 +20897,14 @@ fn state_db_strict_open_error_message(
     if retryable {
         return base;
     }
+    // GH #503: the #434 shape. The strict open rejects only the derived
+    // fts_messages shadow's catalog (a legacy shape older cass wrote); the
+    // canonical rows are readable, and the shadow has an exact repair.
+    if doctor_recover::is_fts_shadow_schema_level_open_failure(err) {
+        return format!(
+            "{base}; the open rejects only the derived fts_messages FTS5 shadow's catalog (a legacy shape written by older cass), not the conversations or messages. This read-only probe leaves the archive unchanged; 'cass doctor --rebuild-canonical-fts --dry-run --json' inspects it and '--yes' drops and rebuilds the derived shadow without modifying canonical rows"
+        );
+    }
     match unpublished_wal_sidecar_bytes(db_path) {
         Some(wal_bytes) => format!(
             "{base}; an unpublished {wal_bytes}-byte WAL sidecar from an unclean shutdown is present and this read-only probe never modifies the archive, so it was not recovered here — run 'cass index' (or 'cass doctor') to checkpoint it"
@@ -87531,6 +87539,33 @@ mod cli_read_db_tests {
         let busy = state_db_strict_open_error_message(&db_path, "status", &err, true);
         assert!(!busy.contains("WAL sidecar"), "{busy}");
         assert!(unpublished_wal_sidecar_bytes(temp.path().join("missing.db").as_path()).is_none());
+    }
+
+    /// GH #503: the strict open's legacy-shadow refusal names the derived-shadow
+    /// repair; a refusal naming a canonical table does not.
+    #[test]
+    fn strict_open_error_message_names_the_shadow_repair_for_the_434_shape() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let legacy = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        )
+        .context("strictly opening dedicated-owner frankensqlite db readonly");
+        let message = state_db_strict_open_error_message(&db_path, "status", &legacy, false);
+        assert!(
+            message.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
+            "{message}"
+        );
+        assert!(
+            message.contains("without modifying canonical rows"),
+            "{message}"
+        );
+
+        let canonical = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `conversations`"
+        );
+        let message = state_db_strict_open_error_message(&db_path, "status", &canonical, false);
+        assert!(!message.contains("rebuild-canonical-fts"), "{message}");
     }
 
     #[test]
