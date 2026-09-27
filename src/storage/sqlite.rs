@@ -767,12 +767,18 @@ pub(crate) fn open_current_schema_storage_with_timeout(
 /// whole compatibility database. Schema-only handles prohibit that promotion
 /// (fsqlite #402). Use one only when the pinned engine would skip its first-open
 /// repair anyway (GH #443/#450); FTS validation and CASS repair remain enabled.
+/// An archive whose repair is pending gets an ordinary open to run it, then
+/// continues in the schema-only lane once the engine has recorded it.
 fn open_index_schema_connection_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<FrankenConnection> {
     if !index_engine_migration_is_complete(path) {
-        return open_franken_raw_connection_with_timeout(path, timeout);
+        let repairing = open_franken_raw_connection_with_timeout(path, timeout)?;
+        if !index_engine_migration_is_complete(path) {
+            return Ok(repairing);
+        }
+        close_first_open_repair_handle(repairing, path);
     }
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
@@ -804,16 +810,34 @@ fn open_index_schema_connection_with_timeout(
 /// `SELECT value FROM meta WHERE key = ?1`) hydrates every row of every table
 /// into the compatibility MemDatabase: on a 16 GB archive the legacy OMP
 /// analytics writer passed a 24 GB memory limit that way before its first
-/// chunk (xcqqa). An archive whose engine migration is still pending keeps the
-/// ordinary constructor so the engine's first-open repair runs.
+/// chunk (xcqqa). An archive whose engine migration is still pending gets the
+/// ordinary constructor so the engine's first-open repair runs, then the
+/// bounded lane once the repair is recorded.
 fn open_archive_writer_connection(
     path: &Path,
 ) -> std::result::Result<FrankenConnection, crate::franken_sync::FrankenError> {
     let path_str = path.to_string_lossy().to_string();
-    if index_engine_migration_is_complete(path) {
-        FrankenConnection::open_existing_schema_only(path_str)
-    } else {
-        FrankenConnection::open(path_str)
+    if !index_engine_migration_is_complete(path) {
+        let repairing = FrankenConnection::open(path_str.clone())?;
+        if !index_engine_migration_is_complete(path) {
+            return Ok(repairing);
+        }
+        close_first_open_repair_handle(repairing, path);
+    }
+    FrankenConnection::open_existing_schema_only(path_str)
+}
+
+/// Close the ordinary handle whose open ran the engine's first-open repair.
+/// Keeping it for the rest of a run would let its first autocommit point lookup
+/// hydrate the whole archive (xcqqa); callers reopen in the schema-only lane.
+fn close_first_open_repair_handle(mut conn: FrankenConnection, path: &Path) {
+    if let Err(err) = conn.close_without_checkpoint_in_place() {
+        tracing::debug!(
+            error = %err,
+            db_path = %path.display(),
+            "closing the first-open repair handle failed; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
     }
 }
 
@@ -42792,20 +42816,41 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         drop(reader);
 
         // An archive whose engine migration is pending still gets the ordinary
-        // constructor, which runs and records the engine's first-open repair.
+        // constructor, which runs and records the engine's first-open repair;
+        // the writer then continues in the bounded lane.
         let marker_path = path.with_file_name("writers.db.fsqlite-migration-state");
         fs::write(&marker_path, r#"{"last_upgrade_version":1}"#).unwrap();
         assert!(!index_engine_migration_is_complete(&path));
         let pending_writer = FrankenStorage::open_writer(&path).unwrap();
-        assert_eq!(
-            schema_version_lookup(pending_writer.raw()),
-            CURRENT_SCHEMA_VERSION.to_string()
-        );
-        drop(pending_writer);
         assert!(
             index_engine_migration_is_complete(&path),
             "the ordinary constructor must finish and record the required repair"
         );
+        assert_eq!(
+            schema_version_lookup(pending_writer.raw()),
+            CURRENT_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            pending_writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "the writer that ran the repair must not keep the hydrating ordinary handle"
+        );
+        {
+            let mut tx = pending_writer.raw().transaction().unwrap();
+            tx.execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![9_i64, "written after the first-open repair"],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(pending_writer);
+        let rows = FrankenStorage::open(&path)
+            .unwrap()
+            .raw()
+            .query("SELECT id FROM bulk_payload ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 10);
     }
 
     #[test]
@@ -42834,6 +42879,20 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             assert!(
                 index_engine_migration_is_complete(&path),
                 "full constructor must finish and record required repair"
+            );
+            let version: String = storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams!["schema_version"],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(version, CURRENT_SCHEMA_VERSION.to_string());
+            assert_eq!(
+                storage.raw().as_async().memdb_row_hydration_count(),
+                0,
+                "after the repair the index handle must be schema-only (xcqqa)"
             );
         }
     }
