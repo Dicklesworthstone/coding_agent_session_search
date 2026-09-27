@@ -799,6 +799,24 @@ fn open_index_schema_connection_with_timeout(
     }
 }
 
+/// Writer handles on an existing archive take the same bounded lane as the
+/// index open. An ordinary handle's first autocommit point lookup (for example
+/// `SELECT value FROM meta WHERE key = ?1`) hydrates every row of every table
+/// into the compatibility MemDatabase: on a 16 GB archive the legacy OMP
+/// analytics writer passed a 24 GB memory limit that way before its first
+/// chunk (xcqqa). An archive whose engine migration is still pending keeps the
+/// ordinary constructor so the engine's first-open repair runs.
+fn open_archive_writer_connection(
+    path: &Path,
+) -> std::result::Result<FrankenConnection, crate::franken_sync::FrankenError> {
+    let path_str = path.to_string_lossy().to_string();
+    if index_engine_migration_is_complete(path) {
+        FrankenConnection::open_existing_schema_only(path_str)
+    } else {
+        FrankenConnection::open(path_str)
+    }
+}
+
 pub(crate) fn index_engine_migration_is_complete(path: &Path) -> bool {
     // fsqlite-core 0.3.18 migration::MigrationMarker and
     // CURRENT_MIGRATION_VERSION. build.rs enforces this exact engine family;
@@ -1358,8 +1376,7 @@ impl FrankenConnectionManager {
             .1
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open(&path_str) {
+        let conn = match open_archive_writer_connection(&self.db_path) {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
@@ -1390,8 +1407,7 @@ impl FrankenConnectionManager {
             .1
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open(&path_str) {
+        let conn = match open_archive_writer_connection(&self.db_path) {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
@@ -5421,10 +5437,9 @@ impl FrankenStorage {
         ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
         fts_shadow_run: Arc<FtsShadowRunState>,
     ) -> Result<Self> {
-        let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
-        let conn = FrankenConnection::open(&path_str)
+        let conn = open_archive_writer_connection(path)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
         let storage = Self::new_with_shared_caches(
             conn,
@@ -42670,6 +42685,127 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             "new searchable evidence"
         );
         assert_eq!(fs::read(&marker_path).unwrap(), marker);
+    }
+
+    #[test]
+    fn xcqqa_archive_writers_do_not_hydrate_unrelated_rows_on_point_lookups() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("writers.db");
+        let payload = "archived session payload ".repeat(16384);
+        {
+            let storage = FrankenStorage::open(&path).unwrap();
+            storage
+                .raw()
+                .execute("CREATE TABLE bulk_payload(id INTEGER PRIMARY KEY, content TEXT NOT NULL)")
+                .unwrap();
+            for id in 0..8_i64 {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                        fparams![id, payload.as_str()],
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(index_engine_migration_is_complete(&path));
+        let schema_version_lookup = |conn: &FrankenConnection| -> String {
+            conn.query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams!["schema_version"],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+        };
+
+        // Control: the constructor writers used before xcqqa hydrates every
+        // row of the unrelated payload table for one metadata lookup.
+        {
+            let mut ordinary = FrankenConnection::open(path.to_string_lossy().to_string()).unwrap();
+            assert_eq!(
+                schema_version_lookup(&ordinary),
+                CURRENT_SCHEMA_VERSION.to_string()
+            );
+            assert!(
+                ordinary.as_async().memdb_row_hydration_count() >= 8,
+                "control must exercise the ordinary constructor's whole-file hydration"
+            );
+            ordinary.close_without_checkpoint_in_place().unwrap();
+        }
+
+        // The legacy OMP analytics writer and the ingest writers.
+        let writer = FrankenStorage::open_writer(&path).unwrap();
+        assert_eq!(
+            schema_version_lookup(writer.raw()),
+            CURRENT_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "a writer's metadata lookup must not hydrate unrelated archive rows"
+        );
+        {
+            let mut tx = writer.raw().transaction().unwrap();
+            tx.execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![8_i64, "written through the bounded writer"],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(writer);
+
+        let manager = FrankenConnectionManager::new(
+            &path,
+            ConnectionManagerConfig {
+                reader_count: 1,
+                max_writers: 2,
+            },
+        )
+        .unwrap();
+        for guard in [
+            manager.writer().unwrap(),
+            manager.concurrent_writer().unwrap(),
+        ] {
+            assert_eq!(
+                schema_version_lookup(guard.storage().raw()),
+                CURRENT_SCHEMA_VERSION.to_string()
+            );
+            assert_eq!(
+                guard.storage().raw().as_async().memdb_row_hydration_count(),
+                0,
+                "a managed writer's metadata lookup must not hydrate unrelated archive rows"
+            );
+        }
+        drop(manager);
+
+        let reader = FrankenStorage::open(&path).unwrap();
+        let rows = reader
+            .raw()
+            .query("SELECT id, length(content) FROM bulk_payload ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 9);
+        for row in &rows[..8] {
+            assert_eq!(row.get_typed::<i64>(1).unwrap(), payload.len() as i64);
+        }
+        assert_eq!(rows[8].get_typed::<i64>(0).unwrap(), 8);
+        drop(reader);
+
+        // An archive whose engine migration is pending still gets the ordinary
+        // constructor, which runs and records the engine's first-open repair.
+        let marker_path = path.with_file_name("writers.db.fsqlite-migration-state");
+        fs::write(&marker_path, r#"{"last_upgrade_version":1}"#).unwrap();
+        assert!(!index_engine_migration_is_complete(&path));
+        let pending_writer = FrankenStorage::open_writer(&path).unwrap();
+        assert_eq!(
+            schema_version_lookup(pending_writer.raw()),
+            CURRENT_SCHEMA_VERSION.to_string()
+        );
+        drop(pending_writer);
+        assert!(
+            index_engine_migration_is_complete(&path),
+            "the ordinary constructor must finish and record the required repair"
+        );
     }
 
     #[test]
