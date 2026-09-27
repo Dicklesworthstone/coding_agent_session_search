@@ -30386,6 +30386,25 @@ fn explicit_watch_once_root_unchanged_after_last_index(
     if modified_at_ms > last_indexed_at {
         return Ok(false);
     }
+    // A database-backed source commits into its -wal (or rollback -journal)
+    // without touching the main file, so the main file's mtime alone cannot
+    // prove the source unchanged (GH #502). -shm is excluded: readers rewrite
+    // it, and it holds no committed data.
+    for suffix in ["-wal", "-journal"] {
+        let sidecar = database_path_with_suffix(&root.path, suffix);
+        let sidecar_modified_at_ms = match fs::metadata(&sidecar) {
+            Ok(metadata) => metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_epoch_millis),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Ok(false),
+        };
+        match sidecar_modified_at_ms {
+            Some(sidecar_modified_at_ms) if sidecar_modified_at_ms <= last_indexed_at => {}
+            _ => return Ok(false),
+        }
+    }
 
     let source_path = root.path.to_string_lossy();
     let matches: Vec<i64> = storage
@@ -62395,6 +62414,85 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    /// GH #502: a SQLite source's committed WAL (or rollback journal) change is
+    /// a source change even when the main database file is untouched, while a
+    /// reader-rewritten -shm is not.
+    #[test]
+    fn explicit_watch_once_freshness_counts_committed_sqlite_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("cass.db")).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "openclaw".into(),
+                name: "OpenClaw".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = storage.ensure_workspace(tmp.path(), None).unwrap();
+        let source = tmp.path().join("openclaw-agent.sqlite");
+        std::fs::write(&source, b"main database").unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO conversations(
+                     id, agent_id, workspace_id, source_id, title, source_path, metadata_json
+                 ) VALUES (1, ?1, ?2, 'local', 'live', ?3, '{}')",
+                &[
+                    ParamValue::from(agent_id),
+                    ParamValue::from(workspace_id),
+                    ParamValue::from(source.to_string_lossy().as_ref()),
+                ],
+            )
+            .unwrap();
+        let indexed_at = FrankenStorage::now_millis();
+        storage.set_last_indexed_at(indexed_at).unwrap();
+        let root = ScanRoot::local(source.clone());
+        let set_mtime = |path: &Path, epoch_ms: i64| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    UNIX_EPOCH + Duration::from_millis(u64::try_from(epoch_ms).unwrap()),
+                ))
+                .unwrap();
+        };
+        set_mtime(&source, indexed_at - 60_000);
+        let unchanged = || {
+            explicit_watch_once_root_unchanged_after_last_index(
+                &storage,
+                ConnectorKind::OpenClaw,
+                &root,
+            )
+            .unwrap()
+        };
+
+        // Negative control: nothing newer than the last index keeps the fast path.
+        assert!(unchanged(), "an unchanged database must skip");
+        let shm = database_path_with_suffix(&source, "-shm");
+        std::fs::write(&shm, b"reader index").unwrap();
+        set_mtime(&shm, indexed_at + 60_000);
+        assert!(
+            unchanged(),
+            "a reader-rewritten -shm is not a source change"
+        );
+        let wal = database_path_with_suffix(&source, "-wal");
+        std::fs::write(&wal, b"old frames").unwrap();
+        set_mtime(&wal, indexed_at - 30_000);
+        assert!(unchanged(), "a WAL already covered by the last index skips");
+
+        // The bug: a WAL-only commit after the last index, main file untouched.
+        set_mtime(&wal, indexed_at + 1);
+        assert!(!unchanged(), "a committed WAL append must be re-read");
+        set_mtime(&wal, indexed_at - 30_000);
+        let journal = database_path_with_suffix(&source, "-journal");
+        std::fs::write(&journal, b"rollback journal").unwrap();
+        set_mtime(&journal, indexed_at + 1);
+        assert!(!unchanged(), "a newer rollback journal must be re-read");
     }
 
     #[test]

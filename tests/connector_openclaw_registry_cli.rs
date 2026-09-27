@@ -319,4 +319,96 @@ mod registry_and_cli {
         );
         Ok(())
     }
+
+    fn search_hit_count(home: &Path, data: &Path, needle: &str) -> Result<usize> {
+        let output = assert_cmd::Command::from_std(command(home, data))
+            .args([
+                "search",
+                needle,
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--limit",
+                "10",
+            ])
+            .timeout(Duration::from_secs(30))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "search {needle} failed: {output:?}"
+        );
+        let result: Value = serde_json::from_slice(&output.stdout)?;
+        Ok(result["hits"].as_array().map_or(0, Vec::len))
+    }
+
+    fn watch_once(home: &Path, data: &Path, paths: &[&Path]) {
+        let mut index = assert_cmd::Command::from_std(command(home, data));
+        index.args(["index", "--watch-once"]);
+        for path in paths {
+            index.arg(path);
+        }
+        index
+            .args(["--json", "--no-progress-events"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+    }
+
+    /// GH #502: targeted watch-once must see a commit that lands only in the
+    /// WAL while the provider's writer stays open, whether the database alone
+    /// or the database plus its WAL is named. Before the fix both passes
+    /// exited 0 having read nothing: freshness looked only at the main file.
+    #[test]
+    fn watch_once_reads_wal_only_commits_while_the_writer_stays_open() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = fixture(home.path(), "openclaw", "live", "firstwalneedle")?;
+        let wal = sidecar(&database, "-wal");
+        let data = home.path().join("cass-data");
+        // The provider's writer opens before cass indexes, so anything its open
+        // does to the main file happens before the archive's last index.
+        let writer = Connection::open(database.to_string_lossy().as_ref())?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        assert_cmd::Command::from_std(command(home.path(), &data))
+            .args(["index", "--full", "--json"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        let seeded = search_hit_count(home.path(), &data, "firstwalneedle")?;
+        ensure!(
+            seeded > 0,
+            "the seeded message must be searchable before the WAL-only commits: {seeded} hits"
+        );
+
+        for (seq, needle, paths) in [
+            (6, "secondwalneedle", vec![database.as_path()]),
+            (7, "thirdwalneedle", vec![database.as_path(), wal.as_path()]),
+        ] {
+            // Keep the commit strictly after the last index on coarse clocks.
+            std::thread::sleep(Duration::from_millis(1_100));
+            let main_before = bundle(&database)?.swap_remove(0);
+            append(
+                &writer,
+                "live",
+                seq,
+                json!({"type": "message", "message": {"role": "user", "content": needle}}),
+            )?;
+            ensure!(
+                bundle(&database)?.swap_remove(0) == main_before,
+                "the commit must land only in the WAL, leaving the main file untouched"
+            );
+            ensure!(
+                search_hit_count(home.path(), &data, needle)? == 0,
+                "{needle} must not be searchable before the pass"
+            );
+            watch_once(home.path(), &data, &paths);
+            let hits = search_hit_count(home.path(), &data, needle)?;
+            ensure!(
+                hits > 0,
+                "watch-once {paths:?} missed the WAL-only commit of {needle}: {hits} hits"
+            );
+        }
+        writer.close_without_checkpoint()?;
+        Ok(())
+    }
 }
