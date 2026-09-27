@@ -20899,7 +20899,15 @@ fn state_db_strict_open_error_message(
     }
     // GH #503: the #434 shape. The strict open rejects only the derived
     // fts_messages shadow's catalog (a legacy shape older cass wrote); the
-    // canonical rows are readable, and the shadow has an exact repair.
+    // canonical rows are readable. Name the shadow repair only when the
+    // pinned engine can open this catalog for it.
+    if !doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX
+        && doctor_recover::is_missing_fts5_shadow_autoindex_failure(err)
+    {
+        return format!(
+            "{base}; the open rejects only the derived fts_messages FTS5 shadow's legacy catalog (written by cass before the #434 fix), not the conversations or messages. This read-only probe leaves the archive unchanged. This build cannot rebuild that shadow in place (GH #503): keep the archive as it is and do not run 'cass doctor --fix'"
+        );
+    }
     if doctor_recover::is_fts_shadow_schema_level_open_failure(err) {
         return format!(
             "{base}; the open rejects only the derived fts_messages FTS5 shadow's catalog (a legacy shape written by older cass), not the conversations or messages. This read-only probe leaves the archive unchanged; 'cass doctor --rebuild-canonical-fts --dry-run --json' inspects it and '--yes' drops and rebuilds the derived shadow without modifying canonical rows"
@@ -87544,7 +87552,7 @@ mod cli_read_db_tests {
     /// GH #503: the strict open's legacy-shadow refusal names the derived-shadow
     /// repair; a refusal naming a canonical table does not.
     #[test]
-    fn strict_open_error_message_names_the_shadow_repair_for_the_434_shape() {
+    fn strict_open_error_message_is_truthful_about_the_503_legacy_shadow_catalog() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let legacy = anyhow::anyhow!(
@@ -87553,11 +87561,32 @@ mod cli_read_db_tests {
         .context("strictly opening dedicated-owner frankensqlite db readonly");
         let message = state_db_strict_open_error_message(&db_path, "status", &legacy, false);
         assert!(
-            message.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
+            message.contains("not the conversations or messages"),
             "{message}"
         );
+        if doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX {
+            assert!(
+                message.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
+                "{message}"
+            );
+        } else {
+            // GH #503: the pinned engine refuses this catalog even for the
+            // shadow repair, so the hint must not send users there.
+            assert!(!message.contains("rebuild-canonical-fts"), "{message}");
+            assert!(message.contains("GH #503"), "{message}");
+            assert!(
+                message.contains("do not run 'cass doctor --fix'"),
+                "{message}"
+            );
+        }
+
+        // Other shadow-catalog refusals keep the shadow repair.
+        let other_shadow = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master row for `fts_messages_data` is invalid"
+        );
+        let message = state_db_strict_open_error_message(&db_path, "status", &other_shadow, false);
         assert!(
-            message.contains("without modifying canonical rows"),
+            message.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
             "{message}"
         );
 

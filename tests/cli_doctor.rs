@@ -1126,6 +1126,113 @@ fn doctor_repair_leaked_pages_refuses_a_doubled_reference() {
     tracker.complete();
 }
 
+/// GH #503: an archive whose `fts_messages_config` shadow carries the catalog
+/// cass wrote before the #434 fix (a declared primary key with no
+/// sqlite_master autoindex row). The fixture is a synthetic two-message
+/// archive written by cass, with that one table rewritten by stock SQLite
+/// (writable_schema); its paths come from the generating machine's scratch
+/// directory. While the pinned engine refuses the catalog even for the shadow
+/// repair (doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX),
+/// status must not send users to that repair, and the dry-run must not plan
+/// what --yes cannot do: both refuse with the same explanation and leave the
+/// bytes alone. When an engine bump flips the constant, this test must be
+/// rewritten to prove the in-place repair instead.
+#[test]
+fn doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog() {
+    let tracker = PhaseTracker::new(
+        "cli_doctor",
+        "doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog",
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let db_path = data_dir.join("agent_search.db");
+    tracker.phase("fixture", "copy the legacy shadow-catalog archive", || {
+        fs::create_dir_all(&data_dir).expect("data dir");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/gh503/legacy_fts_config_shadow.db"),
+            &db_path,
+        )
+        .expect("copy fixture");
+    });
+    let legacy_blake3 = test_file_blake3(&db_path);
+
+    let phase = tracker.start(
+        "status",
+        Some("the read-only probe names GH #503 and not the shadow repair"),
+    );
+    let status = cass_cmd(test_home)
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass status");
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    assert_eq!(status["database"]["opened"].as_bool(), Some(false));
+    let open_error = status["database"]["open_error"]
+        .as_str()
+        .expect("open_error");
+    assert!(
+        open_error.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
+        "{open_error}"
+    );
+    assert!(open_error.contains("GH #503"), "{open_error}");
+    assert!(
+        !open_error.contains("rebuild-canonical-fts"),
+        "{open_error}"
+    );
+    tracker.end(
+        "status",
+        Some("the read-only probe names GH #503 and not the shadow repair"),
+        phase,
+    );
+
+    let phase = tracker.start(
+        "repair",
+        Some("dry-run and --yes refuse alike and leave the archive untouched"),
+    );
+    for mode in ["--dry-run", "--yes"] {
+        let out = cass_cmd(test_home)
+            .args([
+                "doctor",
+                "--rebuild-canonical-fts",
+                mode,
+                "--json",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+            ])
+            .output()
+            .expect("run cass doctor --rebuild-canonical-fts");
+        assert_eq!(
+            out.status.code(),
+            Some(13),
+            "{mode}: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let error = doctor_error_json(&out.stderr);
+        assert_eq!(test_error_kind(&error), Some("storage"), "{mode}: {error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("legacy catalog"), "{mode}: {rendered}");
+        assert!(rendered.contains("GH #503"), "{mode}: {rendered}");
+        assert_eq!(
+            test_file_blake3(&db_path),
+            legacy_blake3,
+            "{mode} must not modify the archive"
+        );
+    }
+    tracker.end(
+        "repair",
+        Some("dry-run and --yes refuse alike and leave the archive untouched"),
+        phase,
+    );
+    tracker.complete();
+}
+
 /// 2l1b0.58: every (code, kind) doctor returns is advertised by
 /// `--emit-capabilities`, and robot-docs doctor documents no other code.
 /// Before the fix the table advertised 5 as `concurrency-lost` while doctor
