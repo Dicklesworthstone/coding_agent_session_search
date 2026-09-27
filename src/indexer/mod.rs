@@ -34938,8 +34938,229 @@ pub mod persist {
         ))
     }
 
+    /// m91r6: the most one persist call may carry for a single conversation.
+    /// A giant conversation (Codex rollouts reach 1 GiB) persisted as ONE
+    /// storage transaction plus ONE lexical batch peaked at ~22x its source
+    /// size in RSS; on a machine already in swap that thrashed for longer than
+    /// the watchdog's 1800 s persist grace.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct PersistSliceLimits {
+        pub(super) messages: usize,
+        pub(super) content_bytes: usize,
+    }
+
+    impl PersistSliceLimits {
+        pub(super) const DEFAULT: Self = Self {
+            messages: 16_384,
+            content_bytes: 32 * 1024 * 1024,
+        };
+    }
+
+    /// Consecutive message ranges of `conv`, each within `limits` (a single
+    /// oversized message still forms its own range).
+    fn persist_slice_ranges(
+        conv: &NormalizedConversation,
+        limits: PersistSliceLimits,
+    ) -> Vec<std::ops::Range<usize>> {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        let mut bytes = 0usize;
+        for (pos, message) in conv.messages.iter().enumerate() {
+            if pos > start
+                && (pos - start >= limits.messages
+                    || bytes.saturating_add(message.content.len()) > limits.content_bytes)
+            {
+                ranges.push(start..pos);
+                start = pos;
+                bytes = 0;
+            }
+            bytes = bytes.saturating_add(message.content.len());
+        }
+        ranges.push(start..conv.messages.len());
+        ranges
+    }
+
+    /// One slice of a giant conversation. A non-final slice ends at its own
+    /// newest message, so the conversation's recorded end never runs ahead of
+    /// the rows actually stored; the final slice carries the real `ended_at`.
+    fn persist_conversation_slice(
+        conv: &NormalizedConversation,
+        range: std::ops::Range<usize>,
+        is_final: bool,
+    ) -> NormalizedConversation {
+        let messages = conv.messages[range].to_vec();
+        let ended_at = if is_final {
+            conv.ended_at
+        } else {
+            messages
+                .iter()
+                .filter_map(|message| message.created_at)
+                .max()
+        };
+        NormalizedConversation {
+            agent_slug: conv.agent_slug.clone(),
+            external_id: conv.external_id.clone(),
+            title: conv.title.clone(),
+            workspace: conv.workspace.clone(),
+            source_path: conv.source_path.clone(),
+            started_at: conv.started_at,
+            ended_at,
+            metadata: conv.metadata.clone(),
+            messages,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_inner(
+        storage: &FrankenStorage,
+        t_index: Option<&mut TantivyIndex>,
+        convs: &[NormalizedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+        capture_semantic_delta: bool,
+        raw_mirror_data_dir: Option<&Path>,
+        heartbeat: PersistHeartbeat<'_>,
+        source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
+    ) -> Result<PersistBatchOutcome> {
+        persist_conversations_batched_sliced(
+            storage,
+            t_index,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            capture_semantic_delta,
+            raw_mirror_data_dir,
+            heartbeat,
+            source_completion,
+            PersistSliceLimits::DEFAULT,
+        )
+    }
+
+    /// Persist `convs`, splitting any conversation larger than `limits` into
+    /// consecutive slices, each its own storage transaction and lexical
+    /// update. The first slice creates the conversation; later slices take
+    /// the ordinary append path (the same one a growing session takes every
+    /// run), so a crash between slices leaves a prefix that the next run
+    /// completes. The source-ledger completion rides only on the final call.
+    /// Native-ID agents (grok_bot, codebuff) reconcile a whole conversation at
+    /// once and are never sliced.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn persist_conversations_batched_sliced(
+        storage: &FrankenStorage,
+        mut t_index: Option<&mut TantivyIndex>,
+        convs: &[NormalizedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+        capture_semantic_delta: bool,
+        raw_mirror_data_dir: Option<&Path>,
+        heartbeat: PersistHeartbeat<'_>,
+        source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
+        limits: PersistSliceLimits,
+    ) -> Result<PersistBatchOutcome> {
+        let oversized = |conv: &NormalizedConversation| {
+            !matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
+                && persist_slice_ranges(conv, limits).len() > 1
+        };
+        if !convs.iter().any(oversized) {
+            return persist_conversations_batched_whole(
+                storage,
+                t_index,
+                convs,
+                lexical_strategy,
+                defer_checkpoints,
+                capture_semantic_delta,
+                raw_mirror_data_dir,
+                heartbeat,
+                source_completion,
+            );
+        }
+
+        // Runs of ordinary conversations still persist together; each giant
+        // conversation becomes its own sequence of slice calls.
+        enum Part<'a> {
+            Whole(&'a [NormalizedConversation]),
+            Slice(Box<NormalizedConversation>),
+        }
+        let mut parts = Vec::new();
+        let mut run_start = 0;
+        for (pos, conv) in convs.iter().enumerate() {
+            if !oversized(conv) {
+                continue;
+            }
+            if run_start < pos {
+                parts.push(Part::Whole(&convs[run_start..pos]));
+            }
+            let ranges = persist_slice_ranges(conv, limits);
+            let last = ranges.len() - 1;
+            for (slice, range) in ranges.into_iter().enumerate() {
+                parts.push(Part::Slice(Box::new(persist_conversation_slice(
+                    conv,
+                    range,
+                    slice == last,
+                ))));
+            }
+            run_start = pos + 1;
+        }
+        if run_start < convs.len() {
+            parts.push(Part::Whole(&convs[run_start..]));
+        }
+
+        let mut outcome = PersistBatchOutcome::default();
+        let last_part = parts.len() - 1;
+        for (index, part) in parts.into_iter().enumerate() {
+            let is_last = index == last_part;
+            // An inline rebuild replays each touched conversation in full from
+            // the canonical rows (streamed in bounded chunks); replaying it
+            // after every slice would be quadratic. Earlier parts only store
+            // rows and the final part's replay covers every slice.
+            let part_strategy = if !is_last
+                && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan
+            {
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
+            } else {
+                lexical_strategy
+            };
+            let completion = source_completion.filter(|_| is_last);
+            let part_outcome = match &part {
+                Part::Whole(batch) => persist_conversations_batched_whole(
+                    storage,
+                    t_index.as_deref_mut(),
+                    batch,
+                    part_strategy,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    raw_mirror_data_dir,
+                    heartbeat,
+                    completion,
+                ),
+                Part::Slice(slice) => persist_conversations_batched_whole(
+                    storage,
+                    t_index.as_deref_mut(),
+                    std::slice::from_ref(slice.as_ref()),
+                    part_strategy,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    raw_mirror_data_dir,
+                    heartbeat,
+                    completion,
+                ),
+            }?;
+            outcome.merge(part_outcome);
+            // Publish each incremental slice so the lexical writer's buffered
+            // documents stay bounded by one slice too.
+            if !is_last
+                && lexical_strategy == LexicalPopulationStrategy::IncrementalInline
+                && let Some(index) = t_index.as_deref_mut()
+            {
+                index.commit()?;
+            }
+            heartbeat.tick();
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_conversations_batched_whole(
         storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
@@ -36111,6 +36332,136 @@ pub mod persist {
                 assert_eq!(hits(marker), 1, "{marker} must be searchable exactly once");
             }
             assert_eq!(hits("tailmark"), 0, "text past one message's cap stays out");
+        }
+
+        /// m91r6: a giant conversation persisted in slices must store exactly
+        /// what one transaction stores, be searchable at both ends, resume
+        /// after a crash between slices, and replay as a no-op.
+        #[test]
+        #[serial]
+        fn giant_conversation_persists_in_slices_like_one_transaction() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _begin = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let limits = PersistSliceLimits {
+                messages: 7,
+                content_bytes: usize::MAX,
+            };
+            let conversation = |dir: &std::path::Path, timestamps: bool| {
+                let messages = (0..50)
+                    .map(|idx| NormalizedMessage {
+                        idx,
+                        role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
+                        author: None,
+                        created_at: timestamps.then_some(1_700_000_000_000 + idx * 1000),
+                        content: format!("slicemark{idx}z giant session text {idx}"),
+                        extra: serde_json::json!({"uuid": format!("slice-{idx}")}),
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    })
+                    .collect();
+                NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some("giant-sliced".into()),
+                    title: Some("Giant sliced".into()),
+                    workspace: Some(dir.join("workspace")),
+                    source_path: dir.join("rollout-giant.jsonl"),
+                    started_at: timestamps.then_some(1_700_000_000_000),
+                    ended_at: timestamps.then_some(1_700_000_049_000),
+                    metadata: serde_json::Value::Null,
+                    messages,
+                }
+            };
+            let stored = |storage: &FrankenStorage| {
+                let rows: Vec<(i64, Option<i64>)> = storage
+                    .raw()
+                    .query_map_collect("SELECT id, ended_at FROM conversations", &[], |row| {
+                        Ok((row.get_typed(0)?, row.get_typed(1)?))
+                    })
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "exactly one conversation row");
+                let messages = storage
+                    .fetch_messages(rows[0].0)
+                    .unwrap()
+                    .into_iter()
+                    .map(|message| (message.idx, message.created_at, message.content))
+                    .collect::<Vec<_>>();
+                (rows[0].1, messages)
+            };
+            for strategy in [
+                LexicalPopulationStrategy::IncrementalInline,
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+            ] {
+                for timestamps in [true, false] {
+                    let dir = tempfile::TempDir::new().unwrap();
+                    let conv = conversation(dir.path(), timestamps);
+                    assert_eq!(persist_slice_ranges(&conv, limits).len(), 8);
+                    let persist = |name: &str, convs: &[NormalizedConversation], sliced: bool| {
+                        let root = dir.path().join(name);
+                        std::fs::create_dir_all(&root).unwrap();
+                        let storage = create_franken_db(&root.join("agent_search.db"));
+                        let index_path = root.join("index");
+                        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+                        let mut outcomes = Vec::new();
+                        for conv in convs {
+                            outcomes.push(
+                                persist_conversations_batched_sliced(
+                                    &storage,
+                                    Some(&mut index),
+                                    std::slice::from_ref(conv),
+                                    strategy,
+                                    false,
+                                    false,
+                                    Some(&root),
+                                    PersistHeartbeat::NONE,
+                                    None,
+                                    if sliced {
+                                        limits
+                                    } else {
+                                        PersistSliceLimits::DEFAULT
+                                    },
+                                )
+                                .unwrap(),
+                            );
+                            index.commit().unwrap();
+                        }
+                        let docs = tantivy_doc_count(&mut index);
+                        drop(index);
+                        (storage, index_path, outcomes, docs)
+                    };
+                    let label = format!("{strategy:?} timestamps={timestamps}");
+
+                    let (whole, _, _, whole_docs) =
+                        persist("whole", std::slice::from_ref(&conv), false);
+                    let expected = stored(&whole);
+                    assert_eq!(expected.1.len(), 50, "{label}");
+
+                    let (sliced, index_path, outcomes, sliced_docs) =
+                        persist("sliced", &[conv.clone(), conv.clone()], true);
+                    assert_eq!(stored(&sliced), expected, "{label}");
+                    assert_eq!(sliced_docs, whole_docs, "{label}");
+                    assert_eq!(outcomes[0].inserted_conversations, 1, "{label}");
+                    assert_eq!(outcomes[0].inserted_messages, 50, "{label}");
+                    assert_eq!(outcomes[1].inserted_messages, 0, "{label}: replay");
+                    let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+                    for marker in ["slicemark0z", "slicemark27z", "slicemark49z"] {
+                        let hits = client
+                            .search(marker, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                            .unwrap();
+                        assert_eq!(hits.len(), 1, "{label}: {marker}");
+                    }
+
+                    // A crash after three slices leaves a stored prefix; the
+                    // next run completes it without duplicating a row.
+                    let prefix = persist_conversation_slice(&conv, 0..21, false);
+                    let (resumed, _, outcomes, resumed_docs) =
+                        persist("resumed", &[prefix, conv.clone()], true);
+                    assert_eq!(stored(&resumed), expected, "{label}: resumed");
+                    assert_eq!(resumed_docs, whole_docs, "{label}: resumed");
+                    assert_eq!(outcomes[1].inserted_messages, 29, "{label}: resumed");
+                }
+            }
         }
 
         #[test]
