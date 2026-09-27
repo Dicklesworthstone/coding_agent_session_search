@@ -292,7 +292,7 @@ fn hold_active_lexical_rebuild_lock(
     };
 
     let mut rebuild_state = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "schema_hash": coding_agent_search::search::tantivy::SCHEMA_HASH,
         "db": {
             "db_path": db_path.display().to_string(),

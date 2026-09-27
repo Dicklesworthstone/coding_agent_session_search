@@ -203,7 +203,7 @@ fn seed_rebuild_state(data_dir: &Path) -> Result<std::fs::File, String> {
     fs::write(
         &checkpoint_path,
         serde_json::to_vec_pretty(&json!({
-            "version": 2,
+            "version": 3,
             "schema_hash": SCHEMA_HASH,
             "db": {
                 "db_path": db_path.display().to_string(),

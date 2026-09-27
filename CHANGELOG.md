@@ -67,6 +67,18 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **Long sessions are searchable past their first 8 MiB.** The lexical
+  index capped each conversation's text at 8 MiB in total, so every message
+  after that point was stored but never searchable, in rebuilds and in
+  incremental updates alike. On one owner archive that was 1,458,931 of
+  3,681,541 non-empty messages (39.6%) across 71 conversations. The cap now
+  applies to each message on its own (`CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES`,
+  still 8 MiB). Rebuilds and incremental updates read a long session in
+  bounded chunks instead of holding it whole. After upgrading, the first
+  `cass index` (a routine, background or scheduled run, on an archive of any
+  size) finds an index built under the old cap short of documents and
+  rebuilds it once from the database. An index built under the old cap can
+  no longer be certified as complete.
 - **An open TUI keeps searching after the index is rebuilt.** A rebuild
   (`cass forget`, `dedup --apply`, an agent purge, `cass index --full`, the
   background repair) publishes a new index in place of the old one. A TUI

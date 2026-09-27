@@ -88132,7 +88132,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -88285,7 +88285,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -88348,7 +88348,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -88413,7 +88413,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -88839,7 +88839,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),

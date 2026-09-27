@@ -602,6 +602,83 @@ struct LexicalRebuildConversationPacket {
     message_bytes: usize,
     flow_reservation_bytes: usize,
     last_message_id: Option<i64>,
+    /// Set when this packet carries one message-range chunk of a conversation
+    /// too long to hold whole (bgn6s); `None` for an ordinary whole-conversation
+    /// packet.
+    chunk: Option<LexicalRebuildChunk>,
+}
+
+/// One message-range chunk of a long conversation (bgn6s). Chunks of one
+/// conversation arrive in order; only the last finishes the conversation, so
+/// progress and commits still happen at conversation boundaries.
+#[derive(Clone)]
+struct LexicalRebuildChunk {
+    is_final: bool,
+    /// Released once the consumer has flushed this chunk into the index, so
+    /// the page-prep worker reads the next chunk only then.
+    gate: Arc<LexicalRebuildChunkGate>,
+}
+
+impl std::fmt::Debug for LexicalRebuildChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LexicalRebuildChunk")
+            .field("is_final", &self.is_final)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for LexicalRebuildChunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_final == other.is_final
+    }
+}
+
+impl Eq for LexicalRebuildChunk {}
+
+/// Flow control for streaming one long conversation from a page-prep worker
+/// to the consumer: at most one flushed-but-unacknowledged chunk is in flight.
+#[derive(Debug, Default)]
+struct LexicalRebuildChunkGate {
+    outstanding: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl LexicalRebuildChunkGate {
+    fn sent(&self) {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        *outstanding = outstanding.saturating_add(1);
+    }
+
+    fn flushed(&self) {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        *outstanding = outstanding.saturating_sub(1);
+        self.cv.notify_all();
+    }
+
+    /// Wait until every sent chunk has been flushed, or fail once the pipeline
+    /// is torn down (the consumer will never flush again). A failing consumer
+    /// closes the flow limiter; a failing producer or worker closes the
+    /// reservation order.
+    fn wait_until_flushed(
+        &self,
+        reservation_order: &LexicalRebuildReservationOrder,
+        flow_limiter: &StreamingByteLimiter,
+    ) -> Result<()> {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        while *outstanding > 0 {
+            if reservation_order.is_closed() || flow_limiter.is_closed() {
+                anyhow::bail!(
+                    "lexical rebuild pipeline closed while a long conversation was streaming"
+                );
+            }
+            outstanding = self
+                .cv
+                .wait_timeout(outstanding, Duration::from_millis(200))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3221,7 +3298,10 @@ fn process_index_write_bytes() -> Option<u64> {
     }
 }
 
-const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
+/// 3: generations built under the per-message content cap (bgn6s). A v2
+/// generation left every message past a long conversation's first 8 MiB
+/// unindexed; the version change stops it certifying, so it is rebuilt once.
+const LEXICAL_REBUILD_STATE_VERSION: u8 = 3;
 // Size of each SQL page fetched from the conversations table during a lexical
 // rebuild. The page is a primary-key-ordered LIMIT window materialized as
 // lightweight `LexicalRebuildConversationRow` records (~1 KB each — no message
@@ -4535,6 +4615,7 @@ impl LexicalRebuildConversationPacket {
             message_bytes,
             flow_reservation_bytes: 0,
             last_message_id,
+            chunk: None,
         }
     }
 
@@ -4636,6 +4717,7 @@ impl LexicalRebuildConversationPacket {
             message_bytes,
             flow_reservation_bytes: 0,
             last_message_id: None,
+            chunk: None,
         }
     }
 
@@ -8681,17 +8763,18 @@ fn bounded_lexical_rebuild_page_reservation_limits(
     (batch_fetch_message_bytes_limit, max_message_bytes_in_flight)
 }
 
-/// Bound the number of conversations retained by one prepared page so the
-/// cumulative per-conversation lexical prefixes cannot exceed that page's
-/// content reservation. A single outlier still gets one page and is handled by
-/// the per-conversation fallback in the prep worker.
+/// Size a page so a typical page of conversations fits its content
+/// reservation: at most one per-message cap's worth of text per conversation.
+/// This is a heuristic; the byte-budgeted batch fetch enforces the real bound
+/// (it stops reading a conversation that cannot fit), and a long conversation
+/// falls back to the prep worker's chunked path (bgn6s).
 fn lexical_rebuild_content_bounded_page_conversation_limit(
     configured_page_conversation_limit: usize,
     batch_fetch_message_bytes_limit: usize,
 ) -> usize {
     let batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit.max(1);
     let effective_conversation_content_cap =
-        crate::storage::sqlite::lexical_max_conversation_content_bytes()
+        crate::storage::sqlite::lexical_max_message_content_bytes()
             .min(i32::MAX as usize)
             .min(batch_fetch_message_bytes_limit)
             .max(1);
@@ -10080,13 +10163,15 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 ///
 /// Exactness comes from reusing the sink's own inputs rather than a SQL
 /// approximation that could drift from Rust trim semantics:
-///   - iterate live conversations only, via `fetch_messages_for_lexical_rebuild`
-///     — orphaned `messages` rows (no live conversation) are never indexed by
-///     the sink, so they must not inflate the expectation;
-///   - that fetch already applies the #290 per-conversation content cap
-///     (`truncate_lexical_rebuild_conversation_content`), so a conversation whose
-///     trailing body is cleared to empty is classified as hard-noise exactly as
-///     the sink drops it;
+///   - iterate live conversations only, via the rebuild's own message stream
+///     (`for_each_lexical_rebuild_message`) — orphaned `messages` rows (no live
+///     conversation) are never indexed by the sink, so they must not inflate the
+///     expectation;
+///   - that stream applies the same #290 per-message cap as the sink; there is
+///     no per-conversation cap any more, so a long conversation's later
+///     messages count as expected documents (bgn6s: the old cumulative cap
+///     cleared them to empty, and this expectation then certified an index
+///     missing them);
 ///   - classify with the same `is_hard_message_noise(lexical_rebuild_noise_role(
 ///     is_tool_role), content)` predicate and precise tool-role mapping the sink
 ///     uses.
@@ -10106,12 +10191,15 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
     let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
-        for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
+        // Stream: a long conversation is classified message by message, never
+        // held whole (bgn6s removed the per-conversation cap that bounded it).
+        storage.for_each_lexical_rebuild_message(conversation_id, None, |message| {
             let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
             if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
                 expected_docs += 1;
             }
-        }
+            Ok(true)
+        })?;
     }
     Ok(expected_docs)
 }
@@ -10119,7 +10207,9 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
 /// GH #461: sidecar next to the rebuild checkpoint memoizing the
 /// noise-adjusted expected doc count for one canonical content identity.
 const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
-const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 1;
+/// 2: counts under the per-message cap (bgn6s). A v1 memo counted a long
+/// conversation's messages past its first 8 MiB as noise and must be recounted.
+const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 2;
 /// Recount in full after this many consecutive append deltas. The identity
 /// (like the lexical checkpoint fingerprint it extends) cannot see an in-place
 /// content edit of an existing row; this bounds how long such an edit can skew
@@ -10169,8 +10259,8 @@ fn expected_lexical_docs_identity(
         max_conversation_id: max_conversation_id_exact(storage)?.unwrap_or(0),
         max_message_id,
         total_messages,
-        // The same effective cap fetch_messages_for_lexical_rebuild applies.
-        content_cap_bytes: crate::storage::sqlite::lexical_max_conversation_content_bytes()
+        // The same per-message cap the rebuild's message stream applies.
+        content_cap_bytes: crate::storage::sqlite::lexical_max_message_content_bytes()
             .min(i32::MAX as usize),
     })
 }
@@ -10179,12 +10269,10 @@ fn expected_lexical_docs_identity(
 /// or `None` when the archive changed in any way an append cannot explain.
 ///
 /// Sound only for pure appends: no conversation or message was deleted (both
-/// totals grew by exactly the rows beyond the memoized maxima), the content
-/// cap is unchanged, and within every touched conversation each new message
-/// sorts after all previously retained ones. The per-conversation cap is
-/// cumulative in `idx` order, so under those conditions the old messages'
-/// truncation, and therefore their noise classification, is unchanged, and
-/// only the new messages need classifying, exactly as the full scan would.
+/// totals grew by exactly the rows beyond the memoized maxima) and the content
+/// cap is unchanged. The cap applies to each message on its own, so appending
+/// rows never changes an older message's truncation or noise classification,
+/// and only the new messages need classifying, exactly as the full scan would.
 fn expected_live_lexical_doc_count_delta(
     storage: &FrankenStorage,
     cached: &ExpectedLexicalDocsCache,
@@ -10214,12 +10302,11 @@ fn expected_live_lexical_doc_count_delta(
     {
         return Ok(None);
     }
-    // Conversations touched since the memo: a rowid range over the new message
-    // rows only. This used to JOIN conversations in the same statement, and
-    // fsqlite's join path materialized every message row (content included)
-    // before filtering: on an 8M-message archive it ran for 20+ minutes at
-    // index startup and again in the post-run checkpoint refresh, where the
-    // stall watchdog killed runs that had finished their work (exit 70).
+    // The per-message cap makes every message's classification independent of
+    // every other, so only the rows appended since the memo need classifying:
+    // a rowid-range scan over them, never a JOIN (fsqlite's join path used to
+    // materialize every message row, content included: 20+ minutes on an
+    // 8M-message archive) and never the older text of a touched conversation.
     let touched: Vec<i64> = storage
         .raw()
         .query_map_collect(
@@ -10228,10 +10315,11 @@ fn expected_live_lexical_doc_count_delta(
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations touched since the expected lexical docs memo")?;
-    let mut expected_docs = cached.expected_docs;
+    // Live conversations only, like the full scan (orphaned rows are never
+    // indexed): one point lookup per touched conversation, resolved before the
+    // row stream so no query runs inside its callback.
+    let mut live_conversations = HashSet::with_capacity(touched.len());
     for conversation_id in touched {
-        // Live conversations only, like the full scan (orphaned rows are never
-        // indexed): a point lookup per touched conversation.
         let live: i64 = storage
             .raw()
             .query_row_map(
@@ -10240,30 +10328,26 @@ fn expected_live_lexical_doc_count_delta(
                 |row: &crate::franken_sync::Row| row.get_typed(0),
             )
             .context("checking a touched conversation for the expected lexical docs memo")?;
-        if live == 0 {
-            continue;
-        }
-        let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
-        let is_new = |message: &crate::model::types::Message| {
-            message.id.is_none_or(|id| id > old.max_message_id)
-        };
-        let retained_max_idx = messages
-            .iter()
-            .filter(|message| !is_new(message))
-            .map(|message| message.idx)
-            .max();
-        for message in messages.iter().filter(|message| is_new(message)) {
-            if retained_max_idx.is_some_and(|max_idx| message.idx <= max_idx) {
-                // Inserted before retained messages: the cumulative cap may
-                // now truncate those differently. Only a full count is exact.
-                return Ok(None);
-            }
-            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
-            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
-                expected_docs = expected_docs.saturating_add(1);
-            }
+        if live != 0 {
+            live_conversations.insert(conversation_id);
         }
     }
+    let mut expected_docs = cached.expected_docs;
+    storage.for_each_lexical_rebuild_message_after_id(
+        old.max_message_id,
+        |conversation_id, message| {
+            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            if live_conversations.contains(&conversation_id)
+                && !is_hard_message_noise(
+                    lexical_rebuild_noise_role(is_tool_role),
+                    &message.content,
+                )
+            {
+                expected_docs = expected_docs.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some(expected_docs))
 }
 
@@ -13296,6 +13380,10 @@ impl StreamingByteLimiter {
         state.closed = true;
         self.cv.notify_all();
     }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
 }
 
 #[derive(Debug)]
@@ -13389,6 +13477,10 @@ impl LexicalRebuildReservationOrder {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
         self.cv.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
 }
 
@@ -21973,7 +22065,14 @@ struct LexicalRebuildSequencedPreparedPage {
 #[derive(Debug)]
 enum LexicalRebuildPagePrepResult {
     Prepared(LexicalRebuildSequencedPreparedPage),
-    Error { sequence: u64, error: String },
+    /// An early part of a page still being prepared: one chunk of a long
+    /// conversation (bgn6s). Parts of a sequence are forwarded in order, before
+    /// its `Prepared` page, and hold no flow reservation.
+    Part(LexicalRebuildSequencedPreparedPage),
+    Error {
+        sequence: u64,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -22111,6 +22210,54 @@ fn lexical_rebuild_shard_merge_injected_panic_hook(output_path: &Path) {
     );
 }
 
+/// Split a conversation's `(idx, indexed bytes)` footprints (in idx order) into
+/// inclusive idx ranges of at most `chunk_bytes` of text each; a single larger
+/// message is a range of its own. One range means the conversation fits.
+fn lexical_rebuild_conversation_chunks(
+    footprints: &[(i64, usize)],
+    chunk_bytes: usize,
+) -> Vec<(i64, i64)> {
+    let mut chunks = Vec::new();
+    let mut current: Option<(i64, i64, usize)> = None;
+    for &(idx, bytes) in footprints {
+        match current.as_mut() {
+            Some((_, last, used)) if used.saturating_add(bytes) <= chunk_bytes => {
+                *last = idx;
+                *used = used.saturating_add(bytes);
+            }
+            _ => {
+                if let Some((first, last, _)) = current.take() {
+                    chunks.push((first, last));
+                }
+                current = Some((idx, idx, bytes));
+            }
+        }
+    }
+    if let Some((first, last, _)) = current {
+        chunks.push((first, last));
+    }
+    chunks
+}
+
+/// An early part of a page: packets handed to the consumer ahead of the page's
+/// completion (bgn6s). It holds no flow reservation and never finishes a
+/// planned shard.
+fn lexical_rebuild_page_part(
+    packets: Vec<LexicalRebuildConversationPacket>,
+    page_last_conversation_id: i64,
+    planned_shard_index: Option<usize>,
+) -> LexicalRebuildPreparedPage {
+    LexicalRebuildPreparedPage {
+        packets,
+        page_last_conversation_id,
+        planned_shard_index,
+        finishes_planned_shard: false,
+        conversation_list_duration: Duration::ZERO,
+        message_fetch_duration: Duration::ZERO,
+        packet_prepare_duration: Duration::ZERO,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_lexical_rebuild_page_work(
     storage: &mut FrankenStorage,
@@ -22120,6 +22267,7 @@ fn prepare_lexical_rebuild_page_work(
     producer_telemetry: &LexicalRebuildProducerTelemetry,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     work: LexicalRebuildPagePrepWork,
+    emit_part: &mut dyn FnMut(LexicalRebuildPreparedPage) -> Result<()>,
 ) -> Result<LexicalRebuildSequencedPreparedPage> {
     let sequence = work.sequence;
     let conversation_ids = work
@@ -22189,6 +22337,9 @@ fn prepare_lexical_rebuild_page_work(
                 "lexical rebuild page exceeded batch-fetch guardrail inside page-prep worker; preparing one conversation at a time"
             );
             let mut prepared_packets = Vec::with_capacity(work.conversation_page.len());
+            // A conversation larger than one page's content budget is streamed
+            // in message-range chunks instead of held whole (bgn6s).
+            let chunk_bytes = work.pipeline_budget.batch_fetch_message_bytes_limit.max(1);
             for conversation in work.conversation_page {
                 let conversation_id = conversation.id.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -22196,6 +22347,93 @@ fn prepare_lexical_rebuild_page_work(
                     )
                 })?;
                 let fallback_fetch_started = Instant::now();
+                let footprints = storage
+                    .lexical_rebuild_message_footprints(conversation_id)
+                    .with_context(|| {
+                        format!(
+                            "reading lexical rebuild footprints for conversation {conversation_id}"
+                        )
+                    })?;
+                let chunks = lexical_rebuild_conversation_chunks(&footprints, chunk_bytes);
+                if chunks.len() > 1 {
+                    message_fetch_duration =
+                        message_fetch_duration.saturating_add(fallback_fetch_started.elapsed());
+                    // Everything prepared so far precedes this conversation.
+                    if !prepared_packets.is_empty() {
+                        emit_part(lexical_rebuild_page_part(
+                            std::mem::take(&mut prepared_packets),
+                            work.page_last_conversation_id,
+                            work.planned_shard_index,
+                        ))?;
+                    }
+                    tracing::info!(
+                        sequence,
+                        conversation_id,
+                        messages = footprints.len(),
+                        indexed_bytes = footprints.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
+                        chunks = chunks.len(),
+                        chunk_bytes,
+                        "lexical rebuild streaming a long conversation in message-range chunks"
+                    );
+                    let gate = Arc::new(LexicalRebuildChunkGate::default());
+                    for (chunk_index, (first_idx, last_idx)) in chunks.iter().enumerate() {
+                        let chunk_fetch_started = Instant::now();
+                        let messages = storage
+                            .fetch_messages_for_lexical_rebuild_idx_range(
+                                conversation_id,
+                                *first_idx,
+                                *last_idx,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "fetching lexical rebuild messages {first_idx}..={last_idx} for conversation {conversation_id}"
+                                )
+                            })?;
+                        message_fetch_duration =
+                            message_fetch_duration.saturating_add(chunk_fetch_started.elapsed());
+                        let mut grouped_messages = HashMap::with_capacity(1);
+                        if !messages.is_empty() {
+                            grouped_messages.insert(conversation_id, messages);
+                        }
+                        let chunk_prepare_started = Instant::now();
+                        let mut chunk_packets = prepare_lexical_rebuild_packet_batch(
+                            vec![conversation.clone()],
+                            grouped_messages,
+                            source_map,
+                            lexical_rebuild_worker_pool,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "preparing lexical rebuild chunk {chunk_index} of conversation {conversation_id}"
+                            )
+                        })?;
+                        packet_prepare_duration =
+                            packet_prepare_duration.saturating_add(chunk_prepare_started.elapsed());
+                        let is_final = chunk_index + 1 == chunks.len();
+                        for packet in &mut chunk_packets {
+                            packet.chunk = Some(LexicalRebuildChunk {
+                                is_final,
+                                gate: Arc::clone(&gate),
+                            });
+                        }
+                        if is_final {
+                            // The last chunk rides the completed page and
+                            // finishes the conversation there.
+                            prepared_packets.extend(chunk_packets);
+                        } else {
+                            // One chunk in flight: the previous must be flushed
+                            // into the index before this one is handed over.
+                            gate.wait_until_flushed(reservation_order, flow_limiter)?;
+                            gate.sent();
+                            emit_part(lexical_rebuild_page_part(
+                                chunk_packets,
+                                work.page_last_conversation_id,
+                                work.planned_shard_index,
+                            ))?;
+                        }
+                    }
+                    continue;
+                }
                 let messages = storage
                     .fetch_messages_for_lexical_rebuild(conversation_id)
                     .with_context(|| {
@@ -22381,6 +22619,20 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                         worker_producer_telemetry.as_ref(),
                                         worker_pool.as_deref(),
                                         work,
+                                        &mut |page| {
+                                            worker_result_tx
+                                                .send(LexicalRebuildPagePrepResult::Part(
+                                                    LexicalRebuildSequencedPreparedPage {
+                                                        sequence,
+                                                        page,
+                                                    },
+                                                ))
+                                                .map_err(|_| {
+                                                    anyhow::anyhow!(
+                                                        "lexical rebuild producer disconnected while a long conversation was streaming"
+                                                    )
+                                                })
+                                        },
                                     )
                                 },
                             ));
@@ -22608,6 +22860,10 @@ fn spawn_lexical_rebuild_packet_producer(
                 let mut handoff_messages_since_budget = 0usize;
                 let mut handoff_message_bytes_since_budget = 0usize;
                 let mut completed_pages = BTreeMap::<u64, LexicalRebuildPreparedPage>::new();
+                // Early parts (long-conversation chunks) per sequence, forwarded
+                // in order ahead of that sequence's completed page (bgn6s).
+                let mut pending_parts =
+                    BTreeMap::<u64, VecDeque<LexicalRebuildPreparedPage>>::new();
                 let mut logged_current_shard_index = None;
 
                 loop {
@@ -22797,7 +23053,29 @@ fn spawn_lexical_rebuild_packet_producer(
                         }
                     }
 
-                    while let Some(prepared_page) = completed_pages.remove(&next_sequence_to_emit) {
+                    loop {
+                        // Parts of the head sequence (chunks of a long
+                        // conversation) go out as soon as they arrive: the
+                        // worker streaming it waits for each to be flushed.
+                        if let Some(parts) = pending_parts.get_mut(&next_sequence_to_emit) {
+                            while let Some(part) = parts.pop_front() {
+                                if tx.send(LexicalRebuildPipelineMessage::Batch(part)).is_err() {
+                                    reservation_order.close();
+                                    release_completed_lexical_rebuild_pages(
+                                        &mut completed_pages,
+                                        flow_limiter.as_ref(),
+                                    );
+                                    return Err(anyhow::anyhow!(
+                                        "lexical rebuild consumer disconnected before an ordered long-conversation chunk handoff"
+                                    ));
+                                }
+                            }
+                        }
+                        let Some(prepared_page) = completed_pages.remove(&next_sequence_to_emit)
+                        else {
+                            break;
+                        };
+                        pending_parts.remove(&next_sequence_to_emit);
                         producer_telemetry.record(
                             page_prep_worker_count,
                             active_work,
@@ -22996,6 +23274,28 @@ fn spawn_lexical_rebuild_packet_producer(
                                 ordered_buffered_pages = completed_pages.len(),
                                 "lexical rebuild producer received prepared page from worker"
                             );
+                        }
+                        Ok(LexicalRebuildPagePrepResult::Part(part)) => {
+                            // A part never finishes its page, so active work
+                            // and the ordered barrier are unchanged.
+                            if part.sequence < next_sequence_to_emit
+                                || completed_pages.contains_key(&part.sequence)
+                            {
+                                reservation_order.close();
+                                release_completed_lexical_rebuild_pages(
+                                    &mut completed_pages,
+                                    flow_limiter.as_ref(),
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "lexical rebuild page-prep worker returned a part for sequence {} after that page completed (ordered barrier {})",
+                                    part.sequence,
+                                    next_sequence_to_emit
+                                ));
+                            }
+                            pending_parts
+                                .entry(part.sequence)
+                                .or_default()
+                                .push_back(part.page);
                         }
                         Ok(LexicalRebuildPagePrepResult::Error { sequence, error }) => {
                             reservation_order.close();
@@ -26200,6 +26500,39 @@ fn rebuild_tantivy_from_db_with_options(
                                 max_message_id = max_message_id.max(last_message_id);
                             }
                             equivalence_accumulator.absorb_packet(&packet);
+                            if let Some(chunk) =
+                                packet.chunk.clone().filter(|chunk| !chunk.is_final)
+                            {
+                                // A non-final chunk of a long conversation
+                                // (bgn6s): flush it into the index now, freeing
+                                // its text so the worker reads the next chunk.
+                                // The conversation is counted, and can be
+                                // committed, only at its last chunk.
+                                observed_messages =
+                                    observed_messages.saturating_add(packet.message_count);
+                                pending_batch_message_count = pending_batch_message_count
+                                    .saturating_add(packet.message_count);
+                                pending_batch_message_bytes = pending_batch_message_bytes
+                                    .saturating_add(packet.message_bytes);
+                                pending_batch.push(packet);
+                                flush_streamed_lexical_rebuild_batch(
+                                    &mut pending_batch,
+                                    &mut pending_batch_message_count,
+                                    &mut pending_batch_message_bytes,
+                                    Some(lexical_rebuild_flow_limiter.as_ref()),
+                                    lexical_rebuild_worker_pool.as_deref(),
+                                    &mut t_index,
+                                    &mut indexed_docs,
+                                    &mut messages_since_commit,
+                                    &mut message_bytes_since_commit,
+                                    current_batch_conversation_limit,
+                                    page_size,
+                                    perf_profile.as_mut(),
+                                )?;
+                                chunk.gate.flushed();
+                                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                                continue;
+                            }
                             finish_conversation!(packet)?;
                         }
                         if flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
@@ -32402,19 +32735,21 @@ pub mod persist {
     use crate::sources::provenance::{Source, SourceKind};
     use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome, SourceFileStamp};
 
-    /// Replay the capped canonical conversation after persistence. Callers map
-    /// changed message indices onto this packet only after its canonical prefix
-    /// has consumed the same content budget as an authoritative database rebuild.
-    fn lexical_packet_for_canonical_outcome(
+    /// Indexed-text bytes read per step when a whole canonical conversation is
+    /// replayed inline, so a conversation with gigabytes of history never has
+    /// more than one chunk in memory (bgn6s). Each message is still capped by
+    /// `lexical_max_message_content_bytes`, so a chunk exceeds this only when
+    /// it holds a single message.
+    const CANONICAL_LEXICAL_REPLAY_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+    /// The canonical conversation a lexical packet is built on, without its
+    /// messages. As in a full rebuild, stored metadata and snippets are
+    /// omitted: only the origin envelope the lexical sink reads is synthesized
+    /// from canonical columns, and the incoming transcript is never cloned.
+    fn canonical_lexical_conversation(
         storage: &FrankenStorage,
         conversation_id: i64,
-    ) -> Result<ConversationPacket> {
-        // GH #466: persistence can retain an earlier, shorter message variant.
-        // Spend the lexical prefix budget on those canonical rows, before
-        // selecting inserted indices, rather than on the freshly parsed source.
-        // As in a full rebuild, omit stored metadata/snippets and hydrate
-        // bounded text. Only the canonical origin envelope is synthesized below;
-        // never clone the incoming transcript just to replace its messages.
+    ) -> Result<Conversation> {
         let mut canonical = storage.raw().query_row_map(
             "SELECT COALESCE(a.slug, 'unknown'), c.external_id, c.title, c.source_path,
                     c.started_at, c.ended_at, c.source_id, c.origin_host, w.path
@@ -32453,29 +32788,103 @@ pub mod persist {
                 })
             },
         )?;
-        canonical.messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
-        let provenance = ConversationPacketProvenance {
-            source_id: canonical.source_id.clone(),
-            origin_kind: crate::search::tantivy::normalized_index_origin_kind(
-                &canonical.source_id,
-                None,
-            ),
-            origin_host: canonical.origin_host.clone(),
-        };
-        // The lexical packet sink reads this small origin envelope. Rebuild
-        // it from canonical columns without loading arbitrary stored metadata.
+        let origin_kind =
+            crate::search::tantivy::normalized_index_origin_kind(&canonical.source_id, None);
         canonical.metadata_json = serde_json::json!({
             "cass": {
                 "origin": {
-                    "source_id": &provenance.source_id,
-                    "kind": &provenance.origin_kind,
-                    "host": &provenance.origin_host,
+                    "source_id": &canonical.source_id,
+                    "kind": origin_kind,
+                    "host": &canonical.origin_host,
                 }
             }
         });
-        Ok(ConversationPacket::from_canonical_replay_owned(
-            canonical, provenance,
-        ))
+        Ok(canonical)
+    }
+
+    fn canonical_lexical_packet(
+        conversation: &Conversation,
+        messages: Vec<Message>,
+    ) -> ConversationPacket {
+        let provenance = ConversationPacketProvenance {
+            source_id: conversation.source_id.clone(),
+            origin_kind: crate::search::tantivy::normalized_index_origin_kind(
+                &conversation.source_id,
+                None,
+            ),
+            origin_host: conversation.origin_host.clone(),
+        };
+        let mut canonical = conversation.clone();
+        canonical.messages = messages;
+        ConversationPacket::from_canonical_replay_owned(canonical, provenance)
+    }
+
+    /// The canonical rows of the message indices a persistence outcome
+    /// changed. GH #466: persistence can retain an earlier message variant, so
+    /// the packet carries what was stored, never the freshly parsed source.
+    /// Only the changed rows are held, so an append to a long conversation
+    /// never reads its older text into memory (bgn6s).
+    fn lexical_packet_for_changed_messages(
+        storage: &FrankenStorage,
+        conversation_id: i64,
+        changed_indices: &[i64],
+    ) -> Result<ConversationPacket> {
+        let conversation = canonical_lexical_conversation(storage, conversation_id)?;
+        let wanted: HashSet<i64> = changed_indices.iter().copied().collect();
+        let mut messages = Vec::with_capacity(wanted.len());
+        if let (Some(&first), Some(&last)) = (wanted.iter().min(), wanted.iter().max()) {
+            storage.for_each_lexical_rebuild_message(
+                conversation_id,
+                Some((first, last)),
+                |message| {
+                    if wanted.contains(&message.idx) {
+                        messages.push(message);
+                    }
+                    Ok(true)
+                },
+            )?;
+        }
+        Ok(canonical_lexical_packet(&conversation, messages))
+    }
+
+    /// Reconcile every canonical message of a conversation, one bounded
+    /// chunk at a time. Reconciliation publishes under stable per-message
+    /// identities in independent engine batches and never promised
+    /// whole-conversation atomicity, so chunking bounds memory without
+    /// changing the published documents.
+    fn replay_canonical_conversation_for_rebuild(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        conversation_id: i64,
+    ) -> Result<()> {
+        replay_canonical_conversation_in_chunks(
+            storage,
+            index,
+            conversation_id,
+            CANONICAL_LEXICAL_REPLAY_CHUNK_BYTES,
+        )
+    }
+
+    fn replay_canonical_conversation_in_chunks(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        conversation_id: i64,
+        chunk_bytes: usize,
+    ) -> Result<()> {
+        let conversation = canonical_lexical_conversation(storage, conversation_id)?;
+        let footprints = storage.lexical_rebuild_message_footprints(conversation_id)?;
+        for (first_idx, last_idx) in
+            super::lexical_rebuild_conversation_chunks(&footprints, chunk_bytes)
+        {
+            let messages = storage.fetch_messages_for_lexical_rebuild_idx_range(
+                conversation_id,
+                first_idx,
+                last_idx,
+            )?;
+            let packet = canonical_lexical_packet(&conversation, messages);
+            publish_canonical_packet_for_rebuild(index, &packet, conversation_id)?;
+        }
+        Ok(())
     }
 
     /// Map `outcome.inserted_indices` (message idx values from
@@ -32547,8 +32956,7 @@ pub mod persist {
         if should_inject_incremental_lexical_update_oom() {
             anyhow::bail!("out of memory");
         }
-        let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
-        publish_canonical_packet_for_rebuild(index, &packet, conversation_id)
+        replay_canonical_conversation_for_rebuild(storage, index, conversation_id)
     }
 
     #[cfg(test)]
@@ -33822,13 +34230,11 @@ pub mod persist {
                     // All outcomes are already persisted, so the first read
                     // for this identity contains its final canonical snapshot.
                     if rebuilt_conversation_ids.insert(outcome.conversation_id) {
-                        let packet =
-                            lexical_packet_for_canonical_outcome(storage, outcome.conversation_id)?;
-                        publish_canonical_packet_for_rebuild(
+                        replay_canonical_conversation_for_rebuild(
+                            storage,
                             t_index
                                 .as_deref_mut()
                                 .expect("inline rebuild requires Tantivy writer"),
-                            &packet,
                             outcome.conversation_id,
                         )?;
                     }
@@ -33836,8 +34242,11 @@ pub mod persist {
                 LexicalPopulationStrategy::IncrementalInline => {
                     let changed_indices = changed_message_indices(&outcome);
                     if !changed_indices.is_empty() {
-                        let packet =
-                            lexical_packet_for_canonical_outcome(storage, outcome.conversation_id)?;
+                        let packet = lexical_packet_for_changed_messages(
+                            storage,
+                            outcome.conversation_id,
+                            &changed_indices,
+                        )?;
                         let positional = positional_indices_for_inserted(&packet, &changed_indices);
                         if !positional.is_empty() {
                             let add_result = if should_inject_incremental_lexical_update_oom() {
@@ -34242,7 +34651,8 @@ pub mod persist {
             .copied()
             .collect();
         if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
-            let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
+            let packet =
+                lexical_packet_for_changed_messages(storage, conversation_id, &changed_indices)?;
             let positional = positional_indices_for_inserted(&packet, &changed_indices);
             if !positional.is_empty() {
                 publish_changed_packet_messages(
@@ -34302,7 +34712,8 @@ pub mod persist {
             .collect();
         if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
             let packet_started = Instant::now();
-            let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
+            let packet =
+                lexical_packet_for_changed_messages(storage, conversation_id, &changed_indices)?;
             profile.packet_duration += packet_started.elapsed();
 
             let positional_started = Instant::now();
@@ -34751,15 +35162,11 @@ pub mod persist {
                         // Coalesce only lexical replay; every persistence
                         // outcome still contributes accounting and semantics.
                         if rebuilt_conversation_ids.insert(outcome.conversation_id) {
-                            let packet = lexical_packet_for_canonical_outcome(
+                            replay_canonical_conversation_for_rebuild(
                                 storage,
-                                outcome.conversation_id,
-                            )?;
-                            publish_canonical_packet_for_rebuild(
                                 t_index
                                     .as_deref_mut()
                                     .expect("inline rebuild requires Tantivy writer"),
-                                &packet,
                                 outcome.conversation_id,
                             )?;
                         }
@@ -34767,9 +35174,10 @@ pub mod persist {
                     LexicalPopulationStrategy::IncrementalInline => {
                         let changed_indices = changed_message_indices(outcome);
                         if !changed_indices.is_empty() {
-                            let packet = lexical_packet_for_canonical_outcome(
+                            let packet = lexical_packet_for_changed_messages(
                                 storage,
                                 outcome.conversation_id,
+                                &changed_indices,
                             )?;
                             let positional =
                                 positional_indices_for_inserted(&packet, &changed_indices);
@@ -35281,10 +35689,7 @@ pub mod persist {
             use crate::search::query::{FieldMask, SearchClient, SearchFilters};
 
             let cap = if expand_prefix { 8 * 1024 * 1024 } else { 128 };
-            let _cap = set_env(
-                "CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES",
-                &cap.to_string(),
-            );
+            let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", &cap.to_string());
             let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
             let _begin = set_env(
                 "CASS_INDEXER_BEGIN_CONCURRENT",
@@ -35380,18 +35785,22 @@ pub mod persist {
             if expand_prefix {
                 // Same identity and timestamp, but the newly parsed source
                 // exceeds the real default cap. Persistence retains the short
-                // canonical prefix, leaving room for both appended documents.
+                // canonical row, and the lexical projection indexes that row.
                 let fresh_prefix = "oversized fresh prefix ";
                 conv.messages[0].content = fresh_prefix.repeat(cap / fresh_prefix.len() + 1);
                 assert!(conv.messages[0].content.len() > cap);
                 conv.messages.push(make_message(2, "appended delta".into()));
                 conv.messages.push(make_message(3, "quartzcharlie".into()));
             } else {
-                // The canonical prefix is unchanged. The first append crosses
-                // the budget; the final canonical row must remain unindexed.
+                // The first append exceeds the per-message cap: only its tail
+                // is dropped. The following message is indexed in full, as it
+                // is however much text the conversation already holds (bgn6s).
                 conv.messages.push(make_message(
                     2,
-                    format!("quartzcharlie {}", "bounded text ".repeat(cap)),
+                    format!(
+                        "quartzcharlie {} tailbeyondcap",
+                        "bounded text ".repeat(cap)
+                    ),
                 ));
                 conv.messages
                     .push(make_message(3, "beyondcapneedle".into()));
@@ -35403,7 +35812,7 @@ pub mod persist {
                 assert_eq!(outcome.updated_messages, 0);
                 assert!(!outcome.lexical_update_deferred);
             }
-            let expected_docs = if expand_prefix { 4 } else { 3 };
+            let expected_docs = 4;
             assert_eq!(tantivy_doc_count(&mut index), expected_docs);
             let stored = storage.fetch_messages(conversation_id).unwrap();
             assert_eq!(stored.len(), 4);
@@ -35419,7 +35828,8 @@ pub mod persist {
             );
             assert_eq!(stored[2].content, conv.messages[2].content);
             assert_eq!(stored[3].content, conv.messages[3].content);
-            let packet = lexical_packet_for_canonical_outcome(&storage, conversation_id).unwrap();
+            let packet =
+                lexical_packet_for_changed_messages(&storage, conversation_id, &[3, 2]).unwrap();
             assert_eq!(
                 packet
                     .payload
@@ -35427,12 +35837,12 @@ pub mod persist {
                     .iter()
                     .map(|message| message.idx)
                     .collect::<Vec<_>>(),
-                vec![0, 1, 2, 3],
-                "capping must not erase indices needed by the insertion outcome"
+                vec![2, 3],
+                "an append carries exactly its changed canonical rows, in idx order"
             );
             assert_eq!(
                 positional_indices_for_inserted(&packet, &[2, 3]),
-                vec![2, 3]
+                vec![0, 1]
             );
             assert_eq!(
                 packet.payload.metadata_json,
@@ -35458,15 +35868,15 @@ pub mod persist {
                 .sum();
             if expand_prefix {
                 assert!(retained_bytes < cap);
-                assert_eq!(packet.payload.messages[3].content, "quartzcharlie");
+                assert_eq!(packet.payload.messages[1].content, "quartzcharlie");
             } else {
-                assert_eq!(retained_bytes, cap);
+                assert_eq!(packet.payload.messages[0].content.len(), cap);
                 assert!(
-                    packet.payload.messages[2]
+                    packet.payload.messages[0]
                         .content
                         .starts_with("quartzcharlie ")
                 );
-                assert!(packet.payload.messages[3].content.is_empty());
+                assert_eq!(packet.payload.messages[1].content, "beyondcapneedle");
             }
             assert_eq!(
                 crate::indexer::expected_live_lexical_doc_count(&storage).unwrap(),
@@ -35514,12 +35924,29 @@ pub mod persist {
                     1,
                     "appended marker must be searchable exactly once"
                 );
-                for absent in ["beyondcapneedle", "oversized"] {
+                for absent in ["tailbeyondcap", "oversized"] {
                     assert!(
                         client
                             .search(absent, SearchFilters::default(), 10, 0, FieldMask::FULL)
                             .unwrap()
-                            .is_empty()
+                            .is_empty(),
+                        "{absent} lies past a message cap or in a replaced source variant"
+                    );
+                }
+                if !expand_prefix {
+                    assert_eq!(
+                        client
+                            .search(
+                                "beyondcapneedle",
+                                SearchFilters::default(),
+                                10,
+                                0,
+                                FieldMask::FULL
+                            )
+                            .unwrap()
+                            .len(),
+                        1,
+                        "a message after a capped one stays searchable (bgn6s)"
                     );
                 }
                 let hit = &hits[0];
@@ -35589,10 +36016,101 @@ pub mod persist {
 
         #[test]
         #[serial]
-        fn gh466_incremental_lexical_cap_preserves_ordinary_append_crossing() {
+        fn gh466_incremental_append_after_a_capped_message_stays_searchable() {
             for route in 0..3 {
                 assert_gh466_canonical_prefix_cap("claude_code", route, false);
             }
+        }
+
+        /// bgn6s: an inline replay reads a conversation one bounded chunk at
+        /// a time and still indexes every message; a cumulative cap would
+        /// leave everything after the first message unindexed here.
+        #[test]
+        #[serial]
+        fn chunked_canonical_replay_indexes_every_message_of_a_long_conversation() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "40");
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let markers = [
+                "alphamark",
+                "bravomark",
+                "charliemark",
+                "deltamark",
+                "foxtrotmark",
+            ];
+            let messages = markers
+                .iter()
+                .enumerate()
+                .map(|(idx, marker)| NormalizedMessage {
+                    idx: idx as i64,
+                    role: "user".into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx as i64),
+                    content: if *marker == "charliemark" {
+                        format!("{marker} {} tailmark", "padding ".repeat(8))
+                    } else {
+                        format!("{marker} steady text")
+                    },
+                    extra: serde_json::json!({"uuid": format!("chunked-replay-{idx}")}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect();
+            let conv = NormalizedConversation {
+                agent_slug: "claude_code".into(),
+                external_id: Some("chunked-canonical-replay".into()),
+                title: Some("Chunked canonical replay".into()),
+                workspace: Some(dir.path().join("workspace")),
+                source_path: dir.path().join("source.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_010),
+                metadata: serde_json::Value::Null,
+                messages,
+            };
+            let unused_index_path = dir.path().join("unused-index");
+            let mut unused_index = TantivyIndex::open_or_create(&unused_index_path).unwrap();
+            persist_conversation(&storage, &mut unused_index, &conv).unwrap();
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+            let footprints = storage
+                .lexical_rebuild_message_footprints(conversation_id)
+                .unwrap();
+            assert_eq!(footprints.len(), markers.len());
+            assert_eq!(footprints[2].1, 40, "footprints report the capped length");
+            assert_eq!(
+                super::super::lexical_rebuild_conversation_chunks(&footprints, 1).len(),
+                markers.len(),
+                "a one-byte chunk budget reads every message as its own chunk"
+            );
+
+            let index_path = dir.path().join("replay-index");
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            for _ in 0..2 {
+                replay_canonical_conversation_in_chunks(&storage, &mut index, conversation_id, 1)
+                    .unwrap();
+                assert_eq!(
+                    tantivy_doc_count(&mut index),
+                    markers.len() as u64,
+                    "a repeated chunked replay reconciles the same identities"
+                );
+            }
+            drop(index);
+            let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+            let hits = |query: &str| {
+                client
+                    .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                    .unwrap()
+                    .len()
+            };
+            for marker in markers {
+                assert_eq!(hits(marker), 1, "{marker} must be searchable exactly once");
+            }
+            assert_eq!(hits("tailmark"), 0, "text past one message's cap stays out");
         }
 
         #[test]
@@ -45595,13 +46113,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn lexical_rebuild_page_conversation_limit_respects_cumulative_content_cap() {
-        let _cap = set_env("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "8");
+    fn lexical_rebuild_page_conversation_limit_respects_message_content_cap() {
+        let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "8");
 
         assert_eq!(
             lexical_rebuild_content_bounded_page_conversation_limit(32, 20),
             2,
-            "two eight-byte conversation prefixes fit inside a twenty-byte page budget"
+            "two eight-byte message caps fit inside a twenty-byte page budget"
         );
         assert_eq!(
             lexical_rebuild_content_bounded_page_conversation_limit(1, 20),
@@ -45611,7 +46129,32 @@ mod tests {
         assert_eq!(
             lexical_rebuild_content_bounded_page_conversation_limit(32, 4),
             1,
-            "a page smaller than one conversation cap must still admit one outlier"
+            "a page smaller than one message cap must still admit one outlier"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_conversation_chunks_cover_every_message_within_budget() {
+        assert!(lexical_rebuild_conversation_chunks(&[], 10).is_empty());
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 4), (1, 4), (2, 2)], 10),
+            vec![(0, 2)],
+            "a conversation within budget is one chunk"
+        );
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 4), (1, 4), (2, 4), (5, 1), (6, 9)], 10),
+            vec![(0, 1), (2, 5), (6, 6)],
+            "chunks close before exceeding the budget and span idx gaps"
+        );
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 3), (1, 25), (2, 3)], 10),
+            vec![(0, 0), (1, 1), (2, 2)],
+            "a message larger than the budget is a chunk of its own"
+        );
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 0), (1, 0), (2, 0)], 0),
+            vec![(0, 2)],
+            "empty messages never split a conversation"
         );
     }
 
@@ -48232,6 +48775,70 @@ mod tests {
     /// 2l1b0.70: an armed injection fires only for work inside its scope and
     /// only once. With the former process-global flag, a rebuild in another
     /// test (a different temp directory) consumed it.
+    /// bgn6s: a page-prep worker streaming a long conversation waits for the
+    /// consumer to flush its previous chunk. A flush releases it; a torn-down
+    /// pipeline (consumer failure closes the flow limiter, producer failure
+    /// closes the reservation order) releases it with an error instead of
+    /// parking it forever.
+    #[test]
+    fn chunk_gate_waits_for_the_flush_and_fails_once_the_pipeline_closes() {
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
+        let reservation_order = Arc::new(LexicalRebuildReservationOrder::new());
+
+        let gate = Arc::new(LexicalRebuildChunkGate::default());
+        gate.wait_until_flushed(&reservation_order, &flow_limiter)
+            .expect("nothing outstanding");
+        gate.sent();
+        let flusher = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                gate.flushed();
+            })
+        };
+        gate.wait_until_flushed(&reservation_order, &flow_limiter)
+            .expect("the consumer flushed the outstanding chunk");
+        flusher.join().unwrap();
+
+        for close_limiter in [true, false] {
+            let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
+            let reservation_order = Arc::new(LexicalRebuildReservationOrder::new());
+            let gate = Arc::new(LexicalRebuildChunkGate::default());
+            gate.sent();
+            let waiter = {
+                let gate = Arc::clone(&gate);
+                let flow_limiter = Arc::clone(&flow_limiter);
+                let reservation_order = Arc::clone(&reservation_order);
+                std::thread::spawn(move || {
+                    gate.wait_until_flushed(&reservation_order, &flow_limiter)
+                })
+            };
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !waiter.is_finished(),
+                "an unflushed chunk must hold the worker"
+            );
+            if close_limiter {
+                flow_limiter.close();
+            } else {
+                reservation_order.close();
+            }
+            let started = Instant::now();
+            while !waiter.is_finished() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "a closed pipeline must release the waiting worker"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let error = waiter.join().unwrap().expect_err("closed pipeline");
+            assert!(
+                error.to_string().contains("pipeline closed"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
     #[test]
     fn scoped_panic_injection_fires_only_inside_its_scope() {
         let injection = ScopedPanicInjection::new();
@@ -58439,6 +59046,116 @@ mod tests {
             "expected oversized single conversation fallback log, got:\n{logs}"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 3);
+    }
+
+    /// bgn6s: a conversation larger than one page's content budget is read
+    /// and indexed in message-range chunks. Every message is searchable,
+    /// including the last; the conversation after it is indexed too; and the
+    /// checkpoint certifies. A cumulative per-conversation cap at the
+    /// per-message cap would have left only the first message searchable.
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_streams_a_long_conversation_in_chunks() {
+        use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let long_markers = [
+            "alphamark",
+            "bravomark",
+            "charliemark",
+            "deltamark",
+            "echomark",
+            "foxtrotmark",
+        ];
+        let conversation = |external_id: &str, markers: &[&str]| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: markers
+                .iter()
+                .enumerate()
+                .map(|(idx, marker)| Message {
+                    id: None,
+                    idx: idx as i64,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_010 + idx as i64),
+                    content: format!("{marker} steady text"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        for (external_id, markers) in [
+            ("long-conversation", &long_markers[..]),
+            ("short-conversation", &["hotelmark"][..]),
+        ] {
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation(external_id, markers))
+                .unwrap();
+        }
+        drop(storage);
+
+        // A 64-byte page budget holds two 21-byte messages: the long
+        // conversation (126 bytes) becomes three chunks.
+        let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "40");
+        let _commit_bytes = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "64");
+        let _initial_commit_bytes = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+            "64",
+        );
+
+        let logs = capture_logs(|| {
+            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+            assert_eq!(rebuild.indexed_docs, 7);
+            assert_eq!(rebuild.observed_messages, Some(7));
+            assert!(rebuild.exact_checkpoint_persisted);
+        });
+        assert!(
+            logs.contains("streaming a long conversation in message-range chunks")
+                && logs.contains("chunks=3"),
+            "expected the long conversation to stream in three chunks, got:\n{logs}"
+        );
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 7);
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_dir(&data_dir).unwrap())
+            .unwrap()
+            .expect("completed checkpoint");
+        assert!(checkpoint.completed);
+        assert_eq!(checkpoint.processed_conversations, 2);
+        assert_eq!(checkpoint.indexed_docs, 7);
+
+        let client = SearchClient::open(&index_dir(&data_dir).unwrap(), None)
+            .unwrap()
+            .expect("search client");
+        for marker in long_markers.iter().chain(["hotelmark"].iter()) {
+            let hits = client
+                .search(marker, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{marker} must be searchable exactly once");
+        }
     }
 
     #[test]

@@ -3647,11 +3647,12 @@ fn assert_gh413_fts_shadow_bound(legacy_checkpoint: bool) {
         serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
     assert_eq!(initial_checkpoint["completed"], true);
     if legacy_checkpoint {
-        // The original GH #413 archive had a matching-path v2 checkpoint
-        // without execution_mode. A copied checkpoint with the old path takes
-        // the ordinary writable route and cannot exercise this regression.
+        // The original GH #413 archive had a matching-path checkpoint of the
+        // current version without execution_mode. A copied checkpoint with
+        // the old path takes the ordinary writable route and cannot exercise
+        // this regression.
         let mut legacy = initial_checkpoint.clone();
-        assert_eq!(legacy["version"], 2);
+        assert_eq!(legacy["version"], 3);
         assert_eq!(
             legacy["db"]["db_path"].as_str().unwrap(),
             fs::canonicalize(&db_path).unwrap().to_str().unwrap()

@@ -4834,33 +4834,27 @@ pub struct LexicalRebuildGroupedMessageRow {
 
 pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 32]>;
 
-/// Default per-conversation lexical-content byte ceiling (#290).
+/// Default per-message lexical-content byte ceiling (#290).
 ///
-/// The staged lexical-rebuild shard cap
-/// (`CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES`) defaults to 64 MiB with
-/// a 16 MiB floor. An indivisible single conversation whose materialized content
-/// exceeds the per-shard cap forces the OOM→bisect→quarantine path because the
-/// dominant resident cost is cass-side materialization of the whole conversation's
-/// text. We cap per-conversation indexed content at 8 MiB —
-/// `min(shard_cap/2, 8 MiB)` for the default 64 MiB shard cap, and comfortably
-/// below even the 16 MiB shard floor — so a normally-large (image/base64-heavy)
-/// conversation is admitted with a truncated lexical body instead of quarantined.
-/// 8 MiB of text is far more than lexical search needs (tokens, not raw blobs)
-/// while leaving headroom for the Tantivy arena and concurrent shard builders.
-pub const LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
+/// 8 MiB of one message's text is far more than lexical search needs (tokens,
+/// not raw blobs) and keeps a single pasted image/base64 payload from
+/// dominating a rebuild's working set.
+pub const LEXICAL_MAX_MESSAGE_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
 
-/// Per-conversation lexical-content byte ceiling, overridable via
-/// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` (#290).
+/// Per-MESSAGE lexical-content byte ceiling, overridable via
+/// `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES` (#290).
 ///
-/// `0` is rejected (treated as "use default") so the cap can never be disabled
-/// into the OOM-quarantine regime by accident; set a large value to effectively
-/// disable it.
-pub fn lexical_max_conversation_content_bytes() -> usize {
-    dotenvy::var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES")
+/// It bounds one message (a pasted image/base64 blob), never a conversation:
+/// a cumulative per-conversation cap blanked every message past a long
+/// session's first 8 MiB, which on the owner's archive was 39.6% of its
+/// messages (bgn6s). Long conversations are instead read in bounded chunks.
+/// `0` is rejected (treated as "use default").
+pub fn lexical_max_message_content_bytes() -> usize {
+    dotenvy::var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT)
+        .unwrap_or(LEXICAL_MAX_MESSAGE_CONTENT_BYTES_DEFAULT)
 }
 
 /// Largest byte length `<= cap` that ends on a UTF-8 char boundary of `content`.
@@ -4875,51 +4869,51 @@ fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
     boundary
 }
 
-/// Cap the cumulative per-conversation lexical content at `cap` bytes (#290).
-///
-/// Messages are visited in `idx` order (earliest first); once the running total
-/// reaches the cap, the message that straddles the boundary is truncated to the
-/// remaining budget on a UTF-8 char boundary and every later message's content is
-/// cleared. Message rows are preserved (count/structure unchanged) so the rest of
-/// the rebuild pipeline's per-message accounting stays consistent — only indexed
-/// text is dropped. Emits one `lexical_content_truncated` diagnostic per affected
-/// conversation. No-op when total content is within the cap.
-#[cfg(test)]
-fn truncate_lexical_rebuild_conversation_content(
-    conversation_id: i64,
-    messages: &mut [Message],
+/// Marker error a lexical-rebuild row callback raises to stop a stream early;
+/// never surfaced to callers.
+const LEXICAL_REBUILD_STREAM_STOPPED: &str = "cass lexical rebuild stream stopped by caller";
+
+/// One lexical-rebuild projection row (`id, idx, role, author, created_at,
+/// capped content, source byte length`) as a [`Message`] whose text is bounded
+/// by `cap` bytes on a UTF-8 boundary (#290).
+fn lexical_rebuild_message_from_row(
+    row: &FrankenRow,
     cap: usize,
-) {
-    let original_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    if original_bytes <= cap {
-        return;
+) -> std::result::Result<Message, crate::franken_sync::FrankenError> {
+    let role: String = row.get_typed(2)?;
+    let mut content: String = row.get_typed(5)?;
+    let boundary = lexical_content_truncation_boundary(&content, cap);
+    if boundary < content.len() {
+        // GH #466: truncate would retain the projected cell's whole allocation.
+        content = content[..boundary].to_owned();
     }
+    Ok(Message {
+        id: Some(row.get_typed(0)?),
+        idx: row.get_typed(1)?,
+        role: match role.as_str() {
+            "user" => MessageRole::User,
+            "agent" | "assistant" => MessageRole::Agent,
+            "tool" => MessageRole::Tool,
+            "system" => MessageRole::System,
+            other => MessageRole::Other(other.to_string()),
+        },
+        author: row.get_typed(3)?,
+        created_at: row.get_typed(4)?,
+        content,
+        extra_json: serde_json::Value::Null,
+        snippets: Vec::new(),
+    })
+}
 
-    let mut used = 0usize;
+/// Cap each message's lexical content at `cap` bytes on a UTF-8 char boundary
+/// (#290), independently of every other message. Test mirror of the per-row
+/// bound the rebuild fetch applies; message rows are always preserved.
+#[cfg(test)]
+fn truncate_lexical_rebuild_message_content(messages: &mut [Message], cap: usize) {
     for message in messages.iter_mut() {
-        if used >= cap {
-            message.content.clear();
-            continue;
-        }
-        let remaining = cap - used;
-        if message.content.len() <= remaining {
-            used += message.content.len();
-        } else {
-            let boundary = lexical_content_truncation_boundary(&message.content, remaining);
-            message.content.truncate(boundary);
-            used += boundary;
-        }
+        let boundary = lexical_content_truncation_boundary(&message.content, cap);
+        message.content.truncate(boundary);
     }
-
-    let capped_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    tracing::warn!(
-        diagnostic = "lexical_content_truncated",
-        conversation_id,
-        original_bytes,
-        capped_bytes,
-        cap,
-        "lexical rebuild conversation content exceeded the per-conversation cap; truncated indexed text to stay within budget instead of OOM-quarantining (#290)"
-    );
 }
 
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
@@ -11978,121 +11972,233 @@ impl FrankenStorage {
     /// `extra_json` here prevents rebuilds from rehydrating enormous historical
     /// payloads that are irrelevant to lexical search.
     ///
-    /// The assembled per-conversation content is additionally capped at
-    /// [`lexical_max_conversation_content_bytes`] (see #290): an image/base64-heavy
-    /// conversation that materializes 10-40 MiB of indexed text would otherwise
-    /// exceed the per-shard byte budget and force the OOM→bisect→quarantine path.
-    /// Capping the *content* (not the message count/structure) admits the
-    /// conversation within budget with a truncated lexical body — lexical search
-    /// needs tokens, not the full multi-megabyte blob.
+    /// Each message's indexed text is capped at
+    /// [`lexical_max_message_content_bytes`] (#290: one pasted image/base64
+    /// blob). Every message keeps its own text however long the conversation is
+    /// (bgn6s); a caller that must bound memory for a long conversation reads it
+    /// in index ranges ([`Self::lexical_rebuild_message_footprints`],
+    /// [`Self::fetch_messages_for_lexical_rebuild_idx_range`]) or stops early
+    /// ([`Self::fetch_messages_for_lexical_rebuild_within`]).
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        // FrankenSQLite's allocation-avoiding ASCII ColumnSubstrPrefix path
-        // requires a literal signed-32-bit prefix length. This value is parsed
-        // from our own numeric cap, never from SQL/user text, so embedding it
-        // cannot introduce SQL injection. Keep the effective byte cap no larger
-        // than that literal so very large environment overrides cannot be
-        // reported inaccurately.
-        let cap = lexical_max_conversation_content_bytes().min(i32::MAX as usize);
-        let hinted_sql = format!(
-            "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
-                 WHERE conversation_id = ?1 ORDER BY idx"
-        );
-        let fallback_sql = format!(
-            "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
-                 FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY idx"
-        );
-        let (messages, original_bytes) = self
-            .stream_capped_lexical_rebuild_messages(conversation_id, cap, &hinted_sql)
-            .or_else(|err| {
-                if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
-                    return self.stream_capped_lexical_rebuild_messages(
-                        conversation_id,
-                        cap,
-                        &fallback_sql,
-                    );
-                }
-                Err(err)
-            })?;
-
-        if original_bytes > cap {
-            let capped_bytes = messages
-                .iter()
-                .map(|message| message.content.len())
-                .sum::<usize>();
-            tracing::warn!(
-                diagnostic = "lexical_content_truncated",
-                conversation_id,
-                original_bytes,
-                capped_bytes,
-                cap,
-                "lexical rebuild conversation content exceeded the per-conversation cap; retained only the bounded indexed prefix instead of the full body (#290, GH#413)"
-            );
-        }
-
+        let mut messages = Vec::new();
+        self.for_each_lexical_rebuild_message(conversation_id, None, |message| {
+            messages.push(message);
+            Ok(true)
+        })?;
         Ok(messages)
     }
 
-    /// Stream each lexical projection through FrankenSQLite's row callback
-    /// instead of collecting the complete result. SQL bounds the largest
-    /// projected text cell by `cap` Unicode scalar values; the callback applies
-    /// the stricter cumulative UTF-8 byte cap before retaining the row.
-    /// Consequently CASS's retained result does not scale with the uncapped
-    /// conversation body. FrankenSQLite can still transiently materialize a
-    /// full non-ASCII source cell until upstream issue #400 is fixed.
-    fn stream_capped_lexical_rebuild_messages(
+    /// [`Self::fetch_messages_for_lexical_rebuild`], but stops reading as soon
+    /// as the conversation's indexed text exceeds `max_bytes` and returns
+    /// `None`, so a batch never materializes a long conversation it will reject.
+    pub fn fetch_messages_for_lexical_rebuild_within(
         &self,
         conversation_id: i64,
-        cap: usize,
-        sql: &str,
-    ) -> Result<(Vec<Message>, usize)> {
+        max_bytes: usize,
+    ) -> Result<Option<Vec<Message>>> {
         let mut messages = Vec::new();
-        let mut original_bytes = 0usize;
-        let mut remaining_bytes = cap;
-        let params = [SqliteValue::from(conversation_id)];
-        self.conn
-            .query_with_params_for_each(sql, &params, |row| {
-                let role: String = row.get_typed(2)?;
-                let mut content: String = row.get_typed(5)?;
-                let content_bytes =
-                    usize::try_from(row.get_typed::<i64>(6)?.max(0)).unwrap_or(usize::MAX);
-                original_bytes = original_bytes.saturating_add(content_bytes);
-                let boundary = lexical_content_truncation_boundary(&content, remaining_bytes);
-                if boundary < content.len() {
-                    // GH #466: truncate/clear would retain each projected cell's
-                    // allocation, including oversized rows after the budget is
-                    // exhausted. Keep only the bounded prefix allocation before
-                    // retaining this row; an empty prefix owns no text buffer.
-                    content = content[..boundary].to_owned();
+        let mut bytes = 0usize;
+        let completed =
+            self.for_each_lexical_rebuild_message(conversation_id, None, |message| {
+                bytes = bytes.saturating_add(message.content.len());
+                if bytes > max_bytes {
+                    return Ok(false);
                 }
-                remaining_bytes = remaining_bytes.saturating_sub(content.len());
-                messages.push(Message {
-                    id: Some(row.get_typed(0)?),
-                    idx: row.get_typed(1)?,
-                    role: match role.as_str() {
-                        "user" => MessageRole::User,
-                        "agent" | "assistant" => MessageRole::Agent,
-                        "tool" => MessageRole::Tool,
-                        "system" => MessageRole::System,
-                        other => MessageRole::Other(other.to_string()),
-                    },
-                    author: row.get_typed(3)?,
-                    created_at: row.get_typed(4)?,
-                    content,
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                });
-                Ok(())
-            })
-            .with_context(|| {
-                format!(
-                    "streaming bounded lexical rebuild content for conversation {conversation_id}"
-                )
+                messages.push(message);
+                Ok(true)
             })?;
-        Ok((messages, original_bytes))
+        Ok(completed.then_some(messages))
+    }
+
+    /// Messages with `first_idx <= idx <= last_idx`, in `idx` order, each
+    /// capped as in [`Self::fetch_messages_for_lexical_rebuild`].
+    pub fn fetch_messages_for_lexical_rebuild_idx_range(
+        &self,
+        conversation_id: i64,
+        first_idx: i64,
+        last_idx: i64,
+    ) -> Result<Vec<Message>> {
+        let mut messages = Vec::new();
+        self.for_each_lexical_rebuild_message(
+            conversation_id,
+            Some((first_idx, last_idx)),
+            |message| {
+                messages.push(message);
+                Ok(true)
+            },
+        )?;
+        Ok(messages)
+    }
+
+    /// Every message with `id > after_message_id`, as `(conversation_id,
+    /// message)` in id order, each capped as in
+    /// [`Self::fetch_messages_for_lexical_rebuild`]: a rowid-range scan that
+    /// reads only rows appended after a memo, never the older text of the
+    /// conversations they belong to.
+    pub(crate) fn for_each_lexical_rebuild_message_after_id<F>(
+        &self,
+        after_message_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(i64, Message) -> Result<()>,
+    {
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let sql = format!(
+            "SELECT id, idx, role, author, created_at, \
+                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0), conversation_id \
+                 FROM messages WHERE id > ?1 ORDER BY id"
+        );
+        let mut callback_error = None;
+        let outcome = self.conn.query_with_params_for_each(
+            &sql,
+            &[SqliteValue::from(after_message_id)],
+            |row| {
+                let conversation_id: i64 = row.get_typed(7)?;
+                let message = lexical_rebuild_message_from_row(row, cap)?;
+                if let Err(err) = f(conversation_id, message) {
+                    callback_error = Some(err);
+                    return Err(crate::franken_sync::FrankenError::Internal(
+                        LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        );
+        if let Some(err) = callback_error {
+            return Err(err);
+        }
+        outcome.with_context(|| {
+            format!("streaming lexical messages appended after message id {after_message_id}")
+        })
+    }
+
+    /// `(idx, indexed text bytes)` for every message of a conversation in
+    /// `idx` order, read from record metadata without the text itself: the
+    /// input for splitting a long conversation into bounded chunks.
+    pub fn lexical_rebuild_message_footprints(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<(i64, usize)>> {
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let sql = |hinted: bool| {
+            format!(
+                "SELECT idx, COALESCE(octet_length(content), 0) FROM messages{} \
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                if hinted {
+                    " INDEXED BY sqlite_autoindex_messages_1"
+                } else {
+                    ""
+                }
+            )
+        };
+        let params = [SqliteValue::from(conversation_id)];
+        let read = |sql: &str| -> Result<Vec<(i64, usize)>> {
+            let mut footprints = Vec::new();
+            self.conn
+                .query_with_params_for_each(sql, &params, |row| {
+                    let bytes = usize::try_from(row.get_typed::<i64>(1)?.max(0))
+                        .unwrap_or(usize::MAX)
+                        .min(cap);
+                    footprints.push((row.get_typed::<i64>(0)?, bytes));
+                    Ok(())
+                })
+                .with_context(|| {
+                    format!("reading lexical footprints for conversation {conversation_id}")
+                })?;
+            Ok(footprints)
+        };
+        read(&sql(true)).or_else(|err| {
+            if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
+                return read(&sql(false));
+            }
+            Err(err)
+        })
+    }
+
+    /// Stream a conversation's lexical projections (optionally one inclusive
+    /// `idx` range) through FrankenSQLite's row callback instead of collecting
+    /// the complete result. SQL bounds each projected text cell by `cap`
+    /// Unicode scalar values and the callback applies the stricter per-message
+    /// UTF-8 byte cap before handing the row on. `f` returns `false` to stop
+    /// early; the return value says whether every row was visited.
+    /// FrankenSQLite can still transiently materialize a full non-ASCII source
+    /// cell until upstream issue #400 is fixed.
+    pub(crate) fn for_each_lexical_rebuild_message<F>(
+        &self,
+        conversation_id: i64,
+        idx_range: Option<(i64, i64)>,
+        mut f: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(Message) -> Result<bool>,
+    {
+        // FrankenSQLite's allocation-avoiding ASCII ColumnSubstrPrefix path
+        // requires a literal signed-32-bit prefix length. This value is parsed
+        // from our own numeric cap, never from SQL/user text, so embedding it
+        // cannot introduce SQL injection.
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let range_clause = if idx_range.is_some() {
+            " AND idx >= ?2 AND idx <= ?3"
+        } else {
+            ""
+        };
+        let sql = |hinted: bool| {
+            format!(
+                "SELECT id, idx, role, author, created_at, \
+                     substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
+                     FROM messages{} \
+                     WHERE conversation_id = ?1{range_clause} ORDER BY idx",
+                if hinted {
+                    " INDEXED BY sqlite_autoindex_messages_1"
+                } else {
+                    ""
+                }
+            )
+        };
+        let mut params = vec![SqliteValue::from(conversation_id)];
+        if let Some((first_idx, last_idx)) = idx_range {
+            params.push(SqliteValue::from(first_idx));
+            params.push(SqliteValue::from(last_idx));
+        }
+        let mut run = |sql: &str| -> Result<bool> {
+            let mut stopped = false;
+            let mut callback_error = None;
+            let outcome = self.conn.query_with_params_for_each(sql, &params, |row| {
+                let message = lexical_rebuild_message_from_row(row, cap)?;
+                match f(message) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        stopped = true;
+                        Err(crate::franken_sync::FrankenError::Internal(
+                            LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                        ))
+                    }
+                    Err(err) => {
+                        callback_error = Some(err);
+                        Err(crate::franken_sync::FrankenError::Internal(
+                            LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                        ))
+                    }
+                }
+            });
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+            match outcome {
+                Ok(()) => Ok(true),
+                Err(_) if stopped => Ok(false),
+                Err(err) => Err(anyhow::Error::new(err).context(format!(
+                    "streaming bounded lexical rebuild content for conversation {conversation_id}"
+                ))),
+            }
+        };
+        run(&sql(true)).or_else(|err| {
+            if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
+                return run(&sql(false));
+            }
+            Err(err)
+        })
     }
 
     /// Fetch messages for multiple conversations during lexical rebuilds.
@@ -12124,11 +12230,35 @@ impl FrankenStorage {
                 continue;
             }
 
-            let messages = self
-                .fetch_messages_for_lexical_rebuild(*conversation_id)
-                .with_context(|| {
-                    format!("fetching lexical rebuild messages for conversation {conversation_id}")
-                })?;
+            // With a byte budget, stop reading a conversation as soon as it
+            // cannot fit: a long conversation is never materialized only to be
+            // rejected here (the page-prep fallback then streams it in chunks).
+            let messages = match max_content_bytes {
+                Some(limit) => self
+                    .fetch_messages_for_lexical_rebuild_within(
+                        *conversation_id,
+                        limit.saturating_sub(total_content_bytes),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "fetching lexical rebuild messages for conversation {conversation_id}"
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "lexical rebuild batch fetch exceeded content-byte guardrail: bytes>{} limit={limit} conversations={}",
+                            limit.saturating_sub(total_content_bytes),
+                            conversation_ids.len()
+                        )
+                    })?,
+                None => self
+                    .fetch_messages_for_lexical_rebuild(*conversation_id)
+                    .with_context(|| {
+                        format!(
+                            "fetching lexical rebuild messages for conversation {conversation_id}"
+                        )
+                    })?,
+            };
             total_messages = total_messages.saturating_add(messages.len());
             if let Some(limit) = max_messages
                 && total_messages > limit
@@ -26309,11 +26439,13 @@ mod tests {
         assert!(again.pairs.is_empty());
     }
 
+    /// bgn6s: the cap bounds each message, never the conversation. A cumulative
+    /// cap (the old behavior) cleared every message after the first 100 bytes.
     #[test]
-    fn lexical_content_truncation_caps_cumulative_bytes_and_keeps_message_count() {
+    fn lexical_content_truncation_caps_each_message_and_keeps_later_text() {
         use crate::model::types::{Message, MessageRole};
 
-        let cap = 100usize;
+        let cap = 50usize;
         let mut messages = vec![
             Message {
                 id: Some(1),
@@ -26347,7 +26479,7 @@ mod tests {
             },
         ];
 
-        truncate_lexical_rebuild_conversation_content(42, &mut messages, cap);
+        truncate_lexical_rebuild_message_content(&mut messages, cap);
 
         // Structure (message count + ids) preserved; only indexed text trimmed.
         assert_eq!(messages.len(), 3, "message rows must be preserved");
@@ -26355,16 +26487,10 @@ mod tests {
             messages.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![Some(1), Some(2), Some(3)]
         );
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, cap,
-            "cumulative content is capped exactly at the cap"
-        );
-        // Earliest content is kept in full; the straddling message is truncated;
-        // later content is dropped.
-        assert_eq!(messages[0].content.len(), 60);
-        assert_eq!(messages[1].content.len(), 40);
-        assert!(messages[2].content.is_empty());
+        // Every message keeps its own capped prefix; the last one included.
+        for (message, letter) in messages.iter().zip(["a", "b", "c"]) {
+            assert_eq!(message.content, letter.repeat(cap));
+        }
     }
 
     #[test]
@@ -26381,7 +26507,7 @@ mod tests {
             extra_json: serde_json::Value::Null,
             snippets: Vec::new(),
         }];
-        truncate_lexical_rebuild_conversation_content(7, &mut messages, 1024);
+        truncate_lexical_rebuild_message_content(&mut messages, 1024);
         assert_eq!(messages[0].content, "short", "within-cap content untouched");
     }
 
@@ -26400,7 +26526,7 @@ mod tests {
             extra_json: serde_json::Value::Null,
             snippets: Vec::new(),
         }];
-        truncate_lexical_rebuild_conversation_content(1, &mut messages, 5);
+        truncate_lexical_rebuild_message_content(&mut messages, 5);
         // Largest char boundary <= 5 is 4 bytes ("éé").
         assert_eq!(messages[0].content, "éé");
         assert!(
@@ -26410,16 +26536,17 @@ mod tests {
         );
     }
 
-    /// #290: a conversation whose content exceeds the cap is admitted through the
-    /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
+    /// #290 + bgn6s: oversized messages are capped one by one; no message of a
+    /// long conversation loses its text to a conversation-wide budget, and the
+    /// footprint / range / budgeted reads let callers bound memory instead.
     #[test]
     #[serial]
-    fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
+    fn fetch_messages_for_lexical_rebuild_caps_each_message_of_a_long_conversation() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
-        // Force a small, deterministic cap independent of host memory.
-        let _cap = set_env_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1025");
+        // Force a small, deterministic per-message cap independent of host memory.
+        let _cap = set_env_var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "1025");
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("agent_search.db");
@@ -26510,31 +26637,53 @@ mod tests {
             MESSAGE_COUNT as usize,
             "message rows preserved"
         );
-        // ... but the cumulative indexed content is capped on a UTF-8 boundary,
-        // never the raw 128 KiB. A 1,025-byte cap cannot split a two-byte `é`.
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, 1024,
-            "cumulative content capped at the largest UTF-8 boundary below the configured cap"
+        // ... and EVERY message keeps its own capped prefix (bgn6s): a 1,025-byte
+        // cap cannot split a two-byte `é`, so each keeps 1,024 bytes. The old
+        // cumulative cap kept only the first message and blanked the other 63.
+        assert!(
+            messages.iter().all(|message| message.content.len() == 1024),
+            "each message is capped on its own UTF-8 boundary"
         );
         assert!(
-            !messages[0].content.is_empty(),
-            "earliest content is retained for lexical tokens"
-        );
-        assert_eq!(messages[0].content.len(), 1024);
-        assert!(messages[1].content.is_empty());
-        assert!(messages[2].content.is_empty());
-        let retained_capacity: usize = messages.iter().map(|m| m.content.capacity()).sum();
-        assert!(
-            retained_capacity <= 1025,
-            "retained content allocations must fit the cap, including all trailing rows: {retained_capacity}"
-        );
-        assert!(
-            messages[1..]
+            messages
                 .iter()
-                .all(|message| message.content.capacity() == 0)
+                .all(|message| message.content.capacity() <= 1025),
+            "a retained prefix never keeps the full projected cell allocation"
         );
         assert!(messages.iter().all(|message| message.extra_json.is_null()));
+
+        // Footprints report each message's capped size without reading text.
+        let footprints = storage
+            .lexical_rebuild_message_footprints(conversation_id)
+            .unwrap();
+        assert_eq!(footprints.len(), MESSAGE_COUNT as usize);
+        assert!(footprints.iter().all(|(_, bytes)| *bytes == 1025));
+        assert_eq!(
+            footprints.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            (0..MESSAGE_COUNT).collect::<Vec<_>>()
+        );
+        // An inclusive idx range returns exactly those messages, in order.
+        let range = storage
+            .fetch_messages_for_lexical_rebuild_idx_range(conversation_id, 10, 12)
+            .unwrap();
+        assert_eq!(
+            range.iter().map(|message| message.idx).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert!(range.iter().all(|message| message.content.len() == 1024));
+        // A byte budget stops the read before the whole conversation is held.
+        assert!(
+            storage
+                .fetch_messages_for_lexical_rebuild_within(conversation_id, 5 * 1024)
+                .unwrap()
+                .is_none(),
+            "64 KiB of text does not fit a 5 KiB budget"
+        );
+        let within = storage
+            .fetch_messages_for_lexical_rebuild_within(conversation_id, 64 * 1024)
+            .unwrap()
+            .expect("the whole conversation fits a 64 KiB budget");
+        assert_eq!(within.len(), MESSAGE_COUNT as usize);
         let stored = storage.fetch_messages(conversation_id).unwrap();
         assert_eq!(stored.len(), MESSAGE_COUNT as usize);
         assert_eq!(
