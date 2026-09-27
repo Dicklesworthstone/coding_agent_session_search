@@ -1244,6 +1244,13 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         rebuild_canonical_fts: bool,
 
+        /// Free leaked pages (integrity_check's "page N is never used": pages
+        /// no table, index or freelist owns) in place. Refuses any other
+        /// integrity damage. Supports `--dry-run`; mutation requires `--yes`
+        /// and backs up the live bundle first (`cass doctor backups restore`)
+        #[arg(long, default_value_t = false)]
+        repair_leaked_pages: bool,
+
         /// Quarantine interrupted `raw_mirror_capture` staging artifacts that
         /// block doctor mutation, instead of forcing a manual `rm` inside the
         /// data dir. Requires `--yes`; artifacts are renamed into a quarantine
@@ -5455,6 +5462,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "cleanup",
         "recover-from-archive",
         "rebuild-canonical-fts",
+        "repair-leaked-pages",
         "cleanup-interrupted-artifacts",
         "archive-scan",
         "archive-normalize",
@@ -5952,6 +5960,20 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         rest.insert(1, "--rebuild-canonical-fts".to_string());
         corrections.push(
             "'doctor rebuild-canonical-fts' → 'doctor --rebuild-canonical-fts' (safe canonical FTS5 parity repair)"
+                .into(),
+        );
+    } else if rest
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
+        && rest.get(1).is_some_and(|arg| {
+            arg.eq_ignore_ascii_case("repair-leaked-pages")
+                || arg.eq_ignore_ascii_case("repair_leaked_pages")
+        })
+    {
+        rest.remove(1);
+        rest.insert(1, "--repair-leaked-pages".to_string());
+        corrections.push(
+            "'doctor repair-leaked-pages' → 'doctor --repair-leaked-pages' (in-place leaked-page repair)"
                 .into(),
         );
     } else if rest
@@ -8767,6 +8789,7 @@ async fn execute_cli(
                     emit_capabilities,
                     recover_from_archive,
                     rebuild_canonical_fts,
+                    repair_leaked_pages,
                     cleanup_interrupted_artifacts,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -8830,6 +8853,18 @@ async fn execute_cli(
                     // and rebuild the canonical FTS5 shadow tables in place.
                     if rebuild_canonical_fts {
                         doctor_recover::run_doctor_rebuild_canonical_fts(
+                            data_dir,
+                            cli.db.clone(),
+                            dry_run,
+                            yes,
+                            structured_format,
+                        )?;
+                        return Ok(());
+                    }
+                    // 2l1b0.73: `cass doctor --repair-leaked-pages --yes` —
+                    // free pages no tree or freelist owns, in place.
+                    if repair_leaked_pages {
+                        doctor_recover::run_doctor_repair_leaked_pages(
                             data_dir,
                             cli.db.clone(),
                             dry_run,
@@ -39557,12 +39592,36 @@ fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static s
 /// (a dry-run reconstruct/restore, or an archive scan), prioritizing the most
 /// fundamental fault; fall back to `--fix` only when the failures are things the
 /// safe auto-fix path genuinely handles (derived cleanup, staging, locks).
+/// Suffix for the database check message when the engine's only integrity
+/// failure is leaked pages; it names the in-place repair (2l1b0.73).
+fn doctor_leaked_pages_remedy_suffix(leaked_pages_only: bool) -> String {
+    if leaked_pages_only {
+        format!(
+            "; the only damage is leaked pages (no table, index or freelist owns them), which `{}` inspects and `--yes` frees in place",
+            doctor_recover::LEAKED_PAGES_DRY_RUN_COMMAND
+        )
+    } else {
+        String::new()
+    }
+}
+
 fn doctor_read_only_next_command(check_reports: &[DoctorCheckReport]) -> String {
     let failing = |name: &str| {
         check_reports
             .iter()
             .any(|check| check.name == name && (check.status == "fail" || check.status == "error"))
     };
+    // A leak-only integrity failure has an exact in-place repair; the generic
+    // repair planner offers nothing for it (2l1b0.73).
+    if check_reports.iter().any(|check| {
+        check.name == "database"
+            && check.status == "fail"
+            && check
+                .message
+                .contains(doctor_recover::LEAKED_PAGES_DRY_RUN_COMMAND)
+    }) {
+        return doctor_recover::LEAKED_PAGES_DRY_RUN_COMMAND.to_string();
+    }
     if failing("database")
         || failing("database_backup")
         || failing("safe_auto_archive_rebuild")
@@ -54985,6 +55044,22 @@ fn doctor_candidate_promotion_root(data_dir: &Path) -> PathBuf {
 }
 
 const DOCTOR_BACKUP_MANIFEST_KIND: &str = "cass_doctor_candidate_promotion_backup_manifest_v1";
+/// Backup of the live bundle taken before `doctor --repair-leaked-pages`. Same
+/// artifact contract as a candidate-promotion backup (prior-live DB/WAL/SHM
+/// with blake3), so `doctor backups verify|restore` handle both.
+const DOCTOR_LEAKED_PAGES_REPAIR_BACKUP_MANIFEST_KIND: &str =
+    "cass_doctor_leaked_pages_repair_backup_manifest_v1";
+
+/// `backup_kind` label for a backup manifest, by its manifest kind.
+fn doctor_backup_kind_label(manifest: &serde_json::Value) -> &'static str {
+    match manifest
+        .get("manifest_kind")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(DOCTOR_LEAKED_PAGES_REPAIR_BACKUP_MANIFEST_KIND) => "leaked-pages-repair",
+        _ => "candidate-promotion",
+    }
+}
 const DOCTOR_BACKUP_RESTORE_PLAN_PREFIX: &str = "doctor-backup-restore-plan-v1";
 
 #[derive(Debug, Clone)]
@@ -55009,6 +55084,7 @@ struct DoctorBackupArtifactVerification {
 #[derive(Debug, Clone)]
 struct DoctorBackupVerification {
     backup_id: String,
+    backup_kind: &'static str,
     manifest_path: PathBuf,
     manifest_blake3: Option<String>,
     status: String,
@@ -55189,7 +55265,7 @@ fn doctor_backup_verification_value(
     serde_json::json!({
         "schema_version": 1,
         "backup_id": verification.backup_id,
-        "backup_kind": "candidate-promotion",
+        "backup_kind": verification.backup_kind,
         "manifest_path": verification.manifest_path.display().to_string(),
         "redacted_manifest_path": doctor_redacted_path(&verification.manifest_path.display().to_string(), data_dir),
         "manifest_blake3": verification.manifest_blake3,
@@ -55232,6 +55308,7 @@ fn verify_doctor_backup_record(
         });
     let mut verification = DoctorBackupVerification {
         backup_id: record.backup_id,
+        backup_kind: doctor_backup_kind_label(&record.manifest),
         manifest_path: record.manifest_path,
         manifest_blake3: record.manifest_blake3,
         status: "failed".to_string(),
@@ -55250,12 +55327,13 @@ fn verify_doctor_backup_record(
         warnings: Vec::new(),
         blocked_reasons: Vec::new(),
     };
-    if record
-        .manifest
-        .get("manifest_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some(DOCTOR_BACKUP_MANIFEST_KIND)
-    {
+    if !matches!(
+        record
+            .manifest
+            .get("manifest_kind")
+            .and_then(serde_json::Value::as_str),
+        Some(DOCTOR_BACKUP_MANIFEST_KIND | DOCTOR_LEAKED_PAGES_REPAIR_BACKUP_MANIFEST_KIND)
+    ) {
         verification
             .blocked_reasons
             .push("backup manifest kind is not supported".to_string());
@@ -55920,7 +55998,8 @@ pub(crate) fn run_doctor_backups_impl(
         "notes": [
             "Backup commands never delete backup artifacts.",
             "Restore defaults to a rehearsal; live restore requires the matching plan_fingerprint.",
-            "Candidate-promotion backups preserve both the promoted candidate bundle and the prior-live bundle."
+            "Candidate-promotion backups preserve both the promoted candidate bundle and the prior-live bundle.",
+            "Leaked-pages-repair backups preserve the prior-live bundle taken before `doctor --repair-leaked-pages`."
         ],
         "_meta": {
             "elapsed_ms": started.elapsed().as_millis() as u64,
@@ -55936,7 +56015,7 @@ pub(crate) fn run_doctor_backups_impl(
                     let verification = verify_doctor_backup_record(&data_dir, record);
                     serde_json::json!({
                         "backup_id": verification.backup_id,
-                        "backup_kind": "candidate-promotion",
+                        "backup_kind": verification.backup_kind,
                         "manifest_path": verification.manifest_path.display().to_string(),
                         "redacted_manifest_path": doctor_redacted_path(&verification.manifest_path.display().to_string(), &data_dir),
                         "manifest_blake3": verification.manifest_blake3,
@@ -79606,6 +79685,30 @@ paths = ["~/.claude/projects"]
             doctor_read_only_next_command(&[cleanup, fail_db]),
             "cass doctor repair --dry-run --json"
         );
+
+        // 2l1b0.73: a leak-only integrity failure routes to its in-place
+        // repair, even beside another failing archive check...
+        let leak_message = format!(
+            "Database failed frankensqlite integrity_check: database disk image is malformed: page 8196 is never used (2715 conversations, 3683202 messages){}",
+            doctor_leaked_pages_remedy_suffix(true)
+        );
+        let fail_leak = doctor_check_report("database", "fail", &leak_message, false, false);
+        let fail_staging =
+            doctor_check_report("candidate_staging", "fail", "blocked", false, false);
+        assert_eq!(
+            doctor_read_only_next_command(&[fail_staging, fail_leak]),
+            "cass doctor --repair-leaked-pages --dry-run --json"
+        );
+        // ...while any other integrity failure keeps the generic planner.
+        let other_message = format!(
+            "Database failed frankensqlite integrity_check: database disk image is malformed: page 7 is referenced multiple times (1 conversations, 2 messages){}",
+            doctor_leaked_pages_remedy_suffix(false)
+        );
+        let fail_other = doctor_check_report("database", "fail", &other_message, false, false);
+        assert_eq!(
+            doctor_read_only_next_command(std::slice::from_ref(&fail_other)),
+            "cass doctor repair --dry-run --json"
+        );
     }
 
     #[test]
@@ -89996,10 +90099,14 @@ fn doctor_canonical_candidate_replacement_authorized(
 /// replacement evidence. Timeouts, locks, permissions, and generic engine
 /// failures remain unknown and must never authorize canonical replacement.
 fn doctor_db_open_error_is_affirmative_integrity_failure(error: &CliError) -> bool {
-    if !error.kind.eq(CliErrorKind::DbOpen.kind_str()) {
-        return false;
-    }
-    let message = error.message.to_ascii_lowercase();
+    error.kind.eq(CliErrorKind::DbOpen.kind_str())
+        && doctor_open_error_message_is_affirmative_corruption(&error.message)
+}
+
+/// An open failure that proves the file is damaged, as opposed to busy,
+/// locked or unreadable for another reason.
+pub(crate) fn doctor_open_error_message_is_affirmative_corruption(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
     message.contains("file is too small to contain a sqlite header")
         || message.contains("file header is not sqlite format 3")
         || message.contains("not a database")
@@ -90873,11 +90980,18 @@ pub(crate) fn run_doctor_impl(
                                         }
                                         Some(attestation) => {
                                             storage_integrity_failed = true;
+                                            let leaked_pages_remedy =
+                                                doctor_leaked_pages_remedy_suffix(
+                                                    doctor_recover::attested_integrity_is_leaked_pages_only(
+                                                        &attestation.check_depth,
+                                                        attestation.detail.as_deref(),
+                                                    ),
+                                                );
                                             add_check!(
                                                 "database",
                                                 "fail",
                                                 format!(
-                                                    "Database opened and bounded row counts succeeded ({conv_count} conversations, {msg_count} messages), but a current fingerprint-matching cached {} attestation records structural failure; {reason}",
+                                                    "Database opened and bounded row counts succeeded ({conv_count} conversations, {msg_count} messages), but a current fingerprint-matching cached {} attestation records structural failure; {reason}{leaked_pages_remedy}",
                                                     attestation.check_depth
                                                 ),
                                                 true
@@ -90995,11 +91109,18 @@ pub(crate) fn run_doctor_impl(
                                             storage_attestation_check_depth = Some(failed_pragma);
                                             storage_attestation_detail =
                                                 Some(diagnostic_summary.clone());
+                                            let leaked_pages_remedy =
+                                                doctor_leaked_pages_remedy_suffix(
+                                                    doctor_recover::integrity_is_leaked_pages_only(
+                                                        &integrity.quick_check_status,
+                                                        &integrity.integrity_check_diagnostics,
+                                                    ),
+                                                );
                                             add_check!(
                                                 "database",
                                                 "fail",
                                                 format!(
-                                                    "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                                    "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages){leaked_pages_remedy}",
                                                     diagnostic_summary, conv_count, msg_count
                                                 ),
                                                 true

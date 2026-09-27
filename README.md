@@ -3196,6 +3196,8 @@ cass doctor --fix --json
 | `cass doctor repair --dry-run --json` | Builds a fingerprinted repair plan and candidate/promotion gates | Read-only plan |
 | `cass doctor repair --yes --plan-fingerprint <fp> --json` | Applies exactly the inspected repair fingerprint | Candidate-based, receipt-backed |
 | `cass doctor backups list/verify/restore ... --json` | Lists backups, verifies manifests, rehearses restore, then applies by fingerprint | Restore apply requires a matching rehearsal fingerprint |
+| `cass doctor --repair-leaked-pages --dry-run --json` | Classifies the engine's integrity verdict: `clean`, `leaked_pages` (pages no table, index or freelist owns — `page N is never used`), or `other_damage` | Read-only |
+| `cass doctor --repair-leaked-pages --yes --json` | Frees leaked pages in place when they are the only damage; re-runs `integrity_check` and compares conversation/message counts. Any other damage exits 5 `data-corruption` untouched | Backs up the live bundle first as a `leaked-pages-repair` backup (`cass doctor backups restore <id>`) |
 | `cass doctor cleanup --json` | Plans cleanup for derived or explicitly reclaimable assets | Apply requires a matching fingerprint |
 | `cass doctor support-bundle --json` | Creates a scrubbed diagnostic handoff bundle | Redacted by default; not a backup |
 

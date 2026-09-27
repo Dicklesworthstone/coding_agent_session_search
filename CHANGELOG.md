@@ -33,6 +33,19 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **`cass doctor --repair-leaked-pages` frees leaked archive pages in place.**
+  Pages that leave the freelist without entering a tree fail the engine's
+  `integrity_check` with `page N is never used`. frankensqlite's one-time
+  migration frees them once per archive, but later leaks stayed, and doctor
+  offered no plan for them. The new surface frees them only when they are
+  the only damage: the engine walks every tree and the freelist before it
+  looks for unowned pages, so any doubled reference or malformed page is
+  reported first and refused (exit 5 `data-corruption`). `--dry-run`
+  classifies the archive; `--yes` holds the index-run lock, backs up the live
+  bundle as a `leaked-pages-repair` backup that `cass doctor backups
+  verify|restore` accept, frees the pages, and requires a clean
+  `integrity_check` with unchanged conversation and message counts. The
+  read-only `cass doctor --json` routes a leak-only failure to it.
 - **Robot search says why the automatic wildcard retry did not run.** A
   sparse lexical result is retried as `*term*`, but only on indexes of at most
   10,000 documents (`CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS`) and not for

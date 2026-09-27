@@ -2144,6 +2144,17 @@
           ]
         },
         {
+          "name": "repair-leaked-pages",
+          "description": "Free leaked pages (integrity_check's \"page N is never used\": pages no table, index or freelist owns) in place. Refuses any other integrity damage. Supports `--dry-run`; mutation requires `--yes` and backs up the live bundle first (`cass doctor backups restore`)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "cleanup-interrupted-artifacts",
           "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
           "arg_type": "flag",
