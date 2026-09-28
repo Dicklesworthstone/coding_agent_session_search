@@ -34984,6 +34984,23 @@ pub mod persist {
         ranges
     }
 
+    /// Slice only conversations whose later slices take the append path's
+    /// bounded lookups. That needs a timestamp on every message: an untimed
+    /// message makes that path read every stored row of the conversation,
+    /// once per slice (quadratic). Native-ID agents (grok_bot, codebuff)
+    /// reconcile a whole conversation at once and are never sliced.
+    fn should_slice_conversation(
+        conv: &NormalizedConversation,
+        limits: PersistSliceLimits,
+    ) -> bool {
+        !matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
+            && conv
+                .messages
+                .iter()
+                .all(|message| message.created_at.is_some())
+            && persist_slice_ranges(conv, limits).len() > 1
+    }
+
     /// One slice of a giant conversation. A non-final slice ends at its own
     /// newest message, so the conversation's recorded end never runs ahead of
     /// the rows actually stored; the final slice carries the real `ended_at`.
@@ -35061,10 +35078,7 @@ pub mod persist {
         source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
         limits: PersistSliceLimits,
     ) -> Result<PersistBatchOutcome> {
-        let oversized = |conv: &NormalizedConversation| {
-            !matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
-                && persist_slice_ranges(conv, limits).len() > 1
-        };
+        let oversized = |conv: &NormalizedConversation| should_slice_conversation(conv, limits);
         if !convs.iter().any(oversized) {
             return persist_conversations_batched_whole(
                 storage,
@@ -36408,6 +36422,9 @@ pub mod persist {
                     let dir = tempfile::TempDir::new().unwrap();
                     let conv = conversation(dir.path(), timestamps);
                     assert_eq!(persist_slice_ranges(&conv, limits).len(), 8);
+                    // Untimed messages would make every later slice rescan
+                    // the stored conversation, so they persist whole.
+                    assert_eq!(should_slice_conversation(&conv, limits), timestamps);
                     let persist = |name: &str, convs: &[NormalizedConversation], sliced: bool| {
                         let root = dir.path().join(name);
                         std::fs::create_dir_all(&root).unwrap();
