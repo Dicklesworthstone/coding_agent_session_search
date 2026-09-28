@@ -33246,6 +33246,37 @@ pub mod persist {
         record_persisted_raw_mirror_db_link_groups(data_dir, convs.iter().zip(outcomes.iter()));
     }
 
+    /// The single raw-mirror link for a conversation persisted in slices,
+    /// carrying the whole parsed conversation's message count. Per-slice links
+    /// would each add a distinct (and misleading) message count to the
+    /// manifest and re-verify the mirror blob once per slice.
+    fn record_sliced_raw_mirror_db_link(
+        data_dir: Option<&Path>,
+        conv: &NormalizedConversation,
+        conversation_id: i64,
+    ) {
+        let (Some(data_dir), Some(manifest_relative_path)) =
+            (data_dir, raw_mirror_manifest_relative_path(conv))
+        else {
+            return;
+        };
+        let link = crate::raw_mirror::RawMirrorDbLink {
+            conversation_id: Some(conversation_id),
+            message_count: Some(conv.messages.len()),
+            source_path: Some(conv.source_path.display().to_string()),
+            started_at_ms: conv.started_at,
+        };
+        if let Err(error) =
+            crate::raw_mirror::merge_manifest_db_links(data_dir, manifest_relative_path, &[link])
+        {
+            tracing::warn!(
+                manifest_relative_path,
+                error = %error,
+                "failed to record the raw mirror link of a conversation persisted in slices"
+            );
+        }
+    }
+
     fn begin_concurrent_writes_enabled() -> bool {
         dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
@@ -35088,16 +35119,21 @@ pub mod persist {
                 defer_checkpoints,
                 capture_semantic_delta,
                 raw_mirror_data_dir,
+                true,
                 heartbeat,
                 source_completion,
             );
         }
 
         // Runs of ordinary conversations still persist together; each giant
-        // conversation becomes its own sequence of slice calls.
+        // conversation becomes its own sequence of slice calls. The final
+        // slice carries the whole conversation for its raw-mirror link.
         enum Part<'a> {
             Whole(&'a [NormalizedConversation]),
-            Slice(Box<NormalizedConversation>),
+            Slice {
+                slice: Box<NormalizedConversation>,
+                finishes: Option<&'a NormalizedConversation>,
+            },
         }
         let mut parts = Vec::new();
         let mut run_start = 0;
@@ -35111,11 +35147,11 @@ pub mod persist {
             let ranges = persist_slice_ranges(conv, limits);
             let last = ranges.len() - 1;
             for (slice, range) in ranges.into_iter().enumerate() {
-                parts.push(Part::Slice(Box::new(persist_conversation_slice(
-                    conv,
-                    range,
-                    slice == last,
-                ))));
+                let is_final = slice == last;
+                parts.push(Part::Slice {
+                    slice: Box::new(persist_conversation_slice(conv, range, is_final)),
+                    finishes: is_final.then_some(conv),
+                });
             }
             run_start = pos + 1;
         }
@@ -35149,10 +35185,11 @@ pub mod persist {
                     defer_checkpoints,
                     capture_semantic_delta,
                     raw_mirror_data_dir,
+                    true,
                     heartbeat,
                     completion,
                 ),
-                Part::Slice(slice) => persist_conversations_batched_whole(
+                Part::Slice { slice, .. } => persist_conversations_batched_whole(
                     storage,
                     t_index.as_deref_mut(),
                     std::slice::from_ref(slice.as_ref()),
@@ -35160,10 +35197,19 @@ pub mod persist {
                     defer_checkpoints,
                     capture_semantic_delta,
                     raw_mirror_data_dir,
+                    false,
                     heartbeat,
                     completion,
                 ),
             }?;
+            if let Part::Slice {
+                finishes: Some(conv),
+                ..
+            } = &part
+                && let Some(&conversation_id) = part_outcome.canonical_conversation_ids.first()
+            {
+                record_sliced_raw_mirror_db_link(raw_mirror_data_dir, conv, conversation_id);
+            }
             let changed = part_outcome.inserted_messages + part_outcome.updated_messages > 0;
             outcome.merge(part_outcome);
             // Bound the lexical writer's buffered documents to a few slices.
@@ -35193,9 +35239,13 @@ pub mod persist {
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
+        record_raw_mirror_links: bool,
         heartbeat: PersistHeartbeat<'_>,
         source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
     ) -> Result<PersistBatchOutcome> {
+        // Link recording re-verifies the mirror blob; a sliced conversation
+        // records one link, with its full message count, after its last slice.
+        let link_data_dir = raw_mirror_data_dir.filter(|_| record_raw_mirror_links);
         let retained;
         let convs = match retain_unforgotten_conversations(storage, convs)? {
             Some(kept) => {
@@ -35253,7 +35303,7 @@ pub mod persist {
                 lexical_strategy,
                 defer_checkpoints,
                 capture_semantic_delta,
-                raw_mirror_data_dir,
+                link_data_dir,
                 heartbeat,
             );
         }
@@ -35373,7 +35423,7 @@ pub mod persist {
         )?;
         let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
-        record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
+        record_persisted_raw_mirror_db_links(link_data_dir, convs, &outcomes);
         if !defer_lexical_updates {
             let rebuild_inline = !outcomes.is_empty()
                 && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan;
