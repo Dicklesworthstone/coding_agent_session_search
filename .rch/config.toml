@@ -1,0 +1,60 @@
+# rch transfer settings for cass (a project layer REPLACES the user's exclude list).
+#
+# Same excludes as the fleet default, minus model weights: cass tracks small ONNX /
+# safetensors fixtures under tests/fixtures/models (two real int8 rerankers, ~40 MB
+# total) that tests/semantic_integration.rs reads and scripts/gate.sh hashes for its
+# source-identity stage. The user-level `**/*.onnx` / `**/*.safetensors` excludes
+# (meant for multi-GB weights in other repos) kept them off workers, so every
+# gate run from such a dispatcher failed source-identity before compiling.
+[transfer]
+exclude_patterns = [
+    "target/",
+    "target_*/",
+    "target-*/",
+    ".target-*/",
+    ".target_*/",
+    ".cargo-target/",
+    ".cargo-target-rusticmill/",
+    ".cargo-target-*/",
+    ".git/",
+    ".beads/",
+    ".venv/",
+    ".oracle-venv/",
+    ".ee/",
+    ".ntm/",
+    ".ruff_cache/",
+    ".wrangler/",
+    "*.rlib",
+    "*.rmeta",
+    "node_modules/",
+    ".bun/",
+    ".npm/",
+    ".pnpm-store/",
+    "dist/",
+    "build/",
+    ".next/",
+    ".nuxt/",
+    ".turbo/",
+    ".parcel-cache/",
+    ".doctor/",
+    "*.xcframework/",
+    "docs/truth-pack/snapshots/",
+    "**/*.[wW][aA][vV]",
+    "**/*.[mM]4[aA]",
+    "**/*.[mM][pP]4",
+    "**/*.[nN][eE][mM][oO]",
+    "**/*.[pP][tT]",
+    "**/*.[pP][tT][hH]",
+    "**/*.[cC][kK][pP][tT]",
+    "**/*.[nN][pP][yY]",
+    "**/*.[nN][pP][zZ]",
+    "**/*.[gG][gG][uU][fF]",
+    "**/*.[gG][gG][mM][lL]",
+    "coverage/",
+    ".nyc_output/",
+    "perf.data",
+    "perf.data.old",
+    "tests/artifacts/",
+    "sample_sqlite_db_files/",
+    "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/",
+]
