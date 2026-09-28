@@ -1,0 +1,179 @@
+name: Tailscale SSH discovery regression
+'on':
+  push:
+    branches:
+    - main
+    paths:
+    - .github/workflows/gh505-tailscale-discovery.yml
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: gh505-tailscale-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUST_MIN_STACK: '134217728'
+  RUST_BACKTRACE: '1'
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Apply exact GH505 candidate without updating any branch
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        python3 - <<'PYAPPLY'
+        import base64, json, os, pathlib, urllib.request
+        repo = os.environ['GITHUB_REPOSITORY']
+        headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+        def load_blob(sha):
+            request = urllib.request.Request(f'https://api.github.com/repos/{repo}/git/blobs/{sha}', headers=headers)
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return base64.b64decode(json.load(response)['content']).decode()
+        def replace_once(path, before, after):
+            p = pathlib.Path(path)
+            text = p.read_text()
+            assert text.count(before) == 1, f'Concurrent source change: {path}'
+            p.write_text(text.replace(before, after, 1))
+        replace_once('src/sources/config.rs', '        #[serde(default)]\n        sharee_node: bool,\n', '        #[serde(default)]\n        sharee_node: bool,\n        #[serde(default)]\n        tags: Option<Vec<String>>,\n')
+        replace_once('src/sources/config.rs', '        if !peer.online || peer.sharee_node {\n            continue;\n        }\n', '        if !peer.online || peer.sharee_node {\n            continue;\n        }\n        // GH505: Mullvad peers are provider WireGuard endpoints, not SSH hosts.\n        // Tags may be absent/null in status JSON. The provider DNS suffix is\n        // also used by Tailscale itself (cmd/tailscale/cli/status.go and\n        // wgengine/magicsock); match a full label boundary, not a substring.\n        // Location and ExitNode/ExitNodeOption alone do not identify Mullvad:\n        // ordinary tailnet machines can have those fields and still run SSH.\n        let mullvad_tag = peer\n            .tags\n            .as_ref()\n            .is_some_and(|tags| tags.iter().any(|tag| tag == "tag:mullvad-exit-node"));\n        let mullvad_dns = peer\n            .dns_name\n            .trim_end_matches(\'.\')\n            .to_ascii_lowercase()\n            .ends_with(".mullvad.ts.net");\n        if mullvad_tag || mullvad_dns {\n            continue;\n        }\n')
+        replace_once('src/sources/setup.rs', '    let discovered_hosts = if !state.discovery_complete {\n', '    // An unfinished probe phase can resume discovery saved by an older version\n    // that included provider exit nodes. Saved names have no peer metadata, so\n    // refresh automatic Tailscale discovery rather than replaying that list.\n    // Explicit --hosts and already-completed probing keep their resume behavior.\n    let discovered_hosts = if !state.discovery_complete\n        || (opts.tailscale && opts.hosts.is_none() && !state.probing_complete)\n    {\n')
+        config = pathlib.Path('src/sources/config.rs')
+        assert 'mod tailscale_tests;' not in config.read_text()
+        with config.open('a') as out:
+            out.write('\n#[cfg(test)]\n#[path = "tailscale_tests.rs"]\nmod tailscale_tests;\n')
+        for path, sha in {'src/sources/tailscale_tests.rs': '8a5b96627a89e7ba271e6e13d0d0c2c506e8b112', 'tests/tailscale_discovery.rs': 'a7ef656acc22ae4c2b1c7372af581d1726f3bdd8'}.items():
+            p = pathlib.Path(path)
+            assert not p.exists(), path
+            p.write_text(load_blob(sha))
+        policy = pathlib.Path('tests/policies/no_mock_allowlist.json')
+        data = json.loads(policy.read_text())
+        assert not any(entry['path'] == 'tests/tailscale_discovery.rs' for entry in data['entries'])
+        data['entries'].append({'path': 'tests/tailscale_discovery.rs', 'pattern': 'fake_tailscale_status', 'rationale': 'External Tailscale CLI/daemon protocol boundary: deterministic status JSON is necessary to exercise Mullvad filtering without a private tailnet or contacting provider infrastructure. The production parser, setup and real OpenSSH execute unchanged; ProxyCommand records and refuses every transport locally.', 'owner': 'sources-team', 'review_date': '2027-03-28', 'cfg_test_only': True, 'permanent': True, 'note': 'GH505 covers tag-only and DNS-only providers, normal exit nodes, aliases, all-provider discovery, and resumed stale discovery. No SSH executable is substituted.'})
+        policy.write_text(json.dumps(data, indent=2) + '\n')
+        pathlib.Path('.github/workflows/gh505-tailscale-discovery.yml').write_text(load_blob('b8ea7f0b702fee1653534c41c7e81e7f445d373d'))
+        PYAPPLY
+    - name: Install pinned Rust and real OpenSSH
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libssl-dev openssh-client ripgrep
+        rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+        rustc --version
+        cargo --version
+        /usr/bin/ssh -V
+    - name: Format candidate Rust and review the exact diff
+      run: |
+        set -euo pipefail
+        rustfmt --edition 2024 --config skip_children=true src/sources/config.rs src/sources/setup.rs src/sources/tailscale_tests.rs tests/tailscale_discovery.rs
+        git diff --check
+        git diff --stat
+        git diff -- src/sources/config.rs src/sources/setup.rs
+    - name: Archive exact candidate source
+      run: tar -czf "$RUNNER_TEMP/gh505-candidate-source.tar.gz" src/sources/config.rs src/sources/setup.rs src/sources/tailscale_tests.rs
+        tests/tailscale_discovery.rs tests/policies/no_mock_allowlist.json .github/workflows/gh505-tailscale-discovery.yml
+    - name: Retain candidate independently of Git write permissions
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: gh505-candidate-source
+        path: ${{ runner.temp }}/gh505-candidate-source.tar.gz
+        retention-days: 7
+        if-no-files-found: error
+    - name: Publish candidate tree objects only
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        python3 - <<'PYPUBLISH'
+        import json, os, pathlib, subprocess, urllib.request
+        repo = os.environ['GITHUB_REPOSITORY']
+        headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'}
+        def post(endpoint, payload):
+            request = urllib.request.Request(f'https://api.github.com/repos/{repo}/git/{endpoint}', data=json.dumps(payload).encode(), headers=headers, method='POST')
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return json.load(response)
+        base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+        base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+        print('GH505_BASE ' + json.dumps({'base_commit': base, 'base_tree': base_tree}), flush=True)
+        entries = []
+        for path in ['src/sources/config.rs', 'src/sources/setup.rs', 'src/sources/tailscale_tests.rs', 'tests/tailscale_discovery.rs', 'tests/policies/no_mock_allowlist.json']:
+            blob = post('blobs', {'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'})
+            entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
+            print('GH505_BLOB ' + json.dumps(entries[-1]), flush=True)
+        tree = post('trees', {'base_tree': base_tree, 'tree': entries})
+        receipt = {'base_commit': base, 'base_tree': base_tree, 'candidate_tree': tree['sha'], 'entries': entries}
+        print('GH505_CANDIDATE ' + json.dumps(receipt), flush=True)
+        pathlib.Path(os.environ['RUNNER_TEMP'], 'gh505-candidate.json').write_text(json.dumps(receipt, indent=2))
+        # Intentionally create no commit and move no branch. The reviewed/tested tree
+        # is committed directly to main through the GitHub connector after the gates.
+        PYPUBLISH
+      continue-on-error: true
+    - name: Focused discovery unit regressions
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-0.log"
+        timeout 1500s cargo test --locked --lib tailscale -- --nocapture 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 6, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 0:', counts)
+        PYTEST
+    - name: Real CLI and SSH transport boundary regressions
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-1.log"
+        timeout 1200s cargo test --locked --test tailscale_discovery -- --nocapture 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 4, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 1:', counts)
+        PYTEST
+    - name: Broader sources library suite
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-2.log"
+        timeout 1200s cargo test --locked --lib sources:: 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 1, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 2:', counts)
+        PYTEST
+    - name: Broader setup and sources CLI suites
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-3.log"
+        timeout 1200s cargo test --locked --test setup_workflow --test e2e_sources 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 1, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 3:', counts)
+        PYTEST
+    - name: Formatting and no-mock policy
+      run: |
+        set -euo pipefail
+        cargo fmt --all -- --check
+        ./scripts/validate_ci.sh --no-mock-only
+        git diff --check
+    - name: Clippy for library and new CLI regressions
+      run: cargo clippy --locked --lib --test tailscale_discovery -- -D warnings
