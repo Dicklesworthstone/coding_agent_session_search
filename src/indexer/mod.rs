@@ -34956,6 +34956,10 @@ pub mod persist {
         };
     }
 
+    /// Changed slices an incremental run buffers in the lexical writer before
+    /// publishing (at most ~128 MiB of text with the default slice size).
+    const PERSIST_SLICES_PER_LEXICAL_COMMIT: usize = 4;
+
     /// Consecutive message ranges of `conv`, each within `limits` (a single
     /// oversized message still forms its own range).
     fn persist_slice_ranges(
@@ -35107,6 +35111,7 @@ pub mod persist {
 
         let mut outcome = PersistBatchOutcome::default();
         let last_part = parts.len() - 1;
+        let mut changed_parts_since_commit = 0usize;
         for (index, part) in parts.into_iter().enumerate() {
             let is_last = index == last_part;
             // An inline rebuild replays each touched conversation in full from
@@ -35145,14 +35150,20 @@ pub mod persist {
                     completion,
                 ),
             }?;
+            let changed = part_outcome.inserted_messages + part_outcome.updated_messages > 0;
             outcome.merge(part_outcome);
-            // Publish each incremental slice so the lexical writer's buffered
-            // documents stay bounded by one slice too.
+            // Bound the lexical writer's buffered documents to a few slices.
+            // Every publish re-verifies the live segments (seconds on a large
+            // index), so slices that changed nothing (a growing session's
+            // already-stored history) never force one.
+            changed_parts_since_commit += usize::from(changed);
             if !is_last
+                && changed_parts_since_commit >= PERSIST_SLICES_PER_LEXICAL_COMMIT
                 && lexical_strategy == LexicalPopulationStrategy::IncrementalInline
                 && let Some(index) = t_index.as_deref_mut()
             {
                 index.commit()?;
+                changed_parts_since_commit = 0;
             }
             heartbeat.tick();
         }
