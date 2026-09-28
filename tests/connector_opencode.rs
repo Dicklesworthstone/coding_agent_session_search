@@ -228,6 +228,198 @@ fn opencode_parses_drizzle_sqlite_schema() {
     assert!(conv.messages[0].content.contains("OpenCode Drizzle schema"));
 }
 
+/// GH #504: OpenCode 2.0.x keeps new sessions only in `session_v2` /
+/// `session_message` (next to the 1.x tables); a 1.x session migrated to 2.x
+/// keeps its id in both. Both must come out of a real connector scan, once each.
+#[test]
+fn opencode_scan_indexes_v2_only_and_migrated_sessions_once() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("opencode.db");
+    let conn = create_drizzle_opencode_db(&db_path);
+    conn.execute_batch(
+        "CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            parent_id TEXT,
+            slug TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            title TEXT,
+            version TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            time_archived INTEGER
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );",
+    )
+    .expect("create opencode 2.x tables");
+
+    // The migrated session: 1.x rows ...
+    conn.execute_compat(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "ses_migrated",
+            "proj_v2",
+            "migrated",
+            "/work/opencode",
+            "1.x title",
+            "1.14.46",
+            1_769_920_193_873_i64,
+            1_769_920_194_000_i64
+        ],
+    )
+    .expect("insert 1.x session");
+    conn.execute_compat(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            "msg_v1",
+            "ses_migrated",
+            1_769_920_193_900_i64,
+            1_769_920_193_900_i64,
+            r#"{"role":"user"}"#
+        ],
+    )
+    .expect("insert 1.x message");
+    conn.execute_compat(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            "part_v1",
+            "msg_v1",
+            "ses_migrated",
+            1_769_920_193_910_i64,
+            1_769_920_193_910_i64,
+            r#"{"type":"text","text":"copy left behind in the 1.x tables"}"#
+        ],
+    )
+    .expect("insert 1.x part");
+    // ... and its 2.x copy, plus a session that exists only in 2.x.
+    for (id, title) in [
+        ("ses_migrated", "2.x title"),
+        ("ses_v2only", "Started on 2.x"),
+    ] {
+        conn.execute_compat(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                "proj_v2",
+                id,
+                "/work/opencode",
+                title,
+                "2.0.16",
+                1_790_000_000_000_i64,
+                1_790_000_010_000_i64
+            ],
+        )
+        .expect("insert 2.x session");
+    }
+    let rows = [
+        (
+            "msg_m1",
+            "ses_migrated",
+            "user",
+            1,
+            r#"{"text":"migrated prompt in 2.x"}"#,
+        ),
+        (
+            "msg_s0",
+            "ses_v2only",
+            "agent-switched",
+            0,
+            r#"{"agent":"build"}"#,
+        ),
+        (
+            "msg_s1",
+            "ses_v2only",
+            "user",
+            1,
+            r#"{"text":"unmistakable v2 only phrase"}"#,
+        ),
+        (
+            "msg_s2",
+            "ses_v2only",
+            "assistant",
+            2,
+            r#"{"model":{"id":"gpt-5","providerID":"openai"},"content":[{"type":"text","text":"answered on 2.x"}]}"#,
+        ),
+        (
+            "msg_s3",
+            "ses_v2only",
+            "idle",
+            3,
+            r#"{"outcome":"succeeded"}"#,
+        ),
+    ];
+    for (id, session_id, kind, seq, data) in rows {
+        conn.execute_compat(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                session_id,
+                kind,
+                seq,
+                1_790_000_000_000_i64 + seq,
+                1_790_000_000_000_i64 + seq,
+                data
+            ],
+        )
+        .expect("insert 2.x message");
+    }
+    drop(conn);
+
+    let connector = OpenCodeConnector::new();
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+        progress_tick: None,
+    };
+    let mut convs = connector
+        .scan(&ctx)
+        .expect("opencode 2.x scan should succeed");
+    convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+
+    let ids: Vec<Option<&str>> = convs.iter().map(|c| c.external_id.as_deref()).collect();
+    assert_eq!(ids, vec![Some("ses_migrated"), Some("ses_v2only")]);
+
+    let migrated = &convs[0];
+    assert_eq!(migrated.title.as_deref(), Some("2.x title"));
+    let migrated_text: Vec<&str> = migrated
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(migrated_text, vec!["migrated prompt in 2.x"]);
+
+    let v2_only = &convs[1];
+    assert_eq!(v2_only.title.as_deref(), Some("Started on 2.x"));
+    assert_eq!(v2_only.workspace, Some(PathBuf::from("/work/opencode")));
+    let turns: Vec<(&str, &str)> = v2_only
+        .messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.as_str()))
+        .collect();
+    assert_eq!(
+        turns,
+        vec![
+            ("user", "unmistakable v2 only phrase"),
+            ("assistant", "answered on 2.x")
+        ]
+    );
+    assert_eq!(v2_only.messages[1].author.as_deref(), Some("gpt-5"));
+}
+
 #[test]
 fn opencode_parses_created_storage() {
     let dir = TempDir::new().unwrap();
