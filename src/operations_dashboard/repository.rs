@@ -813,9 +813,33 @@ mod tests {
         assert_eq!(card["coordination_verified"], false);
     }
 
+    /// A temp dir with no `.git` ancestor. `repository_root` deliberately lets any
+    /// Git marker win over a nearer `.beads` root, so a beads-only fixture is only
+    /// meaningful outside every repository. Remote test runners can put TMPDIR
+    /// inside the project checkout (rch uses `<project>/.rch-tmp`), which made the
+    /// beads-only assertion resolve to the enclosing cass repo instead.
+    fn tempdir_outside_any_repository() -> std::io::Result<tempfile::TempDir> {
+        let has_git_ancestor =
+            |base: &Path| base.ancestors().any(|dir| dir.join(".git").exists());
+        let mut bases = vec![std::env::temp_dir()];
+        if cfg!(unix) {
+            bases.push(PathBuf::from("/tmp"));
+        }
+        for base in bases {
+            if let Ok(base) = base.canonicalize()
+                && !has_git_ancestor(&base)
+            {
+                return tempfile::tempdir_in(base);
+            }
+        }
+        Err(std::io::Error::other(
+            "no temp base outside a git repository is available for this fixture",
+        ))
+    }
+
     #[test]
     fn nested_repository_and_beads_only_roots_are_resolved_without_writes() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
+        let temp = tempdir_outside_any_repository()?;
         fs::create_dir(temp.path().join(".beads"))?;
         let nested = temp.path().join("one/two");
         fs::create_dir_all(&nested)?;

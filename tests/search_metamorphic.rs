@@ -63,7 +63,13 @@ struct Corpus {
 impl Corpus {
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cass"));
-        cmd.env("HOME", &self.home)
+        // Run from the fixture home, not the test's inherited cwd (the repo root).
+        // The aider connector scans the working directory for
+        // `.aider.chat.history.md` when the data dir is a cass state dir, so a
+        // stray transcript in the checkout leaked foreign hits into the oracle
+        // ("hit without a msgid token: # aider chat started at …").
+        cmd.current_dir(&self.home)
+            .env("HOME", &self.home)
             .env("CODEX_HOME", self.home.join(".codex"))
             .env("CASS_DATA_DIR", &self.data_dir)
             .env("CASS_AUTO_REFRESH", "0")
