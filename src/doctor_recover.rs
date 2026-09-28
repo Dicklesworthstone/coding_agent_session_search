@@ -151,9 +151,10 @@ pub(crate) fn is_fts_shadow_schema_level_open_failure(err: &anyhow::Error) -> bo
 /// Whether the pinned frankensqlite's deferred-FTS5 repair open accepts an
 /// FTS5 shadow table whose declared implicit autoindex has no `sqlite_master`
 /// row: the catalog cass wrote for `fts_messages_config` before the #434
-/// writer fix (GH #503). frankensqlite =0.4.4 refuses it on every open,
+/// writer fix (GH #503). frankensqlite =0.4.6 refuses it on every open,
 /// including the repair open, so `--rebuild-canonical-fts` cannot rebuild
-/// that shadow in place. The engine fix is not in a published release yet.
+/// that shadow in place. The engine fix (frankensqlite cbd0b98dc) landed
+/// after the 0.4.6 tag and is not in a published release yet.
 /// `pinned_engine_deferred_open_matches_the_legacy_shadow_catalog_policy`
 /// runs the real repair open on a fixture with that catalog and fails when a
 /// pin bump changes the answer, so this cannot silently go stale.

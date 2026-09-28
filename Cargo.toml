@@ -82,12 +82,15 @@ notify = "8.2.0"
 # 0.4.1 adds GH#462's reserved-page WAL freelist repair and consumes the
 # Asupersync 0.5 runtime. The 0.4.2 candidate adds explicit derived WAL-index
 # recovery for read-only opens (GH#477). The published 0.4.4 family adds
-# durable pending-freelist repairs; all family packages use 0.4.4 and
-# build.rs checks each resolved package exactly.
-frankensqlite = { version = "=0.4.4", package = "fsqlite", features = ["fts5", "async-api"] }
+# durable pending-freelist repairs. 0.4.6 stops a live B-tree page from being
+# freed and granted again across a WAL generation (bd-b5vmw: integrity_check's
+# "page N is referenced multiple times") and fixes a lost-index-entry race
+# (bd-11sz4); all family packages use 0.4.6 and build.rs checks each resolved
+# package exactly.
+frankensqlite = { version = "=0.4.6", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.4.4", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.6", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -238,7 +241,7 @@ tokenizers = { version = "*", default-features = false, features = ["fancy-regex
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.4.4", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.6", package = "fsqlite-types" }
 
 # The fsqlite family resolves from exact reviewed registry versions for every
 # direct and transitive consumer. build.rs rejects duplicates and mixed sources.

@@ -129,7 +129,7 @@ jobs:
           [dependencies]
           anyhow = "=1.0.102"
           tracing = "=0.1.44"
-          frankensqlite = { package = "fsqlite", version = "=0.4.4", features = ["fts5", "async-api"] }
+          frankensqlite = { package = "fsqlite", version = "=0.4.6", features = ["fts5", "async-api"] }
           [profile.test]
           debug = 0
           [profile.test.package."*"]
