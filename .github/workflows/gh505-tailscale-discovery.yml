@@ -79,6 +79,16 @@ jobs:
         git diff --check
         git diff --stat
         git diff -- src/sources/config.rs src/sources/setup.rs
+    - name: Archive exact candidate source
+      run: tar -czf "$RUNNER_TEMP/gh505-candidate-source.tar.gz" src/sources/config.rs src/sources/setup.rs src/sources/tailscale_tests.rs
+        tests/tailscale_discovery.rs tests/policies/no_mock_allowlist.json .github/workflows/gh505-tailscale-discovery.yml
+    - name: Retain candidate independently of Git write permissions
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: gh505-candidate-source
+        path: ${{ runner.temp }}/gh505-candidate-source.tar.gz
+        retention-days: 7
+        if-no-files-found: error
     - name: Publish candidate tree objects only
       env:
         GH_TOKEN: ${{ github.token }}
@@ -93,10 +103,12 @@ jobs:
                 return json.load(response)
         base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
         base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+        print('GH505_BASE ' + json.dumps({'base_commit': base, 'base_tree': base_tree}), flush=True)
         entries = []
-        for path in ['src/sources/config.rs', 'src/sources/setup.rs', 'src/sources/tailscale_tests.rs', 'tests/tailscale_discovery.rs', 'tests/policies/no_mock_allowlist.json', '.github/workflows/gh505-tailscale-discovery.yml']:
+        for path in ['src/sources/config.rs', 'src/sources/setup.rs', 'src/sources/tailscale_tests.rs', 'tests/tailscale_discovery.rs', 'tests/policies/no_mock_allowlist.json']:
             blob = post('blobs', {'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'})
             entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
+            print('GH505_BLOB ' + json.dumps(entries[-1]), flush=True)
         tree = post('trees', {'base_tree': base_tree, 'tree': entries})
         receipt = {'base_commit': base, 'base_tree': base_tree, 'candidate_tree': tree['sha'], 'entries': entries}
         print('GH505_CANDIDATE ' + json.dumps(receipt), flush=True)
@@ -104,6 +116,7 @@ jobs:
         # Intentionally create no commit and move no branch. The reviewed/tested tree
         # is committed directly to main through the GitHub connector after the gates.
         PYPUBLISH
+      continue-on-error: true
     - name: Focused discovery unit regressions
       shell: bash
       run: |
