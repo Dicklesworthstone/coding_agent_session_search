@@ -3195,16 +3195,17 @@ fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
         .is_ok()
 }
 
+/// `PRAGMA table_info` answers from the connection's schema. A `sqlite_master`
+/// query instead materializes a virtual table, and fsqlite 0.4.4's clean-root
+/// probe for it reads every page of the file: the token rollup stage's check
+/// for its stage table held 17 GB on a 16 GB archive (xcqqa). Callers pass
+/// internal table names; views also answer, which none of them name.
 fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
-    let found: Option<i64> = conn
-        .query_row_map(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
-            fparams![table],
-            |row| row.get_typed(0),
-        )
-        .optional()
+    let quoted = table.replace('"', "\"\"");
+    let columns = conn
+        .query(&format!("PRAGMA table_info(\"{quoted}\")"))
         .with_context(|| format!("checking for historical table {table}"))?;
-    Ok(found.is_some())
+    Ok(!columns.is_empty())
 }
 
 fn probe_historical_table_reads(conn: &FrankenConnection, table: &str) -> Result<()> {
@@ -42851,6 +42852,102 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .query("SELECT id FROM bulk_payload ORDER BY id")
             .unwrap();
         assert_eq!(rows.len(), 10);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xcqqa_token_rollup_stage_on_a_stale_writer_does_not_hydrate_archive_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stale-writer.db");
+        let payload = "archived session payload ".repeat(16384);
+        {
+            let storage = FrankenStorage::open(&path).unwrap();
+            storage
+                .raw()
+                .execute("CREATE TABLE bulk_payload(id INTEGER PRIMARY KEY, content TEXT NOT NULL)")
+                .unwrap();
+            // ~30 x 400 KB of overflow pages: a ~3,000-page file, so a probe
+            // that walks the file is distinguishable from one that does not.
+            for id in 0..30_i64 {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                        fparams![id, payload.as_str()],
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(index_engine_migration_is_complete(&path));
+
+        // The legacy OMP analytics writer commits thousands of Track A chunks
+        // while the index run's own connection stays open, then runs the token
+        // rollup stage (Track B) on the same writer.
+        let peer = FrankenStorage::open(&path).unwrap();
+        let writer = FrankenStorage::open_writer(&path).unwrap();
+        for id in 30..34_i64 {
+            let mut tx = writer.raw().transaction().unwrap();
+            tx.execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![id, "writer chunk"],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        peer.raw()
+            .execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![34_i64, "peer commit"],
+            )
+            .unwrap();
+        assert_eq!(writer.raw().as_async().memdb_row_hydration_count(), 0);
+        // Bytes returned by read syscalls. fsqlite 0.4.4 reads every page of
+        // the file (through pread, invisible to its page-cache counters) on a
+        // connection's first sqlite_master query: 4,237,131 preads for the
+        // 4,137,946-page owner archive.
+        let read_bytes = || {
+            fs::read_to_string("/proc/self/io")
+                .ok()
+                .and_then(|io| {
+                    io.lines()
+                        .find_map(|line| line.strip_prefix("rchar: "))
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                })
+                .expect("/proc/self/io rchar")
+        };
+
+        let before_probe = read_bytes();
+        assert!(historical_table_exists(writer.raw(), "bulk_payload").unwrap());
+        assert!(
+            !historical_table_exists(writer.raw(), TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE).unwrap()
+        );
+        let probe_read = read_bytes() - before_probe;
+        assert!(
+            probe_read < 1024 * 1024,
+            "two table-existence probes read {probe_read} bytes of a ~12 MB archive"
+        );
+        assert_eq!(
+            writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "a table-existence probe must not hydrate archive rows"
+        );
+
+        let before_stage = read_bytes();
+        writer
+            .rebuild_token_daily_stats_with_progress(None, None)
+            .unwrap();
+        let stage_read = read_bytes() - before_stage;
+        assert!(
+            stage_read < 4 * 1024 * 1024,
+            "the token rollup stage read {stage_read} bytes of a ~12 MB archive"
+        );
+        assert_eq!(
+            writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "the token rollup stage must not hydrate archive rows"
+        );
+        drop(writer);
+        drop(peer);
     }
 
     #[test]
