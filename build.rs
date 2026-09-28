@@ -155,11 +155,13 @@ const CONTRACTS: &[DependencyContract] = &[
         // the Codex and Pi-family connectors (cass#486), and caps session
         // reads while reading. 0.3.2 (2026-09-26) lets CASS set that Codex
         // rollout read cap, which 0.3.1 fixed at 100 MiB regardless of
-        // CASS_CODEX_MAX_SOURCE_BYTES.
+        // CASS_CODEX_MAX_SOURCE_BYTES. 0.3.3 (2026-09-28) indexes OpenCode 2.x
+        // sessions from session_v2/session_message (cass#504) and decodes
+        // OpenClaw's zstd-compressed transcript events (FAD#25).
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.2",
+        expected_version: "0.3.3",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[
