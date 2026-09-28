@@ -428,6 +428,7 @@ impl EmbeddingWorker {
                 job_id,
                 index_path,
                 db_path,
+                &mut |_| {},
             );
             match pass_result {
                 Ok(EmbeddingPassOutcome::Completed) => {
@@ -493,12 +494,17 @@ impl EmbeddingWorker {
             job_id,
             index_path,
             db_path,
+            &mut |_| {},
         )
     }
 
     /// Plan identities without retaining bodies, then replay the same source
     /// into bounded passage batches. Generated vectors and reconciliation
     /// identities remain corpus-sized; this is not a total-memory bound.
+    ///
+    /// `on_progress` receives the completed-message count after every stored
+    /// progress update, so tests observe progress without depending on
+    /// process-global tracing state (2l1b0.71).
     #[allow(clippy::too_many_arguments)]
     fn generate_embeddings_from_source(
         &self,
@@ -509,6 +515,7 @@ impl EmbeddingWorker {
         job_id: i64,
         index_path: &Path,
         db_path: &Path,
+        on_progress: &mut dyn FnMut(i64),
     ) -> anyhow::Result<EmbeddingPassOutcome> {
         let cancelled = || self.is_cancelled();
         if cancelled() {
@@ -605,6 +612,7 @@ impl EmbeddingWorker {
                 }
                 storage.update_job_progress(job_id, completed)?;
                 debug!(job_id, completed, "Embedding progress");
+                on_progress(completed);
                 Ok(())
             };
             let mut inputs = Vec::with_capacity(EMBED_PROGRESS_CHUNK_SIZE);
@@ -1170,40 +1178,25 @@ mod tests {
         messages.push(make_message(-1, "invalid canonical identity".into()));
         let job_id = storage.upsert_embedding_job(&db_path.to_string_lossy(), "hash", 19)?;
         storage.start_embedding_job(job_id)?;
-        let trace_path = temp.path().join("worker-progress.jsonl");
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(Mutex::new(std::fs::File::create(&trace_path)?))
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, || {
-            worker.generate_embeddings_and_save(
-                &storage,
-                &messages,
-                "hash",
-                false,
-                job_id,
-                &index_path,
-                &db_path,
-            )
-        })?;
+        // Observe progress directly. Capturing the "Embedding progress" debug
+        // event through a scoped tracing subscriber lost every event after
+        // the planning warning in the full parallel suite, because other
+        // tests' dispatchers lowered the process-wide max level (2l1b0.71).
+        let mut completed = Vec::new();
+        let result = worker.generate_embeddings_from_source(
+            &storage,
+            &embedding_source::SliceEmbeddingSource(&messages),
+            "hash",
+            false,
+            job_id,
+            &index_path,
+            &db_path,
+            &mut |count| completed.push(count),
+        )?;
         assert_eq!(result, EmbeddingPassOutcome::Completed);
-        let events = std::fs::read_to_string(&trace_path)?;
-        let completed = events
-            .lines()
-            .map(serde_json::from_str::<serde_json::Value>)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|event| event["fields"]["message"] == "Embedding progress")
-            .map(|event| {
-                event["fields"]["completed"]
-                    .as_i64()
-                    .ok_or_else(|| anyhow::anyhow!("missing completed count: {event}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
         // At 128 inputs, one short and 15 long messages are complete; the last
         // long message still has one pending passage. Empty/invalid rows add 2.
-        assert_eq!(completed, [18, 19], "actual worker trace: {events}");
+        assert_eq!(completed, [18, 19]);
         let index = VectorIndex::open(&vector_index_path(&index_path, "fnv1a-384"))?;
         assert_eq!(index.record_count(), 129);
         drop(index);
@@ -1436,6 +1429,7 @@ mod tests {
                 job_id,
                 &index_path,
                 &db_path,
+                &mut |_| {},
             )?,
             EmbeddingPassOutcome::Cancelled
         );

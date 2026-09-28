@@ -962,7 +962,23 @@ fn malformed_json_handled_gracefully() {
         &[("user", "VALID_CONTENT"), ("assistant", "response")],
     );
 
-    env.full_index();
+    // A rollout with no parseable record is an incomplete source scan. Since
+    // ce8ba84f/80b68f76 that is reported, not swallowed: the run keeps the
+    // valid sessions it committed but exits 9 (kind "index", retryable) so a
+    // caller cannot mistake partial coverage for a complete index.
+    let output = env.full_index_output();
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "an unreadable rollout must make the scan incomplete (exit 9); stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("one or more source scans were incomplete"),
+        "exit 9 must name the incomplete scan; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let hits = env.search("VALID_CONTENT");
     assert!(
@@ -1090,6 +1106,17 @@ impl TestEnv {
             .env("HOME", &self.home)
             .assert()
             .success();
+    }
+
+    /// Run a full index and return its output without asserting success.
+    fn full_index_output(&self) -> std::process::Output {
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&self.data_dir)
+            .env("CODEX_HOME", &self.codex_home)
+            .env("HOME", &self.home)
+            .output()
+            .expect("run cass index --full")
     }
 
     fn search(&self, query: &str) -> Vec<SearchHit> {

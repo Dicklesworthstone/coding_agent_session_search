@@ -82,6 +82,7 @@ fuzz_target!(|input: DecryptInput| {
             files: vec![],
         },
         key_slots: vec![key_slot],
+        next_slot_id: None,
     };
 
     // This should never panic - only return errors for invalid inputs

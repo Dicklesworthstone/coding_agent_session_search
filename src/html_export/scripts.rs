@@ -945,6 +945,25 @@ const Crypto = {
             const plaintext = dec.decode(decrypted);
             const conversation = $('#conversation');
             conversation.innerHTML = plaintext;
+
+            // The real title and header metadata are sealed in the payload;
+            // the page shows only a generic header until unlock.
+            const sealedHeader = conversation.querySelector('#cass-sealed-header');
+            if (sealedHeader) {
+                const headerContent = $('.header .header-content');
+                if (headerContent) {
+                    headerContent.innerHTML = sealedHeader.innerHTML;
+                }
+                const realTitle = sealedHeader.getAttribute('data-title');
+                if (realTitle) {
+                    document.title = realTitle;
+                    const footerTitle = $('.print-footer-title');
+                    if (footerTitle) {
+                        footerTitle.textContent = realTitle;
+                    }
+                }
+                sealedHeader.remove();
+            }
             if (typeof Prism !== 'undefined' && typeof Prism.highlightAllUnder === 'function') {
                 Prism.highlightAllUnder(conversation);
             }

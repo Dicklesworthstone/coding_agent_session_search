@@ -156,6 +156,25 @@ impl fmt::Display for IncompleteScan {
 
 impl std::error::Error for IncompleteScan {}
 
+/// The rollouts a Codex scan skipped for exceeding the per-source read budget.
+pub(crate) struct OverBudgetSources {
+    /// Sampled rejected sources (at most [`MAX_REJECTION_SAMPLES`]).
+    pub(crate) sampled_paths: Vec<PathBuf>,
+}
+
+/// The over-budget rollouts behind a Codex scan error, when that is all it is.
+/// A scan that also failed for other reasons keeps its generic diagnostic.
+pub(crate) fn over_budget_sources(error: &anyhow::Error) -> Option<OverBudgetSources> {
+    let incomplete = error.downcast_ref::<IncompleteScan>()?;
+    Some(OverBudgetSources {
+        sampled_paths: incomplete
+            .rejected_sources
+            .iter()
+            .map(|source| PathBuf::from(&source.source_path))
+            .collect(),
+    })
+}
+
 #[derive(Default)]
 struct ScanState {
     limits: ScanLimits,

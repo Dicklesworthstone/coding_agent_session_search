@@ -169,7 +169,6 @@ pub mod focus_ids {
     pub const COMMAND_PALETTE: FocusId = 10;
     pub const HELP_OVERLAY: FocusId = 11;
     pub const EXPORT_MODAL: FocusId = 12;
-    pub const CONSENT_DIALOG: FocusId = 13;
     pub const BULK_MODAL: FocusId = 14;
     pub const SAVED_VIEWS_MODAL: FocusId = 15;
     pub const SOURCE_FILTER_MENU: FocusId = 16;
@@ -179,7 +178,6 @@ pub mod focus_ids {
     pub const GROUP_PALETTE: u32 = 100;
     pub const GROUP_HELP: u32 = 101;
     pub const GROUP_EXPORT: u32 = 102;
-    pub const GROUP_CONSENT: u32 = 103;
     pub const GROUP_BULK: u32 = 104;
     pub const GROUP_SAVED_VIEWS: u32 = 105;
     pub const GROUP_SOURCE_FILTER: u32 = 106;
@@ -214,7 +212,8 @@ fn take_raw_event() -> Option<super::ftui_adapter::Event> {
 pub const BULK_ACTIONS: [&str; 4] = [
     "Open all in editor",
     "Copy all paths",
-    "Export as JSON",
+    // Copies to the clipboard; it never wrote a file (2l1b0.54).
+    "Copy as JSON",
     "Clear selection",
 ];
 
@@ -3187,7 +3186,7 @@ fn smart_timestamp(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 /// Normalize a raw timestamp (seconds or milliseconds) to seconds.
-fn ts_to_secs(ts: i64) -> i64 {
+pub(super) fn ts_to_secs(ts: i64) -> i64 {
     if ts.unsigned_abs() >= 10_000_000_000 {
         ts / 1000
     } else {
@@ -4796,6 +4795,76 @@ fn match_mode_token(mode: MatchMode) -> &'static str {
     }
 }
 
+/// What the user must do for semantic or hybrid search to use the model, or
+/// `None` when it already can (or is being prepared). Until then those modes
+/// return lexical results. cass never downloads a model without an explicit
+/// command, so this names the command (2l1b0.66).
+fn semantic_mode_guidance(availability: &SemanticAvailability) -> Option<String> {
+    use SemanticAvailability as S;
+    match availability {
+        S::Ready { .. }
+        | S::HashFallback
+        | S::Downloading { .. }
+        | S::Verifying
+        | S::IndexBuilding { .. }
+        | S::UpdateAvailable { .. } => None,
+        S::NotInstalled | S::NeedsConsent | S::ModelMissing { .. } => Some(
+            "results stay lexical until the MiniLM model is installed: run `cass models install` \
+             (offline: `cass models install --from-file <dir>`)"
+                .to_string(),
+        ),
+        S::IndexMissing { .. } | S::IndexStale { .. } => Some(format!(
+            "results stay lexical ({}): run `cass index --semantic`",
+            availability.summary()
+        )),
+        S::Disabled { .. } | S::DatabaseUnavailable { .. } | S::LoadFailed { .. } => {
+            Some(format!("results stay lexical ({})", availability.summary()))
+        }
+    }
+}
+
+/// The query a search runs in prefix match mode (F9): every bare word of two
+/// or more characters also matches as a prefix (`auth` → `auth*`). Quoted
+/// phrases, `AND`/`OR`/`NOT`, negated (`-x`) and field (`a:b`) terms, and
+/// terms that already carry a wildcard are left as typed. One-character
+/// words stay exact because a one-letter prefix expands to most of the index.
+fn prefix_match_query(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut word = String::new();
+    let mut in_quotes = false;
+    let flush = |word: &mut String, out: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        let bare = !matches!(word.as_str(), "AND" | "OR" | "NOT")
+            && !word.starts_with('-')
+            && !word.contains([':', '*', '"'])
+            && word.chars().count() >= 2
+            && word.chars().next_back().is_some_and(char::is_alphanumeric);
+        out.push_str(word);
+        if bare {
+            out.push('*');
+        }
+        word.clear();
+    };
+    for ch in query.chars() {
+        if in_quotes {
+            out.push(ch);
+            in_quotes = ch != '"';
+        } else if ch == '"' && word.is_empty() {
+            in_quotes = true;
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        } else {
+            word.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 fn context_window_token(window: ContextWindow) -> &'static str {
     match window {
         ContextWindow::Small => "S",
@@ -4871,6 +4940,8 @@ fn sparkline_from_values(values: &[f64], max_width: usize) -> String {
 pub struct SavedView {
     pub slot: u8,
     pub label: Option<String>,
+    /// Search query at save time; loading the view restores it (2l1b0.55).
+    pub query: String,
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
     pub created_from: Option<i64>,
@@ -5310,8 +5381,6 @@ pub struct CassApp {
     pub saved_view_rename_mode: bool,
     /// Rename buffer used while editing saved view labels.
     pub saved_view_rename_buffer: String,
-    /// Whether the consent dialog (model download) is visible.
-    pub show_consent_dialog: bool,
     /// Semantic search availability state.
     pub semantic_availability: SemanticAvailability,
     /// Whether the source filter popup menu is open.
@@ -5449,6 +5518,11 @@ pub struct CassApp {
     pub search_service: Option<Arc<dyn SearchService>>,
     /// Concrete search service used for live progressive subscriptions.
     progressive_search_service: Option<Arc<TantivySearchService>>,
+    /// When a first-run background index was started (or found running) at
+    /// launch; ticks show its progress and open search once it publishes.
+    first_run_index_started_at: Option<Instant>,
+    /// Last time a tick probed the first-run index.
+    first_run_index_probed_at: Option<Instant>,
     /// Active live-search subscription request, if any.
     live_search_request: Option<LiveSearchRequest>,
 
@@ -5598,7 +5672,6 @@ impl Default for CassApp {
             saved_view_drag: None,
             saved_view_rename_mode: false,
             saved_view_rename_buffer: String::new(),
-            show_consent_dialog: false,
             semantic_availability: SemanticAvailability::NotInstalled,
             source_filter_menu_open: false,
             source_filter_menu_selection: 0,
@@ -5678,6 +5751,8 @@ impl Default for CassApp {
             known_workspaces: None,
             search_service: None,
             progressive_search_service: None,
+            first_run_index_started_at: None,
+            first_run_index_probed_at: None,
             live_search_request: None,
             macro_recorder: None,
             macro_playback: None,
@@ -5791,11 +5866,6 @@ impl CassApp {
                 .with_group(GROUP_EXPORT),
         );
         g.insert(
-            FocusNode::new(CONSENT_DIALOG, Rect::new(15, 8, 50, 8))
-                .with_tab_index(-1)
-                .with_group(GROUP_CONSENT),
-        );
-        g.insert(
             FocusNode::new(BULK_MODAL, Rect::new(20, 5, 40, 10))
                 .with_tab_index(-1)
                 .with_group(GROUP_BULK),
@@ -5825,8 +5895,6 @@ impl CassApp {
             .create_group(GROUP_HELP, vec![HELP_OVERLAY]);
         self.focus_manager
             .create_group(GROUP_EXPORT, vec![EXPORT_MODAL]);
-        self.focus_manager
-            .create_group(GROUP_CONSENT, vec![CONSENT_DIALOG]);
         self.focus_manager
             .create_group(GROUP_BULK, vec![BULK_MODAL]);
         self.focus_manager
@@ -6484,7 +6552,6 @@ impl CassApp {
             && !self.show_bulk_modal
             && !self.show_saved_views_modal
             && !self.show_export_modal
-            && !self.show_consent_dialog
             && !self.source_filter_menu_open
             && !self.command_palette.is_visible()
     }
@@ -6493,7 +6560,6 @@ impl CassApp {
         if self.show_export_modal
             || self.show_bulk_modal
             || self.show_saved_views_modal
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible()
             || self.show_help
@@ -7145,7 +7211,13 @@ impl CassApp {
             SearchPass::Upgrade | SearchPass::Pagination => self.search_page_size.max(1),
         };
         SearchParams {
-            query: self.query.clone(),
+            // F9 match mode applies here, the one place every search path
+            // (direct, progressive, pagination) takes its query from; the
+            // input box keeps what the user typed (2l1b0.55).
+            query: match self.match_mode {
+                MatchMode::Standard => self.query.clone(),
+                MatchMode::Prefix => prefix_match_query(&self.query),
+            },
             filters: self.filters.clone(),
             pass,
             mode: self.search_mode,
@@ -7380,6 +7452,206 @@ impl CassApp {
     fn push_undo(&mut self, description: &'static str) {
         let entry = self.capture_undo_state(description);
         self.undo_history.push(entry);
+    }
+
+    /// Open the lexical search service over `self.data_dir`, with its
+    /// semantic context. `Ok(false)` means no index exists yet. Runs at launch
+    /// and again when a first-run index publishes, so search goes live
+    /// without a restart (2l1b0.56).
+    fn open_search_service(&mut self) -> Result<bool, String> {
+        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
+        use crate::search::model_manager::{
+            load_hash_semantic_context, load_semantic_context_deferred,
+        };
+
+        let index_path = crate::search::tantivy::index_dir(&self.data_dir)
+            .map_err(|e| format!("Search unavailable: failed to resolve index path ({e})"))?;
+        let client = match crate::search::query::SearchClient::open_with_options(
+            &index_path,
+            Some(&self.db_path),
+            crate::search::query::SearchClientOptions {
+                enable_reload: true,
+                enable_warm: true,
+                strict_read_only: false,
+            },
+        ) {
+            Ok(Some(client)) => Arc::new(client),
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(format!("Search unavailable: failed to open index ({e})")),
+        };
+        let prefer_hash =
+            EmbedderRegistry::new(&self.data_dir).best_available().name == HASH_EMBEDDER;
+        // GH #395: at launch this runs on the main thread BEFORE the first
+        // frame. The deferred loader resolves the model's identity and
+        // artifacts now but initializes the in-process MiniLM lazily on the
+        // first semantic query (which the TUI already runs on a background
+        // task), so a large model or slow disk can never hold the UI at a
+        // blank screen. The CLI's daemon-first path uses the same lazy
+        // embedder.
+        let setup = if prefer_hash {
+            load_hash_semantic_context(&self.data_dir, &self.db_path)
+        } else {
+            load_semantic_context_deferred(&self.data_dir, &self.db_path)
+        };
+        self.semantic_availability = setup.availability.clone();
+        if let Some(context) = setup.context {
+            if let Err(err) = client.set_semantic_artifacts_context(
+                context.embedder,
+                context.artifacts,
+                context.quality_artifact,
+                context.filter_maps,
+                context.roles,
+            ) {
+                tracing::debug!(error = %err, "tui semantic context unavailable");
+                let _ = client.clear_semantic_context();
+            }
+        } else {
+            let _ = client.clear_semantic_context();
+        }
+
+        let service = Arc::new(TantivySearchService::new(Arc::clone(&client)));
+        self.progressive_search_service = Some(Arc::clone(&service));
+        self.search_service = Some(service as Arc<dyn SearchService>);
+        // A first-run index also created the archive the detail views read.
+        if self.db_reader.is_none() && self.db_path.exists() {
+            match crate::storage::sqlite::FrankenStorage::open_readonly(&self.db_path) {
+                Ok(storage) => {
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    {
+                        self.db_reader = Some(Arc::new(storage));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tui could not open the archive for detail views");
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// With no index at launch, start the same detached, low-priority
+    /// `cass index --full --background` child the read paths use (it honors
+    /// index-run.lock and the auto-refresh cooldown and breaker) and return
+    /// the status line to show. Like the stale-on-read refresh it never
+    /// spawns for a scratch data dir or under TUI_HEADLESS (2l1b0.56).
+    fn start_first_run_index(&mut self) -> String {
+        use crate::indexer::background_refresh::{
+            AutoRefreshOutcome, maybe_spawn_background_full_index,
+        };
+        const MANUAL: &str = "Search index not found. Run `cass index --full` to enable search.";
+        if dotenvy::var("TUI_HEADLESS").is_ok()
+            || crate::auto_refresh_is_scratch_data_dir(&self.data_dir)
+        {
+            return MANUAL.to_string();
+        }
+        match maybe_spawn_background_full_index(&self.data_dir, &self.db_path, "tui_first_run") {
+            AutoRefreshOutcome::Spawned { pid, .. } => {
+                self.first_run_index_started_at = Some(Instant::now());
+                format!(
+                    "Indexing your agent history in the background (pid {pid}); search starts when the first index is ready"
+                )
+            }
+            AutoRefreshOutcome::IndexRunActive => {
+                self.first_run_index_started_at = Some(Instant::now());
+                "An index run is in progress; search starts when it publishes".to_string()
+            }
+            AutoRefreshOutcome::Disabled => {
+                format!("{MANUAL} Automatic indexing is off (CASS_AUTO_REFRESH=0).")
+            }
+            AutoRefreshOutcome::Cooldown { remaining_secs } => format!(
+                "{MANUAL} A background index ran moments ago; the next automatic try is in {remaining_secs}s."
+            ),
+            AutoRefreshOutcome::GuardBusy => {
+                format!("{MANUAL} Another cass process is starting an index right now.")
+            }
+            AutoRefreshOutcome::SpawnFailed { error } => {
+                format!("{MANUAL} Automatic indexing could not start: {error}")
+            }
+            AutoRefreshOutcome::BackedOff { remaining_secs, .. } => format!(
+                "{MANUAL} Recent background runs did not finish; the next automatic try is in {remaining_secs}s."
+            ),
+            AutoRefreshOutcome::Tripped { .. } => {
+                format!("{MANUAL} Background indexing keeps failing, so it is paused.")
+            }
+        }
+    }
+
+    /// While the first-run index builds, show its progress; the moment a
+    /// generation is published, open search and run the current query.
+    /// Schedules its own next probe, so it does not depend on other ticks.
+    fn poll_first_run_index(&mut self, now: Instant) -> Option<ftui::Cmd<CassMsg>> {
+        let started = self.first_run_index_started_at?;
+        if self.search_service.is_some() {
+            self.first_run_index_started_at = None;
+            return None;
+        }
+        if self
+            .first_run_index_probed_at
+            .is_some_and(|at| now.duration_since(at) < FIRST_RUN_INDEX_POLL)
+        {
+            return None;
+        }
+        self.first_run_index_probed_at = Some(now);
+        let maintenance =
+            crate::search::asset_state::read_search_maintenance_snapshot(&self.data_dir);
+        let progress = crate::search::tantivy::index_dir(&self.data_dir)
+            .ok()
+            .and_then(|path| crate::lexical_rebuild_progress_note(&path));
+        // Go live only once the first index run has released its lock. An
+        // index that opens while the run still holds it can be a generation
+        // the run has not filled yet, and a search against it found nothing.
+        if !maintenance.active {
+            match self.open_search_service() {
+                Ok(true) => {
+                    self.first_run_index_started_at = None;
+                    self.status = "Index ready: search is live".to_string();
+                    self.toast_manager
+                        .push(crate::ui::components::toast::Toast::success(
+                            "Index ready: search is live",
+                        ));
+                    return Some(ftui::Cmd::msg(CassMsg::SearchRequested));
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    // A generation mid-publish can fail to open; keep waiting.
+                    self.status = message;
+                    return Some(Self::delayed_tick(FIRST_RUN_INDEX_POLL));
+                }
+            }
+        }
+        let running = match (progress, maintenance.active) {
+            (Some(note), _) => Some(format!("Indexing your agent history: {note}")),
+            (None, true) => Some(format!(
+                "Indexing your agent history ({})",
+                maintenance.phase.as_deref().unwrap_or("scanning sources")
+            )),
+            (None, false) if now.duration_since(started) < FIRST_RUN_INDEX_START_GRACE => {
+                Some("Starting the first index...".to_string())
+            }
+            (None, false) => None,
+        };
+        let Some(running) = running else {
+            // No run holds the lock, nothing was published, and the start
+            // grace has passed: say so instead of waiting forever.
+            self.first_run_index_started_at = None;
+            self.status = format!(
+                "The background index stopped before search was ready; run `cass index --full` (log: {})",
+                crate::indexer::background_refresh::log_path(&self.data_dir).display()
+            );
+            return None;
+        };
+        self.status = running;
+        Some(Self::delayed_tick(FIRST_RUN_INDEX_POLL))
+    }
+
+    /// Order the loaded results for the active ranking mode (F12). Engine
+    /// order is only the input: before 2l1b0.53 every mode displayed it.
+    fn apply_ranking(&mut self) {
+        crate::ui::ranking::rank_hits(
+            &mut self.results,
+            self.ranking_mode,
+            chrono::Utc::now().timestamp(),
+        );
     }
 
     /// Re-group results into panes using the current `grouping_mode`.
@@ -12888,72 +13160,6 @@ impl CassApp {
         }
     }
 
-    /// Render the semantic model consent dialog overlay.
-    fn render_consent_overlay(
-        &self,
-        frame: &mut super::ftui_adapter::Frame,
-        area: Rect,
-        styles: &StyleContext,
-    ) {
-        let dialog_w = 68u16.min(area.width.saturating_sub(2));
-        let dialog_h = 9u16.min(area.height.saturating_sub(2));
-        if dialog_w < 28 || dialog_h < 6 {
-            return;
-        }
-
-        let dialog_x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-        let dialog_area = Rect::new(dialog_x, dialog_y, dialog_w, dialog_h);
-
-        let bg_style = styles.style(style_system::STYLE_PANE_BASE);
-        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
-        let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
-        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
-        let key_style = styles.style(style_system::STYLE_KBD_KEY);
-
-        // Clear background — use draw_rect_filled to overwrite both characters
-        // and styles (Block::style only sets bg without clearing foreground text).
-        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
-        frame.draw_rect_filled(dialog_area, ftui::Cell::from_char(' ').with_bg(bg_color));
-        let outer = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title("Enable semantic search?")
-            .title_alignment(Alignment::Left)
-            .style(border_style);
-        let inner = outer.inner(dialog_area);
-        outer.render(dialog_area, frame);
-        if inner.is_empty() {
-            return;
-        }
-
-        let lines = vec![
-            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                "Semantic/Hybrid mode needs a local embedding model download.".to_string(),
-                text_style,
-            )]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[D]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Download model (recommended)".to_string(), text_style),
-            ]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[H]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(
-                    " Use hash fallback (no download)".to_string(),
-                    text_style,
-                ),
-            ]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[Esc]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Cancel for now".to_string(), muted_style),
-            ]),
-        ];
-        Paragraph::new(ftui::text::Text::from_lines(lines))
-            .style(text_style)
-            .wrap(ftui::text::WrapMode::Word)
-            .render(inner, frame);
-    }
-
     /// Render the saved views manager popup centered on screen.
     fn render_saved_views_overlay(
         &self,
@@ -14345,24 +14551,6 @@ pub enum CassMsg {
     /// Export failed.
     ExportFailed(String),
 
-    // -- Consent dialog (semantic model download) -------------------------
-    /// Open the consent dialog.
-    ConsentDialogOpened,
-    /// Close the consent dialog.
-    ConsentDialogClosed,
-    /// User accepted model download.
-    ModelDownloadAccepted,
-    /// Model download progress update.
-    ModelDownloadProgress { bytes_downloaded: u64, total: u64 },
-    /// Model download completed.
-    ModelDownloadCompleted,
-    /// Model download failed.
-    ModelDownloadFailed(String),
-    /// User cancelled the active download.
-    ModelDownloadCancelled,
-    /// User accepted hash mode fallback (no ML model).
-    HashModeAccepted,
-
     // -- Source filter menu ------------------------------------------------
     /// Toggle the source filter popup menu.
     SourceFilterMenuToggled,
@@ -14670,6 +14858,8 @@ struct PersistedSavedView {
     slot: u8,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    query: String,
     #[serde(default)]
     agents: Vec<String>,
     #[serde(default)]
@@ -14929,6 +15119,7 @@ fn persisted_state_file_from_state(state: &PersistedState) -> PersistedStateFile
             PersistedSavedView {
                 slot: view.slot,
                 label: view.label.clone(),
+                query: view.query.clone(),
                 agents: view.agents.iter().cloned().collect(),
                 workspaces: view.workspaces.iter().cloned().collect(),
                 created_from: view.created_from,
@@ -14996,6 +15187,7 @@ fn persisted_state_from_file(file: PersistedStateFile) -> PersistedState {
             Some(SavedView {
                 slot: view.slot,
                 label: view.label.filter(|s| !s.trim().is_empty()),
+                query: view.query,
                 agents: view
                     .agents
                     .into_iter()
@@ -15693,6 +15885,11 @@ impl SearchService for TantivySearchService {
 
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(8);
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
+/// How often a TUI launched without an index probes the first-run index.
+const FIRST_RUN_INDEX_POLL: Duration = Duration::from_secs(1);
+/// How long the first-run child may take to take the index-run lock before
+/// its absence means it stopped.
+const FIRST_RUN_INDEX_START_GRACE: Duration = Duration::from_secs(20);
 
 /// Minimum distance (in terminal cells) for a drag event to be considered
 /// meaningful. Events with movement below this threshold are discarded to
@@ -15730,6 +15927,15 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                 let shift = key.modifiers.contains(Modifiers::SHIFT);
 
                 match key.code {
+                    // -- Copy content (before force quit) -------------------------
+                    // Ctrl+Shift+C must be matched before the Ctrl+C arm: with
+                    // the quit arm first, the documented "copy content" chord
+                    // quit the TUI on every terminal that reports Shift
+                    // (2l1b0.54). Terminals that report the shifted letter
+                    // send 'C'.
+                    KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
+                    KeyCode::Char('C') if ctrl => CassMsg::CopyContent,
+
                     // -- Force quit -----------------------------------------------
                     KeyCode::Char('c') if ctrl => CassMsg::ForceQuit,
 
@@ -15907,7 +16113,8 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('Y') if ctrl => CassMsg::CopyQuery,
                     KeyCode::Char('y') if ctrl && shift => CassMsg::CopyQuery,
                     KeyCode::Char('y') if ctrl => CassMsg::CopyPath,
-                    KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
+                    // Ctrl+Shift+C (CopyContent) is matched above the Ctrl+C
+                    // force-quit arm.
 
                     // -- Peek XL --------------------------------------------------
                     KeyCode::Char(' ') if ctrl => CassMsg::PeekToggled,
@@ -16037,7 +16244,7 @@ impl super::ftui_adapter::Model for CassApp {
     type Message = CassMsg;
 
     fn init(&mut self) -> ftui::Cmd<CassMsg> {
-        if self.startup_state_bootstrapped {
+        let startup = if self.startup_state_bootstrapped {
             // Startup already applied persisted state synchronously, so begin
             // initial browse/search immediately instead of showing a transient
             // default frame and waiting for an async state-load task.
@@ -16049,6 +16256,25 @@ impl super::ftui_adapter::Model for CassApp {
         } else {
             // Request state load on startup.
             ftui::Cmd::msg(CassMsg::StateLoadRequested)
+        };
+        let mut cmds = vec![startup];
+        if self.first_run_index_started_at.is_some() {
+            // Start polling the first-run index (2l1b0.56).
+            cmds.push(Self::delayed_tick(FIRST_RUN_INDEX_POLL));
+        }
+        // Deliver the background update check the moment it finishes. It was
+        // polled only on Tick, and an idle TUI never ticks, so the banner
+        // waited for the first keypress (2l1b0.56).
+        if let Some(rx) = self.update_check_rx.take() {
+            cmds.push(ftui::Cmd::task(move || match rx.recv() {
+                Ok(Some(info)) => CassMsg::UpdateCheckCompleted(info),
+                _ => CassMsg::Tick,
+            }));
+        }
+        if cmds.len() == 1 {
+            cmds.remove(0)
+        } else {
+            ftui::Cmd::batch(cmds)
         }
     }
 
@@ -16088,20 +16314,6 @@ impl super::ftui_adapter::Model for CassApp {
                 if ke.modifiers.contains(super::ftui_adapter::Modifiers::ALT)
         );
         if raw_alt_update_shortcut && !self.can_handle_update_shortcuts() {
-            return ftui::Cmd::none();
-        }
-
-        // Consent dialog intercepts D/H keys and blocks other query input
-        if self.show_consent_dialog
-            && let CassMsg::QueryChanged(ref text) = msg
-        {
-            if text.eq_ignore_ascii_case("d") {
-                return self.update(CassMsg::ModelDownloadAccepted);
-            }
-            if text.eq_ignore_ascii_case("h") {
-                return self.update(CassMsg::HashModeAccepted);
-            }
-            // Ignore other query input while consent dialog is open
             return ftui::Cmd::none();
         }
 
@@ -16304,8 +16516,11 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     return ftui::Cmd::none();
                 }
-                CassMsg::QuerySubmitted => {
-                    // Enter in the modal executes the selected action.
+                // Enter in the modal executes the selected action. The key
+                // converts to DetailOpened, so matching only QuerySubmitted
+                // left Enter opening the detail view behind the menu
+                // (2l1b0.54).
+                CassMsg::QuerySubmitted | CassMsg::DetailOpened => {
                     let idx = self.bulk_action_idx;
                     return self.update(CassMsg::BulkActionExecuted { action_index: idx });
                 }
@@ -17182,6 +17397,9 @@ impl super::ftui_adapter::Model for CassApp {
                     if backend_returned < page_size {
                         self.search_has_more = false;
                     }
+                    // A loaded page joins the ranked window, so the whole
+                    // loaded set keeps one order.
+                    self.apply_ranking();
                     self.regroup_panes();
                     self.trace_search_results_applied(
                         generation,
@@ -17214,10 +17432,12 @@ impl super::ftui_adapter::Model for CassApp {
                 self.suggestions = suggestions;
                 self.wildcard_fallback = wildcard_fallback;
 
-                // Store results and group into panes using current mode.
+                // Store results, order them for the ranking mode, and group
+                // into panes using the current grouping mode.
                 self.results = hits;
                 self.search_backend_offset = self.results.len();
                 self.search_has_more = self.results.len() >= page_size;
+                self.apply_ranking();
                 self.regroup_panes();
                 self.trace_search_results_applied(generation, pass, elapsed_ms, self.results.len());
 
@@ -17494,6 +17714,15 @@ impl super::ftui_adapter::Model for CassApp {
                     search_mode_str(self.search_mode),
                     shortcuts::SEARCH_MODE
                 );
+                // Semantic and hybrid fall back to lexical silently when the
+                // model or vectors are missing; say so, with the command,
+                // because cass never downloads a model on its own (2l1b0.66).
+                if self.search_mode != SearchMode::Lexical
+                    && let Some(guidance) = semantic_mode_guidance(&self.semantic_availability)
+                {
+                    self.status.push_str(": ");
+                    self.status.push_str(&guidance);
+                }
                 self.dirty_since = Some(Instant::now());
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
@@ -17514,10 +17743,12 @@ impl super::ftui_adapter::Model for CassApp {
                     RankingMode::DateNewest => RankingMode::DateOldest,
                     RankingMode::DateOldest => RankingMode::RecentHeavy,
                 };
+                // Reorder what is loaded at once (2l1b0.53).
+                self.apply_ranking();
+                self.regroup_panes();
                 self.dirty_since = Some(Instant::now());
-                // Fix #79: re-fetch results from backend so ranking mode
-                // changes are reflected (especially for empty-query date
-                // browsing where sort order matters).
+                // Fix #79: also re-fetch, because an empty-query date browse
+                // is ordered by the backend query itself.
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
             CassMsg::ContextWindowCycled => {
@@ -19029,145 +19260,6 @@ impl super::ftui_adapter::Model for CassApp {
                 })
             }
 
-            // -- Consent dialog -----------------------------------------------
-            CassMsg::ConsentDialogOpened => {
-                self.show_consent_dialog = true;
-                self.focus_manager.push_trap(focus_ids::GROUP_CONSENT);
-                self.focus_manager.focus(focus_ids::CONSENT_DIALOG);
-                ftui::Cmd::none()
-            }
-            CassMsg::ConsentDialogClosed => {
-                self.show_consent_dialog = false;
-                self.focus_manager.pop_trap();
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadAccepted => {
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::Downloading {
-                    progress_pct: 0,
-                    bytes_downloaded: 0,
-                    total_bytes: 0,
-                };
-                self.status = "Starting semantic model download...".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::info(
-                        "Starting semantic model download...",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadProgress {
-                bytes_downloaded,
-                total,
-            } => {
-                // Respect explicit non-download semantic modes and ignore stale
-                // download lifecycle events that may arrive out of order.
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                let progress_pct = bytes_downloaded
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .map_or(0, |pct| pct.min(100));
-                let progress_pct = u8::try_from(progress_pct).unwrap_or(100);
-                self.semantic_availability = SemanticAvailability::Downloading {
-                    progress_pct,
-                    bytes_downloaded,
-                    total_bytes: total,
-                };
-                if total > 0 {
-                    let done_mb = bytes_downloaded as f64 / 1_048_576.0;
-                    let total_mb = total as f64 / 1_048_576.0;
-                    self.status = format!(
-                        "Downloading semantic model: {progress_pct}% ({done_mb:.1}/{total_mb:.1} MB)"
-                    );
-                } else {
-                    self.status = format!("Downloading semantic model: {bytes_downloaded} bytes");
-                }
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadCompleted => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::Ready {
-                    embedder_id:
-                        crate::search::fastembed_embedder::FastEmbedder::embedder_id_static()
-                            .to_string(),
-                };
-                self.status = "Semantic model ready. Run `cass index --semantic` to build or refresh vector search data.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::success(
-                        "Semantic model download complete",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadFailed(err) => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::NotInstalled;
-                self.status = format!("Model download failed: {err}");
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::error(format!(
-                        "Model download failed: {err}"
-                    )));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadCancelled => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::NotInstalled;
-                self.status =
-                    "Model download cancelled. Semantic search remains disabled.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::warning(
-                        "Model download cancelled",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::HashModeAccepted => {
-                // User chose hash embedder fallback instead of downloading ML model.
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::HashFallback;
-                self.status = "Using hash embedder fallback for semantic mode.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::info(
-                        "Hash embedder fallback enabled",
-                    ));
-                ftui::Cmd::none()
-            }
-
             // -- Source filter menu -------------------------------------------
             CassMsg::SourceFilterMenuToggled => {
                 if self.source_filter_menu_open {
@@ -19502,6 +19594,7 @@ impl super::ftui_adapter::Model for CassApp {
                 let view = SavedView {
                     slot,
                     label: preserved_label,
+                    query: self.query.clone(),
                     agents: self.filters.agents.clone(),
                     workspaces: self.filters.workspaces.clone(),
                     created_from: self.filters.created_from,
@@ -19535,6 +19628,8 @@ impl super::ftui_adapter::Model for CassApp {
                 use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(view) = self.saved_views.iter().find(|v| v.slot == slot).cloned() {
                     self.push_undo("Load saved view");
+                    self.query = view.query.clone();
+                    self.cursor_pos = self.query.len();
                     self.filters.agents = view.agents.clone();
                     self.filters.workspaces = view.workspaces.clone();
                     self.filters.created_from = view.created_from;
@@ -19629,6 +19724,16 @@ impl super::ftui_adapter::Model for CassApp {
                 self.index_progress_snapshot = IndexProgressSnapshot::default();
                 self.clear_loading_context(LoadingContext::IndexRefresh);
                 self.status = "Index refresh complete".to_string();
+                // A refresh on a launch without an index creates the first
+                // one: open search now instead of requiring a restart. Test
+                // builds stub the refresh (it indexes nothing), and their
+                // default data dir is the real one, so they open nothing.
+                if !cfg!(test)
+                    && self.search_service.is_none()
+                    && let Err(message) = self.open_search_service()
+                {
+                    self.status = message;
+                }
                 self.toast_manager
                     .push(crate::ui::components::toast::Toast::success(
                         "Index refresh complete",
@@ -19719,6 +19824,8 @@ impl super::ftui_adapter::Model for CassApp {
                 let data_dir = self.data_dir.clone();
                 let db_path = self.db_path.clone();
                 let search_service = self.search_service.clone();
+                let progressive_search_service = self.progressive_search_service.clone();
+                let first_run_index_started_at = self.first_run_index_started_at;
                 let db_reader = self.db_reader.clone();
                 let known_workspaces = self.known_workspaces.clone();
                 let next_state_save_token = self.next_state_save_token;
@@ -19734,6 +19841,8 @@ impl super::ftui_adapter::Model for CassApp {
                     data_dir,
                     db_path,
                     search_service,
+                    progressive_search_service,
+                    first_run_index_started_at,
                     db_reader,
                     known_workspaces,
                     next_state_save_token,
@@ -19884,28 +19993,9 @@ impl super::ftui_adapter::Model for CassApp {
                 if self.peek_badge_until.is_some_and(|t| now > t) {
                     self.peek_badge_until = None;
                 }
-                // Poll update-check channel once per tick.
-                let mut update_check_done = false;
-                let mut update_info_ready: Option<UpdateInfo> = None;
-                if let Some(rx) = self.update_check_rx.as_ref() {
-                    match rx.try_recv() {
-                        Ok(info) => {
-                            update_check_done = true;
-                            update_info_ready = info;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            update_check_done = true;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    }
-                }
-                if update_check_done {
-                    self.update_check_rx = None;
-                }
-
                 let mut cmds = Vec::new();
-                if let Some(info) = update_info_ready {
-                    cmds.push(ftui::Cmd::msg(CassMsg::UpdateCheckCompleted(info)));
+                if let Some(cmd) = self.poll_first_run_index(now) {
+                    cmds.push(cmd);
                 }
                 // Debounced search-as-you-type: if a one-shot timer fires
                 // slightly early, reschedule the remaining debounce window
@@ -21046,11 +21136,6 @@ impl super::ftui_adapter::Model for CassApp {
                     AppSurface::Analytics | AppSurface::Swarm | AppSurface::Sources
                 ) {
                     return ftui::Cmd::msg(CassMsg::ViewStackPopped);
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                    return ftui::Cmd::none();
                 }
                 if self.show_inspector {
                     self.show_inspector = false;
@@ -22449,7 +22534,6 @@ impl super::ftui_adapter::Model for CassApp {
             || self.show_detail_modal
             || self.show_help
             || self.show_inspector
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible();
         if modal_visible && apply_style {
@@ -22565,10 +22649,6 @@ impl super::ftui_adapter::Model for CassApp {
 
         if self.source_filter_menu_open {
             self.render_source_filter_menu_overlay(frame, area, &styles);
-        }
-
-        if self.show_consent_dialog {
-            self.render_consent_overlay(frame, area, &styles);
         }
 
         // ── Help overlay ─────────────────────────────────────────────
@@ -23380,80 +23460,22 @@ pub fn run_tui_ftui(
     model.latency_trace = latency_trace.clone();
     model.refresh_theme_config_from_data_dir();
     model.bootstrap_persisted_state();
-    model.search_service = match crate::search::tantivy::index_dir(&data_dir) {
-        Ok(index_path) => match crate::search::query::SearchClient::open_with_options(
-            &index_path,
-            Some(&model.db_path),
-            crate::search::query::SearchClientOptions {
-                enable_reload: true,
-                enable_warm: true,
-                strict_read_only: false,
-            },
-        ) {
-            Ok(Some(client)) => {
-                use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
-                use crate::search::model_manager::{
-                    load_hash_semantic_context, load_semantic_context_deferred,
-                };
-
-                let client = Arc::new(client);
-                let prefer_hash =
-                    EmbedderRegistry::new(&data_dir).best_available().name == HASH_EMBEDDER;
-                // GH #395: this runs on the main thread BEFORE the first frame.
-                // The deferred loader resolves the model's identity and
-                // artifacts now but initializes the in-process MiniLM lazily
-                // on the first semantic query (which the TUI already runs on a
-                // background task), so a large model or slow disk can never
-                // hold the UI at a blank screen. The CLI's daemon-first path
-                // uses the same lazy embedder.
-                let setup = if prefer_hash {
-                    load_hash_semantic_context(&data_dir, &model.db_path)
-                } else {
-                    load_semantic_context_deferred(&data_dir, &model.db_path)
-                };
-                model.semantic_availability = setup.availability.clone();
-
-                if let Some(context) = setup.context {
-                    if let Err(err) = client.set_semantic_artifacts_context(
-                        context.embedder,
-                        context.artifacts,
-                        context.quality_artifact,
-                        context.filter_maps,
-                        context.roles,
-                    ) {
-                        tracing::debug!(error = %err, "tui semantic context unavailable");
-                        let _ = client.clear_semantic_context();
-                    }
-                } else {
-                    let _ = client.clear_semantic_context();
-                }
-
-                let service = Arc::new(TantivySearchService::new(Arc::clone(&client)));
-                model.progressive_search_service = Some(Arc::clone(&service));
-                Some(service as Arc<dyn SearchService>)
-            }
-            Ok(None) => {
-                if model.status.is_empty() {
-                    model.status =
-                        "Search index not found. Run `cass index --full` to enable search."
-                            .to_string();
-                }
-                None
-            }
-            Err(e) => {
-                if model.status.is_empty() {
-                    model.status = format!("Search unavailable: failed to open index ({e})");
-                }
-                None
-            }
-        },
-        Err(e) => {
+    match model.open_search_service() {
+        Ok(true) => {}
+        Ok(false) => {
+            // First run (or a missing index): start indexing instead of
+            // leaving search dead until the user finds `cass index --full`.
+            let message = model.start_first_run_index();
             if model.status.is_empty() {
-                model.status = format!("Search unavailable: failed to resolve index path ({e})");
+                model.status = message;
             }
-            None
         }
-    };
+        Err(message) => {
+            if model.status.is_empty() {
+                model.status = message;
+            }
+        }
+    }
 
     // Quality-first budget profile: favor full visuals and smooth transitions.
     let budget = cass_runtime_budget_config();
@@ -24358,134 +24380,12 @@ mod tests {
         assert!(!app.show_detail_modal);
         assert!(!app.show_export_modal);
         assert!(!app.show_bulk_modal);
-        assert!(!app.show_consent_dialog);
         assert!(!app.source_filter_menu_open);
         assert_eq!(app.source_filter_menu_selection, 0);
         assert!(app.available_source_ids.is_empty());
         assert!(app.selected.is_empty());
         assert!(app.saved_views.is_empty());
         assert!(app.query_history.is_empty());
-    }
-
-    #[test]
-    fn model_download_accepted_closes_consent_and_sets_downloading_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ConsentDialogOpened);
-        assert!(app.show_consent_dialog);
-
-        let _ = app.update(CassMsg::ModelDownloadAccepted);
-
-        assert!(!app.show_consent_dialog);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Downloading {
-                progress_pct: 0,
-                bytes_downloaded: 0,
-                total_bytes: 0
-            }
-        ));
-        assert!(app.status.contains("Starting semantic model download"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_progress_updates_downloading_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadProgress {
-            bytes_downloaded: 50,
-            total: 100,
-        });
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Downloading {
-                progress_pct: 50,
-                bytes_downloaded: 50,
-                total_bytes: 100
-            }
-        ));
-        assert!(app.status.contains("50%"));
-    }
-
-    #[test]
-    fn model_download_completed_sets_ready_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadCompleted);
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Ready { .. }
-        ));
-        assert!(app.status.contains("Semantic model ready"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_failed_sets_not_installed_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadFailed("network timeout".to_string()));
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::NotInstalled
-        ));
-        assert!(app.status.contains("network timeout"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn hash_mode_accept_sets_hash_fallback_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ConsentDialogOpened);
-        assert!(app.show_consent_dialog);
-
-        let _ = app.update(CassMsg::HashModeAccepted);
-
-        assert!(!app.show_consent_dialog);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert!(app.status.contains("hash embedder fallback"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_events_do_not_override_hash_fallback() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::HashModeAccepted);
-        let status_after_hash = app.status.clone();
-
-        let _ = app.update(CassMsg::ModelDownloadProgress {
-            bytes_downloaded: 10,
-            total: 100,
-        });
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadCompleted);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadFailed("late failure".to_string()));
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadCancelled);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
     }
 
     #[test]
@@ -24635,6 +24535,26 @@ mod tests {
         );
 
         assert!(matches!(CassMsg::from(event), CassMsg::CopyQuery));
+    }
+
+    /// 2l1b0.54: the documented "copy content" chord used to hit the Ctrl+C
+    /// force-quit arm first and exit the TUI. Plain Ctrl+C still quits.
+    #[test]
+    fn event_mapping_ctrl_shift_c_copies_content_instead_of_quitting() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        let shifted_lower = Event::Key(
+            KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL | Modifiers::SHIFT),
+        );
+        assert!(matches!(CassMsg::from(shifted_lower), CassMsg::CopyContent));
+
+        let shifted_upper = Event::Key(
+            KeyEvent::new(KeyCode::Char('C')).with_modifiers(Modifiers::CTRL | Modifiers::SHIFT),
+        );
+        assert!(matches!(CassMsg::from(shifted_upper), CassMsg::CopyContent));
+
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL));
+        assert!(matches!(CassMsg::from(plain), CassMsg::ForceQuit));
     }
 
     #[test]
@@ -24901,6 +24821,7 @@ mod tests {
             saved_views: vec![SavedView {
                 slot: 3,
                 label: Some("triage".to_string()),
+                query: "auth timeout".to_string(),
                 agents,
                 workspaces,
                 created_from: Some(1000),
@@ -24947,6 +24868,8 @@ mod tests {
         assert_eq!(loaded.saved_views[0].slot, 3);
         assert_eq!(loaded.saved_views[0].grouping_mode, ResultsGrouping::Flat);
         assert_eq!(loaded.saved_views[0].label.as_deref(), Some("triage"));
+        // 2l1b0.55: the query survives the save/load round trip.
+        assert_eq!(loaded.saved_views[0].query, "auth timeout");
         assert!(matches!(
             loaded.saved_views[0].source_filter,
             SourceFilter::SourceId(ref id) if id == "remote-buildbox"
@@ -24983,6 +24906,7 @@ mod tests {
             saved_views: vec![SavedView {
                 slot: 1,
                 label: None,
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,
@@ -26495,6 +26419,7 @@ mod tests {
         app.saved_views.push(SavedView {
             slot: 7,
             label: None,
+            query: String::new(),
             agents: HashSet::new(),
             workspaces: HashSet::new(),
             created_from: None,
@@ -26507,6 +26432,106 @@ mod tests {
         let _ = app.update(CassMsg::ViewLoaded(7));
 
         assert!(matches!(app.filters.source_filter, SourceFilter::Local));
+    }
+
+    #[test]
+    fn prefix_match_query_widens_only_bare_words() {
+        assert_eq!(
+            prefix_match_query(r#"auth "exact phrase" -skip OR c zq00 agent:codex foo*"#),
+            r#"auth* "exact phrase" -skip OR c zq00* agent:codex foo*"#
+        );
+        assert_eq!(prefix_match_query(""), "");
+        assert_eq!(prefix_match_query("  réseau  "), "  réseau*  ");
+        assert_eq!(prefix_match_query("NOT x AND yy"), "NOT x AND yy*");
+    }
+
+    /// 2l1b0.66: with no model installed, Alt+S to semantic or hybrid only
+    /// said "Search mode: semantic" while results silently stayed lexical;
+    /// nothing in the TUI named `cass models install`.
+    #[test]
+    fn semantic_mode_without_a_model_names_the_install_command() {
+        let mut app = CassApp::default();
+        app.semantic_availability = SemanticAvailability::NotInstalled;
+        // The TUI starts in hybrid; begin the cycle from lexical.
+        app.search_mode = SearchMode::Lexical;
+
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert_eq!(app.search_mode, SearchMode::Semantic);
+        assert!(app.status.contains("cass models install"), "{}", app.status);
+        assert!(app.status.contains("--from-file"), "{}", app.status);
+
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert_eq!(app.search_mode, SearchMode::Hybrid);
+        assert!(app.status.contains("cass models install"), "{}", app.status);
+
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert_eq!(app.search_mode, SearchMode::Lexical);
+        assert!(
+            !app.status.contains("cass models install"),
+            "{}",
+            app.status
+        );
+
+        // Ready (or an explicit hash choice) needs no guidance.
+        app.semantic_availability = SemanticAvailability::HashFallback;
+        let _ = app.update(CassMsg::SearchModeCycled);
+        assert!(
+            !app.status.contains("results stay lexical"),
+            "{}",
+            app.status
+        );
+
+        // Missing vectors point at the index command, not the model install.
+        app.semantic_availability = SemanticAvailability::IndexMissing {
+            index_path: PathBuf::from("/data/vector_index"),
+        };
+        let guidance = semantic_mode_guidance(&app.semantic_availability).unwrap();
+        assert!(guidance.contains("cass index --semantic"), "{guidance}");
+        assert!(!guidance.contains("models install"), "{guidance}");
+    }
+
+    /// 2l1b0.55: F9 toggled a PFX/STD status token while every search ran the
+    /// typed query unchanged.
+    #[test]
+    fn match_mode_changes_the_query_a_search_runs() {
+        let mut app = CassApp::default();
+        app.query = "zq00 auth".to_string();
+        assert_eq!(app.match_mode, MatchMode::Standard);
+        assert_eq!(
+            app.build_search_params(SearchPass::Interactive, 0).query,
+            "zq00 auth"
+        );
+        let _ = app.update(CassMsg::MatchModeCycled);
+        assert_eq!(app.match_mode, MatchMode::Prefix);
+        assert_eq!(
+            app.build_search_params(SearchPass::Upgrade, 0).query,
+            "zq00* auth*"
+        );
+        assert_eq!(app.query, "zq00 auth", "the input keeps what was typed");
+    }
+
+    /// 2l1b0.55: README says a saved view stores the search query; it stored
+    /// only filters, ranking and grouping, so loading a view kept whatever
+    /// query was typed at the time.
+    #[test]
+    fn saved_view_restores_its_query() {
+        let mut app = CassApp::default();
+        app.query = "auth timeout".to_string();
+        app.cursor_pos = app.query.len();
+        let _ = app.update(CassMsg::ViewSaved(4));
+        assert_eq!(
+            app.saved_views
+                .iter()
+                .find(|view| view.slot == 4)
+                .map(|view| view.query.as_str()),
+            Some("auth timeout")
+        );
+
+        app.query = "something else".to_string();
+        app.cursor_pos = 3;
+        let _ = app.update(CassMsg::ViewLoaded(4));
+        assert_eq!(app.query, "auth timeout");
+        assert_eq!(app.cursor_pos, "auth timeout".len());
     }
 
     #[test]
@@ -27914,33 +27939,35 @@ mod tests {
         assert!(app.status.contains("TEST mode: would launch self-update"));
     }
 
+    /// 2l1b0.56: the update check result reaches the TUI without any input.
+    /// Negative control: it used to be polled only on Tick, and an idle TUI
+    /// never ticks, so init returned no command that could deliver it.
     #[test]
-    fn tick_polls_update_channel_and_dispatches_completion() {
+    fn init_delivers_the_update_check_without_waiting_for_input() {
         let mut app = CassApp::default();
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Some(sample_update_info()))
             .expect("send update info to test channel");
         app.update_check_rx = Some(rx);
 
-        let msgs = extract_msgs(app.update(CassMsg::Tick));
-        let mut completed_info: Option<UpdateInfo> = None;
-        for msg in msgs {
-            match msg {
-                CassMsg::UpdateCheckCompleted(info) => completed_info = Some(info),
-                CassMsg::ToastTick => {}
-                _ => {}
-            }
-        }
+        let cmds = match app.init() {
+            ftui::Cmd::Batch(cmds) => cmds,
+            other => vec![other],
+        };
+        assert!(app.update_check_rx.is_none(), "init takes the receiver");
+        let delivered = cmds
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                ftui::Cmd::Task(_, task) => Some(task()),
+                _ => None,
+            })
+            .find_map(|msg| match msg {
+                CassMsg::UpdateCheckCompleted(info) => Some(info),
+                _ => None,
+            })
+            .expect("init schedules a task that delivers the update check");
 
-        assert!(
-            completed_info.is_some(),
-            "tick should dispatch update completion"
-        );
-        assert!(app.update_check_rx.is_none(), "receiver should be consumed");
-
-        if let Some(info) = completed_info {
-            let _ = app.update(CassMsg::UpdateCheckCompleted(info));
-        }
+        let _ = app.update(CassMsg::UpdateCheckCompleted(delivered));
         assert!(app.update_banner_visible());
     }
 
@@ -36112,6 +36139,24 @@ not jsonl",
         assert_eq!(app.bulk_action_idx, 0);
     }
 
+    /// 2l1b0.54: Enter in the bulk-actions menu arrives as DetailOpened, and
+    /// the menu only listened for QuerySubmitted, so Enter opened the detail
+    /// view behind the menu instead of running the highlighted action.
+    #[test]
+    fn bulk_menu_enter_runs_the_highlighted_action() {
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::SelectAllToggled);
+        app.show_bulk_modal = true;
+        app.bulk_action_idx = 3; // Clear selection
+        let _ = app.update(CassMsg::DetailOpened);
+        assert!(app.selected.is_empty(), "Enter must run Clear selection");
+        assert!(app.status.contains("Cleared 3"), "{}", app.status);
+        assert!(
+            !app.show_detail_modal,
+            "Enter must not open the detail view"
+        );
+    }
+
     #[test]
     fn bulk_clear_selection_clears_and_shows_status() {
         let mut app = app_with_hits(3);
@@ -37578,6 +37623,7 @@ not jsonl",
             SavedView {
                 slot: 1,
                 label: Some("One".to_string()),
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,
@@ -37589,6 +37635,7 @@ not jsonl",
             SavedView {
                 slot: 2,
                 label: Some("Two".to_string()),
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,
@@ -37600,6 +37647,7 @@ not jsonl",
             SavedView {
                 slot: 3,
                 label: Some("Three".to_string()),
+                query: String::new(),
                 agents: HashSet::new(),
                 workspaces: HashSet::new(),
                 created_from: None,
@@ -42466,6 +42514,109 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         );
     }
 
+    /// 2l1b0.53: F12 used to re-run the same search and show engine order
+    /// again for any non-empty query. Arriving results follow the active
+    /// mode, and cycling the mode reorders what is loaded at once.
+    #[test]
+    fn ranking_modes_reorder_loaded_results_for_a_non_empty_query() {
+        let mut app = CassApp::default();
+        app.query = "auth".into();
+        app.ranking_mode = RankingMode::RelevanceHeavy;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut old_strong = make_hit(1, "/old-strong");
+        old_strong.score = 10.0;
+        old_strong.created_at = Some(now_ms - 120 * 86_400_000);
+        let mut new_weak = make_hit(2, "/new-weak");
+        new_weak.score = 4.0;
+        new_weak.created_at = Some(now_ms);
+        let mut undated = make_hit(3, "/undated");
+        undated.score = 1.0;
+        undated.created_at = None;
+        // Engine order is deliberately not the Relevance Heavy order's
+        // reverse, so both the arrival and the cycle are observable.
+        let _ = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: app.search_page_size.max(1),
+            hits: vec![new_weak, undated, old_strong],
+            elapsed_ms: 1,
+            suggestions: Vec::new(),
+            wildcard_fallback: false,
+            append: false,
+        });
+        let paths = |app: &CassApp| {
+            app.results
+                .iter()
+                .map(|hit| hit.source_path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&app), ["/old-strong", "/new-weak", "/undated"]);
+
+        // F12 twice: Relevance Heavy -> Match Quality -> Date Newest.
+        let _ = app.update(CassMsg::RankingModeCycled);
+        let _ = app.update(CassMsg::RankingModeCycled);
+        assert_eq!(app.ranking_mode, RankingMode::DateNewest);
+        assert_eq!(paths(&app), ["/new-weak", "/old-strong", "/undated"]);
+        let pane_paths: Vec<&str> = app.panes[0]
+            .hits
+            .iter()
+            .map(|hit| hit.source_path.as_str())
+            .collect();
+        assert_eq!(pane_paths, ["/new-weak", "/old-strong", "/undated"]);
+    }
+
+    /// 2l1b0.53: a page loaded under Date Newest joins one global order
+    /// instead of landing below the first page in engine order.
+    #[test]
+    fn a_page_loaded_under_date_newest_joins_one_global_order() {
+        let mut app = CassApp::default();
+        app.query = "auth".into();
+        app.ranking_mode = RankingMode::DateNewest;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let dated = |id, path: &str, age_days: i64| {
+            let mut hit = make_hit(id, path);
+            hit.created_at = Some(now_ms - age_days * 86_400_000);
+            hit
+        };
+        let paths = |app: &CassApp| {
+            app.results
+                .iter()
+                .map(|hit| hit.source_path.clone())
+                .collect::<Vec<_>>()
+        };
+        let _ = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: 2,
+            hits: vec![dated(1, "/day-30", 30), dated(2, "/day-10", 10)],
+            elapsed_ms: 1,
+            suggestions: Vec::new(),
+            wildcard_fallback: false,
+            append: false,
+        });
+        assert_eq!(paths(&app), ["/day-10", "/day-30"]);
+
+        // Page 2, in engine order, holds a hit older and one newer than the
+        // whole first page.
+        let _ = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Pagination,
+            requested_limit: 2,
+            hits: vec![dated(3, "/day-40", 40), dated(4, "/day-1", 1)],
+            elapsed_ms: 1,
+            suggestions: Vec::new(),
+            wildcard_fallback: false,
+            append: true,
+        });
+        assert_eq!(paths(&app), ["/day-1", "/day-10", "/day-30", "/day-40"]);
+        let pane_paths: Vec<&str> = app.panes[0]
+            .hits
+            .iter()
+            .map(|hit| hit.source_path.as_str())
+            .collect();
+        assert_eq!(pane_paths, ["/day-1", "/day-10", "/day-30", "/day-40"]);
+    }
+
     #[test]
     fn search_completed_small_result_set_clears_reveal_sequence() {
         let mut app = CassApp::default();
@@ -43127,8 +43278,9 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     fn focus_graph_initialized_with_nodes() {
         let app = CassApp::default();
         let g = app.focus_manager.graph();
-        // 3 primary + 8 modal nodes = 11
-        assert!(g.node_count() >= 11, "got {}", g.node_count());
+        // 3 primary + 7 modal nodes = 10 (the unreachable consent dialog and
+        // its node were removed under 2l1b0.66)
+        assert!(g.node_count() >= 10, "got {}", g.node_count());
         assert!(g.get(focus_ids::SEARCH_BAR).is_some());
         assert!(g.get(focus_ids::RESULTS_LIST).is_some());
         assert!(g.get(focus_ids::DETAIL_PANE).is_some());

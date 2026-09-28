@@ -57,6 +57,21 @@ pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("query fuel exhausted"))
 }
 
+/// Whether `error` is Quill's posting-cursor invariant refusal
+/// (`ArgusError::CursorInvariant`), anywhere in its context chain. Unlike a
+/// busy or cancelled query, this failure belongs to the published
+/// generation: the same query over the same segments fails the same way every
+/// time (GH #499: a date-filtered Boolean over a sealed segment that holds
+/// tombstones), so callers must not report it as retryable.
+#[must_use]
+pub fn is_engine_invariant_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("posting cursor invariant failed")
+    })
+}
+
 /// Engine configuration every CASS reader and writer opens with.
 ///
 /// Two deliberate departures from `QuillConfig::default()`:
@@ -213,6 +228,33 @@ where
 pub fn refresh_reader(reader: &QuillSearchIndex) -> Result<bool> {
     drive(|cx| async move { reader.refresh(&cx).await })
         .map_err(|error| anyhow!("refreshing the Quill CASS reader: {error}"))
+}
+
+/// Refresh a reader in place, or report that its directory was republished.
+///
+/// A lexical rebuild publishes by exchanging the whole index directory
+/// (`publish_staged_lexical_index`: `cass index --full`, forget, dedup, agent
+/// purge, the background repair). The path then holds a new index whose
+/// MANIFEST generations restart, and read-only catch-up refuses it as a
+/// generation regression, a reused generation, or a watermark rollback. A
+/// long-lived reader would fail every later search. `Ok(None)` is an in-place
+/// refresh; `Ok(Some(reason))` means the path must be opened again.
+///
+/// # Errors
+///
+/// Returns an error when the current publication cannot be read for any
+/// other reason.
+pub fn refresh_reader_or_detect_republish(reader: &QuillSearchIndex) -> Result<Option<String>> {
+    use frankensearch::quill::{QuillIndexError, SnapshotError};
+    match drive(|cx| async move { reader.refresh(&cx).await }) {
+        Ok(_) => Ok(None),
+        Err(QuillIndexError::Snapshot(
+            error @ (SnapshotError::KeeperGenerationRegression { .. }
+            | SnapshotError::KeeperGenerationCollision { .. }
+            | SnapshotError::KeeperTransition { .. }),
+        )) => Ok(Some(error.to_string())),
+        Err(error) => Err(anyhow!("refreshing the Quill CASS reader: {error}")),
+    }
 }
 
 /// One ranked hit from a Quill lexical search.
@@ -1320,6 +1362,43 @@ impl QuillCassIndex {
             self.note_merged(now_ms);
         }
         Ok(merged || compacted)
+    }
+
+    /// At most one bounded merge, for use while a streaming ingest is running.
+    ///
+    /// Every concat merge is a publish, and every publish re-verifies each
+    /// live segment's bytes, so [`Self::optimize_if_idle`] — which folds every
+    /// planned run and then compacts — costs one full verification per run.
+    /// Run mid-ingest on a multi-gigabyte generation, that loop held the
+    /// consumer for more than ten minutes. This folds only the planned run
+    /// that removes the most segments (normally the tail the run's own
+    /// commits left), under the same threshold and cooldown, and leaves the
+    /// rest to the post-run fold.
+    ///
+    /// Returns whether a merge ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the merge itself fails.
+    pub fn fold_largest_small_run(&mut self, now_ms: i64) -> Result<bool> {
+        let segments = self.segment_count();
+        if !self.merge_status(segments, now_ms).should_merge() {
+            return Ok(false);
+        }
+        let profile = self.published_segment_profile()?;
+        let fold_profile = self.published_segment_fold_profile()?;
+        let Some(run) = plan_capped_balanced_merge_runs(
+            &profile,
+            &fold_profile,
+            lexical_merge_max_output_bytes(),
+        )
+        .into_iter()
+        .max_by_key(Vec::len) else {
+            return Ok(false);
+        };
+        self.concat_merge_run(&run)?;
+        self.note_merged(now_ms);
+        Ok(true)
     }
 
     /// Fold the published segments into as few as the merge-output byte cap
@@ -2928,6 +3007,54 @@ mod tests {
         assert_eq!(index.doc_count().expect("engine count"), 0);
     }
 
+    /// The streaming-ingest fold merges one run per call and then honours the
+    /// cooldown, so a mid-run call costs at most one extra publish.
+    #[test]
+    fn fold_largest_small_run_merges_one_run_then_cools_down() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let sessions = 5_u64;
+        for session in 0..sessions {
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            index
+                .add_cass_documents(&[sample(&format!("s{session}"), 0, "session alpha")])
+                .expect("index session documents");
+            index.commit().expect("commit session");
+        }
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let before = published_segment_count(&index);
+        assert!(before >= 5, "each session leaves a segment, got {before}");
+
+        assert!(
+            index
+                .fold_largest_small_run(1_700_000_000_000)
+                .expect("fold")
+        );
+        let after = published_segment_count(&index);
+        assert!(after < before, "{after} segments after folding {before}");
+        assert_eq!(index.doc_count().expect("doc count"), sessions);
+
+        // Enough later commits to clear the merge threshold, so only the
+        // cooldown can hold the next fold back.
+        for late in 0..CASS_MERGE_SEGMENT_THRESHOLD {
+            index
+                .add_cass_documents(&[sample(&format!("late{late}"), 0, "late session alpha")])
+                .expect("index late documents");
+            index.commit().expect("commit late");
+        }
+        let grown = published_segment_count(&index);
+        assert!(
+            grown >= CASS_MERGE_SEGMENT_THRESHOLD,
+            "got {grown} segments"
+        );
+        assert!(
+            !index
+                .fold_largest_small_run(1_700_000_000_001)
+                .expect("fold inside cooldown"),
+            "a call inside the cooldown must not merge"
+        );
+        assert_eq!(published_segment_count(&index), grown);
+    }
+
     /// #441: one writer session per open leases fresh docid blocks, so every
     /// session leaves at least one segment the engine's width-tiered merge
     /// will never fold. The bounded policy must fold them and keep the corpus
@@ -2999,6 +3126,45 @@ mod tests {
         let wrapped = inner.context("executing a Quill lexical query");
         assert!(is_query_fuel_exhausted(&wrapped));
         assert!(!is_query_fuel_exhausted(&anyhow!(
+            "opening the Quill CASS reader: manifest missing"
+        )));
+    }
+
+    /// GH #499: the invariant classifier is keyed to the engine's own Display
+    /// text, so an upstream rewording fails here instead of quietly turning a
+    /// deterministic failure back into a retryable one. Fuel exhaustion,
+    /// cancellation, and reader faults must stay outside the class.
+    #[test]
+    fn cursor_invariant_failure_is_recognised_from_the_engine_display() {
+        use frankensearch::quill::QuillIndexError;
+        use frankensearch::quill::argus::ArgusError;
+
+        let engine_error = |error: ArgusError| {
+            anyhow!(
+                "executing a Quill lexical query: {}",
+                QuillIndexError::from(error)
+            )
+        };
+        let invariant = engine_error(ArgusError::CursorInvariant(
+            "Boolean children belong to different segment domains",
+        ));
+        assert!(is_engine_invariant_failure(&invariant));
+        assert!(!is_query_fuel_exhausted(&invariant));
+
+        let fuel = engine_error(ArgusError::QueryFuelExhausted {
+            budget: 10,
+            consumed: 10,
+            segments_touched: 1,
+            dictionary_blocks: 0,
+            posting_blocks: 10,
+            position_docs: 0,
+        });
+        assert!(is_query_fuel_exhausted(&fuel));
+        assert!(!is_engine_invariant_failure(&fuel));
+        assert!(!is_engine_invariant_failure(&engine_error(
+            ArgusError::QueryCancelled { phase: "collect" }
+        )));
+        assert!(!is_engine_invariant_failure(&anyhow!(
             "opening the Quill CASS reader: manifest missing"
         )));
     }

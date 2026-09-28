@@ -205,9 +205,11 @@ fn test_attachment_object_urls_are_cached_per_mime_type() {
         }
     "#;
 
+    // Node 24 removed `--experimental-default-type`; detection loads the
+    // ES-module assets on Node 20.10+.
     let output = Command::new("node")
         .args([
-            "--experimental-default-type=module",
+            "--experimental-detect-module",
             "--input-type=module",
             "--eval",
             script,

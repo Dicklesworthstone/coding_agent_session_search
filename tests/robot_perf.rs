@@ -158,6 +158,7 @@ fn answer_pack_perf_render_request(
     limits: PackPlannerLimits,
 ) -> PackRenderRequest {
     PackRenderRequest {
+        effective: None,
         query_text: "checkout failure answer pack freshness".to_string(),
         normalized_query: "checkout failure answer pack freshness".to_string(),
         generated_at_ms: ANSWER_PACK_PERF_NOW_MS,

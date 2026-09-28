@@ -288,9 +288,30 @@ fn check() -> Result<(), String> {
         .and_then(Value::as_str)
         .ok_or_else(|| format!("robot _warning missing: {robot_json}"))?;
     let expected_human = format!("Warning: {robot_warning}");
-    if human_line.cmp(expected_human.as_str()).is_ne() {
+    // The two searches run one after the other, so the reported age can
+    // advance by a second between them (observed: 14400 vs 14401). Compare
+    // the text with the age masked, and bound each age separately.
+    let (human_masked, human_age) = mask_stale_age(human_line)
+        .ok_or_else(|| format!("human stale note has no age: {human_line}"))?;
+    let (robot_masked, robot_age) = mask_stale_age(&expected_human)
+        .ok_or_else(|| format!("robot stale note has no age: {expected_human}"))?;
+    if human_masked.cmp(&robot_masked).is_ne() {
         return Err(format!(
             "human/robot stale text drifted:\n  human: {human_line}\n  robot: {expected_human}"
+        ));
+    }
+    let planted = AGE.as_secs();
+    for (surface, age) in [("human", human_age), ("robot", robot_age)] {
+        // Generous upper bound: fixture setup plus both searches on a busy host.
+        if age < planted || age > planted + 900 {
+            return Err(format!(
+                "{surface} stale age {age}s is not the planted {planted}s staleness"
+            ));
+        }
+    }
+    if robot_age < human_age {
+        return Err(format!(
+            "robot ran after human but reported a younger index ({robot_age}s < {human_age}s)"
         ));
     }
     let robot_stale = robot_json
@@ -310,4 +331,18 @@ fn check() -> Result<(), String> {
 #[test]
 fn human_and_robot_search_warn_when_lexical_index_is_stale() -> Result<(), String> {
     check()
+}
+
+/// Split a stale note into its text with the age number masked and the age.
+fn mask_stale_age(line: &str) -> Option<(String, u64)> {
+    const MARKER: &str = "(age: ";
+    let start = line.find(MARKER)? + MARKER.len();
+    let digits = line[start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(line.len() - start);
+    let age = line[start..start + digits].parse().ok()?;
+    Some((
+        format!("{}{{AGE}}{}", &line[..start], &line[start + digits..]),
+        age,
+    ))
 }

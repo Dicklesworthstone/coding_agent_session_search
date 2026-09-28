@@ -576,6 +576,9 @@ impl PackRenderFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackRenderRequest {
+    /// What the pack's search actually ran, echoed as `_meta.effective`
+    /// (2l1b0.68); `None` omits it.
+    pub effective: Option<serde_json::Value>,
     pub query_text: String,
     pub normalized_query: String,
     pub generated_at_ms: i64,
@@ -598,6 +601,7 @@ pub struct PackRenderRequest {
 impl Default for PackRenderRequest {
     fn default() -> Self {
         Self {
+            effective: None,
             query_text: String::new(),
             normalized_query: String::new(),
             generated_at_ms: 0,
@@ -664,6 +668,8 @@ struct RenderedMeta {
     partial: bool,
     format: &'static str,
     warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1921,6 +1927,7 @@ fn rendered_answer_pack_with_correlation(
             partial: request.budget.timed_out || !request.budget.skipped_sections.is_empty(),
             format: request.format.label(),
             warnings: warnings.clone(),
+            effective: request.effective.clone(),
         },
         budget: request.budget.clone(),
         limits: RenderedLimits {
@@ -3004,6 +3011,7 @@ mod tests {
 
     fn render_request(format: PackRenderFormat) -> PackRenderRequest {
         PackRenderRequest {
+            effective: None,
             query_text: "pack handoff".to_string(),
             normalized_query: "pack handoff".to_string(),
             generated_at_ms: 1_060_000,

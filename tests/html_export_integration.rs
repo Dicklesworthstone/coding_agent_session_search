@@ -311,6 +311,81 @@ fn test_encrypted_export_flow() {
     }
 }
 
+/// 2l1b0.67: the plaintext export's default name and title carry the
+/// conversation topic; the encrypted export of the same session must show
+/// neither in its file name nor in its HTML.
+#[test]
+fn test_encrypted_export_hides_topic_in_default_name_and_html() {
+    let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");
+    let session = session_path.to_str().unwrap();
+
+    let plain_dir = TempDir::new().unwrap();
+    let plain = base_cmd()
+        .args([
+            "export-html",
+            session,
+            "--output-dir",
+            plain_dir.path().to_str().unwrap(),
+            "--robot",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_json: Value = serde_json::from_slice(&plain.stdout).unwrap();
+    let plain_title = plain_json["exported"]["title"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_name = plain_json["exported"]["filename"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !plain_title.is_empty(),
+        "fixture must have a title: {plain_json}"
+    );
+    assert!(
+        !plain_name.ends_with("_session.html"),
+        "fixture must produce a topic in its plain default name: {plain_name}"
+    );
+
+    let encrypted_dir = TempDir::new().unwrap();
+    let encrypted = base_cmd()
+        .args([
+            "export-html",
+            session,
+            "--output-dir",
+            encrypted_dir.path().to_str().unwrap(),
+            "--robot",
+            "--encrypt",
+            "--password-stdin",
+        ])
+        .write_stdin("sealed-topic-password\n")
+        .output()
+        .unwrap();
+    assert!(
+        encrypted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypted.stderr)
+    );
+    let encrypted_json: Value = serde_json::from_slice(&encrypted.stdout).unwrap();
+    let encrypted_name = encrypted_json["exported"]["filename"].as_str().unwrap();
+    assert!(
+        encrypted_name.ends_with("_session.html"),
+        "encrypted default name must not carry the topic: {encrypted_name} (plain: {plain_name})"
+    );
+    let html =
+        fs::read_to_string(encrypted_json["exported"]["output_path"].as_str().unwrap()).unwrap();
+    assert!(
+        !html.contains(&plain_title),
+        "the conversation title must not be visible before unlock: {plain_title}"
+    );
+}
+
 #[test]
 fn test_encrypted_export_requires_password() {
     let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");
@@ -504,6 +579,61 @@ fn test_cli_export_with_options() {
     assert!(
         html.contains("data-theme=\"light\""),
         "--theme light should set the exported document's initial theme"
+    );
+}
+
+/// 2l1b0.59/.68: `--include-tools` and `--show-timestamps` default to true and
+/// can be turned off with `=false`. Negative control: before the fix both
+/// were set-true flags, `--include-tools=false` failed to parse, and no CLI
+/// input could reach the exporter's include_tools/show_timestamps=false paths.
+#[test]
+fn test_cli_export_tools_and_timestamps_can_be_turned_off() {
+    let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");
+    let export = |extra: &[&str]| -> String {
+        let tmp = TempDir::new().unwrap();
+        let mut args = vec![
+            "export-html",
+            session_path.to_str().unwrap(),
+            "--output-dir",
+            tmp.path().to_str().unwrap(),
+            "--robot",
+        ];
+        args.extend_from_slice(extra);
+        let output = base_cmd().args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{:?}: {}",
+            extra,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        fs::read_to_string(json["exported"]["output_path"].as_str().unwrap()).unwrap()
+    };
+
+    let defaults = export(&[]);
+    assert!(
+        defaults.contains("<button class=\"tool-badge"),
+        "the fixture's tool calls render by default"
+    );
+    assert!(
+        defaults.contains("<time class=\"message-time\""),
+        "timestamps render by default"
+    );
+    let bare = export(&["--include-tools", "--show-timestamps"]);
+    assert!(
+        bare.contains("<button class=\"tool-badge")
+            && bare.contains("<time class=\"message-time\""),
+        "a bare flag keeps its default of true"
+    );
+
+    let without = export(&["--include-tools=false", "--show-timestamps=false"]);
+    assert!(
+        !without.contains("<button class=\"tool-badge"),
+        "--include-tools=false omits tool calls"
+    );
+    assert!(
+        !without.contains("<time class=\"message-time\""),
+        "--show-timestamps=false hides timestamps"
     );
 }
 

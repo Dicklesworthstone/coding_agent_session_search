@@ -29,12 +29,13 @@ jobs:
           cargo test --locked --lib index_result:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/completion.log"
           cargo test --locked --lib connectors::codex:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/connector.log"
           cargo test --locked --test codex_source_containment -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/source.log"
+          cargo test --locked --test codex_source_budget_override -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/budget.log"
           cargo test --locked --test e2e_codex_partial_index -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/evidence/cli.log"
           python3 - <<'PY'
           import os,re
           from pathlib import Path
           evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
-          for name,minimum in [('completion.log',9),('connector.log',24),('source.log',3),('cli.log',2)]:
+          for name,minimum in [('completion.log',9),('connector.log',24),('source.log',3),('budget.log',3),('cli.log',2)]:
               counts=re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', (evidence/name).read_text())
               assert counts and max(map(int,counts)) >= minimum,name
           PY

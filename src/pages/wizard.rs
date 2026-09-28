@@ -20,6 +20,7 @@ use crate::pages::docs::{ArchiveMode, DocConfig, DocumentationGenerator};
 use crate::pages::encrypt::{EncryptionConfig, EncryptionEngine};
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
 use crate::pages::password::{PasswordStrength, format_strength_inline, validate_password};
+use crate::pages::profiles::ShareProfile;
 use crate::pages::secret_scan::{
     SecretScanConfig, SecretScanFilters, print_human_report, scan_staged_export_database,
     wizard_secret_scan,
@@ -66,6 +67,9 @@ pub struct WizardState {
     pub title: String,
     pub description: String,
     pub hide_metadata: bool,
+    /// Share profile chosen by flag, config or prompt; `None` means the
+    /// default for the encryption mode (see `effective_share_profile`).
+    pub share_profile: Option<ShareProfile>,
 
     // Deployment
     pub target: DeployTarget,
@@ -116,6 +120,7 @@ impl std::fmt::Debug for WizardState {
             .field("title", &self.title)
             .field("description", &self.description)
             .field("hide_metadata", &self.hide_metadata)
+            .field("share_profile", &self.share_profile)
             .field("target", &self.target)
             .field("output_dir", &self.output_dir)
             .field("repo_name", &self.repo_name)
@@ -154,6 +159,7 @@ impl Default for WizardState {
             title: "cass Archive".to_string(),
             description: "Encrypted archive of AI coding agent conversations".to_string(),
             hide_metadata: false,
+            share_profile: None,
             target: DeployTarget::Local,
             output_dir: PathBuf::from("cass-export"),
             repo_name: None,
@@ -171,6 +177,16 @@ impl Default for WizardState {
             cloudflare_api_token: None,
             final_site_dir: None,
         }
+    }
+}
+
+impl WizardState {
+    /// The share profile this export applies (2l1b0.60): the one chosen,
+    /// else the strictest preset for a plaintext export and `team` for an
+    /// encrypted one.
+    pub fn effective_share_profile(&self) -> ShareProfile {
+        self.share_profile
+            .unwrap_or_else(|| ShareProfile::default_for(!self.no_encryption))
     }
 }
 
@@ -288,6 +304,11 @@ impl PagesWizard {
     /// Set the deployment target.
     pub fn set_deploy_target(&mut self, target: DeployTarget) {
         self.state.target = target;
+    }
+
+    /// Choose the share profile up front (skips the wizard's prompt).
+    pub fn set_share_profile(&mut self, profile: ShareProfile) {
+        self.state.share_profile = Some(profile);
     }
 
     /// Set the repository/project name for deployment.
@@ -752,6 +773,37 @@ impl PagesWizard {
         if self.state.hide_metadata {
             writeln!(term, "  {} Metadata will be obfuscated", style("✓").green())?;
         }
+
+        // Share profile (2l1b0.60): a --share-profile flag skips the prompt.
+        if self.state.share_profile.is_none() {
+            let choices = [
+                ShareProfile::Public,
+                ShareProfile::Team,
+                ShareProfile::Personal,
+            ];
+            let default_profile = self.state.effective_share_profile();
+            let items: Vec<String> = choices
+                .iter()
+                .map(|profile| format!("{profile}: {}", profile.description()))
+                .collect();
+            let selection = Select::with_theme(theme)
+                .with_prompt("Share profile (what to redact from every exported text)")
+                .default(
+                    choices
+                        .iter()
+                        .position(|profile| *profile == default_profile)
+                        .unwrap_or(0),
+                )
+                .items(&items)
+                .interact()?;
+            self.state.share_profile = Some(choices[selection]);
+        }
+        writeln!(
+            term,
+            "  {} Share profile: {}",
+            style("✓").green(),
+            self.state.effective_share_profile()
+        )?;
 
         Ok(())
     }
@@ -1706,7 +1758,8 @@ impl PagesWizard {
         };
 
         let engine = ExportEngine::new(&self.state.db_path, &export_db_path, filter)
-            .with_exclusions(self.state.exclusions.clone());
+            .with_exclusions(self.state.exclusions.clone())
+            .with_share_profile(self.state.effective_share_profile());
         let running = Arc::new(AtomicBool::new(true));
 
         let staged_scan_config = SecretScanConfig::from_inputs(&[], &[])?;

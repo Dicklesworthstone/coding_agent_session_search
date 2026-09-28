@@ -165,7 +165,7 @@ mod tests {
         // Exercise the actual dedicated-owner connection and candidate method;
         // no lexical assets, model inference, or provider scans are needed.
         SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             strict_read_only: true,
@@ -184,6 +184,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         }
     }
 

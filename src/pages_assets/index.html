@@ -95,6 +95,26 @@
                     <span class="btn-icon" aria-hidden="true">📷</span>
                     <span class="btn-text">Scan Recovery QR Code</span>
                 </button>
+
+                <button id="recovery-key-btn" type="button" class="btn btn-secondary"
+                        aria-controls="recovery-key-form" aria-expanded="false">
+                    <span class="btn-icon" aria-hidden="true">🔑</span>
+                    <span class="btn-text">Use Recovery Key</span>
+                </button>
+            </form>
+
+            <form id="recovery-key-form" class="auth-form hidden" autocomplete="off">
+                <div class="form-group">
+                    <label for="recovery-key-input" id="recovery-key-label">Recovery key</label>
+                    <input type="password" id="recovery-key-input" autocomplete="off"
+                           spellcheck="false" autocapitalize="off"
+                           placeholder="Paste the recovery key printed when it was created"
+                           aria-labelledby="recovery-key-label" required>
+                </div>
+                <button id="recovery-key-submit" type="submit" class="btn btn-primary">
+                    <span class="btn-text">Unlock with Recovery Key</span>
+                    <span class="btn-icon" aria-hidden="true">🔓</span>
+                </button>
             </form>
 
             <div id="qr-scanner" class="qr-scanner hidden">

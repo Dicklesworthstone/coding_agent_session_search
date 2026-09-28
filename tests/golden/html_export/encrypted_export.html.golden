@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark light">
     <meta name="generator" content="CASS HTML Export">
-    <title>Please review src/auth/login.rs and fix the token refresh bug.</title>
+    <title>Encrypted conversation</title>
     <!-- Critical inline styles for offline operation -->
     <style>
 
@@ -1768,19 +1768,14 @@ canvas {
 <body>
     <div class="scroll-progress" id="scroll-progress"></div>
     <div class="print-footer print-only" aria-hidden="true">
-        <span class="print-footer-title">Please review src/auth/login.rs and fix the token refresh bug.</span>
+        <span class="print-footer-title">Encrypted conversation</span>
         <span class="print-footer-page"></span>
     </div>
     <div id="app" class="app-container">
         <!-- Header with terminal-style traffic lights -->
         <header class="header" role="banner">
             <div class="header-content">
-                <h1 class="header-title">Please review src/auth/login.rs and fix the token refresh bug.</h1>
-                <div class="header-meta"><span><time datetime="2024-01-15 16:00 UTC">2024-01-15 16:00 UTC</time></span>
-                    <span class="header-agent">Claude</span>
-                    <span>2 prompts, 1 response, 0 tool uses</span>
-                    <span>2m</span>
-                    <span class="header-project">cass-html-export-fixture</span></div>
+                <h1 class="header-title">Encrypted conversation</h1>
             </div>
         </header>
         <!-- Toolbar -->
@@ -2442,6 +2437,25 @@ const Crypto = {
             const plaintext = dec.decode(decrypted);
             const conversation = $('#conversation');
             conversation.innerHTML = plaintext;
+
+            // The real title and header metadata are sealed in the payload;
+            // the page shows only a generic header until unlock.
+            const sealedHeader = conversation.querySelector('#cass-sealed-header');
+            if (sealedHeader) {
+                const headerContent = $('.header .header-content');
+                if (headerContent) {
+                    headerContent.innerHTML = sealedHeader.innerHTML;
+                }
+                const realTitle = sealedHeader.getAttribute('data-title');
+                if (realTitle) {
+                    document.title = realTitle;
+                    const footerTitle = $('.print-footer-title');
+                    if (footerTitle) {
+                        footerTitle.textContent = realTitle;
+                    }
+                }
+                sealedHeader.remove();
+            }
             if (typeof Prism !== 'undefined' && typeof Prism.highlightAllUnder === 'function') {
                 Prism.highlightAllUnder(conversation);
             }

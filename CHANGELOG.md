@@ -16,8 +16,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 ---
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
-binary release, through the 2026-09-10 v0.8.0 binary release and the unreleased
-2026-09-16 follow-ups. Earlier version entries retain their existing scope.
+binary release, through the 2026-09-10 v0.8.0 binary release and the
+2026-09-25 v0.9.0 binary release. Earlier version entries retain their existing scope.
 Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
@@ -25,13 +25,287 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
-| [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-19 | Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages |
+| [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-25 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64. Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages, large-archive index and FTS repair fixes |
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
-## [v0.9.0] -- 2026-09-19
+## [Unreleased]
 
 ### Added
+
+- **`cass doctor --repair-leaked-pages` frees leaked archive pages in place.**
+  Pages that leave the freelist without entering a tree fail the engine's
+  `integrity_check` with `page N is never used`. frankensqlite's one-time
+  migration frees them once per archive, but later leaks stayed, and doctor
+  offered no plan for them. The new surface frees them only when they are
+  the only damage: the engine walks every tree and the freelist before it
+  looks for unowned pages, so any doubled reference or malformed page is
+  reported first and refused (exit 5 `data-corruption`). `--dry-run`
+  classifies the archive; `--yes` holds the index-run lock, backs up the live
+  bundle as a `leaked-pages-repair` backup that `cass doctor backups
+  verify|restore` accept, frees the pages, and requires a clean
+  `integrity_check` with unchanged conversation and message counts. The
+  read-only `cass doctor --json` routes a leak-only failure to it.
+- **Robot search says why the automatic wildcard retry did not run.** A
+  sparse lexical result is retried as `*term*`, but only on indexes of at most
+  10,000 documents (`CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS`) and not for
+  zero-hit queries with a token over 16 characters. On a typical archive the
+  retry was therefore skipped with nothing in the output to say so. `--robot-meta`
+  now reports `_meta.wildcard_fallback_skipped`: `index_over_automatic_limit`,
+  `automatic_retry_disabled` (cap `0`) or `long_query_term`, or null when the
+  retry ran or did not apply.
+- **Robot search echoes how the query was grouped.** `_meta.effective` gains
+  `query_structure`, the operand grouping the lexical engine applies with
+  every compound group parenthesized (`a OR b c` reads as
+  `a OR (b AND c)`), and `query_recoveries`, the parentheses it recovered
+  instead of rejecting. Until now only `--explain` showed the grouping.
+- **`cass pack --json` echoes what its search ran.** Its `_meta.effective`
+  carries the same object as `search --robot-meta`: the database path and
+  what chose it, the resolved time window, the parsed filters, the query
+  grouping and the argv auto-corrections. Pack's own `query.filters` was
+  always empty, so a pack gave no way to check the filters it applied.
+
+### Fixed
+
+- **Long sessions are searchable past their first 8 MiB.** The lexical
+  index capped each conversation's text at 8 MiB in total, so every message
+  after that point was stored but never searchable, in rebuilds and in
+  incremental updates alike. On one owner archive that was 1,458,931 of
+  3,681,541 non-empty messages (39.6%) across 71 conversations. The cap now
+  applies to each message on its own (`CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES`,
+  still 8 MiB). Rebuilds and incremental updates read a long session in
+  bounded chunks instead of holding it whole. After upgrading, the first
+  `cass index` (a routine, background or scheduled run, on an archive of any
+  size) finds an index built under the old cap short of documents and
+  rebuilds it once from the database. An index built under the old cap can
+  no longer be certified as complete.
+- **An open TUI keeps searching after the index is rebuilt.** A rebuild
+  (`cass forget`, `dedup --apply`, an agent purge, `cass index --full`, the
+  background repair) publishes a new index in place of the old one. A TUI
+  that was already open then failed every search with "Keeper generation N
+  identifies two different MANIFEST images" until it was restarted. Search
+  now notices the new index, opens it, and drops results cached from the
+  old one. After a forget, the open TUI stops showing the forgotten
+  conversation.
+- **The Pages viewer accepts a typed recovery key.** RECOVERY.md and the
+  bundle's recovery.html tell a reader who lost the password to choose "Use
+  Recovery Key" and enter the secret, but the unlock screen only offered a QR
+  scanner, so someone holding only the text `cass pages key add-recovery`
+  prints could not unlock. The screen now has a "Use Recovery Key" form that
+  sends the typed secret through the same worker unlock path as a scanned QR
+  code.
+- **Claude Code prompts typed while the agent is mid-turn are searchable
+  (GH #500).** Claude Code saves them as `queued_command` attachments, which
+  the connector dropped. franken-agent-detection 0.3.1 indexes person-typed
+  ones as user messages in transcript order. Sessions indexed before this
+  version keep their old rows; `cass index --full` picks up their queued
+  prompts. 0.3.1 also honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family
+  connectors (GH #486) and caps session reads while reading.
+- **Semantic search comes back after `forget`, `dedup --apply` and
+  `sources agents exclude`.** Deleting canonical rows left the semantic embed
+  watermark covering them, so every later `cass index --semantic` (even with
+  `--full`) took the "nothing new to embed" shortcut and never re-certified
+  the vector index: semantic search stayed `semantic-unavailable` for good
+  (the v0.9.0 known issue). Because SQLite reuses freed message ids, messages
+  ingested afterwards could also be skipped or resolve to the deleted text's
+  vectors. Deletions now drop the watermark, so the next
+  `cass index --semantic` re-embeds from the canonical rows.
+- **Every robot error kind is kebab-case.** The lexical artifact-manifest
+  error reported `err.kind` `lexical_generation`, borrowing the quarantine
+  `artifact_kind` spelling. It is now `lexical-generation`, and the three
+  other borrowed spellings in the typed kind vocabulary moved with it
+  (`lexical-shard`, `failed-seed-bundle-file`, `retained-publish-backup`).
+  `artifact_kind` in status, diag and doctor quarantine output keeps its
+  snake_case values. The kind-taxonomy test no longer exempts underscores.
+- **A forgotten session stays forgotten when its neighbors change.**
+  `cass forget --apply` deleted the canonical rows, but the next index run
+  triggered by any new session in the same directory re-read the forgotten,
+  unchanged source and ingested it as a new conversation, bringing the text
+  back into search. Forget now records each forgotten source's size and
+  modification time (schema v22, `forgotten_sources`), and ingest skips a
+  source that is unchanged since then. A source its agent appends to later is
+  still ingested again, whole, and its record is cleared.
+- **A plain `cass index` finishes a purge that was interrupted.** When
+  `forget`, `dedup --apply` or an agent purge deleted canonical rows but its
+  lexical rebuild failed or was killed, the deleted text stayed searchable and
+  `cass status` stayed stale through any number of incremental runs; only
+  `--full` repaired it. The incremental preflight now sees that the canonical
+  archive holds fewer conversations than the lexical generation was
+  certified against and rebuilds it from the canonical rows.
+
+## [v0.9.0] -- 2026-09-25
+
+Cargo.toml moved to 0.9.0 on 2026-09-18; the release was cut on 2026-09-25.
+This section lists what landed after that version bump; the section below it
+covers the work up to the bump.
+
+### Known open at release
+
+These tests were red in at least one release-candidate full-suite run and ship
+knowingly. None covers a fix in this release; Beads ids name where each is
+tracked.
+
+- Deterministic in every run: `ann_shards::wal_tests` (3 tests) and
+  `semantic::unchanged::...tombstoned_vector_image` (FSVI v2 / native ANN
+  contract under older fixtures, 962e8),
+  `message_topk_integration::wal_exact_large_requests_...` (nohx1), and
+  `sources::probe::...share_deadline...` (an optional-command deadline
+  assertion in the remote-source probe script; not yet filed).
+- `watch_notification_backlog_overflow_...` and
+  `gh473_preflight::writer_preflight_contention_regression` (fqt9s): red in
+  earlier runs; the watch test's negative control was reworked on
+  2026-09-25 (41af9387).
+- Run-to-run flakes under host load, each passing when re-run alone:
+  `gh477_readonly_openers_recover_only_derived_wal_index` (vpsls),
+  `search_service::admission::exact_slot_count_...`,
+  `semantic::artifacts::checkpoint_tests::restoring_checkpoint_...`,
+  `storage::sqlite::tests::insert_conversations_batched_flushes_large_fts_batches`,
+  `search_service::canonical::tests::canonical_batch_...`,
+  `regression_behavioral::aider_detect_must_not_scan_recursively` and
+  `agent_detection_completeness::devin_file_override_watch_...` (index-busy
+  race; 2 of 3 isolated re-runs passed).
+- Wall-clock deadline tests in `spec_search_format_contracts`
+  (`timed_out_search_trust_projection_is_shed_without_discarding_hits`,
+  `timed_out_search_meta_preserves_completed_hits_and_names_metadata_gaps`)
+  failed on I/O-saturated gate hosts at the release commit and passed in
+  some isolated re-runs; they assert a sub-4.2 s end-to-end budget.
+
+### Changed (contract)
+
+- An explicit `--mode semantic` search whose remaining robot budget cannot
+  admit semantic setup or dispatch fails with exit 10, kind `timeout`,
+  retryable, instead of exiting 0 with an empty semantic envelope. Lexical
+  hits are never substituted. Hybrid searches still demote to lexical with
+  `semantic_budget_limited` ([c3ac835a](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/c3ac835a)).
+- `cass archive` errors have distinct exit codes and kinds: 2 usage,
+  5 integrity, 7 busy (retryable), 14 I/O (retryable), 9 other. Every archive
+  error used to exit 2 ([0c2cab13](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/0c2cab13)).
+- `cass view` / `expand` follow a search hit with `--message-index` (the
+  hit's `line_number`, a canonical message ordinal); `--line` addresses only
+  a physical JSONL line and no longer substitutes archived content. Payloads
+  name `coordinate_space` and `content_source`, and `cass introspect`
+  describes them (#493, [5173f7db](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5173f7db), [73995e20](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/73995e20)).
+- An index run that could not read a source (for example a rollout with no
+  parseable record) keeps what it committed but exits 9, retryable, naming the
+  incomplete scan ([80b68f76](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/80b68f76)).
+
+### Fixed
+
+- **`cass index --full` on multi-million-document archives no longer fails at
+  `checkpoint_after_fold`** with "posting validation limit exceeded"; every
+  lexical fold stays within the per-term posting limit
+  (#498, [da06837c](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/da06837c)).
+- **The full-rebuild disk check no longer locks a failed large rebuild out of
+  its retry.** A failed rebuild's leftover `.rebuild-staging` generation is no
+  longer doubled (#496, [149ee210](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/149ee210)) and is now credited against
+  the requirement, since the next rebuild resumes into it or clears it first:
+  `max(512 MiB, 2*db + 2*lexical - staging)` ([060807c5](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/060807c5)).
+- **`cass doctor --rebuild-canonical-fts --yes` settles an oversized FTS
+  shadow.** Retiring it is reported as a completed repair (exit 0, not 13),
+  an already retired archive is not rewritten, the interrupted-artifact
+  cleanup is named, and the repair-pending marker is cleared after a verified
+  rebuild so `cass status` stops reporting a pending repair
+  (#495, #497, [89e053f3](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/89e053f3), [71b72ed2](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/71b72ed2)).
+- **macOS: a wedged `footprint(1)` can no longer stall indexing.** Every OS
+  telemetry probe (`footprint`, `ps`, `sysctl`, `vm_stat`, `ioreg`) now has a
+  3 s deadline, after which it is killed and treated as unavailable; a
+  footprint timeout switches process memory to the `ps` fallback for the rest
+  of the run. Before, `cass index` sat at 0% CPU until the stall watchdog
+  aborted it (exit 70) ([8c9ba0b0](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8c9ba0b0)).
+- **GitHub Copilot Chat history kept only in VS Code's native stores is
+  indexed.** Detection now also recognises `workspaceStorage/*/chatSessions`,
+  the empty-window and transferred session stores and legacy `state.vscdb`
+  sessions; before, the connector was never run for such users
+  ([cc16f0aa](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/cc16f0aa)).
+- **Robot semantic and hybrid searches set up semantics once, inside their
+  budget.** The bounded setup worker ran, and then the same setup ran again
+  on the main thread: the cost was paid twice, the second time outside the
+  budget (and again after the worker had timed out), and that path could
+  spawn the warm-model daemon that robot searches must never spawn.
+  Reranking under a budget no longer spawns it either. `_meta.effective.daemon`
+  reports `use_existing`, `auto_spawn_requested` and `auto_spawn`, so
+  `--daemon` on a robot search is visible as requested but not applied.
+- **`cass forget` says what it removes and how a failed purge is finished.**
+  Its help and README row now state that source files are kept: an unchanged
+  source stays forgotten across `cass index` and `cass index --full`, but a
+  source its agent appends to later is indexed again, whole. When the lexical
+  rebuild fails after the canonical rows are deleted, forget exits 5
+  (`lexical-rebuild`) with a `cass index --full` hint. Tests now prove that
+  lexical, hybrid and `pack` stop returning forgotten conversations, that
+  explicit semantic search fails closed (`semantic-unavailable`) rather than
+  returning them, and that a dry run leaves every derived asset
+  byte-identical. Known issue: semantic search does not yet recover after a
+  forget; `cass index --semantic` (even `--full`) leaves it unavailable.
+- **`cass doctor` advertises the exit codes it actually returns.**
+  `--emit-capabilities` listed 5 as `concurrency-lost`, but doctor exits 5
+  with kind `doctor` when failed checks remain. It never listed 7
+  `index-busy` (a repair blocked by an operation lock), and it listed 1, 6
+  and 73, which nothing returns. Robot-docs said findings exit 1; they exit
+  0, and the payload's `operation_outcome.exit_code_kind` names them. Archive
+  export, support-bundle and baseline I/O failures exited 4, which is the
+  global network code; they now exit 14 `io` like every other I/O failure.
+- **Date-filtered search works on a long-lived index again (GH #499).** Every
+  `--days`/`--since`/`--until` search failed with `posting cursor invariant
+  failed: Boolean children belong to different segment domains` (exit 9) once
+  an incremental run had tombstoned a row in a sealed index segment. The
+  engine fix shipped in frankensearch-quill 0.3.2, a hotfix of 0.3.1, and the
+  lock now resolves 0.3.4, which carries it, so no re-index is needed. An engine invariant failure is now also
+  reported `retryable: false`, with `cass index --full --force-rebuild` as the
+  remedy, instead of inviting endless retries.
+- **Search no longer strands a missing or unusable lexical index on a large
+  archive.** When search needs a repair it will not run inline (the archive is
+  over the inline repair budget, or a robot caller faces `checkpoint_incomplete`),
+  it starts a detached `cass index --full --background` and names the pid in the
+  error hint; a small archive still repairs inline as before. A robot search
+  during a first build returns exit 7 `index-busy` with progress at once.
+  Previously nothing built the index: an agent's own `cass index --full` died
+  with its command timeout and every retry started from zero
+  ([76306c0c](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/76306c0c)).
+- **`total_matches` is exact up to 5M documents** (was 50k). On a 1M-document
+  archive the capped value read 11 for a term with 11,915 matches; exact counts
+  cost 0.00-0.11 s CPU there
+  ([1ca2503e](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/1ca2503e)).
+- **Boolean queries follow the documented grammar.** NOT binds tightest, then
+  AND (explicit, `&&`, or implied between words), then OR (`OR`, `||`), and
+  parentheses group. The engine used to bind OR tighter than AND and read
+  parentheses as part of a word, so `a OR b AND c` meant `(a OR b) AND c`
+  and `(a AND x) OR b` returned nothing. The lock resolves
+  frankensearch-quill 0.3.4, which carries the grammar; the SQLite fallback
+  lanes apply the same grammar. `(` groups only at the start of a word, so
+  `foo(bar)` stays one term, and an unclosed `(` closes at the end of the
+  query. `--explain` and `--dry-run` show the grouping searched in
+  `parsed.structure` and warn when parentheses were recovered.
+- **`(a OR b) AND c` no longer misses results after an index merge.** On an
+  index that `cass index` had merged (every staged rebuild and most long-lived
+  archives), a disjunction under a conjunction could silently drop matches:
+  the engine's union answered a skip request from exhausted children
+  instead of its buffer. Under the old grammar every mixed query such as
+  `auth OR login error` took this shape. frankensearch-quill 0.3.4 fixes it;
+  the metamorphic search oracle (tests/search_metamorphic.rs) found it, and a
+  layout-sweep engine test pins it.
+
+### Performance
+
+- **Secret redaction ~26x faster on real text.** Unicode `\b` in the secret
+  patterns forced the regex engine off its DFA for every message containing a
+  non-ASCII byte; the patterns now use ASCII boundaries, which redact at least
+  as much. Measured 10 → 261-284 MiB/s on 593 MiB of session text, and 9.5x
+  more messages ingested per CPU-second in an A/B incremental index on a clone
+  of a 2.1M-message archive
+  ([ff6d6485](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ff6d6485)).
+- **Large incremental catch-ups no longer slow down as they run.** Every lexical
+  publish re-verifies all live segments, so it costs time in proportion to the
+  whole index. The streaming indexer committed every 5 s and folded segments
+  only after the run: a big catch-up re-hashed gigabytes of unchanged segments
+  several times a minute and grew one generation past 3,000 segments. Commits
+  are now paced by their measured cost (the next waits at least 4x as long as
+  the last took, capped at 120 s), and the run folds its small segment tail
+  with one bounded merge every few minutes. On a clone of a real archive the
+  same catch-up added 5.71M messages in 1 h 50 min instead of 1.76M in 5 h 12 min.
+
+### Through the 2026-09-18 version bump
+
+#### Added
 
 - **Sharded native ANN semantic search.** Semantic retrieval is now served from
   an immutable, owner-backed sharded reader. Complete ordered shard cohorts are
@@ -73,7 +347,7 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   generated remote-sync sources. Grok Bot keeps its own provider identity
   and native message IDs (#415, #447).
 
-### Fixed
+#### Fixed
 
 - Incremental lexical merges combine similarly sized segments, avoiding repeated
   rewrites of a large segment for each small append while preserving merge caps (#479).

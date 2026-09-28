@@ -26,6 +26,24 @@ import tempfile
 import tomllib
 
 
+# APIs that exist only in the full CASS crate. A staged test that uses one can
+# never build here; 11fcce89 added such a module and left this lane red for
+# days behind a bare compile error (bead coding_agent_session_search-2l1b0.62).
+FULL_CRATE_ONLY = ("assert_cmd::", "cargo_bin!(", "get_connector_factories(")
+
+
+def refuse_full_crate_tests(root: Path, tests: tuple[str, ...]) -> None:
+    for test in tests:
+        path = root / f"tests/{test}.rs"
+        found = [token for token in FULL_CRATE_ONLY if token in path.read_text(encoding="utf-8")]
+        if found:
+            raise SystemExit(
+                f"tests/{test}.rs uses full-crate APIs ({', '.join(found)}), which this slim "
+                "consumer crate cannot build; put those tests in their own integration target "
+                "(as tests/codex_source_budget_override.rs does)"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fad-checkout", type=Path, help="Test this local FAD checkout without changing CASS's published dependency pin")
@@ -50,6 +68,7 @@ def main() -> None:
         "serde", "serde_json", "tempfile", "thiserror", "tracing",
     )
     tests = ("connector_codex_exclusions", "codex_source_containment")
+    refuse_full_crate_tests(root, tests)
     lines = [
         "[package]", 'name = "cass-codex-contract"', 'version = "0.0.0"',
         'edition = "2024"', "publish = false", "", "[lib]",

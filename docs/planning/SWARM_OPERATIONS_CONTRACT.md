@@ -4,6 +4,20 @@
 **Status:** Contract for implementation beads
 **Date:** 2026-05-08
 
+> **Implementation status (checked 2026-09-24 against `cass swarm --help` and
+> src/lib.rs; bead 2l1b0.59).** This contract is the target. The shipped
+> `cass swarm status` accepts only `--json`, `--robot-format`, `--fixture`,
+> `--fixture-dir` and `--fixture-id`. The flags in the Inputs table below
+> (`--repo`, `--project-key`, `--stale-threshold-seconds`, the six `--max-*`
+> limits, `--include-evidence`, `--no-process-scan`, `--request-id`) do not
+> exist, and `swarm-unsupported-format` is never emitted. The shipped surface
+> also has subcommands this contract does not describe: `work-packet`, `lint`,
+> `evidence`, `proof-debt`, `failure-patterns`, `dependency-drift`,
+> `resource-plan`, `privacy-preview`, `context-pack`, `workflow-analytics`,
+> `replay-fixture`, `macros`, `repro-capsule` and `dashboard`. Live `lint`,
+> `evidence`, `proof-debt` and `failure-patterns` report every provider
+> `live-provider-unimplemented`; fixtures are their tested path.
+
 This document defines the first robot contract for a read-only swarm operations
 surface in cass. The surface composes existing coordination truth sources into
 one stable status payload for agents and operators who are managing a busy shared

@@ -35,13 +35,6 @@ fn error_kind_rs_path() -> PathBuf {
         .join("cli_error_kind.rs")
 }
 
-const LEGACY_SNAKE_CASE_KIND_EXEMPTIONS: &[&str] = &[
-    "failed_seed_bundle_file",
-    "lexical_generation",
-    "lexical_shard",
-    "retained_publish_backup",
-];
-
 fn extract_kind_str_mappings() -> BTreeMap<String, (String, usize)> {
     let source =
         std::fs::read_to_string(error_kind_rs_path()).expect("read src/model/cli_error_kind.rs");
@@ -137,7 +130,7 @@ fn error_kind_exit_codes_do_not_leak_from_adjacent_producers() {
             message: err.to_string(),
         })?.ok_or_else(|| CliError {
             code: 3,
-            kind: CliErrorKind::IndexMissing.kind_str(),
+            kind: CliErrorKind::MissingIndex.kind_str(),
         })?;
         let first = CliError {
             code: 9,
@@ -153,8 +146,8 @@ fn error_kind_exit_codes_do_not_leak_from_adjacent_producers() {
     assert_eq!(
         serde_json::to_value(extract_kind_exit_codes_from_source(source)).unwrap(),
         serde_json::json!({
-            "index-missing": [3],
             "io": [9, 14],
+            "missing-index": [3],
             "selftest": [1, 2],
             "storage": [5],
         })
@@ -167,7 +160,7 @@ fn error_kinds_are_strictly_kebab_case() {
     let mut violations = Vec::new();
 
     for (kind, lines) in &kinds {
-        if kind.contains('_') && !LEGACY_SNAKE_CASE_KIND_EXEMPTIONS.contains(&kind.as_str()) {
+        if kind.contains('_') {
             violations.push(format!(
                 "  {kind} (lines: {lines:?}) — contains underscore, should be: {}",
                 kind.replace('_', "-")

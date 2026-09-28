@@ -362,21 +362,242 @@ fn normalize_wildcard_term_parts(raw: &str) -> Vec<String> {
     parts
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SqliteMessageScanOperand {
     Terms(Vec<SqliteMessageScanTermPart>),
     Phrase(Vec<String>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SqliteMessageScanAlternative {
-    operand: SqliteMessageScanOperand,
-    negated: bool,
+struct SqliteMessageScanQuery {
+    expr: CassBoolExpr<SqliteMessageScanOperand>,
 }
 
-type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
-struct SqliteMessageScanQuery {
-    groups: Vec<SqliteMessageScanGroup>,
+/// A CASS query as the fallback lanes (SQLite FTS5 and the source scan)
+/// evaluate it, parsed with the lexical engine's grammar (2l1b0.52): NOT
+/// binds tightest, then AND (explicit or implied), then OR; parentheses
+/// group; negation is parity-based; an operator with no operand is dropped.
+#[derive(Clone, Debug, PartialEq)]
+enum CassBoolExpr<T> {
+    Operand(T),
+    Not(Box<CassBoolExpr<T>>),
+    And(Vec<CassBoolExpr<T>>),
+    Or(Vec<CassBoolExpr<T>>),
+}
+
+/// The shipping lexer's tokens plus the grouping parentheses it cannot see.
+#[derive(Clone, Debug, PartialEq)]
+enum CassBoolToken {
+    Token(FsCassQueryToken),
+    Open,
+    Close,
+}
+
+/// Lex `raw` for the fallback lanes. Grouping parentheses follow the lexical
+/// engine's rules: a `(` opens a group only at the start of a word (after
+/// whitespace, `&&`, `||`, a phrase, another parenthesis or a leading `-`),
+/// a `)` closes one only while a group is open, and phrases are opaque. The
+/// text between them goes through the shipping lexer unchanged.
+fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
+    fn flush(segment: &mut String, tokens: &mut Vec<CassBoolToken>) {
+        if !segment.is_empty() {
+            tokens.extend(
+                fs_cass_parse_boolean_query(segment)
+                    .into_iter()
+                    .map(CassBoolToken::Token),
+            );
+            segment.clear();
+        }
+    }
+    let mut tokens = Vec::new();
+    let mut segment = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut in_phrase = false;
+    let mut at_word_start = true;
+    let mut open_groups = 0_usize;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_phrase = !in_phrase;
+                at_word_start = true;
+                segment.push(ch);
+            }
+            _ if in_phrase => segment.push(ch),
+            '(' if at_word_start => {
+                flush(&mut segment, &mut tokens);
+                tokens.push(CassBoolToken::Open);
+                open_groups += 1;
+            }
+            ')' if open_groups > 0 => {
+                flush(&mut segment, &mut tokens);
+                tokens.push(CassBoolToken::Close);
+                open_groups -= 1;
+                at_word_start = true;
+            }
+            ' ' | '\t' | '\n' => {
+                at_word_start = true;
+                segment.push(ch);
+            }
+            '&' | '|' if chars.peek() == Some(&ch) => {
+                chars.next();
+                segment.push(ch);
+                segment.push(ch);
+                at_word_start = true;
+            }
+            '-' if at_word_start => segment.push(ch),
+            _ => {
+                at_word_start = false;
+                segment.push(ch);
+            }
+        }
+    }
+    flush(&mut segment, &mut tokens);
+    tokens
+}
+
+/// An operand the lane cannot express: the whole query is declined.
+struct CassBoolUnsupported;
+
+/// Recursive-descent parser for [`CassBoolExpr`]:
+///
+/// ```text
+/// or      := and (OR and)*
+/// and     := unary ([AND] unary)*
+/// unary   := NOT* primary
+/// primary := TERM | PHRASE | '(' or ')'
+/// ```
+struct CassBoolParser<'a, T, F> {
+    tokens: &'a [CassBoolToken],
+    position: usize,
+    lower: F,
+    _operand: std::marker::PhantomData<T>,
+}
+
+impl<'a, T, F> CassBoolParser<'a, T, F>
+where
+    F: FnMut(&FsCassQueryToken) -> Result<Option<T>, CassBoolUnsupported>,
+{
+    /// Parse `tokens`, lowering each term or phrase with `lower`: `Ok(None)`
+    /// skips an operand that normalizes to nothing, `Err` declines the query.
+    fn parse(
+        tokens: &'a [CassBoolToken],
+        lower: F,
+    ) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut parser = Self {
+            tokens,
+            position: 0,
+            lower,
+            _operand: std::marker::PhantomData,
+        };
+        let mut expr = parser.parse_or()?;
+        // A `)` outside any group cannot come from cass_bool_tokens, but a
+        // truncated parse must not drop the rest of the query.
+        while parser.position < parser.tokens.len() {
+            parser.position += 1;
+            if let Some(rest) = parser.parse_or()? {
+                expr = Some(match expr {
+                    Some(CassBoolExpr::Or(mut operands)) => {
+                        operands.push(rest);
+                        CassBoolExpr::Or(operands)
+                    }
+                    Some(first) => CassBoolExpr::Or(vec![first, rest]),
+                    None => rest,
+                });
+            }
+        }
+        Ok(expr)
+    }
+
+    fn peek(&self) -> Option<&'a CassBoolToken> {
+        self.tokens.get(self.position)
+    }
+
+    fn parse_or(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut operands = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(CassBoolToken::Close) => break,
+                Some(CassBoolToken::Token(FsCassQueryToken::Or)) => {
+                    self.position += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if let Some(operand) = self.parse_and()? {
+                operands.push(operand);
+            }
+        }
+        Ok(match operands.len() {
+            0 => None,
+            1 => operands.pop(),
+            _ => Some(CassBoolExpr::Or(operands)),
+        })
+    }
+
+    fn parse_and(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut operands = Vec::new();
+        loop {
+            match self.peek() {
+                None
+                | Some(CassBoolToken::Close)
+                | Some(CassBoolToken::Token(FsCassQueryToken::Or)) => break,
+                Some(CassBoolToken::Token(FsCassQueryToken::And)) => {
+                    self.position += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if let Some(operand) = self.parse_unary()? {
+                operands.push(operand);
+            }
+        }
+        Ok(match operands.len() {
+            0 => None,
+            1 => operands.pop(),
+            _ => Some(CassBoolExpr::And(operands)),
+        })
+    }
+
+    fn parse_unary(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let mut negated = false;
+        while let Some(CassBoolToken::Token(FsCassQueryToken::Not)) = self.peek() {
+            negated = !negated;
+            self.position += 1;
+        }
+        // A NOT with no operand (before AND, OR, `)` or the end) is dropped.
+        if !matches!(
+            self.peek(),
+            Some(
+                CassBoolToken::Open
+                    | CassBoolToken::Token(FsCassQueryToken::Term(_) | FsCassQueryToken::Phrase(_))
+            )
+        ) {
+            return Ok(None);
+        }
+        let operand = self.parse_primary()?;
+        Ok(match operand {
+            Some(operand) if negated => Some(CassBoolExpr::Not(Box::new(operand))),
+            other => other,
+        })
+    }
+
+    fn parse_primary(&mut self) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        let Some(token) = self.peek() else {
+            return Ok(None);
+        };
+        self.position += 1;
+        match token {
+            CassBoolToken::Open => {
+                let inner = self.parse_or()?;
+                // An unclosed group closes at the end of the query.
+                if matches!(self.peek(), Some(CassBoolToken::Close)) {
+                    self.position += 1;
+                }
+                Ok(inner)
+            }
+            CassBoolToken::Token(token) => Ok((self.lower)(token)?.map(CassBoolExpr::Operand)),
+            CassBoolToken::Close => Ok(None),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -838,12 +1059,18 @@ const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 /// else on the box.
 const NO_LIMIT_RAM_DIVISOR: u64 = 16;
 
-/// Above this corpus size, exact Tantivy `Count` collection is not part of the
-/// default top-N path. Common-term counts on multi-million-document indexes can
-/// dominate the query and turn a five-hit search into a full corpus scan; robot
-/// output already reports lower-bound count precision when the exact total is
-/// not available.
-const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
+/// Above this corpus size, exact total counting is not part of the default
+/// top-N path, and a saturated page reports `limit + 1` as a lower bound.
+///
+/// The cap was 50,000 when the lexical engine was Tantivy, whose `Count` over a
+/// common term on a multi-million-document index could dominate the query. On
+/// Quill the count is cheap: on a 1,034,219-document archive (paired runs,
+/// `--limit 10`), exact totals added 0.00-0.11 s CPU to a ~0.8 s search even for
+/// "AGENTS.md" (867,087 matches) and "the" (439,461). Meanwhile the capped
+/// answer was wrong by up to five orders of magnitude ("stale lock": 11 against
+/// 11,915), and agents read `total_matches` as a count. The cap now sits at five
+/// times that archive; `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` still overrides it.
+const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 5_000_000;
 const DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS: usize = 10_000;
 
 fn exact_total_count_max_docs() -> usize {
@@ -1106,6 +1333,98 @@ pub struct ParsedQuery {
     pub operators: Vec<String>,
     /// Whether implicit AND is used between terms
     pub implicit_and: bool,
+    /// How the operands group, as the lexical engine reads the query: every
+    /// compound group parenthesized, e.g. `(a AND b) OR c` (2l1b0.52).
+    pub structure: Option<String>,
+}
+
+/// Grouping of a parsed CASS query for `--explain`: compound operands are
+/// parenthesized, so precedence never has to be inferred from the text.
+fn render_query_structure(expr: &CassBoolExpr<String>) -> String {
+    fn grouped(expr: &CassBoolExpr<String>) -> String {
+        match expr {
+            CassBoolExpr::And(_) | CassBoolExpr::Or(_) => {
+                format!("({})", render_query_structure(expr))
+            }
+            other => render_query_structure(other),
+        }
+    }
+    match expr {
+        CassBoolExpr::Operand(text) => text.clone(),
+        CassBoolExpr::Not(inner) => format!("NOT {}", grouped(inner)),
+        CassBoolExpr::And(operands) => operands
+            .iter()
+            .map(grouped)
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        CassBoolExpr::Or(operands) => operands
+            .iter()
+            .map(grouped)
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    }
+}
+
+/// How the lexical engine reads a query. `--explain` shows it as
+/// `parsed.structure` and warnings; robot search echoes it in
+/// `_meta.effective` (2l1b0.52, 2l1b0.68).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryReading {
+    /// Operand grouping with every compound group parenthesized, e.g.
+    /// `a OR (b AND c)`; `None` for a query without operands.
+    pub structure: Option<String>,
+    /// Parentheses recovered instead of rejected, e.g. `1 unclosed '('
+    /// closed at the end of the query`.
+    pub recoveries: Vec<String>,
+}
+
+/// Read `query` with the grammar the lexical engine applies.
+pub fn read_query(query: &str) -> QueryReading {
+    let tokens = cass_bool_tokens(query);
+    let structure = CassBoolParser::parse(&tokens, |token: &FsCassQueryToken| {
+        Ok(match token {
+            FsCassQueryToken::Term(text) => Some(text.clone()),
+            FsCassQueryToken::Phrase(text) => Some(format!("\"{text}\"")),
+            FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => None,
+        })
+    })
+    .ok()
+    .flatten()
+    .map(|expr| render_query_structure(&expr));
+    QueryReading {
+        structure,
+        recoveries: group_recovery_warnings(&tokens),
+    }
+}
+
+/// `--explain` warnings for parentheses the grammar recovers instead of
+/// rejecting, read the way the lexical engine reads them: an unclosed `(`
+/// closes at the end of the query and an empty `()` is skipped.
+fn group_recovery_warnings(tokens: &[CassBoolToken]) -> Vec<String> {
+    let mut open_groups = 0_usize;
+    let mut empty_groups = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            CassBoolToken::Open => {
+                open_groups += 1;
+                if matches!(tokens.get(index + 1), Some(CassBoolToken::Close)) {
+                    empty_groups += 1;
+                }
+            }
+            CassBoolToken::Close => open_groups = open_groups.saturating_sub(1),
+            CassBoolToken::Token(_) => {}
+        }
+    }
+    let mut warnings = Vec::new();
+    if open_groups > 0 {
+        warnings.push(format!(
+            "{open_groups} unclosed '(' closed at the end of the query"
+        ));
+    }
+    if empty_groups > 0 {
+        warnings.push(format!("{empty_groups} empty '()' skipped"));
+    }
+    warnings
 }
 
 /// Comprehensive query explanation for debugging and understanding search behavior
@@ -1232,6 +1551,8 @@ impl QueryExplanation {
         // a query can contain both an explicit connector and a later implicit
         // one (`foo AND bar baz`).
         parsed.implicit_and = uses_implicit_and;
+        let reading = read_query(query);
+        parsed.structure = reading.structure;
 
         // Determine query type
         let query_type = Self::classify_query(&parsed, filters, &sanitized);
@@ -1246,7 +1567,8 @@ impl QueryExplanation {
         let filters_summary = Self::summarize_filters(filters);
 
         // Generate warnings
-        let warnings = Self::generate_warnings(&parsed, &sanitized, filters);
+        let mut warnings = Self::generate_warnings(&parsed, &sanitized, filters);
+        warnings.extend(reading.recoveries);
 
         Self {
             original_query: query.to_string(),
@@ -1443,7 +1765,9 @@ impl QueryExplanation {
 
         // Warn about complex boolean queries
         if parsed.operators.len() > 3 {
-            warnings.push("Complex boolean query may have unexpected precedence".to_string());
+            warnings.push(
+                "Complex boolean query: parsed.structure shows how its operands group".to_string(),
+            );
         }
 
         // Warn about narrow filters that might miss results
@@ -3084,10 +3408,7 @@ impl FsLexicalRead for CassProgressiveLexicalAdapter {
 }
 
 pub struct SearchClient {
-    reader: Option<(
-        frankensearch::quill::QuillSearchIndex,
-        crate::search::quill_bridge::QuillCassFields,
-    )>,
+    reader: LexicalReaderSlot,
     sqlite: Mutex<Option<SearchSqliteConnection>>,
     sqlite_path: Option<PathBuf>,
     strict_read_only: bool,
@@ -3111,11 +3432,29 @@ pub struct SearchClient {
     /// `_meta.lexical_degrade_reason` so an agent can tell "no lexical hits"
     /// from "lexical was skipped because the engine ran out of query fuel".
     last_lexical_degrade_reason: Mutex<Option<&'static str>>,
+    /// Why the most recent `search_with_fallback` did not run the automatic
+    /// `*term*` retry its sparse result would otherwise get (`None` when the
+    /// retry ran or did not apply). Robot metadata surfaces it as
+    /// `_meta.wildcard_fallback_skipped` (2l1b0.68): above 10,000 documents
+    /// the retry used to turn off without a trace.
+    last_wildcard_fallback_skip: Mutex<Option<&'static str>>,
 }
 
 /// `_meta.lexical_degrade_reason` value when Quill's query-fuel ceiling was
 /// hit on the lexical leg of a hybrid search (GH #441).
 pub const LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
+
+/// `_meta.wildcard_fallback_skipped` value when the index holds more documents
+/// than `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS` (default 10,000).
+pub const WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX: &str = "index_over_automatic_limit";
+
+/// `_meta.wildcard_fallback_skipped` value when
+/// `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS=0` turned the retry off.
+pub const WILDCARD_FALLBACK_SKIPPED_DISABLED: &str = "automatic_retry_disabled";
+
+/// `_meta.wildcard_fallback_skipped` value when a zero-hit query has a term
+/// longer than the automatic retry accepts.
+pub const WILDCARD_FALLBACK_SKIPPED_LONG_TERM: &str = "long_query_term";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchClientOptions {
@@ -3612,6 +3951,51 @@ struct FederatedIndexReader {
 
 static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// The single-directory lexical reader and the path it was opened from.
+///
+/// A lexical rebuild publishes a new index lineage by exchanging the whole
+/// directory, which in-place catch-up cannot follow. The slot lets a
+/// reloading client (the TUI) open the path again and swap the reader in
+/// instead of failing every later search.
+#[derive(Default)]
+struct LexicalReaderSlot {
+    index_path: Option<PathBuf>,
+    current: RwLock<
+        Option<(
+            frankensearch::quill::QuillSearchIndex,
+            crate::search::quill_bridge::QuillCassFields,
+        )>,
+    >,
+}
+
+impl LexicalReaderSlot {
+    fn new(
+        index_path: PathBuf,
+        reader: Option<(
+            frankensearch::quill::QuillSearchIndex,
+            crate::search::quill_bridge::QuillCassFields,
+        )>,
+    ) -> Self {
+        Self {
+            index_path: Some(index_path),
+            current: RwLock::new(reader),
+        }
+    }
+
+    fn get(
+        &self,
+    ) -> Option<(
+        frankensearch::quill::QuillSearchIndex,
+        crate::search::quill_bridge::QuillCassFields,
+    )> {
+        self.current.read().clone()
+    }
+
+    fn is_some(&self) -> bool {
+        self.current.read().is_some()
+    }
+}
 static SEARCH_CLIENT_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static SEARCHER_RELOAD_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
@@ -3631,22 +4015,37 @@ impl Drop for ReloadInFlightGuard {
     }
 }
 
+/// Refresh `readers` in place on a bounded worker. `Ok(true)` when a
+/// directory was republished as a new index lineage and must be opened again
+/// (see [`crate::search::quill_bridge::refresh_reader_or_detect_republish`]).
 fn reload_index_readers_bounded(
     readers: Vec<frankensearch::quill::QuillSearchIndex>,
     reload_in_flight: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<bool> {
+    let republished = Arc::new(AtomicBool::new(false));
+    let worker_republished = Arc::clone(&republished);
     run_reload_bounded(
         move || {
-            readers
-                .iter()
-                .try_for_each(|reader| {
-                    crate::search::quill_bridge::refresh_reader(reader).map(|_| ())
-                })
-                .map_err(|error| error.to_string())
+            for reader in &readers {
+                match crate::search::quill_bridge::refresh_reader_or_detect_republish(reader) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        tracing::info!(
+                            index = %reader.path().display(),
+                            reason,
+                            "lexical index was republished; reopening it"
+                        );
+                        worker_republished.store(true, Ordering::SeqCst);
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok(())
         },
         reload_in_flight,
         *SEARCHER_RELOAD_TIMEOUT,
-    )
+    )?;
+    Ok(republished.load(Ordering::SeqCst))
 }
 
 fn run_reload_bounded<F>(
@@ -4199,7 +4598,7 @@ impl SearchClient {
         }
 
         Ok(Some(Self {
-            reader: tantivy,
+            reader: LexicalReaderSlot::new(index_path, tantivy),
             sqlite: Mutex::new(None),
             sqlite_path,
             strict_read_only: options.strict_read_only,
@@ -4215,6 +4614,7 @@ impl SearchClient {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         }))
     }
 
@@ -4274,9 +4674,13 @@ impl SearchClient {
 
         // Invalidate prefix cache if the index has been updated since last search.
         // This must happen BEFORE the cache check below to avoid serving stale results.
-        if let Some((reader, _)) = &self.reader {
-            self.maybe_reload_reader(reader)?;
-            self.track_generation(reader.keeper_generation());
+        if let Some((reader, _)) = self.reader.get() {
+            // A reload may reopen a republished index, so track the reader
+            // that is current afterwards.
+            self.maybe_reload_reader(&reader)?;
+            if let Some((reader, _)) = self.reader.get() {
+                self.track_generation(reader.keeper_generation());
+            }
         } else if let Some(readers) = self.federated_readers()
             && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?
         {
@@ -4345,7 +4749,7 @@ impl SearchClient {
         };
 
         // Tantivy is the primary high-performance engine.
-        if let Some((reader, fields)) = &self.reader {
+        if let Some((reader, fields)) = self.reader.get() {
             tracing::info!(
                 backend = "tantivy",
                 query = sanitized,
@@ -4354,8 +4758,8 @@ impl SearchClient {
                 "search_start"
             );
             let (hits, tantivy_total_count) = self.search_tantivy(
-                reader,
-                fields,
+                &reader,
+                &fields,
                 query,
                 &sanitized,
                 filters.clone(),
@@ -4389,8 +4793,8 @@ impl SearchClient {
                         "retrying lexical fetch due to dedup or session-path shortfall"
                     );
                     let (retry_hits, retry_total_count) = self.search_tantivy(
-                        reader,
-                        fields,
+                        &reader,
+                        &fields,
                         query,
                         &sanitized,
                         filters.clone(),
@@ -6930,6 +7334,7 @@ impl SearchClient {
         sparse_threshold: usize,
         field_mask: FieldMask,
     ) -> Result<SearchResult> {
+        self.record_wildcard_fallback_skip(None);
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
@@ -6958,7 +7363,12 @@ impl SearchClient {
         {
             // Either we have enough results, query already has wildcards,
             // query uses boolean/phrases, or query is empty.
-            if is_sparse && !automatic_wildcard_allowed {
+            if is_sparse
+                && !automatic_wildcard_allowed
+                && !query_has_wildcards
+                && !has_boolean_or_phrase
+                && !query.trim().is_empty()
+            {
                 tracing::debug!(
                     query,
                     returned_hits = hits.len(),
@@ -6966,6 +7376,13 @@ impl SearchClient {
                     automatic_wildcard_max_docs = automatic_wildcard_fallback_max_docs(),
                     "skipping automatic wildcard fallback on large index"
                 );
+                self.record_wildcard_fallback_skip(Some(
+                    if automatic_wildcard_fallback_max_docs() == 0 {
+                        WILDCARD_FALLBACK_SKIPPED_DISABLED
+                    } else {
+                        WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX
+                    },
+                ));
             }
             // Generate suggestions only if truly zero hits
             let suggestions = if hits.is_empty() && !query.trim().is_empty() {
@@ -6985,6 +7402,7 @@ impl SearchClient {
         }
 
         if should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(query, hits.len()) {
+            self.record_wildcard_fallback_skip(Some(WILDCARD_FALLBACK_SKIPPED_LONG_TERM));
             let suggestions = if hits.is_empty() {
                 self.generate_suggestions(query, &filters)
             } else {
@@ -7313,20 +7731,30 @@ impl SearchClient {
 
         let reload_started = Instant::now();
         let cached_generation = self.federated_generation_signature(readers);
-        if let Err(error) = reload_index_readers_bounded(
+        let republished = match reload_index_readers_bounded(
             readers.iter().map(|shard| shard.reader.clone()).collect(),
             Arc::clone(&self.metrics.reload_in_flight),
         ) {
-            self.metrics
-                .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                    cache_hit: true,
-                    cached_generation: Some(self.federated_generation_signature(readers)),
-                    current_generation: self.federated_generation_signature(readers),
-                    reload_attempted: true,
-                    reload_succeeded: false,
-                    served_fallback: false,
-                });
-            return Err(error);
+            Ok(republished) => republished,
+            Err(error) => {
+                self.metrics
+                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
+                        cache_hit: true,
+                        cached_generation: Some(self.federated_generation_signature(readers)),
+                        current_generation: self.federated_generation_signature(readers),
+                        reload_attempted: true,
+                        reload_succeeded: false,
+                        served_fallback: false,
+                    });
+                return Err(error);
+            }
+        };
+        if republished {
+            self.reopen_republished_lexical_index()?;
+            *guard = Some(Instant::now());
+            return Ok(self
+                .federated_readers()
+                .map(|reopened| self.federated_generation_signature(&reopened)));
         }
         let elapsed = reload_started.elapsed();
         // Rate-limit from completion, not start. A slow successful reload must
@@ -8161,131 +8589,24 @@ impl SearchClient {
                 .collect()
         }
 
-        fn flush_pending_or_group(
-            pending_or_group: &mut SqliteMessageScanGroup,
-            groups: &mut Vec<SqliteMessageScanGroup>,
-        ) {
-            if !pending_or_group.is_empty() {
-                groups.push(std::mem::take(pending_or_group));
-            }
-        }
-
-        fn apply_operand(
-            operand: SqliteMessageScanOperand,
-            next_negated: &mut bool,
-            in_or_sequence: &mut bool,
-            just_saw_or: &mut bool,
-            pending_or_group: &mut SqliteMessageScanGroup,
-            groups: &mut Vec<SqliteMessageScanGroup>,
-        ) {
-            let alternative = SqliteMessageScanAlternative {
-                operand,
-                negated: *next_negated,
-            };
-
-            if *in_or_sequence && *just_saw_or {
-                if pending_or_group.is_empty()
-                    && let Some(previous_group) = groups.pop()
-                {
-                    // The primary frankensearch builder lifts its preceding
-                    // Must/MustNot clause into the tighter-binding OR group.
-                    // Flattening an already-grouped clause is equivalent and
-                    // also handles permissive malformed forms such as
-                    // `A AND OR B` without changing their established meaning.
-                    pending_or_group.extend(previous_group);
-                }
-                pending_or_group.push(alternative);
-            } else {
-                flush_pending_or_group(pending_or_group, groups);
-                *in_or_sequence = false;
-                groups.push(vec![alternative]);
-            }
-
-            *just_saw_or = false;
-            *next_negated = false;
-        }
-
-        let tokens = fs_cass_parse_boolean_query(raw_query);
-        if tokens.is_empty() {
-            return None;
-        }
-
-        let mut groups = Vec::new();
-        let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
-        let mut next_negated = false;
-        let mut in_or_sequence = false;
-        let mut just_saw_or = false;
-        for token in tokens {
-            match token {
-                FsCassQueryToken::And => {
-                    flush_pending_or_group(&mut pending_or_group, &mut groups);
-                    in_or_sequence = false;
-                    just_saw_or = false;
-                    next_negated = false;
-                }
-                FsCassQueryToken::Or => {
-                    in_or_sequence = true;
-                    just_saw_or = true;
-                }
-                FsCassQueryToken::Not => {
-                    if !just_saw_or {
-                        flush_pending_or_group(&mut pending_or_group, &mut groups);
-                        in_or_sequence = false;
-                        just_saw_or = false;
-                    }
-                    // Repeated NOT tokens remain one negation in the pinned
-                    // compatibility grammar; they do not toggle polarity.
-                    next_negated = true;
-                }
+        let tokens = cass_bool_tokens(raw_query);
+        let expr = CassBoolParser::parse(&tokens, |token: &FsCassQueryToken| {
+            Ok(match token {
                 FsCassQueryToken::Term(term) => {
-                    let parts = scan_parts(normalize_wildcard_term_parts(&term));
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    apply_operand(
-                        SqliteMessageScanOperand::Terms(parts),
-                        &mut next_negated,
-                        &mut in_or_sequence,
-                        &mut just_saw_or,
-                        &mut pending_or_group,
-                        &mut groups,
-                    );
-                }
-                FsCassQueryToken::Phrase(phrase) => {
-                    let parts = normalize_phrase_terms(&phrase);
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    apply_operand(
-                        SqliteMessageScanOperand::Phrase(parts),
-                        &mut next_negated,
-                        &mut in_or_sequence,
-                        &mut just_saw_or,
-                        &mut pending_or_group,
-                        &mut groups,
-                    );
-                }
-            }
-        }
-
-        flush_pending_or_group(&mut pending_or_group, &mut groups);
-
-        for group in &mut groups {
-            for alternative in group.iter_mut() {
-                if let SqliteMessageScanOperand::Terms(parts) = &mut alternative.operand {
+                    let mut parts = scan_parts(normalize_wildcard_term_parts(term));
                     parts.sort();
                     parts.dedup();
+                    (!parts.is_empty()).then_some(SqliteMessageScanOperand::Terms(parts))
                 }
-            }
-            group.sort();
-            group.dedup();
-        }
-        groups.retain(|group| !group.is_empty());
-        if groups.is_empty() {
-            return None;
-        }
-
-        Some(SqliteMessageScanQuery { groups })
+                FsCassQueryToken::Phrase(phrase) => {
+                    let parts = normalize_phrase_terms(phrase);
+                    (!parts.is_empty()).then_some(SqliteMessageScanOperand::Phrase(parts))
+                }
+                FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => None,
+            })
+        })
+        .ok()??;
+        Some(SqliteMessageScanQuery { expr })
     }
 
     fn sqlite_message_scan_score(haystacks: &[String], scan_query: &SqliteMessageScanQuery) -> f32 {
@@ -8324,29 +8645,31 @@ impl SearchClient {
             }
         };
 
-        let mut score = 0.0f32;
-        for group in &scan_query.groups {
-            let mut group_matched = false;
-            let mut group_score = 0.0f32;
-            for alternative in group {
-                let alternative_score = operand_score(&alternative.operand);
-                let alternative_matched = if alternative.negated {
-                    alternative_score <= 0.0
-                } else {
-                    alternative_score > 0.0
-                };
-                if alternative_matched {
-                    group_matched = true;
-                    if !alternative.negated {
-                        group_score = group_score.max(alternative_score);
-                    }
+        /// `None` when the row does not match; otherwise the positive score
+        /// it earned (an excluded operand matches with zero).
+        fn evaluate(
+            expr: &CassBoolExpr<SqliteMessageScanOperand>,
+            operand_score: &dyn Fn(&SqliteMessageScanOperand) -> f32,
+        ) -> Option<f32> {
+            match expr {
+                CassBoolExpr::Operand(operand) => {
+                    let score = operand_score(operand);
+                    (score > 0.0).then_some(score)
                 }
+                CassBoolExpr::Not(inner) => evaluate(inner, operand_score).is_none().then_some(0.0),
+                CassBoolExpr::And(operands) => operands
+                    .iter()
+                    .map(|operand| evaluate(operand, operand_score))
+                    .sum(),
+                CassBoolExpr::Or(operands) => operands
+                    .iter()
+                    .filter_map(|operand| evaluate(operand, operand_score))
+                    .reduce(f32::max),
             }
-            if !group_matched {
-                return 0.0;
-            }
-            score += group_score;
         }
+        let Some(score) = evaluate(&scan_query.expr, &operand_score) else {
+            return 0.0;
+        };
 
         // A negative-only query has no positive relevance contribution, but
         // its complement matches still need a non-zero sentinel so the caller
@@ -9378,210 +9701,93 @@ pub fn fuzz_transpile_to_fts5(raw_query: &str) -> Option<String> {
     transpile_to_fts5(raw_query)
 }
 
-/// Transpile a raw query string into an FTS5-compatible query string.
-/// Preserves custom precedence (OR > AND) by adding parentheses.
-/// Returns None if the query contains features unsupported by FTS5 (e.g. leading wildcards).
+/// Transpile a raw query into an FTS5 query with the lexical parser's meaning
+/// (see [`CassBoolExpr`]). Every compound operand is parenthesized, so the
+/// result does not lean on the FTS5 engine's own precedence. Returns None
+/// when FTS5 cannot express the query (a leading or inner wildcard, or a
+/// complement: an OR operand or a conjunction made only of NOTs, since FTS5
+/// NOT is binary), so the caller falls back to a source scan instead of
+/// answering a different question.
 fn transpile_to_fts5(raw_query: &str) -> Option<String> {
-    let tokens = fs_cass_parse_boolean_query(raw_query);
-    if tokens.is_empty() {
-        return Some("".to_string());
+    let tokens = cass_bool_tokens(raw_query);
+    let expr = CassBoolParser::parse(&tokens, |token: &FsCassQueryToken| match token {
+        FsCassQueryToken::Term(t) => {
+            if matches!(
+                FsCassWildcardPattern::parse(t),
+                FsCassWildcardPattern::Suffix(_)
+                    | FsCassWildcardPattern::Substring(_)
+                    | FsCassWildcardPattern::Complex(_)
+            ) {
+                return Err(CassBoolUnsupported);
+            }
+            // Split punctuation into porter-aligned fragments first so
+            // fallback queries match SQLite tokenization: a punctuated term
+            // like `foo-bar` becomes `(foo AND bar)`.
+            let term_parts = normalize_term_parts(t);
+            if term_parts.is_empty() {
+                return Ok(None);
+            }
+            let rendered_parts = term_parts
+                .iter()
+                .map(|part| render_fts5_term_part(part).ok_or(CassBoolUnsupported))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(if rendered_parts.len() > 1 {
+                format!("({})", rendered_parts.join(" AND "))
+            } else {
+                rendered_parts[0].clone()
+            }))
+        }
+        FsCassQueryToken::Phrase(p) => {
+            let phrase_parts = normalize_phrase_terms(p);
+            Ok((!phrase_parts.is_empty()).then(|| format!("\"{}\"", phrase_parts.join(" "))))
+        }
+        FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => Ok(None),
+    })
+    .ok()?;
+    match expr {
+        None => Some(String::new()),
+        Some(expr) => render_fts5_expr(&expr),
     }
+}
 
-    let mut fts_clauses: Vec<(&str, String)> = Vec::new();
-    let mut pending_or_group: Vec<String> = Vec::new();
-    let mut next_op = "AND";
-    let mut in_or_sequence = false;
-    let mut just_saw_or = false;
-    for token in tokens {
-        match token {
-            FsCassQueryToken::And => {
-                if !pending_or_group.is_empty() {
-                    let group = if pending_or_group.len() > 1 {
-                        format!("({})", pending_or_group.join(" OR "))
-                    } else {
-                        pending_or_group.pop().unwrap_or_default()
-                    };
-                    fts_clauses.push(("AND", group));
-                    pending_or_group.clear();
-                }
-                in_or_sequence = false;
-                just_saw_or = false;
-                next_op = "AND";
-            }
-            FsCassQueryToken::Or => {
-                if fts_clauses.is_empty() && pending_or_group.is_empty() {
-                    // Be permissive with a leading OR the same way we already
-                    // salvage a leading AND: ignore it instead of turning the
-                    // whole fallback query into an empty result set.
-                    continue;
-                }
-                if next_op == "NOT" {
-                    // The pinned parser accepts permissive token sequences such
-                    // as `A NOT OR B` and interprets them as `A OR NOT B`.
-                    // FTS5 has no match-all operand with which to express that
-                    // complement branch, so fail over to the source scan rather
-                    // than silently broadening it to `A OR B`.
-                    return None;
-                }
-                // Start or continue an OR group. Unsupported `OR NOT` forms
-                // are rejected when the subsequent NOT token arrives.
-                in_or_sequence = true;
-                just_saw_or = true;
-            }
-            FsCassQueryToken::Not => {
-                // FTS5 supports binary (`foo NOT bar`) NOT, but not a leading
-                // unary-NOT query (`NOT foo`). We also reject `OR NOT` groupings
-                // in the fallback transpiler.
-                if just_saw_or {
-                    return None;
-                }
-
-                if fts_clauses.is_empty() && pending_or_group.is_empty() {
-                    return None;
-                }
-
-                if !pending_or_group.is_empty() {
-                    let group = if pending_or_group.len() > 1 {
-                        format!("({})", pending_or_group.join(" OR "))
-                    } else {
-                        pending_or_group.pop().unwrap_or_default()
-                    };
-                    fts_clauses.push(("AND", group));
-                    pending_or_group.clear();
-                }
-                in_or_sequence = false;
-                just_saw_or = false;
-                next_op = "NOT";
-            }
-            FsCassQueryToken::Term(t) => {
-                let raw_pattern = FsCassWildcardPattern::parse(&t);
-                if matches!(
-                    raw_pattern,
-                    FsCassWildcardPattern::Suffix(_)
-                        | FsCassWildcardPattern::Substring(_)
-                        | FsCassWildcardPattern::Complex(_)
-                ) {
-                    return None;
-                }
-
-                // Sanitize and normalize. FTS5 implicitly ANDs words in a string,
-                // but we split punctuation into porter-aligned fragments first so
-                // fallback queries match SQLite tokenization.
-                let term_parts = normalize_term_parts(&t);
-                if term_parts.is_empty() {
-                    continue;
-                }
-
-                let mut rendered_parts = Vec::with_capacity(term_parts.len());
-                for part in &term_parts {
-                    rendered_parts.push(render_fts5_term_part(part)?);
-                }
-
-                // If multiple parts, wrap in parens and join with AND so a
-                // punctuated term like `foo-bar` becomes `(foo AND bar)`.
-                let fts_term = if rendered_parts.len() > 1 {
-                    format!("({})", rendered_parts.join(" AND "))
-                } else {
-                    rendered_parts[0].clone()
-                };
-
-                if in_or_sequence && just_saw_or {
-                    if pending_or_group.is_empty() {
-                        let (op, _) = fts_clauses.last()?;
-                        if *op != "AND" {
-                            // `(... NOT ...) OR ...` cannot be represented
-                            // with our FTS5 fallback transpilation.
-                            return None;
-                        }
-                        let (_, val) = fts_clauses.pop()?;
-                        pending_or_group.push(val);
-                    }
-                    pending_or_group.push(fts_term);
-                    in_or_sequence = true;
-                } else {
-                    if !pending_or_group.is_empty() {
-                        let group = if pending_or_group.len() > 1 {
-                            format!("({})", pending_or_group.join(" OR "))
-                        } else {
-                            pending_or_group.pop().unwrap_or_default()
-                        };
-                        fts_clauses.push(("AND", group));
-                        pending_or_group.clear();
-                    }
-                    in_or_sequence = false;
-                    fts_clauses.push((next_op, fts_term));
-                }
-                just_saw_or = false;
-                next_op = "AND";
-            }
-            FsCassQueryToken::Phrase(p) => {
-                let phrase_parts = normalize_phrase_terms(&p);
-                if phrase_parts.is_empty() {
-                    continue;
-                }
-                let fts_phrase = format!("\"{}\"", phrase_parts.join(" "));
-
-                if in_or_sequence && just_saw_or {
-                    if pending_or_group.is_empty() {
-                        let (op, _) = fts_clauses.last()?;
-                        if *op != "AND" {
-                            // `(... NOT ...) OR ...` cannot be represented
-                            // with our FTS5 fallback transpilation.
-                            return None;
-                        }
-                        let (_, val) = fts_clauses.pop()?;
-                        pending_or_group.push(val);
-                    }
-                    pending_or_group.push(fts_phrase);
-                    in_or_sequence = true;
-                } else {
-                    if !pending_or_group.is_empty() {
-                        let group = if pending_or_group.len() > 1 {
-                            format!("({})", pending_or_group.join(" OR "))
-                        } else {
-                            pending_or_group.pop().unwrap_or_default()
-                        };
-                        fts_clauses.push(("AND", group));
-                        pending_or_group.clear();
-                    }
-                    in_or_sequence = false;
-                    fts_clauses.push((next_op, fts_phrase));
-                }
-                just_saw_or = false;
-                next_op = "AND";
-            }
+/// FTS5 text for `expr`, or None for a complement FTS5 cannot express.
+fn render_fts5_expr(expr: &CassBoolExpr<String>) -> Option<String> {
+    fn grouped(expr: &CassBoolExpr<String>) -> Option<String> {
+        match expr {
+            CassBoolExpr::Operand(text) => Some(text.clone()),
+            compound => render_fts5_expr(compound).map(|text| format!("({text})")),
         }
     }
-
-    if !pending_or_group.is_empty() {
-        let group = if pending_or_group.len() > 1 {
-            format!("({})", pending_or_group.join(" OR "))
-        } else {
-            pending_or_group.pop().unwrap_or_default()
-        };
-        fts_clauses.push((next_op, group));
-    }
-
-    if fts_clauses.is_empty() {
-        return Some("".to_string());
-    }
-
-    // Safety guard: the fallback transpiler must never emit NOT as the first
-    // operator because SQLite FTS5 requires a left operand.
-    if fts_clauses.first().is_some_and(|(op, _)| *op == "NOT") {
-        return None;
-    }
-
-    // Join clauses. The first operator is ignored (start of query).
-    let mut query = String::new();
-    for (i, (op, text)) in fts_clauses.into_iter().enumerate() {
-        if i > 0 {
-            query.push_str(&format!(" {} ", op));
+    match expr {
+        CassBoolExpr::Operand(text) => Some(text.clone()),
+        CassBoolExpr::Not(_) => None,
+        CassBoolExpr::Or(operands) => Some(
+            operands
+                .iter()
+                .map(grouped)
+                .collect::<Option<Vec<_>>>()?
+                .join(" OR "),
+        ),
+        CassBoolExpr::And(operands) => {
+            let mut included = Vec::new();
+            let mut excluded = Vec::new();
+            for operand in operands {
+                match operand {
+                    CassBoolExpr::Not(inner) => excluded.push(grouped(inner)?),
+                    other => included.push(grouped(other)?),
+                }
+            }
+            if included.is_empty() {
+                return None;
+            }
+            let mut text = included.join(" AND ");
+            for exclusion in excluded {
+                text.push_str(" NOT ");
+                text.push_str(&exclusion);
+            }
+            Some(text)
         }
-        query.push_str(&text);
     }
-
-    Some(query)
 }
 
 #[derive(Default, Clone)]
@@ -9727,9 +9933,21 @@ fn maybe_spawn_warm_worker(
                 }
                 last_run = now;
                 let reload_started = Instant::now();
-                if let Err(err) = crate::search::quill_bridge::refresh_reader(&reader) {
-                    tracing::warn!(error = ?err, "warm_worker_reload_failed");
-                    continue;
+                match crate::search::quill_bridge::refresh_reader_or_detect_republish(&reader) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        // Its clone of the reader belongs to the old lineage;
+                        // warming it would only warm files that are gone.
+                        tracing::debug!(
+                            reason,
+                            "warm worker stops: its lexical index was republished"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "warm_worker_reload_failed");
+                        continue;
+                    }
                 }
                 let elapsed = reload_started.elapsed();
                 let epoch = reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -10104,7 +10322,7 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 impl SearchClient {
     /// Return the total number of indexed Tantivy documents.
     pub fn total_docs(&self) -> usize {
-        if let Some((reader, _)) = &self.reader {
+        if let Some((reader, _)) = self.reader.get() {
             return usize::try_from(reader.doc_count().unwrap_or(0)).unwrap_or(usize::MAX);
         }
         self.federated_readers()
@@ -10137,20 +10355,26 @@ impl SearchClient {
         {
             let reload_started = Instant::now();
             let cached_generation = reader.keeper_generation();
-            if let Err(error) = reload_index_readers_bounded(
+            let republished = match reload_index_readers_bounded(
                 vec![reader.clone()],
                 Arc::clone(&self.metrics.reload_in_flight),
             ) {
-                self.metrics
-                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                        cache_hit: true,
-                        cached_generation: Some(cached_generation),
-                        current_generation: cached_generation,
-                        reload_attempted: true,
-                        reload_succeeded: false,
-                        served_fallback: false,
-                    });
-                return Err(error);
+                Ok(republished) => republished,
+                Err(error) => {
+                    self.metrics
+                        .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
+                            cache_hit: true,
+                            cached_generation: Some(cached_generation),
+                            current_generation: cached_generation,
+                            reload_attempted: true,
+                            reload_succeeded: false,
+                            served_fallback: false,
+                        });
+                    return Err(error);
+                }
+            };
+            if republished {
+                self.reopen_republished_lexical_index()?;
             }
             let elapsed = reload_started.elapsed();
             // Rate-limit from completion, not start. This keeps a slow reload
@@ -10176,6 +10400,86 @@ impl SearchClient {
                 "tantivy_reader_reload"
             );
         }
+        Ok(())
+    }
+
+    /// Open the index path again after it was republished as a new lineage
+    /// (a rebuild's directory exchange), the way `open_with_options` opens
+    /// it, and swap the readers in. The rebuild can reuse the old generation
+    /// number, so the prefix cache is cleared here rather than left to
+    /// `track_generation`.
+    fn reopen_republished_lexical_index(&self) -> Result<()> {
+        let Some(index_path) = self.reader.index_path.clone() else {
+            return Err(anyhow!(
+                "the lexical index was republished and this search client has no path to reopen it from"
+            ));
+        };
+        type Opened = (
+            Option<frankensearch::quill::QuillSearchIndex>,
+            Option<Vec<FederatedIndexReader>>,
+        );
+        let opened: Arc<Mutex<Option<Opened>>> = Arc::new(Mutex::new(None));
+        let worker_opened = Arc::clone(&opened);
+        run_reload_bounded(
+            move || {
+                let single = crate::search::quill_bridge::open_cass_reader(&index_path).ok();
+                let federated = if single.is_none() {
+                    crate::search::tantivy::open_federated_search_readers(&index_path)
+                        .ok()
+                        .flatten()
+                        .filter(|readers| !readers.is_empty())
+                        .map(|readers| {
+                            readers
+                                .into_iter()
+                                .map(|(reader, fields)| FederatedIndexReader { reader, fields })
+                                .collect::<Vec<_>>()
+                        })
+                } else {
+                    None
+                };
+                if single.is_none() && federated.is_none() {
+                    return Err(format!(
+                        "reopening the republished lexical index at {}: no readable index",
+                        index_path.display()
+                    ));
+                }
+                *worker_opened.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((single, federated));
+                Ok(())
+            },
+            Arc::clone(&self.metrics.reload_in_flight),
+            *SEARCHER_RELOAD_TIMEOUT,
+        )?;
+        let (single, federated) = opened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| anyhow!("the lexical reopen worker returned no readers"))?;
+        *self.reader.current.write() = single.map(|reader| {
+            (
+                reader,
+                crate::search::quill_bridge::QuillCassFields::compiled(),
+            )
+        });
+        match federated {
+            Some(readers) => {
+                FEDERATED_SEARCH_READERS
+                    .write()
+                    .insert(self.cache_namespace.clone(), Arc::new(readers));
+            }
+            None => {
+                FEDERATED_SEARCH_READERS
+                    .write()
+                    .remove(&self.cache_namespace);
+            }
+        }
+        if let Ok(mut cache) = self.prefix_cache.lock() {
+            cache.clear();
+        }
+        *self
+            .last_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         Ok(())
     }
 
@@ -10361,6 +10665,25 @@ impl SearchClient {
             .and_then(|slot| *slot)
     }
 
+    fn record_wildcard_fallback_skip(&self, reason: Option<&'static str>) {
+        if let Ok(mut slot) = self.last_wildcard_fallback_skip.lock() {
+            *slot = reason;
+        }
+    }
+
+    /// Why the most recent `search_with_fallback` skipped the automatic
+    /// wildcard retry a sparse result would otherwise get, if it did. See
+    /// [`WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX`],
+    /// [`WILDCARD_FALLBACK_SKIPPED_DISABLED`] and
+    /// [`WILDCARD_FALLBACK_SKIPPED_LONG_TERM`] (2l1b0.68).
+    #[must_use]
+    pub fn wildcard_fallback_skipped_reason(&self) -> Option<&'static str> {
+        self.last_wildcard_fallback_skip
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+    }
+
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, searcher_cache, shortfall, reloads, reload_ms_total) =
             self.metrics.snapshot_all();
@@ -10480,7 +10803,7 @@ mod tests {
 
     fn cass_layer_b_test_client(connection: Option<SearchSqliteConnection>) -> SearchClient {
         SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(connection),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -10496,6 +10819,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         }
     }
 
@@ -11876,7 +12200,7 @@ mod tests {
                 )
             });
         let client = SearchClient {
-            reader,
+            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -11892,6 +12216,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
@@ -12649,7 +12974,7 @@ mod tests {
     #[test]
     fn cache_skips_complex_queries() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12665,6 +12990,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
@@ -12701,7 +13027,7 @@ mod tests {
     #[test]
     fn cache_prefix_lookup_handles_utf8_boundaries() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12717,6 +13043,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -12913,7 +13240,7 @@ mod tests {
     #[test]
     fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12929,6 +13256,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -13455,7 +13783,7 @@ mod tests {
                 (1, 1, 0, 'the error_handler fired', 1);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13471,6 +13799,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13538,7 +13867,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13554,6 +13883,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13626,7 +13956,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13642,6 +13972,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13730,7 +14061,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader,
+            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13746,6 +14077,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let sqlite_hits = client.search_sqlite_fts5(
@@ -13836,7 +14168,7 @@ mod tests {
         // Opening via sqlite_guard() must remain read-only. A search path
         // should not trigger heavyweight derived-index repair.
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13852,6 +14184,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let guard = client
@@ -13956,7 +14289,7 @@ mod tests {
         }
 
         let client = Arc::new(SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13972,6 +14305,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         });
         let worker_count = 4;
         let start = Arc::new(std::sync::Barrier::new(worker_count + 1));
@@ -14244,7 +14578,7 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14260,6 +14594,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let guard = client.sqlite_guard()?;
@@ -14412,7 +14747,7 @@ mod tests {
             ],
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14428,6 +14763,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let direct_hits = client.search_sqlite_fts5(
             Path::new(":memory:"),
@@ -14550,7 +14886,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14566,6 +14902,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let fallback_key = (
@@ -14685,7 +15022,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14701,6 +15038,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -14803,7 +15141,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14819,6 +15157,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let local_hits = client.browse_by_date(
@@ -14932,7 +15271,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -14948,6 +15287,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let remote_hits = client.search(
@@ -15094,7 +15434,7 @@ mod tests {
         );
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15110,6 +15450,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -15151,8 +15492,12 @@ mod tests {
         Ok(())
     }
 
+    /// 2l1b0.52: the scan lane evaluates the lexical engine's standard
+    /// grammar (NOT, then AND, then OR; parentheses group). Negative controls:
+    /// the legacy OR-binds-tighter reading rejected "beta gamma" for the first
+    /// mixed query and "alpha" for the second.
     #[test]
-    fn sqlite_message_scan_preserves_boolean_or_precedence() {
+    fn sqlite_message_scan_follows_standard_boolean_precedence() {
         fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
             SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
         }
@@ -15163,31 +15508,35 @@ mod tests {
         assert!(score("beta", &simple_or) > 0.0);
         assert_eq!(score("gamma", &simple_or), 0.0);
 
+        // (alpha AND beta) OR gamma
         let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
             .expect("AND followed by OR scan query");
-        assert!(
-            score("alpha gamma", &and_then_or) > 0.0,
-            "alpha AND (beta OR gamma) should accept the gamma branch"
-        );
+        assert!(score("alpha beta", &and_then_or) > 0.0);
+        assert!(score("beta gamma", &and_then_or) > 0.0);
         assert_eq!(score("alpha", &and_then_or), 0.0);
-        assert_eq!(score("beta gamma", &and_then_or), 0.0);
 
+        // alpha OR (beta AND gamma)
         let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
             .expect("OR followed by AND scan query");
-        assert!(
-            score("alpha gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the alpha branch"
-        );
-        assert!(
-            score("beta gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the beta branch"
-        );
-        assert_eq!(score("alpha", &or_then_and), 0.0);
+        assert!(score("alpha", &or_then_and) > 0.0);
+        assert!(score("beta gamma", &or_then_and) > 0.0);
+        assert_eq!(score("beta", &or_then_and), 0.0);
+
+        let grouped = SearchClient::sqlite_message_scan_query("(alpha OR beta) AND gamma")
+            .expect("grouped scan query");
+        assert_eq!(score("alpha", &grouped), 0.0);
+        assert!(score("alpha gamma", &grouped) > 0.0);
+        assert!(score("beta gamma", &grouped) > 0.0);
 
         let binary_not =
             SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
         assert!(score("alpha", &binary_not) > 0.0);
         assert_eq!(score("alpha beta", &binary_not), 0.0);
+
+        let excluded_group =
+            SearchClient::sqlite_message_scan_query("alpha -(beta OR gamma)").expect("NOT group");
+        assert!(score("alpha", &excluded_group) > 0.0);
+        assert_eq!(score("alpha gamma", &excluded_group), 0.0);
     }
 
     #[test]
@@ -15196,14 +15545,13 @@ mod tests {
             SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
         }
 
-        // OR binds tighter than the implicit conjunction around NOT, so this
-        // is `alpha AND (NOT beta OR gamma)` in the pinned primary builder.
+        // (alpha AND NOT beta) OR gamma
         let nested = SearchClient::sqlite_message_scan_query("alpha NOT beta OR gamma")
             .expect("nested negated OR scan query");
         assert!(score("alpha", &nested) > 0.0);
         assert_eq!(score("alpha beta", &nested), 0.0);
         assert!(score("alpha beta gamma", &nested) > 0.0);
-        assert_eq!(score("gamma", &nested), 0.0);
+        assert!(score("gamma", &nested) > 0.0);
 
         let or_not = SearchClient::sqlite_message_scan_query("alpha OR NOT beta")
             .expect("OR-NOT scan query");
@@ -15216,16 +15564,277 @@ mod tests {
         assert!(score("alpha", &standalone_not) > 0.0);
         assert_eq!(score("alpha beta", &standalone_not), 0.0);
 
+        // Negation is parity-based: NOT NOT beta is beta.
         let repeated_not = SearchClient::sqlite_message_scan_query("NOT NOT beta")
             .expect("repeated standalone NOT query");
-        assert!(score("alpha", &repeated_not) > 0.0);
-        assert_eq!(score("alpha beta", &repeated_not), 0.0);
+        assert_eq!(score("alpha", &repeated_not), 0.0);
+        assert!(score("alpha beta", &repeated_not) > 0.0);
 
+        // A NOT with no operand is dropped: alpha OR beta.
         let permissive = SearchClient::sqlite_message_scan_query("alpha NOT OR beta")
             .expect("permissive NOT-before-OR query");
         assert!(score("alpha beta", &permissive) > 0.0);
-        assert_eq!(score("gamma beta", &permissive), 0.0);
-        assert!(score("gamma delta", &permissive) > 0.0);
+        assert!(score("gamma beta", &permissive) > 0.0);
+        assert_eq!(score("gamma delta", &permissive), 0.0);
+    }
+
+    /// Set-algebra reference for the fallback-lane differential (2l1b0.52).
+    #[derive(Debug)]
+    enum BoolReference {
+        Term(usize),
+        Not(Box<BoolReference>),
+        And(Vec<BoolReference>),
+        Or(Vec<BoolReference>),
+    }
+
+    impl BoolReference {
+        const TERMS: [&'static str; 4] = ["kiwiword", "limeword", "mangoword", "plumword"];
+
+        /// Deterministic xorshift, so every run generates the same queries.
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        fn generate(state: &mut u64, depth: usize) -> Self {
+            let roll = Self::next(state) % 10;
+            if depth == 0 || roll < 3 {
+                return Self::Term((Self::next(state) % Self::TERMS.len() as u64) as usize);
+            }
+            let children = |state: &mut u64| -> Vec<Self> {
+                let count = 2 + (Self::next(state) % 2) as usize;
+                (0..count)
+                    .map(|_| Self::generate(state, depth - 1))
+                    .collect()
+            };
+            match roll {
+                3 | 4 => Self::Not(Box::new(Self::generate(state, depth - 1))),
+                5..=7 => Self::And(children(state)),
+                _ => Self::Or(children(state)),
+            }
+        }
+
+        fn matches(&self, row: &[bool]) -> bool {
+            match self {
+                Self::Term(term) => row[*term],
+                Self::Not(inner) => !inner.matches(row),
+                Self::And(children) => children.iter().all(|child| child.matches(row)),
+                Self::Or(children) => children.iter().any(|child| child.matches(row)),
+            }
+        }
+
+        /// Query text that the standard grammar parses back into `self`, with
+        /// the operator spelling (AND, `&&` or implied; OR or `||`; NOT or
+        /// `-`) and any optional grouping chosen by `state`.
+        fn render(&self, state: &mut u64) -> String {
+            match self {
+                Self::Term(term) => Self::TERMS[*term].to_string(),
+                Self::Not(inner) => {
+                    let operand = inner.render_operand(state, true);
+                    if matches!(**inner, Self::Not(_)) || Self::next(state).is_multiple_of(2) {
+                        format!("NOT {operand}")
+                    } else {
+                        format!("-{operand}")
+                    }
+                }
+                Self::And(children) => {
+                    let separator = [" AND ", " && ", " "][(Self::next(state) % 3) as usize];
+                    children
+                        .iter()
+                        .map(|child| child.render_operand(state, matches!(child, Self::Or(_))))
+                        .collect::<Vec<_>>()
+                        .join(separator)
+                }
+                Self::Or(children) => {
+                    let separator = [" OR ", " || "][(Self::next(state) % 2) as usize];
+                    children
+                        .iter()
+                        .map(|child| child.render_operand(state, false))
+                        .collect::<Vec<_>>()
+                        .join(separator)
+                }
+            }
+        }
+
+        /// `self` as an operand: a compound expression is parenthesized when
+        /// precedence requires it, and at random otherwise.
+        fn render_operand(&self, state: &mut u64, required: bool) -> String {
+            let compound = matches!(self, Self::And(_) | Self::Or(_));
+            let text = self.render(state);
+            if compound && (required || Self::next(state).is_multiple_of(2)) {
+                format!("({text})")
+            } else {
+                text
+            }
+        }
+    }
+
+    /// 2l1b0.52: both fallback lanes, the SQLite FTS5 entry point and the
+    /// source-table scan, return exactly the set a set-algebra reference
+    /// computes for generated Boolean queries in every operator spelling,
+    /// with and without redundant grouping, including complements. The FTS5
+    /// entry point hands queries FTS5 cannot express to the scan, so the run
+    /// must exercise both routes. The legacy grammar (OR tighter than AND,
+    /// parentheses ignored) fails most mixed cases.
+    #[test]
+    fn fallback_lanes_match_set_algebra_for_generated_boolean_queries() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES(1, 1, 1, 'local', NULL, 'fixture', '/tmp/fixture.jsonl');",
+        )?;
+        let mut state = 0x21B0_0052_u64;
+        let mut rows: Vec<Vec<bool>> = Vec::new();
+        for id in 1..=48_i64 {
+            let row: Vec<bool> = BoolReference::TERMS
+                .iter()
+                .map(|_| BoolReference::next(&mut state) % 100 < 45)
+                .collect();
+            let mut words = vec![format!("msgid{id}")];
+            words.extend(
+                BoolReference::TERMS
+                    .iter()
+                    .zip(&row)
+                    .filter(|(_, present)| **present)
+                    .map(|(term, _)| (*term).to_string()),
+            );
+            let content = words.join(" ");
+            conn.execute_compat(
+                "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(?1, 1, ?2, ?3, ?1)",
+                params![id, id - 1, content.as_str()],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 VALUES(?1, ?2, 'fixture', 'codex', '/ws', '/tmp/fixture.jsonl', ?1)",
+                params![id, content.as_str()],
+            )?;
+            rows.push(row);
+        }
+        let client = cass_layer_b_test_client(Some(conn.into_connection()));
+        let hit_ids = |hits: Vec<SearchHit>| -> Result<std::collections::BTreeSet<i64>> {
+            hits.iter()
+                .map(|hit| {
+                    hit.content
+                        .split_whitespace()
+                        .find_map(|word| word.strip_prefix("msgid"))
+                        .and_then(|digits| digits.parse().ok())
+                        .ok_or_else(|| anyhow!("hit without a msgid token: {:?}", hit.content))
+                })
+                .collect()
+        };
+
+        let (mut fts5_routed, mut scan_routed, mut proper_subsets) = (0, 0, 0);
+        for case in 0..64 {
+            let expr = BoolReference::generate(&mut state, 3);
+            let query = expr.render_operand(&mut state, false);
+            let expected: std::collections::BTreeSet<i64> = rows
+                .iter()
+                .zip(1_i64..)
+                .filter(|(row, _)| expr.matches(row))
+                .map(|(_, id)| id)
+                .collect();
+            if !expected.is_empty() && expected.len() < rows.len() {
+                proper_subsets += 1;
+            }
+            let route = if transpile_to_fts5(&query).is_some() {
+                fts5_routed += 1;
+                "fts5"
+            } else {
+                scan_routed += 1;
+                "scan"
+            };
+            let via_entry = hit_ids(client.search_sqlite_fts5(
+                Path::new(":memory:"),
+                &query,
+                SearchFilters::default(),
+                1000,
+                0,
+                FieldMask::FULL,
+            )?)?;
+            let via_scan = {
+                let sqlite_guard = client.sqlite_guard()?;
+                let conn = sqlite_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("fixture connection missing"))?;
+                hit_ids(client.search_sqlite_message_scan(
+                    conn,
+                    SqliteMessageScanRequest {
+                        raw_query: &query,
+                        filters: &SearchFilters::default(),
+                        limit: 1000,
+                        offset: 0,
+                        scan_page_rows: 16,
+                        field_mask: FieldMask::FULL,
+                        query_match_type: dominant_match_type(&query),
+                    },
+                )?)?
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "fallback_differential",
+                    "case": case,
+                    "query": query,
+                    "route": route,
+                    "expected": expected.len(),
+                    "entry_hits": via_entry.len(),
+                    "scan_hits": via_scan.len(),
+                })
+            );
+            assert_eq!(
+                via_entry, expected,
+                "case {case}: FTS5 entry point ({route}) for {query:?} = {expr:?}"
+            );
+            assert_eq!(
+                via_scan, expected,
+                "case {case}: source scan for {query:?} = {expr:?}"
+            );
+        }
+        assert!(
+            fts5_routed >= 16 && scan_routed >= 8,
+            "both routes must be exercised: fts5={fts5_routed} scan={scan_routed}"
+        );
+        assert!(
+            proper_subsets >= 32,
+            "too few informative cases: {proper_subsets} of 64"
+        );
+        Ok(())
     }
 
     /// 1t79z: the scan lane honours suffix / substring / complex wildcards
@@ -15578,7 +16187,7 @@ mod tests {
                 (3, 1, 2, 'gamma delta', 3);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15594,6 +16203,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -15651,7 +16261,7 @@ mod tests {
                 (3, 1, 2, 'plain hauler text', 3);",
         )?;
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15667,6 +16277,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let contents = |query: &str| -> Result<HashSet<String>> {
             Ok(client
@@ -15758,7 +16369,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15774,6 +16385,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -15854,7 +16466,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15870,6 +16482,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16298,7 +16911,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16314,6 +16927,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16372,7 +16986,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16388,6 +17002,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16462,7 +17077,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16478,6 +17093,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16580,7 +17196,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16596,6 +17212,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16667,7 +17284,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16683,6 +17300,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16761,7 +17379,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16777,6 +17395,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16845,7 +17464,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16861,6 +17480,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16929,7 +17549,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -16945,6 +17565,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17014,7 +17635,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17030,6 +17651,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17137,7 +17759,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17153,6 +17775,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -17266,7 +17889,7 @@ mod tests {
     #[test]
     fn track_generation_clears_cache_on_change() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17282,6 +17905,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17329,7 +17953,7 @@ mod tests {
     #[test]
     fn cache_total_cap_evicts_across_shards() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
@@ -17345,6 +17969,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17385,7 +18010,7 @@ mod tests {
     #[test]
     fn cache_stats_reflect_metrics() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17401,6 +18026,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -17427,7 +18053,7 @@ mod tests {
     fn adaptive_query_prewarm_schedules_only_after_hot_prefix_cache_entry() {
         let (tx, rx) = mpsc::unbounded();
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(10, 0)),
@@ -17443,6 +18069,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/tmp/cass-workspace".into());
@@ -17492,7 +18119,7 @@ mod tests {
 
         let (tx, rx) = mpsc::unbounded();
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(10, byte_cap)),
@@ -17508,6 +18135,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
         let filters = SearchFilters::default();
 
@@ -17535,7 +18163,7 @@ mod tests {
     fn cache_eviction_count_tracks_evictions() {
         // tiny entry cap (2 entries), no byte cap - forces evictions
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
@@ -17551,6 +18179,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17748,7 +18377,7 @@ mod tests {
     fn cache_byte_cap_triggers_eviction() {
         // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
@@ -17764,6 +18393,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -19116,7 +19746,7 @@ mod tests {
     #[test]
     fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19132,6 +19762,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -19210,7 +19841,7 @@ mod tests {
     fn search_with_fallback_skips_for_nonzero_offset() -> Result<()> {
         // Even with zero hits, fallback should not run when paginating (offset > 0)
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19226,6 +19857,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -19256,7 +19888,7 @@ mod tests {
     fn generate_suggestions_limits_and_sets_shortcuts() -> Result<()> {
         // Build a client without backends; suggestions are purely local heuristics
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -19272,6 +19904,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -20332,7 +20965,7 @@ mod tests {
     fn filter_fidelity_cache_key_isolation() {
         // Different filters should have different cache keys
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20348,6 +20981,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -20488,14 +21122,40 @@ mod tests {
         assert_eq!(transpile_to_fts5("-foo"), None);
     }
 
+    /// 2l1b0.52: the fallback follows the lexical parser's standard grammar,
+    /// parentheses included, and refuses only what FTS5 cannot express: a
+    /// complement (an OR operand, or a conjunction of NOTs alone).
     #[test]
-    fn transpile_to_fts5_rejects_or_not_forms_it_cannot_represent() {
+    fn transpile_to_fts5_rejects_only_forms_fts5_cannot_express() {
         assert_eq!(transpile_to_fts5("foo OR NOT bar"), None);
-        assert_eq!(transpile_to_fts5("foo NOT bar OR baz"), None);
+        assert_eq!(transpile_to_fts5("NOT foo NOT bar"), None);
         assert_eq!(
-            transpile_to_fts5("foo NOT OR bar"),
-            None,
-            "permissive NOT-before-OR syntax must not broaden to foo OR bar"
+            transpile_to_fts5("(foo OR bar) baz").as_deref(),
+            Some("(foo OR bar) AND baz")
+        );
+        assert_eq!(
+            transpile_to_fts5("foo -(bar OR baz)").as_deref(),
+            Some("foo NOT (bar OR baz)")
+        );
+        assert_eq!(transpile_to_fts5("x&&(y)").as_deref(), Some("x AND y"));
+        // Negative: without grouping this reads foo OR (bar AND baz).
+        assert_eq!(
+            transpile_to_fts5("foo OR bar baz").as_deref(),
+            Some("foo OR (bar AND baz)")
+        );
+        assert_eq!(
+            transpile_to_fts5("foo NOT bar OR baz").as_deref(),
+            Some("(foo NOT bar) OR baz")
+        );
+        // A NOT with no operand is dropped, as the lexical parser drops it.
+        assert_eq!(
+            transpile_to_fts5("foo NOT OR bar").as_deref(),
+            Some("foo OR bar")
+        );
+        // A `(` inside a word is a term character, not a group.
+        assert_eq!(
+            transpile_to_fts5("foo(bar)").as_deref(),
+            Some("(foo AND bar)")
         );
     }
 
@@ -20532,14 +21192,14 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("foo OR bar NOT baz"),
-            Some("(foo OR bar) NOT baz".to_string())
+            Some("foo OR (bar NOT baz)".to_string())
         );
     }
 
     #[test]
     fn search_sqlite_fts5_returns_empty_when_sqlite_is_unavailable() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20555,6 +21215,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -20681,7 +21342,7 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20697,6 +21358,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Hit-key tuple: (source_path, line_number) is the stable
@@ -21215,6 +21877,62 @@ mod tests {
         assert!(exp.parsed.operators.contains(&"AND".to_string()));
     }
 
+    /// 2l1b0.52: `--explain` shows how the engine groups the query, so an
+    /// agent never infers precedence from the text. Negative control: the
+    /// legacy grammar grouped `a OR b c` as `(a OR b) AND c`.
+    #[test]
+    fn explanation_shows_the_grouping_the_engine_applies() {
+        let structure = |raw: &str| {
+            QueryExplanation::analyze(raw, &SearchFilters::default())
+                .parsed
+                .structure
+        };
+        assert_eq!(structure("a OR b c").as_deref(), Some("a OR (b AND c)"));
+        assert_eq!(structure("(a OR b) c").as_deref(), Some("(a OR b) AND c"));
+        assert_eq!(
+            structure("a -(b OR \"c d\")").as_deref(),
+            Some("a AND NOT (b OR \"c d\")")
+        );
+        assert_eq!(structure("NOT NOT a").as_deref(), Some("a"));
+        assert_eq!(structure("").as_deref(), None);
+    }
+
+    /// Unbalanced parentheses are recovered, not rejected, and `--explain`
+    /// says how: the grouping shown is the one searched.
+    #[test]
+    fn explanation_reports_recovered_parentheses() {
+        let explain = |raw: &str| QueryExplanation::analyze(raw, &SearchFilters::default());
+        let recovery = |warnings: &[String]| {
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("'('") || warning.contains("'()'"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let unclosed = explain("kiwi AND (lime OR mango");
+        assert_eq!(
+            unclosed.parsed.structure.as_deref(),
+            Some("kiwi AND (lime OR mango)")
+        );
+        assert_eq!(
+            recovery(&unclosed.warnings),
+            ["1 unclosed '(' closed at the end of the query"]
+        );
+
+        let empty = explain("kiwi () lime");
+        assert_eq!(empty.parsed.structure.as_deref(), Some("kiwi AND lime"));
+        assert_eq!(recovery(&empty.warnings), ["1 empty '()' skipped"]);
+
+        // Balanced groups, and parentheses inside a word, recover nothing.
+        for balanced in ["(kiwi OR lime) mango", "call foo(bar) now", "kiwi lime)"] {
+            assert!(
+                recovery(&explain(balanced).warnings).is_empty(),
+                "{balanced:?} needs no recovery"
+            );
+        }
+    }
+
     #[test]
     fn explanation_classifies_phrase_query() {
         let exp = QueryExplanation::analyze("\"exact phrase\"", &SearchFilters::default());
@@ -21470,7 +22188,7 @@ mod tests {
     #[test]
     fn cache_metrics_incremented_on_operations() {
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -21486,6 +22204,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -21510,7 +22229,7 @@ mod tests {
     fn cache_shard_name_deterministic() {
         // Verify that shard name generation is deterministic for same filters
         let client = SearchClient {
-            reader: None,
+            reader: LexicalReaderSlot::default(),
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -21526,6 +22245,7 @@ mod tests {
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
             last_lexical_degrade_reason: Mutex::new(None),
+            last_wildcard_fallback_skip: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();
@@ -25016,39 +25736,40 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("foo OR bar"),
-            Some("(foo OR bar)".to_string())
+            Some("foo OR bar".to_string())
         );
         assert_eq!(transpile_to_fts5("OR foo"), Some("foo".to_string()));
         assert_eq!(transpile_to_fts5("NOT foo"), None);
 
-        // Precedence: OR binds tighter than AND in our parser logic
-        // "A AND B OR C" -> "A AND (B OR C)"
+        // Standard precedence (2l1b0.52): AND binds tighter than OR, and the
+        // result is an OR of explicitly parenthesized AND-groups. The legacy
+        // grammar read "A AND B OR C" as "A AND (B OR C)".
         assert_eq!(
             transpile_to_fts5("A AND B OR C"),
-            Some("A AND (B OR C)".to_string())
+            Some("(A AND B) OR C".to_string())
         );
-
-        // "A OR B AND C" -> "(A OR B) AND C"
         assert_eq!(
             transpile_to_fts5("A OR B AND C"),
-            Some("(A OR B) AND C".to_string())
+            Some("A OR (B AND C)".to_string())
         );
-
-        // "A OR B OR C" -> "(A OR B OR C)"
         assert_eq!(
             transpile_to_fts5("A OR B OR C"),
-            Some("(A OR B OR C)".to_string())
+            Some("A OR B OR C".to_string())
         );
 
-        // An implicit conjunction ends the OR sequence just like an explicit
-        // AND. Remaining in OR mode here would silently broaden the query.
+        // An implicit conjunction binds like an explicit AND.
         assert_eq!(
             transpile_to_fts5("A OR B C"),
-            Some("(A OR B) AND C".to_string())
+            Some("A OR (B AND C)".to_string())
         );
         assert_eq!(
             transpile_to_fts5("A OR B C OR D"),
-            Some("(A OR B) AND (C OR D)".to_string())
+            Some("A OR (B AND C) OR D".to_string())
+        );
+        // Negation is parity-based.
+        assert_eq!(
+            transpile_to_fts5("A NOT NOT B"),
+            Some("A AND B".to_string())
         );
 
         // Phrases

@@ -52,6 +52,10 @@ const elements = {
   unlockBtn: null,
   togglePassword: null,
   qrBtn: null,
+  recoveryKeyBtn: null,
+  recoveryKeyForm: null,
+  recoveryKeyInput: null,
+  recoveryKeySubmit: null,
   qrScanner: null,
   qrReader: null,
   qrCancelBtn: null,
@@ -131,6 +135,10 @@ function cacheElements() {
   elements.unlockBtn = document.getElementById("unlock-btn");
   elements.togglePassword = document.getElementById("toggle-password");
   elements.qrBtn = document.getElementById("qr-btn");
+  elements.recoveryKeyBtn = document.getElementById("recovery-key-btn");
+  elements.recoveryKeyForm = document.getElementById("recovery-key-form");
+  elements.recoveryKeyInput = document.getElementById("recovery-key-input");
+  elements.recoveryKeySubmit = document.getElementById("recovery-key-submit");
   elements.qrScanner = document.getElementById("qr-scanner");
   elements.qrReader = document.getElementById("qr-reader");
   elements.qrCancelBtn = document.getElementById("qr-cancel-btn");
@@ -161,6 +169,10 @@ function setupEventListeners() {
   // QR scanner
   elements.qrBtn?.addEventListener("click", openQrScanner);
   elements.qrCancelBtn?.addEventListener("click", closeQrScanner);
+
+  // Typed recovery key (the text `cass pages key add-recovery` prints)
+  elements.recoveryKeyBtn?.addEventListener("click", toggleRecoveryKeyForm);
+  elements.recoveryKeyForm?.addEventListener("submit", handleRecoveryKeySubmit);
 
   // Fingerprint help tooltip
   elements.fingerprintHelp?.addEventListener("click", toggleFingerprintTooltip);
@@ -433,6 +445,8 @@ function setupUnencryptedMode() {
   divider?.classList.add("hidden");
 
   elements.qrBtn?.classList.add("hidden");
+  elements.recoveryKeyBtn?.classList.add("hidden");
+  elements.recoveryKeyForm?.classList.add("hidden");
   elements.togglePassword?.classList.add("hidden");
 
   if (elements.unlockBtn) {
@@ -767,9 +781,17 @@ function handleQrSuccess(decodedText) {
   }
 
   void closeQrScanner();
+  unlockWithRecoveryText(decodedText, "Deriving key from QR...");
+}
 
+/**
+ * Unlock with recovery text from a QR scan or typed by the user: the JSON
+ * payload the QR carries, or the bare secret `cass pages key add-recovery`
+ * prints. Both reach the worker's UNLOCK_RECOVERY path unchanged.
+ */
+function unlockWithRecoveryText(text, progressText) {
   hideError();
-  showProgress("Deriving key from QR...");
+  showProgress(progressText);
   disableForm();
   unlockInFlight = true;
   activeUnlockRequestId = allocateWorkerRequestId();
@@ -777,10 +799,10 @@ function handleQrSuccess(decodedText) {
   // Try to parse as JSON recovery data, or use raw text as recovery secret
   let recoverySecret;
   try {
-    const data = JSON.parse(decodedText);
-    recoverySecret = data.recovery_secret || data.secret || decodedText;
+    const data = JSON.parse(text);
+    recoverySecret = data.recovery_secret || data.secret || text;
   } catch {
-    recoverySecret = decodedText;
+    recoverySecret = text;
   }
 
   // Send unlock request to worker
@@ -790,6 +812,41 @@ function handleQrSuccess(decodedText) {
     config: config,
     requestId: activeUnlockRequestId,
   });
+}
+
+/**
+ * Show or hide the typed recovery-key form
+ */
+function toggleRecoveryKeyForm() {
+  const form = elements.recoveryKeyForm;
+  if (!form) {
+    return;
+  }
+  const opening = form.classList.contains("hidden");
+  form.classList.toggle("hidden", !opening);
+  elements.recoveryKeyBtn?.setAttribute("aria-expanded", String(opening));
+  if (opening) {
+    elements.recoveryKeyInput?.focus();
+  }
+}
+
+/**
+ * Unlock with a typed recovery key
+ */
+function handleRecoveryKeySubmit(event) {
+  event.preventDefault();
+  if (unlockInFlight || decryptInFlight) {
+    return;
+  }
+  const input = elements.recoveryKeyInput;
+  const recoveryText = input?.value.trim() ?? "";
+  if (!recoveryText) {
+    showError("Enter the recovery key");
+    return;
+  }
+  // The secret leaves the DOM as soon as it is handed to the worker.
+  input.value = "";
+  unlockWithRecoveryText(recoveryText, "Deriving key from recovery key...");
 }
 
 /**
@@ -1657,6 +1714,19 @@ function disableForm() {
   elements.passwordInput.disabled = true;
   elements.unlockBtn.disabled = true;
   elements.qrBtn.disabled = true;
+  setRecoveryKeyControlsDisabled(true);
+}
+
+function setRecoveryKeyControlsDisabled(disabled) {
+  for (const control of [
+    elements.recoveryKeyBtn,
+    elements.recoveryKeyInput,
+    elements.recoveryKeySubmit,
+  ]) {
+    if (control) {
+      control.disabled = disabled;
+    }
+  }
 }
 
 /**
@@ -1666,6 +1736,7 @@ function enableForm() {
   elements.passwordInput.disabled = false;
   elements.unlockBtn.disabled = false;
   elements.qrBtn.disabled = false;
+  setRecoveryKeyControlsDisabled(false);
 }
 
 /**

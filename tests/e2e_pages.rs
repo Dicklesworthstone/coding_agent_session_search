@@ -1173,6 +1173,14 @@ fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
         "Hide workspace paths and file names? (for privacy)",
     );
     send_line_and_wait(&mut *writer, &captured, "", "keeping metadata visible");
+    // 2l1b0.60: step 4 asks for the share profile when no flag chose one.
+    wait_for_prompt(&captured, "Share profile");
+    send_line_and_wait(
+        &mut *writer,
+        &captured,
+        "",
+        "accepting the default share profile",
+    );
     wait_for_prompt(&captured, "Where would you like to deploy?");
     send_line_and_wait(
         &mut *writer,

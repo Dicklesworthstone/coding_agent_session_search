@@ -1081,7 +1081,7 @@
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
+          "description": "Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -2517,6 +2517,17 @@
           ]
         },
         {
+          "name": "repair-leaked-pages",
+          "description": "Free leaked pages (integrity_check's \"page N is never used\": pages no table, index or freelist owns) in place. Refuses any other integrity damage. Supports `--dry-run`; mutation requires `--yes` and backs up the live bundle first (`cass doctor backups restore`)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "cleanup-interrupted-artifacts",
           "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
           "arg_type": "flag",
@@ -2935,8 +2946,9 @@
         },
         {
           "name": "include-tools",
-          "description": "Include tool calls in export (default: true)",
-          "arg_type": "flag",
+          "description": "Include tool calls in the export; `--include-tools=false` omits them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2946,8 +2958,9 @@
         },
         {
           "name": "show-timestamps",
-          "description": "Show message timestamps",
-          "arg_type": "flag",
+          "description": "Show message timestamps; `--show-timestamps=false` hides them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -3273,6 +3286,18 @@
           ]
         },
         {
+          "name": "share-profile",
+          "description": "Share profile applied to every exported text: public (home paths, usernames, project names, hostnames, emails and other personal data), team (home paths and personal data), personal (nothing). Credentials are never rewritten; the secret scan rejects them. Default: public for a plaintext export, team when encrypted",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "public",
+            "team",
+            "personal"
+          ]
+        },
+        {
           "name": "target",
           "description": "Deployment target: local, github, cloudflare",
           "arg_type": "option",
@@ -3491,7 +3516,7 @@
     },
     {
       "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
+      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets. Source files are kept: a source that changes afterwards is indexed again",
       "arguments": [
         {
           "name": "source-glob",
@@ -31016,6 +31041,122 @@
               "items": {
                 "type": "string"
               }
+            },
+            "effective": {
+              "type": "object",
+              "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "query_structure": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+                },
+                "query_recoveries": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "db_path_source": {
+                  "type": "string",
+                  "enum": [
+                    "--db",
+                    "env:CASS_DB_PATH",
+                    "--data-dir",
+                    "env:CASS_DATA_DIR",
+                    "env:XDG_DATA_HOME",
+                    "default"
+                  ]
+                },
+                "time_window": {
+                  "type": "object",
+                  "properties": {
+                    "since_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "since_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "until_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "until_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "agents": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "workspaces": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "sessions_from_paths": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "daemon": {
+                  "type": "object",
+                  "description": "Warm-model daemon policy: robot searches use an already-running daemon unless --no-daemon, and never spawn one even with --daemon.",
+                  "properties": {
+                    "use_existing": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn_requested": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "auto_corrections": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },
@@ -31580,6 +31721,18 @@
             "wildcard_fallback": {
               "type": "boolean"
             },
+            "wildcard_fallback_skipped": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "index_over_automatic_limit",
+                "automatic_retry_disabled",
+                "long_query_term",
+                null
+              ]
+            },
             "cache_stats": {
               "type": "object",
               "properties": {
@@ -31994,6 +32147,122 @@
                   "inputs",
                   "evidence"
                 ]
+              }
+            },
+            "effective": {
+              "type": "object",
+              "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "query_structure": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+                },
+                "query_recoveries": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "db_path_source": {
+                  "type": "string",
+                  "enum": [
+                    "--db",
+                    "env:CASS_DB_PATH",
+                    "--data-dir",
+                    "env:CASS_DATA_DIR",
+                    "env:XDG_DATA_HOME",
+                    "default"
+                  ]
+                },
+                "time_window": {
+                  "type": "object",
+                  "properties": {
+                    "since_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "since_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "until_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "until_from": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "agents": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "workspaces": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "sessions_from_paths": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "daemon": {
+                  "type": "object",
+                  "description": "Warm-model daemon policy: robot searches use an already-running daemon unless --no-daemon, and never spawn one even with --daemon.",
+                  "properties": {
+                    "use_existing": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn_requested": {
+                      "type": "boolean"
+                    },
+                    "auto_spawn": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "auto_corrections": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
               }
             },
             "timing": {
@@ -33043,6 +33312,13 @@
             "type": "object",
             "additionalProperties": true
           }
+        },
+        "zero_result_diagnosis": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
         },
         "explanation": {
           "type": [
@@ -38458,6 +38734,32 @@
         "archive_only": {
           "type": "boolean"
         },
+        "coordinate_space": {
+          "type": "string",
+          "enum": [
+            "file_line",
+            "message_index"
+          ]
+        },
+        "content_source": {
+          "type": "string",
+          "enum": [
+            "file",
+            "archive"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "integer"
+        },
+        "target_message_index": {
+          "type": "integer"
+        },
+        "total_messages": {
+          "type": "integer"
+        },
         "budget": {
           "type": "object",
           "properties": {
@@ -38495,8 +38797,46 @@
               "number": {
                 "type": "integer"
               },
+              "file_line": {
+                "type": "integer"
+              },
+              "message_index": {
+                "type": "integer"
+              },
+              "coordinate_space": {
+                "type": "string",
+                "enum": [
+                  "file_line",
+                  "message_index"
+                ]
+              },
+              "content_source": {
+                "type": "string",
+                "enum": [
+                  "file",
+                  "archive"
+                ]
+              },
+              "message_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "conversation_id": {
+                "type": "integer"
+              },
+              "source_id": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string"
+              },
               "content": {
                 "type": "string"
+              },
+              "is_target": {
+                "type": "boolean"
               },
               "highlighted": {
                 "type": "boolean"

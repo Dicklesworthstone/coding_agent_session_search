@@ -13,6 +13,21 @@ The Rust target has not been compiled or executed in the authoring environment:
 GitHub. Repository reads and the direct-main write use the GitHub connector.
 No passing-test or production-qualification claim is attached to this change.
 
+**Status update (checked 2026-09-24).** Section 5 has landed. A proved zero delta
+retains the published generation without packet replay or republication.
+`gh458_unchanged_backfill_preserves_completed_generation_without_replay` in
+`src/indexer/semantic/engine.rs` and
+`gh458_robot_unchanged_maintenance_skips_packet_replay_and_publication` in
+`tests/e2e_semantic_backfill_robot.rs` cover it. The latter asserts
+`status: "unchanged"` with byte-identical vector files and a single `complete`
+progress event, and asserts that a same-count content edit still republishes.
+Further `gh458_*` library tests cover vector reuse across ingest and same-ID
+edit/deletion reconciliation. Serving the retained generation during a
+contract replacement (sections 1-4) and the end-to-end table below are not
+established here. GitHub closed #458 on 2026-09-19 because a commit message
+contained "Does not close #458". The runtime rollover is tracked by bead
+`coding_agent_session_search-962e8`.
+
 ## Production evidence and exact failure boundary
 
 The [nskidan report](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458#issuecomment-5735975241)
@@ -184,7 +199,7 @@ Suggested repository-side validation commands (not executed here):
 cargo test --test semantic_rollover_guardrails
 cargo test --lib gh458_
 cargo test --lib gh470_prefix_checkpoint_restarts_complete_passage_coverage
-cargo test --lib gh404_
+cargo test --test e2e_semantic_backfill_robot gh458_
 cargo fmt --check
 ```
 

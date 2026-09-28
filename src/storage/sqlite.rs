@@ -18,7 +18,7 @@ use frankensqlite::AsyncConnection as FrankenAsyncConnection;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -524,8 +524,34 @@ fn doctor_lock_file_pid_is_current_process(file: &fs::File) -> bool {
     doctor_lock_metadata_pid_is_current_process(&raw)
 }
 
+/// fs2 reports a contended try-lock as its `lock_contended_error()`:
+/// EWOULDBLOCK on unix, but raw ERROR_LOCK_VIOLATION on Windows, which no
+/// `ErrorKind` matches, so a held doctor lock read as not held (2l1b0.74).
 fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::WouldBlock
+        || (err.raw_os_error().is_some()
+            && err.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
+#[cfg(test)]
+mod doctor_mutation_lock_error_tests {
+    use super::*;
+
+    /// fs2's own contended error must read as a held doctor lock on every
+    /// platform (on Windows it is raw ERROR_LOCK_VIOLATION, not WouldBlock),
+    /// and unrelated failures must not (2l1b0.74).
+    #[test]
+    fn contended_lock_error_is_active_and_other_errors_are_not() {
+        assert!(doctor_mutation_lock_error_is_active(
+            &fs2::lock_contended_error()
+        ));
+        assert!(!doctor_mutation_lock_error_is_active(
+            &std::io::Error::from(std::io::ErrorKind::NotFound)
+        ));
+        assert!(!doctor_mutation_lock_error_is_active(
+            &std::io::Error::other("permission denied")
+        ));
+    }
 }
 
 fn acquire_doctor_mutation_db_open_guard(
@@ -741,12 +767,18 @@ pub(crate) fn open_current_schema_storage_with_timeout(
 /// whole compatibility database. Schema-only handles prohibit that promotion
 /// (fsqlite #402). Use one only when the pinned engine would skip its first-open
 /// repair anyway (GH #443/#450); FTS validation and CASS repair remain enabled.
+/// An archive whose repair is pending gets an ordinary open to run it, then
+/// continues in the schema-only lane once the engine has recorded it.
 fn open_index_schema_connection_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<FrankenConnection> {
     if !index_engine_migration_is_complete(path) {
-        return open_franken_raw_connection_with_timeout(path, timeout);
+        let repairing = open_franken_raw_connection_with_timeout(path, timeout)?;
+        if !index_engine_migration_is_complete(path) {
+            return Ok(repairing);
+        }
+        close_first_open_repair_handle(repairing, path);
     }
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
@@ -770,6 +802,42 @@ fn open_index_schema_connection_with_timeout(
                 });
             }
         }
+    }
+}
+
+/// Writer handles on an existing archive take the same bounded lane as the
+/// index open. An ordinary handle's first autocommit point lookup (for example
+/// `SELECT value FROM meta WHERE key = ?1`) hydrates every row of every table
+/// into the compatibility MemDatabase: on a 16 GB archive the legacy OMP
+/// analytics writer passed a 24 GB memory limit that way before its first
+/// chunk (xcqqa). An archive whose engine migration is still pending gets the
+/// ordinary constructor so the engine's first-open repair runs, then the
+/// bounded lane once the repair is recorded.
+fn open_archive_writer_connection(
+    path: &Path,
+) -> std::result::Result<FrankenConnection, crate::franken_sync::FrankenError> {
+    let path_str = path.to_string_lossy().to_string();
+    if !index_engine_migration_is_complete(path) {
+        let repairing = FrankenConnection::open(path_str.clone())?;
+        if !index_engine_migration_is_complete(path) {
+            return Ok(repairing);
+        }
+        close_first_open_repair_handle(repairing, path);
+    }
+    FrankenConnection::open_existing_schema_only(path_str)
+}
+
+/// Close the ordinary handle whose open ran the engine's first-open repair.
+/// Keeping it for the rest of a run would let its first autocommit point lookup
+/// hydrate the whole archive (xcqqa); callers reopen in the schema-only lane.
+fn close_first_open_repair_handle(mut conn: FrankenConnection, path: &Path) {
+    if let Err(err) = conn.close_without_checkpoint_in_place() {
+        tracing::debug!(
+            error = %err,
+            db_path = %path.display(),
+            "closing the first-open repair handle failed; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
     }
 }
 
@@ -1332,8 +1400,7 @@ impl FrankenConnectionManager {
             .1
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open(&path_str) {
+        let conn = match open_archive_writer_connection(&self.db_path) {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
@@ -1364,8 +1431,7 @@ impl FrankenConnectionManager {
             .1
             .recv()
             .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open(&path_str) {
+        let conn = match open_archive_writer_connection(&self.db_path) {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
@@ -2036,6 +2102,20 @@ pub(crate) fn validate_fts_messages_integrity_for_async_connection(
 /// operations"), so the surgery shells to the `sqlite3` CLI — the same
 /// production pattern `scrub_staged_derived_fts_metadata_via_sqlite3` uses
 /// for staged-seed sqlite_master repair.
+/// Error for a failed launch of the external `sqlite3` CLI. A host without it
+/// (Windows by default, minimal containers) used to see only "No such file or
+/// directory"; say which tool is missing and what needed it (2l1b0.65).
+fn sqlite3_cli_launch_error(error: std::io::Error, action: &str) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!(
+            "{action} needs the sqlite3 command-line tool, which is not installed or not on \
+             PATH; install sqlite3 and retry"
+        )
+    } else {
+        anyhow::Error::new(error).context(format!("launching sqlite3 for {action}"))
+    }
+}
+
 pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> Result<()> {
     let dedupe_sql = "PRAGMA writable_schema = ON;
          DELETE FROM sqlite_master
@@ -2053,10 +2133,13 @@ pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> 
         if disable_defensive {
             command.arg(".dbconfig defensive off");
         }
-        command.arg(dedupe_sql).output().with_context(|| {
-            format!(
-                "running sqlite3 duplicate fts schema-row repair for {}",
-                db_path.display()
+        command.arg(dedupe_sql).output().map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "the duplicate fts schema-row repair of {}",
+                    db_path.display()
+                ),
             )
         })
     };
@@ -3112,16 +3195,17 @@ fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
         .is_ok()
 }
 
+/// `PRAGMA table_info` answers from the connection's schema. A `sqlite_master`
+/// query instead materializes a virtual table, and fsqlite 0.4.4's clean-root
+/// probe for it reads every page of the file: the token rollup stage's check
+/// for its stage table held 17 GB on a 16 GB archive (xcqqa). Callers pass
+/// internal table names; views also answer, which none of them name.
 fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
-    let found: Option<i64> = conn
-        .query_row_map(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
-            fparams![table],
-            |row| row.get_typed(0),
-        )
-        .optional()
+    let quoted = table.replace('"', "\"\"");
+    let columns = conn
+        .query(&format!("PRAGMA table_info(\"{quoted}\")"))
         .with_context(|| format!("checking for historical table {table}"))?;
-    Ok(found.is_some())
+    Ok(!columns.is_empty())
 }
 
 fn probe_historical_table_reads(conn: &FrankenConnection, table: &str) -> Result<()> {
@@ -3189,10 +3273,13 @@ fn recover_historical_bundle_via_sqlite3(
         .arg(".recover")
         .stdout(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
-                "launching sqlite3 .recover for historical bundle {}",
-                bundle.root_path.display()
+        .map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "recovering historical bundle {}",
+                    bundle.root_path.display()
+                ),
             )
         })?;
     let recover_stdout = recover
@@ -3204,10 +3291,10 @@ fn recover_historical_bundle_via_sqlite3(
         .arg(&recovered_db)
         .stdin(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!(
-                "launching sqlite3 importer for recovered bundle {}",
-                recovered_db.display()
+        .map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!("importing recovered bundle {}", recovered_db.display()),
             )
         })?;
 
@@ -3382,10 +3469,13 @@ fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Resul
         if disable_defensive {
             command.arg(".dbconfig defensive off");
         }
-        command.arg(scrub_sql).output().with_context(|| {
-            format!(
-                "running sqlite3 staged FTS metadata scrub for {}",
-                staged_db_path.display()
+        command.arg(scrub_sql).output().map_err(|error| {
+            sqlite3_cli_launch_error(
+                error,
+                &format!(
+                    "the staged FTS metadata scrub of {}",
+                    staged_db_path.display()
+                ),
             )
         })
     };
@@ -3958,7 +4048,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
@@ -4674,6 +4764,18 @@ CREATE INDEX IF NOT EXISTS idx_conversations_context
 ON conversations(started_at DESC, workspace_id, agent_id);
 ";
 
+const MIGRATION_V22: &str = r"
+-- `cass forget --apply` tombstones (2l1b0.50): the forgotten source file's size
+-- and modification time. Scans skip an unchanged source; a changed one is
+-- ingested again and its tombstone is removed.
+CREATE TABLE IF NOT EXISTS forgotten_sources (
+    source_path TEXT PRIMARY KEY,
+    size_bytes INTEGER,
+    mtime_ms INTEGER,
+    forgotten_at_ms INTEGER NOT NULL
+);
+";
+
 /// Row from the embedding_jobs table.
 #[derive(Debug, Clone)]
 pub struct EmbeddingJobRow {
@@ -4773,33 +4875,27 @@ pub struct LexicalRebuildGroupedMessageRow {
 
 pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 32]>;
 
-/// Default per-conversation lexical-content byte ceiling (#290).
+/// Default per-message lexical-content byte ceiling (#290).
 ///
-/// The staged lexical-rebuild shard cap
-/// (`CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES`) defaults to 64 MiB with
-/// a 16 MiB floor. An indivisible single conversation whose materialized content
-/// exceeds the per-shard cap forces the OOM→bisect→quarantine path because the
-/// dominant resident cost is cass-side materialization of the whole conversation's
-/// text. We cap per-conversation indexed content at 8 MiB —
-/// `min(shard_cap/2, 8 MiB)` for the default 64 MiB shard cap, and comfortably
-/// below even the 16 MiB shard floor — so a normally-large (image/base64-heavy)
-/// conversation is admitted with a truncated lexical body instead of quarantined.
-/// 8 MiB of text is far more than lexical search needs (tokens, not raw blobs)
-/// while leaving headroom for the Tantivy arena and concurrent shard builders.
-pub const LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
+/// 8 MiB of one message's text is far more than lexical search needs (tokens,
+/// not raw blobs) and keeps a single pasted image/base64 payload from
+/// dominating a rebuild's working set.
+pub const LEXICAL_MAX_MESSAGE_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
 
-/// Per-conversation lexical-content byte ceiling, overridable via
-/// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` (#290).
+/// Per-MESSAGE lexical-content byte ceiling, overridable via
+/// `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES` (#290).
 ///
-/// `0` is rejected (treated as "use default") so the cap can never be disabled
-/// into the OOM-quarantine regime by accident; set a large value to effectively
-/// disable it.
-pub fn lexical_max_conversation_content_bytes() -> usize {
-    dotenvy::var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES")
+/// It bounds one message (a pasted image/base64 blob), never a conversation:
+/// a cumulative per-conversation cap blanked every message past a long
+/// session's first 8 MiB, which on the owner's archive was 39.6% of its
+/// messages (bgn6s). Long conversations are instead read in bounded chunks.
+/// `0` is rejected (treated as "use default").
+pub fn lexical_max_message_content_bytes() -> usize {
+    dotenvy::var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT)
+        .unwrap_or(LEXICAL_MAX_MESSAGE_CONTENT_BYTES_DEFAULT)
 }
 
 /// Largest byte length `<= cap` that ends on a UTF-8 char boundary of `content`.
@@ -4814,51 +4910,51 @@ fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
     boundary
 }
 
-/// Cap the cumulative per-conversation lexical content at `cap` bytes (#290).
-///
-/// Messages are visited in `idx` order (earliest first); once the running total
-/// reaches the cap, the message that straddles the boundary is truncated to the
-/// remaining budget on a UTF-8 char boundary and every later message's content is
-/// cleared. Message rows are preserved (count/structure unchanged) so the rest of
-/// the rebuild pipeline's per-message accounting stays consistent — only indexed
-/// text is dropped. Emits one `lexical_content_truncated` diagnostic per affected
-/// conversation. No-op when total content is within the cap.
-#[cfg(test)]
-fn truncate_lexical_rebuild_conversation_content(
-    conversation_id: i64,
-    messages: &mut [Message],
+/// Marker error a lexical-rebuild row callback raises to stop a stream early;
+/// never surfaced to callers.
+const LEXICAL_REBUILD_STREAM_STOPPED: &str = "cass lexical rebuild stream stopped by caller";
+
+/// One lexical-rebuild projection row (`id, idx, role, author, created_at,
+/// capped content, source byte length`) as a [`Message`] whose text is bounded
+/// by `cap` bytes on a UTF-8 boundary (#290).
+fn lexical_rebuild_message_from_row(
+    row: &FrankenRow,
     cap: usize,
-) {
-    let original_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    if original_bytes <= cap {
-        return;
+) -> std::result::Result<Message, crate::franken_sync::FrankenError> {
+    let role: String = row.get_typed(2)?;
+    let mut content: String = row.get_typed(5)?;
+    let boundary = lexical_content_truncation_boundary(&content, cap);
+    if boundary < content.len() {
+        // GH #466: truncate would retain the projected cell's whole allocation.
+        content = content[..boundary].to_owned();
     }
+    Ok(Message {
+        id: Some(row.get_typed(0)?),
+        idx: row.get_typed(1)?,
+        role: match role.as_str() {
+            "user" => MessageRole::User,
+            "agent" | "assistant" => MessageRole::Agent,
+            "tool" => MessageRole::Tool,
+            "system" => MessageRole::System,
+            other => MessageRole::Other(other.to_string()),
+        },
+        author: row.get_typed(3)?,
+        created_at: row.get_typed(4)?,
+        content,
+        extra_json: serde_json::Value::Null,
+        snippets: Vec::new(),
+    })
+}
 
-    let mut used = 0usize;
+/// Cap each message's lexical content at `cap` bytes on a UTF-8 char boundary
+/// (#290), independently of every other message. Test mirror of the per-row
+/// bound the rebuild fetch applies; message rows are always preserved.
+#[cfg(test)]
+fn truncate_lexical_rebuild_message_content(messages: &mut [Message], cap: usize) {
     for message in messages.iter_mut() {
-        if used >= cap {
-            message.content.clear();
-            continue;
-        }
-        let remaining = cap - used;
-        if message.content.len() <= remaining {
-            used += message.content.len();
-        } else {
-            let boundary = lexical_content_truncation_boundary(&message.content, remaining);
-            message.content.truncate(boundary);
-            used += boundary;
-        }
+        let boundary = lexical_content_truncation_boundary(&message.content, cap);
+        message.content.truncate(boundary);
     }
-
-    let capped_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    tracing::warn!(
-        diagnostic = "lexical_content_truncated",
-        conversation_id,
-        original_bytes,
-        capped_bytes,
-        cap,
-        "lexical rebuild conversation content exceeded the per-conversation cap; truncated indexed text to stay within budget instead of OOM-quarantining (#290)"
-    );
 }
 
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
@@ -5366,10 +5462,9 @@ impl FrankenStorage {
         ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
         fts_shadow_run: Arc<FtsShadowRunState>,
     ) -> Result<Self> {
-        let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
-        let conn = FrankenConnection::open(&path_str)
+        let conn = open_archive_writer_connection(path)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
         let storage = Self::new_with_shared_caches(
             conn,
@@ -6326,6 +6421,7 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (19, "conversation_external_lookup", MIGRATION_V19),
     (20, "conversation_external_tail_lookup", MIGRATION_V20),
     (21, "conversation_context_index", MIGRATION_V21),
+    (22, "forgotten_sources", MIGRATION_V22),
 ];
 
 /// Run each pending migration through its own single-migration runner so an
@@ -7235,6 +7331,11 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         ],
         sql: CURRENT_SCHEMA_REPAIR_MESSAGE_METRICS_SQL,
     },
+    SchemaRepairBatch {
+        name: "forgotten_sources",
+        tables: &["forgotten_sources"],
+        sql: MIGRATION_V22,
+    },
 ];
 
 fn current_schema_repair_batches_for_missing_tables(
@@ -7268,7 +7369,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 21] = [
+const MIGRATION_NAMES: [(i64, &str); 22] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -7290,6 +7391,7 @@ const MIGRATION_NAMES: [(i64, &str); 21] = [
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
     (21, "conversation_context_index"),
+    (22, "forgotten_sources"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -7426,6 +7528,10 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     (
         "usage_models_daily",
         "SELECT day_id FROM usage_models_daily LIMIT 1;",
+    ),
+    (
+        "forgotten_sources",
+        "SELECT source_path FROM forgotten_sources LIMIT 1;",
     ),
 ];
 
@@ -7784,6 +7890,18 @@ fn cursor_workspace_attribution_is_authoritative(
 
 /// Reconcile only the provider-owned attribution fields. A missing workspace
 /// in an ordinary partial packet must never erase a known association.
+/// Canonical rows were deleted (forget, dedup, agent purge). Their vectors
+/// stay in the semantic artifact and SQLite reuses the freed top message ids,
+/// so a watermark that covers them lets `cass index --semantic` take the #394
+/// skip forever: the tier is never re-certified, and a reused id would resolve
+/// to the deleted text's vector. Dropping the watermark sends the next semantic
+/// run through the full re-embed, the same invalidation the reconcilers below
+/// apply on identity changes (2l1b0.78).
+fn clear_semantic_embed_watermark_after_deletion(tx: &FrankenTransaction<'_>) -> Result<()> {
+    tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+    Ok(())
+}
+
 fn franken_reconcile_cursor_workspace(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
@@ -10736,6 +10854,7 @@ impl FrankenStorage {
                )",
             fparams![agent_id],
         )?;
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
 
         Ok(AgentArchivePurgeResult {
@@ -10759,6 +10878,47 @@ impl FrankenStorage {
     /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
     /// operator) so the semantics are portable and deterministic across the
     /// frankensqlite backend.
+    /// Tombstones written by `cass forget --apply` (2l1b0.50), by source path.
+    pub fn forgotten_source_stamps(&self) -> Result<HashMap<String, SourceFileStamp>> {
+        let rows: Vec<(String, Option<i64>, Option<i64>)> = self.conn.query_map_collect(
+            "SELECT source_path, size_bytes, mtime_ms FROM forgotten_sources",
+            fparams![],
+            |row| {
+                Ok((
+                    row.get_typed::<String>(0)?,
+                    row.get_typed::<Option<i64>>(1)?,
+                    row.get_typed::<Option<i64>>(2)?,
+                ))
+            },
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, size_bytes, mtime_ms)| {
+                (
+                    path,
+                    SourceFileStamp {
+                        size_bytes,
+                        mtime_ms,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Drops the tombstones of forgotten sources that changed since the
+    /// forget, so their next ingest is permanent.
+    pub fn clear_forgotten_sources(&self, paths: &[String]) -> Result<()> {
+        let mut tx = self.conn.transaction()?;
+        for path in paths {
+            tx.execute_compat(
+                "DELETE FROM forgotten_sources WHERE source_path = ?1",
+                fparams![path.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn forget_conversations_by_source_glob(
         &self,
         pattern: &str,
@@ -10787,13 +10947,15 @@ impl FrankenStorage {
 
         let mut matched_ids: Vec<i64> = Vec::new();
         let mut sample_paths: Vec<String> = Vec::new();
+        let mut matched_paths: BTreeSet<String> = BTreeSet::new();
         for (id, source_path) in rows {
             let Some(path) = source_path else { continue };
             if glob.matches(&path) {
                 matched_ids.push(id);
                 if sample_paths.len() < 20 {
-                    sample_paths.push(path);
+                    sample_paths.push(path.clone());
                 }
+                matched_paths.insert(path);
             }
         }
 
@@ -10850,6 +11012,24 @@ impl FrankenStorage {
             &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
             fparams![],
         )?;
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
+        // Tombstone every forgotten source so a later scan (triggered by any
+        // sibling change) does not ingest it again while it is unchanged.
+        let forgotten_at_ms = Self::now_millis();
+        for path in &matched_paths {
+            let stamp = SourceFileStamp::of(Path::new(path));
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO forgotten_sources
+                     (source_path, size_bytes, mtime_ms, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                fparams![
+                    path.as_str(),
+                    stamp.size_bytes,
+                    stamp.mtime_ms,
+                    forgotten_at_ms
+                ],
+            )?;
+        }
         tx.commit()?;
 
         Ok(ForgetConversationsResult {
@@ -10978,6 +11158,7 @@ impl FrankenStorage {
             // so there is nothing conversation-scoped to delete there.
             tx.execute_compat("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
         }
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
 
         // The derived FTS shadow rows for the dropped messages are now stale.
@@ -11831,121 +12012,233 @@ impl FrankenStorage {
     /// `extra_json` here prevents rebuilds from rehydrating enormous historical
     /// payloads that are irrelevant to lexical search.
     ///
-    /// The assembled per-conversation content is additionally capped at
-    /// [`lexical_max_conversation_content_bytes`] (see #290): an image/base64-heavy
-    /// conversation that materializes 10-40 MiB of indexed text would otherwise
-    /// exceed the per-shard byte budget and force the OOM→bisect→quarantine path.
-    /// Capping the *content* (not the message count/structure) admits the
-    /// conversation within budget with a truncated lexical body — lexical search
-    /// needs tokens, not the full multi-megabyte blob.
+    /// Each message's indexed text is capped at
+    /// [`lexical_max_message_content_bytes`] (#290: one pasted image/base64
+    /// blob). Every message keeps its own text however long the conversation is
+    /// (bgn6s); a caller that must bound memory for a long conversation reads it
+    /// in index ranges ([`Self::lexical_rebuild_message_footprints`],
+    /// [`Self::fetch_messages_for_lexical_rebuild_idx_range`]) or stops early
+    /// ([`Self::fetch_messages_for_lexical_rebuild_within`]).
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        // FrankenSQLite's allocation-avoiding ASCII ColumnSubstrPrefix path
-        // requires a literal signed-32-bit prefix length. This value is parsed
-        // from our own numeric cap, never from SQL/user text, so embedding it
-        // cannot introduce SQL injection. Keep the effective byte cap no larger
-        // than that literal so very large environment overrides cannot be
-        // reported inaccurately.
-        let cap = lexical_max_conversation_content_bytes().min(i32::MAX as usize);
-        let hinted_sql = format!(
-            "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
-                 WHERE conversation_id = ?1 ORDER BY idx"
-        );
-        let fallback_sql = format!(
-            "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
-                 FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY idx"
-        );
-        let (messages, original_bytes) = self
-            .stream_capped_lexical_rebuild_messages(conversation_id, cap, &hinted_sql)
-            .or_else(|err| {
-                if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
-                    return self.stream_capped_lexical_rebuild_messages(
-                        conversation_id,
-                        cap,
-                        &fallback_sql,
-                    );
-                }
-                Err(err)
-            })?;
-
-        if original_bytes > cap {
-            let capped_bytes = messages
-                .iter()
-                .map(|message| message.content.len())
-                .sum::<usize>();
-            tracing::warn!(
-                diagnostic = "lexical_content_truncated",
-                conversation_id,
-                original_bytes,
-                capped_bytes,
-                cap,
-                "lexical rebuild conversation content exceeded the per-conversation cap; retained only the bounded indexed prefix instead of the full body (#290, GH#413)"
-            );
-        }
-
+        let mut messages = Vec::new();
+        self.for_each_lexical_rebuild_message(conversation_id, None, |message| {
+            messages.push(message);
+            Ok(true)
+        })?;
         Ok(messages)
     }
 
-    /// Stream each lexical projection through FrankenSQLite's row callback
-    /// instead of collecting the complete result. SQL bounds the largest
-    /// projected text cell by `cap` Unicode scalar values; the callback applies
-    /// the stricter cumulative UTF-8 byte cap before retaining the row.
-    /// Consequently CASS's retained result does not scale with the uncapped
-    /// conversation body. FrankenSQLite can still transiently materialize a
-    /// full non-ASCII source cell until upstream issue #400 is fixed.
-    fn stream_capped_lexical_rebuild_messages(
+    /// [`Self::fetch_messages_for_lexical_rebuild`], but stops reading as soon
+    /// as the conversation's indexed text exceeds `max_bytes` and returns
+    /// `None`, so a batch never materializes a long conversation it will reject.
+    pub fn fetch_messages_for_lexical_rebuild_within(
         &self,
         conversation_id: i64,
-        cap: usize,
-        sql: &str,
-    ) -> Result<(Vec<Message>, usize)> {
+        max_bytes: usize,
+    ) -> Result<Option<Vec<Message>>> {
         let mut messages = Vec::new();
-        let mut original_bytes = 0usize;
-        let mut remaining_bytes = cap;
-        let params = [SqliteValue::from(conversation_id)];
-        self.conn
-            .query_with_params_for_each(sql, &params, |row| {
-                let role: String = row.get_typed(2)?;
-                let mut content: String = row.get_typed(5)?;
-                let content_bytes =
-                    usize::try_from(row.get_typed::<i64>(6)?.max(0)).unwrap_or(usize::MAX);
-                original_bytes = original_bytes.saturating_add(content_bytes);
-                let boundary = lexical_content_truncation_boundary(&content, remaining_bytes);
-                if boundary < content.len() {
-                    // GH #466: truncate/clear would retain each projected cell's
-                    // allocation, including oversized rows after the budget is
-                    // exhausted. Keep only the bounded prefix allocation before
-                    // retaining this row; an empty prefix owns no text buffer.
-                    content = content[..boundary].to_owned();
+        let mut bytes = 0usize;
+        let completed =
+            self.for_each_lexical_rebuild_message(conversation_id, None, |message| {
+                bytes = bytes.saturating_add(message.content.len());
+                if bytes > max_bytes {
+                    return Ok(false);
                 }
-                remaining_bytes = remaining_bytes.saturating_sub(content.len());
-                messages.push(Message {
-                    id: Some(row.get_typed(0)?),
-                    idx: row.get_typed(1)?,
-                    role: match role.as_str() {
-                        "user" => MessageRole::User,
-                        "agent" | "assistant" => MessageRole::Agent,
-                        "tool" => MessageRole::Tool,
-                        "system" => MessageRole::System,
-                        other => MessageRole::Other(other.to_string()),
-                    },
-                    author: row.get_typed(3)?,
-                    created_at: row.get_typed(4)?,
-                    content,
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                });
-                Ok(())
-            })
-            .with_context(|| {
-                format!(
-                    "streaming bounded lexical rebuild content for conversation {conversation_id}"
-                )
+                messages.push(message);
+                Ok(true)
             })?;
-        Ok((messages, original_bytes))
+        Ok(completed.then_some(messages))
+    }
+
+    /// Messages with `first_idx <= idx <= last_idx`, in `idx` order, each
+    /// capped as in [`Self::fetch_messages_for_lexical_rebuild`].
+    pub fn fetch_messages_for_lexical_rebuild_idx_range(
+        &self,
+        conversation_id: i64,
+        first_idx: i64,
+        last_idx: i64,
+    ) -> Result<Vec<Message>> {
+        let mut messages = Vec::new();
+        self.for_each_lexical_rebuild_message(
+            conversation_id,
+            Some((first_idx, last_idx)),
+            |message| {
+                messages.push(message);
+                Ok(true)
+            },
+        )?;
+        Ok(messages)
+    }
+
+    /// Every message with `id > after_message_id`, as `(conversation_id,
+    /// message)` in id order, each capped as in
+    /// [`Self::fetch_messages_for_lexical_rebuild`]: a rowid-range scan that
+    /// reads only rows appended after a memo, never the older text of the
+    /// conversations they belong to.
+    pub(crate) fn for_each_lexical_rebuild_message_after_id<F>(
+        &self,
+        after_message_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(i64, Message) -> Result<()>,
+    {
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let sql = format!(
+            "SELECT id, idx, role, author, created_at, \
+                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0), conversation_id \
+                 FROM messages WHERE id > ?1 ORDER BY id"
+        );
+        let mut callback_error = None;
+        let outcome = self.conn.query_with_params_for_each(
+            &sql,
+            &[SqliteValue::from(after_message_id)],
+            |row| {
+                let conversation_id: i64 = row.get_typed(7)?;
+                let message = lexical_rebuild_message_from_row(row, cap)?;
+                if let Err(err) = f(conversation_id, message) {
+                    callback_error = Some(err);
+                    return Err(crate::franken_sync::FrankenError::Internal(
+                        LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        );
+        if let Some(err) = callback_error {
+            return Err(err);
+        }
+        outcome.with_context(|| {
+            format!("streaming lexical messages appended after message id {after_message_id}")
+        })
+    }
+
+    /// `(idx, indexed text bytes)` for every message of a conversation in
+    /// `idx` order, read from record metadata without the text itself: the
+    /// input for splitting a long conversation into bounded chunks.
+    pub fn lexical_rebuild_message_footprints(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<(i64, usize)>> {
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let sql = |hinted: bool| {
+            format!(
+                "SELECT idx, COALESCE(octet_length(content), 0) FROM messages{} \
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                if hinted {
+                    " INDEXED BY sqlite_autoindex_messages_1"
+                } else {
+                    ""
+                }
+            )
+        };
+        let params = [SqliteValue::from(conversation_id)];
+        let read = |sql: &str| -> Result<Vec<(i64, usize)>> {
+            let mut footprints = Vec::new();
+            self.conn
+                .query_with_params_for_each(sql, &params, |row| {
+                    let bytes = usize::try_from(row.get_typed::<i64>(1)?.max(0))
+                        .unwrap_or(usize::MAX)
+                        .min(cap);
+                    footprints.push((row.get_typed::<i64>(0)?, bytes));
+                    Ok(())
+                })
+                .with_context(|| {
+                    format!("reading lexical footprints for conversation {conversation_id}")
+                })?;
+            Ok(footprints)
+        };
+        read(&sql(true)).or_else(|err| {
+            if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
+                return read(&sql(false));
+            }
+            Err(err)
+        })
+    }
+
+    /// Stream a conversation's lexical projections (optionally one inclusive
+    /// `idx` range) through FrankenSQLite's row callback instead of collecting
+    /// the complete result. SQL bounds each projected text cell by `cap`
+    /// Unicode scalar values and the callback applies the stricter per-message
+    /// UTF-8 byte cap before handing the row on. `f` returns `false` to stop
+    /// early; the return value says whether every row was visited.
+    /// FrankenSQLite can still transiently materialize a full non-ASCII source
+    /// cell until upstream issue #400 is fixed.
+    pub(crate) fn for_each_lexical_rebuild_message<F>(
+        &self,
+        conversation_id: i64,
+        idx_range: Option<(i64, i64)>,
+        mut f: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(Message) -> Result<bool>,
+    {
+        // FrankenSQLite's allocation-avoiding ASCII ColumnSubstrPrefix path
+        // requires a literal signed-32-bit prefix length. This value is parsed
+        // from our own numeric cap, never from SQL/user text, so embedding it
+        // cannot introduce SQL injection.
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let range_clause = if idx_range.is_some() {
+            " AND idx >= ?2 AND idx <= ?3"
+        } else {
+            ""
+        };
+        let sql = |hinted: bool| {
+            format!(
+                "SELECT id, idx, role, author, created_at, \
+                     substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
+                     FROM messages{} \
+                     WHERE conversation_id = ?1{range_clause} ORDER BY idx",
+                if hinted {
+                    " INDEXED BY sqlite_autoindex_messages_1"
+                } else {
+                    ""
+                }
+            )
+        };
+        let mut params = vec![SqliteValue::from(conversation_id)];
+        if let Some((first_idx, last_idx)) = idx_range {
+            params.push(SqliteValue::from(first_idx));
+            params.push(SqliteValue::from(last_idx));
+        }
+        let mut run = |sql: &str| -> Result<bool> {
+            let mut stopped = false;
+            let mut callback_error = None;
+            let outcome = self.conn.query_with_params_for_each(sql, &params, |row| {
+                let message = lexical_rebuild_message_from_row(row, cap)?;
+                match f(message) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        stopped = true;
+                        Err(crate::franken_sync::FrankenError::Internal(
+                            LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                        ))
+                    }
+                    Err(err) => {
+                        callback_error = Some(err);
+                        Err(crate::franken_sync::FrankenError::Internal(
+                            LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                        ))
+                    }
+                }
+            });
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+            match outcome {
+                Ok(()) => Ok(true),
+                Err(_) if stopped => Ok(false),
+                Err(err) => Err(anyhow::Error::new(err).context(format!(
+                    "streaming bounded lexical rebuild content for conversation {conversation_id}"
+                ))),
+            }
+        };
+        run(&sql(true)).or_else(|err| {
+            if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
+                return run(&sql(false));
+            }
+            Err(err)
+        })
     }
 
     /// Fetch messages for multiple conversations during lexical rebuilds.
@@ -11977,11 +12270,35 @@ impl FrankenStorage {
                 continue;
             }
 
-            let messages = self
-                .fetch_messages_for_lexical_rebuild(*conversation_id)
-                .with_context(|| {
-                    format!("fetching lexical rebuild messages for conversation {conversation_id}")
-                })?;
+            // With a byte budget, stop reading a conversation as soon as it
+            // cannot fit: a long conversation is never materialized only to be
+            // rejected here (the page-prep fallback then streams it in chunks).
+            let messages = match max_content_bytes {
+                Some(limit) => self
+                    .fetch_messages_for_lexical_rebuild_within(
+                        *conversation_id,
+                        limit.saturating_sub(total_content_bytes),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "fetching lexical rebuild messages for conversation {conversation_id}"
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "lexical rebuild batch fetch exceeded content-byte guardrail: bytes>{} limit={limit} conversations={}",
+                            limit.saturating_sub(total_content_bytes),
+                            conversation_ids.len()
+                        )
+                    })?,
+                None => self
+                    .fetch_messages_for_lexical_rebuild(*conversation_id)
+                    .with_context(|| {
+                        format!(
+                            "fetching lexical rebuild messages for conversation {conversation_id}"
+                        )
+                    })?,
+            };
             total_messages = total_messages.saturating_add(messages.len());
             if let Some(limit) = max_messages
                 && total_messages > limit
@@ -22826,6 +23143,31 @@ pub struct ForgetConversationsResult {
     pub sample_source_paths: Vec<String>,
 }
 
+/// A source file's size and modification time, as `cass forget` recorded it
+/// in `forgotten_sources` (2l1b0.50). `None` fields mean the file was absent
+/// or its metadata unreadable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceFileStamp {
+    pub size_bytes: Option<i64>,
+    pub mtime_ms: Option<i64>,
+}
+
+impl SourceFileStamp {
+    pub fn of(path: &Path) -> Self {
+        let Ok(metadata) = fs::metadata(path) else {
+            return Self::default();
+        };
+        Self {
+            size_bytes: i64::try_from(metadata.len()).ok(),
+            mtime_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok()),
+        }
+    }
+}
+
 /// A single PRE-EXISTING duplicate conversation pair detected by
 /// `collapse_external_id_prefix_duplicates`: a `projects/`-prefixed row
 /// (the drop candidate) and its bare canonical twin (kept), both pointing
@@ -23253,6 +23595,31 @@ mod tests {
             eprintln!("SKIPPED {test}: the sqlite3 CLI is not installed on this host");
         }
         available
+    }
+
+    #[test]
+    fn sqlite3_cli_launch_error_names_the_missing_tool() {
+        let missing = sqlite3_cli_launch_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            "recovering historical bundle /tmp/x",
+        );
+        let message = format!("{missing:#}");
+        assert!(
+            message.contains("needs the sqlite3 command-line tool")
+                && message.contains("recovering historical bundle /tmp/x"),
+            "{message}"
+        );
+
+        let denied = sqlite3_cli_launch_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            "importing recovered bundle /tmp/y",
+        );
+        let message = format!("{denied:#}");
+        assert!(
+            message.contains("launching sqlite3 for importing recovered bundle /tmp/y")
+                && !message.contains("not installed"),
+            "{message}"
+        );
     }
 
     struct EnvGuard {
@@ -26058,6 +26425,11 @@ mod tests {
         assert_eq!(conv_count(&storage), 2, "two rows seeded");
         assert_eq!(msg_count(&storage), 4, "two messages per row");
 
+        let max_message_id = storage.max_message_id().unwrap().unwrap();
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
+
         // Dry-run: detects the pair, mutates nothing.
         let dry = storage
             .collapse_external_id_prefix_duplicates(true)
@@ -26070,6 +26442,11 @@ mod tests {
         assert_eq!(dry.pairs[0].keep_external_id, "-proj/abc.jsonl");
         assert_eq!(conv_count(&storage), 2, "dry-run must not delete rows");
         assert_eq!(msg_count(&storage), 4, "dry-run must not delete messages");
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id),
+            "dry-run must not invalidate semantic assets"
+        );
 
         // Apply: drops the prefixed twin + its 2 messages; keeps canonical.
         let applied = storage
@@ -26080,6 +26457,8 @@ mod tests {
         assert_eq!(applied.messages_affected, 2);
         assert_eq!(conv_count(&storage), 1, "twin row dropped");
         assert_eq!(msg_count(&storage), 2, "twin's messages dropped");
+        // 2l1b0.78: the twin's vectors remain in the semantic artifact.
+        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
 
         let surviving: String = storage
             .conn
@@ -26100,11 +26479,13 @@ mod tests {
         assert!(again.pairs.is_empty());
     }
 
+    /// bgn6s: the cap bounds each message, never the conversation. A cumulative
+    /// cap (the old behavior) cleared every message after the first 100 bytes.
     #[test]
-    fn lexical_content_truncation_caps_cumulative_bytes_and_keeps_message_count() {
+    fn lexical_content_truncation_caps_each_message_and_keeps_later_text() {
         use crate::model::types::{Message, MessageRole};
 
-        let cap = 100usize;
+        let cap = 50usize;
         let mut messages = vec![
             Message {
                 id: Some(1),
@@ -26138,7 +26519,7 @@ mod tests {
             },
         ];
 
-        truncate_lexical_rebuild_conversation_content(42, &mut messages, cap);
+        truncate_lexical_rebuild_message_content(&mut messages, cap);
 
         // Structure (message count + ids) preserved; only indexed text trimmed.
         assert_eq!(messages.len(), 3, "message rows must be preserved");
@@ -26146,16 +26527,10 @@ mod tests {
             messages.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![Some(1), Some(2), Some(3)]
         );
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, cap,
-            "cumulative content is capped exactly at the cap"
-        );
-        // Earliest content is kept in full; the straddling message is truncated;
-        // later content is dropped.
-        assert_eq!(messages[0].content.len(), 60);
-        assert_eq!(messages[1].content.len(), 40);
-        assert!(messages[2].content.is_empty());
+        // Every message keeps its own capped prefix; the last one included.
+        for (message, letter) in messages.iter().zip(["a", "b", "c"]) {
+            assert_eq!(message.content, letter.repeat(cap));
+        }
     }
 
     #[test]
@@ -26172,7 +26547,7 @@ mod tests {
             extra_json: serde_json::Value::Null,
             snippets: Vec::new(),
         }];
-        truncate_lexical_rebuild_conversation_content(7, &mut messages, 1024);
+        truncate_lexical_rebuild_message_content(&mut messages, 1024);
         assert_eq!(messages[0].content, "short", "within-cap content untouched");
     }
 
@@ -26191,7 +26566,7 @@ mod tests {
             extra_json: serde_json::Value::Null,
             snippets: Vec::new(),
         }];
-        truncate_lexical_rebuild_conversation_content(1, &mut messages, 5);
+        truncate_lexical_rebuild_message_content(&mut messages, 5);
         // Largest char boundary <= 5 is 4 bytes ("éé").
         assert_eq!(messages[0].content, "éé");
         assert!(
@@ -26201,16 +26576,17 @@ mod tests {
         );
     }
 
-    /// #290: a conversation whose content exceeds the cap is admitted through the
-    /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
+    /// #290 + bgn6s: oversized messages are capped one by one; no message of a
+    /// long conversation loses its text to a conversation-wide budget, and the
+    /// footprint / range / budgeted reads let callers bound memory instead.
     #[test]
     #[serial]
-    fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
+    fn fetch_messages_for_lexical_rebuild_caps_each_message_of_a_long_conversation() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
-        // Force a small, deterministic cap independent of host memory.
-        let _cap = set_env_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1025");
+        // Force a small, deterministic per-message cap independent of host memory.
+        let _cap = set_env_var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "1025");
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("agent_search.db");
@@ -26301,31 +26677,53 @@ mod tests {
             MESSAGE_COUNT as usize,
             "message rows preserved"
         );
-        // ... but the cumulative indexed content is capped on a UTF-8 boundary,
-        // never the raw 128 KiB. A 1,025-byte cap cannot split a two-byte `é`.
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, 1024,
-            "cumulative content capped at the largest UTF-8 boundary below the configured cap"
+        // ... and EVERY message keeps its own capped prefix (bgn6s): a 1,025-byte
+        // cap cannot split a two-byte `é`, so each keeps 1,024 bytes. The old
+        // cumulative cap kept only the first message and blanked the other 63.
+        assert!(
+            messages.iter().all(|message| message.content.len() == 1024),
+            "each message is capped on its own UTF-8 boundary"
         );
         assert!(
-            !messages[0].content.is_empty(),
-            "earliest content is retained for lexical tokens"
-        );
-        assert_eq!(messages[0].content.len(), 1024);
-        assert!(messages[1].content.is_empty());
-        assert!(messages[2].content.is_empty());
-        let retained_capacity: usize = messages.iter().map(|m| m.content.capacity()).sum();
-        assert!(
-            retained_capacity <= 1025,
-            "retained content allocations must fit the cap, including all trailing rows: {retained_capacity}"
-        );
-        assert!(
-            messages[1..]
+            messages
                 .iter()
-                .all(|message| message.content.capacity() == 0)
+                .all(|message| message.content.capacity() <= 1025),
+            "a retained prefix never keeps the full projected cell allocation"
         );
         assert!(messages.iter().all(|message| message.extra_json.is_null()));
+
+        // Footprints report each message's capped size without reading text.
+        let footprints = storage
+            .lexical_rebuild_message_footprints(conversation_id)
+            .unwrap();
+        assert_eq!(footprints.len(), MESSAGE_COUNT as usize);
+        assert!(footprints.iter().all(|(_, bytes)| *bytes == 1025));
+        assert_eq!(
+            footprints.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            (0..MESSAGE_COUNT).collect::<Vec<_>>()
+        );
+        // An inclusive idx range returns exactly those messages, in order.
+        let range = storage
+            .fetch_messages_for_lexical_rebuild_idx_range(conversation_id, 10, 12)
+            .unwrap();
+        assert_eq!(
+            range.iter().map(|message| message.idx).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert!(range.iter().all(|message| message.content.len() == 1024));
+        // A byte budget stops the read before the whole conversation is held.
+        assert!(
+            storage
+                .fetch_messages_for_lexical_rebuild_within(conversation_id, 5 * 1024)
+                .unwrap()
+                .is_none(),
+            "64 KiB of text does not fit a 5 KiB budget"
+        );
+        let within = storage
+            .fetch_messages_for_lexical_rebuild_within(conversation_id, 64 * 1024)
+            .unwrap()
+            .expect("the whole conversation fits a 64 KiB budget");
+        assert_eq!(within.len(), MESSAGE_COUNT as usize);
         let stored = storage.fetch_messages(conversation_id).unwrap();
         assert_eq!(stored.len(), MESSAGE_COUNT as usize);
         assert_eq!(
@@ -42315,6 +42713,244 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
+    fn xcqqa_archive_writers_do_not_hydrate_unrelated_rows_on_point_lookups() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("writers.db");
+        let payload = "archived session payload ".repeat(16384);
+        {
+            let storage = FrankenStorage::open(&path).unwrap();
+            storage
+                .raw()
+                .execute("CREATE TABLE bulk_payload(id INTEGER PRIMARY KEY, content TEXT NOT NULL)")
+                .unwrap();
+            for id in 0..8_i64 {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                        fparams![id, payload.as_str()],
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(index_engine_migration_is_complete(&path));
+        let schema_version_lookup = |conn: &FrankenConnection| -> String {
+            conn.query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams!["schema_version"],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+        };
+
+        // Control: the constructor writers used before xcqqa hydrates every
+        // row of the unrelated payload table for one metadata lookup.
+        {
+            let mut ordinary = FrankenConnection::open(path.to_string_lossy().to_string()).unwrap();
+            assert_eq!(
+                schema_version_lookup(&ordinary),
+                CURRENT_SCHEMA_VERSION.to_string()
+            );
+            assert!(
+                ordinary.as_async().memdb_row_hydration_count() >= 8,
+                "control must exercise the ordinary constructor's whole-file hydration"
+            );
+            ordinary.close_without_checkpoint_in_place().unwrap();
+        }
+
+        // The legacy OMP analytics writer and the ingest writers.
+        let writer = FrankenStorage::open_writer(&path).unwrap();
+        assert_eq!(
+            schema_version_lookup(writer.raw()),
+            CURRENT_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "a writer's metadata lookup must not hydrate unrelated archive rows"
+        );
+        {
+            let mut tx = writer.raw().transaction().unwrap();
+            tx.execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![8_i64, "written through the bounded writer"],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(writer);
+
+        let manager = FrankenConnectionManager::new(
+            &path,
+            ConnectionManagerConfig {
+                reader_count: 1,
+                max_writers: 2,
+            },
+        )
+        .unwrap();
+        for guard in [
+            manager.writer().unwrap(),
+            manager.concurrent_writer().unwrap(),
+        ] {
+            assert_eq!(
+                schema_version_lookup(guard.storage().raw()),
+                CURRENT_SCHEMA_VERSION.to_string()
+            );
+            assert_eq!(
+                guard.storage().raw().as_async().memdb_row_hydration_count(),
+                0,
+                "a managed writer's metadata lookup must not hydrate unrelated archive rows"
+            );
+        }
+        drop(manager);
+
+        let reader = FrankenStorage::open(&path).unwrap();
+        let rows = reader
+            .raw()
+            .query("SELECT id, length(content) FROM bulk_payload ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 9);
+        for row in &rows[..8] {
+            assert_eq!(row.get_typed::<i64>(1).unwrap(), payload.len() as i64);
+        }
+        assert_eq!(rows[8].get_typed::<i64>(0).unwrap(), 8);
+        drop(reader);
+
+        // An archive whose engine migration is pending still gets the ordinary
+        // constructor, which runs and records the engine's first-open repair;
+        // the writer then continues in the bounded lane.
+        let marker_path = path.with_file_name("writers.db.fsqlite-migration-state");
+        fs::write(&marker_path, r#"{"last_upgrade_version":1}"#).unwrap();
+        assert!(!index_engine_migration_is_complete(&path));
+        let pending_writer = FrankenStorage::open_writer(&path).unwrap();
+        assert!(
+            index_engine_migration_is_complete(&path),
+            "the ordinary constructor must finish and record the required repair"
+        );
+        assert_eq!(
+            schema_version_lookup(pending_writer.raw()),
+            CURRENT_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            pending_writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "the writer that ran the repair must not keep the hydrating ordinary handle"
+        );
+        {
+            let mut tx = pending_writer.raw().transaction().unwrap();
+            tx.execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![9_i64, "written after the first-open repair"],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(pending_writer);
+        let rows = FrankenStorage::open(&path)
+            .unwrap()
+            .raw()
+            .query("SELECT id FROM bulk_payload ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 10);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xcqqa_token_rollup_stage_on_a_stale_writer_does_not_hydrate_archive_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stale-writer.db");
+        let payload = "archived session payload ".repeat(16384);
+        {
+            let storage = FrankenStorage::open(&path).unwrap();
+            storage
+                .raw()
+                .execute("CREATE TABLE bulk_payload(id INTEGER PRIMARY KEY, content TEXT NOT NULL)")
+                .unwrap();
+            // ~30 x 400 KB of overflow pages: a ~3,000-page file, so a probe
+            // that walks the file is distinguishable from one that does not.
+            for id in 0..30_i64 {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                        fparams![id, payload.as_str()],
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(index_engine_migration_is_complete(&path));
+
+        // The legacy OMP analytics writer commits thousands of Track A chunks
+        // while the index run's own connection stays open, then runs the token
+        // rollup stage (Track B) on the same writer.
+        let peer = FrankenStorage::open(&path).unwrap();
+        let writer = FrankenStorage::open_writer(&path).unwrap();
+        for id in 30..34_i64 {
+            let mut tx = writer.raw().transaction().unwrap();
+            tx.execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![id, "writer chunk"],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        peer.raw()
+            .execute_compat(
+                "INSERT INTO bulk_payload(id,content) VALUES(?1,?2)",
+                fparams![34_i64, "peer commit"],
+            )
+            .unwrap();
+        assert_eq!(writer.raw().as_async().memdb_row_hydration_count(), 0);
+        // Bytes returned by read syscalls. fsqlite 0.4.4 reads every page of
+        // the file (through pread, invisible to its page-cache counters) on a
+        // connection's first sqlite_master query: 4,237,131 preads for the
+        // 4,137,946-page owner archive.
+        let read_bytes = || {
+            fs::read_to_string("/proc/self/io")
+                .ok()
+                .and_then(|io| {
+                    io.lines()
+                        .find_map(|line| line.strip_prefix("rchar: "))
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                })
+                .expect("/proc/self/io rchar")
+        };
+
+        let before_probe = read_bytes();
+        assert!(historical_table_exists(writer.raw(), "bulk_payload").unwrap());
+        assert!(
+            !historical_table_exists(writer.raw(), TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE).unwrap()
+        );
+        let probe_read = read_bytes() - before_probe;
+        assert!(
+            probe_read < 1024 * 1024,
+            "two table-existence probes read {probe_read} bytes of a ~12 MB archive"
+        );
+        assert_eq!(
+            writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "a table-existence probe must not hydrate archive rows"
+        );
+
+        let before_stage = read_bytes();
+        writer
+            .rebuild_token_daily_stats_with_progress(None, None)
+            .unwrap();
+        let stage_read = read_bytes() - before_stage;
+        assert!(
+            stage_read < 4 * 1024 * 1024,
+            "the token rollup stage read {stage_read} bytes of a ~12 MB archive"
+        );
+        assert_eq!(
+            writer.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "the token rollup stage must not hydrate archive rows"
+        );
+        drop(writer);
+        drop(peer);
+    }
+
+    #[test]
     fn gh443_current_schema_open_runs_required_engine_migration() {
         for marker in [
             None,
@@ -42340,6 +42976,20 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             assert!(
                 index_engine_migration_is_complete(&path),
                 "full constructor must finish and record required repair"
+            );
+            let version: String = storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams!["schema_version"],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(version, CURRENT_SCHEMA_VERSION.to_string());
+            assert_eq!(
+                storage.raw().as_async().memdb_row_hydration_count(),
+                0,
+                "after the repair the index handle must be schema-only (xcqqa)"
             );
         }
     }
@@ -43598,10 +44248,24 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
         seed_conversation(&storage, "openclaw", "purge-target");
         seed_conversation(&storage, "codex", "keep-target");
+        let max_message_id = storage.max_message_id().unwrap().unwrap();
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
+
+        // An agent with no archived rows purges nothing and keeps the watermark.
+        let noop = storage.purge_agent_archive_data("cursor").unwrap();
+        assert_eq!(noop.conversations_deleted, 0);
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id)
+        );
 
         let purge = storage.purge_agent_archive_data("openclaw").unwrap();
         assert_eq!(purge.conversations_deleted, 1);
         assert_eq!(purge.messages_deleted, 2);
+        // 2l1b0.78: the purged messages' vectors remain in the semantic artifact.
+        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
 
         storage.rebuild_fts().unwrap();
         storage.rebuild_analytics().unwrap();
@@ -43717,6 +44381,11 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.total_conversation_count().unwrap(), 3);
 
         let glob = "**/subagents/*.jsonl";
+        // A semantic embed watermark that covers the whole corpus.
+        let max_message_id = storage.max_message_id().unwrap().unwrap();
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
 
         // Dry-run: reports matches, deletes nothing.
         let dry = storage
@@ -43727,6 +44396,15 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(dry.messages_matched, 2);
         assert_eq!(dry.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 3);
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id),
+            "a dry run must not invalidate semantic assets"
+        );
+        assert!(
+            storage.forgotten_source_stamps().unwrap().is_empty(),
+            "a dry run must not tombstone anything"
+        );
 
         // Apply: deletes the two subagent conversations, keeps the top-level one.
         let applied = storage
@@ -43738,6 +44416,36 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
         // The surviving top-level session's message is intact.
         assert_eq!(storage.total_message_count().unwrap(), 1);
+        // 2l1b0.78: the deleted messages' vectors are still in the semantic
+        // artifact, so the watermark that covered them must not survive.
+        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        storage
+            .set_last_embedded_message_id(max_message_id)
+            .unwrap();
+        // 2l1b0.50: each forgotten source is tombstoned with its file stamp
+        // (these fixture paths do not exist, so the stamp is empty).
+        let tombstones = storage.forgotten_source_stamps().unwrap();
+        assert_eq!(
+            tombstones
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "/home/u/.claude/projects/p/sess-1/subagents/agent-aaa.jsonl",
+                "/home/u/.claude/projects/p/sess-2/subagents/agent-bbb.jsonl",
+            ])
+        );
+        assert!(
+            tombstones
+                .values()
+                .all(|stamp| *stamp == SourceFileStamp::default())
+        );
+        storage
+            .clear_forgotten_sources(&[
+                "/home/u/.claude/projects/p/sess-1/subagents/agent-aaa.jsonl".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(storage.forgotten_source_stamps().unwrap().len(), 1);
 
         // An empty pattern is rejected; a non-matching glob is a clean no-op.
         assert!(
@@ -43751,6 +44459,11 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(none.conversations_matched, 0);
         assert_eq!(none.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
+        assert_eq!(
+            storage.get_last_embedded_message_id().unwrap(),
+            Some(max_message_id),
+            "a no-op forget must not force a semantic re-embed"
+        );
     }
 
     /// Regression for cass#202: a `Connection` dropped mid-transaction can

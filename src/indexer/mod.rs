@@ -44,7 +44,6 @@ use crate::franken_sync::compat::{
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use frankensearch::index::VectorIndex as FsVectorIndex;
-use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
@@ -505,15 +504,17 @@ fn source_file_has_active_advisory_lock(path: &Path) -> bool {
     let Ok(file) = OpenOptions::new().read(true).open(path) else {
         return false;
     };
-    match file.try_lock_exclusive() {
+    // std's File::try_lock reports another holder as WouldBlock on every
+    // platform; with fs2, Windows contention was a raw ERROR_LOCK_VIOLATION
+    // that matched nothing here, so a file a writer held looked unlocked
+    // (2l1b0.74).
+    match file.try_lock() {
         Ok(()) => {
-            let _ = FileExt::unlock(&file);
+            let _ = file.unlock();
             false
         }
-        Err(error) => matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        ),
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(error)) => error.kind() == std::io::ErrorKind::Interrupted,
     }
 }
 
@@ -601,6 +602,83 @@ struct LexicalRebuildConversationPacket {
     message_bytes: usize,
     flow_reservation_bytes: usize,
     last_message_id: Option<i64>,
+    /// Set when this packet carries one message-range chunk of a conversation
+    /// too long to hold whole (bgn6s); `None` for an ordinary whole-conversation
+    /// packet.
+    chunk: Option<LexicalRebuildChunk>,
+}
+
+/// One message-range chunk of a long conversation (bgn6s). Chunks of one
+/// conversation arrive in order; only the last finishes the conversation, so
+/// progress and commits still happen at conversation boundaries.
+#[derive(Clone)]
+struct LexicalRebuildChunk {
+    is_final: bool,
+    /// Released once the consumer has flushed this chunk into the index, so
+    /// the page-prep worker reads the next chunk only then.
+    gate: Arc<LexicalRebuildChunkGate>,
+}
+
+impl std::fmt::Debug for LexicalRebuildChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LexicalRebuildChunk")
+            .field("is_final", &self.is_final)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for LexicalRebuildChunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_final == other.is_final
+    }
+}
+
+impl Eq for LexicalRebuildChunk {}
+
+/// Flow control for streaming one long conversation from a page-prep worker
+/// to the consumer: at most one flushed-but-unacknowledged chunk is in flight.
+#[derive(Debug, Default)]
+struct LexicalRebuildChunkGate {
+    outstanding: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl LexicalRebuildChunkGate {
+    fn sent(&self) {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        *outstanding = outstanding.saturating_add(1);
+    }
+
+    fn flushed(&self) {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        *outstanding = outstanding.saturating_sub(1);
+        self.cv.notify_all();
+    }
+
+    /// Wait until every sent chunk has been flushed, or fail once the pipeline
+    /// is torn down (the consumer will never flush again). A failing consumer
+    /// closes the flow limiter; a failing producer or worker closes the
+    /// reservation order.
+    fn wait_until_flushed(
+        &self,
+        reservation_order: &LexicalRebuildReservationOrder,
+        flow_limiter: &StreamingByteLimiter,
+    ) -> Result<()> {
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|e| e.into_inner());
+        while *outstanding > 0 {
+            if reservation_order.is_closed() || flow_limiter.is_closed() {
+                anyhow::bail!(
+                    "lexical rebuild pipeline closed while a long conversation was streaming"
+                );
+            }
+            outstanding = self
+                .cv
+                .wait_timeout(outstanding, Duration::from_millis(200))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3220,7 +3298,10 @@ fn process_index_write_bytes() -> Option<u64> {
     }
 }
 
-const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
+/// 3: generations built under the per-message content cap (bgn6s). A v2
+/// generation left every message past a long conversation's first 8 MiB
+/// unindexed; the version change stops it certifying, so it is rebuilt once.
+const LEXICAL_REBUILD_STATE_VERSION: u8 = 3;
 // Size of each SQL page fetched from the conversations table during a lexical
 // rebuild. The page is a primary-key-ordered LIMIT window materialized as
 // lightweight `LexicalRebuildConversationRow` records (~1 KB each — no message
@@ -4534,6 +4615,7 @@ impl LexicalRebuildConversationPacket {
             message_bytes,
             flow_reservation_bytes: 0,
             last_message_id,
+            chunk: None,
         }
     }
 
@@ -4635,6 +4717,7 @@ impl LexicalRebuildConversationPacket {
             message_bytes,
             flow_reservation_bytes: 0,
             last_message_id: None,
+            chunk: None,
         }
     }
 
@@ -5369,7 +5452,9 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 #[cfg(test)]
-                                lexical_rebuild_shard_build_injected_panic_hook();
+                                lexical_rebuild_shard_build_injected_panic_hook(
+                                    &work.shard_index_path,
+                                );
                                 build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
                                     &work.shard_index_path,
                                     &work.packets,
@@ -5485,7 +5570,7 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || {
                                 #[cfg(test)]
-                                lexical_rebuild_shard_merge_injected_panic_hook();
+                                lexical_rebuild_shard_merge_injected_panic_hook(&work.output_path);
                                 crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
                                     &work.output_path,
                                     &input_paths,
@@ -6917,15 +7002,23 @@ fn acquire_index_run_lock_with_job_kind(
         .open(&lock_path)
         .with_context(|| format!("opening index-run lock file {}", lock_path.display()))?;
 
-    if let Err(err) = file.try_lock_exclusive() {
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+    // std's File::try_lock reports contention as WouldBlock on every platform;
+    // fs2 surfaced Windows contention as raw ERROR_LOCK_VIOLATION, so a second
+    // `cass index` there got a generic error instead of the index-busy (exit 7)
+    // contract that error_chain_indicates_active_cass_index keys on
+    // (2l1b0.74). Same flock/LockFileEx lock, so fs2 holders still exclude it.
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
             anyhow::bail!(
                 "another cass index process already holds {}",
                 lock_path.display()
             );
         }
-        return Err(err)
-            .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(err)
+                .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
+        }
     }
 
     let now_ms = FrankenStorage::now_millis();
@@ -8670,17 +8763,18 @@ fn bounded_lexical_rebuild_page_reservation_limits(
     (batch_fetch_message_bytes_limit, max_message_bytes_in_flight)
 }
 
-/// Bound the number of conversations retained by one prepared page so the
-/// cumulative per-conversation lexical prefixes cannot exceed that page's
-/// content reservation. A single outlier still gets one page and is handled by
-/// the per-conversation fallback in the prep worker.
+/// Size a page so a typical page of conversations fits its content
+/// reservation: at most one per-message cap's worth of text per conversation.
+/// This is a heuristic; the byte-budgeted batch fetch enforces the real bound
+/// (it stops reading a conversation that cannot fit), and a long conversation
+/// falls back to the prep worker's chunked path (bgn6s).
 fn lexical_rebuild_content_bounded_page_conversation_limit(
     configured_page_conversation_limit: usize,
     batch_fetch_message_bytes_limit: usize,
 ) -> usize {
     let batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit.max(1);
     let effective_conversation_content_cap =
-        crate::storage::sqlite::lexical_max_conversation_content_bytes()
+        crate::storage::sqlite::lexical_max_message_content_bytes()
             .min(i32::MAX as usize)
             .min(batch_fetch_message_bytes_limit)
             .max(1);
@@ -8885,6 +8979,14 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 #[cfg(windows)]
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// How many conversations the published lexical generation was certified
+/// against: its completed rebuild checkpoint for this database, if any.
+fn completed_lexical_checkpoint_conversations(index_path: &Path, db_path: &Path) -> Option<usize> {
+    let state = load_lexical_rebuild_state(index_path).ok().flatten()?;
+    (state.completed && crate::stored_path_identity_matches(&state.db.db_path, db_path))
+        .then_some(state.db.total_conversations)
 }
 
 fn load_lexical_rebuild_state(index_path: &Path) -> Result<Option<LexicalRebuildState>> {
@@ -10061,13 +10163,15 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 ///
 /// Exactness comes from reusing the sink's own inputs rather than a SQL
 /// approximation that could drift from Rust trim semantics:
-///   - iterate live conversations only, via `fetch_messages_for_lexical_rebuild`
-///     — orphaned `messages` rows (no live conversation) are never indexed by
-///     the sink, so they must not inflate the expectation;
-///   - that fetch already applies the #290 per-conversation content cap
-///     (`truncate_lexical_rebuild_conversation_content`), so a conversation whose
-///     trailing body is cleared to empty is classified as hard-noise exactly as
-///     the sink drops it;
+///   - iterate live conversations only, via the rebuild's own message stream
+///     (`for_each_lexical_rebuild_message`) — orphaned `messages` rows (no live
+///     conversation) are never indexed by the sink, so they must not inflate the
+///     expectation;
+///   - that stream applies the same #290 per-message cap as the sink; there is
+///     no per-conversation cap any more, so a long conversation's later
+///     messages count as expected documents (bgn6s: the old cumulative cap
+///     cleared them to empty, and this expectation then certified an index
+///     missing them);
 ///   - classify with the same `is_hard_message_noise(lexical_rebuild_noise_role(
 ///     is_tool_role), content)` predicate and precise tool-role mapping the sink
 ///     uses.
@@ -10087,12 +10191,15 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
     let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
-        for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
+        // Stream: a long conversation is classified message by message, never
+        // held whole (bgn6s removed the per-conversation cap that bounded it).
+        storage.for_each_lexical_rebuild_message(conversation_id, None, |message| {
             let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
             if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
                 expected_docs += 1;
             }
-        }
+            Ok(true)
+        })?;
     }
     Ok(expected_docs)
 }
@@ -10100,7 +10207,9 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
 /// GH #461: sidecar next to the rebuild checkpoint memoizing the
 /// noise-adjusted expected doc count for one canonical content identity.
 const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
-const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 1;
+/// 2: counts under the per-message cap (bgn6s). A v1 memo counted a long
+/// conversation's messages past its first 8 MiB as noise and must be recounted.
+const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 2;
 /// Recount in full after this many consecutive append deltas. The identity
 /// (like the lexical checkpoint fingerprint it extends) cannot see an in-place
 /// content edit of an existing row; this bounds how long such an edit can skew
@@ -10150,8 +10259,8 @@ fn expected_lexical_docs_identity(
         max_conversation_id: max_conversation_id_exact(storage)?.unwrap_or(0),
         max_message_id,
         total_messages,
-        // The same effective cap fetch_messages_for_lexical_rebuild applies.
-        content_cap_bytes: crate::storage::sqlite::lexical_max_conversation_content_bytes()
+        // The same per-message cap the rebuild's message stream applies.
+        content_cap_bytes: crate::storage::sqlite::lexical_max_message_content_bytes()
             .min(i32::MAX as usize),
     })
 }
@@ -10160,12 +10269,10 @@ fn expected_lexical_docs_identity(
 /// or `None` when the archive changed in any way an append cannot explain.
 ///
 /// Sound only for pure appends: no conversation or message was deleted (both
-/// totals grew by exactly the rows beyond the memoized maxima), the content
-/// cap is unchanged, and within every touched conversation each new message
-/// sorts after all previously retained ones. The per-conversation cap is
-/// cumulative in `idx` order, so under those conditions the old messages'
-/// truncation, and therefore their noise classification, is unchanged, and
-/// only the new messages need classifying, exactly as the full scan would.
+/// totals grew by exactly the rows beyond the memoized maxima) and the content
+/// cap is unchanged. The cap applies to each message on its own, so appending
+/// rows never changes an older message's truncation or noise classification,
+/// and only the new messages need classifying, exactly as the full scan would.
 fn expected_live_lexical_doc_count_delta(
     storage: &FrankenStorage,
     cached: &ExpectedLexicalDocsCache,
@@ -10195,39 +10302,52 @@ fn expected_live_lexical_doc_count_delta(
     {
         return Ok(None);
     }
-    // Live conversations only, like the full scan (orphaned rows are never indexed).
+    // The per-message cap makes every message's classification independent of
+    // every other, so only the rows appended since the memo need classifying:
+    // a rowid-range scan over them, never a JOIN (fsqlite's join path used to
+    // materialize every message row, content included: 20+ minutes on an
+    // 8M-message archive) and never the older text of a touched conversation.
     let touched: Vec<i64> = storage
         .raw()
         .query_map_collect(
-            "SELECT DISTINCT m.conversation_id FROM messages m \
-             JOIN conversations c ON c.id = m.conversation_id WHERE m.id > ?1",
+            "SELECT DISTINCT conversation_id FROM messages WHERE id > ?1",
             &[ParamValue::from(old.max_message_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations touched since the expected lexical docs memo")?;
-    let mut expected_docs = cached.expected_docs;
+    // Live conversations only, like the full scan (orphaned rows are never
+    // indexed): one point lookup per touched conversation, resolved before the
+    // row stream so no query runs inside its callback.
+    let mut live_conversations = HashSet::with_capacity(touched.len());
     for conversation_id in touched {
-        let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
-        let is_new = |message: &crate::model::types::Message| {
-            message.id.is_none_or(|id| id > old.max_message_id)
-        };
-        let retained_max_idx = messages
-            .iter()
-            .filter(|message| !is_new(message))
-            .map(|message| message.idx)
-            .max();
-        for message in messages.iter().filter(|message| is_new(message)) {
-            if retained_max_idx.is_some_and(|max_idx| message.idx <= max_idx) {
-                // Inserted before retained messages: the cumulative cap may
-                // now truncate those differently. Only a full count is exact.
-                return Ok(None);
-            }
-            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
-            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
-                expected_docs = expected_docs.saturating_add(1);
-            }
+        let live: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+                &[ParamValue::from(conversation_id)],
+                |row: &crate::franken_sync::Row| row.get_typed(0),
+            )
+            .context("checking a touched conversation for the expected lexical docs memo")?;
+        if live != 0 {
+            live_conversations.insert(conversation_id);
         }
     }
+    let mut expected_docs = cached.expected_docs;
+    storage.for_each_lexical_rebuild_message_after_id(
+        old.max_message_id,
+        |conversation_id, message| {
+            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            if live_conversations.contains(&conversation_id)
+                && !is_hard_message_noise(
+                    lexical_rebuild_noise_role(is_tool_role),
+                    &message.content,
+                )
+            {
+                expected_docs = expected_docs.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some(expected_docs))
 }
 
@@ -12398,6 +12518,18 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     persist_lexical_rebuild_state(index_path, &state)
 }
 
+/// 5ajer: the final checkpoint refresh runs after the scan has parked every
+/// counter at `current == total`, and it can recount the expected lexical docs
+/// (database work that reports no progress). Grant it the finalize-class grace
+/// the other post-publish steps get, so the stall watchdog cannot kill a run
+/// whose ingest has already finished.
+fn grant_final_checkpoint_refresh_grace(progress: Option<&Arc<IndexingProgress>>) {
+    if let Some(progress) = progress {
+        progress.finalizing.store(true, Ordering::Relaxed);
+        progress.tick_activity();
+    }
+}
+
 fn refresh_completed_lexical_rebuild_checkpoint(
     storage: &FrankenStorage,
     db_path: &Path,
@@ -13248,6 +13380,10 @@ impl StreamingByteLimiter {
         state.closed = true;
         self.cv.notify_all();
     }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
 }
 
 #[derive(Debug)]
@@ -13341,6 +13477,10 @@ impl LexicalRebuildReservationOrder {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
         self.cv.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
 }
 
@@ -14188,7 +14328,7 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_scan_error(&ctx.data_dir, e.to_string());
+                    ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -14320,7 +14460,7 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_scan_error(&root.path, e.to_string());
+                    ingest_diagnostics.observe_connector_scan_error(&root.path, &e);
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
@@ -14376,6 +14516,115 @@ fn streaming_consumer_commit_interval() -> Duration {
     let capacity = responsiveness::current_capacity_pct().clamp(1, 100) as u64;
     let scaled = base.saturating_mul(capacity) / 100;
     Duration::from_secs(scaled.max(1))
+}
+
+/// Minimum spacing between segment-fold attempts inside one streaming run.
+const STREAMING_FOLD_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The next streaming commit waits at least this many times as long as the
+/// last one took, so publishing costs at most about a fifth of consumer time.
+const STREAMING_COMMIT_COST_MULTIPLE: u32 = 4;
+
+/// Upper bound on the cost-derived commit interval, so a slow publish cannot
+/// hold freshly ingested sessions out of search for long.
+const STREAMING_COMMIT_MAX_PACED_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Effective streaming commit interval given what the last commit cost.
+///
+/// Every Quill publish re-verifies each live segment, including an xxh3 pass
+/// over its full bytes, so a commit costs time proportional to the whole
+/// lexical index, not to what it adds. On a 2-8M-message archive a commit
+/// took 3-12 s, and with the fixed 5 s interval the consumer spent most of a
+/// catch-up re-verifying unchanged segments while producers waited on
+/// backpressure. Pacing by measured cost keeps small indexes at the base
+/// cadence (their commits take milliseconds) and bounds the verification
+/// share on large ones.
+fn paced_streaming_commit_interval(base: Duration, last_commit_cost: Duration) -> Duration {
+    base.max(
+        last_commit_cost
+            .saturating_mul(STREAMING_COMMIT_COST_MULTIPLE)
+            .min(STREAMING_COMMIT_MAX_PACED_INTERVAL),
+    )
+}
+
+/// Commit cadence and segment-fold bookkeeping for one streaming run.
+struct StreamingCommitPacer {
+    last_commit: std::time::Instant,
+    last_commit_cost: Duration,
+    last_fold_attempt: Option<std::time::Instant>,
+}
+
+impl StreamingCommitPacer {
+    fn new() -> Self {
+        Self {
+            last_commit: std::time::Instant::now(),
+            last_commit_cost: Duration::ZERO,
+            last_fold_attempt: None,
+        }
+    }
+
+    /// Whether enough ingest time has passed since the last commit ended.
+    fn due(&self) -> bool {
+        self.last_commit.elapsed()
+            >= paced_streaming_commit_interval(
+                streaming_consumer_commit_interval(),
+                self.last_commit_cost,
+            )
+    }
+
+    /// Commit, then fold small segments when due, then restart the interval.
+    /// The fold is a publish too, so its time counts toward the pacing cost.
+    fn commit(&mut self, t_index: Option<&mut TantivyIndex>) {
+        if let Some(t_index) = t_index {
+            let started = std::time::Instant::now();
+            match t_index.commit() {
+                Ok(()) => {
+                    tracing::debug!(
+                        commit_ms = started.elapsed().as_millis() as u64,
+                        "incremental commit completed"
+                    );
+                    self.fold_small_segments(t_index);
+                }
+                Err(error) => tracing::warn!(%error, "incremental commit failed"),
+            }
+            self.last_commit_cost = started.elapsed();
+        }
+        self.last_commit = std::time::Instant::now();
+    }
+
+    /// Fold the small segment tail during a long streaming run.
+    ///
+    /// Every commit publishes a few small segments, and every publish
+    /// re-verifies each live segment's term dictionary. A long catch-up that
+    /// only folded after the run ended grew one generation past 3,000 segments,
+    /// so each publish got slower as the run went on and every search opened
+    /// during it paid for the whole pile. This runs at most one merge
+    /// (`fold_largest_small_run`), gated by the segment threshold and a 300 s
+    /// cooldown, so it costs about one extra publish a few times per long run;
+    /// the full fold still runs after the run ends. A pass that folds nothing
+    /// does not restart that cooldown, so attempts are also spaced by
+    /// [`STREAMING_FOLD_ATTEMPT_INTERVAL`].
+    fn fold_small_segments(&mut self, t_index: &mut TantivyIndex) {
+        if lexical_post_run_maintenance_skipped_for_test()
+            || self
+                .last_fold_attempt
+                .is_some_and(|at| at.elapsed() < STREAMING_FOLD_ATTEMPT_INTERVAL)
+        {
+            return;
+        }
+        self.last_fold_attempt = Some(std::time::Instant::now());
+        match t_index.fold_largest_small_run() {
+            Ok(true) => tracing::info!(
+                segments = t_index.segment_count(),
+                "folded lexical segments during streaming ingest"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                error = %format!("{error:#}"),
+                "segment merge during streaming ingest failed; continuing with the unmerged generation"
+            ),
+        }
+    }
 }
 
 /// Flat-combining drain in the streaming consumer (Card 3 / `§14.2 Flat
@@ -14452,7 +14701,7 @@ fn run_streaming_consumer(
     let mut total_conversations = 0usize;
     let mut total_messages = 0usize;
     let mut switched_to_indexing = false;
-    let mut last_commit = std::time::Instant::now();
+    let mut commit_pacer = StreamingCommitPacer::new();
     let index_start = std::time::Instant::now();
     let mut ingest_outcome = NonWatchIngestOutcome::default();
     // Streaming ingest intentionally defers connection-local WAL
@@ -14667,15 +14916,10 @@ fn run_streaming_consumer(
                 // CASS_STREAMING_CONSUMER_COMMIT_SECS); under responsiveness
                 // pressure it is scaled down so the writer hold time and
                 // buffered memory both shrink in lockstep with the rest of
-                // the pipeline.
-                if last_commit.elapsed() >= streaming_consumer_commit_interval() {
-                    if let Some(t_index) = t_index.as_deref_mut() {
-                        if let Err(e) = t_index.commit() {
-                            tracing::warn!("incremental commit failed: {}", e);
-                        } else {
-                            tracing::debug!("incremental commit completed");
-                        }
-                    }
+                // the pipeline. It never drops below a multiple of what the
+                // last commit cost (see `paced_streaming_commit_interval`).
+                if commit_pacer.due() {
+                    commit_pacer.commit(t_index.as_deref_mut());
                     // Do not advance the legacy global `last_scan_ts` from a
                     // partial streaming run: a later connector scan error would
                     // make that global watermark unsafe for legacy fallback.
@@ -14686,7 +14930,6 @@ fn run_streaming_consumer(
                             "preserving streaming incremental last_scan_ts because scan exclusions or active source skips are active"
                         );
                     }
-                    last_commit = std::time::Instant::now();
                 }
 
                 tracing::info!(
@@ -14778,13 +15021,8 @@ fn run_streaming_consumer(
                     });
                 stats.conversations += count;
                 stats.messages += messages;
-                if last_commit.elapsed() >= streaming_consumer_commit_interval() {
-                    if let Some(index) = t_index.as_deref_mut()
-                        && let Err(error) = index.commit()
-                    {
-                        tracing::warn!(%error, "incremental commit failed");
-                    }
-                    last_commit = std::time::Instant::now();
+                if commit_pacer.due() {
+                    commit_pacer.commit(t_index.as_deref_mut());
                 }
                 if completion_written {
                     tracing::info!(
@@ -15527,7 +15765,7 @@ fn run_batch_index_with_connector_factories(
                             // Note: agent was counted as discovered but scan failed
                             // This is acceptable as detection succeeded (agent exists)
                             scan_succeeded = false;
-                            ingest_diagnostics.observe_scan_error(&ctx.data_dir, e.to_string());
+                            ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
                             scan_errors.push(e.to_string());
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }
@@ -15600,7 +15838,7 @@ fn run_batch_index_with_connector_factories(
                             Err(e) => {
                                 scan_succeeded = false;
                                 ingest_diagnostics
-                                .observe_scan_error(&root.path, e.to_string());
+                                .observe_connector_scan_error(&root.path, &e);
                                 scan_errors.push(format!(
                                     "remote scan failed for {}: {}",
                                     root.path.display(),
@@ -15948,6 +16186,74 @@ fn detect_for_local_scan(
     local_connector_roots.is_none().then(detect)
 }
 
+/// GH #489: `CASS_EXCLUDE_PATHS` is comma/newline-delimited, but a PATH-style
+/// list (`/a/x:/b/y`) is an easy mistake. The scan policy
+/// (`connectors::codex::path_policy`) parses it as one nonexistent path that
+/// excludes nothing, so the sources the operator meant to skip are still
+/// scanned. Name the entries that look like that. An entry only qualifies when
+/// every colon-separated piece is itself an absolute or home-relative path and
+/// the whole entry does not exist, so Windows drive paths (`C:\x`) and real
+/// names containing `:` never warn.
+fn colon_separated_exclusion_warning(value: &str) -> Option<String> {
+    let suspicious: Vec<&str> = value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|entry| {
+            let mut pieces = entry.split(':');
+            let looks_like_list = entry.contains(':')
+                && pieces.all(|piece| piece.starts_with('/') || piece.starts_with("~/"));
+            looks_like_list && !Path::new(entry).exists()
+        })
+        .collect();
+    (!suspicious.is_empty()).then(|| {
+        format!(
+            "CASS_EXCLUDE_PATHS separates entries with commas or newlines, not colons; \
+             these entries do not exist and exclude nothing: {}. Use a comma, e.g. {}",
+            suspicious.join(", "),
+            suspicious[0].replace(':', ",")
+        )
+    })
+}
+
+#[cfg(test)]
+mod colon_separated_exclusion_warning_tests {
+    use super::colon_separated_exclusion_warning;
+
+    #[test]
+    fn colon_separated_exclusions_are_named_with_a_comma_suggestion() {
+        let warning = colon_separated_exclusion_warning(
+            "/data/old-codex/a.jsonl:/data/old-codex/b.jsonl,~/x:~/y",
+        )
+        .expect("PATH-style lists must warn");
+        assert!(warning.contains("/data/old-codex/a.jsonl:/data/old-codex/b.jsonl"));
+        assert!(warning.contains("~/x:~/y"));
+        assert!(warning.contains("/data/old-codex/a.jsonl,/data/old-codex/b.jsonl"));
+    }
+
+    #[test]
+    fn well_formed_and_drive_style_exclusions_do_not_warn() -> std::io::Result<()> {
+        assert_eq!(colon_separated_exclusion_warning(""), None);
+        assert_eq!(colon_separated_exclusion_warning("/a/x,/b/y\n~/z"), None);
+        // Windows drive paths and a relative piece are not colon-separated lists.
+        assert_eq!(
+            colon_separated_exclusion_warning(r"C:\Users\me\.codex"),
+            None
+        );
+        assert_eq!(colon_separated_exclusion_warning("/a/x:relative"), None);
+        // A real path whose name contains ':' exists, so it is not a mistake.
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir()?;
+            let odd = root.path().join("a:");
+            std::fs::create_dir(&odd)?;
+            let entry = format!("{}/b", odd.display());
+            std::fs::create_dir(&entry)?;
+            assert_eq!(colon_separated_exclusion_warning(&entry), None);
+        }
+        Ok(())
+    }
+}
+
 fn run_index_inner(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -15955,9 +16261,10 @@ fn run_index_inner(
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
-    if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS").ok().and_then(|value| {
-        crate::connectors::codex::path_policy::colon_separated_exclusion_warning(&value)
-    }) {
+    if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS")
+        .ok()
+        .and_then(|value| colon_separated_exclusion_warning(&value))
+    {
         tracing::warn!("{warning}");
     }
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
@@ -16802,6 +17109,25 @@ fn run_index_inner(
         );
     } else {
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
+    }
+    // 2l1b0.79: rows deleted outside the indexer (a forget, dedup or agent
+    // purge whose own lexical rebuild failed or was interrupted) keep their
+    // documents in the published generation, and the incremental scan never
+    // revisits them. The indexer never deletes conversations, so fewer
+    // canonical conversations than the completed checkpoint was certified
+    // against means deleted text is still live: rebuild from canonical rows.
+    if !tantivy_requires_rebuild
+        && let Some(checkpoint_conversations) =
+            completed_lexical_checkpoint_conversations(&index_path, &opts.db_path)
+        && initial_canonical_sessions_before_salvage < checkpoint_conversations
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            canonical_conversations = initial_canonical_sessions_before_salvage,
+            checkpoint_conversations,
+            "canonical conversations were deleted since the lexical generation was certified; rebuilding it"
+        );
+        tantivy_requires_rebuild = true;
     }
     complete_preflight_phase!();
     let mut needs_rebuild = legacy_omp_upgrade.lexical_rebuild_required
@@ -17736,7 +18062,16 @@ fn run_index_inner(
                 report_analytics_heartbeat();
             };
             let check_analytics_stop = || check_legacy_omp_analytics_stop(opts.progress.as_ref());
-            let _ = storage
+            // 2l1b0.75: the phase gets its own writer connection. Ingest and
+            // repair commit through ephemeral writers, which can leave this
+            // long-lived handle with an execution visibility ahead of its
+            // pager's publication. fsqlite 0.4.4 then refuses every BEGIN on
+            // it ("opened pager visibility N predates connection execution
+            // visibility M"), and no retry clears that. A connection opened
+            // now loads the current publication.
+            let analytics_writer = FrankenStorage::open_writer(&opts.db_path)
+                .with_context(|| "opening a writer for the legacy OMP analytics rebuild")?;
+            let rebuilt = analytics_writer
                 .rebuild_legacy_omp_analytics_with_progress(
                     Some(&report_analytics_progress),
                     Some(&report_analytics_heartbeat),
@@ -17744,7 +18079,12 @@ fn run_index_inner(
                 )
                 .with_context(|| {
                     "rebuilding legacy OMP analytics after lexical publication with resumable progress"
-                })?;
+                });
+            let closed = analytics_writer
+                .close()
+                .with_context(|| "closing the legacy OMP analytics writer");
+            let _ = rebuilt?;
+            closed?;
             if let (Some(progress), Some((phase, current, total, total_is_final))) =
                 (opts.progress.as_ref(), prior_progress)
             {
@@ -18321,6 +18661,7 @@ fn run_index_inner(
         // would silently drop the newly-ingested sessions from search). When
         // Tantivy is really behind, the refresh no-ops and search keeps
         // deferring; the real escalation there is a full rebuild, named below.
+        grant_final_checkpoint_refresh_grace(opts.progress.as_ref());
         if let Err(err) =
             refresh_completed_lexical_rebuild_checkpoint(&storage, &opts.db_path, &opts.data_dir)
         {
@@ -18356,6 +18697,7 @@ fn run_index_inner(
             "skipping final lexical checkpoint refresh because this incremental run made no canonical changes and started from a matching completed checkpoint"
         );
     } else {
+        grant_final_checkpoint_refresh_grace(opts.progress.as_ref());
         refresh_completed_lexical_rebuild_checkpoint_for_final_state(
             &mut storage,
             &opts.db_path,
@@ -20978,7 +21320,7 @@ fn required_index_headroom_bytes(
 /// `lexical_index_bytes` is the LIVE lexical footprint (see
 /// [`LexicalIndexFootprint::live_bytes`]).
 pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
-    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)";
+    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)";
 
 /// The inputs and result of the full-rebuild headroom rule, so `doctor` can
 /// report the same requirement `index --full` / `--force-rebuild` enforces.
@@ -21007,8 +21349,9 @@ pub(crate) struct FullRebuildHeadroomProjection {
     pub(crate) retained_backup_bytes: u64,
     /// A previous rebuild's staged scratch generation
     /// ([`LexicalIndexFootprint::rebuild_staging_bytes`]). The next rebuild
-    /// resumes into it or clears it first; excluded from `required_bytes`
-    /// (GH #496: doubling it locked a failed large rebuild out of its retry).
+    /// resumes into it or clears it first, so those bytes are already paid
+    /// for: they are subtracted from `required_bytes` (GH #496: doubling them
+    /// locked a failed large rebuild out of its retry; GH #498 left 32 GB).
     pub(crate) rebuild_staging_bytes: u64,
 }
 
@@ -21040,9 +21383,15 @@ pub(crate) fn full_rebuild_headroom_projection(
 ) -> FullRebuildHeadroomProjection {
     let db_bundle_bytes = database_bundle_size_bytes(db_path);
     let footprint = lexical_index_footprint(data_dir);
+    // A leftover staged generation occupies disk the rebuild gets back: a
+    // resume continues writing into it, and a from-zero restart clears it
+    // before writing. Either way the new generation's bytes already on disk
+    // (or about to be freed) are not needed a second time, so they are
+    // credited against the requirement rather than merely left out of it.
     let projected = db_bundle_bytes
         .saturating_mul(2)
-        .saturating_add(footprint.live_bytes.saturating_mul(2));
+        .saturating_add(footprint.live_bytes.saturating_mul(2))
+        .saturating_sub(footprint.rebuild_staging_bytes);
     FullRebuildHeadroomProjection {
         required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
         floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
@@ -21716,7 +22065,14 @@ struct LexicalRebuildSequencedPreparedPage {
 #[derive(Debug)]
 enum LexicalRebuildPagePrepResult {
     Prepared(LexicalRebuildSequencedPreparedPage),
-    Error { sequence: u64, error: String },
+    /// An early part of a page still being prepared: one chunk of a long
+    /// conversation (bgn6s). Parts of a sequence are forwarded in order, before
+    /// its `Prepared` page, and hold no flow reservation.
+    Part(LexicalRebuildSequencedPreparedPage),
+    Error {
+        sequence: u64,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -21780,43 +22136,125 @@ impl Drop for StreamingByteReservation<'_> {
     }
 }
 
-/// Test-only panic injection for the page-prep worker panic-containment
-/// regression test (#288). Armed by the test immediately before sending a
-/// work item; consumed (and disarmed) by the first
-/// `prepare_lexical_rebuild_page_work` call that observes it.
+/// Test-only panic injection for the worker panic-containment regression
+/// tests (#282/#288). A test arms an injection for its own temp directory;
+/// only a worker whose database or output path lies inside that directory
+/// consumes it. A process-global flag let a rebuild running in any parallel
+/// test consume the injection, so the arming test saw no panic and the other
+/// test died of it (2l1b0.70).
 #[cfg(test)]
-static LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+struct ScopedPanicInjection(std::sync::Mutex<Option<PathBuf>>);
 
 #[cfg(test)]
-fn lexical_rebuild_page_prep_injected_panic_hook() {
-    if LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild page-prep panic for the #288 regression test");
+impl ScopedPanicInjection {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    fn arm(&self, scope: &Path) {
+        let mut armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *armed = Some(scope.to_path_buf());
+    }
+
+    fn fire_if_armed_for(&self, path: &Path, message: &str) {
+        let mut armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if armed
+            .as_deref()
+            .is_some_and(|scope| path.starts_with(scope))
+        {
+            *armed = None;
+            drop(armed);
+            panic!("{message}");
+        }
     }
 }
 
-/// Test-only panic injection for the shard-build worker panic-containment
-/// regression test (#282/#288). Armed by the test before sending shard-build
-/// work; consumed by the first build attempt inside the worker's catch_unwind.
 #[cfg(test)]
-static LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+static LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC: ScopedPanicInjection = ScopedPanicInjection::new();
 
 #[cfg(test)]
-fn lexical_rebuild_shard_build_injected_panic_hook() {
-    if LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild shard-build panic for the #282 regression test");
-    }
+fn lexical_rebuild_page_prep_injected_panic_hook(db_path: &Path) {
+    LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.fire_if_armed_for(
+        db_path,
+        "injected lexical rebuild page-prep panic for the #288 regression test",
+    );
 }
 
-/// Test-only panic injection for the shard-merge worker panic-containment
-/// regression test (#282). Armed by the test before sending a merge job;
-/// consumed by the first merge attempt inside the worker's catch_unwind.
 #[cfg(test)]
-static LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
+static LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC: ScopedPanicInjection =
+    ScopedPanicInjection::new();
 
 #[cfg(test)]
-fn lexical_rebuild_shard_merge_injected_panic_hook() {
-    if LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild shard-merge panic for the #282 regression test");
+fn lexical_rebuild_shard_build_injected_panic_hook(shard_index_path: &Path) {
+    LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.fire_if_armed_for(
+        shard_index_path,
+        "injected lexical rebuild shard-build panic for the #282 regression test",
+    );
+}
+
+#[cfg(test)]
+static LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC: ScopedPanicInjection =
+    ScopedPanicInjection::new();
+
+#[cfg(test)]
+fn lexical_rebuild_shard_merge_injected_panic_hook(output_path: &Path) {
+    LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.fire_if_armed_for(
+        output_path,
+        "injected lexical rebuild shard-merge panic for the #282 regression test",
+    );
+}
+
+/// Split a conversation's `(idx, indexed bytes)` footprints (in idx order) into
+/// inclusive idx ranges of at most `chunk_bytes` of text each; a single larger
+/// message is a range of its own. One range means the conversation fits.
+fn lexical_rebuild_conversation_chunks(
+    footprints: &[(i64, usize)],
+    chunk_bytes: usize,
+) -> Vec<(i64, i64)> {
+    let mut chunks = Vec::new();
+    let mut current: Option<(i64, i64, usize)> = None;
+    for &(idx, bytes) in footprints {
+        match current.as_mut() {
+            Some((_, last, used)) if used.saturating_add(bytes) <= chunk_bytes => {
+                *last = idx;
+                *used = used.saturating_add(bytes);
+            }
+            _ => {
+                if let Some((first, last, _)) = current.take() {
+                    chunks.push((first, last));
+                }
+                current = Some((idx, idx, bytes));
+            }
+        }
+    }
+    if let Some((first, last, _)) = current {
+        chunks.push((first, last));
+    }
+    chunks
+}
+
+/// An early part of a page: packets handed to the consumer ahead of the page's
+/// completion (bgn6s). It holds no flow reservation and never finishes a
+/// planned shard.
+fn lexical_rebuild_page_part(
+    packets: Vec<LexicalRebuildConversationPacket>,
+    page_last_conversation_id: i64,
+    planned_shard_index: Option<usize>,
+) -> LexicalRebuildPreparedPage {
+    LexicalRebuildPreparedPage {
+        packets,
+        page_last_conversation_id,
+        planned_shard_index,
+        finishes_planned_shard: false,
+        conversation_list_duration: Duration::ZERO,
+        message_fetch_duration: Duration::ZERO,
+        packet_prepare_duration: Duration::ZERO,
     }
 }
 
@@ -21829,9 +22267,8 @@ fn prepare_lexical_rebuild_page_work(
     producer_telemetry: &LexicalRebuildProducerTelemetry,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     work: LexicalRebuildPagePrepWork,
+    emit_part: &mut dyn FnMut(LexicalRebuildPreparedPage) -> Result<()>,
 ) -> Result<LexicalRebuildSequencedPreparedPage> {
-    #[cfg(test)]
-    lexical_rebuild_page_prep_injected_panic_hook();
     let sequence = work.sequence;
     let conversation_ids = work
         .conversation_page
@@ -21900,6 +22337,9 @@ fn prepare_lexical_rebuild_page_work(
                 "lexical rebuild page exceeded batch-fetch guardrail inside page-prep worker; preparing one conversation at a time"
             );
             let mut prepared_packets = Vec::with_capacity(work.conversation_page.len());
+            // A conversation larger than one page's content budget is streamed
+            // in message-range chunks instead of held whole (bgn6s).
+            let chunk_bytes = work.pipeline_budget.batch_fetch_message_bytes_limit.max(1);
             for conversation in work.conversation_page {
                 let conversation_id = conversation.id.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -21907,6 +22347,93 @@ fn prepare_lexical_rebuild_page_work(
                     )
                 })?;
                 let fallback_fetch_started = Instant::now();
+                let footprints = storage
+                    .lexical_rebuild_message_footprints(conversation_id)
+                    .with_context(|| {
+                        format!(
+                            "reading lexical rebuild footprints for conversation {conversation_id}"
+                        )
+                    })?;
+                let chunks = lexical_rebuild_conversation_chunks(&footprints, chunk_bytes);
+                if chunks.len() > 1 {
+                    message_fetch_duration =
+                        message_fetch_duration.saturating_add(fallback_fetch_started.elapsed());
+                    // Everything prepared so far precedes this conversation.
+                    if !prepared_packets.is_empty() {
+                        emit_part(lexical_rebuild_page_part(
+                            std::mem::take(&mut prepared_packets),
+                            work.page_last_conversation_id,
+                            work.planned_shard_index,
+                        ))?;
+                    }
+                    tracing::info!(
+                        sequence,
+                        conversation_id,
+                        messages = footprints.len(),
+                        indexed_bytes = footprints.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
+                        chunks = chunks.len(),
+                        chunk_bytes,
+                        "lexical rebuild streaming a long conversation in message-range chunks"
+                    );
+                    let gate = Arc::new(LexicalRebuildChunkGate::default());
+                    for (chunk_index, (first_idx, last_idx)) in chunks.iter().enumerate() {
+                        let chunk_fetch_started = Instant::now();
+                        let messages = storage
+                            .fetch_messages_for_lexical_rebuild_idx_range(
+                                conversation_id,
+                                *first_idx,
+                                *last_idx,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "fetching lexical rebuild messages {first_idx}..={last_idx} for conversation {conversation_id}"
+                                )
+                            })?;
+                        message_fetch_duration =
+                            message_fetch_duration.saturating_add(chunk_fetch_started.elapsed());
+                        let mut grouped_messages = HashMap::with_capacity(1);
+                        if !messages.is_empty() {
+                            grouped_messages.insert(conversation_id, messages);
+                        }
+                        let chunk_prepare_started = Instant::now();
+                        let mut chunk_packets = prepare_lexical_rebuild_packet_batch(
+                            vec![conversation.clone()],
+                            grouped_messages,
+                            source_map,
+                            lexical_rebuild_worker_pool,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "preparing lexical rebuild chunk {chunk_index} of conversation {conversation_id}"
+                            )
+                        })?;
+                        packet_prepare_duration =
+                            packet_prepare_duration.saturating_add(chunk_prepare_started.elapsed());
+                        let is_final = chunk_index + 1 == chunks.len();
+                        for packet in &mut chunk_packets {
+                            packet.chunk = Some(LexicalRebuildChunk {
+                                is_final,
+                                gate: Arc::clone(&gate),
+                            });
+                        }
+                        if is_final {
+                            // The last chunk rides the completed page and
+                            // finishes the conversation there.
+                            prepared_packets.extend(chunk_packets);
+                        } else {
+                            // One chunk in flight: the previous must be flushed
+                            // into the index before this one is handed over.
+                            gate.wait_until_flushed(reservation_order, flow_limiter)?;
+                            gate.sent();
+                            emit_part(lexical_rebuild_page_part(
+                                chunk_packets,
+                                work.page_last_conversation_id,
+                                work.planned_shard_index,
+                            ))?;
+                        }
+                    }
+                    continue;
+                }
                 let messages = storage
                     .fetch_messages_for_lexical_rebuild(conversation_id)
                     .with_context(|| {
@@ -22082,6 +22609,8 @@ fn spawn_lexical_rebuild_page_prep_workers(
                             // the producer observes a result and aborts loudly.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                                 || {
+                                    #[cfg(test)]
+                                    lexical_rebuild_page_prep_injected_panic_hook(&worker_db_path);
                                     prepare_lexical_rebuild_page_work(
                                         &mut storage,
                                         worker_source_map.as_ref(),
@@ -22090,6 +22619,20 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                         worker_producer_telemetry.as_ref(),
                                         worker_pool.as_deref(),
                                         work,
+                                        &mut |page| {
+                                            worker_result_tx
+                                                .send(LexicalRebuildPagePrepResult::Part(
+                                                    LexicalRebuildSequencedPreparedPage {
+                                                        sequence,
+                                                        page,
+                                                    },
+                                                ))
+                                                .map_err(|_| {
+                                                    anyhow::anyhow!(
+                                                        "lexical rebuild producer disconnected while a long conversation was streaming"
+                                                    )
+                                                })
+                                        },
                                     )
                                 },
                             ));
@@ -22317,6 +22860,10 @@ fn spawn_lexical_rebuild_packet_producer(
                 let mut handoff_messages_since_budget = 0usize;
                 let mut handoff_message_bytes_since_budget = 0usize;
                 let mut completed_pages = BTreeMap::<u64, LexicalRebuildPreparedPage>::new();
+                // Early parts (long-conversation chunks) per sequence, forwarded
+                // in order ahead of that sequence's completed page (bgn6s).
+                let mut pending_parts =
+                    BTreeMap::<u64, VecDeque<LexicalRebuildPreparedPage>>::new();
                 let mut logged_current_shard_index = None;
 
                 loop {
@@ -22506,7 +23053,29 @@ fn spawn_lexical_rebuild_packet_producer(
                         }
                     }
 
-                    while let Some(prepared_page) = completed_pages.remove(&next_sequence_to_emit) {
+                    loop {
+                        // Parts of the head sequence (chunks of a long
+                        // conversation) go out as soon as they arrive: the
+                        // worker streaming it waits for each to be flushed.
+                        if let Some(parts) = pending_parts.get_mut(&next_sequence_to_emit) {
+                            while let Some(part) = parts.pop_front() {
+                                if tx.send(LexicalRebuildPipelineMessage::Batch(part)).is_err() {
+                                    reservation_order.close();
+                                    release_completed_lexical_rebuild_pages(
+                                        &mut completed_pages,
+                                        flow_limiter.as_ref(),
+                                    );
+                                    return Err(anyhow::anyhow!(
+                                        "lexical rebuild consumer disconnected before an ordered long-conversation chunk handoff"
+                                    ));
+                                }
+                            }
+                        }
+                        let Some(prepared_page) = completed_pages.remove(&next_sequence_to_emit)
+                        else {
+                            break;
+                        };
+                        pending_parts.remove(&next_sequence_to_emit);
                         producer_telemetry.record(
                             page_prep_worker_count,
                             active_work,
@@ -22705,6 +23274,28 @@ fn spawn_lexical_rebuild_packet_producer(
                                 ordered_buffered_pages = completed_pages.len(),
                                 "lexical rebuild producer received prepared page from worker"
                             );
+                        }
+                        Ok(LexicalRebuildPagePrepResult::Part(part)) => {
+                            // A part never finishes its page, so active work
+                            // and the ordered barrier are unchanged.
+                            if part.sequence < next_sequence_to_emit
+                                || completed_pages.contains_key(&part.sequence)
+                            {
+                                reservation_order.close();
+                                release_completed_lexical_rebuild_pages(
+                                    &mut completed_pages,
+                                    flow_limiter.as_ref(),
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "lexical rebuild page-prep worker returned a part for sequence {} after that page completed (ordered barrier {})",
+                                    part.sequence,
+                                    next_sequence_to_emit
+                                ));
+                            }
+                            pending_parts
+                                .entry(part.sequence)
+                                .or_default()
+                                .push_back(part.page);
                         }
                         Ok(LexicalRebuildPagePrepResult::Error { sequence, error }) => {
                             reservation_order.close();
@@ -25909,6 +26500,39 @@ fn rebuild_tantivy_from_db_with_options(
                                 max_message_id = max_message_id.max(last_message_id);
                             }
                             equivalence_accumulator.absorb_packet(&packet);
+                            if let Some(chunk) =
+                                packet.chunk.clone().filter(|chunk| !chunk.is_final)
+                            {
+                                // A non-final chunk of a long conversation
+                                // (bgn6s): flush it into the index now, freeing
+                                // its text so the worker reads the next chunk.
+                                // The conversation is counted, and can be
+                                // committed, only at its last chunk.
+                                observed_messages =
+                                    observed_messages.saturating_add(packet.message_count);
+                                pending_batch_message_count = pending_batch_message_count
+                                    .saturating_add(packet.message_count);
+                                pending_batch_message_bytes = pending_batch_message_bytes
+                                    .saturating_add(packet.message_bytes);
+                                pending_batch.push(packet);
+                                flush_streamed_lexical_rebuild_batch(
+                                    &mut pending_batch,
+                                    &mut pending_batch_message_count,
+                                    &mut pending_batch_message_bytes,
+                                    Some(lexical_rebuild_flow_limiter.as_ref()),
+                                    lexical_rebuild_worker_pool.as_deref(),
+                                    &mut t_index,
+                                    &mut indexed_docs,
+                                    &mut messages_since_commit,
+                                    &mut message_bytes_since_commit,
+                                    current_batch_conversation_limit,
+                                    page_size,
+                                    perf_profile.as_mut(),
+                                )?;
+                                chunk.gate.flushed();
+                                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                                continue;
+                            }
                             finish_conversation!(packet)?;
                         }
                         if flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
@@ -29686,7 +30310,7 @@ fn reindex_paths_with_semantic_delta(
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
-                ingest_diagnostics.observe_scan_error(&root.path, e.to_string());
+                ingest_diagnostics.observe_connector_scan_error(&root.path, &e);
                 tracing::debug!(
                     "watch scan failed for {:?} at {}: {}",
                     kind,
@@ -30094,6 +30718,25 @@ fn explicit_watch_once_root_unchanged_after_last_index(
     };
     if modified_at_ms > last_indexed_at {
         return Ok(false);
+    }
+    // A database-backed source commits into its -wal (or rollback -journal)
+    // without touching the main file, so the main file's mtime alone cannot
+    // prove the source unchanged (GH #502). -shm is excluded: readers rewrite
+    // it, and it holds no committed data.
+    for suffix in ["-wal", "-journal"] {
+        let sidecar = database_path_with_suffix(&root.path, suffix);
+        let sidecar_modified_at_ms = match fs::metadata(&sidecar) {
+            Ok(metadata) => metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_epoch_millis),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Ok(false),
+        };
+        match sidecar_modified_at_ms {
+            Some(sidecar_modified_at_ms) if sidecar_modified_at_ms <= last_indexed_at => {}
+            _ => return Ok(false),
+        }
     }
 
     let source_path = root.path.to_string_lossy();
@@ -32090,21 +32733,23 @@ pub mod persist {
     use crate::search::tantivy::TantivyIndex;
     #[cfg(test)]
     use crate::sources::provenance::{Source, SourceKind};
-    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
+    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome, SourceFileStamp};
 
-    /// Replay the capped canonical conversation after persistence. Callers map
-    /// changed message indices onto this packet only after its canonical prefix
-    /// has consumed the same content budget as an authoritative database rebuild.
-    fn lexical_packet_for_canonical_outcome(
+    /// Indexed-text bytes read per step when a whole canonical conversation is
+    /// replayed inline, so a conversation with gigabytes of history never has
+    /// more than one chunk in memory (bgn6s). Each message is still capped by
+    /// `lexical_max_message_content_bytes`, so a chunk exceeds this only when
+    /// it holds a single message.
+    const CANONICAL_LEXICAL_REPLAY_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+    /// The canonical conversation a lexical packet is built on, without its
+    /// messages. As in a full rebuild, stored metadata and snippets are
+    /// omitted: only the origin envelope the lexical sink reads is synthesized
+    /// from canonical columns, and the incoming transcript is never cloned.
+    fn canonical_lexical_conversation(
         storage: &FrankenStorage,
         conversation_id: i64,
-    ) -> Result<ConversationPacket> {
-        // GH #466: persistence can retain an earlier, shorter message variant.
-        // Spend the lexical prefix budget on those canonical rows, before
-        // selecting inserted indices, rather than on the freshly parsed source.
-        // As in a full rebuild, omit stored metadata/snippets and hydrate
-        // bounded text. Only the canonical origin envelope is synthesized below;
-        // never clone the incoming transcript just to replace its messages.
+    ) -> Result<Conversation> {
         let mut canonical = storage.raw().query_row_map(
             "SELECT COALESCE(a.slug, 'unknown'), c.external_id, c.title, c.source_path,
                     c.started_at, c.ended_at, c.source_id, c.origin_host, w.path
@@ -32143,29 +32788,103 @@ pub mod persist {
                 })
             },
         )?;
-        canonical.messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
-        let provenance = ConversationPacketProvenance {
-            source_id: canonical.source_id.clone(),
-            origin_kind: crate::search::tantivy::normalized_index_origin_kind(
-                &canonical.source_id,
-                None,
-            ),
-            origin_host: canonical.origin_host.clone(),
-        };
-        // The lexical packet sink reads this small origin envelope. Rebuild
-        // it from canonical columns without loading arbitrary stored metadata.
+        let origin_kind =
+            crate::search::tantivy::normalized_index_origin_kind(&canonical.source_id, None);
         canonical.metadata_json = serde_json::json!({
             "cass": {
                 "origin": {
-                    "source_id": &provenance.source_id,
-                    "kind": &provenance.origin_kind,
-                    "host": &provenance.origin_host,
+                    "source_id": &canonical.source_id,
+                    "kind": origin_kind,
+                    "host": &canonical.origin_host,
                 }
             }
         });
-        Ok(ConversationPacket::from_canonical_replay_owned(
-            canonical, provenance,
-        ))
+        Ok(canonical)
+    }
+
+    fn canonical_lexical_packet(
+        conversation: &Conversation,
+        messages: Vec<Message>,
+    ) -> ConversationPacket {
+        let provenance = ConversationPacketProvenance {
+            source_id: conversation.source_id.clone(),
+            origin_kind: crate::search::tantivy::normalized_index_origin_kind(
+                &conversation.source_id,
+                None,
+            ),
+            origin_host: conversation.origin_host.clone(),
+        };
+        let mut canonical = conversation.clone();
+        canonical.messages = messages;
+        ConversationPacket::from_canonical_replay_owned(canonical, provenance)
+    }
+
+    /// The canonical rows of the message indices a persistence outcome
+    /// changed. GH #466: persistence can retain an earlier message variant, so
+    /// the packet carries what was stored, never the freshly parsed source.
+    /// Only the changed rows are held, so an append to a long conversation
+    /// never reads its older text into memory (bgn6s).
+    fn lexical_packet_for_changed_messages(
+        storage: &FrankenStorage,
+        conversation_id: i64,
+        changed_indices: &[i64],
+    ) -> Result<ConversationPacket> {
+        let conversation = canonical_lexical_conversation(storage, conversation_id)?;
+        let wanted: HashSet<i64> = changed_indices.iter().copied().collect();
+        let mut messages = Vec::with_capacity(wanted.len());
+        if let (Some(&first), Some(&last)) = (wanted.iter().min(), wanted.iter().max()) {
+            storage.for_each_lexical_rebuild_message(
+                conversation_id,
+                Some((first, last)),
+                |message| {
+                    if wanted.contains(&message.idx) {
+                        messages.push(message);
+                    }
+                    Ok(true)
+                },
+            )?;
+        }
+        Ok(canonical_lexical_packet(&conversation, messages))
+    }
+
+    /// Reconcile every canonical message of a conversation, one bounded
+    /// chunk at a time. Reconciliation publishes under stable per-message
+    /// identities in independent engine batches and never promised
+    /// whole-conversation atomicity, so chunking bounds memory without
+    /// changing the published documents.
+    fn replay_canonical_conversation_for_rebuild(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        conversation_id: i64,
+    ) -> Result<()> {
+        replay_canonical_conversation_in_chunks(
+            storage,
+            index,
+            conversation_id,
+            CANONICAL_LEXICAL_REPLAY_CHUNK_BYTES,
+        )
+    }
+
+    fn replay_canonical_conversation_in_chunks(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        conversation_id: i64,
+        chunk_bytes: usize,
+    ) -> Result<()> {
+        let conversation = canonical_lexical_conversation(storage, conversation_id)?;
+        let footprints = storage.lexical_rebuild_message_footprints(conversation_id)?;
+        for (first_idx, last_idx) in
+            super::lexical_rebuild_conversation_chunks(&footprints, chunk_bytes)
+        {
+            let messages = storage.fetch_messages_for_lexical_rebuild_idx_range(
+                conversation_id,
+                first_idx,
+                last_idx,
+            )?;
+            let packet = canonical_lexical_packet(&conversation, messages);
+            publish_canonical_packet_for_rebuild(index, &packet, conversation_id)?;
+        }
+        Ok(())
     }
 
     /// Map `outcome.inserted_indices` (message idx values from
@@ -32237,8 +32956,7 @@ pub mod persist {
         if should_inject_incremental_lexical_update_oom() {
             anyhow::bail!("out of memory");
         }
-        let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
-        publish_canonical_packet_for_rebuild(index, &packet, conversation_id)
+        replay_canonical_conversation_for_rebuild(storage, index, conversation_id)
     }
 
     #[cfg(test)]
@@ -32526,6 +33244,37 @@ pub mod persist {
             return;
         };
         record_persisted_raw_mirror_db_link_groups(data_dir, convs.iter().zip(outcomes.iter()));
+    }
+
+    /// The single raw-mirror link for a conversation persisted in slices,
+    /// carrying the whole parsed conversation's message count. Per-slice links
+    /// would each add a distinct (and misleading) message count to the
+    /// manifest and re-verify the mirror blob once per slice.
+    fn record_sliced_raw_mirror_db_link(
+        data_dir: Option<&Path>,
+        conv: &NormalizedConversation,
+        conversation_id: i64,
+    ) {
+        let (Some(data_dir), Some(manifest_relative_path)) =
+            (data_dir, raw_mirror_manifest_relative_path(conv))
+        else {
+            return;
+        };
+        let link = crate::raw_mirror::RawMirrorDbLink {
+            conversation_id: Some(conversation_id),
+            message_count: Some(conv.messages.len()),
+            source_path: Some(conv.source_path.display().to_string()),
+            started_at_ms: conv.started_at,
+        };
+        if let Err(error) =
+            crate::raw_mirror::merge_manifest_db_links(data_dir, manifest_relative_path, &[link])
+        {
+            tracing::warn!(
+                manifest_relative_path,
+                error = %error,
+                "failed to record the raw mirror link of a conversation persisted in slices"
+            );
+        }
     }
 
     fn begin_concurrent_writes_enabled() -> bool {
@@ -33512,13 +34261,11 @@ pub mod persist {
                     // All outcomes are already persisted, so the first read
                     // for this identity contains its final canonical snapshot.
                     if rebuilt_conversation_ids.insert(outcome.conversation_id) {
-                        let packet =
-                            lexical_packet_for_canonical_outcome(storage, outcome.conversation_id)?;
-                        publish_canonical_packet_for_rebuild(
+                        replay_canonical_conversation_for_rebuild(
+                            storage,
                             t_index
                                 .as_deref_mut()
                                 .expect("inline rebuild requires Tantivy writer"),
-                            &packet,
                             outcome.conversation_id,
                         )?;
                     }
@@ -33526,8 +34273,11 @@ pub mod persist {
                 LexicalPopulationStrategy::IncrementalInline => {
                     let changed_indices = changed_message_indices(&outcome);
                     if !changed_indices.is_empty() {
-                        let packet =
-                            lexical_packet_for_canonical_outcome(storage, outcome.conversation_id)?;
+                        let packet = lexical_packet_for_changed_messages(
+                            storage,
+                            outcome.conversation_id,
+                            &changed_indices,
+                        )?;
                         let positional = positional_indices_for_inserted(&packet, &changed_indices);
                         if !positional.is_empty() {
                             let add_result = if should_inject_incremental_lexical_update_oom() {
@@ -33932,7 +34682,8 @@ pub mod persist {
             .copied()
             .collect();
         if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
-            let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
+            let packet =
+                lexical_packet_for_changed_messages(storage, conversation_id, &changed_indices)?;
             let positional = positional_indices_for_inserted(&packet, &changed_indices);
             if !positional.is_empty() {
                 publish_changed_packet_messages(
@@ -33992,7 +34743,8 @@ pub mod persist {
             .collect();
         if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
             let packet_started = Instant::now();
-            let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
+            let packet =
+                lexical_packet_for_changed_messages(storage, conversation_id, &changed_indices)?;
             profile.packet_duration += packet_started.elapsed();
 
             let positional_started = Instant::now();
@@ -34166,8 +34918,186 @@ pub mod persist {
         Ok(())
     }
 
+    /// `cass forget --apply` tombstones (2l1b0.50). A connector rescan (any
+    /// sibling change can trigger one) re-reads a forgotten source, and to
+    /// ingest it is a new conversation. Drop conversations whose forgotten
+    /// source is unchanged since the forget; a changed source is ingested
+    /// again, whole, and loses its tombstone. `None` when nothing is dropped.
+    fn retain_unforgotten_conversations(
+        storage: &FrankenStorage,
+        convs: &[NormalizedConversation],
+    ) -> Result<Option<Vec<NormalizedConversation>>> {
+        let tombstones = storage.forgotten_source_stamps()?;
+        if tombstones.is_empty() {
+            return Ok(None);
+        }
+        let mut keep = Vec::with_capacity(convs.len());
+        let mut changed = Vec::new();
+        for conv in convs {
+            let path = conv.source_path.to_string_lossy();
+            let forgotten_and_unchanged = match tombstones.get(path.as_ref()) {
+                None => false,
+                Some(stamp) if *stamp == SourceFileStamp::of(&conv.source_path) => true,
+                Some(_) => {
+                    changed.push(path.into_owned());
+                    false
+                }
+            };
+            if forgotten_and_unchanged {
+                tracing::debug!(
+                    source_path = %conv.source_path.display(),
+                    "skipping a conversation from a source forgotten by `cass forget`"
+                );
+            }
+            keep.push(!forgotten_and_unchanged);
+        }
+        if !changed.is_empty() {
+            changed.sort();
+            changed.dedup();
+            storage.clear_forgotten_sources(&changed)?;
+        }
+        if keep.iter().all(|kept| *kept) {
+            return Ok(None);
+        }
+        Ok(Some(
+            convs
+                .iter()
+                .zip(keep)
+                .filter(|(_, kept)| *kept)
+                .map(|(conv, _)| conv.clone())
+                .collect(),
+        ))
+    }
+
+    /// m91r6: the most one persist call may carry for a single conversation.
+    /// A giant conversation (Codex rollouts reach 1 GiB) persisted as ONE
+    /// storage transaction plus ONE lexical batch peaked at ~22x its source
+    /// size in RSS; on a machine already in swap that thrashed for longer than
+    /// the watchdog's 1800 s persist grace.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct PersistSliceLimits {
+        pub(super) messages: usize,
+        pub(super) content_bytes: usize,
+    }
+
+    impl PersistSliceLimits {
+        pub(super) const DEFAULT: Self = Self {
+            messages: 16_384,
+            content_bytes: 32 * 1024 * 1024,
+        };
+    }
+
+    /// Changed slices an incremental run buffers in the lexical writer before
+    /// publishing (at most ~128 MiB of text with the default slice size).
+    const PERSIST_SLICES_PER_LEXICAL_COMMIT: usize = 4;
+
+    /// Consecutive message ranges of `conv`, each within `limits` (a single
+    /// oversized message still forms its own range).
+    fn persist_slice_ranges(
+        conv: &NormalizedConversation,
+        limits: PersistSliceLimits,
+    ) -> Vec<std::ops::Range<usize>> {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        let mut bytes = 0usize;
+        for (pos, message) in conv.messages.iter().enumerate() {
+            if pos > start
+                && (pos - start >= limits.messages
+                    || bytes.saturating_add(message.content.len()) > limits.content_bytes)
+            {
+                ranges.push(start..pos);
+                start = pos;
+                bytes = 0;
+            }
+            bytes = bytes.saturating_add(message.content.len());
+        }
+        ranges.push(start..conv.messages.len());
+        ranges
+    }
+
+    /// Slice only conversations whose later slices take the append path's
+    /// bounded lookups. That needs a timestamp on every message: an untimed
+    /// message makes that path read every stored row of the conversation,
+    /// once per slice (quadratic). Native-ID agents (grok_bot, codebuff)
+    /// reconcile a whole conversation at once and are never sliced.
+    fn should_slice_conversation(
+        conv: &NormalizedConversation,
+        limits: PersistSliceLimits,
+    ) -> bool {
+        !matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
+            && conv
+                .messages
+                .iter()
+                .all(|message| message.created_at.is_some())
+            && persist_slice_ranges(conv, limits).len() > 1
+    }
+
+    /// One slice of a giant conversation. A non-final slice ends at its own
+    /// newest message, so the conversation's recorded end never runs ahead of
+    /// the rows actually stored; the final slice carries the real `ended_at`.
+    fn persist_conversation_slice(
+        conv: &NormalizedConversation,
+        range: std::ops::Range<usize>,
+        is_final: bool,
+    ) -> NormalizedConversation {
+        let messages = conv.messages[range].to_vec();
+        let ended_at = if is_final {
+            conv.ended_at
+        } else {
+            messages
+                .iter()
+                .filter_map(|message| message.created_at)
+                .max()
+        };
+        NormalizedConversation {
+            agent_slug: conv.agent_slug.clone(),
+            external_id: conv.external_id.clone(),
+            title: conv.title.clone(),
+            workspace: conv.workspace.clone(),
+            source_path: conv.source_path.clone(),
+            started_at: conv.started_at,
+            ended_at,
+            metadata: conv.metadata.clone(),
+            messages,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_inner(
+        storage: &FrankenStorage,
+        t_index: Option<&mut TantivyIndex>,
+        convs: &[NormalizedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+        capture_semantic_delta: bool,
+        raw_mirror_data_dir: Option<&Path>,
+        heartbeat: PersistHeartbeat<'_>,
+        source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
+    ) -> Result<PersistBatchOutcome> {
+        persist_conversations_batched_sliced(
+            storage,
+            t_index,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            capture_semantic_delta,
+            raw_mirror_data_dir,
+            heartbeat,
+            source_completion,
+            PersistSliceLimits::DEFAULT,
+        )
+    }
+
+    /// Persist `convs`, splitting any conversation larger than `limits` into
+    /// consecutive slices, each its own storage transaction and lexical
+    /// update. The first slice creates the conversation; later slices take
+    /// the ordinary append path (the same one a growing session takes every
+    /// run), so a crash between slices leaves a prefix that the next run
+    /// completes. The source-ledger completion rides only on the final call.
+    /// Native-ID agents (grok_bot, codebuff) reconcile a whole conversation at
+    /// once and are never sliced.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn persist_conversations_batched_sliced(
         storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
@@ -34177,7 +35107,153 @@ pub mod persist {
         raw_mirror_data_dir: Option<&Path>,
         heartbeat: PersistHeartbeat<'_>,
         source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
+        limits: PersistSliceLimits,
     ) -> Result<PersistBatchOutcome> {
+        let oversized = |conv: &NormalizedConversation| should_slice_conversation(conv, limits);
+        if !convs.iter().any(oversized) {
+            return persist_conversations_batched_whole(
+                storage,
+                t_index,
+                convs,
+                lexical_strategy,
+                defer_checkpoints,
+                capture_semantic_delta,
+                raw_mirror_data_dir,
+                true,
+                heartbeat,
+                source_completion,
+            );
+        }
+
+        // Runs of ordinary conversations still persist together; each giant
+        // conversation becomes its own sequence of slice calls. The final
+        // slice carries the whole conversation for its raw-mirror link.
+        enum Part<'a> {
+            Whole(&'a [NormalizedConversation]),
+            Slice {
+                slice: Box<NormalizedConversation>,
+                finishes: Option<&'a NormalizedConversation>,
+            },
+        }
+        let mut parts = Vec::new();
+        let mut run_start = 0;
+        for (pos, conv) in convs.iter().enumerate() {
+            if !oversized(conv) {
+                continue;
+            }
+            if run_start < pos {
+                parts.push(Part::Whole(&convs[run_start..pos]));
+            }
+            let ranges = persist_slice_ranges(conv, limits);
+            let last = ranges.len() - 1;
+            for (slice, range) in ranges.into_iter().enumerate() {
+                let is_final = slice == last;
+                parts.push(Part::Slice {
+                    slice: Box::new(persist_conversation_slice(conv, range, is_final)),
+                    finishes: is_final.then_some(conv),
+                });
+            }
+            run_start = pos + 1;
+        }
+        if run_start < convs.len() {
+            parts.push(Part::Whole(&convs[run_start..]));
+        }
+
+        let mut outcome = PersistBatchOutcome::default();
+        let last_part = parts.len() - 1;
+        let mut changed_parts_since_commit = 0usize;
+        for (index, part) in parts.into_iter().enumerate() {
+            let is_last = index == last_part;
+            // An inline rebuild replays each touched conversation in full from
+            // the canonical rows (streamed in bounded chunks); replaying it
+            // after every slice would be quadratic. Earlier parts only store
+            // rows and the final part's replay covers every slice.
+            let part_strategy = if !is_last
+                && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan
+            {
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
+            } else {
+                lexical_strategy
+            };
+            let completion = source_completion.filter(|_| is_last);
+            let part_outcome = match &part {
+                Part::Whole(batch) => persist_conversations_batched_whole(
+                    storage,
+                    t_index.as_deref_mut(),
+                    batch,
+                    part_strategy,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    raw_mirror_data_dir,
+                    true,
+                    heartbeat,
+                    completion,
+                ),
+                Part::Slice { slice, .. } => persist_conversations_batched_whole(
+                    storage,
+                    t_index.as_deref_mut(),
+                    std::slice::from_ref(slice.as_ref()),
+                    part_strategy,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    raw_mirror_data_dir,
+                    false,
+                    heartbeat,
+                    completion,
+                ),
+            }?;
+            if let Part::Slice {
+                finishes: Some(conv),
+                ..
+            } = &part
+                && let Some(&conversation_id) = part_outcome.canonical_conversation_ids.first()
+            {
+                record_sliced_raw_mirror_db_link(raw_mirror_data_dir, conv, conversation_id);
+            }
+            let changed = part_outcome.inserted_messages + part_outcome.updated_messages > 0;
+            outcome.merge(part_outcome);
+            // Bound the lexical writer's buffered documents to a few slices.
+            // Every publish re-verifies the live segments (seconds on a large
+            // index), so slices that changed nothing (a growing session's
+            // already-stored history) never force one.
+            changed_parts_since_commit += usize::from(changed);
+            if !is_last
+                && changed_parts_since_commit >= PERSIST_SLICES_PER_LEXICAL_COMMIT
+                && lexical_strategy == LexicalPopulationStrategy::IncrementalInline
+                && let Some(index) = t_index.as_deref_mut()
+            {
+                index.commit()?;
+                changed_parts_since_commit = 0;
+            }
+            heartbeat.tick();
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_conversations_batched_whole(
+        storage: &FrankenStorage,
+        mut t_index: Option<&mut TantivyIndex>,
+        convs: &[NormalizedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+        capture_semantic_delta: bool,
+        raw_mirror_data_dir: Option<&Path>,
+        record_raw_mirror_links: bool,
+        heartbeat: PersistHeartbeat<'_>,
+        source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
+    ) -> Result<PersistBatchOutcome> {
+        // Link recording re-verifies the mirror blob; a sliced conversation
+        // records one link, with its full message count, after its last slice.
+        let link_data_dir = raw_mirror_data_dir.filter(|_| record_raw_mirror_links);
+        let retained;
+        let convs = match retain_unforgotten_conversations(storage, convs)? {
+            Some(kept) => {
+                retained = kept;
+                retained.as_slice()
+            }
+            None => convs,
+        };
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
         }
@@ -34227,7 +35303,7 @@ pub mod persist {
                 lexical_strategy,
                 defer_checkpoints,
                 capture_semantic_delta,
-                raw_mirror_data_dir,
+                link_data_dir,
                 heartbeat,
             );
         }
@@ -34347,7 +35423,7 @@ pub mod persist {
         )?;
         let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
-        record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
+        record_persisted_raw_mirror_db_links(link_data_dir, convs, &outcomes);
         if !defer_lexical_updates {
             let rebuild_inline = !outcomes.is_empty()
                 && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan;
@@ -34382,15 +35458,11 @@ pub mod persist {
                         // Coalesce only lexical replay; every persistence
                         // outcome still contributes accounting and semantics.
                         if rebuilt_conversation_ids.insert(outcome.conversation_id) {
-                            let packet = lexical_packet_for_canonical_outcome(
+                            replay_canonical_conversation_for_rebuild(
                                 storage,
-                                outcome.conversation_id,
-                            )?;
-                            publish_canonical_packet_for_rebuild(
                                 t_index
                                     .as_deref_mut()
                                     .expect("inline rebuild requires Tantivy writer"),
-                                &packet,
                                 outcome.conversation_id,
                             )?;
                         }
@@ -34398,9 +35470,10 @@ pub mod persist {
                     LexicalPopulationStrategy::IncrementalInline => {
                         let changed_indices = changed_message_indices(outcome);
                         if !changed_indices.is_empty() {
-                            let packet = lexical_packet_for_canonical_outcome(
+                            let packet = lexical_packet_for_changed_messages(
                                 storage,
                                 outcome.conversation_id,
+                                &changed_indices,
                             )?;
                             let positional =
                                 positional_indices_for_inserted(&packet, &changed_indices);
@@ -34912,10 +35985,7 @@ pub mod persist {
             use crate::search::query::{FieldMask, SearchClient, SearchFilters};
 
             let cap = if expand_prefix { 8 * 1024 * 1024 } else { 128 };
-            let _cap = set_env(
-                "CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES",
-                &cap.to_string(),
-            );
+            let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", &cap.to_string());
             let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
             let _begin = set_env(
                 "CASS_INDEXER_BEGIN_CONCURRENT",
@@ -35011,18 +36081,22 @@ pub mod persist {
             if expand_prefix {
                 // Same identity and timestamp, but the newly parsed source
                 // exceeds the real default cap. Persistence retains the short
-                // canonical prefix, leaving room for both appended documents.
+                // canonical row, and the lexical projection indexes that row.
                 let fresh_prefix = "oversized fresh prefix ";
                 conv.messages[0].content = fresh_prefix.repeat(cap / fresh_prefix.len() + 1);
                 assert!(conv.messages[0].content.len() > cap);
                 conv.messages.push(make_message(2, "appended delta".into()));
                 conv.messages.push(make_message(3, "quartzcharlie".into()));
             } else {
-                // The canonical prefix is unchanged. The first append crosses
-                // the budget; the final canonical row must remain unindexed.
+                // The first append exceeds the per-message cap: only its tail
+                // is dropped. The following message is indexed in full, as it
+                // is however much text the conversation already holds (bgn6s).
                 conv.messages.push(make_message(
                     2,
-                    format!("quartzcharlie {}", "bounded text ".repeat(cap)),
+                    format!(
+                        "quartzcharlie {} tailbeyondcap",
+                        "bounded text ".repeat(cap)
+                    ),
                 ));
                 conv.messages
                     .push(make_message(3, "beyondcapneedle".into()));
@@ -35034,7 +36108,7 @@ pub mod persist {
                 assert_eq!(outcome.updated_messages, 0);
                 assert!(!outcome.lexical_update_deferred);
             }
-            let expected_docs = if expand_prefix { 4 } else { 3 };
+            let expected_docs = 4;
             assert_eq!(tantivy_doc_count(&mut index), expected_docs);
             let stored = storage.fetch_messages(conversation_id).unwrap();
             assert_eq!(stored.len(), 4);
@@ -35050,7 +36124,8 @@ pub mod persist {
             );
             assert_eq!(stored[2].content, conv.messages[2].content);
             assert_eq!(stored[3].content, conv.messages[3].content);
-            let packet = lexical_packet_for_canonical_outcome(&storage, conversation_id).unwrap();
+            let packet =
+                lexical_packet_for_changed_messages(&storage, conversation_id, &[3, 2]).unwrap();
             assert_eq!(
                 packet
                     .payload
@@ -35058,12 +36133,12 @@ pub mod persist {
                     .iter()
                     .map(|message| message.idx)
                     .collect::<Vec<_>>(),
-                vec![0, 1, 2, 3],
-                "capping must not erase indices needed by the insertion outcome"
+                vec![2, 3],
+                "an append carries exactly its changed canonical rows, in idx order"
             );
             assert_eq!(
                 positional_indices_for_inserted(&packet, &[2, 3]),
-                vec![2, 3]
+                vec![0, 1]
             );
             assert_eq!(
                 packet.payload.metadata_json,
@@ -35089,15 +36164,15 @@ pub mod persist {
                 .sum();
             if expand_prefix {
                 assert!(retained_bytes < cap);
-                assert_eq!(packet.payload.messages[3].content, "quartzcharlie");
+                assert_eq!(packet.payload.messages[1].content, "quartzcharlie");
             } else {
-                assert_eq!(retained_bytes, cap);
+                assert_eq!(packet.payload.messages[0].content.len(), cap);
                 assert!(
-                    packet.payload.messages[2]
+                    packet.payload.messages[0]
                         .content
                         .starts_with("quartzcharlie ")
                 );
-                assert!(packet.payload.messages[3].content.is_empty());
+                assert_eq!(packet.payload.messages[1].content, "beyondcapneedle");
             }
             assert_eq!(
                 crate::indexer::expected_live_lexical_doc_count(&storage).unwrap(),
@@ -35145,12 +36220,29 @@ pub mod persist {
                     1,
                     "appended marker must be searchable exactly once"
                 );
-                for absent in ["beyondcapneedle", "oversized"] {
+                for absent in ["tailbeyondcap", "oversized"] {
                     assert!(
                         client
                             .search(absent, SearchFilters::default(), 10, 0, FieldMask::FULL)
                             .unwrap()
-                            .is_empty()
+                            .is_empty(),
+                        "{absent} lies past a message cap or in a replaced source variant"
+                    );
+                }
+                if !expand_prefix {
+                    assert_eq!(
+                        client
+                            .search(
+                                "beyondcapneedle",
+                                SearchFilters::default(),
+                                10,
+                                0,
+                                FieldMask::FULL
+                            )
+                            .unwrap()
+                            .len(),
+                        1,
+                        "a message after a capped one stays searchable (bgn6s)"
                     );
                 }
                 let hit = &hits[0];
@@ -35220,9 +36312,233 @@ pub mod persist {
 
         #[test]
         #[serial]
-        fn gh466_incremental_lexical_cap_preserves_ordinary_append_crossing() {
+        fn gh466_incremental_append_after_a_capped_message_stays_searchable() {
             for route in 0..3 {
                 assert_gh466_canonical_prefix_cap("claude_code", route, false);
+            }
+        }
+
+        /// bgn6s: an inline replay reads a conversation one bounded chunk at
+        /// a time and still indexes every message; a cumulative cap would
+        /// leave everything after the first message unindexed here.
+        #[test]
+        #[serial]
+        fn chunked_canonical_replay_indexes_every_message_of_a_long_conversation() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "40");
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let markers = [
+                "alphamark",
+                "bravomark",
+                "charliemark",
+                "deltamark",
+                "foxtrotmark",
+            ];
+            let messages = markers
+                .iter()
+                .enumerate()
+                .map(|(idx, marker)| NormalizedMessage {
+                    idx: idx as i64,
+                    role: "user".into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx as i64),
+                    content: if *marker == "charliemark" {
+                        format!("{marker} {} tailmark", "padding ".repeat(8))
+                    } else {
+                        format!("{marker} steady text")
+                    },
+                    extra: serde_json::json!({"uuid": format!("chunked-replay-{idx}")}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect();
+            let conv = NormalizedConversation {
+                agent_slug: "claude_code".into(),
+                external_id: Some("chunked-canonical-replay".into()),
+                title: Some("Chunked canonical replay".into()),
+                workspace: Some(dir.path().join("workspace")),
+                source_path: dir.path().join("source.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_010),
+                metadata: serde_json::Value::Null,
+                messages,
+            };
+            let unused_index_path = dir.path().join("unused-index");
+            let mut unused_index = TantivyIndex::open_or_create(&unused_index_path).unwrap();
+            persist_conversation(&storage, &mut unused_index, &conv).unwrap();
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+            let footprints = storage
+                .lexical_rebuild_message_footprints(conversation_id)
+                .unwrap();
+            assert_eq!(footprints.len(), markers.len());
+            assert_eq!(footprints[2].1, 40, "footprints report the capped length");
+            assert_eq!(
+                super::super::lexical_rebuild_conversation_chunks(&footprints, 1).len(),
+                markers.len(),
+                "a one-byte chunk budget reads every message as its own chunk"
+            );
+
+            let index_path = dir.path().join("replay-index");
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            for _ in 0..2 {
+                replay_canonical_conversation_in_chunks(&storage, &mut index, conversation_id, 1)
+                    .unwrap();
+                assert_eq!(
+                    tantivy_doc_count(&mut index),
+                    markers.len() as u64,
+                    "a repeated chunked replay reconciles the same identities"
+                );
+            }
+            drop(index);
+            let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+            let hits = |query: &str| {
+                client
+                    .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                    .unwrap()
+                    .len()
+            };
+            for marker in markers {
+                assert_eq!(hits(marker), 1, "{marker} must be searchable exactly once");
+            }
+            assert_eq!(hits("tailmark"), 0, "text past one message's cap stays out");
+        }
+
+        /// m91r6: a giant conversation persisted in slices must store exactly
+        /// what one transaction stores, be searchable at both ends, resume
+        /// after a crash between slices, and replay as a no-op.
+        #[test]
+        #[serial]
+        fn giant_conversation_persists_in_slices_like_one_transaction() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _begin = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let limits = PersistSliceLimits {
+                messages: 7,
+                content_bytes: usize::MAX,
+            };
+            let conversation = |dir: &std::path::Path, timestamps: bool| {
+                let messages = (0..50)
+                    .map(|idx| NormalizedMessage {
+                        idx,
+                        role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
+                        author: None,
+                        created_at: timestamps.then_some(1_700_000_000_000 + idx * 1000),
+                        content: format!("slicemark{idx}z giant session text {idx}"),
+                        extra: serde_json::json!({"uuid": format!("slice-{idx}")}),
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    })
+                    .collect();
+                NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some("giant-sliced".into()),
+                    title: Some("Giant sliced".into()),
+                    workspace: Some(dir.join("workspace")),
+                    source_path: dir.join("rollout-giant.jsonl"),
+                    started_at: timestamps.then_some(1_700_000_000_000),
+                    ended_at: timestamps.then_some(1_700_000_049_000),
+                    metadata: serde_json::Value::Null,
+                    messages,
+                }
+            };
+            let stored = |storage: &FrankenStorage| {
+                let rows: Vec<(i64, Option<i64>)> = storage
+                    .raw()
+                    .query_map_collect("SELECT id, ended_at FROM conversations", &[], |row| {
+                        Ok((row.get_typed(0)?, row.get_typed(1)?))
+                    })
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "exactly one conversation row");
+                let messages = storage
+                    .fetch_messages(rows[0].0)
+                    .unwrap()
+                    .into_iter()
+                    .map(|message| (message.idx, message.created_at, message.content))
+                    .collect::<Vec<_>>();
+                (rows[0].1, messages)
+            };
+            for strategy in [
+                LexicalPopulationStrategy::IncrementalInline,
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+            ] {
+                for timestamps in [true, false] {
+                    let dir = tempfile::TempDir::new().unwrap();
+                    let conv = conversation(dir.path(), timestamps);
+                    assert_eq!(persist_slice_ranges(&conv, limits).len(), 8);
+                    // Untimed messages would make every later slice rescan
+                    // the stored conversation, so they persist whole.
+                    assert_eq!(should_slice_conversation(&conv, limits), timestamps);
+                    let persist = |name: &str, convs: &[NormalizedConversation], sliced: bool| {
+                        let root = dir.path().join(name);
+                        std::fs::create_dir_all(&root).unwrap();
+                        let storage = create_franken_db(&root.join("agent_search.db"));
+                        let index_path = root.join("index");
+                        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+                        let mut outcomes = Vec::new();
+                        for conv in convs {
+                            outcomes.push(
+                                persist_conversations_batched_sliced(
+                                    &storage,
+                                    Some(&mut index),
+                                    std::slice::from_ref(conv),
+                                    strategy,
+                                    false,
+                                    false,
+                                    Some(&root),
+                                    PersistHeartbeat::NONE,
+                                    None,
+                                    if sliced {
+                                        limits
+                                    } else {
+                                        PersistSliceLimits::DEFAULT
+                                    },
+                                )
+                                .unwrap(),
+                            );
+                            index.commit().unwrap();
+                        }
+                        let docs = tantivy_doc_count(&mut index);
+                        drop(index);
+                        (storage, index_path, outcomes, docs)
+                    };
+                    let label = format!("{strategy:?} timestamps={timestamps}");
+
+                    let (whole, _, _, whole_docs) =
+                        persist("whole", std::slice::from_ref(&conv), false);
+                    let expected = stored(&whole);
+                    assert_eq!(expected.1.len(), 50, "{label}");
+
+                    let (sliced, index_path, outcomes, sliced_docs) =
+                        persist("sliced", &[conv.clone(), conv.clone()], true);
+                    assert_eq!(stored(&sliced), expected, "{label}");
+                    assert_eq!(sliced_docs, whole_docs, "{label}");
+                    assert_eq!(outcomes[0].inserted_conversations, 1, "{label}");
+                    assert_eq!(outcomes[0].inserted_messages, 50, "{label}");
+                    assert_eq!(outcomes[1].inserted_messages, 0, "{label}: replay");
+                    let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+                    for marker in ["slicemark0z", "slicemark27z", "slicemark49z"] {
+                        let hits = client
+                            .search(marker, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                            .unwrap();
+                        assert_eq!(hits.len(), 1, "{label}: {marker}");
+                    }
+
+                    // A crash after three slices leaves a stored prefix; the
+                    // next run completes it without duplicating a row.
+                    let prefix = persist_conversation_slice(&conv, 0..21, false);
+                    let (resumed, _, outcomes, resumed_docs) =
+                        persist("resumed", &[prefix, conv.clone()], true);
+                    assert_eq!(stored(&resumed), expected, "{label}: resumed");
+                    assert_eq!(resumed_docs, whole_docs, "{label}: resumed");
+                    assert_eq!(outcomes[1].inserted_messages, 29, "{label}: resumed");
+                }
             }
         }
 
@@ -45226,13 +46542,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn lexical_rebuild_page_conversation_limit_respects_cumulative_content_cap() {
-        let _cap = set_env("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "8");
+    fn lexical_rebuild_page_conversation_limit_respects_message_content_cap() {
+        let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "8");
 
         assert_eq!(
             lexical_rebuild_content_bounded_page_conversation_limit(32, 20),
             2,
-            "two eight-byte conversation prefixes fit inside a twenty-byte page budget"
+            "two eight-byte message caps fit inside a twenty-byte page budget"
         );
         assert_eq!(
             lexical_rebuild_content_bounded_page_conversation_limit(1, 20),
@@ -45242,7 +46558,32 @@ mod tests {
         assert_eq!(
             lexical_rebuild_content_bounded_page_conversation_limit(32, 4),
             1,
-            "a page smaller than one conversation cap must still admit one outlier"
+            "a page smaller than one message cap must still admit one outlier"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_conversation_chunks_cover_every_message_within_budget() {
+        assert!(lexical_rebuild_conversation_chunks(&[], 10).is_empty());
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 4), (1, 4), (2, 2)], 10),
+            vec![(0, 2)],
+            "a conversation within budget is one chunk"
+        );
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 4), (1, 4), (2, 4), (5, 1), (6, 9)], 10),
+            vec![(0, 1), (2, 5), (6, 6)],
+            "chunks close before exceeding the budget and span idx gaps"
+        );
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 3), (1, 25), (2, 3)], 10),
+            vec![(0, 0), (1, 1), (2, 2)],
+            "a message larger than the budget is a chunk of its own"
+        );
+        assert_eq!(
+            lexical_rebuild_conversation_chunks(&[(0, 0), (1, 0), (2, 0)], 0),
+            vec![(0, 2)],
+            "empty messages never split a conversation"
         );
     }
 
@@ -47860,6 +49201,94 @@ mod tests {
     /// parked forever at `result_rx.recv()` — exactly the reporter's
     /// all-parked thread dump (queue_depth=0, active_page_prep_jobs=0,
     /// inflight=0).
+    /// 2l1b0.70: an armed injection fires only for work inside its scope and
+    /// only once. With the former process-global flag, a rebuild in another
+    /// test (a different temp directory) consumed it.
+    /// bgn6s: a page-prep worker streaming a long conversation waits for the
+    /// consumer to flush its previous chunk. A flush releases it; a torn-down
+    /// pipeline (consumer failure closes the flow limiter, producer failure
+    /// closes the reservation order) releases it with an error instead of
+    /// parking it forever.
+    #[test]
+    fn chunk_gate_waits_for_the_flush_and_fails_once_the_pipeline_closes() {
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
+        let reservation_order = Arc::new(LexicalRebuildReservationOrder::new());
+
+        let gate = Arc::new(LexicalRebuildChunkGate::default());
+        gate.wait_until_flushed(&reservation_order, &flow_limiter)
+            .expect("nothing outstanding");
+        gate.sent();
+        let flusher = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                gate.flushed();
+            })
+        };
+        gate.wait_until_flushed(&reservation_order, &flow_limiter)
+            .expect("the consumer flushed the outstanding chunk");
+        flusher.join().unwrap();
+
+        for close_limiter in [true, false] {
+            let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
+            let reservation_order = Arc::new(LexicalRebuildReservationOrder::new());
+            let gate = Arc::new(LexicalRebuildChunkGate::default());
+            gate.sent();
+            let waiter = {
+                let gate = Arc::clone(&gate);
+                let flow_limiter = Arc::clone(&flow_limiter);
+                let reservation_order = Arc::clone(&reservation_order);
+                std::thread::spawn(move || {
+                    gate.wait_until_flushed(&reservation_order, &flow_limiter)
+                })
+            };
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !waiter.is_finished(),
+                "an unflushed chunk must hold the worker"
+            );
+            if close_limiter {
+                flow_limiter.close();
+            } else {
+                reservation_order.close();
+            }
+            let started = Instant::now();
+            while !waiter.is_finished() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "a closed pipeline must release the waiting worker"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let error = waiter.join().unwrap().expect_err("closed pipeline");
+            assert!(
+                error.to_string().contains("pipeline closed"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_panic_injection_fires_only_inside_its_scope() {
+        let injection = ScopedPanicInjection::new();
+        let armed = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        injection.arm(armed.path());
+
+        injection.fire_if_armed_for(&other.path().join("agent_search.db"), "must not fire");
+
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            injection.fire_if_armed_for(&armed.path().join("agent_search.db"), "fired in scope");
+        }));
+        assert!(
+            fired.is_err(),
+            "an injection armed for this scope must fire"
+        );
+
+        // Consumed: a second worker in the same scope proceeds normally.
+        injection.fire_if_armed_for(&armed.path().join("agent_search.db"), "must not fire twice");
+    }
+
     #[test]
     #[serial]
     fn page_prep_worker_panic_surfaces_as_error_result_instead_of_parking_producer() {
@@ -47887,7 +49316,7 @@ mod tests {
         )
         .unwrap();
 
-        LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.arm(tmp.path());
         work_tx
             .send(LexicalRebuildPagePrepWork {
                 sequence: 0,
@@ -47951,7 +49380,7 @@ mod tests {
         );
 
         let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.arm(tmp.path());
         work_tx
             .send(LexicalRebuildShardBuildWork {
                 shard: LexicalShardPlanShard {
@@ -48008,7 +49437,7 @@ mod tests {
         let handles = spawn_lexical_rebuild_shard_merge_workers(worker_count, job_rx, msg_tx);
 
         let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.store(true, Ordering::SeqCst);
+        LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.arm(tmp.path());
         job_tx
             .send(LexicalRebuildShardMergeJob {
                 output_level: 3,
@@ -49192,6 +50621,47 @@ mod tests {
             "a fresh burst is critical; got {}",
             summary.status
         );
+        Ok(())
+    }
+
+    /// 2l1b0.74: the index-run lock and the source advisory-lock probe now use
+    /// std File locking. A holder that took the lock through fs2 (an older
+    /// cass, or any fs2 caller) must still read as busy, and a free lock as
+    /// free: on Linux both are flock, on Windows both are LockFileEx.
+    #[test]
+    fn std_lock_probes_see_an_fs2_holder_as_busy() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("agent_search.db");
+        let lock_path = data_dir.join("index-run.lock");
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&holder)?;
+
+        let error = acquire_index_run_lock(&data_dir, &db_path, SearchMaintenanceMode::Index)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a held index-run lock must refuse a second run"))?;
+        let rendered = format!("{error:#}");
+        anyhow::ensure!(
+            rendered.contains("another cass index process already holds"),
+            "contention must keep the index-busy message: {rendered}"
+        );
+        anyhow::ensure!(
+            source_file_has_active_advisory_lock(&lock_path),
+            "a file another handle holds must read as locked"
+        );
+
+        fs2::FileExt::unlock(&holder)?;
+        anyhow::ensure!(
+            !source_file_has_active_advisory_lock(&lock_path),
+            "a released file must read as unlocked"
+        );
+        let _guard = acquire_index_run_lock(&data_dir, &db_path, SearchMaintenanceMode::Index)?;
         Ok(())
     }
 
@@ -51920,6 +53390,22 @@ mod tests {
     /// `rounds` single-document commits, then fold them into one segment so
     /// the folded inputs sit on disk unreferenced by the MANIFEST (#453).
     fn plant_merged_quill_index(data_dir: &Path, rounds: u64) -> PathBuf {
+        let (index_path, mut index) = plant_unmerged_quill_index(data_dir, rounds);
+        index.force_merge().expect("force merge");
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "merge must leave one live segment"
+        );
+        index_path
+    }
+
+    /// Build a real Quill index at the data dir's expected lexical path with
+    /// `rounds` single-document commits, left unmerged.
+    fn plant_unmerged_quill_index(
+        data_dir: &Path,
+        rounds: u64,
+    ) -> (PathBuf, crate::search::quill_bridge::QuillCassIndex) {
         use crate::search::quill_bridge::QuillCassIndex;
         use frankensearch::quill::cass::CassDocument;
 
@@ -51945,13 +53431,74 @@ mod tests {
                 .expect("index batch");
             index.commit().expect("commit batch");
         }
-        index.force_merge().expect("force merge");
+        (index_path, index)
+    }
+
+    #[test]
+    fn streaming_commit_interval_is_paced_by_commit_cost() {
+        let base = Duration::from_secs(5);
         assert_eq!(
-            index.segment_count(),
-            1,
-            "merge must leave one live segment"
+            paced_streaming_commit_interval(base, Duration::ZERO),
+            base,
+            "cheap commits keep the base cadence"
         );
-        index_path
+        assert_eq!(
+            paced_streaming_commit_interval(base, Duration::from_millis(900)),
+            base
+        );
+        assert_eq!(
+            paced_streaming_commit_interval(base, Duration::from_secs(10)),
+            Duration::from_secs(40),
+            "a 10 s publish is followed by at least 40 s of ingest"
+        );
+        assert_eq!(
+            paced_streaming_commit_interval(base, Duration::from_secs(3600)),
+            STREAMING_COMMIT_MAX_PACED_INTERVAL
+        );
+        assert_eq!(
+            paced_streaming_commit_interval(Duration::from_secs(600), Duration::from_secs(10)),
+            Duration::from_secs(600),
+            "an operator's longer base interval still wins"
+        );
+    }
+
+    /// A long streaming catch-up used to fold segments only after the run
+    /// ended, so every periodic publish re-verified an ever-growing pile. The
+    /// consumer's commit now folds the small tail too, at most once per
+    /// `STREAMING_FOLD_ATTEMPT_INTERVAL`.
+    #[test]
+    fn streaming_commit_folds_small_segments_at_most_once_per_interval() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let (index_path, planted) = plant_unmerged_quill_index(data_dir.path(), 6);
+        let planted_segments = planted.segment_count();
+        drop(planted);
+        assert!(
+            planted_segments >= 6,
+            "each committed round must leave a segment, got {planted_segments}"
+        );
+        let mut t_index = TantivyIndex::open_or_create(&index_path).expect("open lexical index");
+
+        let mut pacer = StreamingCommitPacer::new();
+        pacer.last_fold_attempt = Some(std::time::Instant::now());
+        pacer.commit(Some(&mut t_index));
+        assert_eq!(
+            t_index.segment_count(),
+            planted_segments,
+            "a fold attempted inside the spacing interval must be skipped"
+        );
+
+        pacer.last_fold_attempt = None;
+        pacer.commit(Some(&mut t_index));
+        assert!(
+            pacer.last_fold_attempt.is_some(),
+            "the attempt must be recorded"
+        );
+        assert!(
+            t_index.segment_count() < planted_segments,
+            "the small segments must be folded, still {} of {planted_segments}",
+            t_index.segment_count()
+        );
+        assert_eq!(t_index.doc_count().expect("doc count"), 6);
     }
 
     /// #453: the headroom projection doubles only the live lexical bytes.
@@ -52046,12 +53593,13 @@ mod tests {
         );
     }
 
-    /// GH #496: a failed or interrupted rebuild's staged generation is
-    /// reported but not doubled into the requirement. The next rebuild
-    /// resumes into it or clears it first; doubling it locked a large archive
-    /// out of the retry (13.4 GB archive: 67.8 GB required, 64.7 GB free).
+    /// GH #496 / #498: a failed or interrupted rebuild's staged generation
+    /// is reported and credited against the requirement. The next rebuild
+    /// resumes into it or clears it first, so its bytes come back; doubling
+    /// it locked a large archive out of the retry (13.4 GB archive: 67.8 GB
+    /// required, 64.7 GB free, 32 GB of it the #498 leftover).
     #[test]
-    fn full_rebuild_headroom_does_not_double_a_leftover_rebuild_staging_generation() {
+    fn full_rebuild_headroom_credits_a_leftover_rebuild_staging_generation() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let db_path = data_dir.join("agent_search.db");
@@ -52092,14 +53640,27 @@ mod tests {
 
         let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
         assert_eq!(projection.rebuild_staging_bytes, staged);
-        assert_eq!(
-            projection.required_bytes, projection_before.required_bytes,
-            "a leftover staged generation must not raise the requirement"
-        );
+        // db(300 MiB)*2 clears the 512 MiB floor even after the 96 MiB credit,
+        // so the requirement is exactly 2*db + 2*live - staging.
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + after.live_bytes * 2
+            projection.db_bundle_bytes * 2 + after.live_bytes * 2 - staged
         );
+        assert_eq!(
+            projection.required_bytes + staged,
+            projection_before.required_bytes,
+            "the staged bytes are credited one-for-one against the requirement"
+        );
+
+        // The credit never takes the requirement below the absolute floor.
+        let huge = staging.join("seg-00000000000001ff.fslx");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 * 1024)
+            .unwrap();
+        let floored = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert!(floored.rebuild_staging_bytes > floored.db_bundle_bytes * 2);
+        assert_eq!(floored.required_bytes, INDEX_MIN_FREE_SPACE_BYTES);
     }
 
     /// An unreadable MANIFEST must make the walk conservative: every byte in
@@ -53879,6 +55440,18 @@ mod tests {
         insert(conversation_id, 70, "user", "one more append");
         assert_eq!(cached(), full());
         assert_eq!(sidecar().delta_generations, 1);
+
+        // Orphaned rows are never indexed: an appended message whose
+        // conversation row does not exist must not count, and it is still an
+        // append (5ajer: the delta filters it with a point lookup, not a JOIN).
+        storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
+        insert(conversation_id + 1_000_000, 0, "user", "orphaned evidence");
+        assert_eq!(cached(), full());
+        assert_eq!(
+            sidecar().delta_generations,
+            2,
+            "an orphan append still takes the delta path"
+        );
         storage
             .raw()
             .execute_compat(
@@ -57904,6 +59477,116 @@ mod tests {
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 3);
     }
 
+    /// bgn6s: a conversation larger than one page's content budget is read
+    /// and indexed in message-range chunks. Every message is searchable,
+    /// including the last; the conversation after it is indexed too; and the
+    /// checkpoint certifies. A cumulative per-conversation cap at the
+    /// per-message cap would have left only the first message searchable.
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_streams_a_long_conversation_in_chunks() {
+        use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let long_markers = [
+            "alphamark",
+            "bravomark",
+            "charliemark",
+            "deltamark",
+            "echomark",
+            "foxtrotmark",
+        ];
+        let conversation = |external_id: &str, markers: &[&str]| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: markers
+                .iter()
+                .enumerate()
+                .map(|(idx, marker)| Message {
+                    id: None,
+                    idx: idx as i64,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_010 + idx as i64),
+                    content: format!("{marker} steady text"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        for (external_id, markers) in [
+            ("long-conversation", &long_markers[..]),
+            ("short-conversation", &["hotelmark"][..]),
+        ] {
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation(external_id, markers))
+                .unwrap();
+        }
+        drop(storage);
+
+        // A 64-byte page budget holds two 21-byte messages: the long
+        // conversation (126 bytes) becomes three chunks.
+        let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "40");
+        let _commit_bytes = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "64");
+        let _initial_commit_bytes = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+            "64",
+        );
+
+        let logs = capture_logs(|| {
+            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+            assert_eq!(rebuild.indexed_docs, 7);
+            assert_eq!(rebuild.observed_messages, Some(7));
+            assert!(rebuild.exact_checkpoint_persisted);
+        });
+        assert!(
+            logs.contains("streaming a long conversation in message-range chunks")
+                && logs.contains("chunks=3"),
+            "expected the long conversation to stream in three chunks, got:\n{logs}"
+        );
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 7);
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_dir(&data_dir).unwrap())
+            .unwrap()
+            .expect("completed checkpoint");
+        assert!(checkpoint.completed);
+        assert_eq!(checkpoint.processed_conversations, 2);
+        assert_eq!(checkpoint.indexed_docs, 7);
+
+        let client = SearchClient::open(&index_dir(&data_dir).unwrap(), None)
+            .unwrap()
+            .expect("search client");
+        for marker in long_markers.iter().chain(["hotelmark"].iter()) {
+            let hits = client
+                .search(marker, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{marker} must be searchable exactly once");
+        }
+    }
+
     #[test]
     #[serial]
     fn rebuild_tantivy_from_db_preserves_empty_conversation_gaps_in_stream() {
@@ -60691,10 +62374,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("cass");
         fs::create_dir_all(&data_dir).unwrap();
-        let selected = tmp.path().join("selected/amp");
-        let missed = selected.join("thread-missed.json");
+        // The lost source is a Claude Code session because Claude honors the
+        // mtime watermark. Amp cannot show the loss: FAD re-reads every Amp
+        // thread on every scan (Amp never bumps mtimes), so any retry would
+        // recover it and the negative control below would be vacuous.
+        let selected = tmp.path().join("selected/claude");
+        let missed = selected.join("projects/overflow/session-missed.jsonl");
         let unrelated = tmp.path().join("unrelated/amp/thread-other.json");
-        write_watch_lexical_source(&missed, "thread-missed", "overflowrecoveryneedle");
+        fs::create_dir_all(missed.parent().unwrap()).unwrap();
+        fs::write(
+            &missed,
+            r#"{"type":"user","timestamp":"2023-11-14T22:13:20.100Z","sessionId":"session-missed","message":{"role":"user","content":"overflowrecoveryneedle"}}
+"#,
+        )
+        .unwrap();
         write_watch_lexical_source(&unrelated, "thread-other", "overflowpreservedneedle");
         fs::File::options()
             .write(true)
@@ -60718,8 +62411,8 @@ mod tests {
         let preserved_ids = watch_lexical_search_ids(&index_path, "overflowpreservedneedle");
         assert_eq!(preserved_rows.len(), 1);
         assert_eq!(preserved_ids.len(), 1);
-        let roots = [(ConnectorKind::Amp, ScanRoot::local(selected.clone()))];
-        let state = Mutex::new(HashMap::from([(ConnectorKind::Amp, i64::MAX / 4)]));
+        let roots = [(ConnectorKind::Claude, ScanRoot::local(selected.clone()))];
+        let state = Mutex::new(HashMap::from([(ConnectorKind::Claude, i64::MAX / 4)]));
 
         // A directory-only incremental retry does not recover the lost event:
         // both the event watermark and directory mtime postdate this source.
@@ -61867,6 +63560,85 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    /// GH #502: a SQLite source's committed WAL (or rollback journal) change is
+    /// a source change even when the main database file is untouched, while a
+    /// reader-rewritten -shm is not.
+    #[test]
+    fn explicit_watch_once_freshness_counts_committed_sqlite_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("cass.db")).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "openclaw".into(),
+                name: "OpenClaw".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = storage.ensure_workspace(tmp.path(), None).unwrap();
+        let source = tmp.path().join("openclaw-agent.sqlite");
+        std::fs::write(&source, b"main database").unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO conversations(
+                     id, agent_id, workspace_id, source_id, title, source_path, metadata_json
+                 ) VALUES (1, ?1, ?2, 'local', 'live', ?3, '{}')",
+                &[
+                    ParamValue::from(agent_id),
+                    ParamValue::from(workspace_id),
+                    ParamValue::from(source.to_string_lossy().as_ref()),
+                ],
+            )
+            .unwrap();
+        let indexed_at = FrankenStorage::now_millis();
+        storage.set_last_indexed_at(indexed_at).unwrap();
+        let root = ScanRoot::local(source.clone());
+        let set_mtime = |path: &Path, epoch_ms: i64| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    UNIX_EPOCH + Duration::from_millis(u64::try_from(epoch_ms).unwrap()),
+                ))
+                .unwrap();
+        };
+        set_mtime(&source, indexed_at - 60_000);
+        let unchanged = || {
+            explicit_watch_once_root_unchanged_after_last_index(
+                &storage,
+                ConnectorKind::OpenClaw,
+                &root,
+            )
+            .unwrap()
+        };
+
+        // Negative control: nothing newer than the last index keeps the fast path.
+        assert!(unchanged(), "an unchanged database must skip");
+        let shm = database_path_with_suffix(&source, "-shm");
+        std::fs::write(&shm, b"reader index").unwrap();
+        set_mtime(&shm, indexed_at + 60_000);
+        assert!(
+            unchanged(),
+            "a reader-rewritten -shm is not a source change"
+        );
+        let wal = database_path_with_suffix(&source, "-wal");
+        std::fs::write(&wal, b"old frames").unwrap();
+        set_mtime(&wal, indexed_at - 30_000);
+        assert!(unchanged(), "a WAL already covered by the last index skips");
+
+        // The bug: a WAL-only commit after the last index, main file untouched.
+        set_mtime(&wal, indexed_at + 1);
+        assert!(!unchanged(), "a committed WAL append must be re-read");
+        set_mtime(&wal, indexed_at - 30_000);
+        let journal = database_path_with_suffix(&source, "-journal");
+        std::fs::write(&journal, b"rollback journal").unwrap();
+        set_mtime(&journal, indexed_at + 1);
+        assert!(!unchanged(), "a newer rollback journal must be re-read");
     }
 
     #[test]
@@ -65891,7 +67663,9 @@ mod tests {
                 ),
                 "{configured_name}: watch/quarantine must use the configured connector"
             );
-            if matches!(configured_name, "codex" | "omp" | "pi_agent") {
+            // copilot: CASS widens detection to VS Code's native chat stores,
+            // so its detect() legitimately differs where such stores exist.
+            if matches!(configured_name, "codex" | "omp" | "pi_agent" | "copilot") {
                 assert!(
                     !std::ptr::fn_addr_eq(configured_factory, upstream_factory),
                     "{configured_name}: cass must install its own adapter, not the upstream one"

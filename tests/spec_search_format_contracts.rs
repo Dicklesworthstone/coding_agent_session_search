@@ -177,6 +177,45 @@ fn jsonl_every_line_is_independent_valid_json_without_robot_meta() -> TestResult
     Ok(())
 }
 
+/// 2l1b0.58: README promises `--robot-format jsonl` is hits only unless
+/// `--robot-meta` is given. Every search has a budget and the header was
+/// gated on `budget_ms > 0`, so a `{budget, _meta}` line always led the
+/// output and a line-per-hit consumer counted it as a hit.
+#[test]
+fn jsonl_without_robot_meta_is_hits_only() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let stdout = run_search(&data_dir, &["hello", "--robot-format", "jsonl"])?;
+    let lines = output_lines(&stdout);
+    ensure(!lines.is_empty(), "the demo fixture must match `hello`")?;
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        ensure(
+            value.get("_meta").is_none() && value.get("budget").is_none(),
+            format!("jsonl without --robot-meta printed a header line: {line}"),
+        )?;
+        ensure(
+            value.get("source_path").is_some(),
+            format!("every jsonl line must be a hit: {line}"),
+        )?;
+    }
+
+    // Positive control: asking for metadata still leads with the header.
+    let with_meta = run_search(
+        &data_dir,
+        &["hello", "--robot-format", "jsonl", "--robot-meta"],
+    )?;
+    let first_line = output_lines(&with_meta)
+        .first()
+        .copied()
+        .ok_or_else(|| test_error("jsonl --robot-meta printed nothing"))?;
+    let first: serde_json::Value = serde_json::from_str(first_line)?;
+    ensure(
+        first.get("_meta").is_some(),
+        format!("--robot-meta must lead with the _meta header: {first_line}"),
+    )
+}
+
 #[test]
 fn compact_format_is_exactly_one_line_of_valid_json() -> TestResult {
     let tmp = TempDir::new()?;
@@ -707,6 +746,70 @@ fn blocking_sessions_file_search_returns_bounded_partial_without_broadening_scop
         recommendation.contains("--sessions-from")
             && recommendation.contains(&sessions_fifo.display().to_string()),
         format!("search FIFO retry lost its session file scope: {recommendation}"),
+    )?;
+    Ok(())
+}
+
+/// 2l1b0.68: a budgeted (robot) search configures semantics once, on its
+/// bounded worker. The direct setup path used to run again afterwards: the
+/// cost was paid twice, outside the budget, and that path could spawn the
+/// daemon the worker declined to spawn. The test hook delays only the direct
+/// path. A robot hybrid search must not pay the delay, and a human-mode
+/// search (no budget) still runs the direct path, which proves the hook is
+/// live. The 60 s budget (`--timeout` is milliseconds) is healthy after the
+/// worker, so before the fix the budget check admitted the direct path and the
+/// robot search took the full 30 s delay (negative control); a small budget
+/// would have shed that path for an unrelated reason.
+#[test]
+fn robot_search_configures_semantics_once_on_its_bounded_worker() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let data = data_dir.to_str().ok_or("non-utf8 path")?;
+    let run = |robot: bool, delay_ms: &str| -> Result<(bool, Duration, String), Box<dyn Error>> {
+        let mut cmd = Command::cargo_bin("cass")?;
+        cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_TEST_SEARCH_DIRECT_SEMANTIC_SETUP_SLOW_MS", delay_ms)
+            .args([
+                "--color=never",
+                "search",
+                "hello",
+                "--mode",
+                "hybrid",
+                "--timeout",
+                "60000",
+                "--data-dir",
+                data,
+            ]);
+        if robot {
+            cmd.args(["--robot", "--robot-meta"]);
+        }
+        let started = Instant::now();
+        let output = cmd.output()?;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "{{\"step\":\"search\",\"robot\":{robot},\"direct_delay_ms\":{delay_ms},\"exit\":{:?},\"elapsed_ms\":{}}}",
+            output.status.code(),
+            elapsed.as_millis()
+        );
+        Ok((
+            output.status.success(),
+            elapsed,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    };
+
+    let (ok, elapsed, stderr) = run(true, "30000")?;
+    ensure(ok, format!("robot hybrid search failed: {stderr}"))?;
+    ensure(
+        elapsed < Duration::from_secs(20),
+        format!("a robot search repeated the semantic setup outside its budget: {elapsed:?}"),
+    )?;
+
+    let (ok, elapsed, stderr) = run(false, "3000")?;
+    ensure(ok, format!("human hybrid search failed: {stderr}"))?;
+    ensure(
+        elapsed >= Duration::from_millis(3000),
+        format!("a human search must still configure semantics on the direct path: {elapsed:?}"),
     )?;
     Ok(())
 }

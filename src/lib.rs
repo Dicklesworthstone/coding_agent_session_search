@@ -293,8 +293,10 @@ pub struct Cli {
     /// points outside the default data dir, derived assets (lexical index,
     /// raw-mirror, checkpoints, locks) follow it into the db file's parent
     /// directory, so a scratch `--db` is fully isolated from the live
-    /// install (#403). An explicit `--data-dir` still wins.
-    #[arg(long)]
+    /// install (#403). An explicit `--data-dir` still wins. `CASS_DB_PATH`
+    /// sets the same value when the flag is absent (2l1b0.57: it was
+    /// documented in README, robot-docs and capabilities but never read).
+    #[arg(long, env = "CASS_DB_PATH")]
     pub db: Option<PathBuf>,
 
     /// Deterministic machine-first help (wide, no TUI)
@@ -335,6 +337,21 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+
+    /// How argv was interpreted before dispatch; filled by `parse_cli`.
+    #[arg(skip)]
+    pub interpretation: InvocationInterpretation,
+}
+
+/// What `parse_cli` changed or inferred about the invocation, so robot
+/// output can echo it under `_meta.effective` instead of leaving it on
+/// stderr only (2l1b0.68).
+#[derive(Debug, Clone, Default)]
+pub struct InvocationInterpretation {
+    /// Every auto-correction applied to argv, in the wording stderr uses.
+    pub corrections: Vec<String>,
+    /// `--db` was absent from argv and its value came from `CASS_DB_PATH`.
+    pub db_from_env: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -585,7 +602,7 @@ pub enum Commands {
         /// Timeout in milliseconds. Returns partial results and error if exceeded.
         #[arg(long)]
         timeout: Option<u64>,
-        /// Highlight matching terms in snippets with **bold** markers (text and JSON output)
+        /// Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)
         #[arg(long)]
         highlight: bool,
         /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
@@ -1227,6 +1244,13 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         rebuild_canonical_fts: bool,
 
+        /// Free leaked pages (integrity_check's "page N is never used": pages
+        /// no table, index or freelist owns) in place. Refuses any other
+        /// integrity damage. Supports `--dry-run`; mutation requires `--yes`
+        /// and backs up the live bundle first (`cass doctor backups restore`)
+        #[arg(long, default_value_t = false)]
+        repair_leaked_pages: bool,
+
         /// Quarantine interrupted `raw_mirror_capture` staging artifacts that
         /// block doctor mutation, instead of forcing a manual `rm` inside the
         /// data dir. Requires `--yes`; artifacts are renamed into a quarantine
@@ -1402,12 +1426,28 @@ pub enum Commands {
         #[arg(long)]
         password_stdin: bool,
 
-        /// Include tool calls in export (default: true)
-        #[arg(long, default_value_t = true)]
+        /// Include tool calls in the export; `--include-tools=false` omits
+        /// them (default: true)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
         include_tools: bool,
 
-        /// Show message timestamps
-        #[arg(long, default_value_t = true)]
+        /// Show message timestamps; `--show-timestamps=false` hides them
+        /// (default: true)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
         show_timestamps: bool,
 
         /// Disable CDN references (fully offline, larger file)
@@ -1539,6 +1579,14 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = crate::pages::export::PathMode::Relative)]
         path_mode: crate::pages::export::PathMode,
 
+        /// Share profile applied to every exported text: public (home paths,
+        /// usernames, project names, hostnames, emails and other personal
+        /// data), team (home paths and personal data), personal (nothing).
+        /// Credentials are never rewritten; the secret scan rejects them.
+        /// Default: public for a plaintext export, team when encrypted.
+        #[arg(long, value_enum)]
+        share_profile: Option<crate::pages::profiles::ShareProfile>,
+
         /// Deployment target: local, github, cloudflare
         #[arg(long, value_enum)]
         target: Option<PagesDeployTarget>,
@@ -1624,7 +1672,8 @@ pub enum Commands {
     Quarantine(QuarantineCommand),
     /// Prune an already-indexed subset of conversations by source-path glob
     /// (dry-run by default; `--apply` to commit). Removes matching rows from the
-    /// canonical DB and rebuilds derived search/analytics assets.
+    /// canonical DB and rebuilds derived search/analytics assets. Source files
+    /// are kept: a source that changes afterwards is indexed again.
     Forget {
         /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
         #[arg(long = "source-glob")]
@@ -2891,12 +2940,10 @@ pub enum AnalyticsCommand {
         budget_ms: u64,
     },
     /// Rebuild / backfill analytics rollup tables with progress output
+    /// (always rebuilds; fresh rollups are not skipped)
     Rebuild {
         #[command(flatten)]
         common: AnalyticsCommon,
-        /// Force full rebuild even if rollups appear fresh
-        #[arg(long)]
-        force: bool,
         /// Which analytics track to rebuild: message-level rollups (a),
         /// token-level rollups (b), or both (all)
         #[arg(long, value_enum, default_value_t = AnalyticsTrack::A)]
@@ -5415,6 +5462,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "cleanup",
         "recover-from-archive",
         "rebuild-canonical-fts",
+        "repair-leaked-pages",
         "cleanup-interrupted-artifacts",
         "archive-scan",
         "archive-normalize",
@@ -5918,6 +5966,20 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         .first()
         .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
         && rest.get(1).is_some_and(|arg| {
+            arg.eq_ignore_ascii_case("repair-leaked-pages")
+                || arg.eq_ignore_ascii_case("repair_leaked_pages")
+        })
+    {
+        rest.remove(1);
+        rest.insert(1, "--repair-leaked-pages".to_string());
+        corrections.push(
+            "'doctor repair-leaked-pages' → 'doctor --repair-leaked-pages' (in-place leaked-page repair)"
+                .into(),
+        );
+    } else if rest
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
+        && rest.get(1).is_some_and(|arg| {
             arg.eq_ignore_ascii_case("archive-scan") || arg.eq_ignore_ascii_case("archive_scan")
         })
     {
@@ -6411,15 +6473,21 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
 /// parade` executed it). Adversarial-review finding F1 on GH #367.
 const SIDE_EFFECT_EXACT_ONLY_COMMANDS: &[&str] = &["forget", "upgrade"];
 
+/// Nearest canonical subcommand for a mistyped first argument.
+///
+/// An argument that already names a canonical subcommand is never a typo:
+/// when clap rejects `cass status --jsn` for its flag, the subcommand must
+/// stay `status`. Returning the nearest *other* command here made recovery
+/// run `stats` (and `import` for `export`) with exit 0 and only a stderr
+/// note (2l1b0.51).
 fn closest_top_level_command(arg: &str) -> Option<&'static str> {
     let lower = arg.to_ascii_lowercase();
-    if lower.len() < 3 {
+    if lower.len() < 3 || CANONICAL_TOP_LEVEL_COMMANDS.contains(&lower.as_str()) {
         return None;
     }
     CANONICAL_TOP_LEVEL_COMMANDS
         .iter()
         .copied()
-        .filter(|candidate| candidate != &lower)
         .filter(|candidate| !SIDE_EFFECT_EXACT_ONLY_COMMANDS.contains(candidate))
         .map(|candidate| (candidate, strsim::levenshtein(&lower, candidate)))
         .filter(|(_, distance)| *distance <= 2)
@@ -6576,6 +6644,73 @@ mod canonical_top_level_command_tests {
         assert!(CANONICAL_TOP_LEVEL_COMMANDS.contains(&"upgrade"));
         assert!(looks_like_top_level_command_or_typo("forget"));
         assert!(looks_like_top_level_command_or_typo("upgrade"));
+    }
+
+    /// 2l1b0.51: an exact subcommand is never a typo. Before the fix every
+    /// canonical command within Levenshtein 2 of another one was rerouted
+    /// (status→stats, stats→status, export→import, …) whenever clap
+    /// rejected the invocation for an unrelated flag typo.
+    #[test]
+    fn exact_canonical_commands_are_never_rerouted() {
+        let mut attracted_pairs = Vec::new();
+        for command in CANONICAL_TOP_LEVEL_COMMANDS {
+            for other in CANONICAL_TOP_LEVEL_COMMANDS {
+                if command != other && strsim::levenshtein(command, other) <= 2 {
+                    attracted_pairs.push((*command, *other));
+                }
+            }
+            assert_eq!(
+                closest_top_level_command(command),
+                None,
+                "`cass {command}` must keep its own subcommand"
+            );
+            assert_eq!(
+                closest_top_level_command(&command.to_ascii_uppercase()),
+                None,
+                "`cass {}` must keep its own subcommand",
+                command.to_ascii_uppercase()
+            );
+        }
+        // The fixture only means something while near-collisions exist.
+        assert!(
+            attracted_pairs.contains(&("status", "stats")),
+            "{attracted_pairs:?}"
+        );
+        assert!(
+            attracted_pairs.contains(&("export", "import")),
+            "{attracted_pairs:?}"
+        );
+        // Genuine typos still recover (bead a0z1v).
+        assert_eq!(closest_top_level_command("serach"), Some("search"));
+        assert_eq!(closest_top_level_command("helth"), Some("health"));
+    }
+
+    /// 2l1b0.51, end to end through the recovery layer: a flag typo on an
+    /// exact subcommand corrects only the flag.
+    #[test]
+    fn flag_typo_on_exact_subcommand_keeps_the_subcommand() {
+        for (command, expected_flag) in [
+            ("status", "--json"),
+            ("stats", "--json"),
+            ("export", "--json"),
+        ] {
+            let args = ["cass", command, "--jsn"].map(str::to_string);
+            let error = Cli::try_parse_from(&args).expect_err("--jsn is not a flag");
+            let (corrected, note) =
+                heuristic_parse_recovery(&error, &args).expect("flag typo is recoverable");
+            assert_eq!(
+                corrected[1], command,
+                "subcommand changed: {corrected:?} ({note})"
+            );
+            assert!(
+                corrected.iter().any(|arg| arg == expected_flag),
+                "{corrected:?}"
+            );
+            assert!(
+                !note.contains("subcommand typo"),
+                "no subcommand correction may be reported: {note}"
+            );
+        }
     }
 
     #[test]
@@ -6908,8 +7043,8 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
     // First normalization pass (global flags lift)
     let (normalized_args, parse_note) = normalize_args(raw_args.clone());
 
-    let (cli, heuristic_note) = match Cli::try_parse_from(&normalized_args) {
-        Ok(cli) => (cli, None),
+    let (mut cli, heuristic_note, parsed_args) = match Cli::try_parse_from(&normalized_args) {
+        Ok(cli) => (cli, None, normalized_args),
         Err(err) => {
             // Let clap handle help/version natively (exit 0, print to stdout)
             use clap::error::ErrorKind;
@@ -6932,7 +7067,7 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
             if let Some((recovered_args, note)) = heuristic_parse_recovery(&err, &normalized_args) {
                 // Try parsing again with recovered args
                 match Cli::try_parse_from(&recovered_args) {
-                    Ok(cli) => (cli, Some(note)),
+                    Ok(cli) => (cli, Some(note), recovered_args),
                     Err(retry_err) => {
                         // Check again for help/version in case recovered args triggered it
                         if matches!(
@@ -6972,6 +7107,21 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
             }
         }
     };
+
+    // `--db` and `CASS_DB_PATH` fill the same field and only the matcher
+    // knows which one supplied it.
+    if cli.db.is_some() {
+        cli.interpretation.db_from_env = Cli::command()
+            .try_get_matches_from(&parsed_args)
+            .ok()
+            .and_then(|matches| matches.value_source("db"))
+            == Some(clap::parser::ValueSource::EnvVariable);
+    }
+    cli.interpretation.corrections = [parse_note.as_deref(), heuristic_note.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
 
     Ok(ParsedCli {
         cli,
@@ -7269,15 +7419,10 @@ async fn execute_cli(
                 )
                 .init();
 
-            maybe_prompt_for_update(matches!(command, Commands::Tui { once: true, .. }))
-                .await
-                .map_err(|e| CliError {
-                    code: 9,
-                    kind: CliErrorKind::UpdateCheck.kind_str(),
-                    message: format!("update check failed: {e}"),
-                    hint: None,
-                    retryable: false,
-                })?;
+            // No update check here: the TUI runs its own in a background
+            // thread and surfaces it as a dismissible banner. A pre-TUI
+            // check awaited the network and then blocked on a stdin prompt
+            // before the first frame (2l1b0.56).
             if let Commands::Tui {
                 once,
                 reset_state,
@@ -7619,7 +7764,7 @@ async fn execute_cli(
                             week,
                             since.as_deref(),
                             until.as_deref(),
-                        ),
+                        )?,
                         aggregate,
                         explain,
                         dry_run,
@@ -7631,6 +7776,7 @@ async fn execute_cli(
                         eff_mode,
                         semantic_opts,
                         refresh,
+                        &cli.interpretation,
                     )?;
                 }
                 Commands::Pack {
@@ -7694,7 +7840,7 @@ async fn execute_cli(
                             week,
                             since.as_deref(),
                             until.as_deref(),
-                        ),
+                        )?,
                         source,
                         sessions_from,
                         eff_mode,
@@ -7706,6 +7852,7 @@ async fn execute_cli(
                         refresh,
                         eff_timeout,
                         wrap,
+                        &cli.interpretation,
                     )?;
                 }
                 Commands::Stats {
@@ -7828,6 +7975,7 @@ async fn execute_cli(
                     since,
                     until,
                     path_mode,
+                    share_profile,
                     target,
                     project,
                     branch,
@@ -7891,6 +8039,9 @@ async fn execute_cli(
                         }
                         if let Some(api_token) = api_token.as_ref() {
                             pages_config.deployment.api_token = Some(api_token.to_string());
+                        }
+                        if let Some(profile) = share_profile {
+                            pages_config.bundle.share_profile = Some(profile);
                         }
 
                         let cli_cf_creds_provided = account_id.is_some() || api_token.is_some();
@@ -8274,6 +8425,10 @@ async fn execute_cli(
                                 since.clone(),
                                 until.clone(),
                                 path_mode,
+                                // --export-only writes a plaintext database.
+                                share_profile.unwrap_or(
+                                    crate::pages::profiles::ShareProfile::default_for(false),
+                                ),
                                 |_current, _total| {},
                                 |staged_db_path| {
                                     let scan = crate::pages::secret_scan::scan_staged_export_database(
@@ -8403,6 +8558,9 @@ async fn execute_cli(
                         }
                         if no_encryption {
                             wizard.set_no_encryption(true);
+                        }
+                        if let Some(profile) = share_profile {
+                            wizard.set_share_profile(profile);
                         }
                         if let Some(target) = target {
                             wizard.set_deploy_target(target.to_wizard_target());
@@ -8631,6 +8789,7 @@ async fn execute_cli(
                     emit_capabilities,
                     recover_from_archive,
                     rebuild_canonical_fts,
+                    repair_leaked_pages,
                     cleanup_interrupted_artifacts,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -8694,6 +8853,18 @@ async fn execute_cli(
                     // and rebuild the canonical FTS5 shadow tables in place.
                     if rebuild_canonical_fts {
                         doctor_recover::run_doctor_rebuild_canonical_fts(
+                            data_dir,
+                            cli.db.clone(),
+                            dry_run,
+                            yes,
+                            structured_format,
+                        )?;
+                        return Ok(());
+                    }
+                    // 2l1b0.73: `cass doctor --repair-leaked-pages --yes` —
+                    // free pages no tree or freelist owns, in place.
+                    if repair_leaked_pages {
+                        doctor_recover::run_doctor_repair_leaked_pages(
                             data_dir,
                             cli.db.clone(),
                             dry_run,
@@ -9601,6 +9772,28 @@ fn run_forget_command(
         });
     }
 
+    // The lexical index lives next to the canonical DB (the agent-purge path
+    // resolves it the same way).
+    let data_dir = db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_data_dir);
+    if apply && let Some(active_index) = active_index_run_details(&data_dir, &db_path) {
+        return Err(CliError {
+            code: 7,
+            kind: "lock-busy",
+            message: format!(
+                "refusing to apply forget while an index run is active in {}",
+                active_index.data_dir.display()
+            ),
+            hint: Some(
+                "Wait for indexing/watch work to finish, then rerun `cass forget --apply`."
+                    .to_string(),
+            ),
+            retryable: true,
+        });
+    }
+
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 5,
         kind: "forget",
@@ -9622,21 +9815,56 @@ fn run_forget_command(
             retryable: false,
         })?;
 
-    // After an actual deletion, rebuild derived assets so search/analytics stay
-    // consistent (mirrors the agent-purge path). The lexical index also
-    // self-heals on next search, but rebuilding FTS now keeps DB-resident
-    // surfaces correct.
-    if apply && report.conversations_deleted > 0 {
-        if let Err(e) = storage.rebuild_fts() {
-            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
+    // After an actual deletion every derived surface that stores message text
+    // or counts must stop serving the forgotten conversations, exactly as on
+    // the agent-purge path. The Quill documents carry stored content, so
+    // until the lexical generation is rebuilt a plain search kept returning
+    // the forgotten text (2l1b0.50). Failures are typed errors: a warning
+    // with exit 0 would report success while the text stays searchable.
+    let remaining_conversations = if apply && report.conversations_deleted > 0 {
+        let derived_error = |kind: CliErrorKind, surface: &str, error: anyhow::Error| {
+            CliError {
+            code: 5,
+            kind: kind.kind_str(),
+            message: format!(
+                "forgot {} conversation(s) but failed to rebuild {surface}: {error}",
+                report.conversations_deleted
+            ),
+            hint: Some(
+                "The canonical rows are already deleted; run 'cass index --full' to rebuild derived search data."
+                    .to_string(),
+            ),
+            retryable: false,
         }
-        if let Err(e) = storage.rebuild_analytics() {
-            tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
-        }
-        if let Err(e) = storage.rebuild_daily_stats() {
-            tracing::warn!(error = %e, "forget: failed to rebuild daily stats after deletion");
-        }
-    }
+        };
+        storage
+            .rebuild_fts()
+            .map_err(|e| derived_error(CliErrorKind::ArchiveFtsRebuild, "the FTS fallback", e))?;
+        storage.rebuild_analytics().map_err(|e| {
+            derived_error(
+                CliErrorKind::ArchiveAnalyticsRebuild,
+                "analytics rollups",
+                e,
+            )
+        })?;
+        storage
+            .rebuild_daily_stats()
+            .map_err(|e| derived_error(CliErrorKind::ArchiveDailyStatsRebuild, "daily stats", e))?;
+        storage.rebuild_token_daily_stats().map_err(|e| {
+            derived_error(
+                CliErrorKind::ArchiveTokenDailyStatsRebuild,
+                "token daily stats",
+                e,
+            )
+        })?;
+        Some(
+            storage.total_conversation_count().map_err(|e| {
+                derived_error(CliErrorKind::ArchiveCount, "the conversation count", e)
+            })?,
+        )
+    } else {
+        None
+    };
 
     // WS-B.5 (z2uon): an applied forget deletes rows and rewrites FTS,
     // analytics and daily-stats tables; close through the checkpointing path
@@ -9652,6 +9880,41 @@ fn run_forget_command(
             "forget: final WAL checkpoint did not complete"
         );
         eprintln!("Warning: final WAL checkpoint after forget did not complete: {err:#}");
+    }
+
+    if let Some(remaining_conversations) = remaining_conversations {
+        // Test failpoint: proves a failed purge is a typed error and that
+        // `cass index --full` finishes it. A plain incremental index does
+        // not: it never revisits documents whose rows were deleted.
+        let rebuilt = if dotenvy::var("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE")
+            .is_ok_and(|value| value == "1")
+        {
+            Err(anyhow::anyhow!(
+                "injected by CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE"
+            ))
+        } else {
+            crate::indexer::rebuild_tantivy_from_db(
+                &db_path,
+                &data_dir,
+                remaining_conversations,
+                None,
+            )
+        };
+        rebuilt.map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::LexicalRebuild.kind_str(),
+            message: format!(
+                "forgot {} conversation(s) but failed to rebuild the lexical search index, \
+                 which may still return their text: {e}",
+                report.conversations_deleted
+            ),
+            hint: Some(
+                "Run 'cass index --full': it rebuilds the lexical index from the canonical \
+                 database, which no longer holds the forgotten conversations."
+                    .to_string(),
+            ),
+            retryable: false,
+        })?;
     }
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -18069,11 +18332,9 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
         AnalyticsCommand::Tokens { common, group_by } => {
             run_analytics_tokens(common, *group_by, db_path.as_ref())?
         }
-        AnalyticsCommand::Rebuild {
-            common,
-            force,
-            track,
-        } => run_analytics_rebuild(common, *force, *track, db_path.as_ref())?,
+        AnalyticsCommand::Rebuild { common, track } => {
+            run_analytics_rebuild(common, *track, db_path.as_ref())?
+        }
         AnalyticsCommand::Tools {
             common,
             group_by,
@@ -19019,7 +19280,6 @@ fn acquire_analytics_maintenance_lock(
 /// Rebuild Track A (optionally windowed) and/or the full Track B ledger rollups.
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
-    _force: bool,
     track: AnalyticsTrack,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
@@ -19428,7 +19688,7 @@ mod analytics_filter_validation_tests {
         windowed.days = Some(2);
 
         for track in [AnalyticsTrack::A, AnalyticsTrack::All] {
-            let payload = run_analytics_rebuild(&windowed, false, track, Some(&db_path))
+            let payload = run_analytics_rebuild(&windowed, track, Some(&db_path))
                 .unwrap_or_else(|e| panic!("{track:?}: {}", e.message));
             let has_ms = payload.get("since_ms").is_some();
             let has_day = payload.get("since_day_id").is_some();
@@ -19441,13 +19701,12 @@ mod analytics_filter_validation_tests {
             assert_eq!(SqliteStorage::day_id_from_millis(ms), day, "{payload}");
         }
 
-        let err =
-            run_analytics_rebuild(&windowed, false, AnalyticsTrack::B, Some(&db_path)).unwrap_err();
+        let err = run_analytics_rebuild(&windowed, AnalyticsTrack::B, Some(&db_path)).unwrap_err();
         assert_eq!(err.code, 2);
         assert!(err.message.contains("--track b"), "{}", err.message);
 
         // No window requested => never advertised, whichever track ran.
-        let payload = run_analytics_rebuild(&common(), false, AnalyticsTrack::All, Some(&db_path))
+        let payload = run_analytics_rebuild(&common(), AnalyticsTrack::All, Some(&db_path))
             .unwrap_or_else(|e| panic!("{}", e.message));
         assert!(payload.get("since_ms").is_none(), "{payload}");
         assert!(payload.get("since_day_id").is_none(), "{payload}");
@@ -19955,7 +20214,7 @@ async fn import_chatgpt_export(
     if !export_path.exists() {
         return Err(CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Export file not found: {}", export_path.display()),
             hint: Some(
                 "Provide the path to conversations.json from ChatGPT web export \
@@ -19992,7 +20251,7 @@ async fn import_chatgpt_export(
     let conv_dir = base_dir.join("conversations-web-export");
     std::fs::create_dir_all(&conv_dir).map_err(|e| CliError {
         code: 1,
-        kind: CliErrorKind::IoError.kind_str(),
+        kind: CliErrorKind::Io.kind_str(),
         message: format!("Failed to create output directory: {e}"),
         hint: None,
         retryable: false,
@@ -20001,7 +20260,7 @@ async fn import_chatgpt_export(
     // Read and parse export file
     let content = std::fs::read_to_string(export_path).map_err(|e| CliError {
         code: 1,
-        kind: CliErrorKind::IoError.kind_str(),
+        kind: CliErrorKind::Io.kind_str(),
         message: format!("Failed to read export file: {e}"),
         hint: None,
         retryable: false,
@@ -20032,21 +20291,21 @@ async fn import_chatgpt_export(
         // Write individual conversation file
         let mut file = std::fs::File::create(&filepath).map_err(|e| CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to write {}: {e}", filepath.display()),
             hint: None,
             retryable: false,
         })?;
         serde_json::to_writer(&mut file, conv).map_err(|e| CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to serialize conversation: {e}"),
             hint: None,
             retryable: false,
         })?;
         file.flush().map_err(|e| CliError {
             code: 1,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to flush: {e}"),
             hint: None,
             retryable: false,
@@ -20637,6 +20896,22 @@ fn state_db_strict_open_error_message(
     }
     if retryable {
         return base;
+    }
+    // GH #503: the #434 shape. The strict open rejects only the derived
+    // fts_messages shadow's catalog (a legacy shape older cass wrote); the
+    // canonical rows are readable. Name the shadow repair only when the
+    // pinned engine can open this catalog for it.
+    if !doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX
+        && doctor_recover::is_missing_fts5_shadow_autoindex_failure(err)
+    {
+        return format!(
+            "{base}; the open rejects only the derived fts_messages FTS5 shadow's legacy catalog (written by cass before the #434 fix), not the conversations or messages. This read-only probe leaves the archive unchanged. This build cannot rebuild that shadow in place (GH #503): keep the archive as it is and do not run 'cass doctor --fix'"
+        );
+    }
+    if doctor_recover::is_fts_shadow_schema_level_open_failure(err) {
+        return format!(
+            "{base}; the open rejects only the derived fts_messages FTS5 shadow's catalog (a legacy shape written by older cass), not the conversations or messages. This read-only probe leaves the archive unchanged; 'cass doctor --rebuild-canonical-fts --dry-run --json' inspects it and '--yes' drops and rebuilds the derived shadow without modifying canonical rows"
+        );
     }
     match unpublished_wal_sidecar_bytes(db_path) {
         Some(wal_bytes) => format!(
@@ -22589,8 +22864,9 @@ fn maybe_auto_refresh_index_after_read(
 }
 
 /// True when `data_dir` lives under the platform temp dir (or `CASS_DATA_DIR`
-/// explicitly points at one). Auto-refresh never fires there.
-fn auto_refresh_is_scratch_data_dir(data_dir: &Path) -> bool {
+/// explicitly points at one). Auto-refresh never fires there, and neither
+/// does the TUI's first-run index.
+pub(crate) fn auto_refresh_is_scratch_data_dir(data_dir: &Path) -> bool {
     let temp = std::env::temp_dir();
     let canon_temp = std::fs::canonicalize(&temp).unwrap_or(temp);
     let canon_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
@@ -26075,6 +26351,7 @@ fn highlight_matches(text: &str, query: &str, start_mark: &str, end_mark: &str) 
         // avoid slicing bugs when Unicode case-folding changes string length.
         let (lower_result, lower_starts, orig_ranges) = lowercase_with_map(&result);
         let lower_term = term.to_lowercase();
+        let marked = marked_spans(&result, start_mark, end_mark);
         let mut new_result = String::new();
         let mut last_end = 0;
 
@@ -26088,6 +26365,15 @@ fn highlight_matches(text: &str, query: &str, start_mark: &str, end_mark: &str) 
 
             // Skip if this overlaps with a previous highlight (from a longer term)
             if orig_start < last_end {
+                continue;
+            }
+            // Skip text that is already marked: the search engine wraps the
+            // terms it matched in `**`, and wrapping them again printed
+            // `****term****` (2l1b0.68).
+            if marked
+                .iter()
+                .any(|&(start, end)| orig_start < end && orig_end > start)
+            {
                 continue;
             }
             // Append text before this match
@@ -26104,6 +26390,50 @@ fn highlight_matches(text: &str, query: &str, start_mark: &str, end_mark: &str) 
     }
 
     result
+}
+
+/// Byte ranges of `text` already enclosed by `start_mark ... end_mark`,
+/// markers included, pairing each opening mark with the next closing one.
+fn marked_spans(text: &str, start_mark: &str, end_mark: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while let Some(open) = text[cursor..].find(start_mark) {
+        let open = cursor + open;
+        let body = open + start_mark.len();
+        let Some(close) = text[body..].find(end_mark) else {
+            break;
+        };
+        let end = body + close + end_mark.len();
+        spans.push((open, end));
+        cursor = end;
+    }
+    spans
+}
+
+#[cfg(test)]
+mod highlight_matches_tests {
+    use super::highlight_matches;
+
+    #[test]
+    fn engine_marked_terms_are_not_marked_twice() {
+        // The engine marks the first occurrence; --highlight marks the rest.
+        assert_eq!(
+            highlight_matches("a **hello** b Hello", "hello", "**", "**"),
+            "a **hello** b **Hello**"
+        );
+        // Negative: the old implementation printed `a ****hello**** b **Hello**`.
+        assert!(!highlight_matches("**hello** world", "hello world", "**", "**").contains("****"));
+        // A shorter term inside an already-marked longer word stays untouched.
+        assert_eq!(
+            highlight_matches("**hello** there", "hell", "**", "**"),
+            "**hello** there"
+        );
+        // Other marker styles still mark engine-marked terms in their own style.
+        assert_eq!(
+            highlight_matches("**hello**", "hello", ">>>", "<<<"),
+            "**>>>hello<<<**"
+        );
+    }
 }
 
 /// Extract meaningful search terms from a query string
@@ -26410,6 +26740,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_BACKGROUND_IONICE_CLASS=<N>         ionice class for `cass index --background` on Linux (default 3 = idle)".to_string(),
             "  CASS_DAEMON_INDEX_INTERVAL_SECS=<N>      resident daemon spawns an incremental background index every N s (default 0 = off)".to_string(),
             "  CASS_SCHEDULE_MAX_BACKFILL_BATCHES=<N>   cap on semantic backfill batches per nightly `cass schedule run` (default 200)".to_string(),
+            "  CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS=<N> longest severe load may skip scheduled incremental runs since the last completed one (default 10800; 0 = no limit)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS=<N>  require console idle time before scheduled backfill/nightly jobs (default 0 = off; macOS only, fails open)".to_string(),
             "  CASS_RESPONSIVENESS_DISABLE=1            pin indexer fan-out at 100% (skip governor)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_CAPACITY_PCT=<N> floor for governor shrink (default 25, range 10..100)".to_string(),
@@ -26494,13 +26825,13 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Schemas => render_schema_docs(),
         RobotTopic::ExitCodes => vec![
             "exit-codes:".to_string(),
-            " 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown".to_string(),
+            " 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 io|refused-unsafe | 5 data-corrupt | 6 input-required | 7 lock/busy | 8 partial (sources sync) | 9 unknown".to_string(),
             " 10 config|timeout | 11 config | 12 source|ssh | 13 mapping|not_found | 14 io|mapping | 15 semantic-unavailable|embedder-unavailable".to_string(),
-            " 20-21 model | 22 io | 23 download | 24 io".to_string(),
+            " 20-21 model | 22 io | 23 download | 24 io | 70 index-stalled (cass index abort) | 130 interrupted (SIGINT)".to_string(),
             " NOTE: codes >= 10 cover domain-specific failures (sources/models/semantic/analytics).".to_string(),
             "       Use `err.kind` from the JSON envelope as the canonical identifier — kinds are".to_string(),
             "       kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,".to_string(),
-            "       ambiguous-source, timeout, config, lock-busy, network, model, download, io).".to_string(),
+            "       ambiguous-source, timeout, config, lock-busy, model, download, io).".to_string(),
             "       Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.".to_string(),
             "       `cass archive`: 2 logical-archive-usage | 5 logical-archive-integrity | 7 logical-archive-busy (retryable) | 14 logical-archive-io (retryable) | 9 logical-archive-error.".to_string(),
             "       For doctor JSON, prefer `operation_outcome.kind` and `operation_outcome.exit_code_kind` for no-op/partial/blocked/refused/incomplete repair decisions.".to_string(),
@@ -26847,7 +27178,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  data.overall_elapsed_ms: u64".into(),
         "  data.wal_checkpoint: string ('completed' | 'failed') — the rebuild closes with a".into(),
         "                  WAL checkpoint so the next opener replays nothing".into(),
-        "  --force: rebuild even when rollups appear fresh".into(),
+        "  Always rebuilds; fresh rollups are not skipped (there is no --force).".into(),
         String::new(),
         "### analytics validate".into(),
         "  data.summary: { errors, warnings, drift_entries, buckets_checked, buckets_total }".into(),
@@ -26880,7 +27211,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  exit 9 + retryable=true: transient DB lock/busy — retry after 1s".into(),
         "  exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first".into(),
         "  exit 3: no database — run 'cass index --full' to create it".into(),
-        "  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop".into(),
+        "  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --json' for a manual rebuild loop".into(),
         String::new(),
         "## Common Workflows".into(),
         "  # Quick health check".into(),
@@ -26895,7 +27226,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  # Validation + remediation loop".into(),
         "  cass analytics validate --json | jq '.data.summary'".into(),
         "  # If errors: rebuild then re-validate".into(),
-        "  cass analytics rebuild --force --json && cass analytics validate --json".into(),
+        "  cass analytics rebuild --json && cass analytics validate --json".into(),
     ]
 }
 
@@ -27053,6 +27384,11 @@ fn write_trace_line(
 pub struct TimeFilter {
     pub since: Option<i64>,
     pub until: Option<i64>,
+    /// The flag that set `since` (`--days 7`, `--since 2026-09-01`, ...),
+    /// echoed in `_meta.effective.time_window`.
+    pub since_from: Option<String>,
+    /// The flag that set `until`.
+    pub until_from: Option<String>,
 }
 
 /// Semantic search options from CLI flags (bd-3bbv)
@@ -27223,6 +27559,11 @@ fn unverifiable_daemon_composition_preserves_the_verified_local_embedding_space(
 }
 
 impl TimeFilter {
+    /// Resolve the search/pack time window.
+    ///
+    /// An explicit `--since`/`--until` that cannot be parsed is a usage
+    /// error; it used to be dropped silently, so a typo ran an unfiltered
+    /// query with exit 0 (2l1b0.64).
     pub fn new(
         days: Option<u32>,
         today: bool,
@@ -27230,7 +27571,7 @@ impl TimeFilter {
         week: bool,
         since_str: Option<&str>,
         until_str: Option<&str>,
-    ) -> Self {
+    ) -> CliResult<Self> {
         use chrono::{Datelike, Duration, Local, TimeZone};
 
         let now = Local::now();
@@ -27239,30 +27580,123 @@ impl TimeFilter {
             .single()
             .unwrap_or(now);
 
-        let (since, until) = if today {
-            (Some(today_start.timestamp_millis()), None)
+        let (since, until, preset) = if today {
+            (
+                Some(today_start.timestamp_millis()),
+                None,
+                Some("--today".to_string()),
+            )
         } else if yesterday {
             let yesterday_start = today_start - Duration::days(1);
             (
                 Some(yesterday_start.timestamp_millis()),
                 Some(today_start.timestamp_millis()),
+                Some("--yesterday".to_string()),
             )
         } else if week {
             let week_ago = now - Duration::days(7);
-            (Some(week_ago.timestamp_millis()), None)
+            (
+                Some(week_ago.timestamp_millis()),
+                None,
+                Some("--week".to_string()),
+            )
         } else if let Some(d) = days {
             let days_ago = now - Duration::days(i64::from(d));
-            (Some(days_ago.timestamp_millis()), None)
+            (
+                Some(days_ago.timestamp_millis()),
+                None,
+                Some(format!("--days {d}")),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
+        let mut since_from = since.and(preset.clone());
+        let mut until_from = until.and(preset);
 
-        // Explicit --since/--until override convenience flags when they parse successfully
-        let since = since_str.and_then(parse_datetime_str).or(since);
-        let until = until_str.and_then(parse_datetime_str).or(until);
+        // Explicit --since/--until override the convenience flags.
+        let since = match since_str {
+            Some(raw) => {
+                since_from = Some(format!("--since {raw}"));
+                Some(parse_search_time_bound("--since", raw, TimeBound::Since)?)
+            }
+            None => since,
+        };
+        let until = match until_str {
+            Some(raw) => {
+                until_from = Some(format!("--until {raw}"));
+                Some(parse_search_time_bound("--until", raw, TimeBound::Until)?)
+            }
+            None => until,
+        };
+        if let (Some(since), Some(until)) = (since, until)
+            && since > until
+        {
+            return Err(CliError::usage(
+                "the time window is empty because --since is later than --until",
+                Some("Choose an --until value at or after --since.".into()),
+            ));
+        }
 
-        TimeFilter { since, until }
+        Ok(TimeFilter {
+            since,
+            until,
+            since_from,
+            until_from,
+        })
     }
+}
+
+/// Which end of a time window a user-supplied value bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeBound {
+    Since,
+    Until,
+}
+
+fn parse_search_time_bound(flag: &str, raw: &str, bound: TimeBound) -> CliResult<i64> {
+    parse_time_bound(raw, bound).ok_or_else(|| {
+        CliError::usage(
+            format!("could not parse {flag} value {raw:?}"),
+            Some(
+                "Use an ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS), a US date (MM/DD/YYYY), \
+                 a keyword (now/today/yesterday), a relative offset (-7d, -24h, 30m) or a unix \
+                 timestamp."
+                    .into(),
+            ),
+        )
+    })
+}
+
+/// Parse a `--since`/`--until` value. A value that names a whole local day
+/// (a date without a time, `today`, `yesterday`) starts at local midnight as
+/// `--since` and ends at the day's last millisecond as `--until`, so
+/// `--until 2026-09-01` includes September 1 (README "Flexible Time
+/// Input"). Every other form is an instant and is used as-is.
+fn parse_time_bound(raw: &str, bound: TimeBound) -> Option<i64> {
+    let start = parse_datetime_str(raw)?;
+    if bound == TimeBound::Since || !names_whole_local_day(raw) {
+        return Some(start);
+    }
+    let day = chrono::DateTime::from_timestamp_millis(start)?
+        .with_timezone(&chrono::Local)
+        .date_naive();
+    let next_day = day.succ_opt()?.and_hms_opt(0, 0, 0)?;
+    let next_start = match chrono::TimeZone::from_local_datetime(&chrono::Local, &next_day) {
+        chrono::LocalResult::Single(local) | chrono::LocalResult::Ambiguous(local, _) => {
+            local.timestamp_millis()
+        }
+        chrono::LocalResult::None => return Some(start),
+    };
+    Some(next_start - 1)
+}
+
+fn names_whole_local_day(raw: &str) -> bool {
+    use chrono::NaiveDate;
+    let value = raw.trim().to_ascii_lowercase();
+    matches!(value.as_str(), "today" | "yesterday")
+        || ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y"]
+            .iter()
+            .any(|format| NaiveDate::parse_from_str(&value, format).is_ok())
 }
 
 fn parse_datetime_str(s: &str) -> Option<i64> {
@@ -27292,6 +27726,90 @@ fn parse_datetime_str(s: &str) -> Option<i64> {
     }
 
     crate::ui::time_parser::parse_time_input(s)
+}
+
+#[cfg(test)]
+mod search_time_filter_tests {
+    use super::*;
+
+    const DAY_MS: i64 = 86_400_000;
+
+    /// 2l1b0.64: an unparseable explicit bound used to be dropped, so the
+    /// search ran unfiltered with exit 0.
+    #[test]
+    fn unparseable_bounds_are_usage_errors() {
+        for (since, until) in [(Some("2026-13-01"), None), (None, Some("not-a-date"))] {
+            let error = TimeFilter::new(None, false, false, false, since, until)
+                .expect_err("an unparseable bound must not be ignored");
+            assert_eq!(error.code, 2, "{error:?}");
+            assert_eq!(error.kind, "usage", "{error:?}");
+            let flag = if since.is_some() {
+                "--since"
+            } else {
+                "--until"
+            };
+            assert!(error.message.contains(flag), "{error:?}");
+        }
+    }
+
+    /// README: a date-only `--until` includes the named day.
+    #[test]
+    fn date_only_until_covers_the_whole_local_day() {
+        for raw in ["2026-07-15", "2026/07/15", "07/15/2026", "07-15-2026"] {
+            let start = parse_time_bound(raw, TimeBound::Since).expect("date parses");
+            let end = parse_time_bound(raw, TimeBound::Until).expect("date parses");
+            assert_eq!(end - start, DAY_MS - 1, "{raw}");
+        }
+        let window = TimeFilter::new(None, false, false, false, None, Some("2026-07-15"))
+            .expect("valid bound");
+        let noon = parse_datetime_str("2026-07-15T12:00:00").expect("instant parses");
+        assert!(
+            window.until.is_some_and(|until| until >= noon),
+            "noon on the named day must be inside --until 2026-07-15"
+        );
+        let previous_day = TimeFilter::new(None, false, false, false, None, Some("2026-07-14"))
+            .expect("valid bound");
+        assert!(
+            previous_day.until.is_some_and(|until| until < noon),
+            "noon on the next day must be outside --until 2026-07-14"
+        );
+    }
+
+    #[test]
+    fn instants_and_relative_bounds_are_unchanged() {
+        let instant = "2026-07-15T12:00:00";
+        assert_eq!(
+            parse_time_bound(instant, TimeBound::Until),
+            parse_datetime_str(instant)
+        );
+        let relative_since = parse_time_bound("-7d", TimeBound::Since).expect("relative parses");
+        let relative_until = parse_time_bound("-7d", TimeBound::Until).expect("relative parses");
+        assert!((relative_until - relative_since).abs() < 60_000);
+    }
+
+    #[test]
+    fn inverted_window_is_a_usage_error() {
+        let error = TimeFilter::new(
+            None,
+            false,
+            false,
+            false,
+            Some("2026-07-16"),
+            Some("2026-07-15"),
+        )
+        .expect_err("empty window");
+        assert_eq!(error.kind, "usage");
+        let same_day = TimeFilter::new(
+            None,
+            false,
+            false,
+            false,
+            Some("2026-07-15"),
+            Some("2026-07-15"),
+        )
+        .expect("a single-day window is valid");
+        assert!(same_day.since < same_day.until);
+    }
 }
 
 /// Compute aggregations from search hits
@@ -27874,7 +28392,7 @@ fn describe_background_lexical_repair(
 
 /// Progress of the lexical rebuild recorded under `index_path`, for messages
 /// that tell a caller how far an active rebuild has come.
-fn lexical_rebuild_progress_note(index_path: &Path) -> Option<String> {
+pub(crate) fn lexical_rebuild_progress_note(index_path: &Path) -> Option<String> {
     let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(index_path)
         .ok()
         .flatten()?;
@@ -30077,6 +30595,52 @@ fn empty_search_result() -> crate::search::query::SearchResult {
     }
 }
 
+/// Remedy for a lexical query the engine refused with a posting-cursor
+/// invariant failure, or `None` for every other failure. That refusal belongs
+/// to the published generation, not the moment: retrying the same query
+/// against the same segments fails the same way, so an envelope carrying this
+/// hint must also say `retryable: false` (GH #499, where agents following the
+/// contract retried a date-filtered search forever).
+fn lexical_engine_invariant_hint(error: &anyhow::Error) -> Option<String> {
+    crate::search::quill_bridge::is_engine_invariant_failure(error).then(|| {
+        "the lexical engine rejected this query on the current index generation, and \
+         retrying fails the same way. Run 'cass index --full --force-rebuild' to publish a \
+         clean generation, and report the query with `cass --version` if it recurs (GH #499 \
+         was one such engine defect, fixed in frankensearch-quill 0.3.2)"
+            .to_string()
+    })
+}
+
+#[cfg(test)]
+mod lexical_engine_invariant_hint_tests {
+    use super::*;
+
+    /// GH #499: the reporter's exact envelope message gets the remedy (and
+    /// therefore `retryable: false` at every call site); fuel exhaustion and
+    /// reader faults keep their existing, retryable handling.
+    #[test]
+    fn only_a_cursor_invariant_failure_gets_the_non_retryable_remedy() {
+        let invariant = anyhow::anyhow!(
+            "executing a Quill lexical query: posting cursor invariant failed: Boolean \
+             children belong to different segment domains"
+        );
+        let hint = lexical_engine_invariant_hint(&invariant)
+            .expect("the #499 engine failure must carry a remedy");
+        assert!(hint.contains("cass index --full --force-rebuild"), "{hint}");
+        assert!(hint.contains("retrying fails the same way"), "{hint}");
+
+        for other in [
+            anyhow::anyhow!(
+                "executing a Quill lexical query: query fuel exhausted after 10/10 units"
+            ),
+            anyhow::anyhow!("opening the Quill CASS reader: manifest missing"),
+            anyhow::anyhow!("database is locked"),
+        ] {
+            assert_eq!(lexical_engine_invariant_hint(&other), None, "{other}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_search_operation(
     client: std::sync::Arc<crate::search::query::SearchClient>,
@@ -30109,6 +30673,8 @@ fn execute_search_operation(
                 // degrade to, so name the two real remedies instead of a bare
                 // engine error.
                 let fuel_exhausted = crate::search::quill_bridge::is_query_fuel_exhausted(&error);
+                let invariant_hint = lexical_engine_invariant_hint(&error);
+                let retryable = invariant_hint.is_none();
                 let hint = if fuel_exhausted {
                     Some(format!(
                         "the lexical engine hit its per-query work ceiling (usually a long, \
@@ -30121,14 +30687,14 @@ fn execute_search_operation(
                         crate::search::quill_bridge::cass_quill_config().query_fuel_budget
                     ))
                 } else {
-                    None
+                    invariant_hint
                 };
                 CliError {
                     code: 9,
                     kind: CliErrorKind::Search.kind_str(),
                     message: format!("search failed: {error}"),
                     hint,
-                    retryable: true,
+                    retryable,
                 }
             })?,
         SearchMode::Semantic => {
@@ -30233,14 +30799,17 @@ fn execute_search_operation(
                             search_sparse_threshold,
                             field_mask,
                         )
-                        .map_err(|fallback_error| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({error}); lexical fallback failed: {fallback_error}"
-                            ),
-                            hint: None,
-                            retryable: true,
+                        .map_err(|fallback_error| {
+                            let invariant_hint = lexical_engine_invariant_hint(&fallback_error);
+                            CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!(
+                                    "hybrid search failed ({error}); lexical fallback failed: {fallback_error}"
+                                ),
+                                retryable: invariant_hint.is_none(),
+                                hint: invariant_hint,
+                            }
                         })?
                 } else if message.contains("unavailable") || message.contains("no embedder") {
                     return Err(CliError {
@@ -30254,21 +30823,25 @@ fn execute_search_operation(
                         retryable: false,
                     });
                 } else {
+                    let invariant_hint = lexical_engine_invariant_hint(&error);
                     return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("hybrid search failed: {error}"),
-                        hint: Some(
-                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: true,
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint.or_else(|| {
+                            Some(
+                                "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                    .to_string(),
+                            )
+                        }),
                     });
                 }
             }
         },
     };
     mode_meta.lexical_degrade_reason = client.lexical_degrade_reason();
+    mode_meta.wildcard_fallback_skipped = client.wildcard_fallback_skipped_reason();
     Ok((result, mode_meta))
 }
 
@@ -30659,6 +31232,7 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
     refresh: bool,
+    interpretation: &InvocationInterpretation,
 ) -> CliResult<()> {
     use crate::search::model_manager::{
         load_hash_semantic_context, load_hash_semantic_context_strict, load_semantic_context,
@@ -30679,6 +31253,11 @@ fn run_cli_search(
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let refresh_db_override = db_override.clone();
+    let db_path_source = effective_db_path_source(
+        db_override.is_some(),
+        data_dir_override.is_some(),
+        interpretation,
+    );
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
     // Resolve robot mode before reading any user-supplied session scope so a
@@ -30752,6 +31331,17 @@ fn run_cli_search(
             requested: filters.session_paths.len(),
             matched: matched_session_paths,
         });
+    let effective = search_effective_interpretation(
+        "search",
+        query,
+        &db_path,
+        db_path_source,
+        &time_filter,
+        &filters,
+        sessions_from.as_ref().map(|_| filters.session_paths.len()),
+        interpretation,
+        Some(&semantic_opts),
+    );
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
     let mut limit_val = *limit;
@@ -31115,7 +31705,12 @@ fn run_cli_search(
     let setup_budget_snapshot = search_budget.as_ref().map(BudgetSnapshot::capture);
     let budget_action = semantic_budget_action(&mode_meta, setup_budget_snapshot);
     let execute_semantic = match budget_action {
-        SemanticBudgetAction::Execute => semantic_requested,
+        // A budgeted (structured) search already configured semantics on the
+        // bounded worker above, which never spawns a daemon. Repeating the
+        // setup here paid its cost a second time outside the budget, retried
+        // it unbounded after the worker timed out or fell back, and could
+        // spawn the daemon the worker declined to spawn (2l1b0.68).
+        SemanticBudgetAction::Execute => semantic_requested && search_budget.is_none(),
         SemanticBudgetAction::StrictSemanticTimeout => {
             // NearLimit is deliberately a typed timeout here: semantic setup
             // is an indivisible expensive stage, so insufficient remaining
@@ -31136,6 +31731,7 @@ fn run_cli_search(
     };
 
     if execute_semantic {
+        maybe_test_search_worker_delay("CASS_TEST_SEARCH_DIRECT_SEMANTIC_SETUP_SLOW_MS");
         // Use embedder registry for model selection (bd-2mbe).
 
         // Determine which embedder to use
@@ -31468,12 +32064,15 @@ fn run_cli_search(
                     search_sparse_threshold,
                     field_mask,
                 )
-                .map_err(|e| CliError {
-                    code: 9,
-                    kind: CliErrorKind::Search.kind_str(),
-                    message: format!("search failed: {e}"),
-                    hint: None,
-                    retryable: true,
+                .map_err(|e| {
+                    let invariant_hint = lexical_engine_invariant_hint(&e);
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("search failed: {e}"),
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint,
+                    }
                 })?,
             SearchMode::Semantic => {
                 // The former `semantic` Cargo feature (and its `-baseline`
@@ -31584,14 +32183,17 @@ fn run_cli_search(
                             search_sparse_threshold,
                             field_mask,
                         )
-                        .map_err(|fallback_err| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
-                            ),
-                            hint: None,
-                            retryable: true,
+                        .map_err(|fallback_err| {
+                            let invariant_hint = lexical_engine_invariant_hint(&fallback_err);
+                            CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!(
+                                    "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                                ),
+                                retryable: invariant_hint.is_none(),
+                                hint: invariant_hint,
+                            }
                         })?
                     } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                         return Err(CliError {
@@ -31605,15 +32207,18 @@ fn run_cli_search(
                         retryable: false,
                     });
                     } else {
+                        let invariant_hint = lexical_engine_invariant_hint(&e);
                         return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("hybrid search failed: {e}"),
-                        hint: Some(
-                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: true,
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint.or_else(|| {
+                            Some(
+                                "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                    .to_string(),
+                            )
+                        }),
                     });
                     }
                 }
@@ -31654,7 +32259,10 @@ fn run_cli_search(
             #[cfg(unix)]
             {
                 let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
-                let daemon = if semantic_opts.auto_spawn_daemon {
+                // A budgeted (structured) search never spawns a persistent
+                // daemon, for reranking any more than for embedding; it uses
+                // one that is already running (2l1b0.68).
+                let daemon = if semantic_opts.auto_spawn_daemon && search_budget.is_none() {
                     crate::daemon::client::connect_or_spawn_for_embedder(
                         daemon_embedder_id_for_rerank.as_deref().unwrap_or(
                             crate::search::fastembed_embedder::FastEmbedder::embedder_id_static(),
@@ -31801,7 +32409,7 @@ fn run_cli_search(
     };
 
     // Compute aggregations and create display result based on mode
-    let (aggregations, display_result, total_matches, has_more_results, total_matches_exact) =
+    let (aggregations, mut display_result, total_matches, has_more_results, total_matches_exact) =
         if has_aggregation
             && search_budget
                 .as_ref()
@@ -32108,6 +32716,40 @@ fn run_cli_search(
         None
     };
 
+    // uojcg.7.1: explain an empty search filtered to one workspace. The probes
+    // run only on that empty path, inside the remaining robot budget.
+    let zero_result_diagnosis = if display_result.hits.is_empty()
+        && filters.workspaces.len() == 1
+        && !skipped_sections.iter().any(|section| section == "search")
+    {
+        let probe_client = Arc::clone(&client);
+        let probe_query = query.to_string();
+        let probe_filters = filters.clone();
+        let probe_db_path = db_path.clone();
+        let probe =
+            move || -> CliResult<Option<crate::search::zero_result_diagnosis::ZeroResultReport>> {
+                Ok(diagnose_empty_workspace_search(
+                    &probe_client,
+                    &probe_query,
+                    &probe_filters,
+                    field_mask,
+                    &probe_db_path,
+                ))
+            };
+        match search_budget.as_ref() {
+            Some(budget) if budget.is_healthy() => {
+                run_read_only_search_worker(budget.remaining_ms(), probe)
+                    .ok()
+                    .flatten()
+                    .flatten()
+            }
+            Some(_) => None,
+            None => probe().ok().flatten(),
+        }
+    } else {
+        None
+    };
+
     // Bead v6vuz: captured before the output chain because `warning` and
     // `effective_robot` are conditionally moved into the robot branch below.
     let is_human_search = effective_robot.is_none();
@@ -32206,6 +32848,13 @@ fn run_cli_search(
                 retryable: true,
             });
         }
+        // 2l1b0.68: --highlight marks robot snippets exactly as it marks the
+        // human output; robot mode used to accept the flag and ignore it.
+        if highlight {
+            for hit in &mut display_result.hits {
+                hit.snippet = highlight_matches(&hit.snippet, query, "**", "**");
+            }
+        }
         // Robot output mode (JSON)
         output_robot_results(
             query,
@@ -32239,6 +32888,8 @@ fn run_cli_search(
             search_ms,
             rerank_ms,
             sessions_filter_stats,
+            effective,
+            zero_result_diagnosis.as_ref(),
         )?;
     } else if display_result.hits.is_empty() {
         // GH#414: when the --sessions-from filter provably selected zero
@@ -32256,6 +32907,27 @@ fn run_cli_search(
             );
         } else {
             eprintln!("No results found.");
+        }
+        if let Some(report) = &zero_result_diagnosis {
+            use crate::search::zero_result_diagnosis::ZeroResultDiagnosis;
+            let note = match report.diagnosis {
+                ZeroResultDiagnosis::WorkspaceFilterLikelyWrong => {
+                    "The --workspace filter matches no indexed workspace exactly, but a close one exists."
+                }
+                ZeroResultDiagnosis::WorkspaceNotIndexed => {
+                    "The --workspace filter matches no indexed workspace, and the query has hits elsewhere."
+                }
+                ZeroResultDiagnosis::WorkspaceHasNoMatch => {
+                    "The workspace is indexed; the query has hits in other workspaces but not in this one."
+                }
+                ZeroResultDiagnosis::SourceIdFilter | ZeroResultDiagnosis::GenuineNoMatch => "",
+            };
+            if !note.is_empty() {
+                eprintln!("{note}");
+            }
+            if let Some(rerun) = &report.suggested_rerun {
+                eprintln!("Hint: {rerun}");
+            }
         }
     } else if let Some(display) = display_format {
         // Human-readable display formats
@@ -32510,6 +33182,7 @@ fn run_cli_pack(
     refresh: bool,
     timeout_ms: Option<u64>,
     _wrap: WrapConfig,
+    interpretation: &InvocationInterpretation,
 ) -> CliResult<()> {
     use crate::search::pack_planner::{
         PackLexicalReadiness, PackPlanRequest, PackPlannerLimits, PackReadinessSnapshot,
@@ -32651,6 +33324,24 @@ fn run_cli_pack(
         }
     }
 
+    // 2l1b0.68: pack runs a search and echoes what it ran in `_meta.effective`
+    // like `search --robot-meta`, without the search-only daemon policy.
+    let effective = search_effective_interpretation(
+        "pack",
+        query,
+        &db_path,
+        effective_db_path_source(
+            db_override.is_some(),
+            data_dir_override.is_some(),
+            interpretation,
+        ),
+        &time_filter,
+        &filters,
+        sessions_from.as_ref().map(|_| filters.session_paths.len()),
+        interpretation,
+        None,
+    );
+
     let setup = if structured_pack && !hard_deadline_reached {
         let worker_data_dir = data_dir.clone();
         let worker_db_path = db_path.clone();
@@ -32763,15 +33454,18 @@ fn run_cli_pack(
                     FieldMask::FULL,
                 )
                 .map_err(|error| {
+                    let invariant_hint = lexical_engine_invariant_hint(&error);
                     CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("pack search failed: {error}"),
-                        hint: Some(
-                            "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                                .to_string(),
-                        ),
-                        retryable: true,
+                        retryable: invariant_hint.is_none(),
+                        hint: invariant_hint.or_else(|| {
+                            Some(
+                                "Try `cass search <query> --robot --robot-meta` to inspect the search path."
+                                    .to_string(),
+                            )
+                        }),
                     }
                 })
         };
@@ -32946,6 +33640,7 @@ fn run_cli_pack(
         hard_deadline_reached,
     );
     let mut render_request = PackRenderRequest {
+        effective: Some(effective),
         query_text: query.to_string(),
         normalized_query: query.trim().to_string(),
         generated_at_ms,
@@ -34557,6 +35252,10 @@ struct SearchModeMeta {
     /// GH #441: set when a hybrid search dropped its lexical leg (for example
     /// `query_fuel_exhausted`) and answered from the semantic leg alone.
     lexical_degrade_reason: Option<&'static str>,
+    /// 2l1b0.68: why a sparse lexical result did not get the automatic
+    /// wildcard retry (`index_over_automatic_limit`, `automatic_retry_disabled`,
+    /// `long_query_term`).
+    wildcard_fallback_skipped: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34688,6 +35387,7 @@ impl SearchModeMeta {
             quality_tier_refined: true,
             semantic_work_completed: true,
             lexical_degrade_reason: None,
+            wildcard_fallback_skipped: None,
         }
     }
 
@@ -35170,6 +35870,90 @@ impl SessionsFilterStats {
     }
 }
 
+/// `_meta.effective` (2l1b0.68): what this search actually ran, so a caller
+/// can check the interpretation instead of trusting it. It names the
+/// database and what chose its path, the resolved time window with the flag
+/// behind each bound, the filters as parsed, every argv auto-correction, and
+/// how the lexical engine groups the query, with any parentheses it recovered
+/// (the reading `--explain` shows; cass's parse matches the engine's since
+/// 2l1b0.52).
+/// `pack` runs the same search and echoes the same object, without the
+/// search-only daemon policy (`semantic_opts: None`).
+#[allow(clippy::too_many_arguments)]
+fn search_effective_interpretation(
+    command: &str,
+    query: &str,
+    db_path: &Path,
+    db_path_source: &str,
+    time_filter: &TimeFilter,
+    filters: &crate::search::query::SearchFilters,
+    sessions_from_paths: Option<usize>,
+    interpretation: &InvocationInterpretation,
+    semantic_opts: Option<&SemanticSearchOptions>,
+) -> serde_json::Value {
+    let mut agents: Vec<&str> = filters.agents.iter().map(String::as_str).collect();
+    agents.sort_unstable();
+    let mut workspaces: Vec<&str> = filters.workspaces.iter().map(String::as_str).collect();
+    workspaces.sort_unstable();
+    let reading = crate::search::query::read_query(query);
+    let mut effective = serde_json::json!({
+        "command": command,
+        "query": query,
+        "query_structure": reading.structure,
+        "query_recoveries": reading.recoveries,
+        "db_path": db_path.display().to_string(),
+        "db_path_source": db_path_source,
+        "time_window": {
+            "since_ms": time_filter.since,
+            "since_from": time_filter.since_from,
+            "until_ms": time_filter.until,
+            "until_from": time_filter.until_from,
+        },
+        "filters": {
+            "agents": agents,
+            "workspaces": workspaces,
+            "source": filters.source_filter.to_string(),
+            "sessions_from_paths": sessions_from_paths,
+        },
+        "auto_corrections": interpretation.corrections,
+    });
+    // `--daemon` asks permission to spawn the warm-model daemon. A robot
+    // search is budgeted and never spawns one; it still uses a daemon that is
+    // already running unless `--no-daemon` was given (2l1b0.68).
+    if let Some(semantic_opts) = semantic_opts
+        && let Some(object) = effective.as_object_mut()
+    {
+        object.insert(
+            "daemon".to_string(),
+            serde_json::json!({
+                "use_existing": semantic_opts.use_daemon,
+                "auto_spawn_requested": semantic_opts.auto_spawn_daemon,
+                "auto_spawn": false,
+            }),
+        );
+    }
+    effective
+}
+
+/// Which input chose the canonical database path, for `_meta.effective`.
+fn effective_db_path_source(
+    db_override: bool,
+    data_dir_override: bool,
+    interpretation: &InvocationInterpretation,
+) -> &'static str {
+    if db_override {
+        if interpretation.db_from_env {
+            "env:CASS_DB_PATH"
+        } else {
+            "--db"
+        }
+    } else if data_dir_override {
+        "--data-dir"
+    } else {
+        default_data_dir_with_source().1
+    }
+}
+
 /// Output search results in robot-friendly format
 #[allow(clippy::too_many_arguments, unused_variables)]
 fn output_robot_results(
@@ -35211,6 +35995,10 @@ fn output_robot_results(
     rerank_ms: u64,
     // GH#414: present iff --sessions-from was supplied.
     sessions_filter: Option<SessionsFilterStats>,
+    // 2l1b0.68: `_meta.effective`, from `search_effective_interpretation`.
+    effective: serde_json::Value,
+    // uojcg.7.1: present iff an empty search was filtered to one workspace.
+    zero_result_diagnosis: Option<&crate::search::zero_result_diagnosis::ZeroResultReport>,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -35577,12 +36365,12 @@ fn output_robot_results(
     };
 
     // Clamp hits to token budget if provided (approx 4 chars per token)
+    // Must match the JSONL header condition in the output match below.
     let jsonl_meta_emitted = matches!(format, RobotFormat::Jsonl)
         && (include_meta
             || !aggregations.is_empty()
             || !result.suggestions.is_empty()
             || explanation.is_some()
-            || budget.budget_ms > 0
             || budget.timed_out);
     let estimate_tokens = max_tokens.is_some() || include_meta || jsonl_meta_emitted;
     let (mut filtered_hits, tokens_estimated, hits_clamped) =
@@ -35750,6 +36538,16 @@ fn output_robot_results(
                 }
             }
 
+            // uojcg.7.1: why an empty, workspace-filtered search is empty.
+            if let (Some(report), serde_json::Value::Object(map)) =
+                (zero_result_diagnosis, &mut payload)
+            {
+                map.insert(
+                    "zero_result_diagnosis".to_string(),
+                    serde_json::to_value(report).unwrap_or_default(),
+                );
+            }
+
             // Add suggestions if present. When the --sessions-from filter
             // provably matched zero indexed sessions, the query is
             // demonstrably not the cause of an empty result, so the
@@ -35791,6 +36589,7 @@ fn output_robot_results(
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
+                    "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "cache_stats": {
                         "hits": result.cache_stats.cache_hits,
                         "misses": result.cache_stats.cache_miss,
@@ -35813,6 +36612,7 @@ fn output_robot_results(
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
                     "explanation_cards": explanation_cards_json.clone(),
+                    "effective": effective.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -35916,12 +36716,15 @@ fn output_robot_results(
             let stdout = std::io::stdout();
             let mut out = BufWriter::new(stdout.lock());
 
-            // JSONL: one object per line, optional _meta header
+            // JSONL: one hit per line, preceded by a {budget, _meta} header
+            // only when something asked for it or the budget ran out. Every
+            // search has a budget, so gating on `budget_ms > 0` printed the
+            // header always, and a line-per-hit consumer read it as a hit
+            // (README: "jsonl # hits only"; 2l1b0.58).
             if include_meta
                 || agg_json.is_some()
                 || !result.suggestions.is_empty()
                 || explanation.is_some()
-                || budget.budget_ms > 0
                 || budget.timed_out
             {
                 let mut meta = serde_json::json!({
@@ -35943,6 +36746,7 @@ fn output_robot_results(
                         "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                         "wildcard_fallback": result.wildcard_fallback,
+                        "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                         "cache_stats": {
                             "hits": result.cache_stats.cache_hits,
                             "misses": result.cache_stats.cache_miss,
@@ -35959,6 +36763,7 @@ fn output_robot_results(
                         "query_plan": query_plan_json.clone(),
                         "cursor_manifest": cursor_manifest_json.clone(),
                         "explanation_cards": explanation_cards_json.clone(),
+                        "effective": effective.clone(),
                     }
                 });
                 if let Some(state) = state_meta
@@ -36119,6 +36924,16 @@ fn output_robot_results(
                 }
             }
 
+            // uojcg.7.1: why an empty, workspace-filtered search is empty.
+            if let (Some(report), serde_json::Value::Object(map)) =
+                (zero_result_diagnosis, &mut payload)
+            {
+                map.insert(
+                    "zero_result_diagnosis".to_string(),
+                    serde_json::to_value(report).unwrap_or_default(),
+                );
+            }
+
             // Add suggestions if present. When the --sessions-from filter
             // provably matched zero indexed sessions, the query is
             // demonstrably not the cause of an empty result, so the
@@ -36159,6 +36974,7 @@ fn output_robot_results(
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
+                    "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
                     "request_id": request_id,
@@ -36167,6 +36983,7 @@ fn output_robot_results(
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
                     "explanation_cards": explanation_cards_json.clone(),
+                    "effective": effective.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -36291,6 +37108,16 @@ fn output_robot_results(
                 }
             }
 
+            // uojcg.7.1: why an empty, workspace-filtered search is empty.
+            if let (Some(report), serde_json::Value::Object(map)) =
+                (zero_result_diagnosis, &mut payload)
+            {
+                map.insert(
+                    "zero_result_diagnosis".to_string(),
+                    serde_json::to_value(report).unwrap_or_default(),
+                );
+            }
+
             // Add suggestions if present. When the --sessions-from filter
             // provably matched zero indexed sessions, the query is
             // demonstrably not the cause of an empty result, so the
@@ -36331,6 +37158,7 @@ fn output_robot_results(
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
+                    "wildcard_fallback_skipped": search_mode_meta.wildcard_fallback_skipped,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
                     "request_id": request_id,
@@ -36339,6 +37167,7 @@ fn output_robot_results(
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
                     "explanation_cards": explanation_cards_json.clone(),
+                    "effective": effective.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -38779,12 +39608,36 @@ fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static s
 /// (a dry-run reconstruct/restore, or an archive scan), prioritizing the most
 /// fundamental fault; fall back to `--fix` only when the failures are things the
 /// safe auto-fix path genuinely handles (derived cleanup, staging, locks).
+/// Suffix for the database check message when the engine's only integrity
+/// failure is leaked pages; it names the in-place repair (2l1b0.73).
+fn doctor_leaked_pages_remedy_suffix(leaked_pages_only: bool) -> String {
+    if leaked_pages_only {
+        format!(
+            "; the only damage is leaked pages (no table, index or freelist owns them), which `{}` inspects and `--yes` frees in place",
+            doctor_recover::LEAKED_PAGES_DRY_RUN_COMMAND
+        )
+    } else {
+        String::new()
+    }
+}
+
 fn doctor_read_only_next_command(check_reports: &[DoctorCheckReport]) -> String {
     let failing = |name: &str| {
         check_reports
             .iter()
             .any(|check| check.name == name && (check.status == "fail" || check.status == "error"))
     };
+    // A leak-only integrity failure has an exact in-place repair; the generic
+    // repair planner offers nothing for it (2l1b0.73).
+    if check_reports.iter().any(|check| {
+        check.name == "database"
+            && check.status == "fail"
+            && check
+                .message
+                .contains(doctor_recover::LEAKED_PAGES_DRY_RUN_COMMAND)
+    }) {
+        return doctor_recover::LEAKED_PAGES_DRY_RUN_COMMAND.to_string();
+    }
     if failing("database")
         || failing("database_backup")
         || failing("safe_auto_archive_rebuild")
@@ -39622,10 +40475,15 @@ fn doctor_top_level_operation_outcome(
     }
 
     if !fix_requested {
+        // Same routing as the safe-auto-run report's next_exact_command
+        // (#374): `--fix` only runs derived cleanup, so a failing archive or
+        // source-authority check must not be told to run it. The owner's
+        // leaked-page archive got `cass doctor --fix` here while its own
+        // check said "reconstruct from verified authority" (2l1b0.73).
         let next_command = if not_initialized {
             Some("cass index --full".to_string())
         } else {
-            Some("cass doctor --fix --json".to_string())
+            Some(doctor_read_only_next_command(checks))
         };
         return doctor_operation_outcome_with_details(
             DoctorOperationOutcomeKind::OkReadOnlyDiagnosed,
@@ -43762,9 +44620,10 @@ const CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT: &str =
 const CASS_TEST_DOCTOR_RENAME_FAILURE: &str = "CASS_TEST_DOCTOR_RENAME_FAILURE";
 const DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS: u64 = 500;
 /// World-class-doctor pass-4: lowered from 1 hour to 5 minutes per the
-/// safety-envelope hardening pass. Two `cass doctor --fix` runs racing in the
-/// same wall-clock window now resolve via `concurrency-lost` (exit 5) instead
-/// of one stale lock blocking the other for an hour.
+/// safety-envelope hardening pass, so a stale lock stops blocking repairs
+/// after 5 minutes instead of an hour. While the holder is live, a second
+/// `cass doctor --fix` reports repair-blocked (exit 7 `index-busy` when failed
+/// checks remain).
 ///
 /// The stale-detection threshold is the lock-metadata `started_at_ms` /
 /// `updated_at_ms` age in ms.
@@ -44418,7 +45277,7 @@ fn build_doctor_full_rebuild_readiness(
     }
     if projection.rebuild_staging_bytes > 0 {
         notes.push(format!(
-            "{} bytes of an interrupted or failed rebuild's staged generation sit under index/ (the .rebuild-staging directory) and are not doubled: the next `cass index --full` resumes into them or clears them before starting over.",
+            "{} bytes of an interrupted or failed rebuild's staged generation sit under index/ (the .rebuild-staging directory) and are subtracted from the requirement: the next `cass index --full` resumes into them or clears them before starting over, so that space comes back to the rebuild.",
             projection.rebuild_staging_bytes
         ));
     }
@@ -54201,6 +55060,22 @@ fn doctor_candidate_promotion_root(data_dir: &Path) -> PathBuf {
 }
 
 const DOCTOR_BACKUP_MANIFEST_KIND: &str = "cass_doctor_candidate_promotion_backup_manifest_v1";
+/// Backup of the live bundle taken before `doctor --repair-leaked-pages`. Same
+/// artifact contract as a candidate-promotion backup (prior-live DB/WAL/SHM
+/// with blake3), so `doctor backups verify|restore` handle both.
+const DOCTOR_LEAKED_PAGES_REPAIR_BACKUP_MANIFEST_KIND: &str =
+    "cass_doctor_leaked_pages_repair_backup_manifest_v1";
+
+/// `backup_kind` label for a backup manifest, by its manifest kind.
+fn doctor_backup_kind_label(manifest: &serde_json::Value) -> &'static str {
+    match manifest
+        .get("manifest_kind")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(DOCTOR_LEAKED_PAGES_REPAIR_BACKUP_MANIFEST_KIND) => "leaked-pages-repair",
+        _ => "candidate-promotion",
+    }
+}
 const DOCTOR_BACKUP_RESTORE_PLAN_PREFIX: &str = "doctor-backup-restore-plan-v1";
 
 #[derive(Debug, Clone)]
@@ -54225,6 +55100,7 @@ struct DoctorBackupArtifactVerification {
 #[derive(Debug, Clone)]
 struct DoctorBackupVerification {
     backup_id: String,
+    backup_kind: &'static str,
     manifest_path: PathBuf,
     manifest_blake3: Option<String>,
     status: String,
@@ -54405,7 +55281,7 @@ fn doctor_backup_verification_value(
     serde_json::json!({
         "schema_version": 1,
         "backup_id": verification.backup_id,
-        "backup_kind": "candidate-promotion",
+        "backup_kind": verification.backup_kind,
         "manifest_path": verification.manifest_path.display().to_string(),
         "redacted_manifest_path": doctor_redacted_path(&verification.manifest_path.display().to_string(), data_dir),
         "manifest_blake3": verification.manifest_blake3,
@@ -54448,6 +55324,7 @@ fn verify_doctor_backup_record(
         });
     let mut verification = DoctorBackupVerification {
         backup_id: record.backup_id,
+        backup_kind: doctor_backup_kind_label(&record.manifest),
         manifest_path: record.manifest_path,
         manifest_blake3: record.manifest_blake3,
         status: "failed".to_string(),
@@ -54466,12 +55343,13 @@ fn verify_doctor_backup_record(
         warnings: Vec::new(),
         blocked_reasons: Vec::new(),
     };
-    if record
-        .manifest
-        .get("manifest_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some(DOCTOR_BACKUP_MANIFEST_KIND)
-    {
+    if !matches!(
+        record
+            .manifest
+            .get("manifest_kind")
+            .and_then(serde_json::Value::as_str),
+        Some(DOCTOR_BACKUP_MANIFEST_KIND | DOCTOR_LEAKED_PAGES_REPAIR_BACKUP_MANIFEST_KIND)
+    ) {
         verification
             .blocked_reasons
             .push("backup manifest kind is not supported".to_string());
@@ -55136,7 +56014,8 @@ pub(crate) fn run_doctor_backups_impl(
         "notes": [
             "Backup commands never delete backup artifacts.",
             "Restore defaults to a rehearsal; live restore requires the matching plan_fingerprint.",
-            "Candidate-promotion backups preserve both the promoted candidate bundle and the prior-live bundle."
+            "Candidate-promotion backups preserve both the promoted candidate bundle and the prior-live bundle.",
+            "Leaked-pages-repair backups preserve the prior-live bundle taken before `doctor --repair-leaked-pages`."
         ],
         "_meta": {
             "elapsed_ms": started.elapsed().as_millis() as u64,
@@ -55152,7 +56031,7 @@ pub(crate) fn run_doctor_backups_impl(
                     let verification = verify_doctor_backup_record(&data_dir, record);
                     serde_json::json!({
                         "backup_id": verification.backup_id,
-                        "backup_kind": "candidate-promotion",
+                        "backup_kind": verification.backup_kind,
                         "manifest_path": verification.manifest_path.display().to_string(),
                         "redacted_manifest_path": doctor_redacted_path(&verification.manifest_path.display().to_string(), &data_dir),
                         "manifest_blake3": verification.manifest_blake3,
@@ -57270,18 +58149,23 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
             {"name": "promote_candidate_archive", "op_kind": "atomic-swap", "since_pass": 0},
             {"name": "restore_from_backup", "op_kind": "atomic-swap", "since_pass": 0}
         ],
+        // Exactly the (code, kind) pairs doctor and its subcommands return
+        // (2l1b0.58). Findings without a failed check exit 0; the payload's
+        // operation_outcome.exit_code_kind names them. Failed checks exit 5
+        // `doctor`; a repair blocked by an operation lock exits 7 `index-busy`.
         "exit_codes": [
             {"code": 0, "kind": "success", "retryable_via_kind_branch": false},
-            {"code": 1, "kind": "health-failure", "retryable_via_kind_branch": true},
             {"code": 2, "kind": "usage", "retryable_via_kind_branch": false},
             {"code": 3, "kind": "repair-failure", "retryable_via_kind_branch": false},
             {"code": 4, "kind": "refused-unsafe", "retryable_via_kind_branch": false},
-            {"code": 5, "kind": "concurrency-lost", "retryable_via_kind_branch": true},
-            {"code": 6, "kind": "online-required", "retryable_via_kind_branch": true},
+            {"code": 4, "kind": "output-not-writable", "retryable_via_kind_branch": false},
+            {"code": 5, "kind": "doctor", "retryable_via_kind_branch": true},
+            {"code": 5, "kind": "data-corruption", "retryable_via_kind_branch": false},
+            {"code": 7, "kind": "index-busy", "retryable_via_kind_branch": true},
             {"code": 9, "kind": "internal", "retryable_via_kind_branch": false},
+            {"code": 10, "kind": "config", "retryable_via_kind_branch": false},
             {"code": 13, "kind": "not-found", "retryable_via_kind_branch": false},
-            {"code": 14, "kind": "io", "retryable_via_kind_branch": true},
-            {"code": 73, "kind": "cannot-create-output", "retryable_via_kind_branch": true}
+            {"code": 14, "kind": "io", "retryable_via_kind_branch": true}
         ],
         "data_paths": [
             {"path_kind": "data_dir", "default": "~/.local/share/coding-agent-search/", "writable_by_doctor": true},
@@ -57554,7 +58438,7 @@ fn run_doctor_archive_export_impl(
         "blocked"
     } else {
         doctor_forensic_create_private_dir_all(target_root).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to create archive export target: {err}"),
             hint: Some("Choose a writable target on a filesystem with enough space.".to_string()),
@@ -57594,7 +58478,7 @@ fn run_doctor_archive_export_impl(
         });
         doctor_write_private_json_artifact(&manifest_path, &manifest, "archive export manifest")
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking target filesystem health.".to_string()),
@@ -57612,7 +58496,7 @@ fn run_doctor_archive_export_impl(
         let event_path = doctor_archive_export_event_log_path(target_root);
         doctor_write_private_json_artifact(&event_path, &event_log, "archive export event log")
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking target filesystem health.".to_string()),
@@ -57637,14 +58521,14 @@ fn run_doctor_archive_export_impl(
             "archive export receipt",
         )
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking target filesystem health.".to_string()),
             retryable: true,
         })?;
         sync_directory(target_root).map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking target filesystem health.".to_string()),
@@ -58529,14 +59413,14 @@ fn doctor_support_bundle_include_sensitive_attachments(
             retryable: false,
         })?;
         doctor_forensic_create_private_dir_all(parent).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to create sensitive attachment bundle directory: {err}"),
             hint: Some("Choose a writable cass data directory and retry.".to_string()),
             retryable: true,
         })?;
         let copied = std::fs::copy(source_path, &target_path).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to copy sensitive attachment into support bundle: {err}"),
             hint: Some(
@@ -58546,7 +59430,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
         })?;
         if copied != metadata.len() {
             return Err(CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message: "sensitive attachment copy byte count mismatch".to_string(),
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58555,7 +59439,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
         }
         sync_file(&target_path, "support bundle sensitive attachment").map_err(|message| {
             CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58563,7 +59447,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
             }
         })?;
         sync_directory(parent).map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58585,7 +59469,7 @@ fn doctor_support_bundle_include_sensitive_attachments(
                 },
             )
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58815,21 +59699,21 @@ fn run_doctor_support_bundle_impl(
 
     let root = doctor_support_bundle_root(&data_dir);
     doctor_forensic_bundle_root_is_safe(&data_dir, &root).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Use a normal cass data directory; support bundles must stay under [cass-data]/doctor/support-bundles.".to_string()),
         retryable: false,
     })?;
     doctor_forensic_create_private_dir_all(&root).map_err(|err| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message: format!("failed to create doctor support bundle root: {err}"),
         hint: Some("Choose a writable cass data directory and retry.".to_string()),
         retryable: true,
     })?;
     doctor_forensic_bundle_root_is_safe(&data_dir, &root).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Use a normal cass data directory; support bundles must stay under [cass-data]/doctor/support-bundles.".to_string()),
@@ -58857,7 +59741,7 @@ fn run_doctor_support_bundle_impl(
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 return Err(CliError {
-                    code: 4,
+                    code: 14,
                     kind: "io",
                     message: format!("failed to allocate support bundle directory: {err}"),
                     hint: Some("Choose a writable cass data directory and retry.".to_string()),
@@ -58868,7 +59752,7 @@ fn run_doctor_support_bundle_impl(
     }
     if !allocated {
         return Err(CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!(
                 "failed to allocate unique support bundle under {}",
@@ -58901,7 +59785,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58924,7 +59808,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58944,7 +59828,7 @@ fn run_doctor_support_bundle_impl(
         .unwrap_or(serde_json::Value::Null),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58964,7 +59848,7 @@ fn run_doctor_support_bundle_impl(
         ),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -58984,7 +59868,7 @@ fn run_doctor_support_bundle_impl(
         ),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59005,7 +59889,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59029,7 +59913,7 @@ fn run_doctor_support_bundle_impl(
         }),
     )
     .map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59051,7 +59935,7 @@ fn run_doctor_support_bundle_impl(
             value,
         )
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59074,7 +59958,7 @@ fn run_doctor_support_bundle_impl(
                 value,
             )
             .map_err(|message| CliError {
-                code: 4,
+                code: 14,
                 kind: "io",
                 message,
                 hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59114,7 +59998,7 @@ fn run_doctor_support_bundle_impl(
             diff,
         )
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59165,21 +60049,21 @@ fn run_doctor_support_bundle_impl(
     });
     doctor_write_private_json_artifact(&manifest_path, &manifest_value, "support bundle manifest")
         .map_err(|message| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message,
             hint: Some("Retry after checking filesystem health.".to_string()),
             retryable: true,
         })?;
     sync_directory(&bundle_dir).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
         retryable: true,
     })?;
     sync_directory(&root).map_err(|message| CliError {
-        code: 4,
+        code: 14,
         kind: "io",
         message,
         hint: Some("Retry after checking filesystem health.".to_string()),
@@ -59187,14 +60071,14 @@ fn run_doctor_support_bundle_impl(
     })?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest_path).map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to reread support bundle manifest: {err}"),
             hint: Some("Retry after checking filesystem health.".to_string()),
             retryable: true,
         })?)
         .map_err(|err| CliError {
-            code: 4,
+            code: 14,
             kind: "io",
             message: format!("failed to parse written support bundle manifest: {err}"),
             hint: Some("Retry after checking filesystem health.".to_string()),
@@ -62151,8 +63035,38 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
     }
 }
 
+/// fs2 reports a contended try-lock as its `lock_contended_error()`:
+/// EWOULDBLOCK on unix, but raw ERROR_LOCK_VIOLATION on Windows, which no
+/// `ErrorKind` matches, so an active doctor lock read as unavailable
+/// (2l1b0.74).
 fn doctor_lock_probe_error_is_active(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::WouldBlock
+        || (err.raw_os_error().is_some()
+            && err.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
+#[cfg(test)]
+mod doctor_lock_probe_error_tests {
+    use super::*;
+
+    /// fs2's own contended error must read as an active lock on every
+    /// platform (on Windows it is raw ERROR_LOCK_VIOLATION, not WouldBlock),
+    /// and unrelated failures must not (2l1b0.74).
+    #[test]
+    fn contended_lock_error_is_active_and_other_errors_are_not() {
+        assert!(doctor_lock_probe_error_is_active(
+            &fs2::lock_contended_error()
+        ));
+        assert!(doctor_lock_probe_error_is_active(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!doctor_lock_probe_error_is_active(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!doctor_lock_probe_error_is_active(&std::io::Error::other(
+            "permission denied"
+        )));
+    }
 }
 
 fn doctor_acquire_mutation_lock(
@@ -70605,9 +71519,46 @@ mod doctor_asset_taxonomy_tests {
             DoctorOperationOutcomeKind::OkReadOnlyDiagnosed
         );
         assert_eq!(read_only.data_loss_risk, DoctorDataLossRisk::High);
+        // 2l1b0.73: `--fix` runs derived cleanup only, so a failing archive
+        // check must be routed to the repair planner, as the safe-auto-run
+        // report already did (#374). This assertion used to pin `--fix`.
         assert_eq!(
             read_only.next_command.as_deref(),
-            Some("cass doctor --fix --json")
+            Some("cass doctor repair --dry-run --json")
+        );
+        let derived_only = doctor_check_report(
+            "lock_file",
+            "fail",
+            "stale index-run lock left by a dead process",
+            true,
+            false,
+        );
+        let derived_read_only = doctor_top_level_operation_outcome(
+            std::slice::from_ref(&derived_only),
+            false,
+            1,
+            0,
+            false,
+            &post_repair_probes,
+            None,
+        );
+        assert_eq!(
+            derived_read_only.next_command.as_deref(),
+            Some("cass doctor --fix --json"),
+            "failures the safe auto-fix path handles still point at --fix"
+        );
+        let uninitialized = doctor_top_level_operation_outcome(
+            std::slice::from_ref(&archive_risk),
+            false,
+            1,
+            0,
+            true,
+            &post_repair_probes,
+            None,
+        );
+        assert_eq!(
+            uninitialized.next_command.as_deref(),
+            Some("cass index --full")
         );
 
         let fully_fixed =
@@ -78750,6 +79701,30 @@ paths = ["~/.claude/projects"]
             doctor_read_only_next_command(&[cleanup, fail_db]),
             "cass doctor repair --dry-run --json"
         );
+
+        // 2l1b0.73: a leak-only integrity failure routes to its in-place
+        // repair, even beside another failing archive check...
+        let leak_message = format!(
+            "Database failed frankensqlite integrity_check: database disk image is malformed: page 8196 is never used (2715 conversations, 3683202 messages){}",
+            doctor_leaked_pages_remedy_suffix(true)
+        );
+        let fail_leak = doctor_check_report("database", "fail", &leak_message, false, false);
+        let fail_staging =
+            doctor_check_report("candidate_staging", "fail", "blocked", false, false);
+        assert_eq!(
+            doctor_read_only_next_command(&[fail_staging, fail_leak]),
+            "cass doctor --repair-leaked-pages --dry-run --json"
+        );
+        // ...while any other integrity failure keeps the generic planner.
+        let other_message = format!(
+            "Database failed frankensqlite integrity_check: database disk image is malformed: page 7 is referenced multiple times (1 conversations, 2 messages){}",
+            doctor_leaked_pages_remedy_suffix(false)
+        );
+        let fail_other = doctor_check_report("database", "fail", &other_message, false, false);
+        assert_eq!(
+            doctor_read_only_next_command(std::slice::from_ref(&fail_other)),
+            "cass doctor repair --dry-run --json"
+        );
     }
 
     #[test]
@@ -86574,6 +87549,54 @@ mod cli_read_db_tests {
         assert!(unpublished_wal_sidecar_bytes(temp.path().join("missing.db").as_path()).is_none());
     }
 
+    /// GH #503: the strict open's legacy-shadow refusal names the derived-shadow
+    /// repair; a refusal naming a canonical table does not.
+    #[test]
+    fn strict_open_error_message_is_truthful_about_the_503_legacy_shadow_catalog() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let legacy = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        )
+        .context("strictly opening dedicated-owner frankensqlite db readonly");
+        let message = state_db_strict_open_error_message(&db_path, "status", &legacy, false);
+        assert!(
+            message.contains("not the conversations or messages"),
+            "{message}"
+        );
+        if doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX {
+            assert!(
+                message.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
+                "{message}"
+            );
+        } else {
+            // GH #503: the pinned engine refuses this catalog even for the
+            // shadow repair, so the hint must not send users there.
+            assert!(!message.contains("rebuild-canonical-fts"), "{message}");
+            assert!(message.contains("GH #503"), "{message}");
+            assert!(
+                message.contains("do not run 'cass doctor --fix'"),
+                "{message}"
+            );
+        }
+
+        // Other shadow-catalog refusals keep the shadow repair.
+        let other_shadow = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master row for `fts_messages_data` is invalid"
+        );
+        let message = state_db_strict_open_error_message(&db_path, "status", &other_shadow, false);
+        assert!(
+            message.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
+            "{message}"
+        );
+
+        let canonical = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `conversations`"
+        );
+        let message = state_db_strict_open_error_message(&db_path, "status", &canonical, false);
+        assert!(!message.contains("rebuild-canonical-fts"), "{message}");
+    }
+
     #[test]
     fn strict_open_error_message_distinguishes_wal_recovery_from_plain_busy() {
         for wal_bytes in [None, Some(32), Some(4096)] {
@@ -87138,7 +88161,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -87291,7 +88314,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -87354,7 +88377,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -87419,7 +88442,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -87845,7 +88868,7 @@ mod cli_read_db_tests {
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "schema_hash": crate::search::tantivy::SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
@@ -89140,10 +90163,14 @@ fn doctor_canonical_candidate_replacement_authorized(
 /// replacement evidence. Timeouts, locks, permissions, and generic engine
 /// failures remain unknown and must never authorize canonical replacement.
 fn doctor_db_open_error_is_affirmative_integrity_failure(error: &CliError) -> bool {
-    if !error.kind.eq(CliErrorKind::DbOpen.kind_str()) {
-        return false;
-    }
-    let message = error.message.to_ascii_lowercase();
+    error.kind.eq(CliErrorKind::DbOpen.kind_str())
+        && doctor_open_error_message_is_affirmative_corruption(&error.message)
+}
+
+/// An open failure that proves the file is damaged, as opposed to busy,
+/// locked or unreadable for another reason.
+pub(crate) fn doctor_open_error_message_is_affirmative_corruption(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
     message.contains("file is too small to contain a sqlite header")
         || message.contains("file header is not sqlite format 3")
         || message.contains("not a database")
@@ -90017,11 +91044,18 @@ pub(crate) fn run_doctor_impl(
                                         }
                                         Some(attestation) => {
                                             storage_integrity_failed = true;
+                                            let leaked_pages_remedy =
+                                                doctor_leaked_pages_remedy_suffix(
+                                                    doctor_recover::attested_integrity_is_leaked_pages_only(
+                                                        &attestation.check_depth,
+                                                        attestation.detail.as_deref(),
+                                                    ),
+                                                );
                                             add_check!(
                                                 "database",
                                                 "fail",
                                                 format!(
-                                                    "Database opened and bounded row counts succeeded ({conv_count} conversations, {msg_count} messages), but a current fingerprint-matching cached {} attestation records structural failure; {reason}",
+                                                    "Database opened and bounded row counts succeeded ({conv_count} conversations, {msg_count} messages), but a current fingerprint-matching cached {} attestation records structural failure; {reason}{leaked_pages_remedy}",
                                                     attestation.check_depth
                                                 ),
                                                 true
@@ -90139,11 +91173,18 @@ pub(crate) fn run_doctor_impl(
                                             storage_attestation_check_depth = Some(failed_pragma);
                                             storage_attestation_detail =
                                                 Some(diagnostic_summary.clone());
+                                            let leaked_pages_remedy =
+                                                doctor_leaked_pages_remedy_suffix(
+                                                    doctor_recover::integrity_is_leaked_pages_only(
+                                                        &integrity.quick_check_status,
+                                                        &integrity.integrity_check_diagnostics,
+                                                    ),
+                                                );
                                             add_check!(
                                                 "database",
                                                 "fail",
                                                 format!(
-                                                    "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                                    "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages){leaked_pages_remedy}",
                                                     diagnostic_summary, conv_count, msg_count
                                                 ),
                                                 true
@@ -94184,9 +95225,9 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
         ),
         exit_code_capability(
             "4",
-            "network error",
-            "yes",
-            "Check connectivity or remote source configuration, then retry.",
+            "I/O failure or unsafe operation refused",
+            "maybe",
+            "Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23.",
         ),
         exit_code_capability(
             "5",
@@ -94196,9 +95237,9 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
         ),
         exit_code_capability(
             "6",
-            "incompatible version",
+            "required input missing",
             "no",
-            "Upgrade cass or the calling client before retrying.",
+            "Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun.",
         ),
         exit_code_capability(
             "7",
@@ -94208,9 +95249,9 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
         ),
         exit_code_capability(
             "8",
-            "partial result",
+            "partial result (sources sync only)",
             "yes",
-            "Increase timeout or page through remaining results.",
+            "Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead.",
         ),
         exit_code_capability(
             "9",
@@ -94277,6 +95318,18 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
             "I/O during model verify/install",
             "maybe",
             "Fix filesystem permissions or disk space, then retry.",
+        ),
+        exit_code_capability(
+            "70",
+            "index stalled and aborted",
+            "yes",
+            "Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start.",
+        ),
+        exit_code_capability(
+            "130",
+            "interrupted (SIGINT)",
+            "yes",
+            "Rerun the command; cass sources setup --resume continues an interrupted setup.",
         ),
     ]
 }
@@ -94468,6 +95521,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_SCHEDULE_MAX_BACKFILL_BATCHES",
             Some("200"),
             "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute.",
+        ),
+        env_var_capability(
+            "CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS",
+            Some("10800"),
+            "Longest severe machine load may keep skipping scheduled incremental runs, measured from the last incremental run that completed; past it the run goes ahead at scheduler priority. 0 = skip for load without limit.",
         ),
         env_var_capability(
             "CASS_INDEX_STALL_DETECT_SECS",
@@ -95372,7 +96430,8 @@ fn run_config_based_export(
     // be encrypted, bundled, or deployed. Non-interactive config exports are
     // fail-closed: callers may suppress reviewed false positives with the
     // existing allowlist inputs, but cannot silently approve live findings.
-    let export_engine = crate::pages::export::ExportEngine::new(db_path, &export_db_path, filter);
+    let export_engine = crate::pages::export::ExportEngine::new(db_path, &export_db_path, filter)
+        .with_share_profile(wizard_state.effective_share_profile());
 
     let running = Arc::new(AtomicBool::new(true));
     let secret_scan_config = crate::pages::secret_scan::SecretScanConfig::from_inputs(
@@ -99318,6 +100377,59 @@ fn response_schema_budget_block() -> serde_json::Value {
     ])
 }
 
+fn response_schema_search_effective() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "What the search (or the search behind a pack) actually ran: command, database and path source, resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, how the lexical engine groups the query, and, for search only, the daemon policy.",
+        "properties": {
+            "command": { "type": "string" },
+            "query": { "type": "string" },
+            "query_structure": {
+                "type": ["string", "null"],
+                "description": "Operand grouping the lexical engine applies, every compound group parenthesized (e.g. `a OR (b AND c)`); null for a query without operands."
+            },
+            "query_recoveries": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Parentheses recovered instead of rejected (an unclosed `(` closes at the end of the query; an empty `()` is skipped)."
+            },
+            "db_path": { "type": "string" },
+            "db_path_source": {
+                "type": "string",
+                "enum": ["--db", "env:CASS_DB_PATH", "--data-dir", "env:CASS_DATA_DIR", "env:XDG_DATA_HOME", "default"]
+            },
+            "time_window": {
+                "type": "object",
+                "properties": {
+                    "since_ms": { "type": ["integer", "null"] },
+                    "since_from": { "type": ["string", "null"] },
+                    "until_ms": { "type": ["integer", "null"] },
+                    "until_from": { "type": ["string", "null"] }
+                }
+            },
+            "filters": {
+                "type": "object",
+                "properties": {
+                    "agents": { "type": "array", "items": { "type": "string" } },
+                    "workspaces": { "type": "array", "items": { "type": "string" } },
+                    "source": { "type": "string" },
+                    "sessions_from_paths": { "type": ["integer", "null"] }
+                }
+            },
+            "daemon": {
+                "type": "object",
+                "description": "Warm-model daemon policy: robot searches use an already-running daemon unless --no-daemon, and never spawn one even with --daemon.",
+                "properties": {
+                    "use_existing": { "type": "boolean" },
+                    "auto_spawn_requested": { "type": "boolean" },
+                    "auto_spawn": { "type": "boolean" }
+                }
+            },
+            "auto_corrections": { "type": "array", "items": { "type": "string" } }
+        }
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -99361,10 +100473,25 @@ fn response_schema_search_meta() -> serde_json::Value {
             "wildcard_fallback",
             serde_json::json!({ "type": "boolean" }),
         ),
+        // 2l1b0.68: why a sparse lexical result did not get the automatic
+        // wildcard retry, which used to turn off without a trace.
+        (
+            "wildcard_fallback_skipped",
+            serde_json::json!({
+                "type": ["string", "null"],
+                "enum": [
+                    "index_over_automatic_limit",
+                    "automatic_retry_disabled",
+                    "long_query_term",
+                    null
+                ],
+            }),
+        ),
         ("cache_stats", response_schema_search_cache_stats()),
         ("query_plan", response_schema_query_plan()),
         ("cursor_manifest", response_schema_cursor_manifest()),
         ("explanation_cards", response_schema_explanation_cards()),
+        ("effective", response_schema_search_effective()),
         ("timing", response_schema_search_timing()),
         (
             "tokens_estimated",
@@ -99462,6 +100589,13 @@ fn response_schema_search() -> serde_json::Value {
         ("_meta", response_schema_search_meta()),
         ("suggestions", response_schema_opaque_object_array()),
         (
+            "zero_result_diagnosis",
+            serde_json::json!({
+                "type": ["object", "null"],
+                "additionalProperties": true
+            }),
+        ),
+        (
             "explanation",
             serde_json::json!({
                 "type": ["object", "null"],
@@ -99506,7 +100640,8 @@ fn response_schema_pack() -> serde_json::Value {
                     "elapsed_ms": { "type": "integer" },
                     "partial": { "type": "boolean" },
                     "format": { "type": "string" },
-                    "warnings": { "type": "array", "items": { "type": "string" } }
+                    "warnings": { "type": "array", "items": { "type": "string" } },
+                    "effective": response_schema_search_effective()
                 }
             }),
         ),
@@ -100382,6 +101517,16 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 // source file is gone/stale and content came from the archive.
                 "source_exists": { "type": "boolean" },
                 "archive_only": { "type": "boolean" },
+                // #493 (5173f7db, aa5d5068): every view names the coordinate
+                // system it was addressed in and where its text came from.
+                // `--line` reads the physical file; `--message-index` reads
+                // the canonical archive message ordinal.
+                "coordinate_space": { "type": "string", "enum": ["file_line", "message_index"] },
+                "content_source": { "type": "string", "enum": ["file", "archive"] },
+                "source_id": { "type": "string" },
+                "conversation_id": { "type": "integer" },
+                "target_message_index": { "type": "integer" },
+                "total_messages": { "type": "integer" },
                 "budget": response_schema_budget_block(),
                 "lines": {
                     "type": "array",
@@ -100390,7 +101535,16 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                         "properties": {
                             "line": { "type": "integer" },
                             "number": { "type": "integer" },
+                            "file_line": { "type": "integer" },
+                            "message_index": { "type": "integer" },
+                            "coordinate_space": { "type": "string", "enum": ["file_line", "message_index"] },
+                            "content_source": { "type": "string", "enum": ["file", "archive"] },
+                            "message_id": { "type": ["integer", "null"] },
+                            "conversation_id": { "type": "integer" },
+                            "source_id": { "type": "string" },
+                            "role": { "type": "string" },
                             "content": { "type": "string" },
+                            "is_target": { "type": "boolean" },
                             "highlighted": { "type": "boolean" }
                         }
                     }
@@ -102318,7 +103472,10 @@ mod response_schema_tests {
             .find(|note| note.contains(".rebuild-staging"))
             .expect("rebuild-staging note (GH #496)");
         assert!(staging_note.contains("32000000000 bytes"), "{staging_note}");
-        assert!(staging_note.contains("not doubled"), "{staging_note}");
+        assert!(
+            staging_note.contains("subtracted from the requirement"),
+            "{staging_note}"
+        );
         assert!(
             blocked
                 .notes
@@ -107772,22 +108929,32 @@ fn same_directory(a: &Path, b: &Path) -> bool {
 }
 
 pub fn default_data_dir() -> PathBuf {
+    default_data_dir_with_source().0
+}
+
+/// The default data dir and what chose it: `env:CASS_DATA_DIR`,
+/// `env:XDG_DATA_HOME`, or `default` (the platform data dir).
+pub(crate) fn default_data_dir_with_source() -> (PathBuf, &'static str) {
     if let Ok(dir) = dotenvy::var("CASS_DATA_DIR") {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+            return (PathBuf::from(trimmed), "env:CASS_DATA_DIR");
         }
     }
     if let Ok(dir) = dotenvy::var("XDG_DATA_HOME") {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("coding-agent-search");
+            return (
+                PathBuf::from(trimmed).join("coding-agent-search"),
+                "env:XDG_DATA_HOME",
+            );
         }
     }
-    directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
+    let dir = directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
         .map(|p| p.data_dir().to_path_buf())
         .or_else(|| dirs::home_dir().map(|h| h.join(".coding-agent-search")))
-        .unwrap_or_else(|| PathBuf::from("./data"))
+        .unwrap_or_else(|| PathBuf::from("./data"));
+    (dir, "default")
 }
 
 #[cfg(test)]
@@ -107948,43 +109115,60 @@ fn count_indexed_session_paths(
     complete.then_some(matched)
 }
 
-async fn maybe_prompt_for_update(once: bool) -> Result<()> {
-    if once
-        || dotenvy::var("CI").is_ok()
-        || dotenvy::var("TUI_HEADLESS").is_ok()
-        || dotenvy::var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT").is_ok()
-        || !io::stdin().is_terminal()
-    {
-        return Ok(());
+/// Workspace paths the archive knows about, through the strict read-only
+/// opener. `None` when the database cannot be read quickly.
+fn indexed_workspace_paths(db_path: &Path) -> Option<Vec<String>> {
+    use crate::franken_sync::compat::RowExt;
+    if !db_path.is_file() {
+        return None;
     }
+    let mut conn =
+        crate::storage::sqlite::open_franken_owner_strict_readonly_connection_with_timeout(
+            db_path,
+            Duration::from_secs(2),
+        )
+        .ok()?;
+    let paths = conn
+        .query_map_collect(
+            "SELECT path FROM workspaces",
+            &[] as &[crate::franken_sync::compat::ParamValue],
+            |row| row.get_typed::<String>(0),
+        )
+        .ok();
+    let _ = conn.close_without_checkpoint_sync();
+    paths
+}
 
-    let Some(update_info) = crate::update_check::check_for_updates(env!("CARGO_PKG_VERSION")).await
-    else {
-        return Ok(());
+/// uojcg.7.1: a search filtered to one `--workspace` that comes back empty
+/// reads exactly like "nothing matches", so an agent drops a query that a
+/// moved checkout, a `/Users` vs `/home` path, a trailing slash or a case
+/// difference emptied. Check the filter against the indexed workspaces and
+/// probe once without it (lexical, one hit), then say which case this is.
+/// `None` when either probe cannot run; a probe that misses reports a genuine
+/// no-match, never a suggestion.
+fn diagnose_empty_workspace_search(
+    client: &crate::search::query::SearchClient,
+    query: &str,
+    filters: &crate::search::query::SearchFilters,
+    field_mask: crate::search::query::FieldMask,
+    db_path: &Path,
+) -> Option<crate::search::zero_result_diagnosis::ZeroResultReport> {
+    let mut requested = filters.workspaces.iter();
+    let (Some(requested), None) = (requested.next(), requested.next()) else {
+        return None;
     };
-
-    if !update_info.should_show() {
-        return Ok(());
-    }
-
-    println!(
-        "A newer version is available: current v{}, latest {}. Update now? (y/N): ",
-        env!("CARGO_PKG_VERSION"),
-        update_info.tag_name
-    );
-    print!("> ");
-    io::stdout().flush().ok();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return Ok(());
-    }
-    if !matches!(input.trim(), "y" | "Y") {
-        return Ok(());
-    }
-
-    info!(target: "update", "starting self-update to {}", update_info.tag_name);
-    crate::update_check::run_self_update(&update_info.tag_name);
+    let known = indexed_workspace_paths(db_path)?;
+    let mut unfiltered = filters.clone();
+    unfiltered.workspaces.clear();
+    let global_had_hits = !client
+        .search(query, unfiltered, 1, 0, field_mask)
+        .ok()?
+        .is_empty();
+    Some(crate::search::zero_result_diagnosis::diagnose_zero_result(
+        requested,
+        &known,
+        global_had_hits,
+    ))
 }
 
 // ============================================================================
@@ -110448,6 +111632,17 @@ fn run_export_html(
 
     let mut final_filename = if let Some(name) = filename {
         name.to_string()
+    } else if encrypt {
+        // An encrypted export is meant to be shared; its default name must not
+        // carry the workspace or the opening prompt that the ciphertext hides
+        // (2l1b0.67). An explicit --filename is honored as given.
+        generate_full_filename(
+            agent_name.as_deref().unwrap_or("cass"),
+            None,
+            session_start,
+            None,
+            None,
+        )
     } else {
         generate_full_filename(
             agent_name.as_deref().unwrap_or("cass"),
@@ -116794,7 +117989,7 @@ fn run_sources_artifact_manifest(
     let manifest_path = if write {
         let path = manifest.save(&index_path).map_err(|e| CliError {
             code: 14,
-            kind: CliErrorKind::IoError.kind_str(),
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to write lexical artifact evidence manifest: {e:#}"),
             hint: Some("Check that the index directory is writable.".to_string()),
             retryable: true,
@@ -121369,7 +122564,7 @@ fn run_models_build_hnsw(
         })?
         .ok_or_else(|| CliError {
             code: 3,
-            kind: CliErrorKind::IndexMissing.kind_str(),
+            kind: CliErrorKind::MissingIndex.kind_str(),
             message: format!(
                 "no semantic manifest under {}; nothing is published to accelerate",
                 data_dir.display()
@@ -121396,7 +122591,7 @@ fn run_models_build_hnsw(
     .filter(|record| record.ready)
     .ok_or_else(|| CliError {
         code: 3,
-        kind: CliErrorKind::IndexMissing.kind_str(),
+        kind: CliErrorKind::MissingIndex.kind_str(),
         message: format!(
             "no published {} semantic artifact in the manifest",
             tier.as_str()
@@ -121846,7 +123041,7 @@ fn run_models_backfill_batch(
     if !db_path.is_file() {
         return Err(CliError {
             code: 3,
-            kind: CliErrorKind::IndexMissing.kind_str(),
+            kind: CliErrorKind::MissingIndex.kind_str(),
             message: format!("cass database not found: {}", db_path.display()),
             hint: Some("Run 'cass index --full' before semantic backfill".into()),
             retryable: true,

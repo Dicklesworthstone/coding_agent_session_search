@@ -184,7 +184,7 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     fs::write(
         index_path.join(".lexical-rebuild-state.json"),
         serde_json::to_vec_pretty(&json!({
-            "version": 2,
+            "version": 3,
             "schema_hash": SCHEMA_HASH,
             "db": {
                 "db_path": db_path.display().to_string(),

@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Oh My Pi, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Muse Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Prime Agent, Oh My Pi, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Muse Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, and Kiro CLI into a single, searchable timeline.
 
 <div align="center">
 
@@ -110,7 +110,7 @@ a long JSONL record in an agent prompt.
 **Lexical publish durability (atomic-swap)**
 - Every lexical publish is an atomic renameat2(RENAME_EXCHANGE) on Linux, or a parked-rename + restore-on-failure dance elsewhere. Readers never see a half-torn index — they see either the old or the new generation, never a mix. See `src/indexer/mod.rs::publish_staged_lexical_index`.
 - The prior-live generation is retained under `<data_dir>/index/.lexical-publish-backups/<dated>/` for a bounded retention window. Default cap is `1` (keep just the most-recent prior generation for one-step rollback); override via the `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION` env var (`0` disables retention entirely, higher N keeps deeper history). Pruning runs after every successful publish and emits structured `tracing::info!` events with `freed_bytes` + `retention_limit` for observability.
-- Crash recovery is automatic: a crash between the atomic swap and the retain-rename is handled by `recover_or_finalize_interrupted_lexical_publish_backup` on the next startup, which moves any orphaned canonical sidecar (`.<name>.publish-in-progress.bak`) into `.lexical-publish-backups/` before the next publish lands.
+- Crash recovery is automatic: a crash between the atomic swap and the retain-rename is handled by `recover_or_finalize_interrupted_lexical_publish_backup` at the start of the next lexical publish or rebuild (not at process startup), which moves any orphaned canonical sidecar (`.<name>.publish-in-progress.bak`) into `.lexical-publish-backups/` before the next publish lands.
 
 **Quarantine, GC, and the doctor/diag surface**
 - Corrupt or failed-validation assets are quarantined rather than auto-deleted. `cass diag --json --quarantine` enumerates every quarantined artifact (failed seed bundles, retained publish backups, quarantined lexical generations) with `size_bytes`, `age_seconds`, `safe_to_gc`, and a human-readable `gc_reason`. The `safe_to_gc` flag is **advisory** — it reflects retention policy + cleanup dry-run eligibility and is not wired to any automatic deletion path.
@@ -119,7 +119,7 @@ a long JSONL record in an agent prompt.
 - A derived (SQLite fallback) FTS repair that fails **identically on 5 consecutive `cass index` runs** escalates from a warning to a non-zero exit ([#434](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/434)): the counter persists in `<data_dir>/index/.fts-repair-failure-streak.json`, watch daemons log the escalation instead of exiting, and any run whose repair succeeds — or fails differently — resets it. Canonical rows and the Tantivy index are unaffected; run `cass doctor --rebuild-canonical-fts --yes --json` for the explicit repair.
 
 **Schema stability guarantees**
-- The JSON contract surfaces (`triage`, `capabilities`, `selftest`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`, `swarm status`, `swarm work-packet`, `swarm lint`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
+- JSON contract surfaces are pinned by golden-file regression tests under `tests/golden/robot/`: `capabilities`, `selftest`, `health`, `status`, `diag`, `models status`/`verify`/`check-update`, `introspect`, `doctor`, `api-version`, `stats`, `search`, `export-html`, `onboarding`, the `quarantine` and `dedup` commands and `analytics incidents`, plus `sessions` and `pack` on their missing-database and error paths only. `swarm status` scenarios are pinned under `tests/golden/swarm_status/`. `triage`, `swarm work-packet` and `swarm lint` have no golden files; their shape is covered only by assertion tests. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
 - `cass introspect --json`'s `response_schemas` block enumerates every schema in a stable alphabetical order (`BTreeMap`-backed — see bead coding_agent_session_search-8sl73).
 - Error envelopes (`{error: {code, kind, message, hint, retryable}}`) have a fixed shape. `kind` values are kebab-case; branch on `err.kind`, not on the numeric code, for codes ≥ 10 (see the Error Handling section below).
 
@@ -229,7 +229,7 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 
 ### ⚡ Instant Search (Sub-60ms Latency)
 - **"Search-as-you-type"**: Results update instantly with every keystroke.
-- **Edge N-Gram Indexing**: We frontload the work by pre-computing prefix matches (e.g., "cal" -> "calculate") during indexing, trading disk space for O(1) lookup speed at query time.
+- **Edge N-Gram Indexing**: We frontload the work by pre-computing prefix matches (e.g., "cal" -> "calculate") during indexing: 2–20 character prefixes of every word in titles and in the first 4 KiB of each message, trading disk space for fast lookup at query time.
 - **Smart Tokenization**: Handles `snake_case` ("my_var" matches "my" and "var"), hyphenated terms, and code symbols (`c++`, `foo.bar`) correctly.
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 - **One-shot CLI overhead**: the sub-60ms figure is the engine query. A one-shot `cass search --robot` currently spends roughly a second in archive open and integrity preflight on a ~10 GB archive; `--robot-meta` reports that separately as `_meta.timing.other_ms`, while `search_ms` stays in the tens of milliseconds.
@@ -240,7 +240,11 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
   already-running local embedding daemon (including a socket selected with
   `CASS_DAEMON_SOCKET`) and only initialize the installed in-process model if
   daemon inference fails. Pass `--daemon` to permit auto-spawning a missing
-  daemon, or `--no-daemon` to force direct inference. `--fast-only` stays in
+  daemon in human-mode searches (robot/JSON searches never spawn one, even
+  with `--daemon`, because their bounded budget cannot wait for a daemon to
+  start; start `cass daemon` yourself first; `_meta.effective.daemon` shows
+  the request and what applied), or `--no-daemon` to force
+  direct inference. `--fast-only` stays in
   the deterministic hash-vector space. Each data directory gets a distinct
   default socket and owner-private pinned key; fresh handshake, health,
   embedding, batch, and rerank challenges authenticate the exact response and
@@ -331,10 +335,10 @@ cass search "auth error handling" --mode hybrid --robot
   - `foo*` - Prefix match (finds "foobar", "foo123")
   - `*foo` - Suffix match (finds "barfoo", "configfoo")
   - `*foo*` - Substring match (finds "afoob", "configuration")
-- **Auto-Fuzzy Fallback**: When exact searches return sparse results, automatically retries with `*term*` wildcards to broaden matches. Visual indicator shows when fallback is active.
+- **Auto-Fuzzy Fallback**: On small indexes (up to 10,000 documents by default), an exact search with sparse results is retried with `*term*` wildcards to broaden matches. A visual indicator shows when the fallback is active.
 - **Query History Deduplication**: Recent searches deduplicated to show unique queries; navigate with `Up`/`Down` arrows.
 - **Match Quality Ranking**: New ranking mode (cycle with `F12`) that prioritizes exact matches over wildcard/fuzzy results.
-- **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms in snippets with `**bold**` markers (text and JSON output alike; search has no HTML output).
+- **Match Highlighting**: Snippets mark the terms the engine matched with `**bold**`, in human-readable and robot/JSON output alike; `--highlight` also marks the query terms' other occurrences, never marking a term twice.
 
 ### 🖥️ Rich Terminal UI (TUI)
 
@@ -342,13 +346,13 @@ Powered by [FrankenTUI (ftui)](https://github.com/Dicklesworthstone/frankentui) 
 
 - **Three-Pane Layout**: Filter bar (top), scrollable results (left), and syntax-highlighted details (right).
 - **Multi-Line Result Display**: Each result shows location and up to 3 lines of context; alternating stripes improve scanability.
-- **Live Status**: Footer shows real-time indexing progress—agent discovery count during scanning, then item progress with sparkline visualization (e.g., `📦 Indexing 150/2000 (7%) ▁▂▄▆█`)—plus active filters.
+- **Live Status**: Footer shows real-time indexing progress—agent discovery count during scanning, then item progress as a progress bar labelled `Indexing 150/2000 (7%)`—plus active filters.
 - **Multi-Open Queue**: Queue multiple results with `Ctrl+Enter`, then open all in your editor with `Ctrl+O`. Confirmation prompt for large batches (≥12 items).
 - **Find-in-Detail**: Press `/` to search within the detail pane; matches highlighted with `n`/`N` navigation.
 - **Mouse Support**: Click to select results, scroll panes, or clear filters.
 - **Theming**: Adaptive Dark/Light modes with role-colored messages (User/Assistant/System). Presets include dark, light, high-contrast, and accessible variants.
 - **Ranking Modes**: Cycle through `recent`/`balanced`/`relevance`/`quality` with `F12`; quality mode penalizes fuzzy matches.
-- **Analytics Dashboard**: 7 views (Dashboard, Explorer, Heatmap, Breakdowns, Tools, Plans, Coverage) with interactive charts, KPI tiles, and drill-down filtering. Toggle with `Alt+A`.
+- **Analytics Dashboard**: 7 views (Dashboard, Explorer, Heatmap, Breakdowns, Tools, Plans, Coverage) with interactive charts, KPI tiles, and drill-down filtering. Open with `Alt+A`; `Esc` returns to search.
 - **Inline Mode**: Run `cass tui --inline` to keep terminal scrollback intact. The UI anchors to a region of the terminal while logs scroll normally. Configure with `--ui-height <rows>` and `--anchor top|bottom`.
 - **Macro Recording**: Capture input sessions with `cass tui --record-macro session.macro` for reproducible bug reports and workflow automation. Events are saved as human-readable JSONL with full timing data.
 - **Asciicast Recording**: Capture reproducible TUI demos and bug repro artifacts with `cass tui --asciicast demo.cast`.
@@ -420,6 +424,7 @@ Ingests history from 32 local agent connectors, normalizing them into a unified 
 - **OpenHands (OpenDevin)**: `~/.openhands/conversations/<id>/` — `base_state.json` metadata plus an `events/event-NNNNN-<uuid>.json` event stream (JSON)
 - **Grok Build (xAI `grok`)**: `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/` — `updates.jsonl` (authoritative ACP session-update stream) with `summary.json` metadata and `chat_history.jsonl` fallback (override the base dir with `GROK_HOME`). Resume with `grok --resume <session-id>`.
 - **Codebuff / Freebuff (`codebuff`)**: `~/.config/manicode/projects/<project>/chats/<chat-id>/chat-messages.json` with its `run-state.json` (override with `CASS_CODEBUFF_DATA_ROOT`). Both products write the same Manicode store and no chat records which binary wrote it, so their sessions share one lineage identity, `codebuff` (filter with `--agent codebuff`). Messages are reconciled by their native IDs, so an edited message updates in place instead of duplicating.
+- **Kiro CLI (`kiro`)**: `~/.kiro/sessions/cli/<session-uuid>.jsonl` (append-only event log: prompts, assistant messages, tool results) with the matching `<session-uuid>.json` snapshot read for session ID, working directory, title, timestamps and model.
 
 Claude Code Desktop sidecars preserve title, workspace, model, and session IDs,
 but not necessarily the full conversation body. If Claude Code has culled an old
@@ -470,7 +475,7 @@ cass sources setup
 4. **Installs cass** on remotes that don't have it (optional)
 5. **Indexes** existing sessions on remotes (optional)
 6. **Configures** `sources.toml` with correct paths and mappings
-7. **Prints the sync command** (`cass sources sync`) for you to run; the wizard does not run the sync itself
+7. **Syncs** the configured remotes by running `cass sources sync` right after configuration (skipped with `--skip-sync` or `--dry-run`; `--json` setup defers it and reports the command to run)
 
 **Wizard options:**
 
@@ -563,7 +568,7 @@ raw receipts or inventories to public issues: they contain machine identities.
 
 #### Remote Installation Methods
 
-When the wizard installs `cass` on remote machines, it chooses one method in this priority order and reports a failure rather than falling through to the next:
+When the wizard installs `cass` on remote machines, it tries every viable method in this priority order, falling through to the next when one fails; setup fails only when all of them do, and the error lists each attempt:
 
 | Priority | Method | Speed | Requirements |
 |----------|--------|-------|--------------|
@@ -617,7 +622,7 @@ The setup wizard automatically discovers SSH hosts from your configuration:
 | **Session Count** | How many conversations exist? |
 | **System Info** | OS, architecture, disk space, memory |
 
-**Probe Caching**: Results are cached for 5 minutes to speed up repeated setup attempts. Cache clears automatically on expiry.
+Each setup run probes every selected host afresh; probe results are not cached between runs.
 
 #### Manual Setup
 
@@ -733,7 +738,7 @@ agents = ["claude_code"]
 | `type` | Connection type: `ssh` or `local` |
 | `host` | SSH host (`user@hostname`) |
 | `paths` | Paths to sync (supports `~` expansion) |
-| `sync_schedule` | `manual`, `hourly`, or `daily` |
+| `sync_schedule` | `manual`, `hourly`, or `daily`. Only the jobs installed by `cass schedule install` run it; without them it is a label and syncs happen when you run `cass sources sync` |
 | `path_mappings` | Rewrite remote paths to local equivalents |
 
 #### CLI Commands
@@ -782,44 +787,46 @@ cass sources agents exclude openclaw --keep-indexed-data
 
 #### Sync Engine Internals
 
-The sync engine uses rsync over SSH for efficient delta transfers, with automatic SFTP fallback:
+The sync engine uses rsync over SSH for efficient delta transfers and falls back to other transports when rsync is unavailable:
 
 **Transfer Methods** (auto-detected):
 | Method | When Used | Characteristics |
 |--------|-----------|-----------------|
 | **rsync** | rsync available on both ends | Delta transfers, compression, progress stats |
-| **SFTP** | rsync unavailable | Full file transfers via SSH native protocol |
+| **WSL rsync** | Windows without native rsync, WSL with rsync installed | Runs `wsl rsync` |
+| **scp** | rsync unavailable | Full file copies through the system `scp`, inheriting the OpenSSH agent, keys and `~/.ssh/config` |
+| **SFTP** | the fallbacks above unavailable | Full file transfers via the SSH native protocol |
 
 **Safety Guarantees**:
-- **Additive-only syncs**: rsync runs WITHOUT `--delete` flag—remote deletions never propagate locally
-- **No overwrite risk**: Existing local files are only updated if remote is newer
-- **Atomic operations**: Failed transfers don't leave partial files
+- **Additive-only syncs**: rsync runs WITHOUT `--delete`, so remote deletions never propagate locally.
+- **Local copies follow the remote**: rsync runs with `-a` and without `-u`, so a local mirror file that differs from the remote is overwritten, even when the local copy is newer. The mirror is a copy of the remote, not a place to edit sessions.
+- **Interrupted transfers resume**: `--partial` keeps a partly transferred file under its final name so the next sync continues it. A failed sync can therefore leave a truncated file until the next sync completes.
 
 **Transfer Configuration**:
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | Connection timeout | 10s | Fail fast on unreachable hosts |
-| Transfer timeout | 5 min | Allow large initial syncs |
+| Transfer timeout | 300 s of I/O inactivity | rsync `--timeout` aborts a transfer that stalls this long; there is no wall-clock limit on a transfer that keeps moving |
 | Compression | Enabled | Reduce bandwidth for text-heavy sessions |
 | Partial transfers | Enabled | Resume interrupted syncs |
 
 **rsync Flags Used**:
 ```
 -avz --links --safe-links --stats --partial [--protect-args | --secluded-args] --timeout 300 \
-  -e "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+  -e "ssh [-F $CASS_SSH_CONFIG] -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes"
 ```
-Where `-avz` = archive mode + verbose + compression. `--protect-args`/`--secluded-args` is auto-detected per remote rsync version (omitted when the remote rejects it), and `--timeout` carries the transfer timeout in seconds.
+Where `-avz` = archive mode + verbose + compression. `--protect-args`/`--secluded-args` is auto-detected per remote rsync version (omitted when the remote rejects it), and `--timeout` carries the transfer timeout in seconds. `StrictHostKeyChecking=yes` means a host whose key is not already in `known_hosts` fails with "Host key verification failed". Connect once with plain `ssh <host>` and accept the key, or add it with `ssh-keyscan`, before the first sync.
 
 **Data Flow**:
 ```
 Remote: ~/.claude/projects/
     ↓ (rsync over SSH)
-Local: ~/.local/share/coding-agent-search/remotes/<source>/<path>/
+Local: ~/.local/share/coding-agent-search/remotes/<source>/mirror/<path>_<hash>/
     ↓ (connector scan)
 Index: agent_search.db + index/v9-quill/
 ```
 
-Where `<path>` is a filesystem-safe version of the remote path (e.g., `.claude_projects`).
+Where `<path>` is a filesystem-safe version of the remote path (e.g. `.claude_projects`), and `<hash>` is an FNV-1a hash of the original path in hex, so `foo/bar` and `foo_bar` never collide.
 
 Sessions from remotes are indexed alongside local sessions, with provenance tracking to identify origin.
 
@@ -857,8 +864,11 @@ Remote sessions display with a source indicator (e.g., `[laptop]`) in the result
 
 Each conversation tracks its origin:
 - `source_id`: Machine identifier (e.g., "laptop", "workstation")
-- `source_kind`: `local` or `remote`
+- `origin_kind`: `local` or `remote`
+- `origin_host`: the remote host label, absent for local sessions
 - `workspace_original`: Original path on the remote machine (before path mapping)
+
+`--fields provenance` selects exactly `source_id`, `origin_kind` and `origin_host`.
 
 These fields appear in JSON/robot output and enable filtering:
 ```bash
@@ -934,9 +944,9 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass auth error --json` | `cass search "auth error" --json` | Unquoted robot-mode query words folded into search |
 | `cass search --agent codex --limit 5 auth error --json` | `cass search "auth error" --agent codex --limit 5 --json` | Query moved before leading search filters |
 | `cass view --path session.jsonl --line 42 --json` | `cass view session.jsonl --line 42 --json` | Named path option converted to required positional path |
-| `cass view session.jsonl --line-number 42 --json` | `cass view session.jsonl --line 42 --json` | Search result field name accepted as a line alias |
-| `cass view session.jsonl line_number=42 --json` | `cass view session.jsonl --line 42 --json` | Search result field assignment accepted as a line option |
-| `cass view source_path=session.jsonl source_id=local line_number=42 --json` | `cass view session.jsonl --source local --line 42 --json` | Search hit field bundle accepted as a follow-up command |
+| `cass view session.jsonl --line-number 42 --json` | `cass view session.jsonl --line 42 --json` | Legacy alias for `--line`; still reads raw file line 42 |
+| `cass view session.jsonl line_number=42 --json` | `cass view session.jsonl --message-index 42 --json` | A pasted search-hit field selects canonical message 42, not raw line 42 |
+| `cass view source_path=session.jsonl source_id=local line_number=42 --json` | `cass view session.jsonl --source local --message-index 42 --json` | Search hit field bundle accepted as a follow-up command (add `conversation_id` when the file holds several conversations) |
 | `cass search "auth" --format json` | `cass search "auth" --robot-format json` | Familiar format spelling converted to robot format |
 | `cass search "auth" --output json` | `cass search "auth" --robot-format json` | Familiar output spelling converted to robot format |
 | `cass help search --json` | `cass robot-docs commands` | Structured help intent routed to the machine-readable command reference |
@@ -951,11 +961,11 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass search --limt 5` | `cass search --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
-1. **Flag typo correction**: Long flag names within Levenshtein distance 2 are auto-corrected (e.g. `--limt` → `--limit`). *Subcommand typos are NOT fuzzy-corrected* — use one of the documented aliases instead (see layer 5 below). A typo that isn't a known alias will produce a clap usage error with the canonical form in the hint.
+1. **Typo correction**: when parsing fails, long flag names within Levenshtein distance 2 of a known flag are corrected (e.g. `--limt` → `--limit`), and a first word within distance 2 of a subcommand is corrected to it (e.g. `serach` → `search`). A word that already names a subcommand is never changed, so `cass status --jsn` runs `status --json`. `forget` and `upgrade` are reached only by exact spelling.
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
-5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
+5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `session` → `sessions`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`rootcause`/`summarize`/`summarise` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `diagnose`/`debug`/`check` → `diag`; `caps`/`cap` → `capabilities`; `inspect`/`intro` → `introspect`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
 6. **Robot-docs topic shorthands**: non-command topics such as `commands`, `schemas`, `examples`, `exit-codes`, and `quickstart` become `robot-docs <topic>` instead of falling through to search; command topics such as `doctor` and `sources` use structured help (`cass help doctor --json`, `cass sources --help --json`). Bare `cass guide` is reserved for the guided-operations planner; use `cass robot-docs guide` for the robot-docs walkthrough.
 7. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
 8. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
@@ -968,14 +978,14 @@ The CLI applies multiple normalization layers:
 15. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
 16. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
 17. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
-18. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
-19. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
+18. **Drill-down line aliases**: `--line-number`, `--line_number` and `line=42` become `--line` (a raw file line)
+19. **Search-hit fields**: `line_number=42` pasted from a search hit becomes `--message-index 42` (the canonical message ordinal the hit names), and a `source_path=... source_id=... line_number=...` bundle becomes the canonical path, `--source` and `--message-index` form for follow-up `view`/`expand` commands
 20. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
 21. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
 22. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
 23. **Global flag hoisting**: Position-independent flag handling
 
-When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax. In robot/JSON mode the same information is emitted as one `note: auto-corrected: <note>` line per correction on stderr, so stdout stays data-only.
+When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax. In robot/JSON mode the same information is emitted as one `note: auto-corrected: <note>` line per correction on stderr (at most two: the normalization note and the typo-recovery note), so stdout stays data-only. Robot-mode notes are printed only when the command succeeds; a failing command's stderr is its single JSON error envelope. The same notes appear in search output under `_meta.effective.auto_corrections` with `--robot-meta`.
 
 ### Structured Output Formats
 
@@ -986,7 +996,9 @@ Every command supports machine-readable output:
 cass search "error" --robot
 
 # Streaming JSONL: one hit per line. Add --robot-meta to prepend a
-# _meta header line (elapsed_ms, next_cursor, state, index_freshness).
+# {budget, _meta} header line (elapsed_ms, next_cursor, state, index_freshness).
+# The header also appears without --robot-meta when the search timed out
+# (budget.timed_out), returned did-you-mean suggestions, --aggregate or --explain.
 cass search "error" --robot-format jsonl               # hits only
 cass search "error" --robot-format jsonl --robot-meta  # 1 _meta header + hits
 
@@ -998,6 +1010,19 @@ cass search "error" --robot --robot-meta
 # → { "hits": [...], "_meta": { "elapsed_ms": 12, "cache_hit": true, "wildcard_fallback": false, "lexical_degrade_reason": null, ... } }
 #   lexical_degrade_reason is "query_fuel_exhausted" when a hybrid search dropped its
 #   lexical leg because Quill's query fuel ran out (see CASS_QUILL_QUERY_FUEL_BUDGET)
+
+# What the search actually ran (--robot-meta): check this instead of trusting the flags
+cass search "error" --robot --robot-meta --days 7 | jq '._meta.effective'
+# → { "command": "search", "query": "error",
+#     "query_structure": "error",           // how the engine groups operands: `a OR b c` -> "a OR (b AND c)"
+#     "query_recoveries": [],               // e.g. "1 unclosed '(' closed at the end of the query"
+#     "db_path": "/home/you/.local/share/coding-agent-search/agent_search.db",
+#     "db_path_source": "default",          // --db | env:CASS_DB_PATH | --data-dir | env:CASS_DATA_DIR | env:XDG_DATA_HOME | default
+#     "time_window": { "since_ms": 1758067200000, "since_from": "--days 7", "until_ms": null, "until_from": null },
+#     "filters": { "agents": [], "workspaces": [], "source": "all", "sessions_from_paths": null },
+#     "auto_corrections": [] }              // each argv correction, worded like its stderr note
+#   `cass pack "error" --json` carries the same object for the search it ran in
+#   its own `_meta.effective` ("command": "pack", and no search-only "daemon").
 
 # Per-hit trust verdict (advisory; --robot-meta only)
 cass search "error" --robot --robot-meta
@@ -1150,8 +1175,8 @@ LLMs have context limits. `cass` provides multiple levers to control output size
 
 | Flag | Effect |
 |------|--------|
-| `--fields minimal` | Only `source_path`, `line_number`, `agent` |
-| `--fields summary` | Adds `title`, `score` |
+| `--fields minimal` | Only `source_path`, `line_number`, `agent`, `source_id`, `conversation_id` |
+| `--fields summary` | `minimal` plus `title`, `score` |
 | `--fields score,title,snippet` | Custom field selection |
 | `--max-content-length 500` | Truncate long fields (UTF-8 safe, adds "...") |
 | `--max-tokens 2000` | Soft budget (~4 chars/token); adjusts truncation dynamically |
@@ -1191,7 +1216,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 }
 ```
 
-**Kind names** are kebab-case (e.g. `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`). Agents that branch on `err.kind` should treat them as stable identifiers. The full set (~50 kinds as of 0.3.x) is defined in `src/lib.rs`; the canonical way to discover a kind programmatically is to trigger the condition and inspect `err.kind` from the JSON envelope.
+**Kind names** are kebab-case (e.g. `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`). Agents that branch on `err.kind` should treat them as stable identifiers. The full set (about 90 kinds) is defined in `src/model/cli_error_kind.rs`; the canonical way to discover a kind programmatically is to trigger the condition and inspect `err.kind` from the JSON envelope.
 
 **Exit codes** follow a semantic convention:
 | Code | Meaning | Typical action |
@@ -1200,9 +1225,9 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 1 | Health check failed | Run `cass index --full` |
 | 2 | Usage error | Fix syntax (hint provided) |
 | 3 | Index/DB missing | Run `cass index --full` (retryable: true) |
-| 4 | Network error | Check connectivity |
-| 5 | Data corruption | Run `cass doctor check --json`; repair or restore the canonical SQLite archive before indexing |
-| 6 | Incompatible version | Update cass |
+| 4 | I/O failure or unsafe operation refused (not a network code) | Branch on `err.kind`: fix path/permissions/space for `io`/`output-not-writable`; follow the hint for `refused-unsafe` |
+| 5 | Data corruption, or maintenance required | Inspect `cass health --json` / `cass status --json` / `cass doctor --json` and follow `recommended_action`: usually rebuild derived assets (`maintenance-required`, `checkpoint_incomplete` start that rebuild themselves); only a canonical-archive failure needs repair or restore |
+| 6 | Required input missing (password, resume command) | Supply the input (e.g. `--password-stdin`) and rerun |
 | 7 | Lock/busy | Retry later |
 | 8 | Partial result (`sources sync` only: some sources had path failures) | Inspect per-path errors in the JSON output and retry the failed sources |
 | 9 | Unknown error | Check `retryable` flag |
@@ -1216,12 +1241,14 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 22 | I/O during model handling | Retry |
 | 23 | Model download | Retry or use `--from-file` |
 | 24 | I/O during model verify/install | Retry |
+| 70 | `cass index` stalled and aborted (kind `index-stalled` envelope on stderr) | Inspect `cass status --json`, then rerun `cass index` |
+| 130 | Interrupted (SIGINT) | Rerun; `cass sources setup --resume` continues an interrupted setup |
 
-Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`, and `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` is the other exception: when the remaining budget cannot admit semantic setup or dispatch, search fails with exit 10, kind `timeout`, `retryable: true`, and a `semantic_budget checkpoint=...` message, rather than returning an empty or lexical result. Hybrid (explicit or default) instead falls back to lexical and reports `semantic_budget_limited`.
+Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`, and `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` is the other exception: when the remaining budget cannot admit semantic setup or dispatch, search fails with exit 10, kind `timeout`, `retryable: true`, and a `semantic_budget checkpoint=...` message, rather than returning an empty or lexical result. Hybrid (explicit or default) instead falls back to lexical and reports `semantic_budget_limited`.
 
 **Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
-The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path).
+The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path). A lexical query the engine refuses with `posting cursor invariant failed` (kind `search`, exit 9) is `retryable: false`: the same query fails the same way on the same index generation. The hint names the remedy, `cass index --full --force-rebuild`. Date-filtered searches over an index segment that holds deleted rows triggered it before frankensearch-quill 0.3.2 (GH #499).
 
 ### Session Analysis Commands
 
@@ -1278,7 +1305,7 @@ cass search "TODO" --agent claude --robot --aggregate workspace
 | `agent` | Group by agent type (claude_code, codex, cursor, etc.) |
 | `workspace` | Group by workspace/project path |
 | `date` | Group by date (YYYY-MM-DD) |
-| `match_type` | Group by match quality (exact, prefix, fuzzy) |
+| `match_type` | Group by match type (`exact`, `prefix`, `suffix`, `substring`, `wildcard`, `implicit_wildcard`); one search has one type, so this shows a single bucket unless the wildcard fallback replaced the hits |
 
 **Response Format**:
 ```json
@@ -1359,12 +1386,11 @@ cass search "bug fix" --sessions-from today_sessions.txt --robot
 
 ### Match Highlighting
 
-The `--highlight` flag wraps matching terms for visual/programmatic identification:
+Snippets always mark the terms the search engine matched with `**bold**`, in human-readable output and in robot/JSON output alike. The `--highlight` flag also marks the query terms' remaining literal occurrences and leaves already-marked text alone, so no term gets two pairs of marks. Only the `snippet` field is marked; `content` stays verbatim:
 
 ```bash
 cass search "authentication error" --robot --highlight
-# Snippets come back with **authentication** and **error** bold-wrapped,
-# in text and in JSON output alike (search has no HTML output format).
+# "snippet": "... **authentication** failed with **error** ..."
 ```
 
 Highlighting is query-aware: quoted phrases like `"auth error"` highlight as a unit; individual terms highlight separately.
@@ -1382,7 +1408,54 @@ cass search "TODO" --robot --robot-meta --limit 20
 cass search "TODO" --robot --robot-meta --limit 20 --cursor "eyJ..."
 ```
 
-Cursors are opaque tokens encoding the pagination state. They remain valid as long as the index isn't rebuilt.
+A cursor is base64 JSON `{"offset": N, "limit": M}`: a plain page position, not a snapshot. Any index change between pages (a new session indexed, a rebuild, a `forget`) shifts the ranking, so the next page can skip or repeat hits. Page quickly, or fix the window with `--until` when you need stable pages.
+
+### Match Counts: Exact or Lower Bound
+
+`total_matches` answers "how many messages match?", but it is exact only when
+cass can afford to count. Every search fetches one hit beyond `--limit` to learn
+whether another page exists. When the page is full and the index is larger than
+`CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` documents, cass skips the full count
+and reports that `limit + 1` as a lower bound. Below the threshold it counts
+every match.
+
+| Build | Threshold | `stale lock` with `--limit 10` on a 1,034,219-document index |
+|-------|-----------|---------------------------------------------------------------|
+| v0.9.0 and earlier | 50,000 documents | `total_matches: 11` |
+| Current (unreleased) | 5,000,000 documents | `total_matches: 11915` |
+
+`--robot-meta` says which kind of number you got:
+
+```bash
+cass search "stale lock" --robot --robot-meta --limit 10 \
+  | jq '{total_matches, precision: ._meta.cursor_manifest.count_precision, why: ._meta.cursor_manifest.count_reason}'
+# → {"total_matches": 11915, "precision": "exact", "why": "total_matches is exact; no extra recount was needed"}
+# A lower bound reads "precision": "lower_bound".
+```
+
+**Why the threshold moved.** The 50,000 cap dates from the Tantivy engine,
+where counting a common term over millions of documents could dominate the
+query. The Quill engine counts cheaply. Paired runs on that 1,034,219-document
+archive, capped against exact (`--limit 10`, read-only, CPU time):
+
+| Query | Exact total | Extra CPU for the exact count |
+|-------|-------------|-------------------------------|
+| `stale lock` | 11,915 | ~0.00-0.04 s |
+| `cargo build` | 24,944 | ~0.01-0.03 s |
+| `the` | 439,461 | ~0.03-0.05 s |
+| `AGENTS.md` | 867,087 | ~0.06-0.11 s |
+
+Each search cost about 0.8 s of CPU either way. The capped answer, meanwhile,
+was wrong by up to five orders of magnitude, and agents read `total_matches` as
+a count. The default now covers five times that archive; set
+`CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS=0` to never count exactly, or raise it
+for a larger archive.
+
+**Aggregations have their own window.** `--aggregate` buckets are computed over
+the top `max(1000, limit + offset)` hits, so bucket counts on a large archive
+describe the best-ranked thousand matches, not the whole corpus. Use an exact
+`total_matches` for "how many", and aggregations for "how are the top hits
+distributed".
 
 ### Request Correlation
 
@@ -1390,7 +1463,8 @@ For debugging and logging, attach a request ID:
 
 ```bash
 cass search "bug" --robot --request-id "req-12345"
-# → { "hits": [...], "_meta": { "request_id": "req-12345" } }
+# → { "request_id": "req-12345", "hits": [...], ... }
+#   (top level always; also under _meta.request_id with --robot-meta)
 ```
 
 ### Idempotent Operations
@@ -1408,7 +1482,9 @@ Debug why a search returned unexpected results:
 
 ```bash
 cass search "auth*" --robot --explain
-# → Includes parsed query AST, term expansion, cost estimates
+# → Adds "explanation": the sanitized query, flat lists of its terms, phrases and
+#   operators (not a tree), the query type and index strategy, a low/medium/high cost
+#   class, a filter summary and warnings. Wildcards are reported, not expanded.
 
 cass search "auth error" --robot --dry-run
 # → Validates query syntax without executing
@@ -1433,11 +1509,11 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 |------|---------|
 | `--robot` / `--json` | JSON output (pretty-printed) |
 | `--robot-format jsonl\|compact` | Streaming or single-line JSON |
-| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness, `lexical_degrade_reason`: `"query_fuel_exhausted"` or null) |
+| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness, `lexical_degrade_reason`: `"query_fuel_exhausted"` or null, `wildcard_fallback_skipped`: why a sparse result got no automatic wildcard retry, and `effective`: the database, time window, filters, auto-corrections and query grouping the search actually used) |
 | `--fields minimal\|summary\|<list>` | Reduce payload size |
 | `--max-content-length N` | Truncate content fields to N chars |
 | `--max-tokens N` | Apply an approximate token budget to robot output |
-| `--timeout N` | Timeout in milliseconds. On expiry `search`/`pack` still exit 0 and emit `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`; `--robot-format sessions` fails with exit 10, kind `timeout` |
+| `--timeout N` | Timeout in milliseconds. On expiry `search`/`pack` still exit 0 and emit `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`; `--robot-format sessions` fails with exit 10, kind `timeout` |
 | `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
 | `--request-id ID` | Echoed in response for correlation |
 | `--aggregate agent,workspace,date` | Server-side aggregations |
@@ -1445,7 +1521,7 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 | `--dry-run` | Validate query without executing |
 | `--no-maintenance` | Strict read-only search: never refresh, join, or spawn lexical maintenance, never auto-repair the archive while opening it, and never auto-spawn the daemon (conflicts with `--refresh` and `--daemon`) |
 | `--source <source>` | Filter by source: `local`, `remote`, `all`, or specific source ID |
-| `--highlight` | Highlight matching terms in output |
+| `--highlight` | Also mark query-term occurrences the engine left unmarked (snippets always mark matched terms with `**`) |
 
 ### Index Flags Reference
 
@@ -1553,7 +1629,7 @@ cass introspect --json
  | Flag | Purpose |
  |------------------|--------------------------------------------------------|
  | --robot / --json | Machine-readable JSON output (required!) |
- | --fields minimal | Reduce payload: source_path, line_number, agent only |
+ | --fields minimal | Reduce payload: source_path, line_number, agent, source_id, conversation_id |
  | pack --max-tokens N | Budget a cited handoff pack |
  | --limit N | Cap result count |
  | --agent NAME | Filter to specific agent (claude, codex, cursor, etc.) |
@@ -1588,7 +1664,7 @@ Combine terms with explicit operators for complex queries:
 | `NOT` | `error NOT test` | First term, excluding second |
 | `-` | `error -test` | Shorthand for NOT |
 
-**Operator Precedence**: NOT binds tightest, then AND, then OR. Use parentheses (in robot mode) for explicit grouping.
+**Operator Precedence**: NOT binds tightest, then AND (explicit, `&&`, or implied between words), then OR (`OR`, `||`). Parentheses group, in the TUI and robot mode alike: `a OR b c` means `a OR (b AND c)`, while `(a OR b) c` needs the parentheses. A `(` groups only at the start of a word, so code such as `foo(bar)` stays one term. `NOT NOT x` is `x`. Unbalanced parentheses are recovered rather than rejected. The SQLite fallback lanes, used while no lexical index is available, apply the same grammar.
 
 ```bash
 # Complex boolean query
@@ -1611,18 +1687,18 @@ Wrap terms in double quotes for exact phrase matching:
 | `"cannot read property"` | Exact JavaScript error message |
 | `"def test_"` | Function definitions starting with test_ |
 
-Phrases respect word order and proximity. Useful for error messages, code patterns, and specific terminology.
+Phrases match their words adjacent and in order (no slop). Useful for error messages, code patterns, and specific terminology.
 
 ### Wildcard Patterns
 
 | Pattern | Type | Matches | Performance |
 |---------|------|---------|-------------|
 | `auth*` | Prefix | "auth", "authentication", "authorize" | Fast (uses edge n-grams) |
-| `*tion` | Suffix | "authentication", "function", "exception" | Slower (regex scan) |
-| `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (full regex) |
-| `test_*` | Prefix | "test_user", "test_auth", "test_helpers" | Fast |
+| `*tion` | Suffix | "authentication", "function", "exception" | Slower (term-dictionary expansion) |
+| `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (term-dictionary expansion) |
+| `test_*` | Prefix on `test` | anything whose token starts with "test" | Fast |
 
-**Tip**: Prefix wildcards (`foo*`) are optimized via pre-computed edge n-grams. Suffix and substring wildcards fall back to regex and are slower on large indexes.
+**Tip**: Prefix wildcards (`foo*`) use edge n-grams computed at index time: prefixes of 2–20 characters of every alphanumeric word, taken from titles and from the first 4 KiB of each message. Suffix and substring wildcards expand over the index's term dictionary, at most 16,384 terms per pattern; a pattern matching more terms fails rather than scanning. The tokenizer splits on anything that is not a letter or digit: `test_*` is a prefix match on `test`, `c++` searches for `c`, and `foo.bar` means `foo` AND `bar` anywhere in the message, not the literal string. Phrases (`"..."`) match adjacent words in order (slop 0).
 
 ### Query Modifiers
 
@@ -1653,9 +1729,10 @@ cass search "authentication" --agent codex --workspace myproject --week
 | **Unix Millis** | `1732579200000` | Milliseconds (auto-detected) |
 
 **Intelligent Heuristics**:
-- Numbers >10 digits are treated as milliseconds, otherwise seconds
-- Two-digit years are expanded (24 → 2024)
-- Date-only inputs default to midnight start or 23:59:59 end
+- Numbers of 100,000,000,000 (10^11) or more are milliseconds; smaller numbers are seconds
+- Years are written in full (`2024`, not `24`)
+- A value that names a whole day (a date without a time, `today`, `yesterday`) starts at local midnight as `--since` and runs through the day's last millisecond as `--until`, so `--until 2024-01-31` includes January 31
+- For `search` and `pack`, a `--since`/`--until` value that cannot be parsed, or a `--since` later than `--until`, is a usage error (exit 2, kind `usage`); it is never silently ignored
 
 ```bash
 # All equivalent for "last week"
@@ -1672,21 +1749,26 @@ cass search "error" --since yesterday --until now
 
 ### Match Types
 
-Search results include a `match_type` indicator:
+Search results include a `match_type` indicator. It describes the query, not each hit: every hit of a search carries the type of the least precise pattern in the query (e.g. `auth* *tion` stamps `suffix` on all hits).
 
-| Type | Meaning | Score Boost |
-|------|---------|-------------|
-| `exact` | Query terms found verbatim | Highest |
-| `prefix` | Matched via prefix expansion (e.g., `auth*`) | High |
-| `suffix` | Matched via suffix pattern | Medium |
-| `substring` | Matched via substring pattern | Lower |
-| `fuzzy` | Auto-fallback match when exact results sparse | Lowest |
+| Type | Meaning | Match Quality order |
+|------|---------|---------------------|
+| `exact` | No wildcards: exact terms (and edge n-gram prefixes) | 1 |
+| `prefix` | Trailing wildcard (`auth*`) | 2 |
+| `suffix` | Leading wildcard (`*tion`) | 3 |
+| `substring` | Both sides (`*config*`) | 4 |
+| `wildcard` | Inner wildcard (`f*o`) | 5 |
+| `implicit_wildcard` | Automatic wildcard fallback on a sparse exact search | 6 |
+
+Relevance scores carry no boost for the match type; only the TUI's Match Quality ranking mode (`F12`) orders by it.
 
 ### Auto-Fuzzy Fallback
 
-When an exact query returns fewer than 3 results, `cass` automatically retries with wildcard expansion:
+When an exact query's first page returns fewer than 3 results (or fewer than a smaller `--limit`), `cass` retries with wildcard expansion:
 - `auth` → `*auth*`
-- Results are flagged with `wildcard_fallback: true` in robot mode
+- It runs only on indexes with at most 10,000 documents (`CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS`; `0` disables it), so on a typical real archive it does not run.
+- It skips queries that already use wildcards, boolean operators or phrases, and zero-hit queries containing a token longer than 16 characters.
+- The wildcard results replace the exact ones only when they find more hits; robot mode then reports `_meta.wildcard_fallback: true`. When a sparse result did not get the retry, `_meta.wildcard_fallback_skipped` says why: `index_over_automatic_limit` (the index is over the document cap), `automatic_retry_disabled` (the cap is `0`) or `long_query_term`; add explicit wildcards to run it anyway
 - TUI shows a "fuzzy" indicator in the status bar
 
 ---
@@ -1702,7 +1784,7 @@ When an exact query returns fewer than 3 results, `cass` automatically retries w
 | `F1` / `Alt+?` | Toggle help screen |
 | `F2` / `Alt+T` | Next theme (cycles all 19 presets) |
 | `Shift+F2` / `Alt+Shift+T` | Previous theme |
-| `Ctrl+B` | Toggle border style (rounded/plain) |
+| `Ctrl+B` | Toggle border style (rounded/square) |
 | `Ctrl+P` / `Alt+P` | Open the command palette |
 | `Ctrl+S` | Toggle the stats bar |
 | `Ctrl+Shift+S` | Open the sources management surface |
@@ -1764,10 +1846,10 @@ Launch-time flags: `cass tui --refresh` (alias `--catch-up`) runs an incremental
 |-----|--------|
 | `F7` / `Alt+C` | Cycle context window size: S → M → L → XL |
 | `Ctrl+Space` | Momentary "peek" to XL context |
-| `F9` | Toggle match mode: prefix (default) ↔ standard |
+| `F9` | Toggle match mode: standard (default) ↔ prefix, where every bare word of 2+ characters also matches as a prefix (`auth` → `auth*`; phrases, operators and wildcards are left as typed) |
 | `F12` / `Alt+R` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
 | `Alt+F` | Cycle result grouping: agent → conversation → workspace → flat |
-| `Alt+S` | Cycle search mode (lexical / semantic / hybrid) |
+| `Alt+S` | Cycle search mode (lexical / semantic / hybrid). Without an installed model (or vector index) the status line says results stay lexical and names the command: `cass models install` (offline `--from-file <dir>`) or `cass index --semantic`; nothing downloads on its own |
 | `Ctrl+D` | Cycle density: Compact → Cozy → Spacious |
 | `Ctrl+1`..`Ctrl+9` | Save the current view to slot N |
 | `Shift+1`..`Shift+9` | Load the view from slot N |
@@ -1826,7 +1908,7 @@ The detail pane has six tabs, cycled with `Tab`:
 | **Messages** | Full conversation with markdown rendering | Reading full context |
 | **Snippets** | Keyword-extracted summaries | Quick scanning |
 | **Raw** | Unformatted JSON/text | Debugging, copying exact content |
-| **Json** | Syntax-highlighted JSON with a collapsible tree | Inspecting structured payloads |
+| **Json** | Syntax-highlighted, pretty-printed JSON (static; no collapsible tree) | Inspecting structured payloads |
 | **Analytics** | Per-session token timeline, tool calls, message stats | Understanding one session |
 | **Export** | Export actions and filename previews (HTML/Markdown) | Sharing a session |
 
@@ -1887,79 +1969,29 @@ For opening many files without navigating away:
 
 ### The Six Ranking Modes
 
-Cycle through modes with `F12`:
+Cycle through modes with `F12` (or `Alt+R`) in the TUI. The search engine returns hits in its own relevance order; the mode then re-orders the results the TUI has loaded (the first page of up to 250 hits, plus every further page you load), so the whole loaded list always follows one order. Ranking modes are TUI-only; robot search returns engine order.
 
-1. **Recent Heavy** (default): Strongly favors recent conversations
-   - Score = `text_relevance × 0.3 + recency × 0.7`
-   - Best for: "What was I working on?"
+1. **Recent Heavy**: Score = `relevance × 0.3 + recency × 0.7`. Best for: "What was I working on?"
 
-2. **Balanced**: Equal weight to relevance and recency
-   - Score = `text_relevance × 0.5 + recency × 0.5`
-   - Best for: General-purpose search
+2. **Balanced** (default): Score = `relevance × 0.5 + recency × 0.5`. Best for general-purpose search.
 
-3. **Relevance**: Prioritizes text match quality
-   - Score = `text_relevance × 0.8 + recency × 0.2`
-   - Best for: "Find the best explanation of X"
+3. **Relevance**: Score = `relevance × 0.8 + recency × 0.2`. Best for "find the best explanation of X".
 
-4. **Match Quality**: Penalizes fuzzy/wildcard matches
-   - Score = `text_relevance × 0.7 + recency × 0.2 + match_exactness × 0.1`
-   - Best for: Precise technical searches
+4. **Match Quality**: exact matches first, then prefix, suffix, substring, wildcard, and finally automatic wildcard-fallback matches; within each class, the Relevance score. Best for precise technical searches.
 
-5. **Date Newest**: Pure chronological order (newest first)
-   - Ignores relevance scoring entirely
-   - Best for: "Show me all recent activity"
+5. **Date Newest**: newest first by message time. Best for "show me recent activity".
 
-6. **Date Oldest**: Pure reverse chronological order (oldest first)
-   - Ignores relevance scoring entirely
-   - Best for: "When did I first work on this?"
+6. **Date Oldest**: oldest first. Best for "when did I first work on this?"
+
+Undated hits sort last in the date modes. Hits with equal scores keep the engine's order. With an empty query, cass browses by date instead of searching; Date Oldest browses oldest first and every other mode newest first.
 
 ### Score Components
 
-- **Text Relevance (BM25)**: Quill's implementation of Okapi BM25, considering:
-  - Term frequency in document
-  - Inverse document frequency across corpus
-  - Document length normalization
+- **Relevance**: the engine's score (BM25 for lexical search, fused rank for hybrid), min-max normalized over the loaded hits: the best loaded hit is 1.0 and the weakest 0.0 (all 1.0 when every score ties).
 
-- **Recency**: Exponential decay from current time
-  - Documents from today: ~1.0
-  - Documents from last week: ~0.7
-  - Documents from last month: ~0.3
+- **Recency**: exponential decay from now with a 14-day half-life, `0.5 ^ (age_days / 14)`: 1.0 today, about 0.71 after a week, 0.5 after two weeks, about 0.23 after a month. Undated hits get 0.
 
-- **Match Exactness**: Bonus for exact matches vs wildcards
-  - Exact phrase: 1.0
-  - Prefix match: 0.8
-  - Suffix/Substring: 0.5
-  - Fuzzy fallback: 0.3
-
-### Blended Scoring Formula
-
-The final score combines all components using mode-specific weights:
-
-```
-Final_Score = BM25_Score × Match_Quality + α × Recency_Factor
-```
-
-**Alpha (α) by Ranking Mode**:
-| Mode | α Value | Effect |
-|------|---------|--------|
-| Recent Heavy | 1.0 | Recency dominates |
-| Balanced | 0.4 | Moderate recency boost |
-| Relevance Heavy | 0.1 | BM25 dominates |
-| Match Quality | 0.0 | Pure text matching |
-| Date Newest/Oldest | N/A | Pure chronological sort |
-
-**Match Quality Factors**:
-| Match Type | Factor | Applied When |
-|------------|--------|--------------|
-| Exact | 1.0 | `"exact phrase"` |
-| Prefix | 0.9 | `auth*` |
-| Suffix | 0.8 | `*tion` |
-| Substring | 0.6 | `*config*` |
-| Implicit Wildcard | 0.4 | Auto-fallback expansion |
-
-**Recency Factor**: `timestamp / max_timestamp` normalized to [0, 1].
-
-This formula ensures that "Recent Heavy" mode (default) surfaces your most recent work, while "Relevance Heavy" finds the best explanations regardless of age.
+The formulas live in `src/ui/ranking.rs`, and the tests in that file and in `tests/ranking.rs` exercise the same function the TUI calls.
 
 ---
 
@@ -2027,7 +2059,7 @@ The same conversation content can appear multiple times due to:
 
 `cass` uses a multi-layer deduplication strategy:
 
-1. **Message identity**: messages are keyed by `UNIQUE(conversation_id, idx)` and inserted with `INSERT OR IGNORE`, so re-indexing the same file never stores a message twice
+1. **Message identity**: messages are keyed by `UNIQUE(conversation_id, idx)`. Appends to a known conversation use `INSERT OR IGNORE`, and a new conversation's batched `INSERT` has the same unique index as its backstop, so re-indexing the same file never stores a message twice
    - No content hash is persisted for this; BLAKE3 content hashes are computed in memory only, as merge fingerprints when an updated file is reconciled against stored rows
 
 2. **Conversation identity**: conversations are keyed by `UNIQUE(source_id, agent_id, external_id)`
@@ -2214,13 +2246,12 @@ Cycle through 19 built-in theme presets with `F2`:
 
 ### WCAG Accessibility
 
-All theme colors are validated against WCAG (Web Content Accessibility Guidelines) contrast requirements:
+Every theme preset is checked in the test suite against WCAG contrast ratios, with these floors:
 
-- **Text on backgrounds**: Minimum 4.5:1 contrast ratio (AA standard)
-- **Large text/headers**: Minimum 3:1 contrast ratio
-- **Interactive elements**: Clear visual distinction from content
+- **Body text on the background**: at least 3:1, and 2.5:1 on raised surfaces
+- **Selected rows, muted text, focused borders**: at least 3:1
 
-The theming engine calculates relative luminance and contrast ratios at runtime to ensure readability across all color combinations.
+These floors are below WCAG AA's 4.5:1 for body text, so cass does not claim AA conformance. At runtime, role and status badges pick whichever candidate foreground has the highest contrast against their background.
 
 ### Role-Aware Message Styling
 
@@ -2237,15 +2268,15 @@ Each agent type (Claude, Codex, Cursor, etc.) also receives a subtle tint, makin
 
 ### Adaptive Borders
 
-Border decorations automatically adapt to terminal width:
+Border decorations adapt to terminal width and to render pressure:
 
-| Width | Style | Example |
-|-------|-------|---------|
-| **Narrow** (<80 cols) | Minimal Unicode | `│ content │` |
-| **Normal** (80-120) | Rounded corners | `╭─ content ─╮` |
-| **Wide** (>120) | Full decorations | Double-line headers |
+| Condition | Style | Example |
+|-----------|-------|---------|
+| Narrow (<80 cols) | Square box-drawing | `┌─ content ─┐` |
+| 80 cols and wider | Rounded corners | `╭─ content ─╮` |
+| Frame budget under pressure | Square, then no borders | `┌─┐`, then none |
 
-Toggle between rounded Unicode and plain ASCII borders with `Ctrl+B`.
+There is no double-line tier. `Ctrl+B` toggles between rounded and square Unicode borders; both are box-drawing characters, not ASCII.
 
 ---
 
@@ -2309,18 +2340,17 @@ Bookmarks are stored separately from the main index:
 
 | Type | Icon | Auto-Dismiss | Use Case |
 |------|------|--------------|----------|
-| **Info** | ℹ️ | 3 seconds | Status updates, tips |
-| **Success** | ✓ | 2 seconds | Operations completed |
-| **Warning** | ⚠ | 4 seconds | Non-critical issues |
-| **Error** | ✗ | 6 seconds | Failures requiring attention |
+| **Info** | `i` | 3 seconds | Status updates, tips |
+| **Success** | `*` | 2 seconds | Operations completed |
+| **Warning** | `!` | 4 seconds | Non-critical issues |
+| **Error** | `x` | 6 seconds | Failures requiring attention |
 
 ### Behavior
 
-- **Non-Blocking**: Toasts appear in a corner without stealing focus
+- **Non-Blocking**: Toasts appear in the top-right corner without stealing focus (the position is fixed; there is no setting for it)
 - **Auto-Dismiss**: Each type has an appropriate display duration
 - **Message Coalescing**: Duplicate messages show a count badge instead of stacking
-- **Configurable Position**: Toasts can appear in any corner (default: top-right)
-- **Maximum Visible**: Limited to 3-5 visible toasts to prevent screen clutter
+- **Maximum Visible**: At most 5 toasts at once to prevent screen clutter
 
 ### Visual Design
 
@@ -2333,21 +2363,21 @@ Toasts feature:
 
 | Trigger | Toast |
 |---------|-------|
-| Index rebuild complete | ✓ "Index rebuilt: 2,500 conversations" |
-| Export complete | ✓ "Exported to conversation.md" |
-| Copy to clipboard | ✓ "Copied to clipboard" |
-| Search timeout | ⚠ "Search timed out, showing partial results" |
-| Connector error | ✗ "Failed to scan ChatGPT: encrypted files" |
-| Update available | ℹ️ "Version 0.5.0 available" |
+| Bulk copy of selected paths | `*` "Copied 3 paths" |
+| Bulk export | `*` "Exported 3 items as JSON" |
+| Copy failure | `x` "Copy failed: ..." |
+| Slow search | "Slow search: 1840ms" |
+| Semantic refinement failure | "Refinement failed: ..." |
+| Saved views | `*` "Renamed slot 2", `!` "Slot 4 is empty" |
 
 ---
 
 ## 🏎️ Performance Engineering: Caching & Warming
 To achieve sub-60ms latency on large datasets, `cass` implements a multi-tier caching strategy in `src/search/query.rs`:
 
-1. **Sharded LRU Cache**: The `prefix_cache` is split into shards (default 256 entries each) to reduce mutex contention during concurrent reads/writes from the async searcher.
+1. **Sharded LRU Cache**: The `prefix_cache` is organized into shards (default 256 entries each) that bound per-prefix memory; all shards sit behind one `Mutex`, so the sharding limits size, not lock contention. The cache lives in the searching process: it pays off in the TUI, where each keystroke re-queries, and not for one-shot CLI searches, which start with an empty cache.
 2. **Bloom Filter Pre-checks**: Each cached hit stores a 64-bit Bloom filter mask of its content tokens. When a user types more characters, we check the mask first. If the new token isn't in the mask, we reject the cache entry immediately without a string comparison.
-3. **Predictive Warming**: A background `WarmJob` thread watches the input. When the user pauses typing, it triggers a lightweight query against the lexical reader to pre-load relevant index segments into the OS page cache.
+3. **Predictive Warming**: In the TUI, a background `WarmJob` thread watches the input. When the user pauses typing, it runs a lightweight query against the lexical reader to pre-load relevant index segments into the OS page cache. One-shot CLI searches run with warming disabled.
 
 ## 🔌 The Connector Interface (Polymorphism)
 The system is designed for extensibility via the `Connector` trait (`src/connectors/mod.rs`). This allows `cass` to treat disparate log formats as a uniform stream of events.
@@ -2417,8 +2447,8 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 26 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build).
-2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation. Production writes use single-writer `BEGIN IMMEDIATE` transactions; an experimental opt-in parallel persist path (`CASS_INDEXER_BEGIN_CONCURRENT=1`, off by default) exists but is not the default.
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 32 coding-agent connectors (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Prime Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, Kiro CLI); `cass capabilities --json` lists them as `connectors`.
+2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation. cass turns on the engine's concurrent mode (`PRAGMA fsqlite.concurrent_mode = ON`), so a plain `BEGIN` runs as `BEGIN CONCURRENT`. Indexing still has one writer at a time, because `index-run.lock` admits a single indexer. `BEGIN IMMEDIATE` appears only in the daemon job queue and in logical-archive import/migrate. An experimental opt-in parallel persist path (`CASS_INDEXER_BEGIN_CONCURRENT=1`, off by default) exists but is not the default.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
  * **Prefix Fields**: `title_prefix` and `content_prefix` use **Index-Time Edge N-Grams** (not stored on disk to save space) for instant prefix matching.
@@ -2466,7 +2496,7 @@ flowchart LR
  end
 
  subgraph "Storage + Search"
- S1["frankensqlite (WAL)\nSource of Truth\nBEGIN IMMEDIATE\nMigrations"]:::pastel3
+ S1["frankensqlite (WAL)\nSource of Truth\nBEGIN CONCURRENT\nMigrations"]:::pastel3
  T1["frankensearch\nBM25 + Semantic\nRRF Fusion\nReranking"]:::pastel4
  end
 
@@ -2509,7 +2539,7 @@ flowchart LR
 - **Non-Blocking**: The indexer runs in a background thread. You can search while it works.
 - **Parallel Discovery**: Connector detection and scanning run in parallel across all CPU cores using rayon, significantly reducing startup time when multiple agents are installed.
 - **Watch Mode** (`cass index --watch`, foreground): Uses file system watchers (`notify`) to detect changes in agent logs. When you save a file or an agent replies, `cass` re-indexes just that conversation. The TUI does **not** start a watcher on its own; see *Keeping the Index Fresh* below for what runs automatically.
-- **Real-Time Progress**: The TUI footer updates in real-time showing discovered agent count and conversation totals with sparkline visualization (e.g., "📦 Indexing 150/2000 (7%) ▁▂▄▆█").
+- **Real-Time Progress**: The TUI footer updates in real-time showing discovered agent count and conversation totals as a progress bar labelled "Indexing 150/2000 (7%)" (a spinner with the phase name while the total is still unknown).
 
 ### Keeping the Index Fresh (Automatic)
 
@@ -2518,8 +2548,8 @@ An index that is always a little behind is the most common complaint about any l
 | Layer | What | When it runs | Enable |
 |-------|------|--------------|--------|
 | **Stale-on-read catch-up** | `search`, `pack`, and TUI launch check index freshness. If the index is stale (> 30 min), partial, or has pending sessions, a *detached* incremental `cass index --background` is spawned in its own process group and the current results are returned immediately. The next search is fresh. | On demand, at most once per 5 min per data dir (`CASS_AUTO_REFRESH_COOLDOWN_SECS`). Never for data dirs under the OS temp dir, and never for `search --no-maintenance`. A catch-up that ends without advancing the index is not respawned blindly: 1 h, then 6 h between attempts, and three failures trip the breaker until any run completes. | On by default. `CASS_AUTO_REFRESH=0` disables globally. `--robot-meta` reports `index_freshness.auto_refresh.{outcome,trigger,pid,consecutive_failures,detail}`. |
-| **OS scheduler** (`cass schedule install`) | launchd LaunchAgents (macOS) or systemd user timers (Linux): an **incremental** job every 15 min and a **nightly** job (03:00) that performs a full source census with conditional lexical rebuilding, then one bounded `models backfill --scheduled` worker per tier (fast/hash always; quality/MiniLM when installed). Due remote-source syncs run first. Priority is delegated to the OS (`ProcessType=Background`/`Nice`/`LowPriorityIO`, `Nice=19`/`IOSchedulingClass=idle`/`CPUSchedulingPolicy=idle`). | On the timer, even when no cass process is running; survives reboots (`Persistent=true` / launchd). | `cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-nightly] [--no-semantic] [--dry-run]`; `cass schedule status`; `cass schedule uninstall`. |
-| **Resident daemon timer** | The warm-model daemon (`cass daemon`, auto-spawned by semantic/hybrid searches) can also kick an incremental background index while it is resident. | Every `CASS_DAEMON_INDEX_INTERVAL_SECS` seconds while the daemon lives (it exits after its idle timeout). | Off by default; `CASS_DAEMON_INDEX_INTERVAL_SECS=900` recommended. |
+| **OS scheduler** (`cass schedule install`) | launchd LaunchAgents (macOS) or systemd user timers (Linux): an **incremental** job every 15 min and a **nightly** job (03:00) that performs a full source census with conditional lexical rebuilding, then one bounded `models backfill --scheduled` worker per tier (fast/hash always; quality/MiniLM when installed). Due remote-source syncs run first. Priority is delegated to the OS: launchd jobs set `Nice=15` only, without `ProcessType=Background` or `LowPriorityIO` (background I/O throttling starved scheduled indexing on macOS). systemd units set `Nice=19`, `IOSchedulingClass=idle` and `CPUSchedulingPolicy=idle`. | On the timer, even when no cass process is running; survives reboots (`Persistent=true` / launchd). | `cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-nightly] [--no-semantic] [--dry-run]`; `cass schedule status`; `cass schedule uninstall`. |
+| **Resident daemon timer** | The warm-model daemon (`cass daemon`, started by hand or auto-spawned by a human-mode semantic/hybrid search with `--daemon`; robot searches never spawn it) can also kick an incremental background index while it is resident. | Every `CASS_DAEMON_INDEX_INTERVAL_SECS` seconds while the daemon lives (it exits after its idle timeout). | Off by default; `CASS_DAEMON_INDEX_INTERVAL_SECS=900` recommended. |
 
 Idle awareness: scheduled work skips a run when the machine is under severe load (Linux `/proc/loadavg` + PSI; macOS `sysctl vm.loadavg`). On macOS you can additionally require the console to have been idle — `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS=600` makes the nightly job and scheduled semantic backfill wait until nobody has touched the keyboard for ten minutes (the gate fails open where idle time is unavailable). Foreground `cass index` is never gated.
 
@@ -2549,6 +2579,68 @@ cass schedule status --json
 cass search "auth" --robot --robot-meta | jq '._meta.index_freshness.auto_refresh'
 ```
 
+### When the Index Is Missing: Repair Without Blocking the Search
+
+Stale-on-read catch-up handles an index that is *behind*. A search can also find
+the lexical index *missing or unusable*: a first run, a rebuild that never
+finished, a schema change. The search then has three choices: answer from what
+exists, rebuild before answering, or refuse. cass picks by the size of the job
+and by who is asking.
+
+| Situation | What `cass search` does |
+|-----------|------------------------|
+| A readable index exists but its checkpoint metadata is stale | Searches the existing index and leaves the heavy repair to an index run |
+| No usable index, and the archive is within the inline repair budget (`CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES`, default 1 GiB, database plus WAL) | Rebuilds from SQLite inline, then answers. Robot callers get a bounded refusal instead when the ingest-quarantine circuit breaker is active |
+| No usable index, and the archive is over that budget | Refuses with exit 5 `maintenance-required` **and starts a detached `cass index --full --background`**; the error hint names its pid |
+| Robot caller, existing index whose incomplete checkpoint the cheap metadata refresh cannot reconcile | Refuses with exit 5 `checkpoint_incomplete` and starts the matching background run (`--full` above the size budget, plain `cass index` below it) |
+| A rebuild is already running and no searchable generation exists | Robot callers get exit 7 `index-busy` immediately, with `N of M conversations processed` when the rebuild has recorded progress. Human callers wait up to `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` (30 s) for it to publish |
+
+**Why the search never runs a large rebuild itself.** A rebuild inside the
+search process lives only as long as that process, and an agent's search is
+almost always wrapped in a timeout: cass's own robot budget, or the agent
+harness's command limit. On a large archive the rebuild commits nothing until
+its first batch completes, so a killed rebuild keeps no progress. On one real
+11 GB archive, a search-driven rebuild reached 160 of 4,324 conversations in
+30 seconds (19 of them spent waiting on the in-flight byte budget) with
+`committed_offset` still 0 when the search's budget ended it. The next search
+started again from zero. Telling the agent to run `cass index --full` itself
+failed the same way, because that command ran under the same timeout. The index
+never converged. A detached child in its own process group survives the search,
+so the rebuild finishes and the next search answers.
+
+**What the caller sees.** The hint says what cass did and what to do next, so an
+agent never has to guess whether to run maintenance itself:
+
+```json
+{"error": {"code": 5, "kind": "maintenance-required",
+  "message": "Automatic lexical repair was not started after detecting searchable lexical metadata missing: ...",
+  "hint": "cass started `cass index --full --json --background` as a detached process (pid 62704) to rebuild the search index. Retry this search after it finishes; `cass status --json` shows its progress under .rebuild. Do not run `cass index --full --json` yourself meanwhile: it would exit 7 (index-busy).",
+  "retryable": true}}
+```
+
+When no child is started, the hint says why: a run already holds the index
+lock; a recent spawn is still inside its cooldown (it may still be starting, or
+it failed, with the log path); earlier spawns failed and the breaker backed off
+or tripped (with the failure detail); `CASS_AUTO_REFRESH=0`; or the spawn itself
+failed. Those hints name the foreground command and warn that it needs a process
+that is not killed by a short timeout.
+
+**Guard rails.** The handoff reuses the stale-on-read machinery, so the same
+limits apply: one spawner at a time (a file lock), the 5-minute cooldown, the
+failure breaker (1 h, then 6 h, tripped after three failures), and the
+`index-run.lock` that keeps two indexers from ever running together. Data dirs
+under the OS temp dir and `TUI_HEADLESS` harnesses never spawn, and
+`search --no-maintenance` never spawns anything. Under `--timeout`, a wait for an
+active rebuild stops at nine tenths of the time remaining, so the caller
+receives the `index-busy` verdict rather than an empty timed-out result.
+
+**Measured end to end** (release build, an isolated data dir with 30 sessions,
+lexical index moved aside, inline budget forced to one byte): the search
+answered in 0.09 s with the spawned pid in its hint, the background index
+published about 10 s later, and the next search reported all 60 matching
+messages (50 returned at `--limit 50`). With `CASS_AUTO_REFRESH=0` the same sequence never recovered within
+180 s, which is the behaviour every large archive had before.
+
 ## 🔍 Deep Dive: Internals
 
 ### The TUI Engine (Elm Architecture on FrankenTUI)
@@ -2557,7 +2649,7 @@ The interactive interface (`src/ui/app.rs`) uses **FrankenTUI (ftui)**, a Rust T
 1. **Model (CassApp)**: A monolithic struct tracks the entire UI state (search query, cursor position, scroll offsets, active filters, cached details, animation state).
 2. **Update**: Each event (key, mouse, tick, resize) maps to a `CassMsg` variant. The `update()` function produces `Cmd` effects (async tasks, ticks, quit).
 3. **View**: The `view()` function renders the current state to an ftui `Frame`. The runtime diff engine minimizes terminal writes using Bayesian strategy selection.
-4. **Adaptive Budget**: A 16ms (60fps) frame budget with PID-controlled degradation automatically simplifies rendering (borders, animations) when frame times exceed budget.
+4. **Adaptive Budget**: A 120 ms total frame budget (render 24 ms, present 12 ms, diff 6 ms; frames are never skipped) with PID-controlled degradation automatically simplifies rendering (borders, animations) when frame times exceed budget.
 5. **Background Tasks**: Search queries, indexing, and analytics run on background threads via `Cmd::Task`, with results delivered as messages.
 
 ```mermaid
@@ -2573,12 +2665,15 @@ graph TD
  Background -->|Result Msg| Runtime
 ```
 
-### Append-Only Storage Strategy
-Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`, powered by frankensqlite) as an **append-only log** for conversations:
+### Storage Strategy
+Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`, powered by frankensqlite) as the source of truth for conversations. History grows by insertion, and rows change only where the source changed:
 
-- **Immutable History**: When an agent adds a message to a conversation, we don't update the existing row. We insert the new message linked to the conversation ID.
-- **Deduplication**: Messages are keyed by `UNIQUE(conversation_id, idx)` and inserted with `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice; BLAKE3 content hashes are used only in memory as merge fingerprints.
-- **Versioning**: A `_schema_migrations` table and strict migration path (21 versioned migrations at HEAD; see *Database Schema Migrations*) ensure that upgrades are safe and atomic.
+- **Messages are inserted, not rewritten**: when an agent adds a message to a conversation, cass inserts a new row linked to the conversation ID. There are exceptions:
+  - A Codebuff/Freebuff message whose content or metadata changed under the same native ID is updated in place.
+  - Conversation rows are updated as they grow: end time, last message index, token summaries, title and metadata.
+  - Deduplication, `forget` and purge delete rows.
+- **Deduplication**: messages are keyed by `UNIQUE(conversation_id, idx)`. New conversations are written with batched plain `INSERT`s, with the unique index as the backstop. Appends to a known conversation use `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice. BLAKE3 content hashes are used only in memory, as merge fingerprints.
+- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v21, so a new database records versions 13–21. The v1–v12 SQL is compiled only into tests.
 
 ---
 
@@ -2725,17 +2820,13 @@ Each file system event is routed to the appropriate connector:
 
 ### State Tracking
 
-Watch mode maintains `watch_state.json`:
+Watch mode maintains `watch_state.json`, one scan watermark (ms) per connector under a short connector code (`cd` Claude, `cx` Codex, `gm` Gemini, ...):
 
 ```json
-{
-  "last_scan_ts": 1699900000000,
-  "watched_paths": [
-    "~/.claude/projects",
-    "~/.codex/sessions"
-  ]
-}
+{"v":1,"m":{"cd":1699900000000,"cx":1699900000000}}
 ```
+
+The global `last_scan_ts` and `last_indexed_at` watermarks live in the SQLite `meta` table, not in this file.
 
 ### Incremental Safety
 
@@ -2882,7 +2973,7 @@ install -m 755 cass ~/.local/bin/cass
 ```bash
 cass
 ```
-*On first run, `cass` performs a full index. You'll see progress in the footer. Search works immediately (falling back to SQLite or partial results until complete).*
+*On first run, `cass` starts a full index in the background (a detached, low-priority `cass index --full` that keeps going if you quit) and shows its progress in the status line. Search goes live, without a restart, as soon as the first index is published. Until then there are no results; if automatic indexing is off (`CASS_AUTO_REFRESH=0`) or cannot start, the status line says so and names `cass index --full`.*
 
 ### 3. Usage
 - **Type to search**: "python error", "refactor auth", "c++".
@@ -2895,7 +2986,7 @@ cass
 - **Modes**:
     - `F2`: Next theme (`Shift+F2` previous; 19 presets).
     - `F12`: Cycle ranking mode (recent → balanced → relevance → quality → newest → oldest).
-    - `Ctrl+B`: Toggle rounded/plain borders.
+    - `Ctrl+B`: Toggle rounded/square borders.
 - **Actions**:
     - `Enter`: Open selected result in contextual detail modal (defaults to Messages tab).
     - `Enter` with no selected hit: submit query behavior (no-op if empty).
@@ -2989,6 +3080,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `search --robot` | JSON output for automation pipelines |
 | `pack --robot` | Deterministic cited answer packs for agent/human handoffs; reports health, freshness, privacy, and warnings |
 | `triage` / `ready` / `preflight` | One-shot agent preflight: readiness, exact next command, docs, schemas, workflows, and recoveries |
+| `guide [INTENT]` | Intent-to-command planner (fix-ci, investigate-search-miss, prepare-release, repair-assets, export-session, onboard-source, support-capsule); dry-run by default. With `--apply`, 8 of its 19 allowlisted operations have evaluating proof adapters; the other 11 are observation-only and are reported, not evaluated |
 | `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
 | `health` | Minimal health check (<50ms on a healthy archive; the strict, mutation-free owner-thread probe shared with `status` has a 30 s hard deadline and never checkpoints a dirty WAL), exit 0=healthy, 1=unhealthy |
 | `selftest` | Archive-independent executable probe for installers and binary-promotion gates; exercises an in-memory FrankenSQLite write/read round-trip |
@@ -2996,7 +3088,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `introspect` | Full API schema: commands, arguments, response shapes |
 | `swarm status --json` | Read-only shared-repo operations snapshot across Beads, Agent Mail metadata, git, build pressure, cass readiness, and proof refs |
 | `swarm work-packet --json` | Advisory one-agent packet with readiness, suggested reservations, verification commands, and closeout checklist; it does not claim or reserve |
-| `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps |
+| `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps. Only fixture input (`--fixture`, `--fixture-dir --fixture-id`) is linted today; the live path reports every provider `live-provider-unimplemented` and finds nothing |
 | `swarm dependency-drift --json` | Read-only sibling dependency sentinel for Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations |
 | `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
@@ -3012,7 +3104,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 
 | Command | Purpose |
 |---------|---------|
-| `pages` | Export an encrypted, searchable static-site archive with GitHub Pages / Cloudflare Pages deploy; runs the interactive wizard by default, with `--export-only DIR`, `--verify BUNDLE`, `--preview BUNDLE`, and `--scan-secrets` as non-wizard modes |
+| `pages` | Export an encrypted, searchable static-site archive with GitHub Pages / Cloudflare Pages deploy; runs the interactive wizard by default, with `--export-only DIR`, `--verify BUNDLE`, `--preview BUNDLE`, and `--scan-secrets` as non-wizard modes. `--share-profile public\|team\|personal` (config: `bundle.share_profile`; wizard: step 4) redacts every exported text, including titles, paths, metadata values, message bodies, their search indexes and snippets. `public` covers home paths, usernames, project names, hostnames, emails, phone numbers, IP addresses, social-security and card numbers, and internal URLs; `team` covers home paths, emails, social-security and card numbers; `personal` rewrites nothing. No profile rewrites a credential (API keys, private keys, connection strings): the staged secret scan rejects an export that contains one, so it fails closed instead of publishing a rewritten secret. The default is `public` for a plaintext export and `team` when encrypted. The bundle's `export_meta` records the profile and per-kind redaction counts, never the values. For a plaintext bundle, `--verify` (which every export also runs before it reports success) reads the declared profile and rescans every exported text surface, including both search indexes, with that profile's rules. It fails if any value the profile removes remains, reporting counts per surface. The home-path and username rules use the verifying account's home directory. An encrypted bundle keeps its profile inside the payload, which `--verify` does not open. |
 | `pages key list\|add-password\|add-recovery\|revoke\|rotate --archive BUNDLE` | Manage the key slots of an exported encrypted bundle (LUKS-style: several independently wrapped copies of one data key). Passwords come from an interactive prompt or `--password-stdin` (current password on line 1, new password on line 2), never from argv; `--json` for automation; recovery secrets are printed once and never stored. See `docs/RECOVERY.md` |
 | `upgrade` | Check for a newer release and optionally run the same checksum-verified installer the TUI uses (`--check`, `--yes`, `--force`) |
 | `man` | Generate the man page to stdout |
@@ -3022,7 +3114,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `state` | Quick state/health check (alias of `status`) |
 | `onboarding` | Read-only first-run source onboarding + readiness wizard; `--json` for scripts, never launches the TUI |
 | `quarantine` | Inspect and manage the conversation-ingest quarantine (`list` / `clear`) |
-| `forget` | Prune already-indexed conversations by source-path glob; dry-run by default, `--apply` to commit, then derived search/analytics assets are rebuilt |
+| `forget` | Prune already-indexed conversations by source-path glob; dry-run by default, `--apply` to commit. Deletes the canonical rows, then rebuilds FTS, analytics and the lexical index. Semantic vectors are not rewritten, so explicit semantic search then reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` re-embeds from the canonical rows; no surface returns forgotten messages. `dedup --apply` and `sources agents exclude` behave the same way. It removes indexed copies, not source files: forget records each source's size and modification time, so an unchanged source stays forgotten across `cass index`, `--full` and rescans triggered by other sessions, but if its agent appends to it the whole conversation is indexed again. A store that keeps many sessions in one file (a SQLite database) counts as changed when any of its sessions changes. Delete or move the file to keep it out for good. The raw mirror keeps its verbatim capture of the source; once the source is gone, `cass mirror prune --older-than 0s --safety-hold-down 0s --source-path '<glob>' --apply` removes that capture too (a source still on disk is captured again by the next scan). A `cass serve` session opened before the forget keeps its pinned snapshot until `reload`; the TUI drops forgotten hits on its next search. If the lexical rebuild fails, forget exits 5 (`lexical-rebuild`) and `cass index --full` finishes the purge |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
 | `import chatgpt` | Split a ChatGPT web export (`conversations.json`) into files the ChatGPT connector can index |
@@ -3035,7 +3127,7 @@ Two more commands are dispatched before the main parser (so they are absent from
 
 | Command | Purpose |
 |---------|---------|
-| `serve --stdio [--mcp] (--data-dir DIR \| --index PATH)` | Persistent search service: reuses one read-only lexical index reader across a stream of newline-delimited JSON requests (or MCP with `--mcp`), with per-request deadlines (`--request-timeout-ms`), cross-process reader admission (`--admission-dir`, `--admission-slots`) and a resident-memory cap (`--max-resident-mib`). Search, status and startup never open the canonical database; `--db` opts in to canonical view requests. Lexical only (no semantic/HNSW serving). See `docs/SEARCH_SERVICE.md` |
+| `serve --stdio [--mcp] (--data-dir DIR \| --index PATH)` | Persistent search service: reuses one read-only lexical index reader across a stream of newline-delimited JSON requests (or MCP with `--mcp`), with per-request deadlines (`--request-timeout-ms`), cross-process reader admission (`--admission-dir`, `--admission-slots`) and a resident-memory cap (`--max-resident-mib`). Search, status and startup never open the canonical database; `--db` opts in to canonical `view`/`view_batch` requests. Operations: `search`, `semantic_search`, `refine`, `view`, `view_batch`, `status`, `reload`, `unload`, `shutdown`. `search` is lexical; `semantic_search` needs `--semantic-embedder minilm\|multilingual-minilm\|hash` plus `--data-dir` and `--db`, and `refine` needs `--reranker-model PATH` (installed local assets only, never downloaded). See `docs/SEARCH_SERVICE.md` |
 | `archive export\|verify\|search\|view\|import` | Bounded, versioned logical archive of the canonical rows: `export --output FILE --archive-id ID --include-private` streams a read-only snapshot to a new private JSONL file; `verify` checks framing, identities, counts and digest without a database; `search`/`view` read verified message bodies without restoring; `import` restores into a new database and never replaces an existing archive |
 
 ### Specialized Validation and Recording Tools
@@ -3104,6 +3196,8 @@ cass doctor --fix --json
 | `cass doctor repair --dry-run --json` | Builds a fingerprinted repair plan and candidate/promotion gates | Read-only plan |
 | `cass doctor repair --yes --plan-fingerprint <fp> --json` | Applies exactly the inspected repair fingerprint | Candidate-based, receipt-backed |
 | `cass doctor backups list/verify/restore ... --json` | Lists backups, verifies manifests, rehearses restore, then applies by fingerprint | Restore apply requires a matching rehearsal fingerprint |
+| `cass doctor --repair-leaked-pages --dry-run --json` | Classifies the engine's integrity verdict: `clean`, `leaked_pages` (pages no table, index or freelist owns — `page N is never used`), or `other_damage` | Read-only |
+| `cass doctor --repair-leaked-pages --yes --json` | Frees leaked pages in place when they are the only damage; re-runs `integrity_check` and compares conversation/message counts. Any other damage exits 5 `data-corruption` untouched | Backs up the live bundle first as a `leaked-pages-repair` backup (`cass doctor backups restore <id>`) |
 | `cass doctor cleanup --json` | Plans cleanup for derived or explicitly reclaimable assets | Apply requires a matching fingerprint |
 | `cass doctor support-bundle --json` | Creates a scrubbed diagnostic handoff bundle | Redacted by default; not a backup |
 
@@ -3231,7 +3325,77 @@ All configuration writes follow the same temp-file-then-rename pattern, ensuring
 - Network interruptions during model download won't leave broken installations
 - Concurrent processes won't see partially-written files
 
+### Secret Redaction at Index Time
 
+Agent transcripts are full of credentials: keys pasted into prompts, tokens
+echoed by tool output, `.env` files read into context. With the default
+`CASS_INDEX_REDACTION=full`, cass scrubs them from every persisted message,
+title, snippet and metadata blob before anything reaches SQLite or the lexical
+index, so search results, exports and robot output never repeat them. (The
+original session files and the raw-mirror blobs keep the raw text on the same
+disk; redaction protects the queryable surfaces, not disk-at-rest secrecy.)
+
+**What is recognized.** Thirteen pattern families: AWS access key IDs, AWS
+secret keys and session tokens in assignment context, GitHub tokens (classic and
+fine-grained), OpenAI and Anthropic API keys, `Bearer` tokens, JWTs, PEM/OpenSSH/PGP
+private-key blocks, database connection URLs (Postgres, MySQL, MongoDB, Redis,
+AMQP; the whole URL, since it may carry a password), generic `password=` /
+`api_key:` / `secret=` style assignments, Slack tokens, and Stripe live keys.
+JSON metadata is also redacted by field name: values under keys such as
+`passphrase`, `authorization`, `cookie`, or anything ending in `password`,
+`token`, `secret` or `apikey` are replaced whatever they look like.
+
+**How it runs.** Redaction sits on the ingest hot path, since it touches every
+message, so it is built in three layers:
+
+1. **One prefilter pass.** All patterns are compiled into a single `RegexSet`.
+   One scan per string reports which patterns could match; a string with no
+   candidates (the vast majority) is returned untouched without allocating.
+2. **Targeted replacement.** Only the flagged patterns run their own
+   `replace_all` pass, in a fixed order, replacing each match with `[REDACTED]`.
+3. **A content-addressed memo.** Transcripts repeat themselves (boilerplate
+   system prompts, replayed tool output, salvage re-imports), so candidate-bearing
+   strings are memoized per worker, keyed by a BLAKE3 hash of the content plus a
+   fingerprint of the pattern list. Changing any pattern changes the
+   fingerprint, so a stale cached answer can never be reused. Clean strings
+   bypass the cache entirely, and inputs over 64 KiB are never cached
+   (`CASS_REDACT_MEMO_CAPACITY` sets the entry cap).
+
+A frozen copy of the original algorithm lives in the test suite, and a 512-case
+property test requires the plain path and the memoized path (on both a cache
+miss and a cache hit) to produce byte-identical output to it. The memoized JSON
+path has its own equivalence test against the uncached one over nested shapes.
+
+**Why the patterns use ASCII word boundaries.** Rust's `regex` crate runs a
+`RegexSet` on a fast lazy DFA, but a Unicode word boundary (`\b`) is something
+that DFA cannot evaluate once the haystack contains a non-ASCII byte. It then
+falls back to the PikeVM, a far slower NFA simulation. Real transcripts are full
+of non-ASCII text (emoji, CJK, box-drawing characters in tool output), so every
+such message paid the slow path. The patterns now use `(?-u:\b)`, the ASCII
+word boundary, which the DFA handles.
+
+This cannot weaken redaction. Every boundary in these patterns sits next to an
+ASCII word character, and ASCII word characters are a subset of Unicode word
+characters. So wherever a Unicode boundary exists, an ASCII boundary exists too,
+and the ASCII patterns match everything the Unicode ones did. The only
+difference is a token glued directly to a non-ASCII letter (`凭据ghp_…`): a
+Unicode boundary sees two word characters and no boundary, so the old patterns
+missed that token, while the ASCII form redacts it.
+
+Measured on 593 MiB of real session text (3.1 million strings, 79,870 of them
+containing non-ASCII), with the same regex version cass ships:
+
+| Word boundary | Prefilter throughput | Pattern matches |
+|---------------|----------------------|-----------------|
+| Unicode `\b` | 9.8-10.6 MiB/s | baseline |
+| ASCII `(?-u:\b)` | 261-284 MiB/s | identical on all 3.1M strings |
+
+In an A/B incremental index on two identical clones of a 2.1-million-message
+archive (10 minutes each, run one after the other), the ASCII build committed
+53,155 new messages on 10.1 CPU-minutes, against 7,028 on 12.8 CPU-minutes for
+the Unicode build: about 9.5 times the ingest throughput per CPU second. A unit
+test rejects any secret pattern that reintroduces a Unicode `\b`, so the cliff
+cannot quietly come back.
 
 ## 📦 Installer Strategy
 
@@ -3255,19 +3419,25 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 
 1. **Background Check**: On TUI startup, a background thread queries GitHub releases
 2. **Rate Limiting**: Checks run at most once per hour to avoid API rate limits
-3. **Non-Blocking**: Update checks never slow down TUI startup or search operations
+3. **Non-Blocking**: Update checks never slow down TUI startup or search operations; nothing is asked before the TUI draws
 4. **Offline-Safe**: Failed network requests are silently ignored
 
 ### Update Notifications
 
-When a new version is available, a notification appears in the TUI with:
-- Current version vs. available version
-- Release highlights (from GitHub release notes)
-- Options: **Update Now** | **Skip This Version** | **Remind Later**
+When a new version is available, a one-line banner appears at the top of the TUI:
+
+```
+Update v<current> -> v<latest> | Alt+U upgrade | Alt+N notes | Alt+I ignore | Esc dismiss
+```
+
+- **Alt+U** arms the upgrade; press **Alt+U** again to confirm
+- **Alt+N** opens the release page in your browser
+- **Alt+I** skips this version
+- **Esc** hides the banner for this session
 
 ### Self-Update Installation
 
-Selecting "Update Now" runs the same verified installer used for initial installation:
+Confirming **Alt+U** runs the same verified installer used for initial installation:
 
 macOS/Linux:
 
@@ -3288,26 +3458,23 @@ The update process:
 
 ### Skip Version
 
-If you're not ready to update, "Skip This Version" records the skipped version in persistent state. That specific version won't trigger notifications again, but future versions will.
+If you're not ready to update, **Alt+I** records the skipped version in persistent state. That specific version won't trigger notifications again, but future versions will.
 
 ### Disable Update Checks
 
-For automated environments or personal preference:
+For automated environments or personal preference, set any of these:
 
 ```bash
-# Environment variable
-export CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1
-
-# Or for fully headless operation
-export TUI_HEADLESS=1
+export CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1   # or CASS_SKIP_UPDATE=1
+# Checks are also off when CI or TUI_HEADLESS is set
 ```
 
 ### State Persistence
 
-Update check state is stored in the data directory:
-- `last_update_check`: Timestamp of last check (for rate limiting)
-- `skipped_version`: Version user chose to skip
-- Both are reset on manual update or by deleting `tui_state.json`
+Update check state is stored in `update_state.json` in the data directory:
+- `last_check_ts`: Unix timestamp of the last successful check (for rate limiting)
+- `skipped_version`: Version you chose to skip
+- Delete `update_state.json` to reset both
 
 ---
 
@@ -3342,8 +3509,10 @@ Update check state is stored in the data directory:
 |----------|---------|-------------|
 | **Core** | | |
 | `CASS_DATA_DIR` | Platform default | Override data directory |
-| `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Override database path |
+| `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Same as `--db` (the flag wins): path of the canonical database. When it lies outside the data dir, derived assets (lexical index, checkpoints, locks) follow its directory unless `--data-dir` is given |
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
+| `CASS_OUTPUT_FORMAT` | unset | `json`, `jsonl`, `compact`, `sessions` or `toon` makes robot output the default, as if `--robot-format` were given |
+| `CASS_SSH_CONFIG` | unset | SSH config file passed as `ssh -F <path>` for remote sources (cass also sets `BatchMode=yes` and `StrictHostKeyChecking=yes`) |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `536870912` | Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available |
@@ -3351,6 +3520,7 @@ Update check state is stored in the data directory:
 | **Background Indexing** | | |
 | `CASS_AUTO_REFRESH` | `1` | Stale-on-read catch-up for a stale/partial/behind index seen by `search`, `pack`, or TUI launch. Set `0` to disable globally; `search --no-maintenance` always remains read-only. A spawned catch-up that ends without advancing `last_indexed_at` (OOM-killed in a memory-capped scope, stall-aborted, crashed) counts as a failure: the next attempt waits 1 h, then 6 h, and three failures in a row trip the breaker (no auto-spawn until any run completes). `--robot-meta`/`status --json` report `auto_refresh.outcome` = `backed_off`/`tripped` with `consecutive_failures` and `detail`; `schedule status` and `doctor` show the same. |
 | `CASS_AUTO_REFRESH_COOLDOWN_SECS` | `300` | Minimum spacing between auto-spawned catch-up runs per data dir |
+| `MALLOC_ARENA_MAX` | `2` for background children | glibc allocator arena cap that cass gives each background index child when you have not set it: stale-on-read catch-up, background repair and scheduled job steps. A full lexical rebuild of a 3.7M-message archive peaked at 13.1 and 17.4 GB anonymous RSS in two runs with the cap, versus 19.7 and 19.8 GB with glibc's default, with no consistent difference in wall time. Foreground `cass index` inherits your environment unchanged; set the variable yourself to override either way. Non-glibc allocators ignore it. |
 | `CASS_FTS_INLINE_BUDGET_SECS` | `300` | Wall-clock one index run may spend writing the `fts_messages` SQL-fallback shadow inline. Past it the rest of the run skips the shadow (canonical rows and the Quill index still land, `last_indexed_at` advances) and the reason is recorded for `doctor`; the shadow is behind until a repair. Exists because fsqlite's FTS5 does O(table) work per statement on a large shadow (GH #413, frankensqlite#405/#406). `0` disables. |
 | `CASS_FTS_REPAIR_PAGE_BUDGET_SECS` | `120` | Per-page budget for the paged shadow repair/rebuild (`index --full`, `doctor --fix`): a page over budget stops the repair truthfully (shadow left Partial, reason recorded) instead of wedging the run. `0` disables. |
 | `CASS_FTS_SHADOW_MAX_MESSAGES` | `100000` | Largest canonical corpus (indexable message count) for which cass keeps the `fts_messages` SQL-fallback shadow at all. fsqlite's FTS5 rebuilds the whole shadow in memory on the first write after every writable open (about 32 KB of RAM per message: a 631k-message archive costs 20 GB and minutes before anything is indexed), so above the bound the index run drops the shadow before its first write (through a deferred-FTS5 connection), records why (`status` `index.fallback_fts_repair`, `doctor` `fts_table`), and does not recreate it until the corpus fits. Quill lexical search is unaffected; the SQL fallback scans `messages`. `0` disables the bound. |
@@ -3358,6 +3528,7 @@ Update check state is stored in the data directory:
 | `CASS_BACKGROUND_IONICE_CLASS` | `3` | ionice class for `cass index --background` on Linux (3 = idle) |
 | `CASS_DAEMON_INDEX_INTERVAL_SECS` | `0` | While the semantic daemon is resident, spawn an incremental background index every N seconds (`900` recommended; 0 = off) |
 | `CASS_SCHEDULE_MAX_BACKFILL_BATCHES` | `200` | Maximum backfill batch attempts shared across the nightly workers; each tier retains one loaded model while running its remaining allowance |
+| `CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS` | `10800` | Longest severe machine load may keep skipping scheduled incremental runs, counted from the last incremental run that completed; past it the run goes ahead at scheduler priority (the indexer still throttles itself). `0` = skip for load without limit |
 | `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` | `0` | Require N seconds of console idle (macOS `HIDIdleTime`) before the nightly job / scheduled backfill runs; fails open where unavailable |
 | **Indexing & Redaction** | | |
 | `CASS_INDEX_REDACTION` | `full` | Index-time secret redaction: `full` scrubs API keys/tokens/passwords/private keys from every persisted message, title, snippet, and metadata blob before they reach SQLite or the lexical index; `off` skips redaction for faster ingest. **`off` means raw text is indexed** — note that the original session files and the cass raw-mirror blobs (`<data_dir>/raw-mirror/v1/`) already contain the same raw text unencrypted on the same disk, so `full` protects the queryable surfaces (search results, exports, robot output), not disk-at-rest secrecy. Unrecognized values warn and behave as `full`. |
@@ -3387,12 +3558,20 @@ Update check state is stored in the data directory:
 | **Search & Cache** | | |
 | `CASS_CACHE_SHARD_CAP` | 256 | Per-shard LRU cache entries |
 | `CASS_CACHE_TOTAL_CAP` | 2048 | Total cached search hits |
-| `CASS_CACHE_BYTE_CAP` | 10485760 | Cache byte limit (10MB) |
+| `CASS_CACHE_BYTE_CAP` | available memory / 128, clamped to 64 MiB–2 GiB | Search-hit cache byte limit; `0` disables the byte guard |
+| `CASS_CACHE_EVICTION_POLICY` | `lru` | Cache eviction policy: `lru` or `s3-fifo` |
+| `CASS_SEARCH_BUDGET_MS` | 120000 | Robot search time budget; on expiry search exits 0 with `budget.timed_out` |
+| `CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS` | 10000 | Automatic wildcard fallback for sparse results runs only on indexes with at most this many documents; `0` disables it |
 | `CASS_WARM_DEBOUNCE_MS` | 120 | Warm-up search debounce |
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
 | `CASS_QUILL_QUERY_FUEL_BUDGET` | Quill default (10000000) | Escape hatch for Quill's deterministic per-query work ceiling (GH #441). Zero or unparseable values keep the engine default. When fuel runs out on a hybrid query the lexical leg is dropped, the semantic leg still answers, and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only queries return an actionable hint. The durable fix for fuel exhaustion is a consolidated index (an incremental `cass index` folds fragmented generations in its maintenance pass; `--full` rebuilds from scratch), and cass now publishes Quill snapshots only on its own commits (no per-second visibility seals), which is what let segment counts grow into the hundreds on append-only archives |
 | `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES` | 1073741824 (1 GiB) | Maximum estimated output per lexical merge run, including the covered document-ID range. Oversized singleton segments remain unmerged. This is a merge-planning limit, not a total-process RSS ceiling. Positive byte values accept underscores; zero or invalid values keep the default. Independently of this cap, a merge run never holds more than 4,194,304 documents (Quill's per-term posting limit), and Quill's own tier merge is disabled, so archives with several million messages rebuild into several segments (GH #498). |
-| `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` | unset | Skips the free-space preflight that `cass index --full` / `--force-rebuild` runs before starting. The requirement is `max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)`, where the lexical figure counts only the live published index. Merge-retired segments, retained publish backups and a failed rebuild's leftover `.rebuild-staging` generation are reported but not doubled. Query it before a run with `cass doctor --json \| jq .storage_pressure.full_rebuild_readiness`, which shows `required_bytes`, `available_bytes`, `shortfall_bytes` and each input (GH #496). Set to `1` only when you know the disk can hold the rebuild. |
+| `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES` | 8388608 (8 MiB) | Most text of any one message that the lexical index holds; the rest of that message (typically a pasted image or base64 blob) is not searchable. It never limits a conversation: every message of a long session is indexed, and rebuilds and incremental updates read long sessions in bounded chunks. Zero or invalid values keep the default. |
+| `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` | unset | Skips the free-space preflight that `cass index --full` / `--force-rebuild` runs before starting. The requirement is `max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)`, where the lexical figure counts only the live published index. Merge-retired segments and retained publish backups are reported but not doubled, and a failed rebuild's leftover `.rebuild-staging` generation is subtracted, because the next rebuild resumes into it or clears it first. Query it before a run with `cass doctor --json \| jq .storage_pressure.full_rebuild_readiness`, which shows `required_bytes`, `available_bytes`, `shortfall_bytes` and each input (GH #496). Set to `1` only when you know the disk can hold the rebuild. |
+| `CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS` | 5000000 (50000 in v0.9.0 and earlier) | Largest index (in documents) for which a full result page still reports an exact `total_matches`; above it the count is `limit + 1`, a lower bound (`_meta.cursor_manifest.count_precision` says which). `0` disables exact counting. See *Match Counts: Exact or Lower Bound* |
+| `CASS_SEARCH_BUDGET_MS` | 120000 | Default robot-mode search budget when `--timeout` is not given. A search that runs out of it exits 0 with `budget.timed_out: true`, which means "no complete answer", not "no matches" |
+| `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` | 30000 | How long a human-mode search, or a robot search whose index is still readable, waits for an active lexical rebuild before returning exit 7 `index-busy`. With `--timeout`, the wait also stops at nine tenths of the time remaining. A robot search with no searchable generation does not wait |
+| `CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES` | 1073741824 (1 GiB) | Largest archive (database plus WAL) that a search may repair inline; plain `cass index` compares the database file alone against the same value to decide whether to defer the authoritative lexical repair to `--full`. Over it, search refuses with `maintenance-required` and starts a detached `cass index --full --background` (see *When the Index Is Missing*) |
 | **Semantic Search** | | |
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash`, `minilm`, or explicit `multilingual-minilm` |
 | `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
@@ -3404,8 +3583,7 @@ Update check state is stored in the data directory:
 | `TUI_HEADLESS` | unset | Disable interactive features |
 | `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
 | `CASS_DISABLE_ANIMATIONS` | unset | Disable UI animations |
-| `EDITOR` | `$VISUAL` or `vi` | External editor command |
-| `EDITOR_LINE_FLAG` | `+` | Line number flag (e.g., `+42`) |
+| `EDITOR` | then `$VISUAL`, then `code` | External editor command (line-number flags are chosen per editor) |
 | **Updates** | | |
 | `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | unset | Disable update notifications |
 | **Connector Overrides** | | |
@@ -3417,11 +3595,11 @@ Update check state is stored in the data directory:
 | `OMP_PROFILE` | unset | Active OMP profile; takes precedence over `PI_PROFILE` |
 | `PI_PROFILE` | unset | Legacy OMP profile selector when `OMP_PROFILE` is unset |
 | `PI_CONFIG_DIR` | `.omp` | Home-relative OMP config directory name |
-| `XDG_DATA_HOME` | platform default | OMP XDG data root (`$XDG_DATA_HOME/omp`) when present |
+| `XDG_DATA_HOME` | platform default | OMP XDG data root (`$XDG_DATA_HOME/omp`) when present; also moves cass's own data dir to `$XDG_DATA_HOME/coding-agent-search` when `CASS_DATA_DIR` is unset |
 | `CASS_MUSE_DATA_ROOT` | `~/.local/share/muse` | Muse Code data root |
 | `CODEX_HOME` | `~/.codex` | Codex data directory |
-| `GEMINI_HOME` | `~/.gemini` | Gemini CLI directory |
-| `OPENCODE_STORAGE_ROOT` | (scans home) | OpenCode storage |
+| `GEMINI_HOME` | `~/.gemini/tmp` | Gemini CLI session directory |
+| `OPENCODE_STORAGE_ROOT` | XDG data dir, XDG config dir, then `~/.local/share/opencode/storage` | OpenCode storage (fixed candidates; no home scan) |
 | `CHATGPT_ENCRYPTION_KEY` | unset | Base64-encoded AES key for ChatGPT v2/v3 |
 
 ---
@@ -3432,7 +3610,7 @@ The manifests and lockfile pin the entire SQLite family used by CASS (including
 `fsqlite-types`) at `=0.4.4`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
-archive. `franken-agent-detection =0.3.0` is published. SQLite `0.4.2` adds
+archive. `franken-agent-detection =0.3.2` is published. SQLite `0.4.2` adds
 explicit derived WAL-index recovery for read-only opens (GH#477); its
 upstream recovery, compiler, and package gates passed. All 25 SQLite packages
 are now published at 0.4.4, which adds durable pending-freelist repairs.
@@ -3442,7 +3620,6 @@ Registry resolution and selected consumer checks have passed; full runtime
 qualification and the strict UBS gate remain pending. Selected checks do not
 qualify a release or prove recovery of a damaged archive.
 The candidate must not be released until the remaining gates pass.
-The table below records the previous graph for historical context.
 The build guard enforces the reviewed
 uniform SQLite 0.4.4 versions, a single resolution per package, and registry sources.
 The September 17 FrankenSearch publication blocker is resolved.
@@ -3451,10 +3628,10 @@ The September 17 FrankenSearch publication blocker is resolved.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.18` (updated 2026-09-07; adds parameterized rowid IN-list seeks for GH#415/cass#382, read-only WAL byte/timestamp preservation, reader-registration error propagation, I/O buffer lifetime fixes, and WAL-mode transition and scalar-query corrections). Retains 0.3.17's WAL-tail indexing, reserved lock-byte/freelist repair, FTS metadata/visibility and prefix-BM25 fixes, plus earlier FTS5 savepoint undo, incremental content-backed INSERT, read-only integrity preflight and Windows close repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. The async facade and asupersync requirement are unchanged; `src/franken_sync.rs` preserves cass's synchronous call shape via a current-thread asupersync `block_on` bridge. This version does not resolve upstream GH#411's mixed-engine concurrent-WAL limitation. |
-| `franken-agent-detection` | crates.io `=0.2.4` (2026-09-10; restores the legacy Copilot CLI `history.json` `workspacePath` alias that 0.2.3 dropped when CLI parsing moved out of `copilot.rs`, so those sessions no longer index with no workspace at all, and attributes Cursor Agent workspaces from the `.workspace-trusted` sidecar rather than guessing them from the hyphenated project slug (cass#459). Adds an opt-in `grok-bot` connector and keeps Prime watch roots exact. On top of 0.2.3 (2026-09-07; the Antigravity connector probes the IDE store `~/.gemini/antigravity` as well as the `agy` CLI store (cass#454), Claude Code detection honors `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` (cass#448), Codex token usage is read from real rollouts, Claude tool results survive as `role:"tool"` messages, Cursor/OpenCode mirrors dedupe, the 100 MB scan cap applies everywhere, and Shelley discovery names the canonical database path like scan; the Shelley connector and ChatGPT/OMP injection seams are published). Retains 0.2.2's Cursor/Antigravity/Grok scan-root scoping and Aider, Copilot CLI, Amp, OpenCode, ClawdBot and Muse session-loss fixes. Aligned with fsqlite 0.3.x + asupersync 0.4.x. |
-| `asupersync` | `=0.4.10` (publishes `Cx::is_cancelled`, required by Quill 0.2.3; runtime validation is pending. fsqlite 0.3.x names the 0.4.x types in its public API.) |
-| `frankensearch` | crates.io `=0.4.3` / Quill `0.2.3` (cass#453). Segment collection uses retirement-receipt age so subsequent publication does not restart the grace period; `Cx::is_cancelled` comes from Asupersync `0.4.10`. Preserves the explicit multilingual MiniLM embedding space, Windows Quill publication, `cass-compat` → `lexical-tantivy` differential oracle, pure-Rust `native` embeddings, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission and generation-pinned hydration. Registry `0.3.2` is a stale same-version twin without quill/cass-compat/native, so exact pins remain required. Frankentorch resolves as `frankentorch-*`, HNSW as `frankenhnsw 0.3.5`, and Tantivy as `=0.26.1`. RUSTSEC-2026-0253 on Tantivy's lru requires a panicking key destructor under `catch_unwind`; Tantivy's cache keys are trivially droppable. |
+| `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.4` (tag v0.4.4 = `9d3d98778a372aba95d76d05c5c974ac0238c96a`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477) and 0.4.4's durable pending-freelist repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
+| `franken-agent-detection` | crates.io `=0.3.2` |
+| `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
+| `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.4` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, published from the `frankensearch-quill-v0.3.4` hotfix tag), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 

@@ -708,7 +708,7 @@
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
+          "description": "Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -2144,6 +2144,17 @@
           ]
         },
         {
+          "name": "repair-leaked-pages",
+          "description": "Free leaked pages (integrity_check's \"page N is never used\": pages no table, index or freelist owns) in place. Refuses any other integrity damage. Supports `--dry-run`; mutation requires `--yes` and backs up the live bundle first (`cass doctor backups restore`)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "cleanup-interrupted-artifacts",
           "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
           "arg_type": "flag",
@@ -2562,8 +2573,9 @@
         },
         {
           "name": "include-tools",
-          "description": "Include tool calls in export (default: true)",
-          "arg_type": "flag",
+          "description": "Include tool calls in the export; `--include-tools=false` omits them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2573,8 +2585,9 @@
         },
         {
           "name": "show-timestamps",
-          "description": "Show message timestamps",
-          "arg_type": "flag",
+          "description": "Show message timestamps; `--show-timestamps=false` hides them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2900,6 +2913,18 @@
           ]
         },
         {
+          "name": "share-profile",
+          "description": "Share profile applied to every exported text: public (home paths, usernames, project names, hostnames, emails and other personal data), team (home paths and personal data), personal (nothing). Credentials are never rewritten; the secret scan rejects them. Default: public for a plaintext export, team when encrypted",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "public",
+            "team",
+            "personal"
+          ]
+        },
+        {
           "name": "target",
           "description": "Deployment target: local, github, cloudflare",
           "arg_type": "option",
@@ -3118,7 +3143,7 @@
     },
     {
       "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
+      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets. Source files are kept: a source that changes afterwards is indexed again",
       "arguments": [
         {
           "name": "source-glob",
@@ -3507,9 +3532,9 @@
     },
     {
       "code": "4",
-      "meaning": "network error",
-      "retryable": "yes",
-      "agent_action": "Check connectivity or remote source configuration, then retry."
+      "meaning": "I/O failure or unsafe operation refused",
+      "retryable": "maybe",
+      "agent_action": "Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23."
     },
     {
       "code": "5",
@@ -3519,9 +3544,9 @@
     },
     {
       "code": "6",
-      "meaning": "incompatible version",
+      "meaning": "required input missing",
       "retryable": "no",
-      "agent_action": "Upgrade cass or the calling client before retrying."
+      "agent_action": "Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun."
     },
     {
       "code": "7",
@@ -3531,9 +3556,9 @@
     },
     {
       "code": "8",
-      "meaning": "partial result",
+      "meaning": "partial result (sources sync only)",
       "retryable": "yes",
-      "agent_action": "Increase timeout or page through remaining results."
+      "agent_action": "Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead."
     },
     {
       "code": "9",
@@ -3600,6 +3625,18 @@
       "meaning": "I/O during model verify/install",
       "retryable": "maybe",
       "agent_action": "Fix filesystem permissions or disk space, then retry."
+    },
+    {
+      "code": "70",
+      "meaning": "index stalled and aborted",
+      "retryable": "yes",
+      "agent_action": "Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start."
+    },
+    {
+      "code": "130",
+      "meaning": "interrupted (SIGINT)",
+      "retryable": "yes",
+      "agent_action": "Rerun the command; cass sources setup --resume continues an interrupted setup."
     }
   ],
   "env_vars": [
@@ -3781,6 +3818,11 @@
       "name": "CASS_SCHEDULE_MAX_BACKFILL_BATCHES",
       "default": "200",
       "description": "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute."
+    },
+    {
+      "name": "CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS",
+      "default": "10800",
+      "description": "Longest severe machine load may keep skipping scheduled incremental runs, measured from the last incremental run that completed; past it the run goes ahead at scheduler priority. 0 = skip for load without limit."
     },
     {
       "name": "CASS_INDEX_STALL_DETECT_SECS",

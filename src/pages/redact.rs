@@ -786,7 +786,9 @@ fn build_username_patterns(
 }
 
 fn build_username_pattern(username: &str, replacement: &str) -> Option<(Regex, String)> {
-    if username.is_empty() {
+    // A username equal to its replacement would "redact" forever: every pass
+    // reports a change, so a verifier rescanning redacted text never converges.
+    if username.is_empty() || username == replacement {
         return None;
     }
     let escaped = regex::escape(username);
@@ -904,6 +906,31 @@ mod tests {
         engine.config.redact_home_paths = false;
         let result = engine.redact_text("Error in /home/alice/projects/app.rs");
         assert!(result.output.contains("/home/user/"));
+    }
+
+    #[test]
+    fn redacted_paths_rescan_clean_even_for_an_account_named_user() {
+        for home in ["/home/alice", "/home/user"] {
+            let mut engine = engine_with_context(home);
+            engine.config.redact_home_paths = false;
+            let once = engine.redact_text(&format!("Error in {home}/projects/app.rs"));
+            assert_eq!(once.output, "Error in /home/user/projects/app.rs");
+            let again = engine.redact_text(&once.output);
+            assert!(
+                again.changes.is_empty(),
+                "{home}: a second pass must find nothing to redact, got {:?}",
+                again.changes
+            );
+        }
+        // Negative: a different account's path is still rewritten.
+        let mut engine = engine_with_context("/home/alice");
+        engine.config.redact_home_paths = false;
+        assert!(
+            !engine
+                .redact_text("/home/alice/notes.txt")
+                .changes
+                .is_empty()
+        );
     }
 
     #[test]

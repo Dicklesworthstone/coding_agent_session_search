@@ -125,7 +125,7 @@ because of that day:
 We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (dated nightly pinned by `rust-toolchain.toml`)
-- **Dependency versions:** Wildcard constraints (`*`) for all crates
+- **Dependency versions:** Caret minimums resolved through the committed `Cargo.lock`. The SQLite family, Asupersync, Frankensearch, FAD, FrankenTUI and toon use exact `=` pins (see the dependency source contract below). `sysinfo`, `libc` and the dev-only `tokenizers` use `*`
 - **Configuration:** Cargo.toml only (single-crate project, no workspace)
 - **Unsafe code:** Forbidden as a general tool. Tightly scoped, narrowly audited `unsafe` is allowed only where it is unavoidable (e.g., the few Rust 2024 `std::env::set_var`/`remove_var` calls at controlled startup/teardown, or unavoidable FFI with no safe wrapper). Unsafe cross-thread connection wrappers and unjustified `Send`/`Sync` impls remain prohibited and must be UBS-gated.
 
@@ -159,11 +159,11 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `clap` | CLI argument parsing with derive macros |
 | `serde` + `serde_json` | Serialization |
 | `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend |
-| `rusqlite` | SQLite database (bundled) — legacy, retained during frankensqlite migration |
+| `rusqlite` | Dev-dependency only: C-SQLite interop fixtures in tests. Production never links it (historical salvage uses the external `sqlite3` CLI) |
 | `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion |
 | `franken_agent_detection` | Agent session auto-detection across 15+ providers |
 | `frankentorch` (via `frankensearch`) | Pure-Rust native MiniLM embeddings and reranking |
-| `hnsw_rs` | HNSW approximate nearest neighbors |
+| `frankenhnsw` (via `frankensearch`) | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
 | `ftui` + `ftui-extras` | FrankenTUI terminal interface |
 | `toon` | Terminal rendering library |
@@ -176,7 +176,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `aes-gcm` + `ring` + `pbkdf2` + `argon2` | Encryption (ChatGPT conversations, HTML export) |
 | `ssh2` | SFTP fallback for multi-machine sync |
 | `dialoguer` | Interactive terminal prompts (setup wizard) |
-| `syntect` | Syntax highlighting |
+| `ftui-extras` (`syntax` feature) | Syntax highlighting |
 | `thiserror` | Ergonomic error type derivation |
 | `tracing` | Structured logging and diagnostics |
 | `unicode-normalization` | NFC text canonicalization |
@@ -203,19 +203,17 @@ release candidate until those gates pass.
 SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
 (GH#477); upstream recovery, compiler, and package gates passed. CASS consumer
 runtime qualification remains pending.
-The table below is historical during this transition; its GH#411-open statement
-is superseded by upstream closure. The published SQLite 0.4.1 includes the
-GH#462 reserved-page WAL repair, but damaged-archive recovery remains unproven.
-SQLite 0.4.4 adds durable pending-freelist repairs. The strict family guard
-requires uniform 0.4.4 registry versions. The September 17 publication blocker
-is resolved; the historical table below does not describe the current lockfile.
+The published SQLite 0.4.1 includes the GH#462 reserved-page WAL repair, but
+damaged-archive recovery remains unproven. SQLite 0.4.4 adds durable
+pending-freelist repairs. The strict family guard requires uniform 0.4.4
+registry versions.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.18` (owner-requested update 2026-09-07; release commit `1600766ca698dae99b6018474bc8c150ece4a82d`, 42 commits since 0.3.17). Adds parameterized rowid IN-list seeks (GH#415/cass#382), read-only WAL byte/timestamp preservation, reader-registration error propagation, I/O buffer lifetime fixes, and WAL-mode transition and scalar-query corrections. The async facade and asupersync requirement remain unchanged. Retains 0.3.17's incremental WAL-tail folding, reserved lock-byte/freelist repair (GH#410), FTS metadata/visibility fixes (GH#408), prefix-BM25 ranking and prepared-read cleanup, plus 0.3.16's GH#405 FTS5 savepoint undo log and GH#406 incremental content-backed INSERT. 0.3.15 was evaluated and not adopted; historical evidence remains in bead gh382-fsqlite-pin. This update does not prove repair of the owner's existing archive corruption, and upstream GH#411 mixed-engine concurrent-WAL safety remains unresolved. `build.rs` enforces the exact version for the whole fsqlite family. |
-| `franken-agent-detection` | crates.io `=0.2.3` (2026-09-07; the Antigravity connector probes the IDE store `~/.gemini/antigravity` as well as the `agy` CLI store with `ide/<uuid>` provenance (cass#454), Claude Code detection honors `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` (cass#448), Codex token usage is read from real rollouts, Claude tool results survive as `role:"tool"` messages, Cursor/OpenCode mirrors dedupe, the 100 MB scan cap applies everywhere, Shelley discovery names the canonical database path like scan, and the Shelley connector, FAD#22 source-boundary seam, and chatgpt/omp injection seams are now published. CASS enables the `devin` feature for visible local sessions in `~/.local/share/devin/cli/sessions.db` (override `CASS_DEVIN_DATA_ROOT`); cloud-only Devin history remains out of scope. Retains 0.2.2's cursor/antigravity/grok scan-root scoping and aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes; aligned with fsqlite 0.3.x + asupersync 0.4.x) |
-| `asupersync` | `=0.4.10` (crates.io; publishes `Cx::is_cancelled`, required by Quill 0.2.3; runtime validation is pending. fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable.) |
-| `frankensearch` | crates.io `=0.4.3` / Quill `0.2.3` (cass#453). Segment collection uses retirement-receipt age so subsequent publication does not restart the grace period; `Cx::is_cancelled` comes from Asupersync `0.4.10`. Preserves the explicit multilingual MiniLM embedding space, Windows Quill publication, `cass-compat` → `lexical-tantivy` differential oracle, pure-Rust `native` embeddings, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission and generation-pinned hydration. Registry `0.3.2` is a stale same-version twin without quill/cass-compat/native, so exact pins remain required. Frankentorch resolves as `frankentorch-*`, HNSW as `frankenhnsw 0.3.5`, and Tantivy as `=0.26.1`. RUSTSEC-2026-0253 on Tantivy's lru requires a panicking key destructor under `catch_unwind`; Tantivy's cache keys are trivially droppable. |
+| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.4` (tag v0.4.4 = `9d3d98778a372aba95d76d05c5c974ac0238c96a`); `build.rs` refuses a mixed family. Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477) and 0.4.4's durable pending-freelist repairs. CASS runtime qualification of 0.4.4 is pending. Known defect: a long-lived connection can be left refusing every BEGIN after other connections commit (2l1b0.75) |
+| `franken-agent-detection` | crates.io `=0.3.2` (indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
+| `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x requires) |
+| `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.4`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.3.4 is a hotfix published from tag `frankensearch-quill-v0.3.4`: 0.3.2 (frankensearch-v0.6.1 + the GH#499 tombstone-domain fix), plus 0.3.3's standard CASS Boolean grammar (NOT > AND > OR, parentheses), plus the union seek_danger fix (a disjunction under a conjunction lost matches on concat-merged segments). The next quill release from frankensearch main must be >= 0.3.5 and must carry both (frankensearch#56, and the union issue linked there) |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
@@ -503,6 +501,7 @@ Provides unified full-text and semantic search across all local coding agent ses
 - **Semantic enrichment is opportunistic.** Lexical-only behavior is expected during first indexing, semantic backfill, disabled semantic policy, missing model files, or vector catch-up.
 - **Semantic model acquisition is opt-in.** `cass models install` downloads the MiniLM model (~90 MB) on explicit operator request. cass never auto-downloads. Air-gapped installs use `--from-file <dir>`. While the model is absent, `fallback_mode="lexical"` is reported in health/status and queries silently degrade to lexical-only.
 - **Truth surfaces:** `cass health --json`, `cass status --json`, and search `--robot-meta` expose readiness, active rebuilds, realized search mode, fallback tier, and recommended action. Follow those fields instead of hard-coded manual repair rituals.
+- **No silent substitution.** An input that cannot take effect is a typed error (or, only where the contract says so, a typed warning in `_meta.warnings`), never dropped: a bad `--since`, a flag typo on an exact subcommand, and an ignored env override have each run a different query with exit 0. Search `--robot-meta` echoes what actually ran under `_meta.effective` (database path and its source, the resolved time window with the flag behind each bound, parsed filters, argv auto-corrections, the engine's query grouping and recovered parentheses), and `_meta.wildcard_fallback_skipped` says why a sparse result got no automatic wildcard retry; when you add an input that changes what search does, echo it there and extend `tests/search_metamorphic.rs` (2l1b0.68).
 - **Lexical query fuel is bounded.** cass opens Quill with the engine's deterministic per-query work ceiling (10,000,000 units; `CASS_QUILL_QUERY_FUEL_BUDGET` is an escape hatch, not a tuning knob). If a hybrid search exhausts it, the lexical leg is dropped rather than failing the search and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`; lexical-only searches get an actionable hint. cass publishes Quill snapshots only on its own commits (`max_visibility_lag_ms` is disabled in `src/search/quill_bridge.rs::cass_quill_config`), which stops the per-second seals that grew append-only archives into hundreds of tiny segments (GH #440/#441); `cass index --full` consolidates an archive that already fragmented.
 
 ### Keeping the Index Fresh (do not hand-roll cron for this)
@@ -512,6 +511,7 @@ Provides unified full-text and semantic search across all local coding agent ses
 
 - **Stale-on-read catch-up is on by default.** When `search`/`pack`/TUI launch sees a stale (>30 min), partial, or behind index, cass spawns a *detached* `cass index --background` (nice 15 / ionice idle, own process group, 5-min cooldown, honors `index-run.lock`) and returns the current results immediately. `--robot-meta` shows it under `_meta.index_freshness.auto_refresh` (`outcome`: `spawned|disabled|index_run_active|cooldown|guard_busy|spawn_failed`, plus `trigger`). It never fires for data dirs under the OS temp dir or under `TUI_HEADLESS`, so tests are unaffected. `CASS_AUTO_REFRESH=0` disables. Implementation: `src/indexer/background_refresh.rs`, hook `maybe_auto_refresh_index_after_read` in `src/lib.rs`.
 - **A missing or unusable index is rebuilt in the background, never by the search that found it.** When search needs a lexical repair it will not run inline (archive over the inline repair budget, or a robot caller facing `checkpoint_incomplete`), it spawns the same detached child with `--full` (or plain `cass index` for a small archive's checkpoint) and puts the outcome in the error hint: pid, "already rebuilding", or why no spawn happened. A rebuild run inside the search process, or an agent's own `cass index --full`, dies with the command timeout that wraps it and a large archive commits nothing before its first batch, so every retry used to start from zero and the index never converged. While a rebuild runs and no searchable generation exists, robot searches return exit 7 `index-busy` with `N of M conversations processed` at once instead of waiting `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS`. Implementation: `start_background_lexical_repair_for_search` in `src/lib.rs`.
+- **TUI first run:** launching the TUI with no index starts the same detached `cass index --full --background` child (same guards: never for scratch/temp data dirs or under `TUI_HEADLESS`, honors `CASS_AUTO_REFRESH`, cooldown and breaker), shows its progress in the status line, and opens search once the first generation publishes, without a restart. Implementation: `CassApp::start_first_run_index` / `poll_first_run_index` in `src/ui/app.rs`.
 - **`cass schedule install`** registers launchd LaunchAgents (macOS) / systemd user timers (Linux): incremental every 15 min, nightly full index + bounded `models backfill --scheduled` (fast/hash tier always, quality/MiniLM tier when installed; model-unavailable and index-busy exits count as skips, not failures) + due `sync_schedule` remote syncs, all at OS background priority. `cass schedule status --json` / `schedule run --job incremental|nightly [--force]` / `schedule uninstall`. Unsupported platforms get `err.kind="schedule"` with a manual recipe. Implementation: `src/schedule.rs`.
 - **Daemon timer:** `CASS_DAEMON_INDEX_INTERVAL_SECS=900` makes the resident semantic daemon spawn the same detached incremental index while it lives (`src/daemon/core.rs::spawn_periodic_index`).
 - **Idle gates:** scheduled jobs skip under severe load (Linux loadavg/PSI, macOS `sysctl vm.loadavg` — `responsiveness::machine_pressure_now`); `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` adds a macOS console-idle requirement for nightly/backfill work (`responsiveness::user_idle_gate`; fails open elsewhere). Foreground `cass index` is never gated.
@@ -522,7 +522,7 @@ Provides unified full-text and semantic search across all local coding agent ses
 
 - Every lexical publish is a **single atomic swap**: on Linux `renameat2(RENAME_EXCHANGE)` exchanges the staged and live index trees in one syscall; non-Linux platforms use a parked-rename + restore-on-failure dance. Readers never see a half-torn index — either the old or the new generation is visible, never a mix.
 - The **prior-live generation is retained** under `<data_dir>/index/.lexical-publish-backups/<dated>/` for a bounded retention window. Default cap: `1` (one-step rollback). Override via `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION` env var: `0` disables retention, `N` keeps the N most-recent backups. Pruning runs after every successful publish and emits `tracing::info!` with `freed_bytes`+`retention_limit`.
-- **Crash recovery is automatic.** If cass crashes between the atomic swap and the retain-rename, the next startup's `recover_or_finalize_interrupted_lexical_publish_backup` finds the canonical sidecar (`.<name>.publish-in-progress.bak`) and completes the retain step before the next publish. See src/indexer/mod.rs::publish_staged_lexical_index.
+- **Crash recovery is automatic.** If cass crashes between the atomic swap and the retain-rename, `recover_or_finalize_interrupted_lexical_publish_backup`, run at the start of the next lexical publish or rebuild, finds the canonical sidecar (`.<name>.publish-in-progress.bak`) and completes the retain step before the next publish. See src/indexer/mod.rs::publish_staged_lexical_index.
 - **Do not handwrite "rebuild lexical" recipes.** Call `cass index --full` or trust stale-refresh; the publish + atomic-swap + retention pipeline is the only blessed path. Anything that removes `<data_dir>/index/` directly outside publish is off-contract.
 
 ### Quarantine, GC, and Doctor
@@ -667,6 +667,14 @@ cass robot-docs guide         # LLM-optimized docs
 | Grok Build | `grok.rs` | ACP updates JSONL |
 | Goose | `goose.rs` | SQLite (`sessions.db`, v1.20+) / legacy per-session JSONL |
 | Muse Code | `muse.rs` | JSONL |
+| Prime Agent | FAD `prime_agent` | JSONL |
+| Grok Bot | FAD `grok_bot` (feature `grok-bot`) | local rolling chat replica |
+| Codebuff / Freebuff | FAD `codebuff` (feature `codebuff`) | Manicode chat JSON |
+| Devin CLI | FAD `devin` (feature `devin`) | SQLite (`sessions.db`) |
+| Shelley | FAD `shelley` (feature `shelley`) | SQLite |
+| Kiro CLI | FAD `kiro` | event-log JSONL + JSON snapshot |
+
+All 32 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
 
 ### HTML Export (Robot Mode)
 
@@ -704,10 +712,10 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 **Error codes:**
 | Code | Kind | Description |
 |------|------|-------------|
-| 3 | session_not_found | Session file doesn't exist |
-| 4 | output_not_writable | Cannot write to output directory |
-| 5 | encryption_error | Encryption failed |
-| 6 | password_required | --encrypt used without password |
+| 3 | session-not-found | Session file doesn't exist |
+| 4 | output-not-writable / invalid-filename | Cannot write to the output directory, or `--filename` is unusable |
+| 5 | export-failed | Rendering or encrypting the HTML failed |
+| 6 | password-required / password-read-error | `--encrypt` without a password, or `--password-stdin` could not be read |
 | 9 | opencode-parse / opencode-sqlite-parse / indexed-session-required / empty-session | Session could not be parsed, is not an indexed conversation or JSONL/OpenCode session, or has no messages |
 
 ### Key Flags
@@ -715,7 +723,7 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 | Flag | Purpose |
 |------|---------|
 | `--robot` / `--json` | Machine-readable JSON output (required!) |
-| `--fields minimal` | Reduce payload: `source_path`, `line_number`, `agent` only |
+| `--fields minimal` | Reduce payload: `source_path`, `line_number`, `agent`, `source_id`, `conversation_id` |
 | `--limit N` | Cap result count |
 | `--agent NAME` | Filter to specific agent (claude, codex, cursor, etc.) |
 | `--days N` | Limit to recent N days |
@@ -766,9 +774,9 @@ Returns in <50ms on a healthy archive (the archive probe is the same strict, mut
 | 1 | Health check failed | Yes — inspect `recommended_action` |
 | 2 | Usage/parsing error | No — fix syntax |
 | 3 | Index/DB missing | Yes — run `cass index --full` |
-| 4 | Network error | Yes — check connectivity |
+| 4 | I/O failure or unsafe operation refused (not a network code) | Maybe — branch on `err.kind` (`io`, `output-not-writable`, `refused-unsafe`) |
 | 5 | Data corruption | Yes — inspect health/status, then rebuild derived assets if recommended |
-| 6 | Incompatible version | No — update cass |
+| 6 | Required input missing (password, resume command) | No — supply the input (e.g. `--password-stdin`) |
 | 7 | Lock/busy | Yes — retry later |
 | 8 | Partial result (`sources sync` only: some sources had path failures) | Yes — inspect per-path errors, retry failed sources |
 | 9 | Unknown error | Maybe |
@@ -782,10 +790,12 @@ Returns in <50ms on a healthy archive (the archive probe is the same strict, mut
 | 22 | I/O during model handling | Maybe |
 | 23 | Download failure | Yes — retry or use `--from-file` |
 | 24 | I/O during model verify/install | Maybe |
+| 70 | `cass index` stalled and aborted (kind `index-stalled` envelope on stderr) | Yes — inspect `cass status --json`, rerun `cass index` |
+| 130 | Interrupted (SIGINT) | Yes — rerun; `cass sources setup --resume` continues setup |
 
-Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`; `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` also fails with exit 10, kind `timeout`, retryable, when the budget cannot admit semantic setup or dispatch (ds7uy.4.1); hybrid falls back to lexical with `semantic_budget_limited`.
+Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`; `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` also fails with exit 10, kind `timeout`, retryable, when the budget cannot admit semantic setup or dispatch (ds7uy.4.1); hybrid falls back to lexical with `semantic_budget_limited`.
 
-**Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`, `model`, `download`, `io`). The full set (~50 kinds) lives in `src/lib.rs`.
+**Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `model`, `download`, `io`). The full set (about 90 kinds) lives in `src/model/cli_error_kind.rs`.
 
 ### Multi-Machine Search Setup
 

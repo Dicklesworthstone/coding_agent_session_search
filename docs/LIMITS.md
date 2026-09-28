@@ -121,9 +121,13 @@ not add a `--partial-ok` policy or suppress exit 9 for other incomplete scans.
 
 | Metric | Limit | Notes |
 |--------|-------|-------|
-| Tantivy segments | Auto-merged at 4+ | Configurable |
+| Quill segment merges | The engine's in-commit tier merge is disabled (`tier_fanout = usize::MAX`); cass's capped planners consolidate | `cass index --full` consolidates a fragmented archive |
+| Merge output size | 1 GiB per planned merge (estimate) | `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES`; an oversized singleton is left unmerged; does not cap total RSS |
+| Documents per merge run | 4,194,304 | `MAX_FOLD_OUTPUT_DOCS`, Quill's per-term posting limit |
+| Query work per lexical search | 10,000,000 fuel units | `CASS_QUILL_QUERY_FUEL_BUDGET`; exhausted hybrid searches drop the lexical leg |
+| Integrity preflight | Archives up to 2 GiB | `CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES`; background runs skip the one-time migration repair above it |
 | Schema changes | Trigger full rebuild | Versioned with hash |
-| Concurrent writers | 1 | Tantivy limitation |
+| Concurrent indexers | 1 | `index-run.lock` admits one indexer; others exit 7 `index-busy` |
 | Concurrent readers | Unlimited | Thread-safe |
 
 ## Network/Sync Limits (Remote Sources)
@@ -131,7 +135,7 @@ not add a `--partial-ok` policy or suppress exit 9 for other incomplete scans.
 | Operation | Timeout | Notes |
 |-----------|---------|-------|
 | SSH connection | 10s | Configurable |
-| rsync transfer | 5 min | For large initial syncs |
+| rsync transfer | 300 s of I/O inactivity | rsync `--timeout`; no wall-clock limit on a transfer that keeps moving |
 | SFTP fallback | Per-file | When rsync unavailable |
 
 ## Environment Variable Overrides
@@ -140,8 +144,8 @@ not add a `--partial-ok` policy or suppress exit 9 for other incomplete scans.
 |----------|---------|---------|
 | `CASS_CACHE_SHARD_CAP` | 256 | Max entries per cache shard |
 | `CASS_CACHE_TOTAL_CAP` | 2048 | Total cache entry limit |
-| `CASS_CACHE_BYTE_CAP` | 0 (disabled) | Total cache byte limit |
-| `CASS_PARALLEL_SEARCH` | 10000 | Threshold for parallel vector search |
+| `CASS_CACHE_BYTE_CAP` | available memory / 128, clamped to 64 MiB–2 GiB | Total cache byte limit; `0` disables the byte guard |
+| `CASS_PARALLEL_SEARCH` | `true` | Boolean: parallel vector search on or off |
 | `CASS_WARM_DEBOUNCE_MS` | 120 | Debounce for warm worker |
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force hash/ml embedder |
 | `CASS_STREAMING_INDEX` | true | Enable streaming indexer |

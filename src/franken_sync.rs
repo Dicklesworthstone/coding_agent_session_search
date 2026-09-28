@@ -202,6 +202,14 @@ impl Connection {
         self.inner.last_insert_rowid()
     }
 
+    /// Return every in-range page that neither a b-tree nor the durable
+    /// freelist owns (integrity_check's "page N is never used" class) to the
+    /// freelist through a normal write commit. Returns the pages freed. Run
+    /// only at a quiescent point: no other writer may be active.
+    pub fn repair_orphaned_pages(&self) -> Result<usize, FrankenError> {
+        drive(self.inner.repair_orphaned_pages())
+    }
+
     /// Close the connection (rolls back any active transaction, then runs the
     /// final passive WAL checkpoint).
     pub fn close(mut self) -> Result<(), FrankenError> {

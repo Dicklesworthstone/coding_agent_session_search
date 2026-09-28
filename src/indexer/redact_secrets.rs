@@ -102,18 +102,27 @@ struct SecretPattern {
     regex: Regex,
 }
 
-pub(crate) const AWS_ACCESS_KEY_PATTERN: &str = r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b";
+// Word boundaries are ASCII (`(?-u:\b)`), never Unicode `\b`. A Unicode word
+// boundary stops the regex crate's lazy DFA on any haystack with a non-ASCII
+// byte, and the whole RegexSet then runs on the PikeVM: on 593 MiB of real
+// session text the Unicode set scanned 10 MiB/s and the ASCII set 261-284 MiB/s,
+// with identical pattern matches on all 3.1M strings. Every boundary here sits
+// next to an ASCII word character, and ASCII word characters are a subset of
+// Unicode ones, so the ASCII form matches wherever the Unicode form did (plus a
+// token directly touching a non-ASCII letter): redaction can only get stricter.
+pub(crate) const AWS_ACCESS_KEY_PATTERN: &str = r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)";
 pub(crate) const AWS_SECRET_KEY_PATTERN: &str =
     r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#;
-pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)\baws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)(?-u:\b)aws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
 pub(crate) const GITHUB_TOKEN_PATTERN: &str =
-    r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})\b";
+    r"(?-u:\b)(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})(?-u:\b)";
 pub(crate) const OPENAI_API_KEY_PATTERN: &str =
-    r"\b(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})\b";
+    r"(?-u:\b)(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})(?-u:\b)";
 pub(crate) const ANTHROPIC_API_KEY_PATTERN: &str =
-    r"\bsk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_]\b";
-pub(crate) const BEARER_TOKEN_PATTERN: &str = r"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
-pub(crate) const JWT_PATTERN: &str = r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b";
+    r"(?-u:\b)sk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_](?-u:\b)";
+pub(crate) const BEARER_TOKEN_PATTERN: &str = r"(?i)(?-u:\b)Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
+pub(crate) const JWT_PATTERN: &str =
+    r"(?-u:\b)eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+(?-u:\b)";
 pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
     r"(?s)(?:",
     r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
@@ -126,10 +135,10 @@ pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
     r")",
 );
 pub(crate) const DATABASE_URL_PATTERN: &str =
-    r#"(?i)\b(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
-pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)\b(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
-pub(crate) const SLACK_TOKEN_PATTERN: &str = r"\bxox[bpsaor]-[A-Za-z0-9\-]{10,}";
-pub(crate) const STRIPE_KEY_PATTERN: &str = r"\b[spr]k_live_[A-Za-z0-9]{20,}";
+    r#"(?i)(?-u:\b)(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
+pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)(?-u:\b)(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const SLACK_TOKEN_PATTERN: &str = r"(?-u:\b)xox[bpsaor]-[A-Za-z0-9\-]{10,}";
+pub(crate) const STRIPE_KEY_PATTERN: &str = r"(?-u:\b)[spr]k_live_[A-Za-z0-9]{20,}";
 
 /// All built-in patterns, compiled once on first use.
 static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
@@ -706,6 +715,35 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serial_test::serial;
+
+    /// A Unicode `\b` in any pattern drops the whole RegexSet onto the PikeVM
+    /// for every non-ASCII message (26x slower on real session text); see the
+    /// note above AWS_ACCESS_KEY_PATTERN.
+    #[test]
+    fn secret_patterns_use_only_ascii_word_boundaries() {
+        for pattern in SECRET_PATTERNS.iter() {
+            let without_ascii_boundaries = pattern.pattern.replace(r"(?-u:\b)", "");
+            assert!(
+                !without_ascii_boundaries.contains(r"\b"),
+                "pattern uses a Unicode word boundary: {}",
+                pattern.pattern
+            );
+        }
+    }
+
+    #[test]
+    fn secret_touching_non_ascii_text_is_redacted() {
+        let token = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        for input in [
+            format!("凭据{token}结束"),
+            format!("é{token}é"),
+            format!("🔐 {token} 测试"),
+        ] {
+            let output = redact_text(&input);
+            assert!(!output.contains(token), "{input:?} -> {output:?}");
+            assert!(output.contains(REDACTED), "{input:?} -> {output:?}");
+        }
+    }
 
     /// FROZEN reference implementation of the redaction algorithm as of
     /// the 2026-08 redaction-perf campaign baseline. This is a verbatim

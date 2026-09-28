@@ -1,6 +1,8 @@
 mod exclusions;
 mod source_budget;
 
+pub(crate) use source_budget::over_budget_sources;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};

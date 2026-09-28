@@ -1681,7 +1681,16 @@ fn render_app_text(app: &CassApp, width: u16, height: u16) -> String {
     ftui_harness::buffer_to_text(&frame.buffer)
 }
 
-fn make_session_hit(content_hash: u64, line_number: usize, content: String) -> SearchHit {
+/// `created_at` must be the anchored message's own timestamp (ms): since #493
+/// (d499554f) the detail modal renders a cached view only when it contains the
+/// hit's exact canonical message, so a hit whose timestamp and content match
+/// nothing in the view is correctly shown as "No conversation data loaded".
+fn make_session_hit(
+    content_hash: u64,
+    line_number: usize,
+    created_at_ms: i64,
+    content: String,
+) -> SearchHit {
     SearchHit {
         title: format!("Session A line {line_number}"),
         snippet: String::new(),
@@ -1692,7 +1701,7 @@ fn make_session_hit(content_hash: u64, line_number: usize, content: String) -> S
         source_path: "/session/a.jsonl".into(),
         workspace: "/workspace/cass".into(),
         workspace_original: None,
-        created_at: Some(1_700_000_000),
+        created_at: Some(created_at_ms),
         line_number: Some(line_number),
         match_type: MatchType::Exact,
         source_id: "local".into(),
@@ -1713,8 +1722,8 @@ fn inline_analytics_badges_match_detail_modal_metrics() {
     // Two hits from the same session: inline badges should reflect the same message count
     // as the detail analytics modal (token cost/estimates are intentionally not shown).
     let hits = vec![
-        make_session_hit(11, 1, "a".repeat(4_000)),
-        make_session_hit(12, 2, "b".repeat(2_000)),
+        make_session_hit(11, 1, 1_700_000_000_000, "a".repeat(4_000)),
+        make_session_hit(12, 2, 1_700_000_030_000, "b".repeat(2_000)),
     ];
     let _ = app.update(CassMsg::SearchCompleted {
         generation: app.search_generation,
@@ -1800,6 +1809,18 @@ fn inline_analytics_badges_match_detail_modal_metrics() {
         detail_text.contains("Tokens:   1.5K"),
         "detail analytics should report same token count, got:\n{detail_text}"
     );
+
+    // #493 negative control: the same view relabelled as another session's
+    // file is not this hit's conversation and must not be rendered for it.
+    if let Some((_, view)) = app.cached_detail.as_mut() {
+        view.convo.source_path = PathBuf::from("/session/other.jsonl");
+    }
+    let stale_text = render_app_text(&app, 320, 36);
+    assert!(
+        stale_text.contains("No conversation data loaded for analytics."),
+        "a cached view of a different session must not render for this hit, got:\n{stale_text}"
+    );
+    assert!(!stale_text.contains("2 messages"));
 
     log.assert_ok("inline_badge_messages", "2 msgs", "2 msgs");
     log.assert_ok("detail_modal_tokens", "1.5K tok", "1.5K tok");

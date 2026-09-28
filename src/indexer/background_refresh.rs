@@ -422,6 +422,24 @@ pub fn spawn_detached_analytics_rebuild(data_dir: &Path, db_path: &Path) -> Resu
     Ok(pid)
 }
 
+/// glibc arena cap for background index children (2l1b0.72).
+///
+/// With glibc's default of eight arenas per core, a full lexical rebuild of
+/// the owner's archive peaked at 19.7 and 19.8 GB anonymous RSS (two runs);
+/// with `MALLOC_ARENA_MAX=2` the same rebuild on the same copy peaked at 13.1
+/// and 17.4 GB, and with 8 arenas at 18.5 GB, with no consistent difference
+/// in wall time. After the rebuild ~11 GB sat freed but retained in arenas.
+/// Background runs are the ones that live inside memory-capped scopes and
+/// were OOM-killed. An operator's own setting wins. Non-glibc allocators
+/// ignore the variable.
+pub(crate) fn cap_malloc_arenas_for_background_child(cmd: &mut Command) {
+    if dotenvy::var("MALLOC_ARENA_MAX").is_err() {
+        cmd.env("MALLOC_ARENA_MAX", BACKGROUND_MALLOC_ARENA_MAX);
+    }
+}
+
+pub(crate) const BACKGROUND_MALLOC_ARENA_MAX: &str = "2";
+
 /// Shared shape of every detached cass child: stdio to `log`, own process
 /// group, and `CASS_AUTO_REFRESH=0` so a child never spawns children.
 fn build_detached_command(binary: &Path, args: &[OsString], log: &Path) -> Command {
@@ -432,6 +450,7 @@ fn build_detached_command(binary: &Path, args: &[OsString], log: &Path) -> Comma
     // The child never searches, but be explicit: a catch-up must not spawn
     // catch-ups.
     cmd.env("CASS_AUTO_REFRESH", "0");
+    cap_malloc_arenas_for_background_child(&mut cmd);
     cmd.stdin(Stdio::null());
     match File::create(log) {
         Ok(log) => {
@@ -702,6 +721,36 @@ mod tests {
     #[test]
     fn auto_refresh_is_enabled_by_default() {
         assert!(AutoRefreshPolicy::default().enabled);
+    }
+
+    /// 2l1b0.72: a detached index child gets the glibc arena cap unless the
+    /// operator already chose one, which it then inherits unchanged.
+    /// Negative control: before the cap the child env had no entry.
+    #[test]
+    fn background_index_child_caps_malloc_arenas_unless_the_operator_chose() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cmd = build_command(
+            Path::new("/usr/bin/cass"),
+            dir.path(),
+            &dir.path().join("agent_search.db"),
+            false,
+        );
+        let arena = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "MALLOC_ARENA_MAX")
+            .and_then(|(_, value)| value);
+        if dotenvy::var("MALLOC_ARENA_MAX").is_ok() {
+            assert_eq!(
+                arena, None,
+                "an operator setting is inherited, not replaced"
+            );
+        } else {
+            assert_eq!(
+                arena,
+                Some(std::ffi::OsStr::new(BACKGROUND_MALLOC_ARENA_MAX))
+            );
+            assert_eq!(BACKGROUND_MALLOC_ARENA_MAX, "2");
+        }
     }
 
     #[test]

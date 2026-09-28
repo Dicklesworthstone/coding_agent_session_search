@@ -292,7 +292,7 @@ fn hold_active_lexical_rebuild_lock(
     };
 
     let mut rebuild_state = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "schema_hash": coding_agent_search::search::tantivy::SCHEMA_HASH,
         "db": {
             "db_path": db_path.display().to_string(),
@@ -5588,6 +5588,455 @@ fn robot_mode_auto_correction_emits_teaching_note_on_stderr() -> Result<(), Box<
     Ok(())
 }
 
+fn search_effective_meta(cmd: &mut Command) -> Result<(Value, String), Box<dyn Error>> {
+    let output = cmd.env("TZ", "UTC").output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "search should succeed; stderr: {stderr}"
+    );
+    let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+    let effective = json["_meta"]["effective"].clone();
+    assert!(
+        effective.is_object(),
+        "--robot-meta must carry _meta.effective; _meta keys: {:?}",
+        json["_meta"]
+            .as_object()
+            .map(|m| m.keys().collect::<Vec<_>>())
+    );
+    Ok((effective, stderr))
+}
+
+/// 2l1b0.68: a robot search is budgeted and never spawns the warm-model
+/// daemon, so `--daemon` was accepted and silently ignored. `_meta.effective`
+/// now reports the request next to what applied. Negative control: before
+/// this change `_meta.effective.daemon` did not exist.
+#[test]
+fn search_robot_meta_reports_the_daemon_policy() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let daemon_policy = |flag: Option<&str>| -> Result<Value, Box<dyn Error>> {
+        let mut args = vec![
+            "search",
+            "hello",
+            "--json",
+            "--robot-meta",
+            "--limit",
+            "1",
+            "--data-dir",
+            data_dir,
+        ];
+        args.extend(flag);
+        let (effective, _) = search_effective_meta(base_cmd().args(args))?;
+        Ok(effective["daemon"].clone())
+    };
+    assert_eq!(
+        daemon_policy(Some("--daemon"))?,
+        serde_json::json!({"use_existing": true, "auto_spawn_requested": true, "auto_spawn": false}),
+        "--daemon is echoed as requested, and a robot search does not spawn"
+    );
+    assert_eq!(
+        daemon_policy(None)?,
+        serde_json::json!({"use_existing": true, "auto_spawn_requested": false, "auto_spawn": false})
+    );
+    assert_eq!(
+        daemon_policy(Some("--no-daemon"))?,
+        serde_json::json!({"use_existing": false, "auto_spawn_requested": false, "auto_spawn": false})
+    );
+    Ok(())
+}
+
+/// 2l1b0.68: `_meta.effective` echoes how the lexical engine groups the
+/// query and the parentheses it recovered. The expected groupings are written
+/// by hand from the documented precedence (NOT > AND > OR). Negative control:
+/// before this change neither field existed, and the legacy grammar read
+/// `hello OR world tool` as `(hello OR world) AND tool`.
+#[test]
+fn search_robot_meta_echoes_the_query_grouping() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let reading = |query: &str| -> Result<(Value, Value), Box<dyn Error>> {
+        let (effective, _) = search_effective_meta(base_cmd().args([
+            "search",
+            query,
+            "--json",
+            "--robot-meta",
+            "--limit",
+            "1",
+            "--data-dir",
+            data_dir,
+        ]))?;
+        Ok((
+            effective["query_structure"].clone(),
+            effective["query_recoveries"].clone(),
+        ))
+    };
+    assert_eq!(
+        reading("hello OR world tool")?,
+        (
+            serde_json::json!("hello OR (world AND tool)"),
+            serde_json::json!([])
+        )
+    );
+    assert_eq!(
+        reading("hello AND (world OR tool")?,
+        (
+            serde_json::json!("hello AND (world OR tool)"),
+            serde_json::json!(["1 unclosed '(' closed at the end of the query"])
+        )
+    );
+    assert_eq!(
+        reading("hello")?,
+        (serde_json::json!("hello"), serde_json::json!([]))
+    );
+    Ok(())
+}
+
+/// 2l1b0.68: `_meta.effective` echoes what search actually ran. Every
+/// expected value here comes from outside cass: the fixture path, a UTC
+/// epoch computed by hand, and the flags as typed. Negative control: before
+/// 2l1b0.68 `_meta.effective` did not exist, so the first assertion fails.
+#[test]
+fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let (effective, _) = search_effective_meta(base_cmd().args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--limit",
+        "1",
+        "--agent",
+        "codex",
+        "--agent",
+        "claude_code",
+        "--since",
+        "2026-01-01",
+        "--source",
+        "local",
+        "--data-dir",
+        data_dir,
+    ]))?;
+    assert_eq!(effective["command"], "search");
+    assert_eq!(effective["query"], "hello");
+    assert_eq!(
+        effective["db_path"].as_str(),
+        Some(
+            Path::new(data_dir)
+                .join("agent_search.db")
+                .to_str()
+                .ok_or("non-utf8 path")?
+        )
+    );
+    assert_eq!(effective["db_path_source"], "--data-dir");
+    // 2026-01-01T00:00:00Z.
+    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
+    assert!(effective["time_window"]["until_ms"].is_null());
+    assert!(effective["time_window"]["until_from"].is_null());
+    assert_eq!(
+        effective["filters"]["agents"],
+        serde_json::json!(["claude_code", "codex"])
+    );
+    assert_eq!(effective["filters"]["workspaces"], serde_json::json!([]));
+    assert_eq!(effective["filters"]["source"], "local");
+    assert!(effective["filters"]["sessions_from_paths"].is_null());
+    assert_eq!(effective["auto_corrections"], serde_json::json!([]));
+    Ok(())
+}
+
+/// 2l1b0.68: `pack` runs a search and echoes what that search ran in
+/// `_meta.effective`, as `search --robot-meta` does, without the search-only
+/// daemon policy. Negative control: before this change pack's `_meta` had no
+/// `effective`, and its own `query.filters` is always empty.
+#[test]
+fn pack_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let output = base_cmd()
+        .args([
+            "pack",
+            "hello OR world tool",
+            "--json",
+            "--agent",
+            "codex",
+            "--agent",
+            "claude_code",
+            "--since",
+            "2026-01-01",
+            "--source",
+            "local",
+            "--data-dir",
+            data_dir,
+        ])
+        .env("TZ", "UTC")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+    let effective = &json["_meta"]["effective"];
+    assert_eq!(effective["command"], "pack", "{effective}");
+    assert_eq!(effective["query"], "hello OR world tool");
+    assert_eq!(effective["query_structure"], "hello OR (world AND tool)");
+    assert_eq!(effective["query_recoveries"], serde_json::json!([]));
+    assert_eq!(
+        effective["db_path"].as_str(),
+        Some(
+            Path::new(data_dir)
+                .join("agent_search.db")
+                .to_str()
+                .ok_or("non-utf8 path")?
+        )
+    );
+    assert_eq!(effective["db_path_source"], "--data-dir");
+    // 2026-01-01T00:00:00Z.
+    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
+    assert_eq!(
+        effective["filters"]["agents"],
+        serde_json::json!(["claude_code", "codex"])
+    );
+    assert_eq!(effective["filters"]["source"], "local");
+    assert!(
+        effective.get("daemon").is_none(),
+        "pack has no daemon policy to echo: {effective}"
+    );
+    Ok(())
+}
+
+/// 2l1b0.68: the database path's source distinguishes `--db`,
+/// `CASS_DB_PATH` and the data dir, and a preset window names its flag on
+/// both bounds it sets.
+#[test]
+fn search_effective_meta_names_the_db_source_and_window_preset() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let db = Path::new(data_dir).join("agent_search.db");
+    let db = db.to_str().ok_or("non-utf8 path")?;
+
+    let (by_flag, _) = search_effective_meta(base_cmd().args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--db",
+        db,
+        "--yesterday",
+    ]))?;
+    assert_eq!(by_flag["db_path"], db);
+    assert_eq!(by_flag["db_path_source"], "--db");
+    assert_eq!(by_flag["time_window"]["since_from"], "--yesterday");
+    assert_eq!(by_flag["time_window"]["until_from"], "--yesterday");
+    let since = by_flag["time_window"]["since_ms"]
+        .as_i64()
+        .ok_or("--yesterday sets since")?;
+    let until = by_flag["time_window"]["until_ms"]
+        .as_i64()
+        .ok_or("--yesterday sets until")?;
+    assert_eq!(until - since, 86_400_000, "--yesterday spans one UTC day");
+
+    let (by_env, _) = search_effective_meta(
+        base_cmd()
+            .args(["search", "hello", "--json", "--robot-meta", "--days", "3"])
+            .env("CASS_DB_PATH", db),
+    )?;
+    assert_eq!(by_env["db_path"], db);
+    assert_eq!(by_env["db_path_source"], "env:CASS_DB_PATH");
+    assert_eq!(by_env["time_window"]["since_from"], "--days 3");
+    assert!(by_env["time_window"]["until_from"].is_null());
+    Ok(())
+}
+
+/// 2l1b0.68: robot snippets carry the engine's `**` marks on matched terms
+/// with or without `--highlight`; the flag marks remaining literal
+/// occurrences and never marks a term twice. Negative control: applying the
+/// flag to robot output first printed `****hello****`.
+#[test]
+fn search_robot_highlight_marks_json_snippets() -> Result<(), Box<dyn Error>> {
+    let data_dir = shared_search_demo_data();
+    let snippets = |highlight: bool| -> Result<Vec<String>, Box<dyn Error>> {
+        let mut cmd = base_cmd();
+        cmd.args(["search", "hello", "--json", "--limit", "20"]);
+        if highlight {
+            cmd.arg("--highlight");
+        }
+        cmd.args(["--data-dir", data_dir]);
+        let output = cmd.output()?;
+        assert!(output.status.success(), "{output:?}");
+        let json: Value = serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())?;
+        Ok(json["hits"]
+            .as_array()
+            .ok_or("hits array")?
+            .iter()
+            .filter_map(|hit| hit["snippet"].as_str().map(str::to_string))
+            .collect())
+    };
+    let plain = snippets(false)?;
+    let marked = snippets(true)?;
+    assert_eq!(plain.len(), marked.len(), "same hits either way");
+    let (plain_hit, marked_hit) = plain
+        .iter()
+        .zip(&marked)
+        .find(|(plain, _)| plain.to_lowercase().contains("hello"))
+        .ok_or("the demo fixture has a snippet containing the term")?;
+    assert!(
+        plain_hit.to_lowercase().contains("**hello**"),
+        "the engine marks matched terms without --highlight: {plain_hit}"
+    );
+    assert!(
+        marked_hit.to_lowercase().contains("**hello**") && !marked_hit.contains("****"),
+        "--highlight keeps one pair of marks per term: {marked_hit}"
+    );
+    assert_eq!(
+        marked_hit.replace("**", ""),
+        plain_hit.replace("**", ""),
+        "markers only"
+    );
+    Ok(())
+}
+
+/// 2l1b0.68: an auto-corrected invocation lists each correction in
+/// `_meta.effective.auto_corrections`, worded exactly as the stderr note.
+#[test]
+fn search_effective_meta_lists_the_stderr_auto_corrections() -> Result<(), Box<dyn Error>> {
+    let (effective, stderr) = search_effective_meta(base_cmd().args([
+        "find",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--data-dir",
+        shared_search_demo_data(),
+    ]))?;
+    let noted: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("note: auto-corrected: "))
+        .collect();
+    assert!(
+        !noted.is_empty(),
+        "`find` is corrected to `search`: {stderr}"
+    );
+    assert_eq!(effective["auto_corrections"], serde_json::json!(noted));
+    Ok(())
+}
+
+/// 2l1b0.51: a flag typo on an exact subcommand must never run a different
+/// subcommand. Before the fix `cass status --jsn` ran `stats` instead (on an
+/// empty data dir: exit 3, "Database not found") and reported it only as a
+/// stderr note. Negative control: the `stats` payload keys never appear.
+#[test]
+fn flag_typo_on_exact_subcommand_runs_that_subcommand() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let data_dir = tmp.path().join("data");
+    let output = base_cmd()
+        .args(["status", "--jsn"])
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("HOME", tmp.path())
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("to 'stats'"),
+        "status must not be rerouted to stats; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let payload: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
+        format!("expected one JSON document on stdout ({error}); stdout={stdout} stderr={stderr}")
+    })?;
+    assert!(
+        payload.get("initialized").is_some() && payload.get("index").is_some(),
+        "expected the status payload, got {payload}"
+    );
+    assert!(
+        payload.get("by_agent").is_none(),
+        "the stats payload must not be returned for `status`: {payload}"
+    );
+    Ok(())
+}
+
+/// 2l1b0.57: `CASS_DB_PATH` was advertised (README, robot-docs env,
+/// capabilities) but never read, so commands silently used the default
+/// archive. It now means exactly `--db`: the archive it names is opened and
+/// derived assets follow its directory (#403).
+#[test]
+fn cass_db_path_env_selects_the_archive_like_db_flag() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+    let empty = TempDir::new()?;
+    let status_with = |db_env: Option<&Path>| -> Result<Value, Box<dyn Error>> {
+        let mut cmd = base_cmd();
+        cmd.args(["status", "--json"])
+            .env("CASS_DATA_DIR", empty.path())
+            .env("HOME", empty.path())
+            .env_remove("CASS_DB_PATH");
+        if let Some(db) = db_env {
+            cmd.env("CASS_DB_PATH", db);
+        }
+        let output = cmd.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(serde_json::from_str(stdout.trim()).map_err(|error| {
+            format!(
+                "status stdout is not JSON ({error}): {stdout}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?)
+    };
+
+    // Control: without the variable, status reads the empty data dir.
+    let default_status = status_with(None)?;
+    assert_eq!(
+        default_status["initialized"], false,
+        "control must see the empty data dir: {default_status}"
+    );
+
+    let db_path = fixture.path().join("agent_search.db");
+    let env_status = status_with(Some(&db_path))?;
+    assert_eq!(
+        env_status["initialized"], true,
+        "CASS_DB_PATH must open the fixture archive: {env_status}"
+    );
+    let reported_dir = env_status["data_dir"].as_str().unwrap_or_default();
+    assert_eq!(
+        Path::new(reported_dir).canonicalize()?,
+        fixture.path().canonicalize()?,
+        "derived assets must follow the CASS_DB_PATH directory (#403): {env_status}"
+    );
+    Ok(())
+}
+
+/// 2l1b0.64: an unparseable `--since`/`--until` used to be dropped, so the
+/// search ran unfiltered with exit 0 (or, on an empty data dir, failed later
+/// with exit 3 missing-index). It is a usage error before anything opens.
+#[test]
+fn unparseable_time_bound_is_a_usage_error() -> Result<(), Box<dyn Error>> {
+    for (subcommand, flag, value) in [
+        ("search", "--since", "2026-13-01"),
+        ("search", "--until", "yesterdayish"),
+        ("pack", "--since", "not-a-date"),
+    ] {
+        let tmp = TempDir::new()?;
+        let output = base_cmd()
+            .args([subcommand, "anything", flag, value, "--json"])
+            .env("CASS_DATA_DIR", tmp.path().join("data"))
+            .env("HOME", tmp.path())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{subcommand} {flag} {value}: expected exit 2; stderr: {stderr}"
+        );
+        let envelope_line = stderr
+            .lines()
+            .find(|line| line.trim_start().starts_with("{\"error\""))
+            .ok_or_else(|| format!("no error envelope on stderr: {stderr}"))?;
+        let envelope: Value = serde_json::from_str(envelope_line.trim())?;
+        assert_eq!(envelope["error"]["kind"], "usage", "{envelope}");
+        let message = envelope["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(flag),
+            "message must name {flag}: {message}"
+        );
+    }
+    Ok(())
+}
+
 /// Subcommand alias: query → search
 #[test]
 fn subcommand_alias_query_to_search() {
@@ -8884,5 +9333,84 @@ fn broken_stdout_pipe_terminates_via_sigpipe_not_abort() {
         status.signal(),
         Some(SIGPIPE),
         "expected quiet SIGPIPE termination on a closed stdout pipe, got {status:?}"
+    );
+}
+
+/// uojcg.7.1: a search filtered to one workspace that comes back empty used to
+/// read exactly like "nothing matches". A trailing slash, a case difference or
+/// a moved checkout now carries a `zero_result_diagnosis` naming the indexed
+/// workspace; a correct filter carries none.
+#[test]
+fn workspace_filtered_empty_search_explains_the_filter() {
+    const INDEXED: &str = "/data/projects/coding_agent_session_search";
+    let data_dir = shared_search_demo_data();
+    let search = |workspace: &str| -> Value {
+        let out = base_cmd()
+            .args([
+                "search",
+                "hello",
+                "--json",
+                "--limit",
+                "3",
+                "--workspace",
+                workspace,
+                "--data-dir",
+                data_dir,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        serde_json::from_slice(&out.stdout).expect("search JSON")
+    };
+
+    let exact = search(INDEXED);
+    assert!(
+        !exact["hits"].as_array().expect("hits array").is_empty(),
+        "the indexed workspace must match: {exact}"
+    );
+    assert!(
+        exact.get("zero_result_diagnosis").is_none(),
+        "a search with hits carries no diagnosis: {exact}"
+    );
+
+    for (filter, match_kind) in [
+        (format!("{INDEXED}/"), "path_normalized"),
+        (INDEXED.to_uppercase(), "case_insensitive"),
+        (
+            "/elsewhere/coding_agent_session_search".to_string(),
+            "basename_moved",
+        ),
+    ] {
+        let near = search(&filter);
+        assert!(
+            near["hits"].as_array().expect("hits array").is_empty(),
+            "{filter} must not match the indexed workspace: {near}"
+        );
+        let diagnosis = &near["zero_result_diagnosis"];
+        assert_eq!(
+            diagnosis["diagnosis"], "workspace_filter_likely_wrong",
+            "{filter}: {near}"
+        );
+        assert_eq!(
+            diagnosis["candidate_workspaces"][0]["workspace"], INDEXED,
+            "{filter}: {near}"
+        );
+        assert_eq!(
+            diagnosis["candidate_workspaces"][0]["match_kind"], match_kind,
+            "{filter}: {near}"
+        );
+        assert!(
+            diagnosis["suggested_rerun"]
+                .as_str()
+                .is_some_and(|rerun| rerun.contains(INDEXED)),
+            "{filter}: {near}"
+        );
+    }
+
+    let unrelated = search("/nowhere/at/all");
+    assert_eq!(
+        unrelated["zero_result_diagnosis"]["diagnosis"], "workspace_not_indexed",
+        "{unrelated}"
     );
 }

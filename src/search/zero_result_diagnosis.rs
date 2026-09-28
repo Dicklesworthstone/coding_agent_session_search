@@ -1,10 +1,3 @@
-// Dead-code tolerated module-wide: the zero-result workspace diagnosis
-// lands here ahead of the search pipeline that will populate
-// `candidate_workspaces` from the live workspace list and project this into
-// the search `--robot-meta` JSON. Downstream bead .7.4 (moved-workspace and
-// stale-source fixture suite) consumes these types.
-#![allow(dead_code)]
-
 //! Zero-result workspace diagnosis for filtered searches (bead
 //! cass-fleet-resilience-20260608-uojcg.7.1).
 //!
@@ -20,6 +13,11 @@
 //! `zero_result_diagnosis`, ranked `candidate_workspaces` (with the kind of
 //! match and a per-candidate confidence), an overall `confidence`, and a
 //! `suggested_rerun` when a canonical workspace is likely the right filter.
+//!
+//! `cass search` runs it when a query filtered to exactly one `--workspace`
+//! returns no hits: the robot payload carries the report as top-level
+//! `zero_result_diagnosis`, and human output prints the verdict and rerun hint
+//! on stderr.
 //!
 //! It is decoupled from storage (the caller passes the known workspace
 //! keys), so every case — exact miss, moved checkout, case/path

@@ -127,7 +127,9 @@ before initializing a private replay database. Only this binary's canonical
 storage initializer supplies executable schema. The storage version and every
 table, column and primary-key descriptor must match exactly; a matching version
 number alone is not sufficient. Unknown, additional or omitted tables fail
-explicitly. There is no cross-schema migration or execution of SQL from input.
+explicitly. SQL from input is never executed. The one cross-schema path is the
+reviewed storage-schema v20 -> v21 bridge, and only with
+`--allow-compatible-schema` (see [Reviewed v20 -> v21 restoration](#reviewed-v20---v21-restoration)).
 
 Rows are individually bound as typed SQL parameters using one prepared INSERT
 per table. No exported path is used as a write destination and no URL or provider
@@ -300,6 +302,41 @@ After publication, a lost success receipt does not justify replacing the
 destination: retry with `--if-identical` to validate its complete contents and
 report `unchanged`. A different or incomplete destination remains a conflict.
 
+## Reviewed v20 -> v21 restoration
+
+An archive exported by a build whose storage schema is v20 fails an exact
+import into a v21 build. `--allow-compatible-schema` admits that one reviewed
+bridge and nothing else. Any other version pair is refused, and so is a v20
+archive whose canonical table, column or primary-key descriptors differ from
+the current ones: v21 adds only an index, so table drift is not authorized.
+
+```sh
+cass archive import history-v20.jsonl --archive-id workstation-history \
+  --include-private --allow-compatible-schema \
+  --output /existing/private/directory/restored.db
+```
+
+The current binary's initializer remains the only schema authority. Archived
+`_schema_migrations` rows and `meta.schema_version` are verified as input but
+not replayed. The receipt adds `schema_migration` with `mode:
+"reviewed_v20_to_v21"`, the from/to storage schema versions,
+`schema_authority: "current_binary_initializer"` and `source_rows_verified`.
+The flag combines with `--if-identical` (a retry reports `unchanged` without
+modifying the database image) and with `--rebuild-index`, whose failure message
+names the retry flags to repeat.
+
+## Exit codes
+
+Archive failures are JSON on stderr with a kebab-case `kind`:
+
+| Exit | `kind` | Retryable | Meaning |
+|---|---|---|---|
+| 2 | `logical-archive-usage` | no | Malformed or unacknowledged request |
+| 5 | `logical-archive-integrity` | no | Archive failed decoding, count or digest checks |
+| 7 | `logical-archive-busy` | yes | The destination lock stayed held for five seconds, or the source database stayed locked past its busy timeout |
+| 14 | `logical-archive-io` | yes | Reading or writing a file failed |
+| 9 | `logical-archive-error` | no | Anything else, including an occupied destination |
+
 ## Version 1 wire contract
 
 Each UTF-8 JSONL record ends in a newline and is at most 8 MiB, **including** that
@@ -345,8 +382,9 @@ is an integrity checksum, **not** a signature or proof of source authenticity.
 
 Current restoration supports a new database with the exact current canonical
 schema, plus opt-in read-only comparison for an identical existing destination.
-Explicit indexed restoration additionally rebuilds canonical lexical search.
-Merge, cross-schema migration and semantic reconstruction remain outside these
+Explicit indexed restoration additionally rebuilds canonical lexical search, and
+`--allow-compatible-schema` admits the reviewed v20 -> v21 bridge. Merge, any
+other cross-schema migration and semantic reconstruction remain outside these
 slices; default restoration remains offline. These slices do not close bead
 `.34`. The ordinary library command parser, root help, completion generation
 and robot capabilities are not yet extended; `cass archive --help` documents
