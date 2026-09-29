@@ -22772,9 +22772,19 @@ fn state_meta_json_inner(
     if let Some(detail) = fallback_fts_repair_pending
         && let Some(index) = state.get_mut("index").and_then(|v| v.as_object_mut())
     {
+        // GH #495: a shadow retired as not viable over the message bound keeps
+        // this marker to say why it is absent, but that is a settled state:
+        // `doctor --rebuild-canonical-fts` plans nothing for it. Only other
+        // markers describe a repair that is still pending.
+        let retired =
+            crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable(&detail);
         index.insert(
             "fallback_fts_repair".to_string(),
-            serde_json::json!({ "pending": true, "detail": detail }),
+            serde_json::json!({
+                "pending": !retired,
+                "retired_not_viable": retired,
+                "detail": detail,
+            }),
         );
     }
     // zn1xn F4: surface a persistent lexical-repair deferral streak additively —
@@ -87410,12 +87420,46 @@ mod cli_read_db_tests {
             Some(&serde_json::Value::Bool(true)),
             "a persisted marker must surface as fallback_fts_repair.pending=true"
         );
+        assert_eq!(
+            pending.pointer("/index/fallback_fts_repair/retired_not_viable"),
+            Some(&serde_json::Value::Bool(false)),
+            "a half-built shadow is not a retirement"
+        );
         assert!(
             pending
                 .pointer("/index/fallback_fts_repair/detail")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|d| d.contains("corrupt %_data record")),
             "the detail must carry the failure reason"
+        );
+
+        // GH #495: the marker a not-viable retirement leaves behind says why the
+        // shadow is absent; status must not call that settled state pending.
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .record_fallback_fts_repair_pending(Some(
+                    &crate::storage::sqlite::fts_shadow_not_viable_detail(256_396, 100_000),
+                ))
+                .expect("record retirement marker");
+            drop(storage);
+        }
+        let retired = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert_eq!(
+            retired.pointer("/index/fallback_fts_repair/pending"),
+            Some(&serde_json::Value::Bool(false)),
+            "a settled retirement is not a pending repair: {retired}"
+        );
+        assert_eq!(
+            retired.pointer("/index/fallback_fts_repair/retired_not_viable"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            retired
+                .pointer("/index/fallback_fts_repair/detail")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|d| d.contains("settled state, not a pending repair")),
+            "the retirement keeps its reason"
         );
 
         {

@@ -3734,9 +3734,16 @@ fn assert_gh413_fts_shadow_bound(legacy_checkpoint: bool) {
         .expect("status after the drop");
     let status_json: serde_json::Value =
         serde_json::from_slice(&status.stdout).expect("status --json output is JSON");
+    // GH #495: the drop over the bound is a settled retirement. Status keeps
+    // the reason but does not report it as a pending repair.
     let pending = &status_json["index"]["fallback_fts_repair"];
     assert_eq!(
         pending["pending"],
+        serde_json::json!(false),
+        "a retired shadow is not a pending repair: {status_json}"
+    );
+    assert_eq!(
+        pending["retired_not_viable"],
         serde_json::json!(true),
         "status must carry the dropped-shadow marker: {status_json}"
     );

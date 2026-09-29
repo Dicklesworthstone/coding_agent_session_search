@@ -132,6 +132,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `systemd-run -p MemoryMax=16G`, and sized caches for memory the process
   could not use. It now uses the same cgroup-aware probes as the indexer
   (71759163).
+- **`cass status` no longer calls a retired FTS shadow a pending repair
+  (#495).** Over `CASS_FTS_SHADOW_MAX_MESSAGES`, the SQL-fallback shadow is
+  retired as not viable, and doctor plans nothing more for it. `status`
+  still reported `index.fallback_fts_repair.pending: true`, although its own
+  detail said "settled state, not a pending repair". It now reports
+  `pending: false` with `retired_not_viable: true` and keeps the detail.
+  Other markers (a suspended or budget-stopped shadow repair) still report
+  `pending: true`.
 - **A missing `sqlite3` CLI is named.** The paths that still run the external
   `sqlite3` tool (duplicate schema-row repair, historical-bundle recovery,
   FTS metadata scrub) failed with a bare "No such file or directory" on hosts
