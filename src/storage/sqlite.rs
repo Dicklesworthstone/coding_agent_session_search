@@ -813,18 +813,32 @@ fn open_index_schema_connection_with_timeout(
 /// chunk (xcqqa). An archive whose engine migration is still pending gets the
 /// ordinary constructor so the engine's first-open repair runs, then the
 /// bounded lane once the repair is recorded.
-fn open_archive_writer_connection(
-    path: &Path,
-) -> std::result::Result<FrankenConnection, crate::franken_sync::FrankenError> {
+///
+/// The bounded lane can fail to open while peers commit: fsqlite's
+/// `open_existing_schema_only` returns `BusyRecovery` ("recovery in progress")
+/// or `Busy` when it meets a peer's WAL-index recovery, where the ordinary
+/// constructor waits it out. With 4 threads each opening a writer per commit,
+/// 2-9 of 400 schema-only opens failed per round on fsqlite 0.4.4 and 0 of
+/// 2,000 ordinary opens did (same worker); cass's
+/// frankensqlite_concurrent_stress hit it in `concurrent_writer()`. Opening is
+/// idempotent, so both opens retry busy-class errors, with a budget long
+/// enough to outlast a loaded host (a 5 s budget was exhausted there).
+fn open_archive_writer_connection(path: &Path) -> Result<FrankenConnection> {
+    const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(30);
     let path_str = path.to_string_lossy().to_string();
     if !index_engine_migration_is_complete(path) {
-        let repairing = FrankenConnection::open(path_str.clone())?;
+        let repairing =
+            retry_transient_storage_op_within("open_archive_writer", OPEN_RETRY_BUDGET, || {
+                FrankenConnection::open(path_str.clone()).map_err(anyhow::Error::new)
+            })?;
         if !index_engine_migration_is_complete(path) {
             return Ok(repairing);
         }
         close_first_open_repair_handle(repairing, path);
     }
-    FrankenConnection::open_existing_schema_only(path_str)
+    retry_transient_storage_op_within("open_archive_writer_schema_only", OPEN_RETRY_BUDGET, || {
+        FrankenConnection::open_existing_schema_only(path_str.clone()).map_err(anyhow::Error::new)
+    })
 }
 
 /// Close the ordinary handle whose open ran the engine's first-open repair.
@@ -1159,9 +1173,18 @@ pub(crate) fn retryable_franken_anyhow(err: &anyhow::Error) -> bool {
 /// retry is safe and mirrors upstream's own prepare-prologue retry posture.
 pub(crate) fn retry_transient_storage_op<T>(
     stage: &'static str,
+    attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    retry_transient_storage_op_within(stage, Duration::from_secs(5), attempt)
+}
+
+/// [`retry_transient_storage_op`] with an explicit retry budget.
+pub(crate) fn retry_transient_storage_op_within<T>(
+    stage: &'static str,
+    budget: Duration,
     mut attempt: impl FnMut() -> Result<T>,
 ) -> Result<T> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget;
     let mut delay = Duration::from_millis(25);
     loop {
         match attempt() {
@@ -1404,7 +1427,7 @@ impl FrankenConnectionManager {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
-                return Err(anyhow::Error::from(e).context(format!(
+                return Err(e.context(format!(
                     "opening writer connection at {}",
                     self.db_path.display()
                 )));
@@ -1435,7 +1458,7 @@ impl FrankenConnectionManager {
             Ok(c) => c,
             Err(e) => {
                 let _ = self.writer_tokens.0.send(());
-                return Err(anyhow::Error::from(e).context(format!(
+                return Err(e.context(format!(
                     "opening concurrent writer at {}",
                     self.db_path.display()
                 )));
@@ -42904,16 +42927,19 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         // Bytes returned by read syscalls. fsqlite 0.4.4 reads every page of
         // the file (through pread, invisible to its page-cache counters) on a
         // connection's first sqlite_master query: 4,237,131 preads for the
-        // 4,137,946-page owner archive.
+        // 4,137,946-page owner archive. Counted per thread: the synchronous
+        // wrapper drives the engine on this thread, and the process-wide
+        // counter also collects every test running in parallel (this test
+        // failed its bound in a 735-test storage run and passed alone).
         let read_bytes = || {
-            fs::read_to_string("/proc/self/io")
+            fs::read_to_string("/proc/thread-self/io")
                 .ok()
                 .and_then(|io| {
                     io.lines()
                         .find_map(|line| line.strip_prefix("rchar: "))
                         .and_then(|value| value.trim().parse::<u64>().ok())
                 })
-                .expect("/proc/self/io rchar")
+                .expect("/proc/thread-self/io rchar")
         };
 
         let before_probe = read_bytes();

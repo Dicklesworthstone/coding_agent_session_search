@@ -1903,9 +1903,9 @@ dependencies = [
 
 [[package]]
 name = "franken-agent-detection"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e1a7fe8c1103475e8384e55ba01962a8f51c022c994b8c2dee041fdae5b2861"
+checksum = "66c1e6a33603c730a756221d0393d6ffe2cccee5be8e0e12fc5d67a442bc103a"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1925,6 +1925,7 @@ dependencies = [
  "url",
  "urlencoding",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]
