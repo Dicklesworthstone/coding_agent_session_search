@@ -3230,6 +3230,7 @@ schemas: (auto-generated from contract)
     - realized: object
       - candidate_count: integer
       - fallback_mode: ?
+      - fallback_reason: ?
       - search_mode: string
       - selected_evidence_count: integer
       - selected_session_count: integer

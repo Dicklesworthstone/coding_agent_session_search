@@ -589,6 +589,11 @@ pub struct PackRenderRequest {
     pub limits: PackPlannerLimits,
     pub search_mode: String,
     pub fallback_mode: Option<String>,
+    /// Why the executor fell back to `fallback_mode`, as a typed reason code
+    /// (`SemanticFallbackReason::code`) it observed (GH #507). `None` means no
+    /// cause was supplied, not that assets are missing; the renderer flags such
+    /// a fallback instead of inventing a cause.
+    pub fallback_reason: Option<String>,
     pub semantic_joined: bool,
     pub freshness_policy: PackFreshnessPolicy,
     pub freshness_window_seconds: i64,
@@ -618,6 +623,7 @@ impl Default for PackRenderRequest {
             limits: PackPlannerLimits::default(),
             search_mode: "hybrid".to_string(),
             fallback_mode: None,
+            fallback_reason: None,
             semantic_joined: false,
             freshness_policy: PackFreshnessPolicy::PreferRecent,
             freshness_window_seconds: DEFAULT_FRESHNESS_WINDOW_SECONDS,
@@ -687,6 +693,7 @@ struct RenderedLimits {
 struct RenderedRealized {
     search_mode: String,
     fallback_mode: Option<String>,
+    fallback_reason: Option<String>,
     semantic_joined: bool,
     candidate_count: usize,
     selected_evidence_count: usize,
@@ -1882,16 +1889,27 @@ fn rendered_answer_pack_with_correlation(
     let (omitted_items, omitted_redactions) = rendered_omitted_items(&plan.omitted);
     let semantic_readiness = effective_semantic_readiness(request);
     let health_is_healthy = health_is_healthy(request, &source_readiness);
+    // GH #507: the executor's own cause for its fallback, redacted like the
+    // rest of the envelope. It is never inferred from which assets exist.
+    let fallback_reason = request.fallback_mode.as_ref().and_then(|_| {
+        trimmed_optional_string(request.fallback_reason.as_deref())
+            .map(|reason| redact_pack_output_text(&reason, &mut envelope_redactions))
+    });
     let mut warnings = readiness_warnings(
         request,
         semantic_readiness,
+        fallback_reason.as_deref(),
         &source_readiness,
         evidence.is_empty(),
         &mut envelope_redactions,
     );
-    let recommended_action =
-        readiness_recommended_action(request, semantic_readiness, health_is_healthy)
-            .map(|action| redact_pack_output_text(&action, &mut envelope_redactions));
+    let recommended_action = readiness_recommended_action(
+        request,
+        semantic_readiness,
+        fallback_reason.as_deref(),
+        health_is_healthy,
+    )
+    .map(|action| redact_pack_output_text(&action, &mut envelope_redactions));
     let index_generation = request
         .readiness
         .index_generation
@@ -1942,6 +1960,7 @@ fn rendered_answer_pack_with_correlation(
         realized: RenderedRealized {
             search_mode: request.search_mode.clone(),
             fallback_mode: request.fallback_mode.clone(),
+            fallback_reason,
             semantic_joined: request.semantic_joined,
             candidate_count: plan.candidate_count,
             selected_evidence_count: plan.selected_evidence_count,
@@ -2015,6 +2034,7 @@ fn health_is_healthy(
 fn readiness_warnings(
     request: &PackRenderRequest,
     semantic_readiness: PackSemanticReadiness,
+    fallback_reason: Option<&str>,
     source_readiness: &[RenderedSourceReadiness],
     no_evidence: bool,
     redactions: &mut Vec<RenderedRedaction>,
@@ -2033,6 +2053,10 @@ fn readiness_warnings(
     match semantic_readiness {
         PackSemanticReadiness::FallbackLexical => {
             warnings.push("semantic_fallback_lexical".to_string());
+            // A fallback the executor did not explain stays visible as such.
+            if fallback_reason.is_none() {
+                warnings.push("semantic_fallback_reason_unreported".to_string());
+            }
         }
         PackSemanticReadiness::Unavailable => {
             warnings.push("semantic_unavailable_lexical_fallback".to_string());
@@ -2069,6 +2093,7 @@ fn readiness_warnings(
 fn readiness_recommended_action(
     request: &PackRenderRequest,
     semantic_readiness: PackSemanticReadiness,
+    fallback_reason: Option<&str>,
     health_is_healthy: bool,
 ) -> Option<String> {
     if let Some(action) = trimmed_optional_string(request.readiness.recommended_action.as_deref()) {
@@ -2108,6 +2133,13 @@ fn readiness_recommended_action(
         semantic_readiness,
         PackSemanticReadiness::FallbackLexical | PackSemanticReadiness::Unavailable
     ) {
+        // Pack's own lexical evidence selection is not an asset problem, so a
+        // model install would not change it (GH #507).
+        if fallback_reason == Some("pack_enrichment_unavailable") {
+            return Some(
+                "continue with lexical evidence; pack selects evidence lexically, and cass search --mode hybrid ranks with semantics".to_string(),
+            );
+        }
         return Some(
             "continue with lexical evidence or install semantic model explicitly".to_string(),
         );
@@ -3034,6 +3066,7 @@ mod tests {
             },
             search_mode: "hybrid".to_string(),
             fallback_mode: Some("lexical".to_string()),
+            fallback_reason: Some("semantic_absent".to_string()),
             semantic_joined: false,
             freshness_policy: PackFreshnessPolicy::PreferRecent,
             freshness_window_seconds: 60,
@@ -3917,6 +3950,117 @@ mod tests {
             value["warnings"],
             serde_json::json!(["semantic_unavailable_lexical_fallback"])
         );
+    }
+
+    fn fallback_plan() -> PlannedAnswerPack {
+        plan_answer_pack(request(vec![candidate(
+            "fallback",
+            "local",
+            "/s/fallback.jsonl",
+            10.0,
+        )]))
+        .unwrap()
+    }
+
+    fn warning_list(value: &serde_json::Value) -> Vec<String> {
+        value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|warning| warning.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// GH #507: a fallback the executor explains carries that cause.
+    #[test]
+    fn render_fallback_reports_the_executor_cause() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.fallback_reason = Some("semantic_budget_limited".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+        assert_eq!(value["realized"]["fallback_mode"], "lexical");
+        assert_eq!(
+            value["realized"]["fallback_reason"],
+            "semantic_budget_limited"
+        );
+        assert_eq!(value["health"]["semantic_state"], "fallback_lexical");
+        let warnings = warning_list(&value);
+        assert!(warnings.contains(&"semantic_fallback_lexical".to_string()));
+        assert!(!warnings.contains(&"semantic_fallback_reason_unreported".to_string()));
+    }
+
+    /// A fallback without a supplied cause is flagged, never given one.
+    #[test]
+    fn render_unexplained_fallback_is_flagged_not_filled_in() {
+        for reason in [None, Some("   ".to_string())] {
+            let mut req = render_request(PackRenderFormat::Json);
+            req.fallback_reason = reason;
+            let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+            assert!(value["realized"]["fallback_reason"].is_null());
+            let warnings = warning_list(&value);
+            assert!(warnings.contains(&"semantic_fallback_lexical".to_string()));
+            assert!(warnings.contains(&"semantic_fallback_reason_unreported".to_string()));
+        }
+    }
+
+    /// An explicit lexical request is not a fallback, and a stray cause
+    /// without a fallback is not reported.
+    #[test]
+    fn render_lexical_request_reports_no_fallback_or_cause() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.search_mode = "lexical".to_string();
+        req.fallback_mode = None;
+        req.fallback_reason = Some("semantic_absent".to_string());
+        req.readiness.semantic_readiness = PackSemanticReadiness::Disabled;
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+        assert!(value["realized"]["fallback_mode"].is_null());
+        assert!(value["realized"]["fallback_reason"].is_null());
+        let warnings = warning_list(&value);
+        assert!(warnings.contains(&"semantic_disabled".to_string()));
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.starts_with("semantic_fallback"))
+        );
+    }
+
+    /// Pack's own lexical selection is not an asset problem, so it must not
+    /// send the operator to install a model; an absent model still does.
+    #[test]
+    fn render_pack_policy_fallback_does_not_recommend_a_model_install() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.fallback_reason = Some("pack_enrichment_unavailable".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+        assert_eq!(value["health"]["healthy"], true);
+        let action = value["health"]["recommended_action"].as_str().unwrap();
+        assert!(action.contains("cass search --mode hybrid"), "{action}");
+        assert!(!action.contains("install semantic model"), "{action}");
+
+        req.fallback_reason = Some("semantic_absent".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+        assert_eq!(
+            value["health"]["recommended_action"],
+            "continue with lexical evidence or install semantic model explicitly"
+        );
+    }
+
+    /// The cause passes through the envelope redaction and is counted.
+    #[test]
+    fn render_fallback_reason_is_redacted_and_counted() {
+        let mut req = render_request(PackRenderFormat::Json);
+        req.fallback_reason = Some("semantic_absent".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+        assert_eq!(value["privacy"]["redaction_applied"], false);
+
+        req.fallback_reason =
+            Some("model at /home/alice/.cache/cass/model.bin unreadable".to_string());
+        let value = render_answer_pack_value(&fallback_plan(), &req).unwrap();
+
+        let reason = value["realized"]["fallback_reason"].as_str().unwrap();
+        assert!(!reason.contains("/home/alice"), "{reason}");
+        assert_eq!(value["privacy"]["redaction_applied"], true);
     }
 
     #[test]

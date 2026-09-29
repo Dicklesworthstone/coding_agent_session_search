@@ -26798,7 +26798,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Pack vs search: use search to explore/paginate/aggregate candidates; use pack once you need a bounded handoff artifact.".to_string(),
             "  Pack vs export-html: export-html creates a complete browsable session archive; pack creates a token-budgeted evidence bundle.".to_string(),
             "  Pack vs doctor/status: status/health report readiness before a handoff; doctor diagnoses or repairs derived assets and is not a summarizer.".to_string(),
-            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical, privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
+            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical (realized.fallback_reason names the cause; pack_enrichment_unavailable means pack itself selects evidence lexically), privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
             "  Pack budgets: tune --max-tokens, --max-evidence, --max-sessions, --max-excerpt-chars, and --fields summary/minimal to fit the recipient context.".to_string(),
             "  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.".to_string(),
             "  Quick history: use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id --limit 5 --max-tokens 2000 --timeout 2000.".to_string(),
@@ -33652,6 +33652,9 @@ fn run_cli_pack(
         limits: limits.clone(),
         search_mode: search_mode_label(mode_meta.realized).to_string(),
         fallback_mode: mode_meta.fallback_tier.map(str::to_string),
+        fallback_reason: mode_meta
+            .semantic_fallback_reason()
+            .map(|reason| reason.code().to_string()),
         semantic_joined: mode_meta.semantic_refinement(),
         freshness_policy,
         freshness_window_seconds,
@@ -100797,6 +100800,10 @@ fn response_schema_pack() -> serde_json::Value {
                 "properties": {
                     "search_mode": { "type": "string" },
                     "fallback_mode": { "type": ["string", "null"] },
+                    "fallback_reason": {
+                        "type": ["string", "null"],
+                        "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason; pack_enrichment_unavailable means pack itself selects evidence lexically). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
+                    },
                     "semantic_joined": { "type": "boolean" },
                     "candidate_count": { "type": "integer" },
                     "selected_evidence_count": { "type": "integer" },

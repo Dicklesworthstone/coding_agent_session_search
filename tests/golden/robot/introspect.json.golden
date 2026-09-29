@@ -31206,6 +31206,13 @@
                 "null"
               ]
             },
+            "fallback_reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason; pack_enrichment_unavailable means pack itself selects evidence lexically). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
+            },
             "semantic_joined": {
               "type": "boolean"
             },

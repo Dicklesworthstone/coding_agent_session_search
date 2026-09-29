@@ -1327,6 +1327,47 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
         source_path
     );
     assert_eq!(citation["verified"], true);
+
+    // GH #507: pack selects evidence lexically. A default (hybrid-preferred)
+    // request reports that fallback with its cause; an explicit lexical
+    // request is not a fallback at all.
+    let warnings: Vec<&str> = json["_meta"]["warnings"]
+        .as_array()
+        .expect("pack warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let realized = &json["realized"];
+    if extra_args
+        .windows(2)
+        .any(|pair| pair == ["--mode", "lexical"])
+    {
+        assert_eq!(realized["search_mode"], "lexical", "{json}");
+        assert!(realized["fallback_mode"].is_null(), "{json}");
+        assert!(realized["fallback_reason"].is_null(), "{json}");
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.starts_with("semantic_fallback")),
+            "{json}"
+        );
+    } else {
+        assert_eq!(realized["fallback_mode"], "lexical", "{json}");
+        assert_eq!(
+            realized["fallback_reason"], "pack_enrichment_unavailable",
+            "{json}"
+        );
+        assert!(warnings.contains(&"semantic_fallback_lexical"), "{json}");
+        assert!(
+            !warnings.contains(&"semantic_fallback_reason_unreported"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn pack_explicit_lexical_mode_is_not_reported_as_a_fallback() {
+    assert_pack_command_returns_evidence("pack", &["--mode", "lexical"]);
 }
 
 #[test]

@@ -58524,6 +58524,20 @@
                             }
                           }
                         },
+                        "fallback_reason": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "semantic_joined": {
                           "type": "object",
                           "properties": {
