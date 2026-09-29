@@ -836,6 +836,8 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         addresses: Option<Vec<std::net::IpAddr>>,
         #[serde(default)]
         sharee_node: bool,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
     }
     anyhow::ensure!(
         bytes.len() <= 8 * 1024 * 1024,
@@ -848,6 +850,24 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
     );
     for peer in status.peer.unwrap_or_default().into_values() {
         if !peer.online || peer.sharee_node {
+            continue;
+        }
+        // GH505: Mullvad peers are provider WireGuard endpoints, not SSH hosts.
+        // Tags may be absent/null in status JSON. The provider DNS suffix is
+        // also used by Tailscale itself (cmd/tailscale/cli/status.go and
+        // wgengine/magicsock); match a full label boundary, not a substring.
+        // Location and ExitNode/ExitNodeOption alone do not identify Mullvad:
+        // ordinary tailnet machines can have those fields and still run SSH.
+        let mullvad_tag = peer
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "tag:mullvad-exit-node"));
+        let mullvad_dns = peer
+            .dns_name
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+            .ends_with(".mullvad.ts.net");
+        if mullvad_tag || mullvad_dns {
             continue;
         }
         // The existing SSH/rsync source contract accepts IPv4 and DNS names,
@@ -3293,3 +3313,7 @@ Host production !legacy-prod
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tailscale_tests.rs"]
+mod tailscale_tests;

@@ -517,7 +517,13 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // =========================================================================
     // Phase 1: Discovery
     // =========================================================================
-    let discovered_hosts = if !state.discovery_complete {
+    // An unfinished probe phase can resume discovery saved by an older version
+    // that included provider exit nodes. Saved names have no peer metadata, so
+    // refresh automatic Tailscale discovery rather than replaying that list.
+    // Explicit --hosts and already-completed probing keep their resume behavior.
+    let discovered_hosts = if !state.discovery_complete
+        || (opts.tailscale && opts.hosts.is_none() && !state.probing_complete)
+    {
         check_interrupted()?;
 
         if !opts.json {
