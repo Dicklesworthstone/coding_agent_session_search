@@ -64,8 +64,84 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   what chose it, the resolved time window, the parsed filters, the query
   grouping and the argv auto-corrections. Pack's own `query.filters` was
   always empty, so a pack gave no way to check the filters it applied.
+- **`CASS_RAW_MIRROR=0` turns raw-mirror capture off (#506).** `0`, `false`,
+  `no` or `off` stops copying session source files into `raw-mirror/v1/`, so
+  a `cass mirror prune` is no longer undone by the next index run. Indexing
+  is unchanged, and existing captures stay until they are pruned. Doctor
+  reports `raw_mirror_capture_disabled` as the operator's choice rather than
+  a fault: a file its provider later deletes survives only in the archive
+  database (e0213341).
+- **An empty search filtered to one workspace says why.** `--workspace` is
+  matched exactly, so a trailing slash, a case difference or a moved checkout
+  returned zero hits that read like "nothing matches". When such a search
+  finds nothing, cass checks the indexed workspace paths and probes the query
+  once without the filter, within the remaining robot budget. Robot output
+  carries `zero_result_diagnosis`: the verdict, ranked candidate workspaces
+  and a suggested rerun (31eb05e1).
 
 ### Fixed
+
+- **OpenCode 2.x sessions are indexed (#504).** franken-agent-detection
+  0.3.3 reads OpenCode's `session_v2` and `session_message` tables, so
+  sessions stored only there are no longer skipped. A session migrated from
+  1.x is indexed once, not twice (6d75777e).
+- **`cass pack` says why it used lexical evidence (#507).** A default pack
+  reported `fallback_mode: "lexical"` with no cause, even when direct
+  semantic search worked. Pack selects evidence lexically, so the fallback is
+  by design. `realized.fallback_reason` now carries the typed cause
+  (`pack_enrichment_unavailable`, with the same codes as search's
+  `_meta.semantic_fallback_reason`). A fallback that arrives without a cause
+  is flagged `semantic_fallback_reason_unreported`. The recommended action
+  no longer suggests installing a model that would not change the result.
+  An explicit `--mode lexical` pack reports no fallback (ae2c0cc2).
+- **`sources setup --tailscale` skips Mullvad exit nodes (#505).** Automatic
+  discovery probed Mullvad exit nodes as SSH hosts. Peers tagged
+  `tag:mullvad-exit-node` or under Mullvad's DNS suffix are now excluded
+  before probing, and a resumed setup refreshes an unfinished peer list
+  instead of replaying the unfiltered one (3a48d211).
+- **`cass index --watch-once` sees commits that exist only in a SQLite
+  source's WAL (#502).** With an OpenClaw writer held open and autocheckpoint
+  off, a new message lands only in `openclaw-agent.sqlite-wal`. A targeted
+  watch-once on the database or on its `-wal` compared only the main file's
+  mtime, exited 0 and read nothing. It now checks the WAL too (b4206781).
+- **Codex rollouts above 100 MiB index again when
+  `CASS_CODEX_MAX_SOURCE_BYTES` allows them.** franken-agent-detection 0.3.1
+  capped its rollout reader at 100 MiB regardless of the cass policy. cass
+  now hands the reader its resolved budget (1fc07269). A rollout over the
+  budget is reported as `source-over-read-budget` with its own path and the
+  setting to raise. The previous report blamed the cass data directory and
+  suggested checking permissions (c7c67ef6).
+- **A giant conversation is persisted in bounded slices.** A conversation
+  over 16,384 messages or 32 MiB of content is written as consecutive
+  transactions and lexical updates. It used to be one transaction and one
+  batch, with memory growing with the whole conversation. On a machine
+  already swapping, a 1 GiB Codex rollout's persist outlived the index
+  watchdog (exit 70) (37675c69, fb195d0d, acccf050, 81f14db8).
+- **Index runs on large archives stop dying at startup and at the end.**
+  Counting the conversations touched since the last run joined every message
+  row, content included: 25+ minutes at startup on an 8.3M-message archive,
+  and a watchdog kill (exit 70) after ingest had finished. It now reads a
+  rowid range of the new messages (95b8e91d).
+- **The one-time legacy analytics rebuild no longer loads the whole archive
+  into memory.** An archive writer's point lookups and a table-existence
+  check each made the engine read every page of the file. On a 16 GB archive
+  copy the token-rollup stage went from 17.3 GB to 1.1 GB (3c8b35e9,
+  0871c89d, 15248979, 9c830c01).
+- **`cass status` reports the memory limit the process runs under (#496).**
+  The topology planner read host RAM even under a cgroup limit such as
+  `systemd-run -p MemoryMax=16G`, and sized caches for memory the process
+  could not use. It now uses the same cgroup-aware probes as the indexer
+  (71759163).
+- **A missing `sqlite3` CLI is named.** The paths that still run the external
+  `sqlite3` tool (duplicate schema-row repair, historical-bundle recovery,
+  FTS metadata scrub) failed with a bare "No such file or directory" on hosts
+  without it. The error now names the missing tool and what needed it
+  (2ed4da16).
+- **FrankenSQLite 0.4.6: a live B-tree page can no longer be freed and handed
+  out again.** Across a WAL generation, the engine could free a page still in
+  use and grant it again, the corruption `integrity_check` reports as `page N
+  is referenced multiple times`. A concurrent schema change could also build
+  an index from a snapshot that missed a peer's rows (e69c1414).
 
 - **Long sessions are searchable past their first 8 MiB.** The lexical
   index capped each conversation's text at 8 MiB in total, so every message
