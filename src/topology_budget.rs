@@ -117,10 +117,6 @@ impl TopologyPlannerDefaults {
         }
     }
 
-    pub(crate) fn from_current_process() -> Self {
-        Self::from_current_process_with(effective_memory_snapshot())
-    }
-
     fn from_current_process_with(memory: MemorySnapshot) -> Self {
         let pipeline = crate::indexer::lexical_rebuild_pipeline_settings_snapshot();
         Self::conservative(

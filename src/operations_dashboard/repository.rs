@@ -819,8 +819,7 @@ mod tests {
     /// inside the project checkout (rch uses `<project>/.rch-tmp`), which made the
     /// beads-only assertion resolve to the enclosing cass repo instead.
     fn tempdir_outside_any_repository() -> std::io::Result<tempfile::TempDir> {
-        let has_git_ancestor =
-            |base: &Path| base.ancestors().any(|dir| dir.join(".git").exists());
+        let has_git_ancestor = |base: &Path| base.ancestors().any(|dir| dir.join(".git").exists());
         let mut bases = vec![std::env::temp_dir()];
         if cfg!(unix) {
             bases.push(PathBuf::from("/tmp"));
