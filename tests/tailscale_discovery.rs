@@ -158,6 +158,17 @@ fn mixed_peers() -> Value {
 
 const ALIAS: &str = "Host workstation\n  HostName 100.64.0.1\n  User developer\n";
 
+/// `sources setup --json` reports "nothing to configure" as exit 0 with
+/// `status: no_hosts`, both when discovery is empty and when every probe
+/// fails. The ProxyCommand refuses every transport, so each setup here ends
+/// that way; which transports it attempted is what distinguishes the cases.
+fn assert_setup_no_hosts(output: &Output) {
+    assert!(output.status.success(), "{output:?}");
+    // Stdout that is not JSON reads as Null and fails the status check below.
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert_eq!(report["status"], "no_hosts", "{output:?}");
+}
+
 #[test]
 fn gh505_discovery_and_setup_never_probe_mullvad_peers() {
     let fixture = FleetFixture::new(mixed_peers(), ALIAS);
@@ -172,10 +183,7 @@ fn gh505_discovery_and_setup_never_probe_mullvad_peers() {
     assert!(fixture.attempted_transports().is_empty());
 
     let output = fixture.setup(false);
-    assert!(
-        !output.status.success(),
-        "transport must fail locally: {output:?}"
-    );
+    assert_setup_no_hosts(&output);
     assert_eq!(
         fixture.attempted_transports(),
         BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
@@ -197,7 +205,7 @@ fn gh505_all_mullvad_setup_does_not_start_ssh_transport() {
     let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(discovery["status"], "no_hosts", "{discovery}");
     let output = fixture.setup(false);
-    assert!(!output.status.success(), "expected no hosts: {output:?}");
+    assert_setup_no_hosts(&output);
     assert!(fixture.attempted_transports().is_empty());
     assert_eq!(
         fs::read_to_string(&fixture.status_calls)
@@ -213,10 +221,7 @@ fn gh505_resumed_setup_refreshes_legacy_unfiltered_discovery() {
     let fixture = FleetFixture::new(mixed_peers(), ALIAS);
     fixture.save_legacy_discovery();
     let output = fixture.setup(true);
-    assert!(
-        !output.status.success(),
-        "transport must fail locally: {output:?}"
-    );
+    assert_setup_no_hosts(&output);
     assert_eq!(
         fixture.attempted_transports(),
         BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
@@ -236,10 +241,7 @@ fn gh505_resumed_setup_with_bad_status_keeps_aliases_not_cached_peers() {
     fixture.save_legacy_discovery();
     fs::write(&fixture.status, "invalid status JSON").unwrap();
     let output = fixture.setup(true);
-    assert!(
-        !output.status.success(),
-        "transport must fail locally: {output:?}"
-    );
+    assert_setup_no_hosts(&output);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("Tailscale discovery unavailable"),
         "{output:?}"
