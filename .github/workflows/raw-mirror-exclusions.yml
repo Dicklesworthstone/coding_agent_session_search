@@ -22,7 +22,9 @@ jobs:
   capture:
     name: Raw mirror (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # A cold Windows build of the staged crate (FrankenSQLite, FAD, Asupersync)
+    # took 11-12 min in September and passed 15 min on 2026-09-29.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
