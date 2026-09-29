@@ -1,6 +1,8 @@
 mod exclusions;
 mod source_budget;
 
+#[cfg(test)]
+pub(crate) use source_budget::over_budget_scan_error;
 pub(crate) use source_budget::over_budget_sources;
 
 use std::collections::HashMap;

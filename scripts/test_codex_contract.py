@@ -98,6 +98,9 @@ def main() -> None:
     lines.extend(["", "[lints.rust]", 'unsafe_code = "forbid"', ""])
 
     library = '''// Re-exports only; the Codex implementation is unmodified production code.
+// Crate-internal entry points used only by unstaged CASS modules (such as
+// ingest diagnostics) are unused here; the full crate's clippy checks them.
+#![allow(dead_code)]
 pub use franken_agent_detection::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation,
     NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages,

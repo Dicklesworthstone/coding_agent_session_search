@@ -1320,4 +1320,47 @@ mod tests {
         verify_eq!(value["connector_diagnostics"], json!([]));
         Ok(())
     }
+
+    /// A Codex scan that stopped only because rollouts exceeded the read budget
+    /// is diagnosed per rejected rollout with the setting that admits it, even
+    /// through added context; it used to read as one "unreadable, check
+    /// permissions" entry naming the cass data directory. Any other scan error
+    /// keeps the generic entry.
+    #[test]
+    fn codex_over_budget_scan_error_is_diagnosed_per_rollout_not_as_the_data_dir() -> TestResult {
+        let error = crate::connectors::codex::over_budget_scan_error(&[(
+            "/codex/sessions/rollout-big.jsonl",
+            200 * 1024 * 1024,
+        )])
+        .context("scanning codex");
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+
+        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/data"), &error);
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::SourceOverReadBudget
+        );
+        verify_eq!(diagnostic.source_path, "/codex/sessions/rollout-big.jsonl");
+        verify!(
+            diagnostic
+                .safe_next_action
+                .contains("CASS_CODEX_MAX_SOURCE_BYTES")
+        );
+        verify_eq!(report.summary.skipped, 1);
+
+        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/data"), &anyhow::anyhow!("disk went away"));
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        verify_eq!(report.diagnostics[0].source_path, "/data");
+        Ok(())
+    }
 }

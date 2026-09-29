@@ -162,6 +162,24 @@ pub(crate) struct OverBudgetSources {
     pub(crate) sampled_paths: Vec<PathBuf>,
 }
 
+/// The error a Codex scan returns when these rollouts exceeded the per-source
+/// read budget, for tests of the modules that diagnose it.
+#[cfg(test)]
+pub(crate) fn over_budget_scan_error(rejected: &[(&str, u64)]) -> anyhow::Error {
+    anyhow::Error::from(IncompleteScan {
+        rejected_source_count: rejected.len(),
+        rejected_sources: rejected
+            .iter()
+            .map(|&(source_path, observed_bytes)| RejectedSource {
+                source_path: source_path.to_string(),
+                observed_bytes,
+                limit_bytes: None,
+            })
+            .collect(),
+        ..IncompleteScan::default()
+    })
+}
+
 /// The over-budget rollouts behind a Codex scan error, when that is all it is.
 /// A scan that also failed for other reasons keeps its generic diagnostic.
 pub(crate) fn over_budget_sources(error: &anyhow::Error) -> Option<OverBudgetSources> {

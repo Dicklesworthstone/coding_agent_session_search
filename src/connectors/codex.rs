@@ -14,8 +14,14 @@ use super::{
 };
 
 // Keep the existing crate-internal message projection entry point available.
+// These re-exports serve consumers outside this module (ingest diagnostics),
+// which the standalone Codex/raw-mirror contract crates do not stage.
 #[allow(unused_imports)]
 pub(crate) use implementation::modern_codex_message;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use implementation::over_budget_scan_error;
+#[allow(unused_imports)]
 pub(crate) use implementation::over_budget_sources;
 
 /// Archive-aware public surface; parsing and enrichment live in implementation.
