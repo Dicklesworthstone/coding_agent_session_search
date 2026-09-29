@@ -1,4 +1,5 @@
 //! GH #486: the CLI must exclude raw copies as well as canonical/search rows.
+//! GH #506: `CASS_RAW_MIRROR=0` stops raw copies without excluding any rows.
 //! Run with `cargo test --test e2e_codex_exclusion_capture` in a full CASS build.
 
 use coding_agent_search::raw_mirror::storage_summary;
@@ -248,5 +249,70 @@ fn removing_exclusions_ingests_old_sources_without_hidden_raw_copies_or_duplicat
         fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
         fixture.assert_hits("cassprivateproof9z", 1);
         fixture.assert_hits("cassarchiveproof8z", 1);
+    }
+}
+
+/// GH #506: with `CASS_RAW_MIRROR=0` an index run writes and serves every
+/// conversation but copies no source into the raw mirror, and doctor reports
+/// the switch rather than a backfill gap. Control: the same fixture indexed
+/// with the switch unset captures all three sources.
+#[test]
+fn raw_mirror_switch_indexes_without_raw_copies_and_doctor_discloses_it() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        let home = fixture.home.path();
+        let mut index = fixture.command(streaming, "");
+        index
+            .env("CASS_RAW_MIRROR", "0")
+            .args(["index", "--json", "--full"]);
+        let output = assert_cmd::Command::from_std(index)
+            .timeout(Duration::from_secs(180))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let summary: Value = serde_json::from_slice(&output).unwrap_or(Value::Null);
+        assert_eq!(summary["success"], true, "{summary}");
+        fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
+        fixture.assert_hits("casspublicproof7z", 1);
+        assert!(
+            !home.join("data/raw-mirror").exists(),
+            "no raw copy may be written (streaming={streaming})"
+        );
+
+        let mut doctor = fixture.command(streaming, "");
+        doctor
+            .env("CASS_RAW_MIRROR", "0")
+            .args(["doctor", "--json"]);
+        let output = assert_cmd::Command::from_std(doctor)
+            .timeout(Duration::from_secs(120))
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        let risk = &report["coverage_risk"];
+        assert_eq!(risk["status"], "raw_mirror_capture_disabled", "{report}");
+        assert_eq!(risk["raw_mirror_capture_disabled"], true, "{risk}");
+        assert_eq!(risk["db_without_raw_mirror_count"], 3, "{risk}");
+        let coverage_check = report["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|check| check["name"] == "source_coverage")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(coverage_check["status"], "warn", "{coverage_check}");
+        assert_eq!(coverage_check["fix_available"], false, "{coverage_check}");
+        assert!(
+            coverage_check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("CASS_RAW_MIRROR")),
+            "{coverage_check}"
+        );
+
+        let control = Fixture::new();
+        control.index(streaming, "", true);
+        let captured = storage_summary(&control.home.path().join("data"));
+        assert_eq!(captured.manifest_count, 3, "streaming={streaming}");
     }
 }

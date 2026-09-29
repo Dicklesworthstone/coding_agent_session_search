@@ -495,6 +495,7 @@
     "current_source_newer_than_archive_count": 0,
     "raw_mirror_db_link_count": 0,
     "sole_copy_warning_count": 0,
+    "raw_mirror_capture_disabled": false,
     "recommended_action": "Run 'cass index --full' once before coverage can be assessed."
   },
   "quarantine": {

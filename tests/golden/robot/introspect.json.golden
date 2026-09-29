@@ -8287,6 +8287,10 @@
             "sole_copy_warning_count": {
               "type": "integer"
             },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
+            },
             "recommended_action": {
               "type": "string"
             }
@@ -19646,7 +19650,7 @@
         },
         "archive_coverage_state": {
           "type": "string",
-          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
         },
         "source_mirror_state": {
           "type": "string",
@@ -27557,7 +27561,7 @@
         },
         "archive_coverage_state": {
           "type": "string",
-          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
         },
         "source_mirror_state": {
           "type": "string",
@@ -28971,7 +28975,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -29266,6 +29270,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -34918,7 +34926,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -35213,6 +35221,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -37017,7 +37029,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -37312,6 +37324,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"

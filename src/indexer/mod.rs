@@ -32248,6 +32248,9 @@ fn capture_discovered_source_file_before_parse(
     provider: &str,
     source: &crate::connectors::DiscoveredSourceFile,
 ) {
+    if !crate::raw_mirror::capture_enabled() {
+        return;
+    }
     if let Err(reason) = validate_discovered_source_path(source) {
         tracing::warn!(
             provider,
@@ -32424,6 +32427,9 @@ fn capture_scan_root_file_before_parse(
     if should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path) {
         return true;
     }
+    if !crate::raw_mirror::capture_enabled() {
+        return false;
+    }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
         provider,
@@ -32457,6 +32463,11 @@ fn capture_scan_root_file_before_parse(
 }
 
 fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
+    // GH #506: CASS_RAW_MIRROR=off leaves the conversation without raw-mirror
+    // metadata; the archive rows are written as usual.
+    if !crate::raw_mirror::capture_enabled() {
+        return;
+    }
     if should_skip_raw_mirror_capture_for_logical_source(&conv.source_path) {
         tracing::debug!(
             agent = %conv.agent_slug,

@@ -688,6 +688,14 @@ confirmed result.
 Use `--provider opencode` and/or `--source-path '*/opencode.db'` with an age
 or size rule to target one source without retiring unrelated captures.
 Repeated providers are alternatives; a source-path glob further narrows them.
+
+A pruned capture of a source that is still on disk is copied again by the next
+index run. On a machine whose providers never delete their session files, set
+`CASS_RAW_MIRROR=0` (or `false`, `no`, `off`) to stop capturing altogether.
+Indexing and search are unchanged, and existing captures stay until you prune
+them. `cass doctor` reports `raw_mirror_capture_disabled` and warns about what is
+given up: a session file its provider later deletes survives only in the
+archive DB.
 With a selector, `--max-size` measures unique blobs in that selection. Shared
 blobs still referenced outside it and orphan blobs without source provenance
 remain protected. The JSON plan records the selectors and `scope_blob_bytes`.
@@ -3513,6 +3521,7 @@ Update check state is stored in `update_state.json` in the data directory:
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
 | `CASS_OUTPUT_FORMAT` | unset | `json`, `jsonl`, `compact`, `sessions` or `toon` makes robot output the default, as if `--robot-format` were given |
 | `CASS_SSH_CONFIG` | unset | SSH config file passed as `ssh -F <path>` for remote sources (cass also sets `BatchMode=yes` and `StrictHostKeyChecking=yes`) |
+| `CASS_RAW_MIRROR` | `1` | Raw-mirror capture of session source files into `raw-mirror/v1/`. `0`, `false`, `no` or `off` stops capturing (GH #506). Indexing is unchanged, and existing captures stay until `cass mirror prune`. Doctor reports `raw_mirror_capture_disabled`, because a file its provider deletes then survives only in the archive DB. |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `536870912` | Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available |

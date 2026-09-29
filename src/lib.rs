@@ -26734,6 +26734,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES=<N>  refuse the unbounded V14 legacy-FTS teardown on archives above N bytes (default 536870912; 0 disables the refusal)".to_string(),
             "  CASS_DEFER_ANALYTICS_UPDATES=1             defer derived analytics writes during indexing; a pending legacy OMP rebuild resumes on a later run with this unset".to_string(),
             "  CASS_STORAGE_PROBE_TIMEOUT_MS=<N>        budget for the dedicated typed storage probes on status/search/doctor (default 100; clamped 10..10000) — widen on slow hosts where schema/contention classification times out to `unchecked`".to_string(),
+            "  CASS_RAW_MIRROR=0                        stop copying session files into the raw mirror (default on); indexing continues, doctor reports raw_mirror_capture_disabled".to_string(),
             "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
@@ -39510,6 +39511,10 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         "source_coverage" => {
             if message.contains("sole-copy") {
                 DoctorAnomaly::UpstreamSourcePruned
+            } else if message.contains("CASS_RAW_MIRROR") {
+                // GH #506: an operator setting reduces coverage, like
+                // CASS_EXCLUDE_PATHS; nothing about the archive is unsafe.
+                DoctorAnomaly::ConfigExclusionRisk
             } else {
                 DoctorAnomaly::SourceAuthorityUnsafe
             }
@@ -44259,6 +44264,9 @@ struct DoctorCoverageRiskSummary {
     current_source_newer_than_archive_count: usize,
     raw_mirror_db_link_count: usize,
     sole_copy_warning_count: usize,
+    /// `CASS_RAW_MIRROR` turned raw capture off (GH #506): archive rows
+    /// without a raw copy are then expected rather than a backfill gap.
+    raw_mirror_capture_disabled: bool,
     recommended_action: String,
 }
 
@@ -46394,7 +46402,7 @@ fn doctor_risk_level_for_reports(
         return "high";
     }
     if coverage_risk.missing_current_source_count > 0
-        || coverage_risk.db_without_raw_mirror_count > 0
+        || doctor_unmirrored_rows_are_a_gap(coverage_risk)
         || checks.iter().any(|check| {
             matches!(
                 check.data_loss_risk,
@@ -50200,7 +50208,11 @@ fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorA
         &raw_mirror_backfill,
         &sole_copy_warnings,
     );
-    let coverage_risk = doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len());
+    let coverage_risk = doctor_coverage_risk_summary(
+        &coverage_summary,
+        sole_copy_warnings.len(),
+        !crate::raw_mirror::capture_enabled(),
+    );
     let source_authority =
         build_doctor_source_authority_report(db_path, &source_inventory, &raw_mirror);
     let coverage =
@@ -51791,6 +51803,17 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         return receipt;
     }
 
+    if !crate::raw_mirror::capture_enabled() {
+        // GH #506: the operator turned capture off. The source is capturable,
+        // so this is neither a projection-only row nor a failure.
+        receipt.action = "capture_disabled".to_string();
+        receipt.warnings.push(
+            "raw mirror capture is off (CASS_RAW_MIRROR); doctor does not copy the live source file"
+                .to_string(),
+        );
+        return receipt;
+    }
+
     if !apply {
         receipt.action = "would_capture_live_source".to_string();
         return receipt;
@@ -52287,6 +52310,8 @@ fn build_doctor_coverage_summary(
             || source_inventory.unknown_mapping_count > 0;
     let recommended_action = if !sole_copy_warnings.is_empty() {
         "Back up the cass data directory and avoid source-session rebuilds that reduce archive coverage.".to_string()
+    } else if db_without_raw_mirror_count > 0 && !crate::raw_mirror::capture_enabled() {
+        "Raw mirror capture is off (CASS_RAW_MIRROR), so these archive rows have no raw copy by design; if a provider deletes a session file, the archive DB holds the only copy. Unset CASS_RAW_MIRROR and run 'cass doctor --fix --json' to restore raw-mirror coverage.".to_string()
     } else if db_without_raw_mirror_count > 0 {
         "Run 'cass doctor --fix --json' to add raw-mirror coverage for eligible live source files."
             .to_string()
@@ -52497,9 +52522,12 @@ fn build_doctor_coverage_comparison_gate(
 fn doctor_coverage_risk_summary(
     coverage_summary: &DoctorCoverageSummary,
     sole_copy_warning_count: usize,
+    raw_mirror_capture_disabled: bool,
 ) -> DoctorCoverageRiskSummary {
     let status = if sole_copy_warning_count > 0 {
         "sole_copy_risk"
+    } else if coverage_summary.db_without_raw_mirror_count > 0 && raw_mirror_capture_disabled {
+        "raw_mirror_capture_disabled"
     } else if coverage_summary.db_without_raw_mirror_count > 0 {
         "raw_mirror_backfill_available"
     } else if coverage_summary.mirror_without_db_link_count > 0 {
@@ -52522,6 +52550,7 @@ fn doctor_coverage_risk_summary(
             .current_source_newer_than_archive_count,
         raw_mirror_db_link_count: coverage_summary.raw_mirror_db_link_count,
         sole_copy_warning_count,
+        raw_mirror_capture_disabled,
         recommended_action: coverage_summary.recommended_action.clone(),
     }
 }
@@ -52535,6 +52564,7 @@ fn doctor_fast_coverage_risk_unchecked(db_exists: bool) -> DoctorCoverageRiskSum
             "not_initialized".to_string()
         },
         confidence_tier: "unchecked".to_string(),
+        raw_mirror_capture_disabled: !crate::raw_mirror::capture_enabled(),
         recommended_action: if db_exists {
             "Run 'cass doctor --json' for source coverage and sole-copy analysis.".to_string()
         } else {
@@ -52592,6 +52622,7 @@ fn doctor_summary_coverage_state(coverage_risk: &DoctorCoverageRiskSummary) -> &
         "not_initialized" => "not_initialized",
         "sole_copy_risk" => "sole_copy_risk",
         "raw_mirror_backfill_available" => "raw_mirror_backfill_available",
+        "raw_mirror_capture_disabled" => "raw_mirror_capture_disabled",
         "raw_mirror_unlinked" => "raw_mirror_unlinked",
         "current_sources_newer_than_archive" => "current_sources_newer_than_archive",
         status if status.starts_with("unchecked") => "not_checked",
@@ -52617,18 +52648,26 @@ fn doctor_summary_source_mirror_state(coverage_risk: &DoctorCoverageRiskSummary)
     }
 }
 
+/// Archive rows lacking a raw copy that doctor could still capture. With
+/// capture switched off (GH #506) they are the operator's choice, reported as
+/// low risk rather than as a coverage gap.
+fn doctor_unmirrored_rows_are_a_gap(coverage_risk: &DoctorCoverageRiskSummary) -> bool {
+    coverage_risk.db_without_raw_mirror_count > 0 && !coverage_risk.raw_mirror_capture_disabled
+}
+
 fn doctor_summary_risk_level(coverage_risk: &DoctorCoverageRiskSummary) -> &'static str {
     if coverage_risk.status == "sole_copy_risk" {
         "high"
     } else if coverage_risk.confidence_tier == "unchecked" {
         "unknown"
     } else if coverage_risk.missing_current_source_count > 0
-        || coverage_risk.db_without_raw_mirror_count > 0
+        || doctor_unmirrored_rows_are_a_gap(coverage_risk)
         || coverage_risk.db_projection_only_count > 0
     {
         "medium"
     } else if coverage_risk.mirror_without_db_link_count > 0
         || coverage_risk.current_source_newer_than_archive_count > 0
+        || coverage_risk.db_without_raw_mirror_count > 0
     {
         "low"
     } else {
@@ -52645,7 +52684,7 @@ fn doctor_summary_health_class(
         "repair-blocked"
     } else if coverage_risk.status == "sole_copy_risk"
         || coverage_risk.missing_current_source_count > 0
-        || coverage_risk.db_without_raw_mirror_count > 0
+        || doctor_unmirrored_rows_are_a_gap(coverage_risk)
         || coverage_risk.db_projection_only_count > 0
     {
         "degraded-archive-risk"
@@ -60567,7 +60606,11 @@ fn build_doctor_baseline_snapshot(
         &raw_mirror_backfill,
         &sole_copy_warnings,
     );
-    let coverage_risk = doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len());
+    let coverage_risk = doctor_coverage_risk_summary(
+        &coverage_summary,
+        sole_copy_warnings.len(),
+        !crate::raw_mirror::capture_enabled(),
+    );
     let source_authority =
         build_doctor_source_authority_report(db_path, &source_inventory, &raw_mirror);
     let storage_pressure = collect_doctor_storage_pressure(data_dir, db_path);
@@ -79333,7 +79376,7 @@ paths = ["~/.claude/projects"]
         assert_eq!(summary.latest_started_at_ms, Some(1_700_000_000_000));
         assert!(summary.coverage_reducing_live_source_rebuild_refused);
 
-        let risk = doctor_coverage_risk_summary(&summary, sole_copy_warnings.len());
+        let risk = doctor_coverage_risk_summary(&summary, sole_copy_warnings.len(), false);
         assert_eq!(risk.status, "sole_copy_risk");
         assert_eq!(risk.sole_copy_warning_count, 1);
         assert_eq!(risk.raw_mirror_db_link_count, 1);
@@ -79365,9 +79408,68 @@ paths = ["~/.claude/projects"]
                 ..DoctorCoverageSummary::default()
             },
             0,
+            false,
         );
         assert_eq!(mirror_only_risk.status, "raw_mirror_unlinked");
         assert_eq!(mirror_only_risk.mirror_without_db_link_count, 1);
+    }
+
+    /// GH #506: with capture switched off, archive rows without a raw copy are
+    /// disclosed as the operator's choice (low risk, not a degraded archive),
+    /// while a sole copy still reports high risk.
+    #[test]
+    fn gh506_capture_disabled_unmirrored_rows_are_disclosed_not_a_gap() {
+        let unmirrored = DoctorCoverageSummary {
+            confidence_tier: "archive_db_without_raw_mirror".to_string(),
+            archive_conversation_count: 3,
+            db_without_raw_mirror_count: 3,
+            recommended_action: "inspect".to_string(),
+            ..DoctorCoverageSummary::default()
+        };
+
+        let enabled = doctor_coverage_risk_summary(&unmirrored, 0, false);
+        assert_eq!(enabled.status, "raw_mirror_backfill_available");
+        assert!(!enabled.raw_mirror_capture_disabled);
+        assert_eq!(doctor_summary_risk_level(&enabled), "medium");
+        assert_eq!(
+            doctor_summary_health_class(&enabled, None, true),
+            "degraded-archive-risk"
+        );
+        assert_eq!(doctor_risk_level_for_reports(&enabled, &[]), "medium");
+
+        let disabled = doctor_coverage_risk_summary(&unmirrored, 0, true);
+        assert_eq!(disabled.status, "raw_mirror_capture_disabled");
+        assert!(disabled.raw_mirror_capture_disabled);
+        assert_eq!(
+            doctor_summary_coverage_state(&disabled),
+            "raw_mirror_capture_disabled"
+        );
+        assert_eq!(
+            doctor_summary_source_mirror_state(&disabled),
+            "archive_rows_without_raw_mirror"
+        );
+        assert_eq!(doctor_summary_risk_level(&disabled), "low");
+        assert_eq!(
+            doctor_summary_health_class(&disabled, None, true),
+            "healthy"
+        );
+        assert_eq!(doctor_risk_level_for_reports(&disabled, &[]), "none");
+
+        // The switch does not hide a sole copy or a missing source.
+        let sole_copy = doctor_coverage_risk_summary(
+            &DoctorCoverageSummary {
+                missing_current_source_count: 1,
+                ..unmirrored.clone()
+            },
+            1,
+            true,
+        );
+        assert_eq!(sole_copy.status, "sole_copy_risk");
+        assert_eq!(doctor_summary_risk_level(&sole_copy), "high");
+        assert_eq!(
+            doctor_summary_health_class(&sole_copy, None, true),
+            "degraded-archive-risk"
+        );
     }
 
     fn doctor_test_source_authority_report() -> DoctorSourceAuthorityReport {
@@ -92164,7 +92266,11 @@ pub(crate) fn run_doctor_impl(
         );
         risk
     } else {
-        doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len())
+        doctor_coverage_risk_summary(
+            &coverage_summary,
+            sole_copy_warnings.len(),
+            !crate::raw_mirror::capture_enabled(),
+        )
     };
     if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
         add_check!(
@@ -92180,6 +92286,21 @@ pub(crate) fn run_doctor_impl(
             format!(
                 "Source coverage ledger found {} sole-copy warning(s); live-source rebuilds that reduce coverage are refused",
                 sole_copy_warnings.len()
+            ),
+            false
+        );
+    } else if coverage_summary.db_without_raw_mirror_count > 0
+        && !crate::raw_mirror::capture_enabled()
+    {
+        // GH #506: say plainly what the operator's switch gives up; doctor
+        // --fix cannot add raw copies while capture is off.
+        add_check!(
+            "source_coverage",
+            "warn",
+            format!(
+                "Raw mirror capture is off (CASS_RAW_MIRROR): {} DB row(s) have no raw copy, so a session file its provider deletes survives only in the archive DB ({} raw mirror manifest(s) lack DB links)",
+                coverage_summary.db_without_raw_mirror_count,
+                coverage_summary.mirror_without_db_link_count
             ),
             false
         );
@@ -95488,6 +95609,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset.",
         ),
         env_var_capability(
+            "CASS_RAW_MIRROR",
+            Some("1"),
+            "Raw-mirror capture of session source files. Set 0, false, no or off to stop copying sources whose provider keeps its own history; existing captures stay until `cass mirror prune`, indexing is unaffected, and doctor reports raw_mirror_capture_disabled because a file its provider deletes then survives only in the archive DB.",
+        ),
+        env_var_capability(
             "CASS_AUTO_REFRESH",
             Some("1"),
             "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request.",
@@ -98253,7 +98379,7 @@ fn response_schema_doctor_v2_summary(surface: &'static str) -> serde_json::Value
                 "archive_coverage_state",
                 serde_json::json!({
                     "type": "string",
-                    "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+                    "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
                 }),
             ),
             (
@@ -99458,6 +99584,10 @@ fn response_schema_doctor_coverage_risk() -> serde_json::Value {
             "current_source_newer_than_archive_count": { "type": "integer" },
             "raw_mirror_db_link_count": { "type": "integer" },
             "sole_copy_warning_count": { "type": "integer" },
+            "raw_mirror_capture_disabled": {
+                "type": "boolean",
+                "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
+            },
             "recommended_action": { "type": "string" }
         }
     })

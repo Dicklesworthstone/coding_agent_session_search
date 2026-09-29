@@ -9970,6 +9970,17 @@
                             }
                           }
                         },
+                        "raw_mirror_capture_disabled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "recommended_action": {
                           "type": "object",
                           "properties": {
@@ -54082,6 +54093,17 @@
                             }
                           }
                         },
+                        "raw_mirror_capture_disabled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "recommended_action": {
                           "type": "object",
                           "properties": {
@@ -67267,6 +67289,17 @@
                             }
                           }
                         },
+                        "raw_mirror_capture_disabled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "recommended_action": {
                           "type": "object",
                           "properties": {
@@ -71798,6 +71831,17 @@
                           "type": "object",
                           "properties": {
                             "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "raw_mirror_capture_disabled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
                               "type": "string"
                             }
                           }

@@ -546,6 +546,9 @@
         "sole_copy_warning_count": {
           "type": "integer"
         },
+        "raw_mirror_capture_disabled": {
+          "type": "boolean"
+        },
         "recommended_action": {
           "type": "string"
         }

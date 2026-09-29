@@ -222,6 +222,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
@@ -2764,6 +2765,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
@@ -3403,6 +3405,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
@@ -3798,6 +3801,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
+      - raw_mirror_capture_disabled: boolean
       - raw_mirror_db_link_count: integer
       - recommended_action: string
       - schema_version: integer
