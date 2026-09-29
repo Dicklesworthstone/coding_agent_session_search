@@ -22,10 +22,29 @@
       "cfg_test_only": true,
       "permanent": true,
       "note": "Creates test ResourceInfo struct for unit testing check_resources() and can_compile(). Complemented by real resource probe tests."
+    },
+    {
+      "path": "tests/tailscale_discovery.rs",
+      "pattern": "fake_tailscale_status",
+      "rationale": "External Tailscale CLI/daemon protocol boundary: deterministic status JSON is necessary to exercise Mullvad filtering without a private tailnet or contacting provider infrastructure. The production parser, setup and real OpenSSH execute unchanged; ProxyCommand records and refuses every transport locally.",
+      "owner": "sources-team",
+      "review_date": "2027-03-28",
+      "cfg_test_only": true,
+      "permanent": true,
+      "note": "GH505 covers tag-only and DNS-only providers, normal exit nodes, aliases, all-provider discovery, and resumed stale discovery. No SSH executable is substituted."
     }
   ],
-  "excluded_paths": ["node_modules/", "target/", ".git/", "tests/fixtures/", "test-results/"],
-  "excluded_patterns": ["mock-.*\\.jsonl$", "mock-.*\\.html$"],
+  "excluded_paths": [
+    "node_modules/",
+    "target/",
+    ".git/",
+    "tests/fixtures/",
+    "test-results/"
+  ],
+  "excluded_patterns": [
+    "mock-.*\\.jsonl$",
+    "mock-.*\\.html$"
+  ],
   "notes": [
     "Entries with permanent: true are allowed indefinitely (true OS/hardware boundaries or false positives)",
     "See docs/artifacts/no-mock-audit.md for full audit report",

@@ -1,0 +1,107 @@
+name: Tailscale SSH discovery regression
+'on':
+  push:
+    branches:
+    - main
+    paths:
+    - .github/workflows/gh505-tailscale-discovery.yml
+    - src/sources/**
+    - tests/tailscale_discovery.rs
+    - tests/setup_workflow.rs
+    - tests/e2e_sources.rs
+    - tests/policies/no_mock_allowlist.json
+    - Cargo.toml
+    - Cargo.lock
+    - rust-toolchain.toml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: gh505-tailscale-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUST_MIN_STACK: '134217728'
+  RUST_BACKTRACE: '1'
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Install pinned Rust and real OpenSSH
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libssl-dev openssh-client ripgrep
+        rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+        rustc --version
+        cargo --version
+        /usr/bin/ssh -V
+    - name: Focused discovery unit regressions
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-0.log"
+        timeout 1500s cargo test --locked --lib tailscale -- --nocapture 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 6, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 0:', counts)
+        PYTEST
+    - name: Real CLI and SSH transport boundary regressions
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-1.log"
+        timeout 1200s cargo test --locked --test tailscale_discovery -- --nocapture 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 4, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 1:', counts)
+        PYTEST
+    - name: Broader sources library suite
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-2.log"
+        timeout 1200s cargo test --locked --lib sources:: 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 1, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 2:', counts)
+        PYTEST
+    - name: Broader setup and sources CLI suites
+      shell: bash
+      run: |
+        set -euo pipefail
+        log="$RUNNER_TEMP/gh505-test-3.log"
+        timeout 1200s cargo test --locked --test setup_workflow --test e2e_sources 2>&1 | tee "$log"
+        python3 - "$log" <<'PYTEST'
+        import pathlib, re, sys
+        text = pathlib.Path(sys.argv[1]).read_text()
+        counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+        assert counts and sum(map(int, counts)) >= 1, 'Required Rust tests did not execute'
+        print('GH505_TEST_RECEIPT 3:', counts)
+        PYTEST
+    - name: Formatting and no-mock policy
+      run: |
+        set -euo pipefail
+        cargo fmt --all -- --check
+        ./scripts/validate_ci.sh --no-mock-only
+        git diff --check
+    - name: Clippy for library and new CLI regressions
+      run: cargo clippy --locked --lib --test tailscale_discovery -- -D warnings
