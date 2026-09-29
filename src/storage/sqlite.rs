@@ -42927,16 +42927,19 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         // Bytes returned by read syscalls. fsqlite 0.4.4 reads every page of
         // the file (through pread, invisible to its page-cache counters) on a
         // connection's first sqlite_master query: 4,237,131 preads for the
-        // 4,137,946-page owner archive.
+        // 4,137,946-page owner archive. Counted per thread: the synchronous
+        // wrapper drives the engine on this thread, and the process-wide
+        // counter also collects every test running in parallel (this test
+        // failed its bound in a 735-test storage run and passed alone).
         let read_bytes = || {
-            fs::read_to_string("/proc/self/io")
+            fs::read_to_string("/proc/thread-self/io")
                 .ok()
                 .and_then(|io| {
                     io.lines()
                         .find_map(|line| line.strip_prefix("rchar: "))
                         .and_then(|value| value.trim().parse::<u64>().ok())
                 })
-                .expect("/proc/self/io rchar")
+                .expect("/proc/thread-self/io rchar")
         };
 
         let before_probe = read_bytes();
