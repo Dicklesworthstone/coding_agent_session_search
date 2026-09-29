@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "value": {
+    "entries": [
+      {
+        "kind": "send-message",
+        "id": "s60c5",
+        "message": {
+          "type": "secret-request",
+          "secretRequest": {
+            "label": "dolore magna eiusmod ex quis",
+            "description": "nisi ut nisi ut eiusmod nisi lorem ea magna ad tempor ut lorem",
+            "target": {
+              "kind": "channel-credential",
+              "platform": "service-c0989e",
+              "field": "service-f62cc8"
+            }
+          }
+        },
+        "timestampMs": 1767225600000,
+        "requestId": "a483a948-5a76-ed72-0bae-d9ab8ff781d2"
+      },
+      {
+        "kind": "message",
+        "id": "t79t",
+        "role": "user",
+        "content": "incididunt nostrud labore dolore eiusmod quis consec",
+        "richText": "{\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"lorem sit labore commodo eiusmod incididunt veniam t\"}]}]}",
+        "isStreaming": false,
+        "timestampMs": 1767225622759,
+        "clientNonce": "6d1fa14e-073d-b468-4b3d-416dd9642cd8",
+        "requestId": "6492119c-3235-398b-8e72-7ab054f156f4"
+      },
+      {
+        "kind": "send-message",
+        "id": "t28y4",
+        "message": {
+          "type": "text",
+          "content": "minim consectetur nostrud consectetur magna commodo dolore do do ad exerci"
+        },
+        "timestampMs": 1767225651447,
+        "requestId": "6492119c-3235-398b-8e72-7ab054f156f4"
+      },
+      {
+        "kind": "send-message",
+        "id": "p63f6",
+        "message": {
+          "type": "text",
+          "content": "aliqua et aliquip et elit commodo sit dolor commodo minim ad dolore tempor sit amet dolor laboris et sit dolore eiusmod sit veniam aliqua minim nostrud ex ipsum nis"
+        },
+        "timestampMs": 1767225691137,
+        "requestId": "5c1583f8-250b-8c6c-c91c-323f416b5cca"
+      },
+      {
+        "kind": "send-message",
+        "id": "f65h7",
+        "message": {
+          "type": "text",
+          "content": "minim minim et minim ipsum sit minim aliqua lorem dolore tempor laboris sit ut ea dolore laboris ut tempor magna tempor incididunt ullamco elit minim aliquip ea minim ex sed ad lorem exercitation incididunt tempor tempor ex ipsum veniam commodo nisi aliquip e"
+        },
+        "timestampMs": 1767225691567,
+        "requestId": "5c1583f8-250b-8c6c-c91c-323f416b5cca"
+      },
+      {
+        "kind": "message",
+        "id": "h45w",
+        "role": "user",
+        "content": "ex commodo ullamco amet commodo ea sed dolor minim aliquip dolor sed amet elit sit commodo exercitation consectetur ipsum laboris nostrud ad laboris tempor et minim ullamco nisi minim et exercitation dolor tempor consectetur sed consectetur lorem ea ad magna amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim ve",
+        "richText": "{\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"lorem sit labore commodo eiusmod incididunt veniam tempor eiusmod nostrud consectetur amet dolore commodo minim laboris dolor incididunt dolore elit veniam dolore incididunt ea aliqua sed magna labore commodo labore nisi do ullamco ut veniam veniam et aliqua et lorem elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud ex\"}]}]}",
+        "isStreaming": false,
+        "timestampMs": 1767225905566,
+        "clientNonce": "8ed3159a-9ad4-03fa-a9f8-eedcf3f516b7",
+        "requestId": "c6e99bc7-5213-89f2-6900-bbc842971474"
+      },
+      {
+        "kind": "event",
+        "id": "ilnsy-86p9cy03-m9hr-21nd-8m61-96l9s04861l6",
+        "event": {
+          "type": "automation-changed",
+          "action": "created",
+          "automationId": "qfqtzxr-lbrig",
+          "automationName": "elit et do lo"
+        },
+        "timestampMs": 1767225934713
+      },
+      {
+        "kind": "message",
+        "id": "l08t",
+        "role": "user",
+        "content": "veniam do adipiscing enim quis exercitation sed veniam tempor ut adipiscing ex ullamco dolore do labore amet ea ea enim temp",
+        "richText": "{\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"lorem sit labore commodo eiusmod incididunt veniam tempor eiusmod nostrud consectetur amet dolore commodo minim laboris dolo\"}]}]}",
+        "isStreaming": false,
+        "timestampMs": 1767226017328,
+        "clientNonce": "1de27801-faa0-f0f0-9203-f257b738158c",
+        "requestId": "2d258944-2e22-5d40-7a5b-ab7e632dbb3e"
+      },
+      {
+        "kind": "user-attachment",
+        "id": "z77pp5",
+        "file_path": "/segc45381/seg12de5c/seg4787e8/seg9422b7/81da155f-cc4c-58b3-aadf-770858d5e55c/segb0cf66/segde8a23",
+        "timestampMs": 1767287330449,
+        "file_name": "dolore adipiscing ea ut minim labore ex",
+        "batchId": "2bf704d7-7878-e575-5a3b-c96d7318d5e0",
+        "clientNonce": "dfede564-817d-b5e1-78c0-77daa90a9866",
+        "width": 3998,
+        "height": 900,
+        "byteSize": 497950
+      },
+      {
+        "kind": "send-message",
+        "id": "e98y3",
+        "message": {
+          "type": "auto-review-approval",
+          "approval": {
+            "requestId": "1139fd81-b594-2182-08ea-dd1a4cb6fd17",
+            "surface": "subagent",
+            "summary": "enim nisi do veniam nostrud dolor ut ut elit sit lorem ut dolore sit eiusmod do eiusmod et aliquip ad dolor amet enim laboris aliqua consectetur incididunt tempor sed aliqua enim adipiscing et labore enim consectetur magna ut quis aliqua ullamco laboris nisi aliquip ex ea comm",
+            "reason": "dolore labore quis magna magna enim ipsum quis nisi tempor labore nostrud exercitation dolor ut magna sed ad sed do do sed tempor aliquip nostrud aliquip aliqua do enim commodo et laboris laboris tempor veniam minim nisi ea ad et qui",
+            "status": "always",
+            "proposedRule": "tempor ea ullamco do lorem elit ullamco aliquip veniam sit eiusmod et amet enim ip"
+          }
+        },
+        "timestampMs": 1767352434666
+      },
+      {
+        "kind": "send-message",
+        "id": "q22a4",
+        "message": {
+          "type": "widget",
+          "widget": {
+            "prompt": "aliquip incididunt do tempor ipsum amet ex commodo veniam labore elit nisi ipsum exercitation al",
+            "helpText": "aliquip consectetur adipiscing incididunt dolore lorem do ea amet exercitation aliqua nostrud veniam ullamco tempor",
+            "options": [
+              {
+                "label": "dolore sed aliq",
+                "value": "dolor enim tempor aliqua eni",
+                "style": "primary"
+              },
+              { "label": "dolore aliquip ut", "value": "aliqua nostrud n" }
+            ],
+            "allowCustom": true
+          }
+        },
+        "timestampMs": 1767369407490,
+        "requestId": "28e6e11c-cf7c-0560-878f-9e94f172fd34",
+        "respondedValue": "dolor magna adipiscing aliqu"
+      },
+      {
+        "kind": "send-message",
+        "id": "u52k7",
+        "message": {
+          "type": "connector",
+          "connector": "service-fc6467",
+          "serverId": "service-b26eec",
+          "variant": "connect"
+        },
+        "timestampMs": 1767369472050,
+        "requestId": "0bf45b0d-3726-fe65-c3aa-fbe1c6947cab"
+      },
+      {
+        "kind": "message",
+        "id": "g02u2",
+        "role": "assistant",
+        "content": "ut aliqua et amet adipiscing ex adipiscing labore aliquip dolore labore commodo adipiscing commodo nostrud laboris ea exercitation exercitation magna enim elit adipiscing nisi sed tempor commodo ad amet dolore eiusmod ipsum amet ea tempor ullamco ullamco ea veniam lorem ad minim veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea commodo lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris",
+        "isStreaming": false,
+        "timestampMs": 1767485345477,
+        "toAgent": {
+          "id": "adaa3325-982b-ca55-4278-cdd43d14a207",
+          "name": "ullamco tempor a",
+          "kind": "agent"
+        }
+      }
+    ],
+    "epochHint": null,
+    "acceptedSequenceHint": null,
+    "persistedAt": 1768058962822
+  }
+}
