@@ -127,9 +127,9 @@ before initializing a private replay database. Only this binary's canonical
 storage initializer supplies executable schema. The storage version and every
 table, column and primary-key descriptor must match exactly; a matching version
 number alone is not sufficient. Unknown, additional or omitted tables fail
-explicitly. SQL from input is never executed. The one cross-schema path is the
-reviewed storage-schema v20 -> v21 bridge, and only with
-`--allow-compatible-schema` (see [Reviewed v20 -> v21 restoration](#reviewed-v20---v21-restoration)).
+explicitly. SQL from input is never executed. The only cross-schema paths are the
+reviewed storage-schema v20 and v21 -> v22 bridges, and only with
+`--allow-compatible-schema` (see [Reviewed restoration into v22](#reviewed-restoration-into-v22)).
 
 Rows are individually bound as typed SQL parameters using one prepared INSERT
 per table. No exported path is used as a write destination and no URL or provider
@@ -302,24 +302,32 @@ After publication, a lost success receipt does not justify replacing the
 destination: retry with `--if-identical` to validate its complete contents and
 report `unchanged`. A different or incomplete destination remains a conflict.
 
-## Reviewed v20 -> v21 restoration
+## Reviewed restoration into v22
 
-An archive exported by a build whose storage schema is v20 fails an exact
-import into a v21 build. `--allow-compatible-schema` admits that one reviewed
-bridge and nothing else. Any other version pair is refused, and so is a v20
-archive whose canonical table, column or primary-key descriptors differ from
-the current ones: v21 adds only an index, so table drift is not authorized.
+An archive exported by a build whose storage schema is v20 or v21 (v0.9.0 is
+v21) fails an exact import into a v22 build. `--allow-compatible-schema`
+admits those two reviewed bridges and nothing else. Any other version pair is
+refused. What the bridges allow:
+- v21 added only an index.
+- v22 added only the `forgotten_sources` table (the `cass forget` tombstones).
+  An older archive cannot carry it, so it is created empty, which is what an
+  in-place upgrade does.
+- Every other canonical table, column and primary-key descriptor must match
+  the current ones. An archive that differs, or that already carries
+  `forgotten_sources`, is refused.
+- A later identical retry also refuses a destination whose
+  `forgotten_sources` gained rows.
 
 ```sh
-cass archive import history-v20.jsonl --archive-id workstation-history \
+cass archive import history-v21.jsonl --archive-id workstation-history \
   --include-private --allow-compatible-schema \
   --output /existing/private/directory/restored.db
 ```
 
 The current binary's initializer remains the only schema authority. Archived
 `_schema_migrations` rows and `meta.schema_version` are verified as input but
-not replayed. The receipt adds `schema_migration` with `mode:
-"reviewed_v20_to_v21"`, the from/to storage schema versions,
+not replayed. The receipt adds `schema_migration` with `mode`
+(`"reviewed_v20_to_v22"` or `"reviewed_v21_to_v22"`), the from/to storage schema versions,
 `schema_authority: "current_binary_initializer"` and `source_rows_verified`.
 The flag combines with `--if-identical` (a retry reports `unchanged` without
 modifying the database image) and with `--rebuild-index`, whose failure message
@@ -383,7 +391,7 @@ is an integrity checksum, **not** a signature or proof of source authenticity.
 Current restoration supports a new database with the exact current canonical
 schema, plus opt-in read-only comparison for an identical existing destination.
 Explicit indexed restoration additionally rebuilds canonical lexical search, and
-`--allow-compatible-schema` admits the reviewed v20 -> v21 bridge. Merge, any
+`--allow-compatible-schema` admits the reviewed v20 and v21 -> v22 bridges. Merge, any
 other cross-schema migration and semantic reconstruction remain outside these
 slices; default restoration remains offline. These slices do not close bead
 `.34`. The ordinary library command parser, root help, completion generation

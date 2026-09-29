@@ -132,6 +132,16 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `systemd-run -p MemoryMax=16G`, and sized caches for memory the process
   could not use. It now uses the same cgroup-aware probes as the indexer
   (71759163).
+- **Logical archives from v0.9.0 (schema v21) and v20 restore into the
+  current schema again.** Schema v22 (`forgotten_sources`, for `cass forget`)
+  broke `cass archive import --allow-compatible-schema`: the only reviewed
+  bridge was v20 -> v21, so both older versions were refused. The reviewed
+  bridges are now v20 and v21 -> v22. The archive's canonical tables must
+  match the current schema apart from `forgotten_sources`, which is created
+  empty as an in-place upgrade creates it. An old archive that carries that
+  table is refused, and so is a later identical retry onto a destination
+  where it gained rows. Receipts name the mode: `reviewed_v20_to_v22` or
+  `reviewed_v21_to_v22`.
 - **`cass status` no longer calls a retired FTS shadow a pending repair
   (#495).** Over `CASS_FTS_SHADOW_MAX_MESSAGES`, the SQL-fallback shadow is
   retired as not viable, and doctor plans nothing more for it. `status`
