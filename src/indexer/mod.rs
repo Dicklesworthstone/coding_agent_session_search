@@ -55442,15 +55442,21 @@ mod tests {
             "appends take the delta path"
         );
 
-        // Negative: an insertion before retained messages cannot be a delta.
+        // Text is capped per message (bgn6s, 938bf986), so a row inserted
+        // before retained messages changes no other message's truncation or
+        // noise class and is still an exact delta. The memo's first design
+        // capped text per conversation and had to recount here.
         insert(conversation_id, 55, "user", "inserted mid-conversation");
         assert_eq!(cached(), full());
-        assert_eq!(sidecar().delta_generations, 0, "mid-insertion must recount");
+        assert_eq!(
+            sidecar().delta_generations,
+            2,
+            "a mid-conversation insertion is an exact delta under the per-message cap"
+        );
 
-        // Negative: a deletion cannot be explained by appends.
         insert(conversation_id, 70, "user", "one more append");
         assert_eq!(cached(), full());
-        assert_eq!(sidecar().delta_generations, 1);
+        assert_eq!(sidecar().delta_generations, 3);
 
         // Orphaned rows are never indexed: an appended message whose
         // conversation row does not exist must not count, and it is still an
@@ -55460,7 +55466,7 @@ mod tests {
         assert_eq!(cached(), full());
         assert_eq!(
             sidecar().delta_generations,
-            2,
+            4,
             "an orphan append still takes the delta path"
         );
         storage
