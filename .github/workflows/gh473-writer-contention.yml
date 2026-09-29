@@ -85,7 +85,14 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/gh473-core"
           rustc --version
-          cargo generate-lockfile
+          # Seed the probe's resolution with the CASS lockfile. fsqlite's crates
+          # require each other with caret ranges, so a fresh resolution takes
+          # the newest published members under the exact facade pin (0.4.7's
+          # publication made it a mixed 0.4.6/0.4.7 family and failed this
+          # probe). `update --workspace` keeps every locked version and only
+          # adds or prunes what the probe itself needs.
+          cp "$GITHUB_WORKSPACE/Cargo.lock" Cargo.lock
+          cargo update --workspace
           sha256sum Cargo.lock
           python3 - <<'PY'
           import tomllib

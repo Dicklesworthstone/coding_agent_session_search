@@ -151,7 +151,15 @@ jobs:
           cd "$RUNNER_TEMP/cass-scope-sql-check"
           # The temporary harness has its own recorded resolution; the CASS
           # Cargo.toml/Cargo.lock and unpublished search pin remain unchanged.
-          cargo generate-lockfile
+          # Seed the harness resolution with the CASS lockfile. fsqlite's crates
+          # require each other with caret ranges, so a fresh resolution takes
+          # the newest published members under the exact facade pin (a mixed
+          # 0.4.6/0.4.7 engine since 0.4.7's publication). `update --workspace`
+          # keeps every locked version and only adds or prunes what the
+          # harness needs. A mixed engine is refused.
+          cp "$GITHUB_WORKSPACE/Cargo.lock" Cargo.lock
+          cargo update --workspace
+          python3 -c "import tomllib, sys; from pathlib import Path; family = sorted({p['version'] for p in tomllib.loads(Path('Cargo.lock').read_text())['package'] if p['name'].startswith('fsqlite')}); print('engine family versions:', family); sys.exit(0 if len(family) == 1 else 'mixed fsqlite family')"
           sha256sum Cargo.lock
           cargo test --locked -- --nocapture 2>&1 | tee "$RUNNER_TEMP/session-scope-sql-tests.log"
           python3 - <<'PY'
