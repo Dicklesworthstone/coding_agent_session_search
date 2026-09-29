@@ -164,7 +164,11 @@ fn gh505_discovery_and_setup_never_probe_mullvad_peers() {
     let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
     assert!(output.status.success(), "{output:?}");
     let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(discovery["hosts"].as_array().unwrap().len(), 2, "{discovery}");
+    assert_eq!(
+        discovery["hosts"].as_array().unwrap().len(),
+        2,
+        "{discovery}"
+    );
     assert!(fixture.attempted_transports().is_empty());
 
     let output = fixture.setup(false);
