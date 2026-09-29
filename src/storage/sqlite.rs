@@ -23817,7 +23817,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn primary_writer_discovers_virtual_fts_and_preserves_append_replay() {
+        // The shadow writes asserted below are skipped while
+        // CASS_DEFER_LEXICAL_UPDATES is truthy, and #[serial] tests set it to
+        // "1" for their duration; pin it off and run serially with them.
+        let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("primary-fts.db")).unwrap();
         storage.ensure_search_fallback_fts_consistency().unwrap();
@@ -30019,10 +30024,15 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
+    #[serial]
     fn insert_conversations_batched_flushes_large_fts_batches() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
+        // The inline FTS writes this test counts are skipped while
+        // CASS_DEFER_LEXICAL_UPDATES is truthy, and #[serial] tests set it to
+        // "1" for their duration; pin it off and run serially with them.
+        let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
