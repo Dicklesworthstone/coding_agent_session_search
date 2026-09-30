@@ -24,16 +24,156 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use frankensearch::quill::cass::CassDocument;
 use serde::{Deserialize, Serialize};
 
+use crate::model::types::Message;
 use crate::search::asset_state::SearchMaintenanceMode;
 use crate::search::tantivy::{TantivyIndex, expected_index_dir};
-use crate::storage::sqlite::FrankenStorage;
+use crate::storage::sqlite::{FrankenStorage, LexicalRebuildConversationRow};
 
 mod canary;
 mod checkpoint;
 
 const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024;
+const RECONCILE_BATCH_MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+const RECONCILE_BATCH_MAX_MESSAGES: usize = 16_384;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProjectionSummary {
+    message_count: usize,
+    max_message_idx: i64,
+    content_bytes: usize,
+    expected_docs: usize,
+}
+
+impl ProjectionSummary {
+    fn observe_messages(&mut self, messages: &[Message]) -> Result<()> {
+        for message in messages {
+            if self.message_count == 0 || message.idx > self.max_message_idx {
+                self.max_message_idx = message.idx;
+            }
+            self.message_count = self
+                .message_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("lexical reconcile message count overflow"))?;
+            self.content_bytes = self
+                .content_bytes
+                .checked_add(message.content.len())
+                .ok_or_else(|| anyhow!("lexical reconcile content byte count overflow"))?;
+        }
+        Ok(())
+    }
+
+    fn matches_checkpoint(&self, checkpoint: &LexicalReconcileCheckpoint) -> bool {
+        self.message_count == checkpoint.message_count
+            && self.max_message_idx == checkpoint.max_message_idx
+            && self.content_bytes == checkpoint.content_bytes
+            && self.expected_docs == checkpoint.expected_docs
+    }
+}
+
+/// Re-read canonical rows instead of retaining an entire giant conversation,
+/// its packet, and its projected documents through both index publications.
+/// Only one batch is live. A message larger than the batch byte budget is
+/// admitted alone, still subject to the storage layer's per-message text cap;
+/// splitting or dropping that message here would change its lexical identity.
+struct CanonicalProjection<'a> {
+    storage: &'a FrankenStorage,
+    row: &'a LexicalRebuildConversationRow,
+    provenance: &'a super::LexicalRebuildPacketProvenance,
+    conversation_id: i64,
+    max_content_bytes: usize,
+    max_messages: usize,
+}
+
+impl CanonicalProjection<'_> {
+    fn visit(
+        &self,
+        mut visitor: impl FnMut(&[CassDocument]) -> Result<()>,
+    ) -> Result<ProjectionSummary> {
+        anyhow::ensure!(
+            self.max_content_bytes > 0 && self.max_messages > 0,
+            "lexical reconcile batch limits must be positive"
+        );
+        let mut summary = ProjectionSummary::default();
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0usize;
+        let mut flush = |messages: &mut Vec<Message>| -> Result<()> {
+            if messages.is_empty() {
+                return Ok(());
+            }
+            summary.observe_messages(messages)?;
+            let packet = super::lexical_rebuild_contract_from_canonical_messages(
+                self.row,
+                self.provenance,
+                std::mem::take(messages),
+            );
+            let docs = TantivyIndex::build_packet_documents(&packet, Some(self.conversation_id));
+            drop(packet);
+            summary.expected_docs = summary
+                .expected_docs
+                .checked_add(docs.len())
+                .ok_or_else(|| anyhow!("lexical reconcile document count overflow"))?;
+            visitor(&docs)
+        };
+        let completed = self.storage.for_each_lexical_rebuild_message(
+            self.conversation_id,
+            None,
+            |message| {
+                if !batch.is_empty()
+                    && (batch.len() >= self.max_messages
+                        || message.content.len()
+                            > self.max_content_bytes.saturating_sub(batch_bytes))
+                {
+                    flush(&mut batch)?;
+                    batch_bytes = 0;
+                }
+                batch_bytes = batch_bytes
+                    .checked_add(message.content.len())
+                    .ok_or_else(|| anyhow!("lexical reconcile batch byte count overflow"))?;
+                batch.push(message);
+                if batch_bytes >= self.max_content_bytes || batch.len() >= self.max_messages {
+                    flush(&mut batch)?;
+                    batch_bytes = 0;
+                }
+                Ok(true)
+            },
+        )?;
+        anyhow::ensure!(completed, "lexical reconcile canonical stream stopped early");
+        flush(&mut batch)?;
+        Ok(summary)
+    }
+
+    fn publish(
+        &self,
+        index: &mut TantivyIndex,
+        checkpoint: &LexicalReconcileCheckpoint,
+    ) -> Result<usize> {
+        let mut fingerprint = checkpoint::ProjectionFingerprint::new(checkpoint.expected_docs);
+        let mut upserted_docs = 0usize;
+        let summary = self.visit(|docs| {
+            fingerprint.update(docs)?;
+            if !docs.is_empty() {
+                upserted_docs = upserted_docs
+                    .checked_add(index.upsert_prebuilt_documents_slice(docs)?)
+                    .ok_or_else(|| anyhow!("lexical reconcile upsert count overflow"))?;
+                // A bounded row reader alone is insufficient: committing each
+                // batch also prevents the writer's pending set growing with
+                // the full conversation. Recovery stays durable throughout.
+                index.commit()?;
+            }
+            Ok(())
+        })?;
+        let digest = fingerprint.finish()?;
+        anyhow::ensure!(
+            summary.matches_checkpoint(checkpoint)
+                && checkpoint.projection_blake3.as_deref() == Some(digest.as_str()),
+            "canonical lexical projection changed during replay; checkpoint retained"
+        );
+        Ok(upserted_docs)
+    }
+}
 
 /// Durable recovery checkpoint written before the first publication and
 /// cleared only after convergence + canary verification.
@@ -165,17 +305,6 @@ pub(crate) fn run_lexical_conversation_reconcile(
             anyhow!("canonical conversation {conversation_id} not found in the archive")
         })?;
 
-    // Capped message rows in idx order — the immutable source set this run
-    // binds. The cap matches every other lexical path, so the projection is
-    // byte-identical to what a healthy inline index would have produced.
-    let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
-    if messages.is_empty() {
-        bail!("canonical conversation {conversation_id} has no messages to reconcile");
-    }
-    let message_count = messages.len();
-    let max_message_idx = messages.iter().map(|m| m.idx).max().unwrap_or(0);
-    let content_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
-
     let source_map: HashMap<String, (crate::sources::provenance::SourceKind, Option<String>)> =
         storage
             .list_sources()
@@ -185,24 +314,57 @@ pub(crate) fn run_lexical_conversation_reconcile(
             .collect();
     let (provenance, _mode) =
         super::lexical_rebuild_packet_provenance_from_canonical(&row, &source_map);
-    let packet =
-        super::lexical_rebuild_contract_from_canonical_messages(&row, &provenance, messages);
-
-    let index_path = expected_index_dir(data_dir);
-    let docs = TantivyIndex::build_packet_documents(&packet, Some(conversation_id));
-    if docs.is_empty() {
+    let projection = CanonicalProjection {
+        storage: &storage,
+        row: &row,
+        provenance: &provenance,
+        conversation_id,
+        max_content_bytes: super::responsiveness::effective_inflight_byte_limit(
+            RECONCILE_BATCH_MAX_CONTENT_BYTES,
+        ),
+        max_messages: RECONCILE_BATCH_MAX_MESSAGES,
+    };
+    // Version two prefixes the exact projected document count. A bounded
+    // count pass preserves that durable format, including noise filtering,
+    // without retaining all the text just to learn its final count.
+    let summary = projection.visit(|_| Ok(()))?;
+    if summary.message_count == 0 {
+        bail!("canonical conversation {conversation_id} has no messages to reconcile");
+    }
+    if summary.expected_docs == 0 {
         bail!(
             "conversation {conversation_id} projects to zero lexical documents \
              (all messages are filtered as noise); nothing to reconcile"
         );
     }
-    let early_token = docs.first().and_then(|doc| canary_token(&doc.content));
-    let late_token = docs.last().and_then(|doc| canary_token(&doc.content));
+    let mut fingerprint = checkpoint::ProjectionFingerprint::new(summary.expected_docs);
+    let mut early_doc = None;
+    let mut late_doc = None;
+    let bound_summary = projection.visit(|docs| {
+        fingerprint.update(docs)?;
+        if let Some(first) = docs.first() {
+            if early_doc.is_none() {
+                early_doc = Some(first.clone());
+            }
+            late_doc = docs.last().cloned();
+        }
+        Ok(())
+    })?;
+    anyhow::ensure!(
+        summary == bound_summary,
+        "canonical lexical projection changed during preflight; checkpoint retained"
+    );
+    let digest = fingerprint.finish()?;
+    let early_doc = early_doc.ok_or_else(|| anyhow!("missing early reconcile endpoint"))?;
+    let late_doc = late_doc.ok_or_else(|| anyhow!("missing late reconcile endpoint"))?;
+    let early_token = canary_token(&early_doc.content);
+    let late_token = canary_token(&late_doc.content);
 
     // 2. Durable checkpoint BEFORE publication; on retry, converge only when
     // the complete projected content and metadata are unchanged. A legacy
     // shape-only checkpoint is rebound before the full replay, never trusted
     // as evidence that any document was already published.
+    let index_path = expected_index_dir(data_dir);
     let checkpoint_path = lexical_reconcile_checkpoint_path(&index_path, conversation_id);
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("creating index directory {}", index_path.display()))?;
@@ -212,11 +374,11 @@ pub(crate) fn run_lexical_conversation_reconcile(
             conversation_id,
             source_id: row.source_id.clone(),
             source_path: row.source_path.to_string_lossy().to_string(),
-            message_count,
-            max_message_idx,
-            content_bytes,
-            expected_docs: docs.len(),
-            projection_blake3: Some(checkpoint::projection_fingerprint(&docs)),
+            message_count: summary.message_count,
+            max_message_idx: summary.max_message_idx,
+            content_bytes: summary.content_bytes,
+            expected_docs: summary.expected_docs,
+            projection_blake3: Some(digest),
             started_at_ms: FrankenStorage::now_millis(),
             attempt: 1,
         },
@@ -228,15 +390,13 @@ pub(crate) fn run_lexical_conversation_reconcile(
     // 3. Upsert the full source doc set and publish a successor generation.
     let mut index = TantivyIndex::open_or_create(&index_path)?;
     let doc_count_before = index.doc_count()?;
-    let upserted_docs = index.upsert_prebuilt_documents_slice(&docs)?;
-    index.commit()?;
+    let upserted_docs = projection.publish(&mut index, &checkpoint)?;
     let doc_count_after_first = index.doc_count()?;
 
     // 4. Preserve the existing replay invariant until the CASS adapter exposes
     // Quill's writer-side per-document witnesses. Counts alone do not prove
     // that every expected projected document is present with matching content.
-    index.upsert_prebuilt_documents_slice(&docs)?;
-    index.commit()?;
+    projection.publish(&mut index, &checkpoint)?;
     // Reuse one admitted reader for final accounting and both endpoint checks.
     // No refresh or path reopen may split these observations across generations.
     let reader = index.reader()?;
@@ -245,8 +405,8 @@ pub(crate) fn run_lexical_conversation_reconcile(
 
     // 5. Early/late endpoints against the published snapshot. Tokenless
     // messages must be verified too; unknown evidence cannot clear recovery.
-    let early_canary_ok = canary::verify(&reader, &docs[0], early_token.as_deref())?;
-    let late_canary_ok = canary::verify(&reader, &docs[docs.len() - 1], late_token.as_deref())?;
+    let early_canary_ok = canary::verify(&reader, &early_doc, early_token.as_deref())?;
+    let late_canary_ok = canary::verify(&reader, &late_doc, late_token.as_deref())?;
 
     let canaries_ok = early_canary_ok && late_canary_ok;
     let checkpoint_cleared = if converged && canaries_ok {
@@ -261,8 +421,8 @@ pub(crate) fn run_lexical_conversation_reconcile(
         source_id: checkpoint.source_id,
         source_path: checkpoint.source_path,
         attempt,
-        message_count,
-        expected_docs: docs.len(),
+        message_count: summary.message_count,
+        expected_docs: summary.expected_docs,
         upserted_docs,
         doc_count_before,
         doc_count_after,
@@ -284,9 +444,10 @@ pub(crate) fn run_lexical_conversation_reconcile(
 
 #[cfg(test)]
 mod tests {
+    use super::super::LexicalRebuildPacketProvenance;
     use super::*;
     use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
-    use crate::model::types::{Conversation, Message, MessageRole};
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use tempfile::TempDir;
 
     fn message(idx: i64, content: &str) -> Message {
@@ -318,6 +479,209 @@ mod tests {
             source_id: "local".to_string(),
             origin_host: None,
         }
+    }
+
+    fn stored_projection(
+        tmp: &TempDir,
+        messages: Vec<Message>,
+    ) -> Result<(
+        FrankenStorage,
+        LexicalRebuildConversationRow,
+        LexicalRebuildPacketProvenance,
+    )> {
+        let storage = FrankenStorage::open(&tmp.path().join("archive.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let inserted = storage.insert_conversation_tree(agent_id, None, &conversation(messages))?;
+        let (agents, workspaces) = storage.build_lexical_rebuild_lookups()?;
+        let row = storage
+            .list_conversations_for_lexical_rebuild_after_id(
+                1,
+                inserted.conversation_id - 1,
+                &agents,
+                &workspaces,
+            )?
+            .into_iter()
+            .next()
+            .context("missing test conversation")?;
+        let (provenance, _) = super::super::lexical_rebuild_packet_provenance_from_canonical(
+            &row,
+            &HashMap::new(),
+        );
+        Ok((storage, row, provenance))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bounded_projection_preserves_sparse_indices_noise_and_oversized_messages() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let (storage, row, provenance) = stored_projection(
+            &tmp,
+            vec![
+                message(0, "alpha meridian content"),
+                message(2, ""),
+                message(7, "unicode λλ meridian content"),
+                message(11, &"oversized meridian content ".repeat(30)),
+                message(15, "bravo meridian content"),
+                message(21, "final meridian content"),
+            ],
+        )?;
+        let conversation_id = row.id.context("missing test identity")?;
+        let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
+        let expected_bytes = messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>();
+        let packet = super::super::lexical_rebuild_contract_from_canonical_messages(
+            &row,
+            &provenance,
+            messages,
+        );
+        let expected = TantivyIndex::build_packet_documents(&packet, Some(conversation_id));
+        let projection = CanonicalProjection {
+            storage: &storage,
+            row: &row,
+            provenance: &provenance,
+            conversation_id,
+            max_content_bytes: 64,
+            max_messages: 2,
+        };
+        let mut observed = Vec::new();
+        let mut batches = 0;
+        let summary = projection.visit(|docs| {
+            assert!(docs.len() <= 2, "row admission must stay bounded");
+            let bytes = docs.iter().map(|doc| doc.content.len()).sum::<usize>();
+            assert!(
+                bytes <= 64 || docs.len() == 1,
+                "oversized messages must be alone"
+            );
+            batches += usize::from(!docs.is_empty());
+            observed.extend_from_slice(docs);
+            Ok(())
+        })?;
+        assert!(
+            batches >= 3,
+            "fixture must cross real reader batch boundaries"
+        );
+        assert_eq!(summary.message_count, 6);
+        assert_eq!(summary.max_message_idx, 21);
+        assert_eq!(summary.content_bytes, expected_bytes);
+        assert_eq!(summary.expected_docs, expected.len());
+        assert_eq!(
+            checkpoint::projection_fingerprint(&observed),
+            checkpoint::projection_fingerprint(&expected),
+            "chunking must preserve every projected byte and identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bounded_projection_propagates_consumer_errors_without_poisoning_the_reader() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let (storage, row, provenance) = stored_projection(
+            &tmp,
+            (0..5).map(|idx| message(idx, "meridian content")).collect(),
+        )?;
+        let projection = CanonicalProjection {
+            storage: &storage,
+            row: &row,
+            provenance: &provenance,
+            conversation_id: row.id.context("missing test identity")?,
+            max_content_bytes: 32,
+            max_messages: 1,
+        };
+        let mut visits = 0;
+        let error = projection
+            .visit(|_| {
+                visits += 1;
+                bail!("consumer failed")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("consumer failed"));
+        assert_eq!(visits, 1);
+        assert_eq!(projection.visit(|_| Ok(()))?.message_count, 5);
+        let invalid = CanonicalProjection {
+            max_content_bytes: 0,
+            ..projection
+        };
+        assert!(
+            invalid
+                .visit(|_| panic!("invalid budget reached the consumer"))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bounded_publications_backfill_and_replay_without_losing_the_checkpoint() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let (storage, row, provenance) = stored_projection(
+            &tmp,
+            (0..8)
+                .map(|idx| message(idx, &format!("meridian endpoint {idx}")))
+                .collect(),
+        )?;
+        let conversation_id = row.id.context("missing test identity")?;
+        let projection = CanonicalProjection {
+            storage: &storage,
+            row: &row,
+            provenance: &provenance,
+            conversation_id,
+            max_content_bytes: 64,
+            max_messages: 2,
+        };
+        let mut docs = Vec::new();
+        let summary = projection.visit(|batch| {
+            docs.extend_from_slice(batch);
+            Ok(())
+        })?;
+        assert_eq!(docs.len(), 8);
+        let checkpoint = LexicalReconcileCheckpoint {
+            version: checkpoint::VERSION,
+            conversation_id,
+            source_id: row.source_id.clone(),
+            source_path: row.source_path.to_string_lossy().to_string(),
+            message_count: summary.message_count,
+            max_message_idx: summary.max_message_idx,
+            content_bytes: summary.content_bytes,
+            expected_docs: summary.expected_docs,
+            projection_blake3: Some(checkpoint::projection_fingerprint(&docs)),
+            started_at_ms: 1,
+            attempt: 1,
+        };
+        let index_path = tmp.path().join("index");
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(&docs[4..])?;
+        index.commit()?;
+        assert_eq!(index.doc_count()?, 4);
+        let path = lexical_reconcile_checkpoint_path(&index_path, conversation_id);
+        super::super::write_json_pretty_atomically(&path, &checkpoint)?;
+        let original = std::fs::read(&path)?;
+        for _ in 0..2 {
+            projection.publish(&mut index, &checkpoint)?;
+            assert_eq!(index.doc_count()?, 8);
+            assert_eq!(
+                std::fs::read(&path)?,
+                original,
+                "only final verification may clear recovery"
+            );
+        }
+        let reader = index.reader()?;
+        for doc in &docs {
+            assert!(canary::verify(
+                &reader,
+                doc,
+                canary_token(&doc.content).as_deref()
+            )?);
+        }
+        Ok(())
     }
 
     /// The core converge property at the index layer: a partial-prefix index
@@ -400,6 +764,7 @@ mod tests {
         assert!(load_checkpoint(&path)?.is_none());
         // Clearing an absent checkpoint stays Ok (idempotent retry surface).
         clear_checkpoint(&path)?;
+        assert!(load_checkpoint(&path)?.is_none());
         Ok(())
     }
 

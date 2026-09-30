@@ -6,10 +6,54 @@ use frankensearch::quill::cass::CassDocument;
 
 pub(super) const VERSION: u32 = 2;
 
-/// Hash every projected field in order without copying large message bodies.
+/// Incremental version-two binding. Batch boundaries are deliberately absent
+/// from the encoding, so a retry may change its memory budget without changing
+/// the identity of the canonical projection. The count pass keeps existing
+/// checkpoints compatible: version two prefixes the document count.
+pub(super) struct ProjectionFingerprint {
+    hasher: blake3::Hasher,
+    expected_docs: usize,
+    observed_docs: usize,
+}
+
+impl ProjectionFingerprint {
+    pub(super) fn new(expected_docs: usize) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"cass-lexical-reconcile-projection-v2\0");
+        hasher.update(&(expected_docs as u64).to_le_bytes());
+        Self {
+            hasher,
+            expected_docs,
+            observed_docs: 0,
+        }
+    }
+
+    pub(super) fn update(&mut self, docs: &[CassDocument]) -> Result<()> {
+        let observed_docs = self
+            .observed_docs
+            .checked_add(docs.len())
+            .ok_or_else(|| anyhow::anyhow!("lexical projection document count overflow"))?;
+        ensure!(
+            observed_docs <= self.expected_docs,
+            "canonical lexical projection grew during reconcile; checkpoint retained"
+        );
+        hash_document_fields(&mut self.hasher, docs);
+        self.observed_docs = observed_docs;
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> Result<String> {
+        ensure!(
+            self.observed_docs == self.expected_docs,
+            "canonical lexical projection shrank during reconcile; checkpoint retained"
+        );
+        Ok(self.hasher.finalize().to_hex().to_string())
+    }
+}
+
 /// Length prefixes and option tags make the encoding unambiguous; fixed-width
 /// little-endian lengths keep it independent of the host's pointer width.
-pub(super) fn projection_fingerprint(docs: &[CassDocument]) -> String {
+fn hash_document_fields(hasher: &mut blake3::Hasher, docs: &[CassDocument]) {
     fn text(hasher: &mut blake3::Hasher, value: &str) {
         hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
@@ -36,9 +80,6 @@ pub(super) fn projection_fingerprint(docs: &[CassDocument]) -> String {
             }
         }
     }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cass-lexical-reconcile-projection-v2\0");
-    hasher.update(&(docs.len() as u64).to_le_bytes());
     for doc in docs {
         for value in [
             &doc.content,
@@ -47,7 +88,7 @@ pub(super) fn projection_fingerprint(docs: &[CassDocument]) -> String {
             &doc.source_id,
             &doc.origin_kind,
         ] {
-            text(&mut hasher, value);
+            text(hasher, value);
         }
         for value in [
             doc.title.as_deref(),
@@ -55,13 +96,19 @@ pub(super) fn projection_fingerprint(docs: &[CassDocument]) -> String {
             doc.workspace_original.as_deref(),
             doc.origin_host.as_deref(),
         ] {
-            optional_text(&mut hasher, value);
+            optional_text(hasher, value);
         }
-        optional_i64(&mut hasher, doc.created_at);
-        optional_i64(&mut hasher, doc.conversation_id);
+        optional_i64(hasher, doc.created_at);
+        optional_i64(hasher, doc.conversation_id);
         hasher.update(&doc.msg_idx.to_le_bytes());
     }
-    hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
+pub(super) fn projection_fingerprint(docs: &[CassDocument]) -> String {
+    let mut fingerprint = ProjectionFingerprint::new(docs.len());
+    fingerprint.update(docs).expect("the declared slice fits");
+    fingerprint.finish().expect("the entire slice was hashed")
 }
 
 fn valid_digest(value: Option<&str>) -> bool {
@@ -151,6 +198,73 @@ mod tests {
             msg_idx: 3,
         }
     }
+
+    #[test]
+    fn streaming_fingerprint_preserves_the_frozen_version_two_encoding() -> Result<()> {
+        // Exact preimage of the original v2 encoder for document(). Do not
+        // regenerate it from hash_document_fields: it pins persisted recovery
+        // checkpoints independently of the implementation under test.
+        let encoded = b"cass-lexical-reconcile-projection-v2\0\
+            \x01\0\0\0\0\0\0\0\
+            \x05\0\0\0\0\0\0\0alpha\
+            \x05\0\0\0\0\0\0\0codex\
+            \x07\0\0\0\0\0\0\0/source\
+            \x05\0\0\0\0\0\0\0local\
+            \x05\0\0\0\0\0\0\0local\
+            \x01\x05\0\0\0\0\0\0\0title\
+            \x01\x05\0\0\0\0\0\0\0/work\
+            \x01\x05\0\0\0\0\0\0\0/Work\
+            \0\x01\x2a\0\0\0\0\0\0\0\
+            \x01\x07\0\0\0\0\0\0\0\
+            \x03\0\0\0\0\0\0\0";
+        let mut fingerprint = ProjectionFingerprint::new(1);
+        fingerprint.update(&[document()])?;
+        assert_eq!(
+            fingerprint.finish()?,
+            blake3::hash(encoded).to_hex().to_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_fingerprint_is_independent_of_batch_boundaries() -> Result<()> {
+        let docs: Vec<_> = (0..7)
+            .map(|index| {
+                let mut doc = document();
+                doc.content = format!("batch {index}: unicode λ and embedded \0 bytes");
+                doc.origin_host = (index % 2 == 0).then(|| "remote-host".to_string());
+                doc
+            })
+            .collect();
+        let expected = projection_fingerprint(&docs);
+        for chunk_size in 1..=docs.len() {
+            let mut fingerprint = ProjectionFingerprint::new(docs.len());
+            fingerprint.update(&[])?;
+            for chunk in docs.chunks(chunk_size) {
+                fingerprint.update(chunk)?;
+                fingerprint.update(&[])?;
+            }
+            assert_eq!(fingerprint.finish()?, expected, "chunk size {chunk_size}");
+        }
+        assert_eq!(
+            ProjectionFingerprint::new(0).finish()?,
+            projection_fingerprint(&[])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_fingerprint_rejects_missing_and_extra_documents() -> Result<()> {
+        let mut incomplete = ProjectionFingerprint::new(2);
+        incomplete.update(&[document()])?;
+        assert!(incomplete.finish().is_err());
+        let mut extra = ProjectionFingerprint::new(1);
+        assert!(extra.update(&[document(), document()]).is_err());
+        let mut empty = ProjectionFingerprint::new(0);
+        assert!(empty.update(&[document()]).is_err());
+        Ok(())
+    }
+
     fn checkpoint(docs: &[CassDocument]) -> LexicalReconcileCheckpoint {
         LexicalReconcileCheckpoint {
             version: VERSION,
