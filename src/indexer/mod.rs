@@ -29396,11 +29396,25 @@ fn should_force_watch_solo_retry_oom() -> bool {
     false
 }
 
+// Test-only ingest OOM injection. These are thread-local, not process env
+// vars: libtest runs every test on its own thread while others run beside it,
+// and `#[serial]` only orders tests that are themselves `#[serial]`. An env
+// var set by one test injected OOMs into unrelated ingests running at the same
+// time, which then inserted nothing (bead xicw9). Non-watch and incremental
+// ingest run on the thread that called them, so a fault set here reaches
+// exactly the calling test's ingest and nobody else's.
+#[cfg(test)]
+std::thread_local! {
+    static NON_WATCH_INGEST_TEST_OOM_MIN_CONVS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static INCREMENTAL_LEXICAL_UPDATE_TEST_OOM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 fn should_inject_non_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
-    dotenvy::var("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+    NON_WATCH_INGEST_TEST_OOM_MIN_CONVS
+        .with(std::cell::Cell::get)
         .is_some_and(|min| min > 0 && convs.len() >= min)
 }
 
@@ -33119,7 +33133,7 @@ pub mod persist {
                 fault.set(Some(WatchLexicalTestFault::PublicationAfter(remaining - 1)));
                 false
             }
-            _ => dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_ok(),
+            _ => super::INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get),
         })
     }
 
@@ -41120,6 +41134,79 @@ mod tests {
             std::env::set_var(key, value);
         }
         EnvGuard { key, previous }
+    }
+
+    /// Restores the one ingest OOM injection it set on this thread when dropped.
+    enum IngestTestOomGuard {
+        NonWatch(Option<usize>),
+        Lexical(bool),
+    }
+
+    impl Drop for IngestTestOomGuard {
+        fn drop(&mut self) {
+            match *self {
+                Self::NonWatch(previous) => {
+                    NON_WATCH_INGEST_TEST_OOM_MIN_CONVS.with(|cell| cell.set(previous));
+                }
+                Self::Lexical(previous) => {
+                    INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(|cell| cell.set(previous));
+                }
+            }
+        }
+    }
+
+    /// Make non-watch ingest on THIS thread fail with a typed OOM for any batch
+    /// of at least `min_convs` conversations.
+    fn inject_non_watch_ingest_test_oom(min_convs: usize) -> IngestTestOomGuard {
+        IngestTestOomGuard::NonWatch(
+            NON_WATCH_INGEST_TEST_OOM_MIN_CONVS.with(|cell| cell.replace(Some(min_convs))),
+        )
+    }
+
+    /// Make incremental lexical updates on THIS thread fail with an OOM.
+    fn inject_incremental_lexical_update_test_oom() -> IngestTestOomGuard {
+        IngestTestOomGuard::Lexical(
+            INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(|cell| cell.replace(true)),
+        )
+    }
+
+    /// xicw9: an ingest OOM injected by one test must not reach an ingest
+    /// running on another test's thread. With the old process-env injection,
+    /// the spawned thread below saw the fault and a concurrent
+    /// `streaming_configured_scan_roots_ignore_global_watermark` inserted
+    /// nothing.
+    #[test]
+    fn ingest_test_oom_injection_is_scoped_to_the_injecting_thread() {
+        let convs = vec![norm_conv(
+            Some("oom-scope"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        )];
+        let guard = inject_non_watch_ingest_test_oom(1);
+        let lexical_guard = inject_incremental_lexical_update_test_oom();
+        assert!(should_inject_non_watch_ingest_test_oom(&convs));
+        assert!(INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get));
+
+        let other_convs = convs.clone();
+        let (other_non_watch, other_lexical) = std::thread::spawn(move || {
+            (
+                should_inject_non_watch_ingest_test_oom(&other_convs),
+                INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get),
+            )
+        })
+        .join()
+        .expect("probe thread");
+        assert!(!other_non_watch, "non-watch OOM leaked to another thread");
+        assert!(!other_lexical, "lexical OOM leaked to another thread");
+
+        assert!(
+            !should_inject_non_watch_ingest_test_oom(&[]),
+            "a batch smaller than the minimum is not failed"
+        );
+        drop(lexical_guard);
+        assert!(!INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get));
+        assert!(should_inject_non_watch_ingest_test_oom(&convs));
+        drop(guard);
+        assert!(!should_inject_non_watch_ingest_test_oom(&convs));
     }
 
     #[test]
@@ -50260,7 +50347,7 @@ mod tests {
     #[test]
     #[serial]
     fn streaming_consumer_defers_lexical_oom_without_quarantining_persisted_conversation() {
-        let _oom_guard = set_env("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM", "1");
+        let _oom_guard = inject_incremental_lexical_update_test_oom();
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -50323,7 +50410,7 @@ mod tests {
     #[test]
     #[serial]
     fn streaming_consumer_quarantines_single_non_watch_oom_and_dedupes_record() {
-        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _oom_guard = inject_non_watch_ingest_test_oom(1);
         // #298: this test models a *genuinely* poisoned conversation, so the
         // small-conversation plausibility gate must be disabled — otherwise a
         // tiny fixture conversation is deferred instead of quarantined.
@@ -50415,7 +50502,7 @@ mod tests {
     #[serial]
     fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
         for source_completion in [false, true] {
-            let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+            let oom_guard = inject_non_watch_ingest_test_oom(1);
             // Pin the pressure probe to "never real pressure" so the size gate is
             // what decides, deterministically, on any host.
             let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
@@ -53047,7 +53134,7 @@ mod tests {
             Some(scan_start_ts),
             "batch mode must persist each safe connector watermark only after its rows commit"
         );
-        let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let oom_guard = inject_non_watch_ingest_test_oom(1);
         let _pressure_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let next_scan_ts = scan_start_ts + 1;
         let deferred = run_batch_index_with_connector_factories(
@@ -62113,7 +62200,7 @@ mod tests {
         std::fs::create_dir_all(&xdg).unwrap();
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
-        let _lexical_oom_guard = set_env("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM", "1");
+        let _lexical_oom_guard = inject_incremental_lexical_update_test_oom();
 
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
