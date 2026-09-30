@@ -6602,9 +6602,14 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         return Err(format!("mkfifo failed with status {mkfifo:?}").into());
     }
 
+    // Nothing writes the FIFO, so a pack that waits on it never exits and the
+    // harness kills it at this timeout (a failed status below). The timeout
+    // is deliberately generous: it also covers process launch, which pack
+    // cannot control and which stalled for seconds in dyld on a macOS host
+    // (bead d32jo). Pack's own bound is checked on its budget clock instead.
     let started = std::time::Instant::now();
     let output = base_cmd()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(30))
         .args([
             "pack",
             "hello",
@@ -6619,12 +6624,10 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         .args(["--data-dir"])
         .arg(data_dir.path())
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack waited for the blocking sessions FIFO".into());
-    }
+    let wall = started.elapsed();
     if !output.status.success() {
         return Err(format!(
-            "FIFO-scoped pack failed: status={:?}; stderr={}",
+            "FIFO-scoped pack failed (a kill at the harness timeout means pack waited for the blocking sessions FIFO): status={:?}; wall={wall:?}; stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         )
@@ -6633,6 +6636,15 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
 
     let payload: Value = serde_json::from_slice(&output.stdout)?;
     let budget = &payload["budget"];
+    let pack_elapsed_ms = budget["elapsed_ms"]
+        .as_u64()
+        .ok_or_else(|| format!("pack FIFO budget omitted elapsed_ms: {budget}"))?;
+    if pack_elapsed_ms >= 1_500 {
+        return Err(format!(
+            "pack waited for the blocking sessions FIFO: budget.elapsed_ms={pack_elapsed_ms} for a 120 ms budget (wall={wall:?})"
+        )
+        .into());
+    }
     let skipped = budget["skipped_sections"]
         .as_array()
         .ok_or("pack FIFO skipped_sections is not an array")?;
