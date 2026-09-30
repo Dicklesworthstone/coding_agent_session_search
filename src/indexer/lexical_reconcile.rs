@@ -34,6 +34,7 @@ use crate::storage::sqlite::{FrankenStorage, LexicalRebuildConversationRow};
 
 mod canary;
 mod checkpoint;
+mod snapshot;
 
 const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024;
 const RECONCILE_BATCH_MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
@@ -287,6 +288,10 @@ pub(crate) fn run_lexical_conversation_reconcile(
 
     let storage = FrankenStorage::open_readonly(db_path)
         .with_context(|| format!("opening canonical archive {} read-only", db_path.display()))?;
+    // The index-run lock serializes CASS writers, but it is not a database
+    // snapshot. Bind metadata, the count/hash passes, and both bounded replays
+    // to one view even if another application writes the archive meanwhile.
+    let snapshot = snapshot::CanonicalSnapshot::begin(storage.raw())?;
 
     // 1. Bind the conversation identity.
     let (agent_slugs, workspace_paths) = storage
@@ -407,6 +412,10 @@ pub(crate) fn run_lexical_conversation_reconcile(
     // messages must be verified too; unknown evidence cannot clear recovery.
     let early_canary_ok = canary::verify(&reader, &early_doc, early_token.as_deref())?;
     let late_canary_ok = canary::verify(&reader, &late_doc, late_token.as_deref())?;
+
+    // Release explicitly before clearing recovery: a failed transaction
+    // cleanup is not a successful repair. Early errors release through Drop.
+    snapshot.release()?;
 
     let canaries_ok = early_canary_ok && late_canary_ok;
     let checkpoint_cleared = if converged && canaries_ok {
