@@ -100,8 +100,8 @@ jobs:
           packages = tomllib.loads(Path('Cargo.lock').read_text())['package']
           family = [(p['name'], p['version']) for p in packages if p['name'].startswith('fsqlite')]
           print('Independent probe engine family:', family)
-          if not family or any(version != '0.4.6' for _, version in family):
-              raise SystemExit('Probe must use the same 0.4.6 engine family, never an older substitute')
+          if not family or any(version != '0.4.7' for _, version in family):
+              raise SystemExit('Probe must use the same 0.4.7 engine family, never an older substitute')
           PY
       - name: Build the narrow production-source engine probe
         run: |

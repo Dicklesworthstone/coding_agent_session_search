@@ -1131,17 +1131,19 @@ fn doctor_repair_leaked_pages_refuses_a_doubled_reference() {
 /// sqlite_master autoindex row). The fixture is a synthetic two-message
 /// archive written by cass, with that one table rewritten by stock SQLite
 /// (writable_schema); its paths come from the generating machine's scratch
-/// directory. While the pinned engine refuses the catalog even for the shadow
-/// repair (doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX),
-/// status must not send users to that repair, and the dry-run must not plan
-/// what --yes cannot do: both refuse with the same explanation and leave the
-/// bytes alone. When an engine bump flips the constant, this test must be
-/// rewritten to prove the in-place repair instead.
+/// directory. Ordinary opens still refuse that catalog, but since
+/// frankensqlite 0.4.7 the deferred-FTS5 repair open binds the missing
+/// autoindex (doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX),
+/// so status routes to the shadow repair, the dry-run plans it without
+/// touching the bytes, and --yes rebuilds the derived shadow from the
+/// unchanged canonical rows. Afterwards the archive opens normally, a repeat
+/// dry-run finds the shadow healthy and plans no rebuild, and the
+/// conversation indexes and searches again.
 #[test]
-fn doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog() {
+fn doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place() {
     let tracker = PhaseTracker::new(
         "cli_doctor",
-        "doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog",
+        "doctor_rebuild_canonical_fts_repairs_the_503_legacy_shadow_catalog_in_place",
     );
     let temp = tempfile::tempdir().expect("tempdir");
     let test_home = temp.path();
@@ -1160,7 +1162,7 @@ fn doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog(
 
     let phase = tracker.start(
         "status",
-        Some("the read-only probe names GH #503 and not the shadow repair"),
+        Some("the read-only probe routes the legacy catalog to the shadow repair"),
     );
     let status = cass_cmd(test_home)
         .args([
@@ -1180,54 +1182,125 @@ fn doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog(
         open_error.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
         "{open_error}"
     );
-    assert!(open_error.contains("GH #503"), "{open_error}");
     assert!(
-        !open_error.contains("rebuild-canonical-fts"),
+        open_error.contains("cass doctor --rebuild-canonical-fts --dry-run --json"),
+        "{open_error}"
+    );
+    assert!(
+        !open_error.contains("cannot rebuild that shadow in place"),
         "{open_error}"
     );
     tracker.end(
         "status",
-        Some("the read-only probe names GH #503 and not the shadow repair"),
+        Some("the read-only probe routes the legacy catalog to the shadow repair"),
+        phase,
+    );
+
+    let data_dir_arg = data_dir.to_str().expect("utf8");
+    let run = |args: &[&str]| {
+        let out = cass_cmd(test_home)
+            .args(args)
+            .args(["--data-dir", data_dir_arg])
+            .output()
+            .expect("run cass");
+        assert!(
+            out.status.success(),
+            "{args:?}: exit={:?} stdout={} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).expect("one JSON document")
+    };
+
+    let phase = tracker.start(
+        "dry_run",
+        Some("the dry-run plans the rebuild and leaves the archive untouched"),
+    );
+    let plan = run(&["doctor", "--rebuild-canonical-fts", "--dry-run", "--json"]);
+    assert_eq!(plan["status"], "shadow_structure_corrupt", "{plan}");
+    assert_eq!(
+        plan["planned_action"], "drop_recreate_rebuild_from_canonical",
+        "{plan}"
+    );
+    assert_eq!(test_file_blake3(&db_path), legacy_blake3);
+    tracker.end(
+        "dry_run",
+        Some("the dry-run plans the rebuild and leaves the archive untouched"),
         phase,
     );
 
     let phase = tracker.start(
         "repair",
-        Some("dry-run and --yes refuse alike and leave the archive untouched"),
+        Some("--yes rebuilds the derived shadow; the archive opens normally"),
     );
-    for mode in ["--dry-run", "--yes"] {
-        let out = cass_cmd(test_home)
-            .args([
-                "doctor",
-                "--rebuild-canonical-fts",
-                mode,
-                "--json",
-                "--data-dir",
-                data_dir.to_str().expect("utf8"),
-            ])
-            .output()
-            .expect("run cass doctor --rebuild-canonical-fts");
-        assert_eq!(
-            out.status.code(),
-            Some(13),
-            "{mode}: stdout={} stderr={}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let error = doctor_error_json(&out.stderr);
-        assert_eq!(test_error_kind(&error), Some("storage"), "{mode}: {error}");
-        let rendered = error.to_string();
-        assert!(rendered.contains("legacy catalog"), "{mode}: {rendered}");
-        assert!(rendered.contains("GH #503"), "{mode}: {rendered}");
-        assert_eq!(
-            test_file_blake3(&db_path),
-            legacy_blake3,
-            "{mode} must not modify the archive"
+    let repaired = run(&["doctor", "--rebuild-canonical-fts", "--yes", "--json"]);
+    assert_eq!(
+        repaired["status"], "rebuilt_from_corrupt_shadow",
+        "{repaired}"
+    );
+    assert_eq!(repaired["inserted_messages"], 2, "{repaired}");
+    let status = run(&["status", "--json"]);
+    assert_eq!(status["database"]["opened"], true, "{status}");
+    assert_eq!(status["database"]["conversations"], 1, "{status}");
+    assert_eq!(status["database"]["messages"], 2, "{status}");
+    // The canonical rows are the fixture's, byte for byte.
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open");
+    let messages: Vec<(i64, String)> = conn
+        .query("SELECT idx, content FROM messages ORDER BY conversation_id, idx")
+        .expect("messages")
+        .into_iter()
+        .map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap()))
+        .collect();
+    drop(conn);
+    assert_eq!(
+        messages,
+        [
+            (0, "legacyshadowneedle how do I rebuild".to_string()),
+            (1, "canonicalreplyneedle run the repair".to_string()),
+        ]
+    );
+    // The rebuilt shadow indexes every canonical message, and the plan is the
+    // one any healthy shadow gets (record its generation), not a rebuild.
+    let settled = run(&["doctor", "--rebuild-canonical-fts", "--dry-run", "--json"]);
+    assert_eq!(settled["parity"]["status"], "healthy", "{settled}");
+    assert_eq!(settled["parity"]["canonical_messages"], 2, "{settled}");
+    assert_eq!(settled["parity"]["indexed_messages"], 2, "{settled}");
+    assert_eq!(
+        settled["planned_action"], "verify_and_record_generation",
+        "{settled}"
+    );
+    tracker.end(
+        "repair",
+        Some("--yes rebuilds the derived shadow; the archive opens normally"),
+        phase,
+    );
+
+    let phase = tracker.start(
+        "search",
+        Some("the repaired archive indexes and both messages search again"),
+    );
+    let indexed = run(&["index", "--full", "--json", "--no-progress-events"]);
+    assert_eq!(indexed["success"], true, "{indexed}");
+    // The conversation's title carries the first needle, so that query also
+    // matches the second message; each message must come back by its text.
+    for (needle, text) in [
+        ("legacyshadowneedle", "legacyshadowneedle how do I rebuild"),
+        (
+            "canonicalreplyneedle",
+            "canonicalreplyneedle run the repair",
+        ),
+    ] {
+        let found = run(&["search", needle, "--mode", "lexical", "--json"]);
+        let hits = found["hits"].as_array().cloned().unwrap_or_default();
+        assert!(
+            hits.iter().any(|hit| hit["content"] == text),
+            "{needle}: {found}"
         );
     }
     tracker.end(
-        "repair",
-        Some("dry-run and --yes refuse alike and leave the archive untouched"),
+        "search",
+        Some("the repaired archive indexes and both messages search again"),
         phase,
     );
     tracker.complete();
