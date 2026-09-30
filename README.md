@@ -3616,32 +3616,29 @@ Update check state is stored in `update_state.json` in the data directory:
 ## Dependency Source Contract
 
 The manifests and lockfile pin the entire SQLite family used by CASS (including
-`fsqlite-types`) at `=0.4.7`, with `asupersync =0.5.0`.
+`fsqlite-types`) at `=0.4.6`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
-archive. `franken-agent-detection =0.3.3` is published and accepts the 0.4.7
+archive. `franken-agent-detection =0.3.3` is published and accepts the 0.4.6
 family. SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only
-opens (GH#477) and 0.4.4 adds durable pending-freelist repairs. 0.4.6 stops a
-live B-tree page from being freed and granted again across a WAL generation
-(`page N is referenced multiple times`, bd-b5vmw) and fixes a lost-index-entry
-race (bd-11sz4). All 26 public SQLite packages are published at 0.4.7, which
-keeps index entries whole in large multi-row INSERTs (bd-2eebi), fixes a
-schema change inside an explicit `BEGIN IMMEDIATE`/`EXCLUSIVE` missing rows
-that another same-process connection autocommits concurrently (bd-4iaoi), lets
-`cass doctor --rebuild-canonical-fts` open and rebuild the GH#503 legacy
-`fts_messages_config` shadow catalog, bounds the shared page plane, and stops a
-connection's first `sqlite_master` query from reading the whole database file.
-The lockfile resolves the 20 SQLite packages CASS uses at 0.4.7.
+opens (GH#477) and 0.4.4 adds durable pending-freelist repairs. All 26 public
+SQLite packages are published at 0.4.6, which stops a live B-tree page from
+being freed and granted again across a WAL generation (`page N is referenced
+multiple times`, bd-b5vmw) and fixes a lost-index-entry race (bd-11sz4). The
+lockfile resolves the 20 SQLite packages CASS uses at 0.4.6.
+Upstream still lists bd-4iaoi (present in 0.4.4 and earlier, fix pending for
+0.4.7): a schema change inside an explicit `BEGIN IMMEDIATE`/`EXCLUSIVE` can
+miss rows that another same-process connection autocommits concurrently.
 Full runtime qualification and the strict UBS gate remain pending, and no
 release of this pin proves recovery of an already damaged archive.
 The build guard enforces the reviewed
-uniform SQLite 0.4.7 versions, a single resolution per package, and registry sources.
+uniform SQLite 0.4.6 versions, a single resolution per package, and registry sources.
 
 `cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. No active dependency or patch currently resolves from git. Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.7` (tag v0.4.7 = `347c965adc94e6e704e2f349f23178b9e85b18f7`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, and 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
+| `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.6` (tag v0.4.6 = `7a28b76dd9c9c747a2b2524db527da9a3e3b583d`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs and 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
 | `franken-agent-detection` | crates.io `=0.3.3` |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
 | `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.4` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, published from the `frankensearch-quill-v0.3.4` hotfix tag), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
@@ -3650,7 +3647,7 @@ uniform SQLite 0.4.7 versions, a single resolution per package, and registry sou
 
 **Build-time validation**
 - `build.rs` validates every named dependency contract against its exact registry requirement, package name, enabled features, and `default-features` policy. It also rejects git/revision fields for these registry-only contracts.
-- The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.7` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
+- The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.6` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
 - Enable optional sibling-manifest validation with `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. For sibling checkouts that are present, this verifies package names, versions, and required features before you switch to local path overrides; registry-only contracts do not require a particular sibling branch or clean worktree.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 
