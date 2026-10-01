@@ -25,11 +25,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
+| [v0.10.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0) | 2026-10-01 | Leaked-page doctor repair, robot search/pack interpretation echoes, `CASS_RAW_MIRROR=0`, OpenCode 2.x and mid-turn Claude Code prompts indexed, giant-conversation slicing, WAL-only watch-once and forget-tombstone fixes |
 | [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-25 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64. Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages, large-archive index and FTS repair fixes |
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
 ## [Unreleased]
+
+## [v0.10.0] -- 2026-10-01
 
 ### Added
 
@@ -81,6 +84,27 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **An index run that rebuilds the lexical index no longer drops the
+  conversations batched around a giant one.** When a run rebuilt the index
+  inline (a missing or replaced index, without `--full`) and one batch held a
+  conversation large enough to persist in slices (37675c69), only the
+  conversations in the batch's last part were indexed. Ordinary conversations
+  before the giant one, or the giant one itself when ordinary conversations
+  followed it, were stored but never searchable, and `cass status` stayed
+  stale until a `--full` rebuild. Only the giant conversation's earlier slices
+  now skip the lexical replay; its final slice replays the whole conversation.
+- **`cass pack` redacts its `_meta.effective` echo.** The new echo of what the
+  pack's search ran (raw query, query grouping, database path, workspace
+  filters) bypassed the strict redaction the rest of the pack applies, so a
+  secret or a home-directory path in the query came back verbatim there.
+  Every string in it is now redacted and counted like the rest of the
+  envelope.
+- **`zero_result_diagnosis` no longer explains a page past the last hit.** A
+  `--workspace` search with `--offset` beyond its matches returned an empty
+  page that was diagnosed as "the workspace has no match" next to a nonzero
+  `total_matches`. The diagnosis now requires the search itself to be empty.
+- **`cargo fmt --check` is clean again** on the lexical reconcile code
+  (baeaf43c).
 - **OpenCode 2.x sessions are indexed (#504).** franken-agent-detection
   0.3.3 reads OpenCode's `session_v2` and `session_message` tables, so
   sessions stored only there are no longer skipped. A session migrated from
@@ -226,6 +250,38 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `--full` repaired it. The incremental preflight now sees that the canonical
   archive holds fewer conversations than the lexical generation was
   certified against and rebuilds it from the canonical rows.
+
+### Known open at release
+
+- `ann_shards::wal_tests` (3 tests) are still red at this release, as at
+  v0.9.0: the fixtures carry a non-native graph sidecar
+  (`SidecarNotNative`), tracked on 962e8. The module is unchanged since
+  v0.9.0. The rest of the lib suite (7,930 tests) and the gated integration
+  targets (`cli_robot`, `bookmarks_cli`, `search_metamorphic`,
+  `pages_bundle`) and goldens pass at the release commit.
+- `cass index --semantic` reads each conversation whole: 938bf986 lifted the
+  8 MiB per-conversation text cap so lexical indexing covers every message
+  of a long session, and the semantic batch fetch now inherits that. On an
+  archive with a very large conversation (hundreds of MiB of text), a
+  semantic pass holds that whole conversation in memory at once. No data is
+  lost; a bounded semantic fetch is follow-up work.
+- The strict whole-file UBS scan of the files changed since v0.9.0 is still
+  red, as the README's dependency source contract records ("strict UBS gate
+  ... pending"); none of its sampled critical findings is in this release's
+  own changes.
+
+### Dependencies
+
+- `dirs` 6 -> 7 (its only breaking change is Windows `preference_dir`, which
+  cass does not call), plus semver-compatible lockfile updates: bloomfilter
+  3.0.2, clap 4.6.7, clap_complete 4.6.11, flate2 1.1.10, lru 0.18.5, rand
+  0.10.3, rustls 0.23.45, smallvec 1.16.2, thiserror 2.0.21, which 8.0.6,
+  xxhash-rust 0.8.19.
+- Held back on purpose: the SQLite family stays at `=0.4.6` (0.4.7 regresses
+  strict read-only opens; see 0450b116), and FrankenTUI stays at `=0.5.0`
+  (0.7.0 removes `ColorProfile` and the `TerminalCapabilities` color fields
+  the TUI uses, and turns BOCPD resize coalescing on by default; that port is
+  its own change).
 
 ## [v0.9.0] -- 2026-09-25
 
