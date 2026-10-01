@@ -63,7 +63,11 @@ mod tests {
     #[test]
     fn read_snapshot_does_not_mix_same_length_rewrites_between_passes() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let path = tmp.path().join("snapshot.db").to_string_lossy().into_owned();
+        let path = tmp
+            .path()
+            .join("snapshot.db")
+            .to_string_lossy()
+            .into_owned();
         let writer = Connection::open(path.clone())?;
         writer.execute("PRAGMA journal_mode=WAL")?;
         writer.execute("CREATE TABLE snapshot_probe (id INTEGER PRIMARY KEY, body TEXT)")?;
@@ -74,7 +78,11 @@ mod tests {
         writer.execute("UPDATE snapshot_probe SET body = 'bravo' WHERE id = 1")?;
         assert_eq!(body(&writer)?, "bravo");
         for _ in 0..4 {
-            assert_eq!(body(&reader)?, "alpha", "every replay uses the bound snapshot");
+            assert_eq!(
+                body(&reader)?,
+                "alpha",
+                "every replay uses the bound snapshot"
+            );
         }
         snapshot.release()?;
         assert_eq!(
@@ -108,7 +116,11 @@ mod tests {
 
     fn seed(
         data_dir: &Path,
-    ) -> Result<(FrankenStorage, Vec<CassDocument>, LexicalReconcileCheckpoint)> {
+    ) -> Result<(
+        FrankenStorage,
+        Vec<CassDocument>,
+        LexicalReconcileCheckpoint,
+    )> {
         let storage = FrankenStorage::open(&data_dir.join("archive.db"))?;
         let agent_id = storage.ensure_agent(&Agent {
             id: None,
@@ -152,10 +164,8 @@ mod tests {
             .into_iter()
             .next()
             .context("missing canonical test conversation")?;
-        let (provenance, _) = crate::indexer::lexical_rebuild_packet_provenance_from_canonical(
-            &row,
-            &HashMap::new(),
-        );
+        let (provenance, _) =
+            crate::indexer::lexical_rebuild_packet_provenance_from_canonical(&row, &HashMap::new());
         let messages = storage.fetch_messages_for_lexical_rebuild(id)?;
         let content_bytes = messages.iter().map(|message| message.content.len()).sum();
         let packet = crate::indexer::lexical_rebuild_contract_from_canonical_messages(
@@ -236,11 +246,13 @@ mod tests {
         assert_eq!(report.early_canary_ok, Some(true));
         assert_eq!(report.late_canary_ok, Some(true));
         assert!(report.checkpoint_cleared);
-        assert!(!lexical_reconcile_checkpoint_path(
-            &expected_index_dir(tmp.path()),
-            checkpoint.conversation_id,
-        )
-        .exists());
+        assert!(
+            !lexical_reconcile_checkpoint_path(
+                &expected_index_dir(tmp.path()),
+                checkpoint.conversation_id,
+            )
+            .exists()
+        );
         assert_eq!(canonical_bytes(tmp.path())?, before);
         Ok(())
     }

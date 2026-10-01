@@ -141,7 +141,10 @@ impl CanonicalProjection<'_> {
                 Ok(true)
             },
         )?;
-        anyhow::ensure!(completed, "lexical reconcile canonical stream stopped early");
+        anyhow::ensure!(
+            completed,
+            "lexical reconcile canonical stream stopped early"
+        );
         flush(&mut batch)?;
         Ok(summary)
     }
@@ -518,10 +521,8 @@ mod tests {
             .into_iter()
             .next()
             .context("missing test conversation")?;
-        let (provenance, _) = super::super::lexical_rebuild_packet_provenance_from_canonical(
-            &row,
-            &HashMap::new(),
-        );
+        let (provenance, _) =
+            super::super::lexical_rebuild_packet_provenance_from_canonical(&row, &HashMap::new());
         Ok((storage, row, provenance))
     }
 
