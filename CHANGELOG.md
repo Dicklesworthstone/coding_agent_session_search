@@ -32,6 +32,18 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cass schedule` no longer reports a failing index run as lock contention
+  (#509).** Every exit 7 from the index step was reported as "another index
+  run already holds the index lock; skipped this cycle". That included a
+  canonical database that kept failing with `BusyRecovery` while no other
+  process held the lock, so a permanently failing schedule looked like a
+  benign skip. The step now claims lock contention only when the child
+  reports another index run holding the lock. A busy database is reported
+  as such, with the child's error message, and an exit 7 without a message
+  claims no cause.
+
 ## [v0.10.0] -- 2026-10-01
 
 ### Added

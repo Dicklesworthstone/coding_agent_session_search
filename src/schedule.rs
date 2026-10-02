@@ -1341,27 +1341,53 @@ pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
         return false;
     }
     step.ok = false;
-    // Exit 7 also covers a background run that deferred the one-time storage
-    // migration repair (GH #450); name the cause the child reported.
+    // Exit 7 covers several causes; name the one the child reported. Only a
+    // child that saw another index run holding the lock is contention
+    // (GH #509: a database stuck in WAL-index recovery was reported as a
+    // held lock, so a permanently failing schedule read as a benign skip).
+    let message = step_error_field(step, "/error/message").unwrap_or_default();
     step.skipped_reason = Some(
-        if step_error_kind(step).as_deref() == Some("migration-repair-pending") {
+        if step_error_field(step, "/error/kind").as_deref() == Some("migration-repair-pending") {
             "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
-        } else {
+        } else if message.contains("another 'cass index' run is already active")
+            || message.contains("another cass index process already holds")
+        {
             "another index run already holds the index lock; skipped this cycle".to_string()
+        } else if message.contains("canonical database is busy/locked") {
+            format!(
+                "the index run failed: the canonical database stayed busy and no other index run held the lock: {}",
+                bounded_reason(&message)
+            )
+        } else if message.is_empty() {
+            "the index run exited 7 (busy) without an error message; see stderr_tail".to_string()
+        } else {
+            format!(
+                "the index run exited 7 (busy): {}",
+                bounded_reason(&message)
+            )
         },
     );
     true
 }
 
-/// `error.kind` from the last JSON error envelope a step wrote to stderr.
-fn step_error_kind(step: &StepReport) -> Option<String> {
+/// A field from the last JSON error envelope a step wrote to stderr.
+fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
     step.stderr_tail.as_deref()?.lines().rev().find_map(|line| {
         serde_json::from_str::<serde_json::Value>(line.trim())
             .ok()?
-            .pointer("/error/kind")?
+            .pointer(pointer)?
             .as_str()
             .map(str::to_owned)
     })
+}
+
+/// The first 300 characters of a child's error message, for a step reason.
+fn bounded_reason(message: &str) -> String {
+    let mut reason: String = message.chars().take(300).collect();
+    if reason.len() < message.len() {
+        reason.push('…');
+    }
+    reason
 }
 
 /// Probe whether the MiniLM model is installed via `models status --json`.
@@ -1793,10 +1819,39 @@ mod tests {
         let reason = deferred.skipped_reason.unwrap();
         assert!(reason.contains("migration repair"), "{reason}");
         assert!(reason.contains("cass index --full"), "{reason}");
-        let mut locked =
-            with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
+        let mut locked = with_stderr(
+            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"another 'cass index' run is already active for data dir /d (pid 42)\",\"retryable\":true}}",
+        );
         assert!(soften_busy_index_step(&mut locked));
         assert!(locked.skipped_reason.unwrap().contains("index lock"));
+        let mut held = with_stderr(
+            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed: another cass index process already holds /d/index-run.lock\",\"retryable\":true}}",
+        );
+        assert!(soften_busy_index_step(&mut held));
+        assert!(held.skipped_reason.unwrap().contains("index lock"));
+
+        // GH #509: the same exit 7 and kind from a database stuck in
+        // WAL-index recovery is not lock contention, and says what failed.
+        let mut stuck = with_stderr(
+            "ERROR group-commit callback failed\n{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed because the canonical database is busy/locked: ephemeral writer preflight write failed for serial batched indexing | database is busy (recovery in progress)\",\"retryable\":true}}",
+        );
+        assert!(soften_busy_index_step(&mut stuck));
+        assert!(!stuck.ok);
+        let reason = stuck.skipped_reason.unwrap();
+        assert!(!reason.contains("index lock"), "{reason}");
+        assert!(
+            reason.contains("no other index run held the lock"),
+            "{reason}"
+        );
+        assert!(reason.contains("recovery in progress"), "{reason}");
+
+        // Without a message the step claims no cause at all.
+        let mut bare =
+            with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
+        assert!(soften_busy_index_step(&mut bare));
+        let reason = bare.skipped_reason.unwrap();
+        assert!(!reason.contains("index lock"), "{reason}");
+        assert!(reason.contains("stderr_tail"), "{reason}");
     }
 
     #[test]
