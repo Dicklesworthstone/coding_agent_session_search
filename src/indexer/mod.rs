@@ -10204,9 +10204,22 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
     Ok(expected_docs)
 }
 
-/// GH #461: sidecar next to the rebuild checkpoint memoizing the
-/// noise-adjusted expected doc count for one canonical content identity.
+/// GH #461: sidecar memoizing the noise-adjusted expected doc count for one
+/// canonical content identity (see [`expected_lexical_docs_cache_path`]).
 const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
+
+/// The memo describes the canonical database, not a lexical generation, so it
+/// lives beside the generation directory rather than inside it. Every lexical
+/// publish exchanges that directory: a memo kept inside was discarded by each
+/// rebuild, and the next run re-read every message in the archive to recreate
+/// it (GH #381: 900 s in `watch_startup:count_total_messages` on a 28 GB
+/// archive).
+fn expected_lexical_docs_cache_path(index_path: &Path) -> Option<PathBuf> {
+    index_path
+        .parent()
+        .map(|parent| parent.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE))
+}
+
 /// 2: counts under the per-message cap (bgn6s). A v1 memo counted a long
 /// conversation's messages past its first 8 MiB as noise and must be recounted.
 const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 2;
@@ -10367,9 +10380,10 @@ fn expected_live_lexical_doc_count_cached(
     total_messages: usize,
 ) -> Result<usize> {
     let current = expected_lexical_docs_identity(storage, total_messages)?;
-    let cache_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
-    let cached = fs::read(&cache_path)
-        .ok()
+    let cache_path = expected_lexical_docs_cache_path(index_path);
+    let cached = cache_path
+        .as_deref()
+        .and_then(|path| fs::read(path).ok())
         .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsCache>(&raw).ok())
         .filter(|cached| {
             cached.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
@@ -10393,7 +10407,7 @@ fn expected_live_lexical_doc_count_cached(
         delta_generations,
         "expected lexical doc count recomputed"
     );
-    if index_path.is_dir() {
+    if let Some(cache_path) = cache_path.filter(|path| path.parent().is_some_and(Path::is_dir)) {
         let payload = ExpectedLexicalDocsCache {
             schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
             db_path: db_path.to_string(),
@@ -10401,7 +10415,7 @@ fn expected_live_lexical_doc_count_cached(
             expected_docs,
             delta_generations,
         };
-        let tmp_path = index_path.join(format!(
+        let tmp_path = cache_path.with_file_name(format!(
             "{EXPECTED_LEXICAL_DOCS_CACHE_FILE}.{}.tmp",
             std::process::id()
         ));
@@ -55606,7 +55620,7 @@ mod tests {
             )
             .unwrap()
         };
-        let sidecar_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
+        let sidecar_path = expected_lexical_docs_cache_path(&index_path).unwrap();
         let sidecar = || {
             serde_json::from_slice::<ExpectedLexicalDocsCache>(&fs::read(&sidecar_path).unwrap())
                 .unwrap()
@@ -55673,6 +55687,78 @@ mod tests {
             .unwrap();
         assert_eq!(cached(), full());
         assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
+    }
+
+    /// GH #381: the expected-docs memo describes the canonical database, so a
+    /// lexical publish (which exchanges the generation directory) must not
+    /// discard it. Otherwise the first run after every rebuild re-reads every
+    /// message in the archive. A planted sentinel that is still served after
+    /// a real from-zero rebuild and publish proves no full scan was owed.
+    #[test]
+    #[serial_test::serial]
+    fn gh381_expected_lexical_docs_memo_survives_lexical_publication() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("gh381.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        drop(storage);
+        rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        let db = db_path.to_string_lossy().into_owned();
+        let cached = || {
+            let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+            expected_live_lexical_doc_count_cached(
+                &storage,
+                &index_path,
+                &db,
+                count_total_messages_exact(&storage).unwrap(),
+            )
+            .unwrap()
+        };
+        let full =
+            expected_live_lexical_doc_count(&FrankenStorage::open_readonly(&db_path).unwrap())
+                .unwrap();
+        assert_eq!(cached(), full);
+        let sidecar_path = expected_lexical_docs_cache_path(&index_path).unwrap();
+        assert!(
+            !sidecar_path.starts_with(&index_path),
+            "the memo must live outside the generation directory a publish exchanges"
+        );
+        let mut planted: ExpectedLexicalDocsCache =
+            serde_json::from_slice(&fs::read(&sidecar_path).unwrap()).unwrap();
+        planted.expected_docs = 999_999;
+        fs::write(&sidecar_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        // Drop the completed checkpoint so the next rebuild starts from zero,
+        // builds off-live and publishes by exchanging the generation directory.
+        clear_lexical_rebuild_state(&index_path).unwrap();
+        let retained_backups = || -> std::collections::BTreeSet<std::ffi::OsString> {
+            fs::read_dir(
+                index_path
+                    .parent()
+                    .unwrap()
+                    .join(".lexical-publish-backups"),
+            )
+            .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+            .unwrap_or_default()
+        };
+        let backups_before = retained_backups();
+        let rebuilt = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        assert!(rebuilt.exact_checkpoint_persisted);
+        assert_eq!(
+            retained_backups().difference(&backups_before).count(),
+            1,
+            "the rebuild must have exchanged the generation directory and retained the prior one"
+        );
+
+        assert_eq!(
+            cached(),
+            999_999,
+            "an unchanged canonical identity is served from the memo after publication"
+        );
     }
 
     /// #439: the fallback-FTS shadow maintenance must report liveness per
