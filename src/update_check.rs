@@ -404,6 +404,7 @@ exec bash "$script" --easy-mode --verify --version "$3"
 #[cfg(any(test, target_os = "windows"))]
 fn windows_self_update_script() -> &'static str {
     r#"
+$ErrorActionPreference = 'Stop'
 $InstallUrl = $args[0]
 $ChecksumsUrl = $args[1]
 $Version = $args[2]
@@ -449,6 +450,9 @@ try {
 
     & $Script -EasyMode -Verify -Version $Version
     exit $LASTEXITCODE
+} catch {
+    [Console]::Error.WriteLine("cass self-update failed: $_")
+    exit 1
 } finally {
     Remove-Item -LiteralPath $Temp -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -515,6 +519,25 @@ fn windows_self_update_powershell_args(version: &str) -> Vec<String> {
     .collect()
 }
 
+/// The Windows PowerShell 5.1 child that runs the self-update.
+///
+/// `PSModulePath` is removed from its environment. PowerShell 7 prepends its
+/// own module directories to that variable, and cass started from `pwsh`
+/// passes them on. Windows PowerShell then resolves its built-in
+/// `Microsoft.PowerShell.Utility` module to PowerShell 7's copy, which it
+/// cannot load, so `Get-FileHash` (used here and by install.ps1) is "not
+/// recognized" and no update installs. Without the variable it uses its own
+/// default module path, which is what `pwsh` itself arranges when it starts
+/// Windows PowerShell directly.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_self_update_command(version: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("powershell");
+    command
+        .args(windows_self_update_powershell_args(version))
+        .env_remove("PSModulePath");
+    command
+}
+
 /// Run the self-update installer script interactively.
 /// This function does NOT return - it replaces the current process with the installer.
 /// The caller should ensure the terminal is in a clean state before calling.
@@ -554,9 +577,7 @@ pub fn run_self_update(version: &str) -> ! {
     #[cfg(target_os = "windows")]
     {
         // Windows doesn't have exec(), so we spawn and wait.
-        let status = std::process::Command::new("powershell")
-            .args(windows_self_update_powershell_args(version))
-            .status();
+        let status = windows_self_update_command(version).status();
         match status {
             Ok(s) => std::process::exit(installer_process_exit_code(s)),
             Err(e) => {
@@ -1167,6 +1188,39 @@ mod tests {
         assert!(script.contains("Get-FileHash"));
         assert!(script.contains("-EasyMode -Verify -Version $Version"));
         assert!(script.contains("Remove-Item -LiteralPath $Temp"));
+        // A failed step must fail the process: run from pwsh, a missing
+        // Get-FileHash left nothing installed and still exited 0.
+        assert!(
+            script
+                .trim_start()
+                .starts_with("$ErrorActionPreference = 'Stop'")
+        );
+        assert!(script.contains("} catch {\n    [Console]::Error.WriteLine(\"cass self-update failed: $_\")\n    exit 1\n}"));
+    }
+
+    /// The Windows PowerShell child must not inherit PowerShell 7's module
+    /// path: with it, `Get-FileHash` was not recognized when cass ran from
+    /// `pwsh`, and no self-update could install (GH #381, Windows).
+    #[test]
+    fn test_windows_self_update_child_drops_inherited_module_path() {
+        let command = windows_self_update_command("v1.2.3");
+        assert_eq!(command.get_program(), "powershell");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            windows_self_update_powershell_args("v1.2.3")
+        );
+        let envs: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            envs,
+            [(
+                std::ffi::OsStr::new("PSModulePath"),
+                None::<&std::ffi::OsStr>
+            )],
+            "the only environment change is removing PSModulePath"
+        );
     }
 
     #[test]
