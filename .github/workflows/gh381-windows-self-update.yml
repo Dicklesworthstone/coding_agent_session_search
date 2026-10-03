@@ -1,0 +1,99 @@
+name: GH381 Windows self-update acceptance
+
+# Release-binary acceptance for bead coding_agent_session_search-6gmrz (the
+# GH #381 Windows report): `cass upgrade --yes` must run the checksum-verified
+# install.ps1 with its arguments intact and leave the latest release installed.
+# Starting releases are downloaded and checksum-verified, never built here.
+# v0.8.0 predates 612bd808 and is the negative control: its
+# `powershell -Command <script> <url>...` form ran the script with empty $args,
+# so its upgrade must fail and install nothing. If it ever succeeds, this job
+# cannot tell the broken form from the fixed one and fails.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gh381-windows-self-update.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh381-windows-self-update-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-update:
+    name: upgrade from ${{ matrix.start }} (${{ matrix.expect }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - start: v0.9.0
+            expect: upgrades
+          - start: v0.8.0
+            expect: fails
+    steps:
+      - name: Download and verify the starting release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $start = Join-Path $env:RUNNER_TEMP 'start'
+          gh release download '${{ matrix.start }}' -R $env:GITHUB_REPOSITORY -p 'cass-windows-amd64.zip' -p 'cass-windows-amd64.zip.sha256' -D $start
+          if ($LASTEXITCODE -ne 0) { throw 'release download failed' }
+          $expected = ((Get-Content (Join-Path $start 'cass-windows-amd64.zip.sha256') -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash (Join-Path $start 'cass-windows-amd64.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "zip sha256 $actual does not match $expected" }
+          Expand-Archive (Join-Path $start 'cass-windows-amd64.zip') -DestinationPath (Join-Path $start 'bin')
+          $exe = Get-ChildItem (Join-Path $start 'bin') -Recurse -Filter 'cass.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'cass.exe is not in the release zip' }
+          & $exe.FullName --version
+          $latest = gh release view -R $env:GITHUB_REPOSITORY --json tagName -q .tagName
+          if ($LASTEXITCODE -ne 0 -or -not $latest) { throw 'cannot read the latest release tag' }
+          "CASS_START_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CASS_LATEST_TAG=$latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "starting release ${{ matrix.start }}; latest release $latest"
+
+      - name: cass upgrade --yes
+        shell: pwsh
+        run: |
+          # CI=true turns off every cass update path (updates_disabled). This
+          # job exists to exercise that path, so clear it for the child.
+          Remove-Item Env:CI -ErrorAction SilentlyContinue
+          $installed = Join-Path $HOME '.local\bin\cass.exe'
+          if (Test-Path $installed) { throw "unexpected pre-existing $installed" }
+          & $env:CASS_START_EXE upgrade --yes 2>&1 | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade.log')
+          "$LASTEXITCODE" | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade.exit') -Encoding ascii
+          exit 0
+
+      - name: Verify the outcome
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $code = [int](Get-Content (Join-Path $env:RUNNER_TEMP 'upgrade.exit') -Raw).Trim()
+          $installed = Join-Path $HOME '.local\bin\cass.exe'
+          $want = $env:CASS_LATEST_TAG.TrimStart('v')
+          Write-Host "upgrade from ${{ matrix.start }} exited $code; installed=$(Test-Path $installed)"
+          if ('${{ matrix.expect }}' -eq 'upgrades') {
+            if ($code -ne 0) { throw "upgrade from ${{ matrix.start }} exited $code" }
+            if (-not (Test-Path $installed)) { throw "no cass.exe was installed at $installed" }
+            $version = (& $installed --version | Out-String).Trim()
+            Write-Host "installed: $version"
+            if ($version -notmatch [regex]::Escape($want)) { throw "installed '$version', expected $want" }
+          } elseif ($code -eq 0 -and (Test-Path $installed)) {
+            throw "pre-fix ${{ matrix.start }} upgraded successfully; this job cannot distinguish broken from fixed"
+          }
+
+      - name: Keep the upgrade log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh381-windows-self-update-${{ matrix.start }}
+          path: ${{ runner.temp }}/upgrade.*
+          if-no-files-found: warn
+          retention-days: 14
