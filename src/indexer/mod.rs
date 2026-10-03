@@ -9169,8 +9169,8 @@ pub(crate) fn verify_published_lexical_doc_count(
         })?;
     if summary.docs != indexed_docs {
         return Err(anyhow::anyhow!(
-            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader only \
-             sees {}; refusing to certify the generation (GH #457)",
+            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader sees \
+             {}; refusing to certify the generation (GH #457)",
             summary.docs
         ));
     }
@@ -25825,6 +25825,19 @@ fn rebuild_tantivy_from_db_with_options(
                 u128::from(live_docs) >= rebuild_state.indexed_docs as u128,
                 "resumed lexical candidate contains {live_docs} documents, but its checkpoint \
                  requires {} committed documents",
+                rebuild_state.indexed_docs
+            );
+            // A surplus is reconciled only by replaying the identities behind
+            // it through the #440 upsert window. With the cursor at EOF nothing
+            // is replayed, so the candidate keeps the surplus and the finalize
+            // count check (GH #457) refuses it; a refused finalize leaves this
+            // same EOF checkpoint, so every later run would repeat the refusal.
+            anyhow::ensure!(
+                rebuild_state.processed_conversations < total_conversations
+                    || u128::from(live_docs) == rebuild_state.indexed_docs as u128,
+                "resumed lexical candidate contains {live_docs} documents, more than the {} its \
+                 checkpoint counted, and the checkpoint is at the end of the archive, so no \
+                 replay can reconcile the difference",
                 rebuild_state.indexed_docs
             );
             Ok(())
