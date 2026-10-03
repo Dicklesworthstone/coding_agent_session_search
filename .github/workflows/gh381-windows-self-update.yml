@@ -12,7 +12,10 @@ name: GH381 Windows self-update acceptance
 #     Windows PowerShell child inherited PowerShell 7's PSModulePath, so
 #     Get-FileHash was not recognized, nothing installed, and cass exited 0.
 #   - v0.9.0 from Windows PowerShell 5.1 shows the argument fix on a parent
-#     that does not pollute the module path.
+#     that does not pollute the module path. It installs the latest release,
+#     but exits 1: v0.10.0's install.ps1 self-test reset $LASTEXITCODE at
+#     script scope and read $null back, so it failed every run as a file.
+#     Released binaries are therefore judged on what got installed.
 #   A negative control that upgrades fails its job: it could no longer tell
 #   broken from fixed.
 # source: this commit, built with its package version lowered to 0.0.1 in the
@@ -107,7 +110,11 @@ jobs:
           $want = $env:CASS_LATEST_TAG.TrimStart('v')
           Write-Host "release ${{ matrix.start }} from ${{ matrix.parent }}: exit $code, installed=$(Test-Path $installed)"
           if ('${{ matrix.expect }}' -eq 'upgrades') {
-            if ($code -ne 0) { throw "upgrade exited $code" }
+            # A released cass runs the latest release's install.ps1 self-test,
+            # which (v0.10.0) exits 1 after a good install when run as a file.
+            # Released binaries are judged on what got installed; the source
+            # job below also requires exit 0.
+            if ($code -ne 0) { Write-Host "::warning::released ${{ matrix.start }} upgrade exited $code" }
             if (-not (Test-Path $installed)) { throw "no cass.exe was installed at $installed" }
             $version = (& $installed --version | Out-String).Trim()
             Write-Host "installed: $version"

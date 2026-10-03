@@ -448,8 +448,22 @@ try {
         exit 1
     }
 
-    & $Script -EasyMode -Verify -Version $Version
-    exit $LASTEXITCODE
+    # install.ps1 comes from the target release, so its own self-test cannot
+    # be trusted: v0.10.0's resets $LASTEXITCODE at script scope, which shadows
+    # the code `cass --version` sets, and it fails every run as a file even
+    # after a good install. Verify the installed binary here instead.
+    & $Script -EasyMode -Version $Version
+    if ($LASTEXITCODE) {
+        exit $LASTEXITCODE
+    }
+    $Installed = Join-Path (Join-Path $HOME ".local\bin") "cass.exe"
+    $Reported = (& $Installed --version | Out-String).Trim()
+    $Wanted = '(^|\s)' + [regex]::Escape($Version.TrimStart('v')) + '(\s|$)'
+    if ($LASTEXITCODE -ne 0 -or $Reported -notmatch $Wanted) {
+        throw "installed $Installed reports '$Reported' (exit $LASTEXITCODE), expected $Version"
+    }
+    Write-Output "cass self-update verified: $Reported"
+    exit 0
 } catch {
     [Console]::Error.WriteLine("cass self-update failed: $_")
     exit 1
@@ -1186,7 +1200,13 @@ mod tests {
         assert!(script.contains("if ($Expected)"));
         assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("Get-FileHash"));
-        assert!(script.contains("-EasyMode -Verify -Version $Version"));
+        assert!(script.contains("& $Script -EasyMode -Version $Version"));
+        // The installed binary is verified here, not by the release's own
+        // install.ps1 -Verify, whose v0.10.0 self-test always exits 1 when it
+        // runs as a file.
+        assert!(!script.contains("-Verify"));
+        assert!(script.contains("$Reported = (& $Installed --version | Out-String).Trim()"));
+        assert!(script.contains("$Reported -notmatch $Wanted"));
         assert!(script.contains("Remove-Item -LiteralPath $Temp"));
         // A failed step must fail the process: run from pwsh, a missing
         // Get-FileHash left nothing installed and still exited 0.

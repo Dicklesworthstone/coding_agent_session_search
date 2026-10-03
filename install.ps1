@@ -363,9 +363,13 @@ try {
     # Clear any exit code left by an earlier native command. If cass cannot
     # report a fresh code, verification must fail closed rather than reusing a
     # stale success (or passing $null to `exit`, which PowerShell treats as 0).
-    $LASTEXITCODE = $null
+    # Native commands set the GLOBAL $LASTEXITCODE; assigning the bare name in
+    # a script run as a file (`& install.ps1`, as cass self-update does)
+    # creates a script-scope variable that hides it, so every self-test read
+    # $null and failed after a good install.
+    $global:LASTEXITCODE = $null
     & "$Dest\cass.exe" --version
-    $verifyExitCode = $LASTEXITCODE
+    $verifyExitCode = $global:LASTEXITCODE
     if ($null -eq $verifyExitCode) {
       Write-Error "Self-test failed: $Dest\cass.exe --version did not report an exit code"
       exit 1
