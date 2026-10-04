@@ -20,7 +20,11 @@ jobs:
   verify:
     if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Two cold builds (the CASS lib tests, then the independent FrankenSQLite
+    # harness crate) at CARGO_BUILD_JOBS=2 do not fit 30 minutes. The CASS step
+    # alone took 25 min on bb40b10d, and the harness step was cancelled every
+    # run since 09-26, so this lane never reported.
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
