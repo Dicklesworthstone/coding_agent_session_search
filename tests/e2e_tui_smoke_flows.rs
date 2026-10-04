@@ -922,6 +922,92 @@ fn tui_pty_help_overlay_open_close_flow() {
 }
 
 #[test]
+fn tui_pty_alt_e_bookmarks_the_selected_hit_once() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_alt_e_bookmarks_the_selected_hit_once");
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 45,
+            cols: 145,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    apply_ftui_env(&mut tui_cmd, &env);
+    let mut child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+    assert!(
+        wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT),
+        "Did not observe startup output before the bookmark flow"
+    );
+
+    send_key_sequence(&mut *writer, b"hello");
+    thread::sleep(Duration::from_millis(120));
+    send_key_sequence(&mut *writer, b"\r");
+    assert!(
+        wait_for_rendered_output(
+            &captured,
+            Duration::from_secs(10),
+            rendered_contains_hello_fixture_content,
+        ),
+        "the fixture hit must be listed before bookmarking it"
+    );
+    thread::sleep(Duration::from_millis(180));
+
+    // Alt+E arrives as ESC + 'e' in one write.
+    send_key_sequence(&mut *writer, b"\x1be");
+    let bookmarked = wait_for_rendered_output(&captured, Duration::from_secs(6), |screen| {
+        screen.contains("Bookmarked")
+    });
+    thread::sleep(Duration::from_millis(180));
+    send_key_sequence(&mut *writer, b"\x1be");
+    let duplicate_reported =
+        wait_for_rendered_output(&captured, Duration::from_secs(6), |screen| {
+            screen.contains("Already bookmarked")
+        });
+
+    let (status, _esc_presses) =
+        quit_tui_with_escape(&mut *writer, &mut *child, 8, Duration::from_millis(180));
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_bookmark_output.raw", &trace, &raw);
+    assert!(
+        status.success(),
+        "ftui process exited unsuccessfully: {status}"
+    );
+    assert!(bookmarked, "Alt+E must report the new bookmark");
+    assert!(
+        duplicate_reported,
+        "a second Alt+E must report the duplicate"
+    );
+
+    let store = coding_agent_search::bookmarks::BookmarkStore::open(
+        &coding_agent_search::bookmarks::bookmarks_path_in(&env.data_dir),
+    )
+    .expect("open the bookmarks store the TUI wrote");
+    let saved = store.list(None).expect("list bookmarks");
+    assert_eq!(saved.len(), 1, "two presses keep one bookmark: {saved:?}");
+    assert!(
+        saved[0].source_path.contains("codex_home"),
+        "the bookmark names the fixture session: {}",
+        saved[0].source_path
+    );
+    tracker.complete();
+}
+
+#[test]
 fn tui_pty_search_detail_and_quit_flow() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
