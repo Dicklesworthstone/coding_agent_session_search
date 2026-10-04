@@ -49,8 +49,8 @@ fn rusqlite_is_dev_dependency_only() {
 /// silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const FACADE_REQUIREMENT: &str = "=0.4.6";
-    const TYPES_REQUIREMENT: &str = "=0.4.6";
+    const FACADE_REQUIREMENT: &str = "=0.4.9";
+    const TYPES_REQUIREMENT: &str = "=0.4.9";
     const EXPECTED_FACADE_FEATURES: &[&str] = &["fts5", "async-api"];
 
     let manifest: toml::Table =
@@ -154,7 +154,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
     let mut seen_names = std::collections::BTreeSet::new();
     for package in resolved_fsqlite {
         let name = package["name"].as_str().expect("locked package name");
-        let expected_version = "0.4.6";
+        let expected_version = "0.4.9";
         assert!(
             seen_names.insert(name.to_string()),
             "Cargo.lock resolves more than one version of {name}"
@@ -162,7 +162,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
         assert_eq!(
             package.get("version").and_then(toml::Value::as_str),
             Some(expected_version),
-            "{name} resolved at a different version than the published 0.4.6 family contract"
+            "{name} resolved at a different version than the published 0.4.9 family contract"
         );
         let source = package
             .get("source")
@@ -176,7 +176,9 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.4.6\"")
+        build_contract.contains("expected_version: \"0.4.9\"")
+            && !build_contract.contains("expected_version: \"0.4.7\"")
+            && !build_contract.contains("expected_version: \"0.4.6\"")
             && !build_contract.contains("expected_version: \"0.4.4\"")
             && !build_contract.contains("expected_version: \"0.4.2\"")
             && !build_contract.contains("expected_version: \"0.4.0\"")
@@ -1136,6 +1138,98 @@ fn gate2_file_compat_wal_mode() {
         "  WAL file exists: {}, SHM file exists: {}",
         wal_path.exists(),
         shm_path.exists()
+    );
+}
+
+/// GH #509 (frankensqlite GH#443): one stock SQLite read-only query on a
+/// healthy CASS archive whose WAL holds no frames leaves `-shm` holding stock's
+/// unindexed "empty" WAL-index header, because a read-only connection cannot
+/// delete the index on close. The engine before 0.4.9 accepted that header for
+/// reads but refused every later commit with BusyRecovery, so each `cass index`
+/// after a `sqlite3 -readonly agent_search.db 'PRAGMA quick_check'` exited 7,
+/// and no later process cleared it. A fresh CASS writer must commit, and keep
+/// committing, after that read.
+#[test]
+fn gh509_cass_writer_commits_after_a_stock_readonly_query() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let db_path = dir.path().join("agent_search.db");
+    let wal_path = dir.path().join("agent_search.db-wal");
+    let shm_path = dir.path().join("agent_search.db-shm");
+
+    // A healthy CASS archive whose WAL is checkpointed down to its header,
+    // the state the reporter's archive was in (`-wal` of 32 bytes).
+    let storage = FrankenStorage::open(&db_path).expect("create CASS archive");
+    storage
+        .raw()
+        .execute("INSERT OR REPLACE INTO meta(key, value) VALUES('gh509_seed', '1')")
+        .expect("seed write");
+    storage
+        .raw()
+        .query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("truncate the WAL");
+    storage.close().expect("close with checkpoint");
+    let wal_len = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+    assert!(
+        wal_len <= 32,
+        "precondition: the WAL holds no frames (len {wal_len})"
+    );
+
+    // The trigger: one stock read-only query.
+    {
+        let stock = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("stock read-only open");
+        let journal: String = stock
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("stock journal mode");
+        assert_eq!(journal, "wal", "precondition: the archive is in WAL mode");
+        let seeded: i64 = stock
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key = 'gh509_seed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stock read");
+        assert_eq!(seeded, 1);
+    }
+    assert!(
+        shm_path.exists(),
+        "precondition: the stock reader left a WAL index"
+    );
+
+    // A fresh CASS writer commits, and keeps committing.
+    let storage =
+        FrankenStorage::open(&db_path).expect("reopen the CASS archive after the stock read");
+    for n in 0..3 {
+        let result = storage.raw().execute(&format!(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('gh509_after_{n}', '{n}')"
+        ));
+        assert!(
+            result.is_ok(),
+            "commit {n} after a stock read-only query failed: {result:?}"
+        );
+    }
+    storage.close().expect("close");
+
+    // Both engines see every row.
+    let stock = rusqlite::Connection::open(&db_path).expect("stock open");
+    let rows: i64 = stock
+        .query_row(
+            "SELECT count(*) FROM meta WHERE key LIKE 'gh509_%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stock count");
+    assert_eq!(rows, 4);
+    let franken = Connection::open(db_path.to_str().expect("utf-8 path")).expect("fsqlite open");
+    let rows = franken
+        .query("SELECT count(*) FROM meta WHERE key LIKE 'gh509_%'")
+        .expect("fsqlite count");
+    assert_eq!(
+        rows[0].get(0).expect("count column"),
+        &SqliteValue::Integer(4)
     );
 }
 
