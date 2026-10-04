@@ -95183,6 +95183,45 @@ fn run_context(
     Ok(())
 }
 
+/// The binary's compiled completed-source reuse policy (GH#426). Reuse is
+/// compiled in only when every dependency in the build's `Cargo.lock` has a
+/// registry or git source: a local path dependency or `[patch]` can change a
+/// parser without changing the lockfile, so such a build reparses every
+/// source on every incremental run. Release binaries have it enabled.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceIngestReuseCapability {
+    pub enabled: bool,
+    /// The first unpinned package that disabled reuse; `None` when enabled.
+    pub disabled_by: Option<String>,
+}
+
+impl SourceIngestReuseCapability {
+    fn compiled() -> Self {
+        let blocker = env!("CASS_SOURCE_INGEST_REUSE_BLOCKER");
+        Self {
+            enabled: env!("CASS_SOURCE_INGEST_REUSE") == "true",
+            disabled_by: (!blocker.is_empty()).then(|| blocker.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_ingest_reuse_capability_tests {
+    use super::SourceIngestReuseCapability;
+
+    /// The compiled policy and its reason never disagree: reuse is on exactly
+    /// when build.rs found no unpinned package to blame, and the reason field
+    /// is always present so agents can branch on it.
+    #[test]
+    fn compiled_reuse_policy_names_a_blocker_exactly_when_disabled() {
+        let policy = SourceIngestReuseCapability::compiled();
+        assert_eq!(policy.enabled, policy.disabled_by.is_none(), "{policy:?}");
+        let json = serde_json::to_value(&policy).unwrap();
+        assert!(json.get("disabled_by").is_some(), "{json}");
+        assert_eq!(json["enabled"], policy.enabled);
+    }
+}
+
 /// Capabilities response for agent introspection.
 /// Provides static information about CLI features, versions, and limits.
 #[derive(Debug, Clone, Serialize)]
@@ -95198,6 +95237,9 @@ pub struct CapabilitiesResponse {
     /// Commit date (`YYYY-MM-DD`) of `build_commit`; `"unknown"` when built
     /// without git metadata.
     pub build_commit_date: String,
+    /// Whether this binary skips re-parsing sources it already ingested
+    /// completely (GH#426). Decided at build time.
+    pub source_ingest_reuse: SourceIngestReuseCapability,
     /// API contract version (bumped on breaking changes)
     pub api_version: u32,
     /// Human-readable contract identifier
@@ -96369,6 +96411,7 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
         build_commit_date: option_env!("CASS_BUILD_COMMIT_DATE")
             .unwrap_or("unknown")
             .to_string(),
+        source_ingest_reuse: SourceIngestReuseCapability::compiled(),
         api_version: 1,
         contract_version: CONTRACT_VERSION.to_string(),
         features: vec![
@@ -96445,6 +96488,10 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
             "Build commit: {} ({})",
             response.build_commit, response.build_commit_date
         );
+    }
+    match &response.source_ingest_reuse.disabled_by {
+        None => println!("Completed-source reuse: on"),
+        Some(blocker) => println!("Completed-source reuse: off ({blocker})"),
     }
     println!();
     println!("Features:");
@@ -101535,6 +101582,13 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "crate_version": { "type": "string" },
                 "build_commit": { "type": "string" },
                 "build_commit_date": { "type": "string" },
+                "source_ingest_reuse": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "disabled_by": { "type": ["string", "null"] }
+                    }
+                },
                 "api_version": { "type": "integer" },
                 "contract_version": { "type": "string" },
                 "features": { "type": "array", "items": { "type": "string" } },

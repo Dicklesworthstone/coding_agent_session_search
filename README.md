@@ -2847,6 +2847,7 @@ The global `last_scan_ts` and `last_indexed_at` watermarks live in the SQLite `m
 - **File-level filtering only**: When a file is modified, the entire file is re-scanned
 - **1-second mtime slack**: Accounts for filesystem timestamp granularity
 - **No per-message filtering**: Prevents data loss when new messages are appended
+- **Completed-source reuse is a build-time property**: a source that was fully ingested and has not changed is skipped, but only in builds whose `Cargo.lock` resolves every dependency from a registry or git source. A build with a local path dependency or `[patch]` reparses every source on every incremental run. `cass capabilities --json` reports which applies as `source_ingest_reuse.{enabled,disabled_by}` (GH #426). Release binaries have it on.
 
 ### Codex Token Backfill
 

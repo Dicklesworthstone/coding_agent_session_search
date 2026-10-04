@@ -415,20 +415,42 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
         .unwrap_or_else(|error| fatal(format!("cannot parse ingest dependency lock: {error}")));
     let crate_name = env::var("CARGO_PKG_NAME").unwrap_or_default();
     let crate_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let pinned_dependencies =
-        lock.get("package")
-            .and_then(Value::as_array)
-            .is_some_and(|packages| {
-                !packages.is_empty()
-                    && packages.iter().all(|package| {
-                        package.get("source").and_then(Value::as_str).is_some()
-                            || (package.get("name").and_then(Value::as_str)
-                                == Some(crate_name.as_str())
-                                && package.get("version").and_then(Value::as_str)
-                                    == Some(crate_version.as_str()))
-                    })
-            });
+    let packages = lock
+        .get("package")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // The first package that disables reuse, named so `cass capabilities` can
+    // tell an operator why (GH#426): a source build with a local path override
+    // reparses every source on every incremental run.
+    let reuse_blocker = if packages.is_empty() {
+        Some("Cargo.lock lists no packages".to_string())
+    } else {
+        packages
+            .iter()
+            .find(|package| {
+                package.get("source").and_then(Value::as_str).is_none()
+                    && !(package.get("name").and_then(Value::as_str) == Some(crate_name.as_str())
+                        && package.get("version").and_then(Value::as_str)
+                            == Some(crate_version.as_str()))
+            })
+            .map(|package| {
+                format!(
+                    "{} {} has no registry or git source (local path dependency or [patch])",
+                    package.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    package
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                )
+            })
+    };
+    let pinned_dependencies = reuse_blocker.is_none();
     println!("cargo:rustc-env=CASS_SOURCE_INGEST_REUSE={pinned_dependencies}");
+    println!(
+        "cargo:rustc-env=CASS_SOURCE_INGEST_REUSE_BLOCKER={}",
+        reuse_blocker.unwrap_or_default()
+    );
     let mut inputs = BTreeSet::from([
         PathBuf::from("Cargo.toml"),
         PathBuf::from("Cargo.lock"),
