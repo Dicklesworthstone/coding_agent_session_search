@@ -83,8 +83,9 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   retried after 1 minute, doubling to at most 1 hour. The warning repeats
   on the 1st, 2nd, 4th, 8th... deferral and names `FSQLITE_PAGE_BUFFER_MAX`.
   `cass quarantine list` shows deferred conversations, which are still
-  never quarantined. A clean later batch also no longer advances the watch
-  watermark past an earlier deferred one.
+  never quarantined. `cass status` and `cass health` report their count as
+  `ingest_quarantine.deferred_conversations`. A clean later batch also no
+  longer advances the watch watermark past an earlier deferred one.
 - **An interrupted expected-docs scan resumes (#381).** On a large archive
   the first noise-adjusted document count could outlive a caller's
   timeout, and the next run started over. The scan now saves its position
