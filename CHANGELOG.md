@@ -84,13 +84,33 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   on the 1st, 2nd, 4th, 8th... deferral and names `FSQLITE_PAGE_BUFFER_MAX`.
   `cass quarantine list` shows deferred conversations, which are still
   never quarantined. `cass status` and `cass health` report their count as
-  `ingest_quarantine.deferred_conversations`. A clean later batch also no
+  `ingest_quarantine.deferred_conversations` and name them in `warnings`;
+  human `cass status` prints the same warning. A clean later batch also no
   longer advances the watch watermark past an earlier deferred one.
+- **The quarantine warning no longer calls every quarantine irreducible.**
+  `status` and `health` said quarantined conversations followed an
+  "irreducible ingest OOM", but each entry carries retry eligibility and a
+  retry can help. The warning now points at `cass quarantine list --json`,
+  which says whether it can.
 - **An interrupted expected-docs scan resumes (#381).** On a large archive
   the first noise-adjusted document count could outlive a caller's
   timeout, and the next run started over. The scan now saves its position
   every few seconds and continues from it if the archive has only grown
-  since. It also reports activity to the stall watchdog.
+  since. It also reports activity to the stall watchdog. `cass status
+  --json` and `cass health --json` show the saved position under
+  `rebuild.expected_docs_scan`, and human `cass status` prints it as a
+  "Coverage scan" line, so a timeout-wrapped caller can see it advance.
+
+### Added
+
+- **Bookmark the selected result from the TUI.** `Alt+E`, or "Bookmark
+  selected result" in the command palette, saves the selected hit to the
+  store `cass bookmarks list` reads. Pressing it again on the same line
+  reports "Already bookmarked" instead of adding a duplicate.
+- **`cass capabilities` reports whether the binary reuses completed sources
+  (#426).** `source_ingest_reuse` gives `enabled` and, when it is off,
+  `disabled_by`: the first dependency without a registry or git source,
+  which is what turns completed-source reuse off at build time.
 
 ### Changed
 
@@ -99,6 +119,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `live-provider-unimplemented` and found nothing. They now share the live
   Git, Beads, RCH, Agent Mail and health collection that `swarm status`
   uses.
+- **The TUI's Swarm tab reads that live collection.** It used to show a
+  placeholder with every provider "not wired yet" and every count 0.
+  Entering the tab now starts one background read, `r` reads again, and a
+  count whose provider could not be read shows `?` instead of 0.
+- **frankensearch 0.7.1 / frankensearch-quill 0.4.0.** This is the first
+  main-branch quill release after the 0.3.4 hotfix, and it keeps that
+  hotfix's grammar, union and date-filter fixes. Snapshot segments are
+  verified concurrently on open, which shortens the per-search
+  verification #501 measured; every segment is still hashed. Snippets are
+  built only for returned hits. The CASS index schema is unchanged, so the
+  upgrade does not rebuild the lexical index.
 - **`cass sources doctor` checks sources.toml itself.** It now reports a
   missing `rsync`/`scp`, an interrupted setup and leftover
   `.sources.toml.tmp*` files as `config_validation`. Validation errors make
