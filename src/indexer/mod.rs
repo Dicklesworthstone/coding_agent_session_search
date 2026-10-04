@@ -10181,15 +10181,27 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 /// sparse-looking branch (observed already below the cheap raw upper bound), so
 /// the extra scan is paid lazily.
 fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
+    expected_live_lexical_doc_count_after(storage, 0, 0, |_, _| Ok(()))
+}
+
+/// The scan behind [`expected_live_lexical_doc_count`], over the live
+/// conversations with an id above `after_conversation_id` in id order, added to
+/// `expected_docs`. `after_conversation(id, docs)` runs once each conversation
+/// is counted; an error from it stops the scan.
+fn expected_live_lexical_doc_count_after(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    mut expected_docs: usize,
+    mut after_conversation: impl FnMut(i64, usize) -> Result<()>,
+) -> Result<usize> {
     let conversation_ids: Vec<i64> = storage
         .raw()
         .query_map_collect(
-            "SELECT id FROM conversations",
-            &[] as &[ParamValue],
+            "SELECT id FROM conversations WHERE id > ?1 ORDER BY id",
+            &[ParamValue::from(after_conversation_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
-    let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
         // Stream: a long conversation is classified message by message, never
         // held whole (bgn6s removed the per-conversation cap that bounded it).
@@ -10200,6 +10212,7 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
             }
             Ok(true)
         })?;
+        after_conversation(conversation_id, expected_docs)?;
     }
     Ok(expected_docs)
 }
@@ -10291,14 +10304,29 @@ fn expected_live_lexical_doc_count_delta(
     cached: &ExpectedLexicalDocsCache,
     current: &ExpectedLexicalDocsIdentity,
 ) -> Result<Option<usize>> {
-    let old = &cached.identity;
+    if !expected_lexical_docs_identity_is_pure_append(storage, &cached.identity, current)? {
+        return Ok(None);
+    }
+    let appended =
+        expected_appended_lexical_docs(storage, cached.identity.max_message_id, |_| true)?;
+    Ok(Some(cached.expected_docs.saturating_add(appended)))
+}
+
+/// Whether the archive changed from `old` to `current` only by appended rows:
+/// no conversation or message was deleted (both totals grew by exactly the
+/// rows beyond the old maxima) and the content cap is unchanged.
+fn expected_lexical_docs_identity_is_pure_append(
+    storage: &FrankenStorage,
+    old: &ExpectedLexicalDocsIdentity,
+    current: &ExpectedLexicalDocsIdentity,
+) -> Result<bool> {
     if old.content_cap_bytes != current.content_cap_bytes
         || current.max_message_id < old.max_message_id
         || current.max_conversation_id < old.max_conversation_id
         || current.total_conversations < old.total_conversations
         || current.total_messages < old.total_messages
     {
-        return Ok(None);
+        return Ok(false);
     }
     let new_conversations = count_exact(
         storage,
@@ -10310,11 +10338,19 @@ fn expected_live_lexical_doc_count_delta(
         "SELECT COUNT(*) FROM messages WHERE id > ?1",
         old.max_message_id,
     )?;
-    if old.total_conversations.checked_add(new_conversations) != Some(current.total_conversations)
-        || old.total_messages.checked_add(new_messages) != Some(current.total_messages)
-    {
-        return Ok(None);
-    }
+    Ok(
+        old.total_conversations.checked_add(new_conversations) == Some(current.total_conversations)
+            && old.total_messages.checked_add(new_messages) == Some(current.total_messages),
+    )
+}
+
+/// Expected docs among the messages with an id above `after_message_id` whose
+/// live conversation satisfies `include`.
+fn expected_appended_lexical_docs(
+    storage: &FrankenStorage,
+    after_message_id: i64,
+    include: impl Fn(i64) -> bool,
+) -> Result<usize> {
     // The per-message cap makes every message's classification independent of
     // every other, so only the rows appended since the memo need classifying:
     // a rowid-range scan over them, never a JOIN (fsqlite's join path used to
@@ -10324,7 +10360,7 @@ fn expected_live_lexical_doc_count_delta(
         .raw()
         .query_map_collect(
             "SELECT DISTINCT conversation_id FROM messages WHERE id > ?1",
-            &[ParamValue::from(old.max_message_id)],
+            &[ParamValue::from(after_message_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations touched since the expected lexical docs memo")?;
@@ -10332,7 +10368,7 @@ fn expected_live_lexical_doc_count_delta(
     // indexed): one point lookup per touched conversation, resolved before the
     // row stream so no query runs inside its callback.
     let mut live_conversations = HashSet::with_capacity(touched.len());
-    for conversation_id in touched {
+    for conversation_id in touched.into_iter().filter(|id| include(*id)) {
         let live: i64 = storage
             .raw()
             .query_row_map(
@@ -10345,9 +10381,9 @@ fn expected_live_lexical_doc_count_delta(
             live_conversations.insert(conversation_id);
         }
     }
-    let mut expected_docs = cached.expected_docs;
+    let mut expected_docs = 0usize;
     storage.for_each_lexical_rebuild_message_after_id(
-        old.max_message_id,
+        after_message_id,
         |conversation_id, message| {
             let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
             if live_conversations.contains(&conversation_id)
@@ -10361,7 +10397,154 @@ fn expected_live_lexical_doc_count_delta(
             Ok(())
         },
     )?;
-    Ok(Some(expected_docs))
+    Ok(expected_docs)
+}
+
+/// GH #381 (ntxs1): where an interrupted full expected-docs scan stopped. It
+/// sits beside the memo; a completed scan removes it.
+const EXPECTED_LEXICAL_DOCS_PARTIAL_FILE: &str = ".expected-lexical-docs.partial.json";
+/// How often a full scan saves its position: an interruption loses at most
+/// this much reading.
+const EXPECTED_LEXICAL_DOCS_PARTIAL_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExpectedLexicalDocsPartial {
+    schema_version: u32,
+    db_path: String,
+    /// The archive the cursor and count describe.
+    identity: ExpectedLexicalDocsIdentity,
+    /// Every live conversation with an id at or below this one is counted.
+    last_conversation_id: i64,
+    expected_docs: usize,
+}
+
+fn write_expected_lexical_docs_sidecar<T: serde::Serialize>(path: &Path, payload: &T) {
+    let Some(file_name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return;
+    };
+    let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    let written = serde_json::to_vec(payload)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| fs::write(&tmp_path, bytes))
+        .and_then(|()| fs::rename(&tmp_path, path));
+    if let Err(err) = written {
+        tracing::debug!(error = %err, path = %path.display(), "expected lexical docs sidecar write skipped");
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+/// The full expected-docs count, resumable (GH #381, ntxs1). The first full
+/// scan reads every message; on a 28 GB archive it outlived the caller's
+/// 900 s timeout, and an interrupted scan kept nothing, so the next run
+/// started over and never finished. The scan now saves its cursor and count
+/// at `partial_path` every few seconds. A later run continues from there:
+/// as-is when the archive is unchanged, or after counting the rows appended to
+/// already-counted conversations when the archive only grew. Any other change
+/// (a deletion, a cap change) starts over.
+fn expected_live_lexical_doc_count_resumable(
+    storage: &FrankenStorage,
+    partial_path: Option<&Path>,
+    db_path: &str,
+    current: &ExpectedLexicalDocsIdentity,
+    progress: Option<&IndexingProgress>,
+) -> Result<usize> {
+    expected_live_lexical_doc_count_resumable_with(
+        storage,
+        partial_path,
+        db_path,
+        current,
+        progress,
+        EXPECTED_LEXICAL_DOCS_PARTIAL_SAVE_INTERVAL,
+        |_| Ok(()),
+    )
+}
+
+fn expected_live_lexical_doc_count_resumable_with(
+    storage: &FrankenStorage,
+    partial_path: Option<&Path>,
+    db_path: &str,
+    current: &ExpectedLexicalDocsIdentity,
+    progress: Option<&IndexingProgress>,
+    save_interval: Duration,
+    mut on_conversation: impl FnMut(i64) -> Result<()>,
+) -> Result<usize> {
+    let saved = partial_path
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsPartial>(&raw).ok())
+        .filter(|partial| {
+            partial.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
+                && lexical_rebuild_db_paths_match(&partial.db_path, db_path)
+        });
+    let (resume_after, resume_docs) = match saved {
+        Some(partial) if partial.identity == *current => {
+            (partial.last_conversation_id, partial.expected_docs)
+        }
+        Some(partial)
+            if expected_lexical_docs_identity_is_pure_append(
+                storage,
+                &partial.identity,
+                current,
+            )? =>
+        {
+            // Conversations above the cursor are read whole below, appended
+            // rows included; rows appended to the ones already counted are not
+            // in the saved count yet.
+            let cursor = partial.last_conversation_id;
+            let appended = expected_appended_lexical_docs(
+                storage,
+                partial.identity.max_message_id,
+                |conversation_id| conversation_id <= cursor,
+            )?;
+            (cursor, partial.expected_docs.saturating_add(appended))
+        }
+        _ => (0, 0),
+    };
+    if resume_after > 0 {
+        tracing::info!(
+            resume_after_conversation_id = resume_after,
+            expected_docs_so_far = resume_docs,
+            "resuming the interrupted expected lexical docs scan (GH #381)"
+        );
+    }
+    let mut last_save = Instant::now();
+    let expected_docs = expected_live_lexical_doc_count_after(
+        storage,
+        resume_after,
+        resume_docs,
+        |conversation_id, expected_docs| {
+            if let Some(progress) = progress {
+                // The stall watchdog reads activity, not phase counters.
+                progress.tick_activity();
+            }
+            if let Some(path) = partial_path
+                && last_save.elapsed() >= save_interval
+            {
+                write_expected_lexical_docs_sidecar(
+                    path,
+                    &ExpectedLexicalDocsPartial {
+                        schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+                        db_path: db_path.to_string(),
+                        identity: current.clone(),
+                        last_conversation_id: conversation_id,
+                        expected_docs,
+                    },
+                );
+                tracing::info!(
+                    last_conversation_id = conversation_id,
+                    max_conversation_id = current.max_conversation_id,
+                    expected_docs_so_far = expected_docs,
+                    "expected lexical docs scan position saved (GH #381)"
+                );
+                last_save = Instant::now();
+            }
+            on_conversation(conversation_id)
+        },
+    )?;
+    if let Some(path) = partial_path {
+        // The memo the caller writes next supersedes the partial count.
+        let _ = fs::remove_file(path);
+    }
+    Ok(expected_docs)
 }
 
 /// [`expected_live_lexical_doc_count`] without re-reading the whole archive on
@@ -10378,9 +10561,14 @@ fn expected_live_lexical_doc_count_cached(
     index_path: &Path,
     db_path: &str,
     total_messages: usize,
+    progress: Option<&IndexingProgress>,
 ) -> Result<usize> {
     let current = expected_lexical_docs_identity(storage, total_messages)?;
-    let cache_path = expected_lexical_docs_cache_path(index_path);
+    let cache_path = expected_lexical_docs_cache_path(index_path)
+        .filter(|path| path.parent().is_some_and(Path::is_dir));
+    let partial_path = cache_path
+        .as_deref()
+        .map(|path| path.with_file_name(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE));
     let cached = cache_path
         .as_deref()
         .and_then(|path| fs::read(path).ok())
@@ -10389,6 +10577,15 @@ fn expected_live_lexical_doc_count_cached(
             cached.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
                 && lexical_rebuild_db_paths_match(&cached.db_path, db_path)
         });
+    let full_scan = || {
+        expected_live_lexical_doc_count_resumable(
+            storage,
+            partial_path.as_deref(),
+            db_path,
+            &current,
+            progress,
+        )
+    };
     let (expected_docs, delta_generations, source) = match cached {
         Some(cached) if cached.identity == current => {
             return Ok(cached.expected_docs);
@@ -10396,10 +10593,10 @@ fn expected_live_lexical_doc_count_cached(
         Some(cached) if cached.delta_generations < EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS => {
             match expected_live_lexical_doc_count_delta(storage, &cached, &current)? {
                 Some(expected) => (expected, cached.delta_generations + 1, "delta"),
-                None => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+                None => (full_scan()?, 0, "full"),
             }
         }
-        _ => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+        _ => (full_scan()?, 0, "full"),
     };
     tracing::debug!(
         expected_lexical_docs = expected_docs,
@@ -10407,26 +10604,17 @@ fn expected_live_lexical_doc_count_cached(
         delta_generations,
         "expected lexical doc count recomputed"
     );
-    if let Some(cache_path) = cache_path.filter(|path| path.parent().is_some_and(Path::is_dir)) {
-        let payload = ExpectedLexicalDocsCache {
-            schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
-            db_path: db_path.to_string(),
-            identity: current,
-            expected_docs,
-            delta_generations,
-        };
-        let tmp_path = cache_path.with_file_name(format!(
-            "{EXPECTED_LEXICAL_DOCS_CACHE_FILE}.{}.tmp",
-            std::process::id()
-        ));
-        let written = serde_json::to_vec(&payload)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| fs::write(&tmp_path, bytes))
-            .and_then(|()| fs::rename(&tmp_path, &cache_path));
-        if let Err(err) = written {
-            tracing::debug!(error = %err, "expected lexical docs cache write skipped");
-            let _ = fs::remove_file(&tmp_path);
-        }
+    if let Some(cache_path) = cache_path {
+        write_expected_lexical_docs_sidecar(
+            &cache_path,
+            &ExpectedLexicalDocsCache {
+                schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+                db_path: db_path.to_string(),
+                identity: current,
+                expected_docs,
+                delta_generations,
+            },
+        );
     }
     Ok(expected_docs)
 }
@@ -12451,6 +12639,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
             index_path,
             &db_state.db_path,
             total_messages,
+            None,
         )?
     };
     if observed_tantivy_docs != expected_docs {
@@ -17468,6 +17657,7 @@ fn run_index_inner(
                         &index_path,
                         &opts.db_path.to_string_lossy(),
                         canonical_messages,
+                        opts.progress.as_deref(),
                     )?
                 } else {
                     canonical_messages
@@ -55816,6 +56006,7 @@ mod tests {
                 &index_path,
                 &db,
                 count_total_messages_exact(&storage).unwrap(),
+                None,
             )
             .unwrap()
         };
@@ -55888,6 +56079,112 @@ mod tests {
         assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
     }
 
+    /// GH #381 (ntxs1): an interrupted full expected-docs scan resumes from its
+    /// saved cursor instead of starting over, and still lands on exactly the
+    /// full count: unchanged, after pure appends (rows appended to an
+    /// already-counted conversation are added; conversations above the cursor
+    /// are read whole), and never after a deletion, which restarts the scan.
+    #[test]
+    fn gh381_interrupted_expected_docs_scan_resumes_exactly() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("gh381-resume.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        let db = db_path.to_string_lossy().into_owned();
+        let partial_path = dir.path().join(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+        let ids: Vec<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT id FROM conversations ORDER BY id",
+                &[] as &[ParamValue],
+                |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 2, "the fixture seeds two conversations");
+        let (first, second) = (ids[0], ids[1]);
+        let insert = |conversation_id: i64, idx: i64, role: &str, content: &str| {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, ?3, ?4)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(idx),
+                        ParamValue::from(role.to_string()),
+                        ParamValue::from(content.to_string()),
+                    ],
+                )
+                .unwrap();
+        };
+        let current = || {
+            expected_lexical_docs_identity(&storage, count_total_messages_exact(&storage).unwrap())
+                .unwrap()
+        };
+        let full = || expected_live_lexical_doc_count(&storage).unwrap();
+        // Interrupt right after the first conversation, as a watchdog kill
+        // would; the position was saved first (interval zero).
+        let interrupted_scan = || {
+            let result = expected_live_lexical_doc_count_resumable_with(
+                &storage,
+                Some(&partial_path),
+                &db,
+                &current(),
+                None,
+                Duration::ZERO,
+                |_| Err(anyhow::anyhow!("interrupted")),
+            );
+            assert!(result.is_err());
+            let partial: ExpectedLexicalDocsPartial =
+                serde_json::from_slice(&fs::read(&partial_path).unwrap()).unwrap();
+            assert_eq!(partial.last_conversation_id, first);
+        };
+        let finishing_scan = || {
+            let mut visited = Vec::new();
+            let count = expected_live_lexical_doc_count_resumable_with(
+                &storage,
+                Some(&partial_path),
+                &db,
+                &current(),
+                None,
+                Duration::ZERO,
+                |conversation_id| {
+                    visited.push(conversation_id);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(
+                !partial_path.exists(),
+                "a completed scan removes its partial"
+            );
+            (count, visited)
+        };
+        insert(first, 50, "user", "   ");
+
+        // Unchanged archive: only the conversation after the cursor is read.
+        interrupted_scan();
+        assert_eq!(finishing_scan(), (full(), vec![second]));
+
+        // Pure appends after the interruption: below the cursor (one indexed,
+        // one noise) and above it. The resumed count still matches a full scan.
+        interrupted_scan();
+        insert(first, 60, "assistant", "appended below the cursor");
+        insert(first, 61, "tool", "");
+        insert(second, 60, "assistant", "appended above the cursor");
+        assert_eq!(finishing_scan(), (full(), vec![second]));
+
+        // A deletion below the cursor invalidates the partial: start over.
+        interrupted_scan();
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND idx = 60",
+                &[ParamValue::from(first)],
+            )
+            .unwrap();
+        assert_eq!(finishing_scan(), (full(), vec![first, second]));
+    }
+
     /// GH #381: the expected-docs memo describes the canonical database, so a
     /// lexical publish (which exchanges the generation directory) must not
     /// discard it. Otherwise the first run after every rebuild re-reads every
@@ -55914,6 +56211,7 @@ mod tests {
                 &index_path,
                 &db,
                 count_total_messages_exact(&storage).unwrap(),
+                None,
             )
             .unwrap()
         };
