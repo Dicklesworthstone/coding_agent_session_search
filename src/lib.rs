@@ -97506,6 +97506,7 @@ fn response_schema_ingest_quarantine() -> serde_json::Value {
             "schema_version": { "type": "integer" },
             "status": { "type": "string" },
             "quarantined_conversations": { "type": "integer" },
+            "deferred_conversations": { "type": "integer" },
             "recent_quarantined_conversations": { "type": "integer" },
             "recent_window_seconds": { "type": "integer" },
             "circuit_breaker_limit": { "type": "integer" },

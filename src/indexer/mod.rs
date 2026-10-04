@@ -29131,6 +29131,9 @@ pub struct ConversationIngestQuarantineSummary {
     pub schema_version: i64,
     pub status: String,
     pub quarantined_conversations: usize,
+    /// Conversations the watcher keeps deferring after a bounded-guard NoMem
+    /// (GH#510): never quarantined, but missing from search until one ingests.
+    pub deferred_conversations: usize,
     pub recent_quarantined_conversations: usize,
     pub recent_window_seconds: i64,
     pub circuit_breaker_limit: usize,
@@ -29237,6 +29240,9 @@ pub fn conversation_ingest_quarantine_summary(
     let recent_quarantined_conversations = recent_keys.len();
     let circuit_breaker_active =
         circuit_breaker_limit > 0 && recent_quarantined_conversations >= circuit_breaker_limit;
+    // GH#510: deferred conversations are counted but leave `status` alone;
+    // they are retried on a backoff and are not a quarantine.
+    let deferred_conversations = WatchNomemDeferrals::load(data_dir).entries.len();
     ConversationIngestQuarantineSummary {
         schema_version: POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
         status: if circuit_breaker_active {
@@ -29247,6 +29253,7 @@ pub fn conversation_ingest_quarantine_summary(
             "ok".to_string()
         },
         quarantined_conversations,
+        deferred_conversations,
         recent_quarantined_conversations,
         recent_window_seconds,
         circuit_breaker_limit,
@@ -29258,10 +29265,16 @@ pub fn conversation_ingest_quarantine_summary(
                 "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
                     .to_string(),
             )
-        } else {
-            (quarantined_conversations > 0).then(|| {
+        } else if quarantined_conversations > 0 {
+            Some(
                 "Run `cass quarantine list --json` to see which conversations are excluded and whether `cass quarantine retry` can re-ingest them."
-                    .to_string()
+                    .to_string(),
+            )
+        } else {
+            (deferred_conversations > 0).then(|| {
+                format!(
+                    "{deferred_conversations} conversation(s) are deferred by the watcher after repeated bounded-allocation NoMem and are missing from search until they ingest; `cass quarantine list --json` lists them. An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger."
+                )
             })
         },
     }
@@ -62806,6 +62819,74 @@ mod tests {
         assert!(
             load_watch_state(&data_dir).contains_key(&ConnectorKind::Amp),
             "the watermark advances once the deferred conversation ingests"
+        );
+    }
+
+    /// GH#510: status/health surface watcher deferrals through the ingest
+    /// quarantine summary without calling them a quarantine.
+    #[test]
+    #[serial]
+    fn ingest_quarantine_summary_counts_watch_nomem_deferrals() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("deferral-summary");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let deferral = |source: &str| WatchNomemDeferral {
+            agent: "amp".to_string(),
+            source_path: source.to_string(),
+            external_id: None,
+            deferrals: 3,
+            first_deferred_at_ms: 1_700_000_000_000,
+            last_deferred_at_ms: 1_700_000_100_000,
+            next_retry_at_ms: 1_700_000_340_000,
+            indexed_text_bytes: 525,
+        };
+        let empty = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(empty.deferred_conversations, 0);
+        assert!(empty.recommended_action.is_none());
+
+        let mut ledger = WatchNomemDeferrals::default();
+        ledger
+            .entries
+            .insert("a".to_string(), deferral("/logs/a.json"));
+        ledger
+            .entries
+            .insert("b".to_string(), deferral("/logs/b.json"));
+        ledger.save(&data_dir);
+        let deferred = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(deferred.deferred_conversations, 2);
+        assert_eq!(deferred.quarantined_conversations, 0);
+        assert_eq!(deferred.status, "ok", "a deferral is not a quarantine");
+        let action = deferred
+            .recommended_action
+            .expect("deferrals get an action");
+        assert!(
+            action.starts_with("2 conversation(s) are deferred"),
+            "{action}"
+        );
+        assert!(action.contains("cass quarantine list --json"), "{action}");
+
+        // A real quarantine keeps its own action; the deferral count stays.
+        let mut state = crate::indexer::quarantine::QuarantineState::default();
+        state.entries.insert(
+            "conv-q::v1".to_string(),
+            crate::indexer::quarantine::QuarantineRecord {
+                first_attempt_at: chrono::Utc::now(),
+                last_attempt_at: chrono::Utc::now(),
+                attempt_count: 1,
+                last_reason: "ingest_oom".to_string(),
+                cass_version_at_quarantine: None,
+            },
+        );
+        state.save(&data_dir).unwrap();
+        let both = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(both.deferred_conversations, 2);
+        assert_eq!(both.status, "degraded");
+        assert!(
+            both.recommended_action
+                .as_deref()
+                .is_some_and(|action| action.starts_with("Run `cass quarantine list --json`")),
+            "{:?}",
+            both.recommended_action
         );
     }
 

@@ -638,6 +638,9 @@
         "quarantined_conversations": {
           "type": "integer"
         },
+        "deferred_conversations": {
+          "type": "integer"
+        },
         "recent_quarantined_conversations": {
           "type": "integer"
         },
@@ -1396,6 +1399,9 @@
               "type": "string"
             },
             "quarantined_conversations": {
+              "type": "integer"
+            },
+            "deferred_conversations": {
               "type": "integer"
             },
             "recent_quarantined_conversations": {
