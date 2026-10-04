@@ -85032,6 +85032,15 @@ fn probe_daemon_runtime_for_diagnostics(
     }
 }
 
+/// The status/health warning for conversations the watcher keeps deferring
+/// after a bounded-guard NoMem (GH#510). They are not quarantined, but they are
+/// missing from search until one ingests.
+fn watch_nomem_deferral_warning(deferred_conversations: u64) -> String {
+    format!(
+        "{deferred_conversations} conversation(s) are deferred by the watcher after repeated bounded-allocation NoMem and are missing from search until they ingest; `cass quarantine list --json` lists them"
+    )
+}
+
 fn run_status(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -85205,8 +85214,16 @@ fn run_status(
         ));
     } else if quarantined_conversations > 0 {
         warnings.push(format!(
-            "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; search remains usable for the rest of the archive"
+            "{quarantined_conversations} conversation(s) are excluded from search after ingest quarantine; search remains usable for the rest of the archive, and `cass quarantine list --json` names them and says whether a retry can help"
         ));
+    }
+    let deferred_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("deferred_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if deferred_conversations > 0 {
+        warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
@@ -85305,7 +85322,7 @@ fn run_status(
         Some(format!(
             "Run 'cass index' to refresh the index{pending_msg}"
         ))
-    } else if quarantined_conversations > 0 {
+    } else if quarantined_conversations > 0 || deferred_conversations > 0 {
         ingest_quarantine_recommended_action
     } else {
         semantic_recommended_action(&state, not_initialized)
@@ -85614,6 +85631,13 @@ fn run_status(
         println!();
         println!(
             "Warning: {quarantined_conversations} conversation(s) quarantined after ingest OOM"
+        );
+    }
+    if deferred_conversations > 0 {
+        println!();
+        println!(
+            "Warning: {}",
+            watch_nomem_deferral_warning(deferred_conversations)
         );
     }
 
@@ -86623,8 +86647,16 @@ fn run_health(
         ));
     } else if quarantined_conversations > 0 {
         warnings.push(format!(
-            "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; lexical search remains usable for non-quarantined sessions"
+            "{quarantined_conversations} conversation(s) are excluded from search after ingest quarantine; lexical search remains usable for the rest, and `cass quarantine list --json` names them and says whether a retry can help"
         ));
+    }
+    let deferred_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("deferred_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if deferred_conversations > 0 {
+        warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
 
     let db_degraded = db_exists && !db_opened;
@@ -86664,7 +86696,9 @@ fn run_health(
         // GH #457: mirror run_status — name the repair, not the generic
         // stale advice, so the operator knows why the run will rebuild.
         Some(HOLLOW_INDEX_RECOMMENDED_ACTION.to_string())
-    } else if ingest_quarantine_critical || (healthy && quarantined_conversations > 0) {
+    } else if ingest_quarantine_critical
+        || (healthy && (quarantined_conversations > 0 || deferred_conversations > 0))
+    {
         ingest_quarantine_recommended_action
     } else if !healthy {
         Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
