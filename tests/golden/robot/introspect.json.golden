@@ -1128,7 +1128,7 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. `cass models status --json` lists them",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -1146,7 +1146,7 @@
         },
         {
           "name": "reranker",
-          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "description": "Reranker model to use (requires --rerank). Defaults to `ms-marco`, the only registered reranker",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -29352,6 +29352,9 @@
             "quarantined_conversations": {
               "type": "integer"
             },
+            "deferred_conversations": {
+              "type": "integer"
+            },
             "recent_quarantined_conversations": {
               "type": "integer"
             },
@@ -30161,6 +30164,9 @@
                   "type": "string"
                 },
                 "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "deferred_conversations": {
                   "type": "integer"
                 },
                 "recent_quarantined_conversations": {
@@ -32957,6 +32963,9 @@
                     "quarantined_conversations": {
                       "type": "integer"
                     },
+                    "deferred_conversations": {
+                      "type": "integer"
+                    },
                     "recent_quarantined_conversations": {
                       "type": "integer"
                     },
@@ -34341,6 +34350,9 @@
               "type": "string"
             },
             "quarantined_conversations": {
+              "type": "integer"
+            },
+            "deferred_conversations": {
               "type": "integer"
             },
             "recent_quarantined_conversations": {
@@ -36440,6 +36452,9 @@
               "type": "string"
             },
             "quarantined_conversations": {
+              "type": "integer"
+            },
+            "deferred_conversations": {
               "type": "integer"
             },
             "recent_quarantined_conversations": {
@@ -38558,6 +38573,9 @@
                   "type": "string"
                 },
                 "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "deferred_conversations": {
                   "type": "integer"
                 },
                 "recent_quarantined_conversations": {

@@ -129,7 +129,7 @@ jobs:
           [dependencies]
           anyhow = "=1.0.102"
           tracing = "=0.1.44"
-          frankensqlite = { package = "fsqlite", version = "=0.4.6", features = ["fts5", "async-api"] }
+          frankensqlite = { package = "fsqlite", version = "=0.4.9", features = ["fts5", "async-api"] }
           [profile.test]
           debug = 0
           [profile.test.package."*"]
@@ -154,7 +154,7 @@ jobs:
           # Seed the harness resolution with the CASS lockfile. fsqlite's crates
           # require each other with caret ranges, so a fresh resolution takes
           # the newest published members under the exact facade pin (a mixed
-          # 0.4.6/0.4.7 engine since 0.4.7's publication). `update --workspace`
+          # engine whenever a newer family is published). `update --workspace`
           # keeps every locked version and only adds or prunes what the
           # harness needs. A mixed engine is refused.
           cp "$GITHUB_WORKSPACE/Cargo.lock" Cargo.lock

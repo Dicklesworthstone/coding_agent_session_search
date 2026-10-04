@@ -113,6 +113,8 @@ jobs:
             gh494_missing_staged_eof_cannot_certify_same_count_prior_live_content \
             gh494_missing_staged_pending_commit_cannot_be_promoted_by_prior_live \
             gh494_legacy_cursor_without_its_generation_replays_instead_of_guessing \
+            gh494_eof_resume_with_a_surplus_rebuilds_instead_of_repeating_the_count_refusal \
+            gh494_eof_resume_with_a_matching_count_publishes_its_candidate \
             gh494_explicit_live_resume_ignores_unrelated_scratch_generation \
             gh494_bound_staged_reconciliation_refuses_missing_content_without_mutation \
             gh494_refused_rebuild_preserves_and_bootstraps_prior_publication_authority \

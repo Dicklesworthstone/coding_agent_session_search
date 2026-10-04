@@ -628,7 +628,7 @@ pub enum Commands {
         // ==========================================================================
         /// Embedding model to use for semantic search.
         /// Available models depend on what's been downloaded.
-        /// Use `cass models --list` to see available options.
+        /// `cass models status --json` lists them.
         #[arg(long)]
         model: Option<String>,
 
@@ -638,7 +638,7 @@ pub enum Commands {
         rerank: bool,
 
         /// Reranker model to use (requires --rerank).
-        /// Use `cass models --list` to see available options.
+        /// Defaults to `ms-marco`, the only registered reranker.
         #[arg(long)]
         reranker: Option<String>,
 
@@ -1190,8 +1190,9 @@ pub enum Commands {
         robot_triage: bool,
 
         /// Show what `--fix` would change vs the current state. Read-only.
-        /// Optional `<REF>` compares against a prior run-id instead.
-        #[arg(long, hide = true)]
+        /// Optional `<REF>` compares against a prior run-id instead; with no
+        /// value it compares the current state, as robot-docs documents.
+        #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "current")]
         diff: Option<String>,
 
         /// Quarantine doctor runs older than `<ISO8601>`. Renames into
@@ -5271,6 +5272,44 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
     ));
 }
 
+/// `cass robot-docs doctor` documents the doctor run-history surface as verbs
+/// (`cass doctor ls`, `undo <run-id>`, `diff [<ref>]`, `gc --before <ts>`,
+/// `capabilities`), but `doctor` takes them as flags, so every documented
+/// spelling failed with "unexpected argument". Map `rest[1]` onto its flag and
+/// return the correction note, or `None` when `rest[1]` is not such a verb.
+/// `gc` without `--before` becomes a bare `--gc-before`, so clap reports the
+/// missing value instead of running a plain doctor check.
+fn rewrite_doctor_history_verb(rest: &mut Vec<String>) -> Option<String> {
+    let verb = rest.get(1)?.to_ascii_lowercase();
+    let flag = match verb.as_str() {
+        "ls" => "--ls",
+        "undo" => "--undo",
+        "diff" => "--diff",
+        "explain" => "--explain",
+        "watch" => "--watch",
+        "capabilities" => "--emit-capabilities",
+        "gc" => {
+            rest.remove(1);
+            if let Some(before) = rest.iter_mut().find(|arg| *arg == "--before") {
+                *before = "--gc-before".to_string();
+            } else if let Some(before) = rest.iter_mut().find(|arg| arg.starts_with("--before=")) {
+                *before = before.replacen("--before=", "--gc-before=", 1);
+            } else {
+                rest.insert(1, "--gc-before".to_string());
+            }
+            return Some(
+                "'doctor gc --before <ts>' → 'doctor --gc-before <ts>' (doctor run-history GC)"
+                    .to_string(),
+            );
+        }
+        _ => return None,
+    };
+    rest[1] = flag.to_string();
+    Some(format!(
+        "'doctor {verb}' → 'doctor {flag}' (doctor run-history surface)"
+    ))
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -5300,6 +5339,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 22. **Current-session shorthand**: `current --json` → `sessions --current --json`
 /// 23. **Structured help recovery**: `help search --json` → `robot-docs commands`
 /// 24. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 25. **Doctor run-history verbs**: `doctor ls|undo|diff|gc --before|capabilities` → flags
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -6003,6 +6043,13 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             "'doctor archive-normalize' → 'doctor --archive-normalize' (fingerprinted additive archive metadata normalization)"
                 .into(),
         );
+    }
+    if rest
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
+        && let Some(correction) = rewrite_doctor_history_verb(&mut rest)
+    {
+        corrections.push(correction);
     }
     if rest
         .first()
@@ -6810,6 +6857,78 @@ mod canonical_top_level_command_tests {
             assert_eq!(query, "privacyneedle");
             assert_eq!(include_skill_content, expected);
         }
+    }
+
+    /// `cass robot-docs doctor` documents the run-history surface as verbs;
+    /// every spelling it shows must parse to the matching doctor flag, the
+    /// flag spellings must keep working, and a malformed or unknown verb must
+    /// still be a usage error rather than a plain doctor run.
+    #[test]
+    fn doctor_history_verbs_parse_as_robot_docs_document_them() {
+        let doctor = |args: &[&str]| {
+            let (normalized, _) = normalize_args(args.iter().map(ToString::to_string).collect());
+            Cli::try_parse_from(normalized)
+                .ok()
+                .and_then(|cli| cli.command)
+        };
+        assert!(matches!(
+            doctor(&["cass", "doctor", "ls", "--json"]),
+            Some(Commands::Doctor { ls: true, .. })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "undo", "latest", "--json"]),
+            Some(Commands::Doctor { undo: Some(id), .. }) if id == "latest"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "diff", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "current"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "diff", "run-a..run-b", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "run-a..run-b"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "gc", "--before", "2026-01-01T00:00:00Z", "--yes", "--json"]),
+            Some(Commands::Doctor { gc_before: Some(before), yes: true, .. })
+                if before == "2026-01-01T00:00:00Z"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "gc", "--before=2026-01-01T00:00:00Z", "--yes"]),
+            Some(Commands::Doctor { gc_before: Some(before), yes: true, .. })
+                if before == "2026-01-01T00:00:00Z"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "capabilities", "--json"]),
+            Some(Commands::Doctor {
+                emit_capabilities: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "explain", "latest", "--json"]),
+            Some(Commands::Doctor { explain: Some(id), .. }) if id == "latest"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "watch", "--watch-iterations", "1"]),
+            Some(Commands::Doctor {
+                watch: true,
+                watch_iterations: 1,
+                ..
+            })
+        ));
+        // The flag spellings keep working.
+        assert!(matches!(
+            doctor(&["cass", "doctor", "--ls", "--json"]),
+            Some(Commands::Doctor { ls: true, .. })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "--diff", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "current"
+        ));
+        // `gc` without `--before` must not become a plain doctor run.
+        assert!(doctor(&["cass", "doctor", "gc", "--yes", "--json"]).is_none());
+        // An unknown verb is still a usage error.
+        assert!(doctor(&["cass", "doctor", "frobnicate", "--json"]).is_none());
     }
 
     /// Behavioral pin for the #367 repro: the robot flag must not turn a
@@ -9432,12 +9551,15 @@ fn run_quarantine_retry_command(
     Ok(())
 }
 
-/// Build the deterministic per-entry JSON view used by both `list` and the
-/// `clear` plan. Each entry reports its conversation_id, schema version,
-/// attempt count, last reason, the wall-clock timestamps, and whether it is
-/// retry-eligible under the current binary (version-stale/legacy).
-fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+/// Build the deterministic `cass quarantine list` rows: the structured state
+/// merged with the poison ledgers. Each entry reports its conversation_id,
+/// schema version, attempt count, last reason, the wall-clock timestamps, and
+/// whether it is retry-eligible under the current binary (version-stale/legacy).
+fn quarantine_list_entries(
+    data_dir: &Path,
+) -> anyhow::Result<Vec<crate::search::quarantine_status::QuarantineListEntry>> {
     use crate::indexer::quarantine::QuarantineState;
+    use crate::search::quarantine_status::QuarantineListEntry;
     let state = QuarantineState::load_for_operator(data_dir)
         .map_err(|error| anyhow::anyhow!("loading quarantine state for operator list: {error}"))?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -9445,16 +9567,16 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
         .iter()
         .map(|(key, record)| {
             let identity = (key.conversation_id.clone(), i64::from(key.schema_version));
-            let entry = serde_json::json!({
-                "conversation_id": key.conversation_id,
-                "schema_version": key.schema_version,
-                "attempt_count": record.attempt_count,
-                "last_reason": record.last_reason,
-                "first_attempt_at": record.first_attempt_at.to_rfc3339(),
-                "last_attempt_at": record.last_attempt_at.to_rfc3339(),
-                "cass_version_at_quarantine": record.cass_version_at_quarantine,
-                "retry_eligible": record.is_version_stale_for_retry(current_version),
-            });
+            let entry = QuarantineListEntry {
+                conversation_id: key.conversation_id,
+                schema_version: i64::from(key.schema_version),
+                attempt_count: record.attempt_count,
+                last_reason: record.last_reason.clone(),
+                first_attempt_at: Some(record.first_attempt_at.to_rfc3339()),
+                last_attempt_at: Some(record.last_attempt_at.to_rfc3339()),
+                cass_version_at_quarantine: record.cass_version_at_quarantine.clone(),
+                retry_eligible: record.is_version_stale_for_retry(current_version),
+            };
             (identity, entry)
         })
         .collect::<BTreeMap<_, _>>();
@@ -9488,19 +9610,20 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(1);
         let retry_eligible = cass_version != Some(current_version);
-        let poison_entry = serde_json::json!({
-            "conversation_id": identity.0.clone(),
-            "schema_version": identity.1,
-            "attempt_count": attempt_count,
-            "last_reason": record
+        let poison_entry = QuarantineListEntry {
+            conversation_id: identity.0.clone(),
+            schema_version: identity.1,
+            attempt_count,
+            last_reason: record
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("ingest-out-of-memory"),
-            "first_attempt_at": first_attempt_at,
-            "last_attempt_at": last_attempt_at,
-            "cass_version_at_quarantine": cass_version,
-            "retry_eligible": retry_eligible,
-        });
+                .unwrap_or("ingest-out-of-memory")
+                .to_string(),
+            first_attempt_at,
+            last_attempt_at,
+            cass_version_at_quarantine: cass_version.map(str::to_string),
+            retry_eligible,
+        };
 
         match entries.entry(identity) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -9508,19 +9631,13 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let existing = entry.get_mut();
-                let existing_attempt_count = existing
-                    .get("attempt_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                if attempt_count > existing_attempt_count {
-                    existing["attempt_count"] = serde_json::json!(attempt_count);
-                }
+                existing.attempt_count = existing.attempt_count.max(attempt_count);
                 if !retry_eligible {
                     // Cross-surface saves are best-effort. If either surface
                     // records a retry under this binary, do not falsely offer
                     // the key as retry-eligible because the other is stale.
-                    existing["cass_version_at_quarantine"] = serde_json::json!(current_version);
-                    existing["retry_eligible"] = serde_json::json!(false);
+                    existing.cass_version_at_quarantine = Some(current_version.to_string());
+                    existing.retry_eligible = false;
                 }
             }
         }
@@ -9534,7 +9651,7 @@ fn run_quarantine_list(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let entries = quarantine_entries_json(&data_dir).map_err(|err| CliError {
+    let entries = quarantine_list_entries(&data_dir).map_err(|err| CliError {
         code: 9,
         kind: "quarantine",
         message: format!("quarantine list failed: {err:#}"),
@@ -9542,6 +9659,18 @@ fn run_quarantine_list(
         retryable: false,
     })?;
     let summary = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
+    let status = crate::search::quarantine_status::quarantine_status(
+        &entries,
+        env!("CARGO_PKG_VERSION"),
+        &crate::indexer::quarantine_source_missing_ids(&data_dir),
+    );
+    // GH#510: conversations the watcher keeps deferring after a bounded-guard
+    // NoMem are not quarantined, but they are missing from search until one
+    // ingests.
+    let deferred: Vec<_> = crate::indexer::WatchNomemDeferrals::load(&data_dir)
+        .entries
+        .into_values()
+        .collect();
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -9557,7 +9686,9 @@ fn run_quarantine_list(
             "quarantined_conversations": entries.len(),
             "circuit_breaker_active": summary.circuit_breaker_active,
             "recommended_action": summary.recommended_action,
+            "status": status,
             "entries": entries,
+            "deferred": deferred,
         });
         return output_structured_value(payload, fmt);
     }
@@ -9565,6 +9696,22 @@ fn run_quarantine_list(
     println!("CASS Conversation Quarantine");
     println!("============================");
     println!();
+    if !deferred.is_empty() {
+        println!(
+            "Deferred by the watcher after repeated NoMem (not quarantined): {}",
+            deferred.len()
+        );
+        for entry in &deferred {
+            println!(
+                "  {} ({}, deferrals={})",
+                entry.source_path, entry.agent, entry.deferrals
+            );
+        }
+        println!(
+            "  An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger."
+        );
+        println!();
+    }
     if entries.is_empty() {
         println!("No quarantined conversations.");
         return Ok(());
@@ -9573,30 +9720,21 @@ fn run_quarantine_list(
     if summary.circuit_breaker_active {
         println!("Circuit breaker: ACTIVE (a recent burst of quarantines tripped the breaker)");
     }
+    println!("{}", status.eligibility_reason);
+    for (cause, count) in &status.by_cause {
+        println!("  {count:>6}  {cause}");
+    }
     println!();
     for entry in &entries {
         println!(
             "  {} (schema v{}, attempts={}, retry_eligible={})",
-            entry
-                .get("conversation_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<unknown>"),
-            entry
-                .get("schema_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("attempt_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("retry_eligible")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            entry.conversation_id, entry.schema_version, entry.attempt_count, entry.retry_eligible,
         );
-        if let Some(reason) = entry.get("last_reason").and_then(|v| v.as_str()) {
-            println!("      reason: {reason}");
-        }
+        println!("      reason: {}", entry.last_reason);
+    }
+    if let Some(next) = &status.next_safe_command {
+        println!();
+        println!("Next: {next}");
     }
     Ok(())
 }
@@ -11468,7 +11606,7 @@ fn run_swarm_lint(
         let collection = set.collect_required();
         render_swarm_lint_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_lint_live_partial(bead)
+        render_swarm_lint_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11525,7 +11663,7 @@ fn run_swarm_evidence(
         let collection = set.collect_required();
         render_swarm_evidence_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_evidence_live_partial(bead)
+        render_swarm_evidence_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11581,7 +11719,7 @@ fn run_swarm_proof_debt(
         let collection = set.collect_required();
         render_swarm_proof_debt_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_proof_debt_live_partial(bead)
+        render_swarm_proof_debt_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11643,7 +11781,7 @@ fn run_swarm_failure_patterns(
             bead,
         )
     } else {
-        render_swarm_failure_patterns_live_partial(bead)
+        render_swarm_failure_patterns_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -12298,19 +12436,20 @@ pub fn render_swarm_status_live_partial() -> serde_json::Value {
     )
 }
 
-/// CLI-only collection; the TUI's initial model must remain allocation-only.
-fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
+/// The bounded live provider collection every `swarm` read surface shares:
+/// the current repository's git and Beads state, Agent Mail metadata,
+/// process pressure, proof evidence and passive CASS health. CLI-only; the
+/// TUI's initial model must remain allocation-only.
+fn collect_swarm_sources_live(cli: &Cli) -> crate::swarm_status::SwarmSourceCollection {
     use crate::swarm_status::{
-        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmProviderName, SwarmProviderStatus,
-        SwarmSourceCollection, SwarmSourceSnapshot,
+        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
     };
-    let started = std::time::Instant::now();
     let data_dir = resolve_data_dir(&None, cli.db.as_ref());
     let db_path = cli
         .db
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let collection = match std::env::current_dir() {
+    match std::env::current_dir() {
         Ok(repo) => {
             crate::swarm_status::collect_live_swarm_sources(&repo, Some((&data_dir, &db_path)))
         }
@@ -12328,7 +12467,13 @@ fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
                 })
                 .collect(),
         },
-    };
+    }
+}
+
+fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
+    use crate::swarm_status::{SwarmProviderName, SwarmProviderStatus};
+    let started = std::time::Instant::now();
+    let collection = collect_swarm_sources_live(cli);
     let mut payload = render_swarm_status_payload(
         "live",
         "Bounded live source collection",
@@ -12502,29 +12647,9 @@ fn render_swarm_work_packet_fixture(
     render_swarm_work_packet_from_status(&status, bead_filter)
 }
 
-fn render_swarm_lint_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    use crate::swarm_status::{REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection};
-
-    let collection = SwarmSourceCollection {
-        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-            .iter()
-            .copied()
-            .map(swarm_lint_live_unavailable_snapshot)
-            .collect(),
-    };
-
+fn render_swarm_lint_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    let collection = collect_swarm_sources_live(cli);
     render_swarm_lint_payload("live", &collection, None, bead_filter, true)
-}
-
-fn swarm_lint_live_unavailable_snapshot(
-    provider: crate::swarm_status::SwarmProviderName,
-) -> crate::swarm_status::SwarmSourceSnapshot {
-    crate::swarm_status::SwarmSourceSnapshot::unavailable(
-        provider,
-        format!("live:{}", provider.fixture_key()),
-        "live-provider-unimplemented",
-        format!("live provider {provider} is not wired yet; fixture-backed lint is available"),
-    )
 }
 
 fn render_swarm_lint_fixture(
@@ -12542,31 +12667,11 @@ fn render_swarm_lint_fixture(
     )
 }
 
-fn render_swarm_evidence_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    use crate::swarm_status::{
-        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
-    };
-
-    let collection = SwarmSourceCollection {
-        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-            .iter()
-            .copied()
-            .map(|provider| {
-                SwarmSourceSnapshot::unavailable(
-                    provider,
-                    format!("live:{}", provider.fixture_key()),
-                    "live-provider-unimplemented",
-                    format!(
-                        "live provider {provider} is not wired yet; fixture-backed evidence is available"
-                    ),
-                )
-            })
-            .collect(),
-    };
-
+fn render_swarm_evidence_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    let collection = collect_swarm_sources_live(cli);
     render_swarm_evidence_payload(
         "live",
-        "Live swarm evidence with unavailable providers",
+        "Bounded live source collection",
         &collection,
         None,
         bead_filter,
@@ -12590,8 +12695,8 @@ fn render_swarm_evidence_fixture(
     )
 }
 
-fn render_swarm_proof_debt_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(bead_filter))
+fn render_swarm_proof_debt_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(cli, bead_filter))
 }
 
 fn render_swarm_proof_debt_fixture(
@@ -12611,8 +12716,11 @@ fn render_swarm_proof_debt_fixture(
     render_swarm_proof_debt_from_evidence(evidence)
 }
 
-fn render_swarm_failure_patterns_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    let evidence = render_swarm_evidence_live_partial(bead_filter);
+fn render_swarm_failure_patterns_live_partial(
+    cli: &Cli,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let evidence = render_swarm_evidence_live_partial(cli, bead_filter);
     render_swarm_failure_patterns_from_evidence(evidence, Vec::new())
 }
 
@@ -97398,6 +97506,7 @@ fn response_schema_ingest_quarantine() -> serde_json::Value {
             "schema_version": { "type": "integer" },
             "status": { "type": "string" },
             "quarantined_conversations": { "type": "integer" },
+            "deferred_conversations": { "type": "integer" },
             "recent_quarantined_conversations": { "type": "integer" },
             "recent_window_seconds": { "type": "integer" },
             "circuit_breaker_limit": { "type": "integer" },
@@ -118774,6 +118883,53 @@ struct SourcesDoctorOutput<'a> {
     health: &'a crate::source_doctor_health::SourceDoctorReport,
     diagnostics: &'a [SourceDiagnostics],
     budget: &'a crate::robot_budget_envelope::BudgetBlock,
+    /// Problems in `sources.toml` itself that no per-host probe can see.
+    config_validation: &'a crate::sources::config_validation::SourceConfigValidation,
+}
+
+/// Bead uojcg.8.5: validate the parsed source configuration against this
+/// host. The validator is pure; this gathers its environment signals: the
+/// sync transports on PATH, an interrupted `sources setup` (its checkpoint is
+/// removed on completion) and `.sources.toml.tmp.*` files an interrupted
+/// config write left beside the config. `disabled_agents` names are not
+/// checked: they accept aliases (`claude_code`) that raw connector names would
+/// misreport as unknown.
+fn sources_doctor_config_validation(
+    config: &crate::sources::config::SourcesConfig,
+) -> crate::sources::config_validation::SourceConfigValidation {
+    use crate::sources::config_validation::{ConfigValidationContext, validate_sources_config};
+    let on_path = |tool: &str| {
+        let file = if cfg!(target_os = "windows") {
+            format!("{tool}.exe")
+        } else {
+            tool.to_string()
+        };
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&file).is_file()))
+    };
+    let orphaned_temp_files = crate::sources::config::SourcesConfig::config_path()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".sources.toml.tmp")
+                })
+                .count()
+        });
+    let ctx = ConfigValidationContext {
+        rsync_available: on_path("rsync"),
+        scp_available: on_path("scp"),
+        setup_in_progress: matches!(crate::sources::SetupState::load(), Ok(Some(_))),
+        orphaned_temp_files,
+        known_agents: Vec::new(),
+    };
+    validate_sources_config(config, &ctx)
 }
 
 const SOURCE_DOCTOR_FIXTURE_MAX_BYTES: usize = 16 * 1024;
@@ -119107,6 +119263,8 @@ fn run_sources_doctor(
         return Ok(());
     }
 
+    let config_validation = sources_doctor_config_validation(&config);
+
     // Filter sources if specified
     let sources_to_check: Vec<_> = config
         .sources
@@ -119380,6 +119538,7 @@ fn run_sources_doctor(
             health: &health_report,
             diagnostics: &all_diagnostics,
             budget: &budget,
+            config_validation: &config_validation,
         };
         println!(
             "{}",
@@ -119451,6 +119610,22 @@ fn run_sources_doctor(
                 println!("Next bounded probe: {next}");
             }
         }
+        if !config_validation.issues.is_empty() {
+            use crate::sources::config_validation::ConfigIssueSeverity;
+            println!();
+            println!("{}", "Configuration".bold());
+            for issue in &config_validation.issues {
+                let icon = match issue.severity {
+                    ConfigIssueSeverity::Error => "✗".red(),
+                    ConfigIssueSeverity::Warning => "⚠".yellow(),
+                    ConfigIssueSeverity::Info => "ℹ".cyan(),
+                };
+                println!("  {icon} {}", issue.detail);
+                if let Some(command) = issue.safe_next_command.as_deref() {
+                    println!("    {}: {command}", "Next".cyan());
+                }
+            }
+        }
     }
 
     // Set exit code based on results
@@ -119458,6 +119633,7 @@ fn run_sources_doctor(
     if total_failed > 0
         || health_report.summary.unhealthy > 0
         || health_report.summary.unreached > 0
+        || config_validation.has_errors()
     {
         std::process::exit(1);
     }

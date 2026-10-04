@@ -9169,8 +9169,8 @@ pub(crate) fn verify_published_lexical_doc_count(
         })?;
     if summary.docs != indexed_docs {
         return Err(anyhow::anyhow!(
-            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader only \
-             sees {}; refusing to certify the generation (GH #457)",
+            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader sees \
+             {}; refusing to certify the generation (GH #457)",
             summary.docs
         ));
     }
@@ -10180,16 +10180,25 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 /// single conversation regardless of corpus size. Only called on the
 /// sparse-looking branch (observed already below the cheap raw upper bound), so
 /// the extra scan is paid lazily.
-fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
+///
+/// This scans the live conversations with an id above `after_conversation_id`
+/// in id order, adding to `expected_docs`, so an interrupted scan can resume
+/// (GH #381). `after_conversation(id, docs)` runs once each conversation is
+/// counted; an error from it stops the scan.
+fn expected_live_lexical_doc_count_after(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    mut expected_docs: usize,
+    mut after_conversation: impl FnMut(i64, usize) -> Result<()>,
+) -> Result<usize> {
     let conversation_ids: Vec<i64> = storage
         .raw()
         .query_map_collect(
-            "SELECT id FROM conversations",
-            &[] as &[ParamValue],
+            "SELECT id FROM conversations WHERE id > ?1 ORDER BY id",
+            &[ParamValue::from(after_conversation_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
-    let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
         // Stream: a long conversation is classified message by message, never
         // held whole (bgn6s removed the per-conversation cap that bounded it).
@@ -10200,13 +10209,34 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
             }
             Ok(true)
         })?;
+        after_conversation(conversation_id, expected_docs)?;
     }
     Ok(expected_docs)
 }
 
-/// GH #461: sidecar next to the rebuild checkpoint memoizing the
-/// noise-adjusted expected doc count for one canonical content identity.
+/// The whole-archive count in one uninterrupted pass: the reference the
+/// memoized, delta and resumed counts must equal.
+#[cfg(test)]
+fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
+    expected_live_lexical_doc_count_after(storage, 0, 0, |_, _| Ok(()))
+}
+
+/// GH #461: sidecar memoizing the noise-adjusted expected doc count for one
+/// canonical content identity (see [`expected_lexical_docs_cache_path`]).
 const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
+
+/// The memo describes the canonical database, not a lexical generation, so it
+/// lives beside the generation directory rather than inside it. Every lexical
+/// publish exchanges that directory: a memo kept inside was discarded by each
+/// rebuild, and the next run re-read every message in the archive to recreate
+/// it (GH #381: 900 s in `watch_startup:count_total_messages` on a 28 GB
+/// archive).
+fn expected_lexical_docs_cache_path(index_path: &Path) -> Option<PathBuf> {
+    index_path
+        .parent()
+        .map(|parent| parent.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE))
+}
+
 /// 2: counts under the per-message cap (bgn6s). A v1 memo counted a long
 /// conversation's messages past its first 8 MiB as noise and must be recounted.
 const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 2;
@@ -10278,14 +10308,29 @@ fn expected_live_lexical_doc_count_delta(
     cached: &ExpectedLexicalDocsCache,
     current: &ExpectedLexicalDocsIdentity,
 ) -> Result<Option<usize>> {
-    let old = &cached.identity;
+    if !expected_lexical_docs_identity_is_pure_append(storage, &cached.identity, current)? {
+        return Ok(None);
+    }
+    let appended =
+        expected_appended_lexical_docs(storage, cached.identity.max_message_id, |_| true)?;
+    Ok(Some(cached.expected_docs.saturating_add(appended)))
+}
+
+/// Whether the archive changed from `old` to `current` only by appended rows:
+/// no conversation or message was deleted (both totals grew by exactly the
+/// rows beyond the old maxima) and the content cap is unchanged.
+fn expected_lexical_docs_identity_is_pure_append(
+    storage: &FrankenStorage,
+    old: &ExpectedLexicalDocsIdentity,
+    current: &ExpectedLexicalDocsIdentity,
+) -> Result<bool> {
     if old.content_cap_bytes != current.content_cap_bytes
         || current.max_message_id < old.max_message_id
         || current.max_conversation_id < old.max_conversation_id
         || current.total_conversations < old.total_conversations
         || current.total_messages < old.total_messages
     {
-        return Ok(None);
+        return Ok(false);
     }
     let new_conversations = count_exact(
         storage,
@@ -10297,11 +10342,19 @@ fn expected_live_lexical_doc_count_delta(
         "SELECT COUNT(*) FROM messages WHERE id > ?1",
         old.max_message_id,
     )?;
-    if old.total_conversations.checked_add(new_conversations) != Some(current.total_conversations)
-        || old.total_messages.checked_add(new_messages) != Some(current.total_messages)
-    {
-        return Ok(None);
-    }
+    Ok(
+        old.total_conversations.checked_add(new_conversations) == Some(current.total_conversations)
+            && old.total_messages.checked_add(new_messages) == Some(current.total_messages),
+    )
+}
+
+/// Expected docs among the messages with an id above `after_message_id` whose
+/// live conversation satisfies `include`.
+fn expected_appended_lexical_docs(
+    storage: &FrankenStorage,
+    after_message_id: i64,
+    include: impl Fn(i64) -> bool,
+) -> Result<usize> {
     // The per-message cap makes every message's classification independent of
     // every other, so only the rows appended since the memo need classifying:
     // a rowid-range scan over them, never a JOIN (fsqlite's join path used to
@@ -10311,7 +10364,7 @@ fn expected_live_lexical_doc_count_delta(
         .raw()
         .query_map_collect(
             "SELECT DISTINCT conversation_id FROM messages WHERE id > ?1",
-            &[ParamValue::from(old.max_message_id)],
+            &[ParamValue::from(after_message_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations touched since the expected lexical docs memo")?;
@@ -10319,7 +10372,7 @@ fn expected_live_lexical_doc_count_delta(
     // indexed): one point lookup per touched conversation, resolved before the
     // row stream so no query runs inside its callback.
     let mut live_conversations = HashSet::with_capacity(touched.len());
-    for conversation_id in touched {
+    for conversation_id in touched.into_iter().filter(|id| include(*id)) {
         let live: i64 = storage
             .raw()
             .query_row_map(
@@ -10332,9 +10385,9 @@ fn expected_live_lexical_doc_count_delta(
             live_conversations.insert(conversation_id);
         }
     }
-    let mut expected_docs = cached.expected_docs;
+    let mut expected_docs = 0usize;
     storage.for_each_lexical_rebuild_message_after_id(
-        old.max_message_id,
+        after_message_id,
         |conversation_id, message| {
             let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
             if live_conversations.contains(&conversation_id)
@@ -10348,11 +10401,158 @@ fn expected_live_lexical_doc_count_delta(
             Ok(())
         },
     )?;
-    Ok(Some(expected_docs))
+    Ok(expected_docs)
 }
 
-/// [`expected_live_lexical_doc_count`] without re-reading the whole archive on
-/// every run (GH #461). The full per-conversation content scan ran at index
+/// GH #381 (ntxs1): where an interrupted full expected-docs scan stopped. It
+/// sits beside the memo; a completed scan removes it.
+const EXPECTED_LEXICAL_DOCS_PARTIAL_FILE: &str = ".expected-lexical-docs.partial.json";
+/// How often a full scan saves its position: an interruption loses at most
+/// this much reading.
+const EXPECTED_LEXICAL_DOCS_PARTIAL_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExpectedLexicalDocsPartial {
+    schema_version: u32,
+    db_path: String,
+    /// The archive the cursor and count describe.
+    identity: ExpectedLexicalDocsIdentity,
+    /// Every live conversation with an id at or below this one is counted.
+    last_conversation_id: i64,
+    expected_docs: usize,
+}
+
+fn write_expected_lexical_docs_sidecar<T: serde::Serialize>(path: &Path, payload: &T) {
+    let Some(file_name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return;
+    };
+    let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    let written = serde_json::to_vec(payload)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| fs::write(&tmp_path, bytes))
+        .and_then(|()| fs::rename(&tmp_path, path));
+    if let Err(err) = written {
+        tracing::debug!(error = %err, path = %path.display(), "expected lexical docs sidecar write skipped");
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+/// The full expected-docs count, resumable (GH #381, ntxs1). The first full
+/// scan reads every message; on a 28 GB archive it outlived the caller's
+/// 900 s timeout, and an interrupted scan kept nothing, so the next run
+/// started over and never finished. The scan now saves its cursor and count
+/// at `partial_path` every few seconds. A later run continues from there:
+/// as-is when the archive is unchanged, or after counting the rows appended to
+/// already-counted conversations when the archive only grew. Any other change
+/// (a deletion, a cap change) starts over.
+fn expected_live_lexical_doc_count_resumable(
+    storage: &FrankenStorage,
+    partial_path: Option<&Path>,
+    db_path: &str,
+    current: &ExpectedLexicalDocsIdentity,
+    progress: Option<&IndexingProgress>,
+) -> Result<usize> {
+    expected_live_lexical_doc_count_resumable_with(
+        storage,
+        partial_path,
+        db_path,
+        current,
+        progress,
+        EXPECTED_LEXICAL_DOCS_PARTIAL_SAVE_INTERVAL,
+        |_| Ok(()),
+    )
+}
+
+fn expected_live_lexical_doc_count_resumable_with(
+    storage: &FrankenStorage,
+    partial_path: Option<&Path>,
+    db_path: &str,
+    current: &ExpectedLexicalDocsIdentity,
+    progress: Option<&IndexingProgress>,
+    save_interval: Duration,
+    mut on_conversation: impl FnMut(i64) -> Result<()>,
+) -> Result<usize> {
+    let saved = partial_path
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsPartial>(&raw).ok())
+        .filter(|partial| {
+            partial.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
+                && lexical_rebuild_db_paths_match(&partial.db_path, db_path)
+        });
+    let (resume_after, resume_docs) = match saved {
+        Some(partial) if partial.identity == *current => {
+            (partial.last_conversation_id, partial.expected_docs)
+        }
+        Some(partial)
+            if expected_lexical_docs_identity_is_pure_append(
+                storage,
+                &partial.identity,
+                current,
+            )? =>
+        {
+            // Conversations above the cursor are read whole below, appended
+            // rows included; rows appended to the ones already counted are not
+            // in the saved count yet.
+            let cursor = partial.last_conversation_id;
+            let appended = expected_appended_lexical_docs(
+                storage,
+                partial.identity.max_message_id,
+                |conversation_id| conversation_id <= cursor,
+            )?;
+            (cursor, partial.expected_docs.saturating_add(appended))
+        }
+        _ => (0, 0),
+    };
+    if resume_after > 0 {
+        tracing::info!(
+            resume_after_conversation_id = resume_after,
+            expected_docs_so_far = resume_docs,
+            "resuming the interrupted expected lexical docs scan (GH #381)"
+        );
+    }
+    let mut last_save = Instant::now();
+    let expected_docs = expected_live_lexical_doc_count_after(
+        storage,
+        resume_after,
+        resume_docs,
+        |conversation_id, expected_docs| {
+            if let Some(progress) = progress {
+                // The stall watchdog reads activity, not phase counters.
+                progress.tick_activity();
+            }
+            if let Some(path) = partial_path
+                && last_save.elapsed() >= save_interval
+            {
+                write_expected_lexical_docs_sidecar(
+                    path,
+                    &ExpectedLexicalDocsPartial {
+                        schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+                        db_path: db_path.to_string(),
+                        identity: current.clone(),
+                        last_conversation_id: conversation_id,
+                        expected_docs,
+                    },
+                );
+                tracing::info!(
+                    last_conversation_id = conversation_id,
+                    max_conversation_id = current.max_conversation_id,
+                    expected_docs_so_far = expected_docs,
+                    "expected lexical docs scan position saved (GH #381)"
+                );
+                last_save = Instant::now();
+            }
+            on_conversation(conversation_id)
+        },
+    )?;
+    if let Some(path) = partial_path {
+        // The memo the caller writes next supersedes the partial count.
+        let _ = fs::remove_file(path);
+    }
+    Ok(expected_docs)
+}
+
+/// The expected doc count ([`expected_live_lexical_doc_count_after`]) without
+/// re-reading the whole archive on every run (GH #461). The full per-conversation content scan ran at index
 /// startup and again at the post-run checkpoint refresh on any archive whose
 /// sink drops tool-acks or empty messages, i.e. on essentially every
 /// incremental run; a 16 MB incremental run read 9.4 GB. The count is served
@@ -10365,16 +10565,31 @@ fn expected_live_lexical_doc_count_cached(
     index_path: &Path,
     db_path: &str,
     total_messages: usize,
+    progress: Option<&IndexingProgress>,
 ) -> Result<usize> {
     let current = expected_lexical_docs_identity(storage, total_messages)?;
-    let cache_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
-    let cached = fs::read(&cache_path)
-        .ok()
+    let cache_path = expected_lexical_docs_cache_path(index_path)
+        .filter(|path| path.parent().is_some_and(Path::is_dir));
+    let partial_path = cache_path
+        .as_deref()
+        .map(|path| path.with_file_name(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE));
+    let cached = cache_path
+        .as_deref()
+        .and_then(|path| fs::read(path).ok())
         .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsCache>(&raw).ok())
         .filter(|cached| {
             cached.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
                 && lexical_rebuild_db_paths_match(&cached.db_path, db_path)
         });
+    let full_scan = || {
+        expected_live_lexical_doc_count_resumable(
+            storage,
+            partial_path.as_deref(),
+            db_path,
+            &current,
+            progress,
+        )
+    };
     let (expected_docs, delta_generations, source) = match cached {
         Some(cached) if cached.identity == current => {
             return Ok(cached.expected_docs);
@@ -10382,10 +10597,10 @@ fn expected_live_lexical_doc_count_cached(
         Some(cached) if cached.delta_generations < EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS => {
             match expected_live_lexical_doc_count_delta(storage, &cached, &current)? {
                 Some(expected) => (expected, cached.delta_generations + 1, "delta"),
-                None => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+                None => (full_scan()?, 0, "full"),
             }
         }
-        _ => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+        _ => (full_scan()?, 0, "full"),
     };
     tracing::debug!(
         expected_lexical_docs = expected_docs,
@@ -10393,26 +10608,17 @@ fn expected_live_lexical_doc_count_cached(
         delta_generations,
         "expected lexical doc count recomputed"
     );
-    if index_path.is_dir() {
-        let payload = ExpectedLexicalDocsCache {
-            schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
-            db_path: db_path.to_string(),
-            identity: current,
-            expected_docs,
-            delta_generations,
-        };
-        let tmp_path = index_path.join(format!(
-            "{EXPECTED_LEXICAL_DOCS_CACHE_FILE}.{}.tmp",
-            std::process::id()
-        ));
-        let written = serde_json::to_vec(&payload)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| fs::write(&tmp_path, bytes))
-            .and_then(|()| fs::rename(&tmp_path, &cache_path));
-        if let Err(err) = written {
-            tracing::debug!(error = %err, "expected lexical docs cache write skipped");
-            let _ = fs::remove_file(&tmp_path);
-        }
+    if let Some(cache_path) = cache_path {
+        write_expected_lexical_docs_sidecar(
+            &cache_path,
+            &ExpectedLexicalDocsCache {
+                schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+                db_path: db_path.to_string(),
+                identity: current,
+                expected_docs,
+                delta_generations,
+            },
+        );
     }
     Ok(expected_docs)
 }
@@ -12437,6 +12643,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
             index_path,
             &db_state.db_path,
             total_messages,
+            None,
         )?
     };
     if observed_tantivy_docs != expected_docs {
@@ -17454,6 +17661,7 @@ fn run_index_inner(
                         &index_path,
                         &opts.db_path.to_string_lossy(),
                         canonical_messages,
+                        opts.progress.as_deref(),
                     )?
                 } else {
                     canonical_messages
@@ -25827,6 +26035,19 @@ fn rebuild_tantivy_from_db_with_options(
                  requires {} committed documents",
                 rebuild_state.indexed_docs
             );
+            // A surplus is reconciled only by replaying the identities behind
+            // it through the #440 upsert window. With the cursor at EOF nothing
+            // is replayed, so the candidate keeps the surplus and the finalize
+            // count check (GH #457) refuses it; a refused finalize leaves this
+            // same EOF checkpoint, so every later run would repeat the refusal.
+            anyhow::ensure!(
+                rebuild_state.processed_conversations < total_conversations
+                    || u128::from(live_docs) == rebuild_state.indexed_docs as u128,
+                "resumed lexical candidate contains {live_docs} documents, more than the {} its \
+                 checkpoint counted, and the checkpoint is at the end of the archive, so no \
+                 replay can reconcile the difference",
+                rebuild_state.indexed_docs
+            );
             Ok(())
         })();
         if let Err(error) = resume_check {
@@ -27593,13 +27814,16 @@ fn ingest_watch_batch_with_oom_split_inner(
     };
 
     match batch_result {
-        Ok(batch_outcome) => Ok(WatchIngestBatchOutcome {
-            batch_outcome,
-            processed_conversations: convs.len(),
-            quarantined_conversations: 0,
-            deferred_conversations: 0,
-            max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
-        }),
+        Ok(batch_outcome) => {
+            clear_watch_nomem_deferrals(data_dir, convs);
+            Ok(WatchIngestBatchOutcome {
+                batch_outcome,
+                processed_conversations: convs.len(),
+                quarantined_conversations: 0,
+                deferred_conversations: 0,
+                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+            })
+        }
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
             let split_at = convs.len() / 2;
             tracing::warn!(
@@ -27723,15 +27947,40 @@ fn ingest_watch_batch_with_oom_split_inner(
                         None => !small_conversation,
                     };
                     if !should_quarantine {
-                        tracing::warn!(
-                            agent = %conv.agent_slug,
-                            external_id = conv.external_id.as_deref().unwrap_or(""),
-                            source_path = %conv.source_path.display(),
+                        // GH#510: back off instead of replaying this on every
+                        // tick, and warn only on the 1st, 2nd, 4th, 8th, ...
+                        // deferral rather than once per tick.
+                        let deferral = record_watch_nomem_deferral(
+                            data_dir,
+                            conv,
                             indexed_text_bytes,
-                            real_memory_pressure = ?real_pressure,
-                            error = %solo_error,
-                            "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
+                            FrankenStorage::now_millis(),
                         );
+                        let retry_in_secs = deferral
+                            .next_retry_at_ms
+                            .saturating_sub(deferral.last_deferred_at_ms)
+                            / 1_000;
+                        if deferral.deferrals.is_power_of_two() {
+                            tracing::warn!(
+                                agent = %conv.agent_slug,
+                                external_id = conv.external_id.as_deref().unwrap_or(""),
+                                source_path = %conv.source_path.display(),
+                                indexed_text_bytes,
+                                real_memory_pressure = ?real_pressure,
+                                deferrals = deferral.deferrals,
+                                retry_in_secs,
+                                error = %solo_error,
+                                "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) with backoff (#298, GH#510). An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger; `cass quarantine list --json` lists deferred conversations"
+                            );
+                        } else {
+                            tracing::debug!(
+                                agent = %conv.agent_slug,
+                                source_path = %conv.source_path.display(),
+                                deferrals = deferral.deferrals,
+                                retry_in_secs,
+                                "watch conversation deferred again after bounded-allocation NoMem (GH#510)"
+                            );
+                        }
                         if let Some(progress) = progress {
                             progress.current.fetch_add(1, Ordering::Relaxed);
                         }
@@ -27906,6 +28155,155 @@ fn watch_oom_real_pressure_reserve_bytes() -> u64 {
 fn watch_oom_under_real_memory_pressure() -> Option<bool> {
     let available = responsiveness::available_memory_bytes()?;
     Some(available <= watch_oom_real_pressure_reserve_bytes())
+}
+
+/// GH#510: a bounded-guard NoMem that recurs deterministically is deferred,
+/// never quarantined (#298/#364). The deferral holds the watch watermark, so
+/// without a ledger every tick replays the batch split, the solo retry and the
+/// deferral forever. The ledger records each deferral and the next time the
+/// conversation may be attempted again.
+pub(crate) const WATCH_NOMEM_DEFERRALS_FILE: &str = "watch_nomem_deferrals.json";
+const WATCH_NOMEM_DEFERRAL_BASE_BACKOFF_MS: i64 = 60_000;
+const WATCH_NOMEM_DEFERRAL_MAX_BACKOFF_MS: i64 = 3_600_000;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WatchNomemDeferrals {
+    #[serde(default)]
+    pub(crate) entries: BTreeMap<String, WatchNomemDeferral>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WatchNomemDeferral {
+    pub(crate) agent: String,
+    pub(crate) source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_id: Option<String>,
+    pub(crate) deferrals: u32,
+    pub(crate) first_deferred_at_ms: i64,
+    pub(crate) last_deferred_at_ms: i64,
+    pub(crate) next_retry_at_ms: i64,
+    pub(crate) indexed_text_bytes: usize,
+}
+
+impl WatchNomemDeferrals {
+    pub(crate) fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join("quarantine").join(WATCH_NOMEM_DEFERRALS_FILE)
+    }
+
+    /// A missing or unreadable ledger is empty: losing it costs one more
+    /// attempt per conversation, never a conversation.
+    pub(crate) fn load(data_dir: &Path) -> Self {
+        fs::read(Self::path(data_dir))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, data_dir: &Path) {
+        let path = Self::path(data_dir);
+        if let Err(error) = write_json_pretty_atomically(&path, self) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to persist the watch NoMem deferral ledger; deferred conversations retry on the next tick"
+            );
+        }
+    }
+}
+
+fn watch_nomem_deferral_key(conv: &NormalizedConversation) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        conv.agent_slug,
+        conv.source_path.display(),
+        conv.external_id.as_deref().unwrap_or("")
+    )
+}
+
+/// 1 min after the first deferral, doubling up to 1 h.
+fn watch_nomem_deferral_backoff_ms(deferrals: u32) -> i64 {
+    let doublings = deferrals.saturating_sub(1).min(16);
+    WATCH_NOMEM_DEFERRAL_BASE_BACKOFF_MS
+        .saturating_mul(1_i64 << doublings)
+        .min(WATCH_NOMEM_DEFERRAL_MAX_BACKOFF_MS)
+}
+
+/// Count one more deferral of `conv` and schedule its next attempt.
+fn record_watch_nomem_deferral(
+    data_dir: &Path,
+    conv: &NormalizedConversation,
+    indexed_text_bytes: usize,
+    now_ms: i64,
+) -> WatchNomemDeferral {
+    let mut ledger = WatchNomemDeferrals::load(data_dir);
+    let entry = ledger
+        .entries
+        .entry(watch_nomem_deferral_key(conv))
+        .or_insert_with(|| WatchNomemDeferral {
+            agent: conv.agent_slug.clone(),
+            source_path: conv.source_path.display().to_string(),
+            external_id: conv.external_id.clone(),
+            deferrals: 0,
+            first_deferred_at_ms: now_ms,
+            last_deferred_at_ms: now_ms,
+            next_retry_at_ms: now_ms,
+            indexed_text_bytes,
+        });
+    entry.deferrals = entry.deferrals.saturating_add(1);
+    entry.last_deferred_at_ms = now_ms;
+    entry.indexed_text_bytes = indexed_text_bytes;
+    entry.next_retry_at_ms =
+        now_ms.saturating_add(watch_nomem_deferral_backoff_ms(entry.deferrals));
+    let recorded = entry.clone();
+    ledger.save(data_dir);
+    recorded
+}
+
+/// Forget deferrals for conversations that just ingested.
+fn clear_watch_nomem_deferrals(data_dir: &Path, convs: &[NormalizedConversation]) {
+    if !WatchNomemDeferrals::path(data_dir).exists() {
+        return;
+    }
+    let mut ledger = WatchNomemDeferrals::load(data_dir);
+    let before = ledger.entries.len();
+    for conv in convs {
+        ledger.entries.remove(&watch_nomem_deferral_key(conv));
+    }
+    if ledger.entries.len() != before {
+        ledger.save(data_dir);
+    }
+}
+
+/// Hold back conversations still inside their deferral backoff and return
+/// how many were held. The caller counts them as deferred, so the watch
+/// watermark stays where it is and they are scanned again later.
+fn retain_watch_conversations_past_nomem_backoff(
+    data_dir: &Path,
+    convs: &mut Vec<NormalizedConversation>,
+    now_ms: i64,
+) -> usize {
+    if !WatchNomemDeferrals::path(data_dir).exists() {
+        return 0;
+    }
+    let ledger = WatchNomemDeferrals::load(data_dir);
+    if ledger.entries.is_empty() {
+        return 0;
+    }
+    let before = convs.len();
+    convs.retain(|conv| {
+        ledger
+            .entries
+            .get(&watch_nomem_deferral_key(conv))
+            .is_none_or(|entry| entry.next_retry_at_ms <= now_ms)
+    });
+    let held = before - convs.len();
+    if held > 0 {
+        tracing::debug!(
+            held,
+            "watch conversations are waiting out their NoMem deferral backoff (GH#510)"
+        );
+    }
+    held
 }
 
 fn error_message_is_exact_out_of_memory(message: &str) -> bool {
@@ -28733,6 +29131,9 @@ pub struct ConversationIngestQuarantineSummary {
     pub schema_version: i64,
     pub status: String,
     pub quarantined_conversations: usize,
+    /// Conversations the watcher keeps deferring after a bounded-guard NoMem
+    /// (GH#510): never quarantined, but missing from search until one ingests.
+    pub deferred_conversations: usize,
     pub recent_quarantined_conversations: usize,
     pub recent_window_seconds: i64,
     pub circuit_breaker_limit: usize,
@@ -28839,6 +29240,9 @@ pub fn conversation_ingest_quarantine_summary(
     let recent_quarantined_conversations = recent_keys.len();
     let circuit_breaker_active =
         circuit_breaker_limit > 0 && recent_quarantined_conversations >= circuit_breaker_limit;
+    // GH#510: deferred conversations are counted but leave `status` alone;
+    // they are retried on a backoff and are not a quarantine.
+    let deferred_conversations = WatchNomemDeferrals::load(data_dir).entries.len();
     ConversationIngestQuarantineSummary {
         schema_version: POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
         status: if circuit_breaker_active {
@@ -28849,6 +29253,7 @@ pub fn conversation_ingest_quarantine_summary(
             "ok".to_string()
         },
         quarantined_conversations,
+        deferred_conversations,
         recent_quarantined_conversations,
         recent_window_seconds,
         circuit_breaker_limit,
@@ -28860,10 +29265,16 @@ pub fn conversation_ingest_quarantine_summary(
                 "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
                     .to_string(),
             )
+        } else if quarantined_conversations > 0 {
+            Some(
+                "Run `cass quarantine list --json` to see which conversations are excluded and whether `cass quarantine retry` can re-ingest them."
+                    .to_string(),
+            )
         } else {
-            (quarantined_conversations > 0).then(|| {
-                "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
-                    .to_string()
+            (deferred_conversations > 0).then(|| {
+                format!(
+                    "{deferred_conversations} conversation(s) are deferred by the watcher after repeated bounded-allocation NoMem and are missing from search until they ingest; `cass quarantine list --json` lists them. An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger."
+                )
             })
         },
     }
@@ -28873,7 +29284,7 @@ pub fn conversation_ingest_quarantine_summary(
 /// gone (so a retry could never succeed). The poison JSONL records carry the
 /// `source_path`; if a record has a path that no longer exists, that
 /// conversation is source-missing.
-fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
+pub(crate) fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
     let quarantine_dir = data_dir.join("quarantine");
     let mut missing = BTreeSet::new();
     for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
@@ -30374,9 +30785,25 @@ fn reindex_paths_with_semantic_delta(
                 conv,
             );
         }
-        if !explicit_watch_once {
-            sort_watch_conversations_for_watermark(&mut convs);
-        }
+        // Watermark order for live watch; a total order (watermark, path,
+        // external id) for every batch, so canonical ids never depend on the
+        // filesystem's directory order (connectors walk unsorted).
+        sort_watch_conversations_for_watermark(&mut convs);
+
+        // GH#510: a conversation whose bounded-guard NoMem keeps recurring
+        // waits out its deferral backoff instead of re-running the split, solo
+        // retry and deferral on every tick. It counts as deferred so the
+        // watermark stays held for it. An explicit --watch-once is an
+        // operator's retry and is never held back.
+        let nomem_backoff_held = if explicit_watch_once {
+            0
+        } else {
+            retain_watch_conversations_past_nomem_backoff(
+                &opts.data_dir,
+                &mut convs,
+                FrankenStorage::now_millis(),
+            )
+        };
 
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
@@ -30416,7 +30843,7 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
-        let mut deferred_conversations = 0usize;
+        let mut deferred_conversations = nomem_backoff_held;
         let mut lexical_replay_deferred = false;
         {
             let storage = storage
@@ -30582,11 +31009,18 @@ fn reindex_paths_with_semantic_delta(
                     )?;
                 }
 
+                // Conversations are sorted by watermark, so a clean later
+                // chunk must not advance past an earlier (or backed-off)
+                // deferred one, which would drop it from every later scan:
+                // the cumulative deferral count gates this. Quarantined
+                // conversations keep the per-chunk gate: they have no backoff,
+                // so holding the watermark for them would re-attempt them on
+                // every tick.
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
                     && !lexical_replay_deferred
                     && chunk_outcome.quarantined_conversations == 0
-                    && chunk_outcome.deferred_conversations == 0
+                    && deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
@@ -55590,10 +56024,11 @@ mod tests {
                 &index_path,
                 &db,
                 count_total_messages_exact(&storage).unwrap(),
+                None,
             )
             .unwrap()
         };
-        let sidecar_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
+        let sidecar_path = expected_lexical_docs_cache_path(&index_path).unwrap();
         let sidecar = || {
             serde_json::from_slice::<ExpectedLexicalDocsCache>(&fs::read(&sidecar_path).unwrap())
                 .unwrap()
@@ -55660,6 +56095,185 @@ mod tests {
             .unwrap();
         assert_eq!(cached(), full());
         assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
+    }
+
+    /// GH #381 (ntxs1): an interrupted full expected-docs scan resumes from its
+    /// saved cursor instead of starting over, and still lands on exactly the
+    /// full count: unchanged, after pure appends (rows appended to an
+    /// already-counted conversation are added; conversations above the cursor
+    /// are read whole), and never after a deletion, which restarts the scan.
+    #[test]
+    fn gh381_interrupted_expected_docs_scan_resumes_exactly() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("gh381-resume.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        let db = db_path.to_string_lossy().into_owned();
+        let partial_path = dir.path().join(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+        let ids: Vec<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT id FROM conversations ORDER BY id",
+                &[] as &[ParamValue],
+                |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 2, "the fixture seeds two conversations");
+        let (first, second) = (ids[0], ids[1]);
+        let insert = |conversation_id: i64, idx: i64, role: &str, content: &str| {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, ?3, ?4)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(idx),
+                        ParamValue::from(role.to_string()),
+                        ParamValue::from(content.to_string()),
+                    ],
+                )
+                .unwrap();
+        };
+        let current = || {
+            expected_lexical_docs_identity(&storage, count_total_messages_exact(&storage).unwrap())
+                .unwrap()
+        };
+        let full = || expected_live_lexical_doc_count(&storage).unwrap();
+        // Interrupt right after the first conversation, as a watchdog kill
+        // would; the position was saved first (interval zero).
+        let interrupted_scan = || {
+            let result = expected_live_lexical_doc_count_resumable_with(
+                &storage,
+                Some(&partial_path),
+                &db,
+                &current(),
+                None,
+                Duration::ZERO,
+                |_| Err(anyhow::anyhow!("interrupted")),
+            );
+            assert!(result.is_err());
+            let partial: ExpectedLexicalDocsPartial =
+                serde_json::from_slice(&fs::read(&partial_path).unwrap()).unwrap();
+            assert_eq!(partial.last_conversation_id, first);
+        };
+        let finishing_scan = || {
+            let mut visited = Vec::new();
+            let count = expected_live_lexical_doc_count_resumable_with(
+                &storage,
+                Some(&partial_path),
+                &db,
+                &current(),
+                None,
+                Duration::ZERO,
+                |conversation_id| {
+                    visited.push(conversation_id);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(
+                !partial_path.exists(),
+                "a completed scan removes its partial"
+            );
+            (count, visited)
+        };
+        insert(first, 50, "user", "   ");
+
+        // Unchanged archive: only the conversation after the cursor is read.
+        interrupted_scan();
+        assert_eq!(finishing_scan(), (full(), vec![second]));
+
+        // Pure appends after the interruption: below the cursor (one indexed,
+        // one noise) and above it. The resumed count still matches a full scan.
+        interrupted_scan();
+        insert(first, 60, "assistant", "appended below the cursor");
+        insert(first, 61, "tool", "");
+        insert(second, 60, "assistant", "appended above the cursor");
+        assert_eq!(finishing_scan(), (full(), vec![second]));
+
+        // A deletion below the cursor invalidates the partial: start over.
+        interrupted_scan();
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND idx = 60",
+                &[ParamValue::from(first)],
+            )
+            .unwrap();
+        assert_eq!(finishing_scan(), (full(), vec![first, second]));
+    }
+
+    /// GH #381: the expected-docs memo describes the canonical database, so a
+    /// lexical publish (which exchanges the generation directory) must not
+    /// discard it. Otherwise the first run after every rebuild re-reads every
+    /// message in the archive. A planted sentinel that is still served after
+    /// a real from-zero rebuild and publish proves no full scan was owed.
+    #[test]
+    #[serial_test::serial]
+    fn gh381_expected_lexical_docs_memo_survives_lexical_publication() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("gh381.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        drop(storage);
+        rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        let db = db_path.to_string_lossy().into_owned();
+        let cached = || {
+            let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+            expected_live_lexical_doc_count_cached(
+                &storage,
+                &index_path,
+                &db,
+                count_total_messages_exact(&storage).unwrap(),
+                None,
+            )
+            .unwrap()
+        };
+        let full =
+            expected_live_lexical_doc_count(&FrankenStorage::open_readonly(&db_path).unwrap())
+                .unwrap();
+        assert_eq!(cached(), full);
+        let sidecar_path = expected_lexical_docs_cache_path(&index_path).unwrap();
+        assert!(
+            !sidecar_path.starts_with(&index_path),
+            "the memo must live outside the generation directory a publish exchanges"
+        );
+        let mut planted: ExpectedLexicalDocsCache =
+            serde_json::from_slice(&fs::read(&sidecar_path).unwrap()).unwrap();
+        planted.expected_docs = 999_999;
+        fs::write(&sidecar_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        // Drop the completed checkpoint so the next rebuild starts from zero,
+        // builds off-live and publishes by exchanging the generation directory.
+        clear_lexical_rebuild_state(&index_path).unwrap();
+        let retained_backups = || -> std::collections::BTreeSet<std::ffi::OsString> {
+            fs::read_dir(
+                index_path
+                    .parent()
+                    .unwrap()
+                    .join(".lexical-publish-backups"),
+            )
+            .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+            .unwrap_or_default()
+        };
+        let backups_before = retained_backups();
+        let rebuilt = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        assert!(rebuilt.exact_checkpoint_persisted);
+        assert_eq!(
+            retained_backups().difference(&backups_before).count(),
+            1,
+            "the rebuild must have exchanged the generation directory and retained the prior one"
+        );
+
+        assert_eq!(
+            cached(),
+            999_999,
+            "an unchanged canonical identity is served from the memo after publication"
+        );
     }
 
     /// #439: the fallback-FTS shadow maintenance must report liveness per
@@ -62080,6 +62694,212 @@ mod tests {
                 .exists(),
             "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
         );
+    }
+
+    /// GH#510: a deterministic bounded-guard NoMem used to re-run the split,
+    /// the solo retry and the deferral on every watch tick forever. A
+    /// deferred conversation now waits out an exponential backoff (counted in
+    /// a ledger) without an ingest attempt, keeps the watermark held, and is
+    /// forgotten once it ingests.
+    #[test]
+    #[serial]
+    fn watch_reindex_backs_off_a_repeatedly_deferred_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-backoff");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-oom-defer-backoff.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-oom-defer-backoff","messages":[{{"role":"user","text":"back off","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+        let tick = || {
+            reindex_paths(
+                &opts,
+                vec![amp_file.clone()],
+                &roots,
+                &state,
+                &storage,
+                &t_index,
+                &index_path,
+                false,
+            )
+            .unwrap()
+        };
+        let only_entry = || {
+            let ledger = WatchNomemDeferrals::load(&data_dir);
+            assert_eq!(ledger.entries.len(), 1, "one deferred conversation");
+            ledger.entries.into_values().next().unwrap()
+        };
+        let expire_backoff = || {
+            let mut ledger = WatchNomemDeferrals::load(&data_dir);
+            for entry in ledger.entries.values_mut() {
+                entry.next_retry_at_ms = 0;
+            }
+            ledger.save(&data_dir);
+        };
+
+        // Tick 1: attempted, deferred, scheduled one minute out.
+        assert_eq!(tick(), 1);
+        let first = only_entry();
+        assert_eq!(first.deferrals, 1);
+        assert_eq!(first.next_retry_at_ms - first.last_deferred_at_ms, 60_000);
+        assert!(load_watch_state(&data_dir).is_empty());
+
+        // Tick 2, inside the backoff: no ingest attempt. An attempt would
+        // NoMem again under the injection and count a second deferral.
+        assert_eq!(tick(), 0, "a backed-off conversation is not ingested");
+        assert_eq!(only_entry(), first, "no attempt inside the backoff");
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "the watermark stays held for a backed-off conversation"
+        );
+
+        // Backoff elapsed: attempted again, and the backoff doubles.
+        expire_backoff();
+        assert_eq!(tick(), 1);
+        let second = only_entry();
+        assert_eq!(second.deferrals, 2);
+        assert_eq!(second.first_deferred_at_ms, first.first_deferred_at_ms);
+        assert_eq!(
+            second.next_retry_at_ms - second.last_deferred_at_ms,
+            120_000
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "backoff never turns a bounded-guard NoMem into a quarantine"
+        );
+
+        // The trigger goes away: the next attempt ingests, the ledger forgets
+        // the conversation and the watermark advances.
+        drop(solo_oom_guard);
+        drop(oom_guard);
+        expire_backoff();
+        assert_eq!(tick(), 1);
+        assert!(WatchNomemDeferrals::load(&data_dir).entries.is_empty());
+        assert!(
+            load_watch_state(&data_dir).contains_key(&ConnectorKind::Amp),
+            "the watermark advances once the deferred conversation ingests"
+        );
+    }
+
+    /// GH#510: status/health surface watcher deferrals through the ingest
+    /// quarantine summary without calling them a quarantine.
+    #[test]
+    #[serial]
+    fn ingest_quarantine_summary_counts_watch_nomem_deferrals() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("deferral-summary");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let deferral = |source: &str| WatchNomemDeferral {
+            agent: "amp".to_string(),
+            source_path: source.to_string(),
+            external_id: None,
+            deferrals: 3,
+            first_deferred_at_ms: 1_700_000_000_000,
+            last_deferred_at_ms: 1_700_000_100_000,
+            next_retry_at_ms: 1_700_000_340_000,
+            indexed_text_bytes: 525,
+        };
+        let empty = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(empty.deferred_conversations, 0);
+        assert!(empty.recommended_action.is_none());
+
+        let mut ledger = WatchNomemDeferrals::default();
+        ledger
+            .entries
+            .insert("a".to_string(), deferral("/logs/a.json"));
+        ledger
+            .entries
+            .insert("b".to_string(), deferral("/logs/b.json"));
+        ledger.save(&data_dir);
+        let deferred = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(deferred.deferred_conversations, 2);
+        assert_eq!(deferred.quarantined_conversations, 0);
+        assert_eq!(deferred.status, "ok", "a deferral is not a quarantine");
+        let action = deferred
+            .recommended_action
+            .expect("deferrals get an action");
+        assert!(
+            action.starts_with("2 conversation(s) are deferred"),
+            "{action}"
+        );
+        assert!(action.contains("cass quarantine list --json"), "{action}");
+
+        // A real quarantine keeps its own action; the deferral count stays.
+        let mut state = crate::indexer::quarantine::QuarantineState::default();
+        state.entries.insert(
+            "conv-q::v1".to_string(),
+            crate::indexer::quarantine::QuarantineRecord {
+                first_attempt_at: chrono::Utc::now(),
+                last_attempt_at: chrono::Utc::now(),
+                attempt_count: 1,
+                last_reason: "ingest_oom".to_string(),
+                cass_version_at_quarantine: None,
+            },
+        );
+        state.save(&data_dir).unwrap();
+        let both = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(both.deferred_conversations, 2);
+        assert_eq!(both.status, "degraded");
+        assert!(
+            both.recommended_action
+                .as_deref()
+                .is_some_and(|action| action.starts_with("Run `cass quarantine list --json`")),
+            "{:?}",
+            both.recommended_action
+        );
+    }
+
+    #[test]
+    fn watch_nomem_deferral_backoff_doubles_to_one_hour() {
+        let backoffs: Vec<i64> = (1..=8).map(watch_nomem_deferral_backoff_ms).collect();
+        assert_eq!(
+            backoffs,
+            [
+                60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000, 3_600_000
+            ]
+        );
+        assert_eq!(watch_nomem_deferral_backoff_ms(u32::MAX), 3_600_000);
     }
 
     /// #364 gate: a *large* conversation whose solo isolate-retry also OOMs

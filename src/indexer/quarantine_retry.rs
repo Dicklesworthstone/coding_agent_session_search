@@ -280,7 +280,7 @@ pub fn plan_retry(
         skip_source_missing,
         skip_budget_exhausted,
     );
-    let next_safe_command = plan_next_command(total, planned_attempts, skip_irreducible);
+    let next_safe_command = plan_next_command(total, planned_attempts, config);
 
     RetryPlan {
         current_version: current_version.to_string(),
@@ -385,7 +385,8 @@ where
         re_quarantined_failed,
         remaining_quarantined,
     );
-    let next_safe_command = exec_next_command(remaining_quarantined, stalled, resume_recommended);
+    let next_safe_command =
+        exec_next_command(remaining_quarantined, stalled, resume_recommended, config);
 
     RetryReport {
         current_version: current_version.to_string(),
@@ -424,23 +425,35 @@ fn plan_summary(
     )
 }
 
-fn plan_next_command(total: usize, planned_attempts: usize, skip_irreducible: usize) -> String {
+/// The command that lists quarantined conversations. `cass diag --quarantine`
+/// inventories derived-asset quarantine (seed bundles, lexical generations)
+/// and never names a quarantined conversation.
+pub(crate) const QUARANTINE_LIST_COMMAND: &str = "cass quarantine list --json";
+
+/// The exact command that applies, or resumes, a pass under `config`. Plain
+/// `cass index` is not equivalent: it rescans the whole archive and retries
+/// only index-ingest OOM records.
+fn apply_command(config: &RetryConfig) -> String {
+    let mut command = "cass quarantine retry --apply --json".to_string();
+    if let Some(max_attempts) = config.max_attempts {
+        command.push_str(&format!(" --max-attempts {max_attempts}"));
+    }
+    if !config.eligible_only {
+        command.push_str(" --force-irreducible");
+    }
+    command
+}
+
+fn plan_next_command(total: usize, planned_attempts: usize, config: &RetryConfig) -> String {
     if total == 0 {
         // Nothing quarantined — readiness is the right place to look next.
         "cass status --json".to_string()
     } else if planned_attempts > 0 {
-        // Re-running the index re-attempts eligible (legacy / version-stale)
-        // entries and clears them on success — the existing, non-destructive
-        // retry trigger (matching `.3.1`'s eligible-case recommendation). A
-        // deferred-by-budget remainder is drained by re-running the same
-        // command (the durable quarantine_state.json is the checkpoint).
-        "cass index".to_string()
-    } else if skip_irreducible > 0 {
-        // Everything left is irreducible same-version — inspect, do not loop.
-        "cass diag --json --quarantine".to_string()
+        apply_command(config)
     } else {
-        // Only source-missing entries remain; nothing a retry can fix.
-        "cass diag --json --quarantine".to_string()
+        // Everything left is irreducible same-version or source-missing:
+        // nothing a retry can fix. Inspect, do not loop.
+        QUARANTINE_LIST_COMMAND.to_string()
     }
 }
 
@@ -458,21 +471,26 @@ fn exec_summary(
     )
 }
 
-fn exec_next_command(remaining: usize, stalled: bool, resume_recommended: bool) -> String {
+fn exec_next_command(
+    remaining: usize,
+    stalled: bool,
+    resume_recommended: bool,
+    config: &RetryConfig,
+) -> String {
     if remaining == 0 {
         // Quarantine drained — confirm readiness.
         "cass status --json".to_string()
     } else if stalled {
         // Retrying is not helping; inspect before looping further.
-        "cass diag --json --quarantine".to_string()
+        QUARANTINE_LIST_COMMAND.to_string()
     } else if resume_recommended {
-        // Eligible work remains under the budget cap; re-running the index
-        // resumes the bounded retry (durable state is the checkpoint).
-        "cass index".to_string()
+        // Eligible work remains under the budget cap; the same pass resumes
+        // it (durable state is the checkpoint).
+        apply_command(config)
     } else {
         // Progress made and nothing eligible deferred; the leftover is
         // irreducible / source-missing. Inspect it, do not retry blindly.
-        "cass diag --json --quarantine".to_string()
+        QUARANTINE_LIST_COMMAND.to_string()
     }
 }
 
@@ -596,6 +614,39 @@ mod tests {
         // With the override, all 4 (none source-missing) are attempted.
         assert_eq!(plan.planned_attempts, 4);
         assert_eq!(plan.skip_irreducible, 0);
+        // The next command applies this plan, override included; dropping
+        // the flag would apply a different, eligible-only plan.
+        assert_eq!(
+            plan.next_safe_command,
+            "cass quarantine retry --apply --json --force-irreducible"
+        );
+    }
+
+    /// A dry-run plan with work in it points at the command that applies that
+    /// plan, not at `cass index` (a full rescan that retries only index-ingest
+    /// OOM records).
+    #[test]
+    fn plan_with_attempts_recommends_applying_the_same_pass() {
+        let plan = plan_retry(
+            &mixed_state(),
+            CURRENT,
+            &RetryConfig::default(),
+            &no_missing(),
+        );
+        assert_eq!(plan.planned_attempts, 2);
+        assert_eq!(
+            plan.next_safe_command,
+            "cass quarantine retry --apply --json"
+        );
+        let budgeted = RetryConfig {
+            max_attempts: Some(1),
+            eligible_only: true,
+        };
+        let plan = plan_retry(&mixed_state(), CURRENT, &budgeted, &no_missing());
+        assert_eq!(
+            plan.next_safe_command,
+            "cass quarantine retry --apply --json --max-attempts 1"
+        );
     }
 
     #[test]
@@ -625,7 +676,7 @@ mod tests {
         let plan = plan_retry(&s, CURRENT, &RetryConfig::default(), &no_missing());
         assert_eq!(plan.planned_attempts, 0);
         assert_eq!(plan.skip_irreducible, 133);
-        assert_eq!(plan.next_safe_command, "cass diag --json --quarantine");
+        assert_eq!(plan.next_safe_command, QUARANTINE_LIST_COMMAND);
     }
 
     #[test]
@@ -753,7 +804,7 @@ mod tests {
         assert_eq!(rec.attempt_count, 4);
         assert!(!rec.is_version_stale_for_retry(CURRENT));
         // The stall recommendation is to inspect, not loop.
-        assert_eq!(report.next_safe_command, "cass diag --json --quarantine");
+        assert_eq!(report.next_safe_command, QUARANTINE_LIST_COMMAND);
 
         // Second pass: the same entry is now irreducible same-version and is
         // suppressed — confirming OOM re-quarantine prevents a retry storm. The
@@ -810,7 +861,10 @@ mod tests {
         assert_eq!(r1.cleared, 1);
         assert_eq!(r1.skipped_budget_exhausted, 1);
         assert!(r1.resume_recommended);
-        assert_eq!(r1.next_safe_command, "cass index");
+        assert_eq!(
+            r1.next_safe_command,
+            "cass quarantine retry --apply --json --max-attempts 1"
+        );
         assert_eq!(state.len(), 1, "one eligible entry remains for the resume");
 
         // Pass 2 (resume): re-plans against the shrunken state, attempts c-b.
@@ -962,14 +1016,19 @@ mod tests {
     fn next_commands_are_never_destructive() {
         // Exercise every command-producing branch and assert all are safe.
         let mut commands: Vec<String> = Vec::new();
-        commands.push(plan_next_command(0, 0, 0));
-        commands.push(plan_next_command(4, 2, 2));
-        commands.push(plan_next_command(4, 1, 0));
-        commands.push(plan_next_command(3, 0, 3));
-        commands.push(exec_next_command(0, false, false));
-        commands.push(exec_next_command(2, true, false));
-        commands.push(exec_next_command(2, false, true));
-        commands.push(exec_next_command(2, false, false));
+        let safe = RetryConfig::default();
+        let forced = RetryConfig {
+            max_attempts: Some(5),
+            eligible_only: false,
+        };
+        commands.push(plan_next_command(0, 0, &safe));
+        commands.push(plan_next_command(4, 2, &safe));
+        commands.push(plan_next_command(4, 1, &forced));
+        commands.push(plan_next_command(3, 0, &safe));
+        commands.push(exec_next_command(0, false, false, &safe));
+        commands.push(exec_next_command(2, true, false, &safe));
+        commands.push(exec_next_command(2, false, true, &forced));
+        commands.push(exec_next_command(2, false, false, &safe));
         for cmd in &commands {
             assert!(cmd.starts_with("cass "), "must be a cass command: {cmd}");
             for bad in [

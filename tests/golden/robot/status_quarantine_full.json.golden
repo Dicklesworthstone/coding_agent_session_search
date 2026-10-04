@@ -204,6 +204,7 @@
     "schema_version": 1,
     "status": "ok",
     "quarantined_conversations": 0,
+    "deferred_conversations": 0,
     "recent_quarantined_conversations": 0,
     "recent_window_seconds": 3600,
     "circuit_breaker_limit": 25,

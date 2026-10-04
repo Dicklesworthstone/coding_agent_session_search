@@ -1,0 +1,245 @@
+name: GH381 Windows self-update acceptance
+
+# Native acceptance for bead coding_agent_session_search-6gmrz (the GH #381
+# Windows report): `cass upgrade --yes` must run the checksum-verified
+# install.ps1 and leave the latest release installed at its default
+# destination, whatever shell launched cass.
+#
+# released: published binaries, downloaded and checksum-verified, never built.
+#   - v0.8.0 from pwsh is a negative control for the argument bug fixed in
+#     612bd808: `powershell -Command <script> <url>...` ran with empty $args.
+#   - v0.9.0 from pwsh is a negative control for the module-path bug: the
+#     Windows PowerShell child inherited PowerShell 7's PSModulePath, so
+#     Get-FileHash was not recognized, nothing installed, and cass exited 0.
+#   - v0.9.0 from Windows PowerShell 5.1 shows the argument fix on a parent
+#     that does not pollute the module path. It installs the latest release,
+#     but exits 1: v0.10.0's install.ps1 self-test reset $LASTEXITCODE at
+#     script scope and read $null back, so it failed every run as a file.
+#     Released binaries are therefore judged on what got installed.
+#   A negative control that upgrades fails its job: it could no longer tell
+#   broken from fixed.
+# source: this commit, built with its package version lowered to 0.0.1 in the
+#   CI checkout only, so the latest release is newer. It must upgrade when
+#   launched from pwsh and from Windows PowerShell 5.1.
+#
+# CI=true turns off every cass update path (updates_disabled), so each upgrade
+# step clears it for the cass child.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/update_check.rs'
+      - 'install.ps1'
+      - '.github/workflows/gh381-windows-self-update.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh381-windows-self-update-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  released:
+    name: release ${{ matrix.start }} from ${{ matrix.parent }} (${{ matrix.expect }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - start: v0.8.0
+            parent: pwsh
+            expect: fails
+          - start: v0.9.0
+            parent: pwsh
+            expect: fails
+          - start: v0.9.0
+            parent: powershell
+            expect: upgrades
+    steps:
+      - name: Download and verify the starting release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $start = Join-Path $env:RUNNER_TEMP 'start'
+          gh release download '${{ matrix.start }}' -R $env:GITHUB_REPOSITORY -p 'cass-windows-amd64.zip' -p 'cass-windows-amd64.zip.sha256' -D $start
+          if ($LASTEXITCODE -ne 0) { throw 'release download failed' }
+          $expected = ((Get-Content (Join-Path $start 'cass-windows-amd64.zip.sha256') -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash (Join-Path $start 'cass-windows-amd64.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "zip sha256 $actual does not match $expected" }
+          Expand-Archive (Join-Path $start 'cass-windows-amd64.zip') -DestinationPath (Join-Path $start 'bin')
+          $exe = Get-ChildItem (Join-Path $start 'bin') -Recurse -Filter 'cass.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'cass.exe is not in the release zip' }
+          & $exe.FullName --version
+          $latest = gh release view -R $env:GITHUB_REPOSITORY --json tagName -q .tagName
+          if ($LASTEXITCODE -ne 0 -or -not $latest) { throw 'cannot read the latest release tag' }
+          "CASS_START_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CASS_LATEST_TAG=$latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: cass upgrade --yes (from pwsh)
+        if: matrix.parent == 'pwsh'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Remove-Item Env:CI -ErrorAction SilentlyContinue
+          & $env:CASS_START_EXE upgrade --yes 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade.log')
+          "$LASTEXITCODE" | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade.exit') -Encoding ascii
+          exit 0
+
+      - name: cass upgrade --yes (from Windows PowerShell 5.1)
+        if: matrix.parent == 'powershell'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Remove-Item Env:CI -ErrorAction SilentlyContinue
+          & $env:CASS_START_EXE upgrade --yes 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade.log')
+          "$LASTEXITCODE" | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade.exit') -Encoding ascii
+          exit 0
+
+      - name: Verify the outcome
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $code = [int](Get-Content (Join-Path $env:RUNNER_TEMP 'upgrade.exit') -Raw).Trim()
+          $installed = Join-Path $HOME '.local\bin\cass.exe'
+          $want = $env:CASS_LATEST_TAG.TrimStart('v')
+          Write-Host "release ${{ matrix.start }} from ${{ matrix.parent }}: exit $code, installed=$(Test-Path $installed)"
+          if ('${{ matrix.expect }}' -eq 'upgrades') {
+            # A released cass runs the latest release's install.ps1 self-test,
+            # which (v0.10.0) exits 1 after a good install when run as a file.
+            # Released binaries are judged on what got installed; the source
+            # job below also requires exit 0.
+            if ($code -ne 0) { Write-Host "::warning::released ${{ matrix.start }} upgrade exited $code" }
+            if (-not (Test-Path $installed)) { throw "no cass.exe was installed at $installed" }
+            $version = (& $installed --version | Out-String).Trim()
+            Write-Host "installed: $version"
+            if ($version -notmatch [regex]::Escape($want)) { throw "installed '$version', expected $want" }
+          } elseif (Test-Path $installed) {
+            throw "negative control ${{ matrix.start }} from ${{ matrix.parent }} installed a release; this job can no longer tell broken from fixed"
+          }
+
+      - name: Keep the upgrade log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh381-released-${{ matrix.start }}-${{ matrix.parent }}
+          path: ${{ runner.temp }}/upgrade.*
+          if-no-files-found: warn
+          retention-days: 14
+
+  source:
+    name: this commit from pwsh and Windows PowerShell
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+        with:
+          toolchain: nightly-2026-08-31
+
+      - name: Configure Windows MSVC CRT for cc-rs
+        shell: pwsh
+        run: |
+          # Same as release.yml: esaxx-rs requests /MT via cc-rs.
+          "CRATE_CC_NO_DEFAULTS=1" >> $env:GITHUB_ENV
+          "CFLAGS=/MD" >> $env:GITHUB_ENV
+          "CXXFLAGS=/MD" >> $env:GITHUB_ENV
+
+      - name: Lower the package version so the latest release is newer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = @(Get-Content Cargo.toml)
+          $found = $false
+          for ($i = 0; $i -lt $manifest.Count; $i++) {
+            if ($manifest[$i] -match '^version = "') {
+              $manifest[$i] = 'version = "0.0.1"'
+              $found = $true
+              break
+            }
+          }
+          if (-not $found) { throw 'package version line not found' }
+          Set-Content -Path Cargo.toml -Value $manifest -Encoding utf8
+          git diff --stat
+
+      - name: Build cass
+        shell: pwsh
+        run: |
+          cargo build --bin cass
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = (Resolve-Path 'target\debug\cass.exe').Path
+          & $exe --version
+          "CASS_START_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Read the latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $latest = gh release view -R $env:GITHUB_REPOSITORY --json tagName -q .tagName
+          if ($LASTEXITCODE -ne 0 -or -not $latest) { throw 'cannot read the latest release tag' }
+          "CASS_LATEST_TAG=$latest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: cass upgrade --yes from pwsh
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Remove-Item Env:CI -ErrorAction SilentlyContinue
+          & $env:CASS_START_EXE upgrade --yes --force 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade-pwsh.log')
+          "$LASTEXITCODE" | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade-pwsh.exit') -Encoding ascii
+          exit 0
+
+      - name: Verify and remove the pwsh-launched install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $code = [int](Get-Content (Join-Path $env:RUNNER_TEMP 'upgrade-pwsh.exit') -Raw).Trim()
+          $installed = Join-Path $HOME '.local\bin\cass.exe'
+          if ($code -ne 0) { throw "upgrade from pwsh exited $code" }
+          if (-not (Test-Path $installed)) { throw "no cass.exe was installed at $installed" }
+          $version = (& $installed --version | Out-String).Trim()
+          Write-Host "installed from pwsh: $version"
+          if ($version -notmatch [regex]::Escape($env:CASS_LATEST_TAG.TrimStart('v'))) { throw "installed '$version', expected $env:CASS_LATEST_TAG" }
+          Remove-Item $installed -Force
+
+      - name: cass upgrade --yes from Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Remove-Item Env:CI -ErrorAction SilentlyContinue
+          & $env:CASS_START_EXE upgrade --yes --force 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade-powershell.log')
+          "$LASTEXITCODE" | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'upgrade-powershell.exit') -Encoding ascii
+          exit 0
+
+      - name: Verify the Windows PowerShell-launched install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $code = [int](Get-Content (Join-Path $env:RUNNER_TEMP 'upgrade-powershell.exit') -Raw).Trim()
+          $installed = Join-Path $HOME '.local\bin\cass.exe'
+          if ($code -ne 0) { throw "upgrade from Windows PowerShell exited $code" }
+          if (-not (Test-Path $installed)) { throw "no cass.exe was installed at $installed" }
+          $version = (& $installed --version | Out-String).Trim()
+          Write-Host "installed from Windows PowerShell: $version"
+          if ($version -notmatch [regex]::Escape($env:CASS_LATEST_TAG.TrimStart('v'))) { throw "installed '$version', expected $env:CASS_LATEST_TAG" }
+
+      - name: Keep the upgrade logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh381-source-${{ github.sha }}
+          path: ${{ runner.temp }}/upgrade-*
+          if-no-files-found: warn
+          retention-days: 14

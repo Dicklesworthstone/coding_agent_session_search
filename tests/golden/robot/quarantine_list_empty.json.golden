@@ -4,5 +4,18 @@
   "quarantined_conversations": 0,
   "circuit_breaker_active": false,
   "recommended_action": null,
-  "entries": []
+  "status": {
+    "total_excluded_conversations": 0,
+    "by_cause": {},
+    "by_version_bucket": {},
+    "by_schema_version": {},
+    "by_eligibility": {},
+    "source_missing_count": 0,
+    "retryable_now": 0,
+    "representative_entries": [],
+    "eligibility_reason": "no quarantined conversations",
+    "next_safe_command": "cass status --json"
+  },
+  "entries": [],
+  "deferred": []
 }

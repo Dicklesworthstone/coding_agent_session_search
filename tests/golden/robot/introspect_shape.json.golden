@@ -54284,6 +54284,14 @@
                             }
                           }
                         },
+                        "deferred_conversations": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "recent_quarantined_conversations": {
                           "type": "object",
                           "properties": {
@@ -56042,6 +56050,14 @@
                                   }
                                 },
                                 "quarantined_conversations": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "deferred_conversations": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -62454,6 +62470,14 @@
                                             }
                                           }
                                         },
+                                        "deferred_conversations": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
                                         "recent_quarantined_conversations": {
                                           "type": "object",
                                           "properties": {
@@ -65414,6 +65438,14 @@
                           }
                         },
                         "quarantined_conversations": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "deferred_conversations": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -69956,6 +69988,14 @@
                             }
                           }
                         },
+                        "deferred_conversations": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "recent_quarantined_conversations": {
                           "type": "object",
                           "properties": {
@@ -74482,6 +74522,14 @@
                                   }
                                 },
                                 "quarantined_conversations": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "deferred_conversations": {
                                   "type": "object",
                                   "properties": {
                                     "type": {

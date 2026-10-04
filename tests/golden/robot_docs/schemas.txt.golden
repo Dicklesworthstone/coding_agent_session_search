@@ -2873,6 +2873,7 @@ schemas: (auto-generated from contract)
     - ingest_quarantine: object
       - circuit_breaker_active: boolean
       - circuit_breaker_limit: integer
+      - deferred_conversations: integer
       - newest_last_attempt_at_ms: ?
       - quarantine_files: array
       - quarantined_conversations: integer
@@ -3024,6 +3025,7 @@ schemas: (auto-generated from contract)
       - ingest_quarantine: object
         - circuit_breaker_active: boolean
         - circuit_breaker_limit: integer
+        - deferred_conversations: integer
         - newest_last_attempt_at_ms: ?
         - quarantine_files: array
         - quarantined_conversations: integer
@@ -3553,6 +3555,7 @@ schemas: (auto-generated from contract)
     - ingest_quarantine: object
       - circuit_breaker_active: boolean
       - circuit_breaker_limit: integer
+      - deferred_conversations: integer
       - newest_last_attempt_at_ms: ?
       - quarantine_files: array
       - quarantined_conversations: integer
@@ -3949,6 +3952,7 @@ schemas: (auto-generated from contract)
     - ingest_quarantine: object
       - circuit_breaker_active: boolean
       - circuit_breaker_limit: integer
+      - deferred_conversations: integer
       - newest_last_attempt_at_ms: ?
       - quarantine_files: array
       - quarantined_conversations: integer
@@ -4219,6 +4223,7 @@ schemas: (auto-generated from contract)
       - ingest_quarantine: object
         - circuit_breaker_active: boolean
         - circuit_breaker_limit: integer
+        - deferred_conversations: integer
         - inspected: boolean
         - newest_last_attempt_at_ms: ?
         - quarantine_files: array

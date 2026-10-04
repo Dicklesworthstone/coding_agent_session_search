@@ -191,11 +191,12 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 **Dependency source contract:**
 
-Dependency update (2026-09-28): Cargo.toml and Cargo.lock pin the entire
-SQLite family, including `fsqlite-types`, at `=0.4.6`, with Asupersync `=0.5.0`.
-All 26 public SQLite packages are published at 0.4.6; the v0.4.6 tag points to
-`7a28b76dd9c9c747a2b2524db527da9a3e3b583d`. FAD `=0.3.2` accepts the family.
-The lockfile resolves the 20 SQLite packages used by CASS at 0.4.6.
+Dependency update (2026-10-04): Cargo.toml and Cargo.lock pin the entire
+SQLite family, including `fsqlite-types`, at `=0.4.9`, with Asupersync `=0.5.0`.
+All 26 public SQLite packages are published at 0.4.9 (replacing the withdrawn
+0.4.8); the v0.4.9 tag points to `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`.
+FAD `=0.3.3` accepts the family.
+The lockfile resolves the 20 SQLite packages used by CASS at 0.4.9.
 Full runtime qualification and the strict UBS gate remain pending. Do not
 publish a release candidate until those gates pass.
 SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
@@ -203,17 +204,23 @@ SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
 repair, but damaged-archive recovery remains unproven. SQLite 0.4.4 adds
 durable pending-freelist repairs; 0.4.6 stops a live B-tree page from being
 freed and granted again across a WAL generation (bd-b5vmw) and fixes the
-lost-index-entry race (bd-11sz4). Upstream bd-4iaoi (fix pending for 0.4.7,
-also present in 0.4.4): explicit `BEGIN IMMEDIATE`/`EXCLUSIVE` DDL can miss
-rows a same-process connection autocommits concurrently. Not yet released:
-the GH#503 legacy shadow-autoindex repair open (cbd0b98dc), the bounded
-published-page plane (ad3f23ca9, bead 5s1la) and the first-`sqlite_master`
-full-file read fix (ec4956420, bead xcqqa). The strict family guard requires
-uniform 0.4.6 registry versions.
+lost-index-entry race (bd-11sz4). 0.4.7 keeps index entries whole in large
+multi-row INSERTs (register writes past 65,535 were dropped since February:
+bd-2eebi), fixes the serialized-DDL index race (bd-4iaoi), lets the
+deferred-FTS5 repair open bind the GH#503 legacy shadow autoindex (cbd0b98dc;
+`doctor --rebuild-canonical-fts` now repairs that catalog in place), bounds
+the published-page plane (ad3f23ca9, bead 5s1la) and stops a connection's
+first `sqlite_master` query from reading the whole file (ec4956420, k2k20).
+CASS skipped 0.4.7 because its strict read-only opens spent ~30 s on a stale
+WAL index (0853f5e8e). 0.4.9 refuses that index promptly again (48c6cf6b2) and
+lets the first write after stock SQLite opened the archive read-only
+establish the WAL generation instead of failing `BusyRecovery` on every later
+commit (frankensqlite GH#443, 4b48c95d8; cass GH#509/#508).
+The strict family guard requires uniform 0.4.9 registry versions.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.6` (tag v0.4.6 = `7a28b76dd9c9c747a2b2524db527da9a3e3b583d`); `build.rs` refuses a mixed family. Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs and 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes. CASS runtime qualification of 0.4.6 is pending. 0.4.6 includes upstream's likely fix (fd8c16a94) for a long-lived connection left refusing every BEGIN (2l1b0.75, frankensqlite GH#429), not yet verified on the owner-archive scenario; the legacy OMP analytics phase keeps its own fresh writer regardless |
+| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.9` (tag v0.4.9 = `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`); `build.rs` refuses a mixed family. Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded published-page plane (5s1la) and first-`sqlite_master` full-file read fix (k2k20), and 0.4.9's prompt stale-WAL-index refusal (48c6cf6b2) and stock-empty-WAL-index first-write fix (4b48c95d8, cass GH#509). CASS runtime qualification of 0.4.9 is pending. 0.4.6 included upstream's likely fix (fd8c16a94) for a long-lived connection left refusing every BEGIN (2l1b0.75, frankensqlite GH#429), not yet verified on the owner-archive scenario; the legacy OMP analytics phase keeps its own fresh writer regardless |
 | `franken-agent-detection` | crates.io `=0.3.3` (indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x requires) |
 | `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.4`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.3.4 is a hotfix published from tag `frankensearch-quill-v0.3.4`: 0.3.2 (frankensearch-v0.6.1 + the GH#499 tombstone-domain fix), plus 0.3.3's standard CASS Boolean grammar (NOT > AND > OR, parentheses), plus the union seek_danger fix (a disjunction under a conjunction lost matches on concat-merged segments). The next quill release from frankensearch main must be >= 0.3.5 and must carry both (frankensearch#56, and the union issue linked there) |
