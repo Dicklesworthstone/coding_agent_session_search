@@ -43,6 +43,65 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   reports another index run holding the lock. A busy database is reported
   as such, with the child's error message, and an exit 7 without a message
   claims no cause.
+- **`cass index` keeps committing after another tool reads the archive
+  read-only (#509).** With fsqlite 0.4.6, a stock SQLite read-only query on
+  an archive whose WAL was empty left a WAL-index header the old writer
+  could not accept. Every later `cass index` then failed with
+  `BusyRecovery` until the `-shm` file was moved aside. cass now builds on
+  frankensqlite 0.4.9 (tag v0.4.9, `1eacdbe0`), which accepts that header.
+  `frankensqlite_compat_gates` reproduces the sequence: cass write,
+  checkpoint, stock read-only query, three cass commits. It fails on 0.4.6
+  and passes on 0.4.9. 0.4.7 was skipped because of its read-only
+  regression; 0.4.9 contains that fix.
+- **`cass doctor` repairs a 0.6.24-era archive with the #434 autoindex
+  signature in place (#503).** The engine repair for the missing FTS5
+  shadow autoindex ships in frankensqlite 0.4.9, so doctor now offers it.
+- **Doctor run-history verbs parse as documented.** `cass doctor ls`,
+  `undo`, `diff`, `explain`, `watch`, `capabilities` and
+  `gc --before <ts>` are what `cass robot-docs` documents. They failed with
+  "unexpected argument"; they now map to the doctor flags and the mapping
+  is reported on stderr. `cass search --help` no longer points at the
+  nonexistent `cass models --list`.
+- **Health points quarantined conversations at a command that lists them.**
+  `search_completeness.next_command` in health, status and
+  `search --robot-meta` sent agents to `cass diag --json --quarantine`.
+  That command inventories derived assets and never names a conversation.
+  It now points at `cass quarantine list --json`. That list gains a `status`
+  grouping by cause, version and retry eligibility, with `retryable_now`
+  and a next command. The next command is `cass quarantine retry --json`
+  only when a retry can help: a row whose source file is gone does not
+  count.
+- **`cass quarantine retry` recommends the command that applies its plan.**
+  After a dry run it recommended `cass index`, a whole-archive rescan that
+  retries only index-ingest OOM records. It now recommends
+  `cass quarantine retry --apply --json` with the same `--max-attempts` and
+  `--force-irreducible` options.
+- **A conversation the watcher keeps deferring after a bounded-guard NoMem
+  backs off (#510).** Every watch tick re-ran the batch split, the solo
+  retry and the deferral for it, holding a core for hours and writing
+  hundreds of MB of identical warnings. A deferral is now counted and
+  retried after 1 minute, doubling to at most 1 hour. The warning repeats
+  on the 1st, 2nd, 4th, 8th... deferral and names `FSQLITE_PAGE_BUFFER_MAX`.
+  `cass quarantine list` shows deferred conversations, which are still
+  never quarantined. A clean later batch also no longer advances the watch
+  watermark past an earlier deferred one.
+- **An interrupted expected-docs scan resumes (#381).** On a large archive
+  the first noise-adjusted document count could outlive a caller's
+  timeout, and the next run started over. The scan now saves its position
+  every few seconds and continues from it if the archive has only grown
+  since. It also reports activity to the stall watchdog.
+
+### Changed
+
+- **`swarm lint`, `evidence`, `proof-debt` and `failure-patterns` read the
+  live repository.** Outside fixtures they reported every provider as
+  `live-provider-unimplemented` and found nothing. They now share the live
+  Git, Beads, RCH, Agent Mail and health collection that `swarm status`
+  uses.
+- **`cass sources doctor` checks sources.toml itself.** It now reports a
+  missing `rsync`/`scp`, an interrupted setup and leftover
+  `.sources.toml.tmp*` files as `config_validation`. Validation errors make
+  it exit 1.
 
 ## [v0.10.0] -- 2026-10-01
 
