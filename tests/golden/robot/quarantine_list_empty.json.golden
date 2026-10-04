@@ -16,5 +16,6 @@
     "eligibility_reason": "no quarantined conversations",
     "next_safe_command": "cass status --json"
   },
-  "entries": []
+  "entries": [],
+  "deferred": []
 }

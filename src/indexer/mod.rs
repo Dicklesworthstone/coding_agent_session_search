@@ -27620,13 +27620,16 @@ fn ingest_watch_batch_with_oom_split_inner(
     };
 
     match batch_result {
-        Ok(batch_outcome) => Ok(WatchIngestBatchOutcome {
-            batch_outcome,
-            processed_conversations: convs.len(),
-            quarantined_conversations: 0,
-            deferred_conversations: 0,
-            max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
-        }),
+        Ok(batch_outcome) => {
+            clear_watch_nomem_deferrals(data_dir, convs);
+            Ok(WatchIngestBatchOutcome {
+                batch_outcome,
+                processed_conversations: convs.len(),
+                quarantined_conversations: 0,
+                deferred_conversations: 0,
+                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+            })
+        }
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
             let split_at = convs.len() / 2;
             tracing::warn!(
@@ -27750,15 +27753,40 @@ fn ingest_watch_batch_with_oom_split_inner(
                         None => !small_conversation,
                     };
                     if !should_quarantine {
-                        tracing::warn!(
-                            agent = %conv.agent_slug,
-                            external_id = conv.external_id.as_deref().unwrap_or(""),
-                            source_path = %conv.source_path.display(),
+                        // GH#510: back off instead of replaying this on every
+                        // tick, and warn only on the 1st, 2nd, 4th, 8th, ...
+                        // deferral rather than once per tick.
+                        let deferral = record_watch_nomem_deferral(
+                            data_dir,
+                            conv,
                             indexed_text_bytes,
-                            real_memory_pressure = ?real_pressure,
-                            error = %solo_error,
-                            "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
+                            FrankenStorage::now_millis(),
                         );
+                        let retry_in_secs = deferral
+                            .next_retry_at_ms
+                            .saturating_sub(deferral.last_deferred_at_ms)
+                            / 1_000;
+                        if deferral.deferrals.is_power_of_two() {
+                            tracing::warn!(
+                                agent = %conv.agent_slug,
+                                external_id = conv.external_id.as_deref().unwrap_or(""),
+                                source_path = %conv.source_path.display(),
+                                indexed_text_bytes,
+                                real_memory_pressure = ?real_pressure,
+                                deferrals = deferral.deferrals,
+                                retry_in_secs,
+                                error = %solo_error,
+                                "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) with backoff (#298, GH#510). An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger; `cass quarantine list --json` lists deferred conversations"
+                            );
+                        } else {
+                            tracing::debug!(
+                                agent = %conv.agent_slug,
+                                source_path = %conv.source_path.display(),
+                                deferrals = deferral.deferrals,
+                                retry_in_secs,
+                                "watch conversation deferred again after bounded-allocation NoMem (GH#510)"
+                            );
+                        }
                         if let Some(progress) = progress {
                             progress.current.fetch_add(1, Ordering::Relaxed);
                         }
@@ -27933,6 +27961,155 @@ fn watch_oom_real_pressure_reserve_bytes() -> u64 {
 fn watch_oom_under_real_memory_pressure() -> Option<bool> {
     let available = responsiveness::available_memory_bytes()?;
     Some(available <= watch_oom_real_pressure_reserve_bytes())
+}
+
+/// GH#510: a bounded-guard NoMem that recurs deterministically is deferred,
+/// never quarantined (#298/#364). The deferral holds the watch watermark, so
+/// without a ledger every tick replays the batch split, the solo retry and the
+/// deferral forever. The ledger records each deferral and the next time the
+/// conversation may be attempted again.
+pub(crate) const WATCH_NOMEM_DEFERRALS_FILE: &str = "watch_nomem_deferrals.json";
+const WATCH_NOMEM_DEFERRAL_BASE_BACKOFF_MS: i64 = 60_000;
+const WATCH_NOMEM_DEFERRAL_MAX_BACKOFF_MS: i64 = 3_600_000;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WatchNomemDeferrals {
+    #[serde(default)]
+    pub(crate) entries: BTreeMap<String, WatchNomemDeferral>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WatchNomemDeferral {
+    pub(crate) agent: String,
+    pub(crate) source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_id: Option<String>,
+    pub(crate) deferrals: u32,
+    pub(crate) first_deferred_at_ms: i64,
+    pub(crate) last_deferred_at_ms: i64,
+    pub(crate) next_retry_at_ms: i64,
+    pub(crate) indexed_text_bytes: usize,
+}
+
+impl WatchNomemDeferrals {
+    pub(crate) fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join("quarantine").join(WATCH_NOMEM_DEFERRALS_FILE)
+    }
+
+    /// A missing or unreadable ledger is empty: losing it costs one more
+    /// attempt per conversation, never a conversation.
+    pub(crate) fn load(data_dir: &Path) -> Self {
+        fs::read(Self::path(data_dir))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, data_dir: &Path) {
+        let path = Self::path(data_dir);
+        if let Err(error) = write_json_pretty_atomically(&path, self) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to persist the watch NoMem deferral ledger; deferred conversations retry on the next tick"
+            );
+        }
+    }
+}
+
+fn watch_nomem_deferral_key(conv: &NormalizedConversation) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        conv.agent_slug,
+        conv.source_path.display(),
+        conv.external_id.as_deref().unwrap_or("")
+    )
+}
+
+/// 1 min after the first deferral, doubling up to 1 h.
+fn watch_nomem_deferral_backoff_ms(deferrals: u32) -> i64 {
+    let doublings = deferrals.saturating_sub(1).min(16);
+    WATCH_NOMEM_DEFERRAL_BASE_BACKOFF_MS
+        .saturating_mul(1_i64 << doublings)
+        .min(WATCH_NOMEM_DEFERRAL_MAX_BACKOFF_MS)
+}
+
+/// Count one more deferral of `conv` and schedule its next attempt.
+fn record_watch_nomem_deferral(
+    data_dir: &Path,
+    conv: &NormalizedConversation,
+    indexed_text_bytes: usize,
+    now_ms: i64,
+) -> WatchNomemDeferral {
+    let mut ledger = WatchNomemDeferrals::load(data_dir);
+    let entry = ledger
+        .entries
+        .entry(watch_nomem_deferral_key(conv))
+        .or_insert_with(|| WatchNomemDeferral {
+            agent: conv.agent_slug.clone(),
+            source_path: conv.source_path.display().to_string(),
+            external_id: conv.external_id.clone(),
+            deferrals: 0,
+            first_deferred_at_ms: now_ms,
+            last_deferred_at_ms: now_ms,
+            next_retry_at_ms: now_ms,
+            indexed_text_bytes,
+        });
+    entry.deferrals = entry.deferrals.saturating_add(1);
+    entry.last_deferred_at_ms = now_ms;
+    entry.indexed_text_bytes = indexed_text_bytes;
+    entry.next_retry_at_ms =
+        now_ms.saturating_add(watch_nomem_deferral_backoff_ms(entry.deferrals));
+    let recorded = entry.clone();
+    ledger.save(data_dir);
+    recorded
+}
+
+/// Forget deferrals for conversations that just ingested.
+fn clear_watch_nomem_deferrals(data_dir: &Path, convs: &[NormalizedConversation]) {
+    if !WatchNomemDeferrals::path(data_dir).exists() {
+        return;
+    }
+    let mut ledger = WatchNomemDeferrals::load(data_dir);
+    let before = ledger.entries.len();
+    for conv in convs {
+        ledger.entries.remove(&watch_nomem_deferral_key(conv));
+    }
+    if ledger.entries.len() != before {
+        ledger.save(data_dir);
+    }
+}
+
+/// Hold back conversations still inside their deferral backoff and return
+/// how many were held. The caller counts them as deferred, so the watch
+/// watermark stays where it is and they are scanned again later.
+fn retain_watch_conversations_past_nomem_backoff(
+    data_dir: &Path,
+    convs: &mut Vec<NormalizedConversation>,
+    now_ms: i64,
+) -> usize {
+    if !WatchNomemDeferrals::path(data_dir).exists() {
+        return 0;
+    }
+    let ledger = WatchNomemDeferrals::load(data_dir);
+    if ledger.entries.is_empty() {
+        return 0;
+    }
+    let before = convs.len();
+    convs.retain(|conv| {
+        ledger
+            .entries
+            .get(&watch_nomem_deferral_key(conv))
+            .is_none_or(|entry| entry.next_retry_at_ms <= now_ms)
+    });
+    let held = before - convs.len();
+    if held > 0 {
+        tracing::debug!(
+            held,
+            "watch conversations are waiting out their NoMem deferral backoff (GH#510)"
+        );
+    }
+    held
 }
 
 fn error_message_is_exact_out_of_memory(message: &str) -> bool {
@@ -30405,6 +30582,21 @@ fn reindex_paths_with_semantic_delta(
             sort_watch_conversations_for_watermark(&mut convs);
         }
 
+        // GH#510: a conversation whose bounded-guard NoMem keeps recurring
+        // waits out its deferral backoff instead of re-running the split, solo
+        // retry and deferral on every tick. It counts as deferred so the
+        // watermark stays held for it. An explicit --watch-once is an
+        // operator's retry and is never held back.
+        let nomem_backoff_held = if explicit_watch_once {
+            0
+        } else {
+            retain_watch_conversations_past_nomem_backoff(
+                &opts.data_dir,
+                &mut convs,
+                FrankenStorage::now_millis(),
+            )
+        };
+
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
             p.total.fetch_add(convs.len(), Ordering::Relaxed);
@@ -30443,7 +30635,7 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
-        let mut deferred_conversations = 0usize;
+        let mut deferred_conversations = nomem_backoff_held;
         let mut lexical_replay_deferred = false;
         {
             let storage = storage
@@ -30609,11 +30801,18 @@ fn reindex_paths_with_semantic_delta(
                     )?;
                 }
 
+                // Conversations are sorted by watermark, so a clean later
+                // chunk must not advance past an earlier (or backed-off)
+                // deferred one, which would drop it from every later scan:
+                // the cumulative deferral count gates this. Quarantined
+                // conversations keep the per-chunk gate: they have no backoff,
+                // so holding the watermark for them would re-attempt them on
+                // every tick.
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
                     && !lexical_replay_deferred
                     && chunk_outcome.quarantined_conversations == 0
-                    && chunk_outcome.deferred_conversations == 0
+                    && deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
@@ -62179,6 +62378,144 @@ mod tests {
                 .exists(),
             "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
         );
+    }
+
+    /// GH#510: a deterministic bounded-guard NoMem used to re-run the split,
+    /// the solo retry and the deferral on every watch tick forever. A
+    /// deferred conversation now waits out an exponential backoff (counted in
+    /// a ledger) without an ingest attempt, keeps the watermark held, and is
+    /// forgotten once it ingests.
+    #[test]
+    #[serial]
+    fn watch_reindex_backs_off_a_repeatedly_deferred_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-backoff");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-oom-defer-backoff.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-oom-defer-backoff","messages":[{{"role":"user","text":"back off","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+        let tick = || {
+            reindex_paths(
+                &opts,
+                vec![amp_file.clone()],
+                &roots,
+                &state,
+                &storage,
+                &t_index,
+                &index_path,
+                false,
+            )
+            .unwrap()
+        };
+        let only_entry = || {
+            let ledger = WatchNomemDeferrals::load(&data_dir);
+            assert_eq!(ledger.entries.len(), 1, "one deferred conversation");
+            ledger.entries.into_values().next().unwrap()
+        };
+        let expire_backoff = || {
+            let mut ledger = WatchNomemDeferrals::load(&data_dir);
+            for entry in ledger.entries.values_mut() {
+                entry.next_retry_at_ms = 0;
+            }
+            ledger.save(&data_dir);
+        };
+
+        // Tick 1: attempted, deferred, scheduled one minute out.
+        assert_eq!(tick(), 1);
+        let first = only_entry();
+        assert_eq!(first.deferrals, 1);
+        assert_eq!(first.next_retry_at_ms - first.last_deferred_at_ms, 60_000);
+        assert!(load_watch_state(&data_dir).is_empty());
+
+        // Tick 2, inside the backoff: no ingest attempt. An attempt would
+        // NoMem again under the injection and count a second deferral.
+        assert_eq!(tick(), 0, "a backed-off conversation is not ingested");
+        assert_eq!(only_entry(), first, "no attempt inside the backoff");
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "the watermark stays held for a backed-off conversation"
+        );
+
+        // Backoff elapsed: attempted again, and the backoff doubles.
+        expire_backoff();
+        assert_eq!(tick(), 1);
+        let second = only_entry();
+        assert_eq!(second.deferrals, 2);
+        assert_eq!(second.first_deferred_at_ms, first.first_deferred_at_ms);
+        assert_eq!(
+            second.next_retry_at_ms - second.last_deferred_at_ms,
+            120_000
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "backoff never turns a bounded-guard NoMem into a quarantine"
+        );
+
+        // The trigger goes away: the next attempt ingests, the ledger forgets
+        // the conversation and the watermark advances.
+        drop(solo_oom_guard);
+        drop(oom_guard);
+        expire_backoff();
+        assert_eq!(tick(), 1);
+        assert!(WatchNomemDeferrals::load(&data_dir).entries.is_empty());
+        assert!(
+            load_watch_state(&data_dir).contains_key(&ConnectorKind::Amp),
+            "the watermark advances once the deferred conversation ingests"
+        );
+    }
+
+    #[test]
+    fn watch_nomem_deferral_backoff_doubles_to_one_hour() {
+        let backoffs: Vec<i64> = (1..=8).map(watch_nomem_deferral_backoff_ms).collect();
+        assert_eq!(
+            backoffs,
+            [
+                60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000, 3_600_000
+            ]
+        );
+        assert_eq!(watch_nomem_deferral_backoff_ms(u32::MAX), 3_600_000);
     }
 
     /// #364 gate: a *large* conversation whose solo isolate-retry also OOMs

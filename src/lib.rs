@@ -9664,6 +9664,13 @@ fn run_quarantine_list(
         env!("CARGO_PKG_VERSION"),
         &crate::indexer::quarantine_source_missing_ids(&data_dir),
     );
+    // GH#510: conversations the watcher keeps deferring after a bounded-guard
+    // NoMem are not quarantined, but they are missing from search until one
+    // ingests.
+    let deferred: Vec<_> = crate::indexer::WatchNomemDeferrals::load(&data_dir)
+        .entries
+        .into_values()
+        .collect();
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -9681,6 +9688,7 @@ fn run_quarantine_list(
             "recommended_action": summary.recommended_action,
             "status": status,
             "entries": entries,
+            "deferred": deferred,
         });
         return output_structured_value(payload, fmt);
     }
@@ -9688,6 +9696,22 @@ fn run_quarantine_list(
     println!("CASS Conversation Quarantine");
     println!("============================");
     println!();
+    if !deferred.is_empty() {
+        println!(
+            "Deferred by the watcher after repeated NoMem (not quarantined): {}",
+            deferred.len()
+        );
+        for entry in &deferred {
+            println!(
+                "  {} ({}, deferrals={})",
+                entry.source_path, entry.agent, entry.deferrals
+            );
+        }
+        println!(
+            "  An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger."
+        );
+        println!();
+    }
     if entries.is_empty() {
         println!("No quarantined conversations.");
         return Ok(());
