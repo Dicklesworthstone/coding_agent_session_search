@@ -11587,7 +11587,7 @@ fn run_swarm_lint(
         let collection = set.collect_required();
         render_swarm_lint_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_lint_live_partial(bead)
+        render_swarm_lint_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11644,7 +11644,7 @@ fn run_swarm_evidence(
         let collection = set.collect_required();
         render_swarm_evidence_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_evidence_live_partial(bead)
+        render_swarm_evidence_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11700,7 +11700,7 @@ fn run_swarm_proof_debt(
         let collection = set.collect_required();
         render_swarm_proof_debt_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_proof_debt_live_partial(bead)
+        render_swarm_proof_debt_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11762,7 +11762,7 @@ fn run_swarm_failure_patterns(
             bead,
         )
     } else {
-        render_swarm_failure_patterns_live_partial(bead)
+        render_swarm_failure_patterns_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -12417,19 +12417,20 @@ pub fn render_swarm_status_live_partial() -> serde_json::Value {
     )
 }
 
-/// CLI-only collection; the TUI's initial model must remain allocation-only.
-fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
+/// The bounded live provider collection every `swarm` read surface shares:
+/// the current repository's git and Beads state, Agent Mail metadata,
+/// process pressure, proof evidence and passive CASS health. CLI-only; the
+/// TUI's initial model must remain allocation-only.
+fn collect_swarm_sources_live(cli: &Cli) -> crate::swarm_status::SwarmSourceCollection {
     use crate::swarm_status::{
-        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmProviderName, SwarmProviderStatus,
-        SwarmSourceCollection, SwarmSourceSnapshot,
+        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
     };
-    let started = std::time::Instant::now();
     let data_dir = resolve_data_dir(&None, cli.db.as_ref());
     let db_path = cli
         .db
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let collection = match std::env::current_dir() {
+    match std::env::current_dir() {
         Ok(repo) => {
             crate::swarm_status::collect_live_swarm_sources(&repo, Some((&data_dir, &db_path)))
         }
@@ -12447,7 +12448,13 @@ fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
                 })
                 .collect(),
         },
-    };
+    }
+}
+
+fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
+    use crate::swarm_status::{SwarmProviderName, SwarmProviderStatus};
+    let started = std::time::Instant::now();
+    let collection = collect_swarm_sources_live(cli);
     let mut payload = render_swarm_status_payload(
         "live",
         "Bounded live source collection",
@@ -12621,29 +12628,9 @@ fn render_swarm_work_packet_fixture(
     render_swarm_work_packet_from_status(&status, bead_filter)
 }
 
-fn render_swarm_lint_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    use crate::swarm_status::{REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection};
-
-    let collection = SwarmSourceCollection {
-        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-            .iter()
-            .copied()
-            .map(swarm_lint_live_unavailable_snapshot)
-            .collect(),
-    };
-
+fn render_swarm_lint_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    let collection = collect_swarm_sources_live(cli);
     render_swarm_lint_payload("live", &collection, None, bead_filter, true)
-}
-
-fn swarm_lint_live_unavailable_snapshot(
-    provider: crate::swarm_status::SwarmProviderName,
-) -> crate::swarm_status::SwarmSourceSnapshot {
-    crate::swarm_status::SwarmSourceSnapshot::unavailable(
-        provider,
-        format!("live:{}", provider.fixture_key()),
-        "live-provider-unimplemented",
-        format!("live provider {provider} is not wired yet; fixture-backed lint is available"),
-    )
 }
 
 fn render_swarm_lint_fixture(
@@ -12661,31 +12648,11 @@ fn render_swarm_lint_fixture(
     )
 }
 
-fn render_swarm_evidence_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    use crate::swarm_status::{
-        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
-    };
-
-    let collection = SwarmSourceCollection {
-        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-            .iter()
-            .copied()
-            .map(|provider| {
-                SwarmSourceSnapshot::unavailable(
-                    provider,
-                    format!("live:{}", provider.fixture_key()),
-                    "live-provider-unimplemented",
-                    format!(
-                        "live provider {provider} is not wired yet; fixture-backed evidence is available"
-                    ),
-                )
-            })
-            .collect(),
-    };
-
+fn render_swarm_evidence_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    let collection = collect_swarm_sources_live(cli);
     render_swarm_evidence_payload(
         "live",
-        "Live swarm evidence with unavailable providers",
+        "Bounded live source collection",
         &collection,
         None,
         bead_filter,
@@ -12709,8 +12676,8 @@ fn render_swarm_evidence_fixture(
     )
 }
 
-fn render_swarm_proof_debt_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(bead_filter))
+fn render_swarm_proof_debt_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(cli, bead_filter))
 }
 
 fn render_swarm_proof_debt_fixture(
@@ -12730,8 +12697,11 @@ fn render_swarm_proof_debt_fixture(
     render_swarm_proof_debt_from_evidence(evidence)
 }
 
-fn render_swarm_failure_patterns_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    let evidence = render_swarm_evidence_live_partial(bead_filter);
+fn render_swarm_failure_patterns_live_partial(
+    cli: &Cli,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let evidence = render_swarm_evidence_live_partial(cli, bead_filter);
     render_swarm_failure_patterns_from_evidence(evidence, Vec::new())
 }
 

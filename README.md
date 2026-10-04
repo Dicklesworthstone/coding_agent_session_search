@@ -1136,8 +1136,10 @@ cass swarm lint --json --bead coding_agent_session_search-example
 cass swarm dependency-drift --json
 ```
 
-`swarm status` and `swarm work-packet` collect bounded read-only Git state and
-Beads exports when run from the repository root without a fixture. Git uses
+`swarm status`, `swarm work-packet`, `swarm lint`, `swarm evidence`,
+`swarm proof-debt` and `swarm failure-patterns` collect the same bounded
+read-only Git state and Beads exports when run from the repository root
+without a fixture. Git uses
 porcelain-v2 with optional locks disabled. Beads uses `br 0.6.x --no-db`, so its
 JSONL snapshot is explicitly partial: unexported database changes may exist.
 Recheck Beads and reservations before claiming work. Child commands share a
@@ -1158,8 +1160,9 @@ pages are refused. The total reservation count remains unknown; source metadata
 reports only the observed active count. Activity and expiry use
 the observation time. Task descriptions, reservation reasons and message bodies
 are omitted. These observations do not authorize claims or establish proof.
-CASS evidence remains unwired. `swarm lint` still uses the placeholder
-live snapshot. Fixture selection (`--fixture <file>` or `--fixture-dir <dir>
+CASS evidence remains unwired. Live lint marks itself partial and adds an
+`agent-mail-unavailable` advisory whenever Agent Mail messages are not
+collected. Fixture selection (`--fixture <file>` or `--fixture-dir <dir>
 --fixture-id <id>`) retains deterministic behavior; `swarm dependency-drift`
 also has a live path.
 
@@ -3098,7 +3101,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `introspect` | Full API schema: commands, arguments, response shapes |
 | `swarm status --json` | Read-only shared-repo operations snapshot across Beads, Agent Mail metadata, git, build pressure, cass readiness, and proof refs |
 | `swarm work-packet --json` | Advisory one-agent packet with readiness, suggested reservations, verification commands, and closeout checklist; it does not claim or reserve |
-| `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps. Only fixture input (`--fixture`, `--fixture-dir --fixture-id`) is linted today; the live path reports every provider `live-provider-unimplemented` and finds nothing |
+| `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps. Without a fixture it lints the repository's live Git, Beads, Agent Mail and evidence providers (the same bounded collection as `swarm status`); `--fixture`, `--fixture-dir --fixture-id` lint recorded input |
 | `swarm dependency-drift --json` | Read-only sibling dependency sentinel for Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations |
 | `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
