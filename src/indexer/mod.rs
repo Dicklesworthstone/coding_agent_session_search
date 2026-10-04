@@ -35191,9 +35191,12 @@ pub mod persist {
             let is_last = index == last_part;
             // An inline rebuild replays each touched conversation in full from
             // the canonical rows (streamed in bounded chunks); replaying it
-            // after every slice would be quadratic. Earlier parts only store
-            // rows and the final part's replay covers every slice.
-            let part_strategy = if !is_last
+            // after every slice would be quadratic. A giant conversation's
+            // earlier slices only store rows, and its final slice replays the
+            // whole conversation. A part replays only its own conversations,
+            // so runs of ordinary conversations, and a final slice that is not
+            // the batch's last part, keep the inline rebuild.
+            let part_strategy = if matches!(part, Part::Slice { finishes: None, .. })
                 && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan
             {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
@@ -36563,6 +36566,98 @@ pub mod persist {
                     assert_eq!(stored(&resumed), expected, "{label}: resumed");
                     assert_eq!(resumed_docs, whole_docs, "{label}: resumed");
                     assert_eq!(outcomes[1].inserted_messages, 29, "{label}: resumed");
+                }
+            }
+        }
+
+        /// An inline rebuild of one batch that holds a giant conversation must
+        /// index every conversation in the batch, not only those in its last
+        /// part: the ordinary runs around the giant one, and a giant
+        /// conversation whose final slice is not the batch's last part.
+        #[test]
+        #[serial]
+        fn sliced_inline_rebuild_batch_indexes_every_conversation() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _begin = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let limits = PersistSliceLimits {
+                messages: 7,
+                content_bytes: usize::MAX,
+            };
+            let conversation =
+                |dir: &std::path::Path, name: &str, count: i64| NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(format!("batch-{name}")),
+                    title: Some(format!("Batch {name}")),
+                    workspace: Some(dir.join("workspace")),
+                    source_path: dir.join(format!("rollout-{name}.jsonl")),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_000 + (count - 1) * 1000),
+                    metadata: serde_json::Value::Null,
+                    messages: (0..count)
+                        .map(|idx| NormalizedMessage {
+                            idx,
+                            role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
+                            author: None,
+                            created_at: Some(1_700_000_000_000 + idx * 1000),
+                            content: format!("{name}mark{idx}z batch text {idx}"),
+                            extra: serde_json::json!({"uuid": format!("{name}-{idx}")}),
+                            snippets: Vec::new(),
+                            invocations: Vec::new(),
+                        })
+                        .collect(),
+                };
+            let dir = tempfile::TempDir::new().unwrap();
+            let before = conversation(dir.path(), "before", 3);
+            let giant = conversation(dir.path(), "giant", 50);
+            let after = conversation(dir.path(), "after", 3);
+            assert!(!should_slice_conversation(&before, limits));
+            assert!(should_slice_conversation(&giant, limits));
+            for (label, batch) in [
+                (
+                    "surrounded",
+                    vec![before.clone(), giant.clone(), after.clone()],
+                ),
+                ("giant-first", vec![giant.clone(), after.clone()]),
+                ("giant-last", vec![before.clone(), giant.clone()]),
+            ] {
+                let root = dir.path().join(label);
+                std::fs::create_dir_all(&root).unwrap();
+                let storage = create_franken_db(&root.join("agent_search.db"));
+                let index_path = root.join("index");
+                let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+                let outcome = persist_conversations_batched_sliced(
+                    &storage,
+                    Some(&mut index),
+                    &batch,
+                    LexicalPopulationStrategy::InlineRebuildFromScan,
+                    false,
+                    false,
+                    Some(&root),
+                    PersistHeartbeat::NONE,
+                    None,
+                    limits,
+                )
+                .unwrap();
+                index.commit().unwrap();
+                let messages: usize = batch.iter().map(|conv| conv.messages.len()).sum();
+                assert_eq!(outcome.inserted_messages, messages, "{label}");
+                assert_eq!(
+                    tantivy_doc_count(&mut index),
+                    messages as u64,
+                    "{label}: every stored message is indexed"
+                );
+                drop(index);
+                let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+                for conv in &batch {
+                    for message in [&conv.messages[0], &conv.messages[conv.messages.len() - 1]] {
+                        let marker = message.content.split_whitespace().next().unwrap();
+                        let hits = client
+                            .search(marker, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                            .unwrap();
+                        assert_eq!(hits.len(), 1, "{label}: {marker}");
+                    }
                 }
             }
         }
