@@ -28889,7 +28889,7 @@ pub fn conversation_ingest_quarantine_summary(
             )
         } else {
             (quarantined_conversations > 0).then(|| {
-                "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
+                "Run `cass quarantine list --json` to see which conversations are excluded and whether `cass quarantine retry` can re-ingest them."
                     .to_string()
             })
         },
@@ -28900,7 +28900,7 @@ pub fn conversation_ingest_quarantine_summary(
 /// gone (so a retry could never succeed). The poison JSONL records carry the
 /// `source_path`; if a record has a path that no longer exists, that
 /// conversation is source-missing.
-fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
+pub(crate) fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
     let quarantine_dir = data_dir.join("quarantine");
     let mut missing = BTreeSet::new();
     for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {

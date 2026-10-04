@@ -51,7 +51,7 @@ static CORPUS: &[IssueClassFixture] = &[
         root_cause_family: RootCauseFamily::CassDerivedState,
         category: IncidentCategory::QuarantineOom,
         expected_behavior: "rebuild bounds memory and quarantines the poison chunk rather than OOM-killing the run",
-        safe_next_command: "cass diag --json --quarantine",
+        safe_next_command: "cass quarantine list --json",
         proof_command: "cargo test --lib indexer::quarantine",
     },
     IssueClassFixture {
@@ -123,7 +123,7 @@ static CORPUS: &[IssueClassFixture] = &[
         root_cause_family: RootCauseFamily::CassDerivedState,
         category: IncidentCategory::QuarantineOom,
         expected_behavior: "a legacy quarantine record (no version) is retry-eligible, not silently orphaned forever",
-        safe_next_command: "cass diag --json --quarantine",
+        safe_next_command: "cass quarantine list --json",
         proof_command: "cargo test --lib indexer::quarantine",
     },
     IssueClassFixture {

@@ -9551,12 +9551,15 @@ fn run_quarantine_retry_command(
     Ok(())
 }
 
-/// Build the deterministic per-entry JSON view used by both `list` and the
-/// `clear` plan. Each entry reports its conversation_id, schema version,
-/// attempt count, last reason, the wall-clock timestamps, and whether it is
-/// retry-eligible under the current binary (version-stale/legacy).
-fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+/// Build the deterministic `cass quarantine list` rows: the structured state
+/// merged with the poison ledgers. Each entry reports its conversation_id,
+/// schema version, attempt count, last reason, the wall-clock timestamps, and
+/// whether it is retry-eligible under the current binary (version-stale/legacy).
+fn quarantine_list_entries(
+    data_dir: &Path,
+) -> anyhow::Result<Vec<crate::search::quarantine_status::QuarantineListEntry>> {
     use crate::indexer::quarantine::QuarantineState;
+    use crate::search::quarantine_status::QuarantineListEntry;
     let state = QuarantineState::load_for_operator(data_dir)
         .map_err(|error| anyhow::anyhow!("loading quarantine state for operator list: {error}"))?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -9564,16 +9567,16 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
         .iter()
         .map(|(key, record)| {
             let identity = (key.conversation_id.clone(), i64::from(key.schema_version));
-            let entry = serde_json::json!({
-                "conversation_id": key.conversation_id,
-                "schema_version": key.schema_version,
-                "attempt_count": record.attempt_count,
-                "last_reason": record.last_reason,
-                "first_attempt_at": record.first_attempt_at.to_rfc3339(),
-                "last_attempt_at": record.last_attempt_at.to_rfc3339(),
-                "cass_version_at_quarantine": record.cass_version_at_quarantine,
-                "retry_eligible": record.is_version_stale_for_retry(current_version),
-            });
+            let entry = QuarantineListEntry {
+                conversation_id: key.conversation_id,
+                schema_version: i64::from(key.schema_version),
+                attempt_count: record.attempt_count,
+                last_reason: record.last_reason.clone(),
+                first_attempt_at: Some(record.first_attempt_at.to_rfc3339()),
+                last_attempt_at: Some(record.last_attempt_at.to_rfc3339()),
+                cass_version_at_quarantine: record.cass_version_at_quarantine.clone(),
+                retry_eligible: record.is_version_stale_for_retry(current_version),
+            };
             (identity, entry)
         })
         .collect::<BTreeMap<_, _>>();
@@ -9607,19 +9610,20 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(1);
         let retry_eligible = cass_version != Some(current_version);
-        let poison_entry = serde_json::json!({
-            "conversation_id": identity.0.clone(),
-            "schema_version": identity.1,
-            "attempt_count": attempt_count,
-            "last_reason": record
+        let poison_entry = QuarantineListEntry {
+            conversation_id: identity.0.clone(),
+            schema_version: identity.1,
+            attempt_count,
+            last_reason: record
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("ingest-out-of-memory"),
-            "first_attempt_at": first_attempt_at,
-            "last_attempt_at": last_attempt_at,
-            "cass_version_at_quarantine": cass_version,
-            "retry_eligible": retry_eligible,
-        });
+                .unwrap_or("ingest-out-of-memory")
+                .to_string(),
+            first_attempt_at,
+            last_attempt_at,
+            cass_version_at_quarantine: cass_version.map(str::to_string),
+            retry_eligible,
+        };
 
         match entries.entry(identity) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -9627,19 +9631,13 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let existing = entry.get_mut();
-                let existing_attempt_count = existing
-                    .get("attempt_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                if attempt_count > existing_attempt_count {
-                    existing["attempt_count"] = serde_json::json!(attempt_count);
-                }
+                existing.attempt_count = existing.attempt_count.max(attempt_count);
                 if !retry_eligible {
                     // Cross-surface saves are best-effort. If either surface
                     // records a retry under this binary, do not falsely offer
                     // the key as retry-eligible because the other is stale.
-                    existing["cass_version_at_quarantine"] = serde_json::json!(current_version);
-                    existing["retry_eligible"] = serde_json::json!(false);
+                    existing.cass_version_at_quarantine = Some(current_version.to_string());
+                    existing.retry_eligible = false;
                 }
             }
         }
@@ -9653,7 +9651,7 @@ fn run_quarantine_list(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let entries = quarantine_entries_json(&data_dir).map_err(|err| CliError {
+    let entries = quarantine_list_entries(&data_dir).map_err(|err| CliError {
         code: 9,
         kind: "quarantine",
         message: format!("quarantine list failed: {err:#}"),
@@ -9661,6 +9659,11 @@ fn run_quarantine_list(
         retryable: false,
     })?;
     let summary = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
+    let status = crate::search::quarantine_status::quarantine_status(
+        &entries,
+        env!("CARGO_PKG_VERSION"),
+        &crate::indexer::quarantine_source_missing_ids(&data_dir),
+    );
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -9676,6 +9679,7 @@ fn run_quarantine_list(
             "quarantined_conversations": entries.len(),
             "circuit_breaker_active": summary.circuit_breaker_active,
             "recommended_action": summary.recommended_action,
+            "status": status,
             "entries": entries,
         });
         return output_structured_value(payload, fmt);
@@ -9692,30 +9696,21 @@ fn run_quarantine_list(
     if summary.circuit_breaker_active {
         println!("Circuit breaker: ACTIVE (a recent burst of quarantines tripped the breaker)");
     }
+    println!("{}", status.eligibility_reason);
+    for (cause, count) in &status.by_cause {
+        println!("  {count:>6}  {cause}");
+    }
     println!();
     for entry in &entries {
         println!(
             "  {} (schema v{}, attempts={}, retry_eligible={})",
-            entry
-                .get("conversation_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<unknown>"),
-            entry
-                .get("schema_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("attempt_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("retry_eligible")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            entry.conversation_id, entry.schema_version, entry.attempt_count, entry.retry_eligible,
         );
-        if let Some(reason) = entry.get("last_reason").and_then(|v| v.as_str()) {
-            println!("      reason: {reason}");
-        }
+        println!("      reason: {}", entry.last_reason);
+    }
+    if let Some(next) = &status.next_safe_command {
+        println!();
+        println!("Next: {next}");
     }
     Ok(())
 }

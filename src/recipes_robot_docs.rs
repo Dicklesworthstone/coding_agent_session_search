@@ -108,8 +108,12 @@ When a cass surface is unavailable and you must read provider logs directly:
 
 ## 4. Quarantine decision tree
 
-`cass status --json` (`ingest_quarantine`) and `cass diag --json --quarantine`
-enumerate quarantined work. The `safe_to_gc` flag is advisory only — no path
+`cass quarantine list --json` names every quarantined conversation with its
+reason and retry eligibility; its `status` groups them and gives the next
+command (`cass quarantine retry --json` plans a bounded retry, `--apply` runs
+it). `cass status --json` (`ingest_quarantine`) counts them. Quarantined derived
+assets (seed bundles, lexical generations) are in `cass diag --json
+--quarantine`, whose `safe_to_gc` flag is advisory only — no path
 auto-deletes. Branch on the quarantine reason:
 
   * Current irreducible OOM quarantine — the host ran out of memory mid-ingest;
