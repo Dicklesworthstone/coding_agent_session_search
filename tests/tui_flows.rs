@@ -466,23 +466,103 @@ fn swarm_entered_msg_seeds_snapshot_from_live_partial_aggregator() {
         .snapshot
         .as_ref()
         .expect("SwarmEntered must seed the cockpit via render_swarm_status_live_partial");
-    // The live-partial aggregator marks every required provider as
-    // unavailable until live wiring lands. The render must reflect that
-    // truthfully (no fabricated counts) — see bead acceptance criteria for
-    // coding_agent_session_search-oh96l.6 ("It should reuse the read-only
-    // aggregator and refresh only on explicit command or bounded background
-    // interval").
+    // The placeholder marks every provider unread, so every count is unknown:
+    // `?`, never a fabricated zero. Entering also starts exactly one
+    // background live read (the task itself is not run here).
     assert_eq!(snapshot.status, "partial");
+    assert_eq!(snapshot.ready_count, None);
+    assert!(app.swarm_cockpit.loading, "entering starts the live read");
+    assert!(!app.swarm_cockpit.live);
     let text = render_app_text(&app, 110, 24);
-    assert!(text.contains("ready:0"));
+    assert!(text.contains("ready:?"), "{text}");
+    assert!(!text.contains("ready:0"), "{text}");
+    assert!(text.contains("reading live swarm providers"), "{text}");
     assert!(text.contains("Safety"));
 
-    // Re-entering must NOT re-seed (the surface is read-only and idempotent
-    // — repeated taps of Alt+W shouldn't churn state).
+    // Re-entering must NOT re-seed or start a second read (the surface is
+    // read-only and idempotent — repeated taps of Alt+W shouldn't churn state).
     let original = app.swarm_cockpit.clone();
     let cmd = app.update(CassMsg::SwarmEntered);
     drain_cmd_messages(&mut app, cmd);
     assert_eq!(app.swarm_cockpit, original, "re-entering must not re-seed");
+}
+
+#[test]
+fn swarm_live_read_replaces_the_placeholder_and_r_reads_again() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    let cmd = app.update(CassMsg::SwarmEntered);
+    drain_cmd_messages(&mut app, cmd);
+    assert!(app.swarm_cockpit.loading);
+
+    // The background task's result: Beads read, Agent Mail not (null counts).
+    let cmd = app.update(CassMsg::SwarmLiveLoaded(Box::new(serde_json::json!({
+        "status": "partial",
+        "summary": {
+            "ready_count": 3,
+            "in_progress_count": 2,
+            "blocked_count": 1,
+            "active_agent_count": null,
+            "active_reservation_count": null,
+            "stale_candidate_count": null,
+            "stale_state_counts": null,
+            "proof_gap_count": null,
+            "build_pressure": null,
+            "recommended_action": "recheck-live-coordination"
+        },
+        "evidence": {"proof_gaps": []},
+        "providers": [{"warning": "agent-mail unavailable"}],
+        "_meta": {"elapsed_ms": 42}
+    }))));
+    drain_cmd_messages(&mut app, cmd);
+    assert!(!app.swarm_cockpit.loading);
+    assert!(app.swarm_cockpit.live);
+    let text = render_app_text(&app, 140, 24);
+    assert!(text.contains("Live Operations Snapshot"), "{text}");
+    assert!(text.contains("ready:3"), "{text}");
+    assert!(text.contains("in-progress 2"), "{text}");
+    assert!(text.contains("blocked 1"), "{text}");
+    // Unread providers stay unknown.
+    assert!(text.contains("agents:?"), "{text}");
+    assert!(text.contains("reservations:?"), "{text}");
+    assert!(text.contains("Stale      unknown"), "{text}");
+    assert!(!text.contains("agents:0"), "{text}");
+    assert!(text.contains("live providers read in 42 ms"), "{text}");
+
+    // `r` starts another read; other typing neither reads nor edits the
+    // hidden search query.
+    type_text(&mut app, "x");
+    assert!(!app.swarm_cockpit.loading);
+    assert!(
+        app.query.is_empty(),
+        "typing on the swarm surface must not search"
+    );
+    type_text(&mut app, "r");
+    assert!(app.swarm_cockpit.loading, "r requests a live read");
+    let while_loading = app.swarm_cockpit.clone();
+    type_text(&mut app, "r");
+    assert_eq!(
+        app.swarm_cockpit, while_loading,
+        "a second r while a read is in flight starts nothing"
+    );
+
+    // The request schedules the read as a background task, never inline;
+    // while one is in flight a request schedules nothing. (The task is not run
+    // here: its observers re-launch the current executable, which in this
+    // test is the test binary.)
+    let cmd = app.update(CassMsg::SwarmLiveLoaded(Box::new(serde_json::json!({
+        "status": "ok", "summary": {}, "_meta": {}
+    }))));
+    drain_cmd_messages(&mut app, cmd);
+    assert!(matches!(
+        app.update(CassMsg::SwarmLiveRefreshRequested),
+        ftui::Cmd::Task(..)
+    ));
+    assert!(matches!(
+        app.update(CassMsg::SwarmLiveRefreshRequested),
+        ftui::Cmd::None
+    ));
 }
 
 // ── Swarm cockpit: empty queue + evidence-gap state coverage ──────────────

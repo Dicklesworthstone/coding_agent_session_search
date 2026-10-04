@@ -1172,6 +1172,12 @@ advisory only: coordinate through Beads and Agent Mail before reopening,
 force-releasing, or taking over work. Suggested commands are robot-safe
 templates, not automatic actions.
 
+The TUI's Swarm tab shows the same live payload for the directory the TUI was
+started in. Entering the tab starts one background read with this collector;
+until it lands, every count shows as `?`. Counts of providers that could not
+be read stay `?`, never zero. `r` reads again. Rendering never runs a provider
+read.
+
 `swarm dependency-drift` reads `Cargo.toml` and optional sibling checkouts to
 report manifest pins, local HEAD/dirty state, strict validation commands, and
 release-risk recommendations. It does not fetch remotes, edit manifests, run

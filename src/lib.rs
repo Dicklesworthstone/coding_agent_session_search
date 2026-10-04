@@ -12400,11 +12400,10 @@ fn swarm_fixture_privacy_probe(path: &Path) -> CliResult<Option<serde_json::Valu
         .cloned())
 }
 
-/// Produce a swarm-status payload reflecting the current "no live providers
-/// are wired yet" reality. Pure-function, allocation-only — no I/O — so it
-/// is safe to call from the TUI surface-entry path. Used by the TUI's
-/// `CassMsg::SwarmEntered` handler to seed the cockpit on first entry
-/// when no cached snapshot has been supplied yet.
+/// The swarm-status placeholder the TUI cockpit shows on first entry, before
+/// its background live read ([`render_swarm_status_live_at`]) lands: every
+/// provider unread and every measurement unknown. Pure-function,
+/// allocation-only — no I/O — so it is safe on the surface-entry path.
 pub fn render_swarm_status_live_partial() -> serde_json::Value {
     use crate::swarm_status::{
         REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
@@ -12418,77 +12417,31 @@ pub fn render_swarm_status_live_partial() -> serde_json::Value {
                 SwarmSourceSnapshot::unavailable(
                     provider,
                     format!("live:{}", provider.fixture_key()),
-                    "live-provider-unimplemented",
-                    format!(
-                        "live provider {provider} is not wired yet; fixture-backed status is available"
-                    ),
+                    "live-provider-not-read",
+                    format!("live provider {provider} has not been read yet"),
                 )
             })
             .collect(),
     };
 
-    render_swarm_status_payload(
-        "live",
-        "Live swarm status with unavailable providers",
-        &collection,
-        None,
-        true,
-    )
-}
-
-/// The bounded live provider collection every `swarm` read surface shares:
-/// the current repository's git and Beads state, Agent Mail metadata,
-/// process pressure, proof evidence and passive CASS health. CLI-only; the
-/// TUI's initial model must remain allocation-only.
-fn collect_swarm_sources_live(cli: &Cli) -> crate::swarm_status::SwarmSourceCollection {
-    use crate::swarm_status::{
-        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
-    };
-    let data_dir = resolve_data_dir(&None, cli.db.as_ref());
-    let db_path = cli
-        .db
-        .clone()
-        .unwrap_or_else(|| data_dir.join("agent_search.db"));
-    match std::env::current_dir() {
-        Ok(repo) => {
-            crate::swarm_status::collect_live_swarm_sources(&repo, Some((&data_dir, &db_path)))
-        }
-        Err(_) => SwarmSourceCollection {
-            snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-                .iter()
-                .copied()
-                .map(|name| {
-                    SwarmSourceSnapshot::unavailable(
-                        name,
-                        format!("live:{name}"),
-                        "working-directory-unavailable",
-                        "Cannot identify the current repository",
-                    )
-                })
-                .collect(),
-        },
-    }
-}
-
-fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
-    use crate::swarm_status::{SwarmProviderName, SwarmProviderStatus};
-    let started = std::time::Instant::now();
-    let collection = collect_swarm_sources_live(cli);
     let mut payload = render_swarm_status_payload(
         "live",
-        "Bounded live source collection",
+        "Live swarm status before the first provider read",
         &collection,
         None,
         true,
     );
-    payload["_meta"]["generated_at_ms"] = serde_json::json!(
-        std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
-    payload["_meta"]["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
-    // Empty arrays remain iterable, but unknown measurements are never zero.
+    null_unavailable_swarm_summary_fields(&mut payload, &collection);
+    payload
+}
+
+/// Empty arrays remain iterable, but unknown measurements are never zero:
+/// blank the summary fields an unavailable provider would have measured.
+fn null_unavailable_swarm_summary_fields(
+    payload: &mut serde_json::Value,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+) {
+    use crate::swarm_status::{SwarmProviderName, SwarmProviderStatus};
     for (provider, fields) in [
         (
             SwarmProviderName::Beads,
@@ -12517,6 +12470,88 @@ fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
             }
         }
     }
+}
+
+/// The bounded live provider collection every `swarm` read surface shares:
+/// the current repository's git and Beads state, Agent Mail metadata,
+/// process pressure, proof evidence and passive CASS health. The TUI's
+/// initial model must remain allocation-only; its cockpit runs this from a
+/// background task ([`render_swarm_status_live_at`]).
+fn collect_swarm_sources_live(cli: &Cli) -> crate::swarm_status::SwarmSourceCollection {
+    let (data_dir, db_path) = swarm_live_archive_paths(cli);
+    collect_swarm_sources_live_at(std::env::current_dir().ok().as_deref(), &data_dir, &db_path)
+}
+
+fn swarm_live_archive_paths(cli: &Cli) -> (PathBuf, PathBuf) {
+    let data_dir = resolve_data_dir(&None, cli.db.as_ref());
+    let db_path = cli
+        .db
+        .clone()
+        .unwrap_or_else(|| data_dir.join("agent_search.db"));
+    (data_dir, db_path)
+}
+
+fn collect_swarm_sources_live_at(
+    repo: Option<&Path>,
+    data_dir: &Path,
+    db_path: &Path,
+) -> crate::swarm_status::SwarmSourceCollection {
+    use crate::swarm_status::{
+        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
+    };
+    match repo {
+        Some(repo) => {
+            crate::swarm_status::collect_live_swarm_sources(repo, Some((data_dir, db_path)))
+        }
+        None => SwarmSourceCollection {
+            snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
+                .iter()
+                .copied()
+                .map(|name| {
+                    SwarmSourceSnapshot::unavailable(
+                        name,
+                        format!("live:{name}"),
+                        "working-directory-unavailable",
+                        "Cannot identify the current repository",
+                    )
+                })
+                .collect(),
+        },
+    }
+}
+
+fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
+    let (data_dir, db_path) = swarm_live_archive_paths(cli);
+    render_swarm_status_live_at(std::env::current_dir().ok().as_deref(), &data_dir, &db_path)
+}
+
+/// `cass swarm status --json`'s live payload for the repository at `repo`
+/// (`None`: unknown, every repository provider is unavailable) and the CASS
+/// archive at `data_dir`/`db_path`. Read-only and bounded; the TUI cockpit
+/// runs it from a background task, never on render.
+pub fn render_swarm_status_live_at(
+    repo: Option<&Path>,
+    data_dir: &Path,
+    db_path: &Path,
+) -> serde_json::Value {
+    use crate::swarm_status::{SwarmProviderName, SwarmProviderStatus};
+    let started = std::time::Instant::now();
+    let collection = collect_swarm_sources_live_at(repo, data_dir, db_path);
+    let mut payload = render_swarm_status_payload(
+        "live",
+        "Bounded live source collection",
+        &collection,
+        None,
+        true,
+    );
+    payload["_meta"]["generated_at_ms"] = serde_json::json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    payload["_meta"]["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+    null_unavailable_swarm_summary_fields(&mut payload, &collection);
     payload["beads"]["graph"] = serde_json::Value::Null;
     // Exported tracker state and missing coordination cannot authorize a claim
     // or classify an owner's work as stale.
