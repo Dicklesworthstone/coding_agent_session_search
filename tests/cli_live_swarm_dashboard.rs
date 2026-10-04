@@ -53,10 +53,15 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Result<Output, Box<dyn Error>> {
-        self.run_swarm("dashboard", args)
+        self.run_swarm(&self.nested, "dashboard", args)
     }
 
-    fn run_swarm(&self, subcommand: &str, args: &[&str]) -> Result<Output, Box<dyn Error>> {
+    fn run_swarm(
+        &self,
+        cwd: &Path,
+        subcommand: &str,
+        args: &[&str],
+    ) -> Result<Output, Box<dyn Error>> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
         for (name, _) in std::env::vars_os() {
             let key = name.to_string_lossy();
@@ -68,7 +73,7 @@ impl Fixture {
             }
         }
         let output = command
-            .current_dir(&self.nested)
+            .current_dir(cwd)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join("config"))
@@ -157,9 +162,11 @@ fn nested_live_dashboard_classifies_tasks_without_mutating_beads() -> TestResult
 }
 
 /// `swarm lint`, `evidence`, `proof-debt` and `failure-patterns` read the same
-/// bounded live providers as `swarm status`. They used to report every
-/// provider as `live-provider-unimplemented` and find nothing outside
-/// fixtures. An in-progress bead with no Agent Mail thread is a real finding.
+/// bounded live providers as `swarm status`, from the repository root (the
+/// live collector's precondition). They used to report every provider as
+/// `live-provider-unimplemented` and find nothing outside fixtures, so the git
+/// provider was never read. The Beads provider shells out to `br`; where `br`
+/// is installed, an in-progress bead with no Agent Mail thread is a finding.
 #[test]
 fn live_swarm_lint_reads_repository_providers_and_finds_bead_gaps() -> TestResult {
     let fixture = Fixture::new()?;
@@ -167,7 +174,11 @@ fn live_swarm_lint_reads_repository_providers_and_finds_bead_gaps() -> TestResul
     let before = fs::read(&path)?;
     let modified = fs::metadata(&path)?.modified()?;
 
-    let lint: Value = serde_json::from_slice(&fixture.run_swarm("lint", &["--json"])?.stdout)?;
+    let lint: Value = serde_json::from_slice(
+        &fixture
+            .run_swarm(&fixture.repo, "lint", &["--json"])?
+            .stdout,
+    )?;
     let providers = lint["providers"].as_array().ok_or("providers array")?;
     assert!(
         providers
@@ -175,27 +186,41 @@ fn live_swarm_lint_reads_repository_providers_and_finds_bead_gaps() -> TestResul
             .all(|provider| provider["error_kind"] != "live-provider-unimplemented"),
         "no live provider may be a placeholder: {providers:?}"
     );
-    let beads = providers
-        .iter()
-        .find(|provider| provider["name"] == "beads")
-        .ok_or("beads provider")?;
-    assert!(
-        beads["status"] == "partial" || beads["status"] == "ok",
-        "the live Beads export must be read: {beads}"
-    );
-    let findings = lint["findings"].as_array().ok_or("findings array")?;
-    assert!(
-        findings
+    let provider = |name: &str| {
+        providers
             .iter()
-            .any(|finding| finding["code"] == "missing-start-mail"
-                && finding["subject_id"] == "doing"),
-        "the in-progress bead without a start mail must be flagged: {findings:?}"
+            .find(|provider| provider["name"] == name)
+            .ok_or(format!("{name} provider"))
+    };
+    let git = provider("git")?;
+    assert!(
+        git["status"] == "partial" || git["status"] == "ok",
+        "the repository's git state must be read live: {git}"
     );
+    let beads = provider("beads")?;
+    let beads_read = beads["status"] == "partial" || beads["status"] == "ok";
+    assert!(
+        beads_read || beads["error_kind"] == "live-provider-read-failed",
+        "the Beads provider must attempt a real read: {beads}"
+    );
+    if beads_read {
+        let findings = lint["findings"].as_array().ok_or("findings array")?;
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding["code"] == "missing-start-mail"
+                    && finding["subject_id"] == "doing"),
+            "the in-progress bead without a start mail must be flagged: {findings:?}"
+        );
+    }
     assert_eq!(lint["mutation_contract"]["read_only"], true);
 
     for subcommand in ["evidence", "proof-debt", "failure-patterns"] {
-        let payload: Value =
-            serde_json::from_slice(&fixture.run_swarm(subcommand, &["--json"])?.stdout)?;
+        let payload: Value = serde_json::from_slice(
+            &fixture
+                .run_swarm(&fixture.repo, subcommand, &["--json"])?
+                .stdout,
+        )?;
         assert!(
             !payload.to_string().contains("live-provider-unimplemented"),
             "swarm {subcommand} still reports placeholder providers: {payload}"
