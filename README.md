@@ -1887,6 +1887,7 @@ palette and is preserved with ranking and filters in saved views.
 | `Ctrl+Y` | Copy path |
 | `Alt+Y` | Copy snippet |
 | `Ctrl+Shift+C` | Copy content |
+| `Alt+E` | Bookmark the selected hit (`cass bookmarks list` shows bookmarks) |
 | `Ctrl+E` | Open the export modal |
 | `Ctrl+Shift+E` | Export Markdown immediately |
 | `Alt+U` / `Alt+N` / `Alt+I` | Update banner: upgrade now / show release notes / skip this version |
@@ -3009,6 +3010,7 @@ cass
     - `Ctrl+X`: Toggle selection on current item (`Ctrl+M` opens the detail modal, like `Enter`).
     - `Alt+B`: Bulk actions menu (when items selected).
     - `Ctrl+Y` / `Alt+Y` / `Ctrl+Shift+C`: Copy file path / snippet / content to clipboard.
+    - `Alt+E`: Bookmark the selected hit (same store as `cass bookmarks`; a second press keeps one bookmark).
     - `/`: Find text within detail pane; `Enter` advances matches; `n`/`N` cycle contextual session hits; `Esc` closes the modal.
     - `Ctrl+Shift+R`: Trigger manual re-index (refresh search results).
     - `Ctrl+Shift+Del`: Reset TUI state (clear history, filters, layout).

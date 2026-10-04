@@ -6661,6 +6661,7 @@ impl CassApp {
             PaletteResult::LoadViewSlot(slot) => ftui::Cmd::msg(CassMsg::ViewLoaded(slot)),
             PaletteResult::OpenBulkActions => ftui::Cmd::msg(CassMsg::BulkActionsOpened),
             PaletteResult::ReloadIndex => ftui::Cmd::msg(CassMsg::IndexRefreshRequested),
+            PaletteResult::BookmarkSelectedHit => ftui::Cmd::msg(CassMsg::BookmarkSelectedHit),
             PaletteResult::OpenAnalyticsView(target) => {
                 let view = match target {
                     AnalyticsTarget::Dashboard => AnalyticsView::Dashboard,
@@ -12895,6 +12896,10 @@ impl CassApp {
                     shortcuts::COPY_CONTENT
                 ),
                 format!(
+                    "{} bookmark the selected hit (`cass bookmarks list` shows them)",
+                    shortcuts::BOOKMARK
+                ),
+                format!(
                     "{} toggle aggregate results stats bar",
                     shortcuts::STATS_BAR
                 ),
@@ -14445,6 +14450,8 @@ pub enum CassMsg {
     CopyContent,
     /// Copy the current search query to clipboard.
     CopyQuery,
+    /// Save the selected hit to the bookmarks store (`cass bookmarks`).
+    BookmarkSelectedHit,
     /// Open the current result in $EDITOR.
     OpenInEditor,
     /// Open content in nano.
@@ -16030,6 +16037,9 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('J') if alt => CassMsg::ToggleJsonView,
                     KeyCode::Char('r') if alt => CassMsg::ResultsRefreshed,
                     KeyCode::Char('b') if alt => CassMsg::BulkActionsOpened,
+                    KeyCode::Char('e') | KeyCode::Char('E') if alt && !ctrl => {
+                        CassMsg::BookmarkSelectedHit
+                    }
                     KeyCode::Char('f') | KeyCode::Char('F') if alt && !ctrl => {
                         CassMsg::GroupingCycled
                     }
@@ -16677,6 +16687,7 @@ impl super::ftui_adapter::Model for CassApp {
                     | CassMsg::CopyContent
                     | CassMsg::OpenInEditor
                     | CassMsg::OpenInNano
+                    | CassMsg::BookmarkSelectedHit
                     | CassMsg::ViewRaw
                     | CassMsg::Tick
                     | CassMsg::MouseEvent { .. }
@@ -16840,6 +16851,7 @@ impl super::ftui_adapter::Model for CassApp {
                     | CassMsg::CopyContent
                     | CassMsg::OpenInEditor
                     | CassMsg::OpenInNano
+                    | CassMsg::BookmarkSelectedHit
                     | CassMsg::ViewRaw
                     | CassMsg::ToolCollapseToggled(_)
                     | CassMsg::ToolExpandAll
@@ -18693,6 +18705,40 @@ impl super::ftui_adapter::Model for CassApp {
                                 .push(Toast::new(format!("Copy failed: {e}"), ToastType::Error));
                         }
                     }
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::BookmarkSelectedHit => {
+                use crate::bookmarks::{BookmarkAddOutcome, BookmarkStore, bookmarks_path_in};
+                use crate::ui::components::toast::{Toast, ToastType};
+                if let Some(hit) = self.selected_hit() {
+                    let bookmark = bookmark_for_hit(hit);
+                    let added = BookmarkStore::open(&bookmarks_path_in(&self.data_dir))
+                        .and_then(|store| store.add_unless_bookmarked(&bookmark));
+                    match added {
+                        Ok(BookmarkAddOutcome::Added(_)) => {
+                            self.status =
+                                format!("Bookmarked {} (cass bookmarks list)", bookmark.title);
+                            self.toast_manager
+                                .push(Toast::new("Bookmarked".to_string(), ToastType::Success));
+                        }
+                        Ok(BookmarkAddOutcome::AlreadyBookmarked) => {
+                            self.status = "Already bookmarked.".to_string();
+                            self.toast_manager.push(Toast::new(
+                                "Already bookmarked".to_string(),
+                                ToastType::Info,
+                            ));
+                        }
+                        Err(e) => {
+                            self.status = format!("Bookmark failed: {e:#}");
+                            self.toast_manager.push(Toast::new(
+                                format!("Bookmark failed: {e}"),
+                                ToastType::Error,
+                            ));
+                        }
+                    }
+                } else {
+                    self.status = "No active result to bookmark.".to_string();
                 }
                 ftui::Cmd::none()
             }
@@ -24254,6 +24300,34 @@ fn actionable_path_for_hit_with_config(config: Option<&SourcesConfig>, hit: &Sea
     };
     let agent = trimmed_non_empty(hit.agent.as_str());
     source.rewrite_path_for_agent(&hit.source_path, agent)
+}
+
+/// The bookmark the TUI saves for a hit: the same fields `cass bookmarks add`
+/// stores, keyed by the hit's indexed source path and line. An untitled hit
+/// takes the first snippet line, then the source file name.
+fn bookmark_for_hit(hit: &SearchHit) -> crate::bookmarks::Bookmark {
+    let title = trimmed_non_empty(hit.title.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            hit.snippet
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            Path::new(&hit.source_path).file_name().map_or_else(
+                || hit.source_path.clone(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        });
+    let mut bookmark =
+        crate::bookmarks::Bookmark::new(title, &hit.source_path, &hit.agent, &hit.workspace)
+            .with_snippet(&hit.snippet);
+    if let Some(line) = hit.line_number {
+        bookmark = bookmark.with_line(line);
+    }
+    bookmark
 }
 
 // =========================================================================
@@ -33829,6 +33903,90 @@ not jsonl",
         assert_eq!(copied, "Fallback title");
     }
 
+    /// b3woj: the bookmark key and palette action save the selected hit to the
+    /// same store `cass bookmarks` reads, under the TUI's data dir; a second
+    /// press keeps one row and says so.
+    #[test]
+    fn bookmark_selected_hit_saves_once_to_the_data_dir_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut app = app_with_hits(2);
+        app.data_dir = dir.path().to_path_buf();
+        app.panes[0].hits[0].line_number = Some(7);
+        let expected_path = app.panes[0].hits[0].source_path.clone();
+
+        let _ = app.update(CassMsg::BookmarkSelectedHit);
+        let store =
+            crate::bookmarks::BookmarkStore::open(&crate::bookmarks::bookmarks_path_in(dir.path()))
+                .unwrap();
+        let saved = store.list(None).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].source_path, expected_path);
+        assert_eq!(saved[0].line_number, Some(7));
+        assert!(!saved[0].title.is_empty());
+        assert!(app.status.starts_with("Bookmarked"), "{}", app.status);
+
+        let _ = app.update(CassMsg::BookmarkSelectedHit);
+        assert_eq!(store.count().unwrap(), 1, "a second press adds no row");
+        assert_eq!(app.status, "Already bookmarked.");
+    }
+
+    /// Enter on a result opens the detail modal, whose router drops every
+    /// message it does not list. Alt+E must still bookmark from there, with
+    /// or without the in-detail find bar (the PTY journey caught this).
+    #[test]
+    fn bookmark_selected_hit_works_from_the_open_detail_modal() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+        for find_active in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut app = app_with_hits(1);
+            app.data_dir = dir.path().to_path_buf();
+            app.show_detail_modal = true;
+            if find_active {
+                app.detail_find = Some(DetailFindState::default());
+                app.input_mode = InputMode::DetailFind;
+            }
+
+            let alt_e =
+                Event::Key(KeyEvent::new(KeyCode::Char('e')).with_modifiers(Modifiers::ALT));
+            let _ = app.update(CassMsg::from(alt_e));
+
+            let store = crate::bookmarks::BookmarkStore::open(
+                &crate::bookmarks::bookmarks_path_in(dir.path()),
+            )
+            .unwrap();
+            assert_eq!(store.count().unwrap(), 1, "find_active={find_active}");
+            assert!(
+                app.status.starts_with("Bookmarked"),
+                "find_active={find_active}: {}",
+                app.status
+            );
+            assert!(app.show_detail_modal, "bookmarking keeps the modal open");
+        }
+    }
+
+    #[test]
+    fn bookmark_without_a_selected_hit_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut app = CassApp::default();
+        app.data_dir = dir.path().to_path_buf();
+        let _ = app.update(CassMsg::BookmarkSelectedHit);
+        assert_eq!(app.status, "No active result to bookmark.");
+        assert!(!crate::bookmarks::bookmarks_path_in(dir.path()).exists());
+    }
+
+    #[test]
+    fn event_mapping_alt_e_maps_to_bookmark_selected_hit() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('e')).with_modifiers(Modifiers::ALT));
+        assert!(matches!(CassMsg::from(event), CassMsg::BookmarkSelectedHit));
+        // A plain 'e' still edits the query.
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('e')));
+        assert!(!matches!(
+            CassMsg::from(plain),
+            CassMsg::BookmarkSelectedHit
+        ));
+    }
+
     #[test]
     #[serial]
     fn copy_path_rewrites_configured_remote_source_paths() {
@@ -43152,6 +43310,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert!(
             text.contains(shortcuts::COPY_CONTENT),
             "Should reference copy content"
+        );
+        assert!(
+            text.contains(shortcuts::BOOKMARK),
+            "Should reference the bookmark key"
         );
         assert!(
             text.contains("clear agent filter"),

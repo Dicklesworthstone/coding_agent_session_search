@@ -104,6 +104,15 @@ impl Bookmark {
     }
 }
 
+/// Result of [`BookmarkStore::add_unless_bookmarked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookmarkAddOutcome {
+    /// A new row was inserted with this id.
+    Added(i64),
+    /// The same source path and line were already bookmarked; nothing changed.
+    AlreadyBookmarked,
+}
+
 /// Storage backend for bookmarks using `SQLite`
 pub struct BookmarkStore {
     conn: Connection,
@@ -265,6 +274,15 @@ impl BookmarkStore {
             |row: &crate::franken_sync::Row| row.get_typed(0),
         )?;
         usize::try_from(count).context("bookmark count is out of range")
+    }
+
+    /// Add `bookmark` unless its `source_path` + line is already bookmarked,
+    /// so saving the same hit twice (the TUI's bookmark key) keeps one row.
+    pub fn add_unless_bookmarked(&self, bookmark: &Bookmark) -> Result<BookmarkAddOutcome> {
+        if self.is_bookmarked(&bookmark.source_path, bookmark.line_number)? {
+            return Ok(BookmarkAddOutcome::AlreadyBookmarked);
+        }
+        Ok(BookmarkAddOutcome::Added(self.add(bookmark)?))
     }
 
     /// Check if a `source_path` + line is already bookmarked
@@ -1088,6 +1106,27 @@ mod tests {
             vec![expected_path],
             "query {query:?} should match exactly one source path"
         );
+    }
+
+    #[test]
+    fn add_unless_bookmarked_keeps_one_row_per_source_line() -> Result<()> {
+        let (store, _dir) = test_store();
+        let hit = Bookmark::new("Fix", "/s/session.jsonl", "codex", "/w").with_line(42);
+        let first = store.add_unless_bookmarked(&hit)?;
+        assert!(matches!(first, BookmarkAddOutcome::Added(id) if id > 0));
+        assert_eq!(
+            store.add_unless_bookmarked(&hit)?,
+            BookmarkAddOutcome::AlreadyBookmarked
+        );
+        assert_eq!(store.count()?, 1);
+        // Another line of the same session is a different bookmark.
+        let other_line = Bookmark::new("Fix", "/s/session.jsonl", "codex", "/w").with_line(43);
+        assert!(matches!(
+            store.add_unless_bookmarked(&other_line)?,
+            BookmarkAddOutcome::Added(_)
+        ));
+        assert_eq!(store.count()?, 2);
+        Ok(())
     }
 
     #[test]

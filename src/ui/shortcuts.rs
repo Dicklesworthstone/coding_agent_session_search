@@ -38,6 +38,7 @@ pub const STATS_BAR: &str = "Ctrl+S";
 pub const COPY: &str = "Alt+Y";
 pub const COPY_PATH: &str = "Ctrl+Y";
 pub const COPY_CONTENT: &str = "Ctrl+Shift+C";
+pub const BOOKMARK: &str = "Alt+E";
 pub const BULK_MENU: &str = "Alt+B";
 pub const JSON_VIEW: &str = "Alt+Shift+J";
 pub const TOGGLE_SELECT: &str = "Ctrl+X";
@@ -179,6 +180,7 @@ mod tests {
     #[test]
     fn action_shortcuts_have_expected_values() {
         assert_eq!(COPY, "Alt+Y");
+        assert_eq!(BOOKMARK, "Alt+E");
         assert_eq!(BULK_MENU, "Alt+B");
         assert_eq!(PANE_FILTER, "Alt+/");
         assert_eq!(EXPORT_HTML, "Ctrl+E");
