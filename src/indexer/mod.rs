@@ -10180,14 +10180,11 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 /// single conversation regardless of corpus size. Only called on the
 /// sparse-looking branch (observed already below the cheap raw upper bound), so
 /// the extra scan is paid lazily.
-fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
-    expected_live_lexical_doc_count_after(storage, 0, 0, |_, _| Ok(()))
-}
-
-/// The scan behind [`expected_live_lexical_doc_count`], over the live
-/// conversations with an id above `after_conversation_id` in id order, added to
-/// `expected_docs`. `after_conversation(id, docs)` runs once each conversation
-/// is counted; an error from it stops the scan.
+///
+/// This scans the live conversations with an id above `after_conversation_id`
+/// in id order, adding to `expected_docs`, so an interrupted scan can resume
+/// (GH #381). `after_conversation(id, docs)` runs once each conversation is
+/// counted; an error from it stops the scan.
 fn expected_live_lexical_doc_count_after(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -10215,6 +10212,13 @@ fn expected_live_lexical_doc_count_after(
         after_conversation(conversation_id, expected_docs)?;
     }
     Ok(expected_docs)
+}
+
+/// The whole-archive count in one uninterrupted pass: the reference the
+/// memoized, delta and resumed counts must equal.
+#[cfg(test)]
+fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
+    expected_live_lexical_doc_count_after(storage, 0, 0, |_, _| Ok(()))
 }
 
 /// GH #461: sidecar memoizing the noise-adjusted expected doc count for one
@@ -10547,8 +10551,8 @@ fn expected_live_lexical_doc_count_resumable_with(
     Ok(expected_docs)
 }
 
-/// [`expected_live_lexical_doc_count`] without re-reading the whole archive on
-/// every run (GH #461). The full per-conversation content scan ran at index
+/// The expected doc count ([`expected_live_lexical_doc_count_after`]) without
+/// re-reading the whole archive on every run (GH #461). The full per-conversation content scan ran at index
 /// startup and again at the post-run checkpoint refresh on any archive whose
 /// sink drops tool-acks or empty messages, i.e. on essentially every
 /// incremental run; a 16 MB incremental run read 9.4 GB. The count is served
