@@ -27608,6 +27608,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                         assert!(wal_before.0.len() > 32);
                     }
                     let timeout = Duration::from_millis(50);
+                    let refusals_started = Instant::now();
                     let strict = FrankenStorage::open_strict_readonly_with_timeout(&path, timeout);
                     let err = strict.err().expect("strict storage must refuse stale SHM");
                     assert!(matches!(
@@ -27621,6 +27622,14 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                         err.downcast_ref::<crate::franken_sync::FrankenError>(),
                         Some(crate::franken_sync::FrankenError::BusyRecovery)
                     ));
+                    // e9f0v: fsqlite 0.4.7 retried a strict read-only bootstrap
+                    // on BusyRecovery for a 30 s floor. A stale WAL index must be
+                    // refused at once.
+                    let refusals = refusals_started.elapsed();
+                    assert!(
+                        refusals < Duration::from_secs(5),
+                        "strict refusals took {refusals:?} ({opener}, header_only={header_only}, writer={writer})"
+                    );
                     assert_eq!(fingerprint("-shm"), shm_before);
                     assert_eq!(fingerprint(""), main_before);
                     assert_eq!(fingerprint("-wal"), wal_before);
