@@ -1920,6 +1920,12 @@ fn rendered_answer_pack_with_correlation(
         .lock_state
         .as_deref()
         .map(|state| redact_pack_output_text(state, &mut envelope_redactions));
+    // `_meta.effective` echoes the raw query, its grouping, the database path
+    // and the filters, so it is redacted like the rest of the envelope.
+    let effective = request
+        .effective
+        .as_ref()
+        .map(|value| redact_pack_output_json(value, &mut envelope_redactions));
     let redaction_counts = redaction_counts(
         redacted_count,
         &evidence,
@@ -1945,7 +1951,7 @@ fn rendered_answer_pack_with_correlation(
             partial: request.budget.timed_out || !request.budget.skipped_sections.is_empty(),
             format: request.format.label(),
             warnings: warnings.clone(),
-            effective: request.effective.clone(),
+            effective,
         },
         budget: request.budget.clone(),
         limits: RenderedLimits {
@@ -2216,6 +2222,30 @@ fn redact_pack_output_text(input: &str, redactions: &mut Vec<RenderedRedaction>)
     }
 
     output
+}
+
+/// Redacts every string in a JSON value; keys are schema names and are kept.
+fn redact_pack_output_json(
+    value: &serde_json::Value,
+    redactions: &mut Vec<RenderedRedaction>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_pack_output_text(text, redactions))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| redact_pack_output_json(item, redactions))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), redact_pack_output_json(item, redactions)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn redacted_source_label(
@@ -4204,6 +4234,13 @@ mod tests {
             last_synced_at_ms: Some(1_000_000),
             recommended_action: Some(format!("sync {home_path} from {host}")),
         }];
+        req.effective = Some(serde_json::json!({
+            "command": "pack",
+            "query": req.query_text,
+            "query_structure": format!("investigate AND {token}"),
+            "db_path": format!("{home_path}/agent_search.db"),
+            "filters": {"workspaces": [home_path]},
+        }));
 
         let rendered = render_answer_pack(&plan, &req).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
@@ -4211,6 +4248,14 @@ mod tests {
         for raw in [&token, home_path, host] {
             assert!(!rendered.contains(raw));
         }
+        let effective = &value["_meta"]["effective"];
+        assert_eq!(effective["command"], "pack");
+        assert_eq!(effective["query"], value["query"]["text"]);
+        assert_eq!(effective["db_path"], "[REDACTED_PATH]/agent_search.db");
+        assert_eq!(
+            effective["filters"]["workspaces"],
+            serde_json::json!(["[REDACTED_PATH]/private"])
+        );
         assert_eq!(
             value["query"]["text"],
             "investigate [REDACTED] at [REDACTED_PATH]/private"
@@ -4237,7 +4282,7 @@ mod tests {
             value["privacy"]["redaction_counts"]["private_path"]
                 .as_u64()
                 .unwrap()
-                >= 3
+                >= 6
         );
     }
 

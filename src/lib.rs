@@ -32728,8 +32728,11 @@ fn run_cli_search(
     };
 
     // uojcg.7.1: explain an empty search filtered to one workspace. The probes
-    // run only on that empty path, inside the remaining robot budget.
+    // run only on that empty path, inside the remaining robot budget. An empty
+    // page past the last match (`--offset` beyond the total) is not an empty
+    // search, so the total must be zero too.
     let zero_result_diagnosis = if display_result.hits.is_empty()
+        && total_matches == 0
         && filters.workspaces.len() == 1
         && !skipped_sections.iter().any(|section| section == "search")
     {

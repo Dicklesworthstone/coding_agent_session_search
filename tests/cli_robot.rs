@@ -5820,14 +5820,15 @@ fn pack_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
     assert_eq!(effective["query"], "hello OR world tool");
     assert_eq!(effective["query_structure"], "hello OR (world AND tool)");
     assert_eq!(effective["query_recoveries"], serde_json::json!([]));
-    assert_eq!(
-        effective["db_path"].as_str(),
-        Some(
-            Path::new(data_dir)
-                .join("agent_search.db")
-                .to_str()
-                .ok_or("non-utf8 path")?
-        )
+    // Pack redacts private paths in `_meta.effective` like the rest of its
+    // envelope, so a temp dir under a home directory is echoed redacted.
+    let db_path = Path::new(data_dir).join("agent_search.db");
+    let db_path = db_path.to_str().ok_or("non-utf8 path")?;
+    let echoed = effective["db_path"].as_str().ok_or("db_path missing")?;
+    assert!(
+        echoed == db_path
+            || (echoed.contains("[REDACTED_PATH]") && echoed.ends_with("agent_search.db")),
+        "db_path is the data dir's database, verbatim or redacted: {effective}"
     );
     assert_eq!(effective["db_path_source"], "--data-dir");
     // 2026-01-01T00:00:00Z.
@@ -9466,4 +9467,43 @@ fn workspace_filtered_empty_search_explains_the_filter() {
         unrelated["zero_result_diagnosis"]["diagnosis"], "workspace_not_indexed",
         "{unrelated}"
     );
+}
+
+/// A page past the last match of a correctly filtered search is empty, but the
+/// search is not: it carries no `zero_result_diagnosis`, which used to claim
+/// the workspace had no match next to a nonzero `total_matches`.
+#[test]
+fn workspace_filtered_search_past_its_last_page_is_not_diagnosed() {
+    const INDEXED: &str = "/data/projects/coding_agent_session_search";
+    let data_dir = shared_search_demo_data();
+    let out = base_cmd()
+        .args([
+            "search",
+            "hello",
+            "--json",
+            "--limit",
+            "3",
+            "--offset",
+            "1000",
+            "--workspace",
+            INDEXED,
+            "--data-dir",
+            data_dir,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let page: Value = serde_json::from_slice(&out.stdout).expect("search JSON");
+    assert!(
+        page["hits"].as_array().expect("hits array").is_empty(),
+        "{page}"
+    );
+    assert!(
+        page["total_matches"]
+            .as_u64()
+            .is_some_and(|total| total > 0),
+        "{page}"
+    );
+    assert!(page.get("zero_result_diagnosis").is_none(), "{page}");
 }

@@ -1030,7 +1030,9 @@ cass search "error" --robot --robot-meta --days 7 | jq '._meta.effective'
 #     "filters": { "agents": [], "workspaces": [], "source": "all", "sessions_from_paths": null },
 #     "auto_corrections": [] }              // each argv correction, worded like its stderr note
 #   `cass pack "error" --json` carries the same object for the search it ran in
-#   its own `_meta.effective` ("command": "pack", and no search-only "daemon").
+#   its own `_meta.effective` ("command": "pack", and no search-only "daemon"),
+#   with home-directory paths, private hosts and secrets redacted like the rest
+#   of the pack (the db_path above reads "[REDACTED_PATH]/agent_search.db").
 
 # Per-hit trust verdict (advisory; --robot-meta only)
 cass search "error" --robot --robot-meta
