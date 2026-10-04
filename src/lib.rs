@@ -22775,7 +22775,19 @@ fn state_meta_json_inner(
             "processed_conversations": lexical.processed_conversations,
             "total_conversations": lexical.total_conversations,
             "indexed_docs": lexical.indexed_docs,
-            "pipeline": lexical_rebuild_pipeline_json
+            "pipeline": lexical_rebuild_pipeline_json,
+            // GH #381 (ntxs1): where a running or interrupted full
+            // expected-docs scan stands; the next index run resumes it
+            // when the archive is unchanged or only grew. Null otherwise.
+            "expected_docs_scan": crate::indexer::expected_lexical_docs_scan_position(&index_path, db_path)
+                .map(|position| serde_json::json!({
+                    "last_conversation_id": position.last_conversation_id,
+                    "max_conversation_id": position.max_conversation_id,
+                    "expected_docs_so_far": position.expected_docs_so_far,
+                    "saved_at": position.saved_at_ms
+                        .and_then(chrono::DateTime::from_timestamp_millis)
+                        .map(|saved| saved.to_rfc3339()),
+                }))
         },
         "semantic": {
             "status": semantic.status,
@@ -85551,6 +85563,18 @@ fn run_status(
                 _ => println!("  Rebuild progress: in progress"),
             }
         }
+        if let Some(scan) = state
+            .get("rebuild")
+            .and_then(|rebuild| rebuild.get("expected_docs_scan"))
+            .filter(|scan| !scan.is_null())
+        {
+            println!(
+                "  Coverage scan: counted through conversation id {} of {} ({} docs so far); the next index run resumes it if the archive only grew",
+                scan["last_conversation_id"],
+                scan["max_conversation_id"],
+                scan["expected_docs_so_far"]
+            );
+        }
         if index_empty_with_messages {
             println!("  Warning: index has 0 documents but database has messages");
             println!("  Run 'cass index --full' to populate the search index");
@@ -88312,6 +88336,52 @@ mod cli_read_db_tests {
         );
         assert_eq!(resolve_semantic_index_embedder(Some("minilm")), "minilm");
         assert_eq!(resolve_semantic_index_embedder(Some("hash")), "hash");
+    }
+
+    /// GH #381 (ntxs1): status shows where an interrupted expected-docs scan
+    /// stopped, from the position file such a run leaves beside the index,
+    /// and nothing for a position file that belongs to another archive.
+    #[test]
+    #[serial]
+    fn state_meta_json_reports_interrupted_expected_docs_scan_position() {
+        let (temp, db_path) = seed_cli_db();
+        let index_root = temp.path().join("index");
+        std::fs::create_dir_all(&index_root).expect("index root");
+        let partial_path = index_root.join(".expected-lexical-docs.partial.json");
+        // The on-disk shape an interrupted scan saves (memo schema 2).
+        let write_partial = |db: &Path| {
+            let partial = serde_json::json!({
+                "schema_version": 2,
+                "db_path": db.display().to_string(),
+                "identity": {
+                    "total_conversations": 9,
+                    "max_conversation_id": 9,
+                    "max_message_id": 40,
+                    "total_messages": 40,
+                    "content_cap_bytes": 8_388_608
+                },
+                "last_conversation_id": 4,
+                "expected_docs": 17
+            });
+            std::fs::write(&partial_path, serde_json::to_vec(&partial).unwrap())
+                .expect("write scan position");
+        };
+
+        write_partial(&db_path);
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        let scan = &state["rebuild"]["expected_docs_scan"];
+        assert_eq!(scan["last_conversation_id"].as_i64(), Some(4), "{scan}");
+        assert_eq!(scan["max_conversation_id"].as_i64(), Some(9), "{scan}");
+        assert_eq!(scan["expected_docs_so_far"].as_u64(), Some(17), "{scan}");
+        assert!(scan["saved_at"].is_string(), "{scan}");
+
+        write_partial(&temp.path().join("another-archive.db"));
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert!(
+            state["rebuild"]["expected_docs_scan"].is_null(),
+            "{}",
+            state["rebuild"]
+        );
     }
 
     #[test]
@@ -97714,6 +97784,16 @@ fn response_schema_rebuild_state() -> serde_json::Value {
                 "type": "object",
                 "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                 "additionalProperties": true
+            },
+            "expected_docs_scan": {
+                "type": ["object", "null"],
+                "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                "properties": {
+                    "last_conversation_id": { "type": "integer" },
+                    "max_conversation_id": { "type": "integer" },
+                    "expected_docs_so_far": { "type": "integer" },
+                    "saved_at": { "type": ["string", "null"] }
+                }
             }
         }
     })

@@ -10422,6 +10422,49 @@ struct ExpectedLexicalDocsPartial {
     expected_docs: usize,
 }
 
+/// The saved position of a running or interrupted full expected-docs scan,
+/// read without opening the database, so `cass status --json` shows a long
+/// first scan moving across runs (GH #381, ntxs1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ExpectedLexicalDocsScanPosition {
+    /// Every live conversation with an id at or below this one is counted.
+    pub(crate) last_conversation_id: i64,
+    /// The highest conversation id when the position was saved.
+    pub(crate) max_conversation_id: i64,
+    pub(crate) expected_docs_so_far: usize,
+    /// When the position was saved (the file's mtime).
+    pub(crate) saved_at_ms: Option<i64>,
+}
+
+/// The position file beside the lexical index at `index_path`, if it belongs
+/// to `db_path` and the current memo schema. The next scan resumes from it
+/// when the archive is unchanged or only grew, and starts over otherwise.
+pub(crate) fn expected_lexical_docs_scan_position(
+    index_path: &Path,
+    db_path: &Path,
+) -> Option<ExpectedLexicalDocsScanPosition> {
+    let path = expected_lexical_docs_cache_path(index_path)?
+        .with_file_name(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+    let partial: ExpectedLexicalDocsPartial =
+        serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if partial.schema_version != EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
+        || !lexical_rebuild_db_paths_match(&partial.db_path, &db_path.to_string_lossy())
+    {
+        return None;
+    }
+    let saved_at_ms = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
+    Some(ExpectedLexicalDocsScanPosition {
+        last_conversation_id: partial.last_conversation_id,
+        max_conversation_id: partial.identity.max_conversation_id,
+        expected_docs_so_far: partial.expected_docs,
+        saved_at_ms,
+    })
+}
+
 fn write_expected_lexical_docs_sidecar<T: serde::Serialize>(path: &Path, payload: &T) {
     let Some(file_name) = path.file_name().map(|name| name.to_string_lossy()) else {
         return;
@@ -56110,6 +56153,8 @@ mod tests {
         seed_lexical_rebuild_fixture(&storage);
         let db = db_path.to_string_lossy().into_owned();
         let partial_path = dir.path().join(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+        // The generation directory whose parent holds the scan sidecars.
+        let index_path = dir.path().join("index-generation");
         let ids: Vec<i64> = storage
             .raw()
             .query_map_collect(
@@ -56155,6 +56200,23 @@ mod tests {
             let partial: ExpectedLexicalDocsPartial =
                 serde_json::from_slice(&fs::read(&partial_path).unwrap()).unwrap();
             assert_eq!(partial.last_conversation_id, first);
+            // Status reads the same position, and only for this database.
+            let position = expected_lexical_docs_scan_position(&index_path, &db_path)
+                .expect("status sees the saved scan position");
+            assert_eq!(
+                (
+                    position.last_conversation_id,
+                    position.max_conversation_id,
+                    position.expected_docs_so_far
+                ),
+                (first, second, partial.expected_docs)
+            );
+            assert!(position.saved_at_ms.is_some());
+            assert_eq!(
+                expected_lexical_docs_scan_position(&index_path, &dir.path().join("other.db")),
+                None,
+                "another archive's position is not this one's"
+            );
         };
         let finishing_scan = || {
             let mut visited = Vec::new();
@@ -56174,6 +56236,10 @@ mod tests {
             assert!(
                 !partial_path.exists(),
                 "a completed scan removes its partial"
+            );
+            assert_eq!(
+                expected_lexical_docs_scan_position(&index_path, &db_path),
+                None
             );
             (count, visited)
         };
