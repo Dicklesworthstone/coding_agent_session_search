@@ -628,7 +628,7 @@ pub enum Commands {
         // ==========================================================================
         /// Embedding model to use for semantic search.
         /// Available models depend on what's been downloaded.
-        /// Use `cass models --list` to see available options.
+        /// `cass models status --json` lists them.
         #[arg(long)]
         model: Option<String>,
 
@@ -638,7 +638,7 @@ pub enum Commands {
         rerank: bool,
 
         /// Reranker model to use (requires --rerank).
-        /// Use `cass models --list` to see available options.
+        /// Defaults to `ms-marco`, the only registered reranker.
         #[arg(long)]
         reranker: Option<String>,
 
@@ -1190,8 +1190,9 @@ pub enum Commands {
         robot_triage: bool,
 
         /// Show what `--fix` would change vs the current state. Read-only.
-        /// Optional `<REF>` compares against a prior run-id instead.
-        #[arg(long, hide = true)]
+        /// Optional `<REF>` compares against a prior run-id instead; with no
+        /// value it compares the current state, as robot-docs documents.
+        #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "current")]
         diff: Option<String>,
 
         /// Quarantine doctor runs older than `<ISO8601>`. Renames into
@@ -5271,6 +5272,44 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
     ));
 }
 
+/// `cass robot-docs doctor` documents the doctor run-history surface as verbs
+/// (`cass doctor ls`, `undo <run-id>`, `diff [<ref>]`, `gc --before <ts>`,
+/// `capabilities`), but `doctor` takes them as flags, so every documented
+/// spelling failed with "unexpected argument". Map `rest[1]` onto its flag and
+/// return the correction note, or `None` when `rest[1]` is not such a verb.
+/// `gc` without `--before` becomes a bare `--gc-before`, so clap reports the
+/// missing value instead of running a plain doctor check.
+fn rewrite_doctor_history_verb(rest: &mut Vec<String>) -> Option<String> {
+    let verb = rest.get(1)?.to_ascii_lowercase();
+    let flag = match verb.as_str() {
+        "ls" => "--ls",
+        "undo" => "--undo",
+        "diff" => "--diff",
+        "explain" => "--explain",
+        "watch" => "--watch",
+        "capabilities" => "--emit-capabilities",
+        "gc" => {
+            rest.remove(1);
+            if let Some(before) = rest.iter_mut().find(|arg| *arg == "--before") {
+                *before = "--gc-before".to_string();
+            } else if let Some(before) = rest.iter_mut().find(|arg| arg.starts_with("--before=")) {
+                *before = before.replacen("--before=", "--gc-before=", 1);
+            } else {
+                rest.insert(1, "--gc-before".to_string());
+            }
+            return Some(
+                "'doctor gc --before <ts>' → 'doctor --gc-before <ts>' (doctor run-history GC)"
+                    .to_string(),
+            );
+        }
+        _ => return None,
+    };
+    rest[1] = flag.to_string();
+    Some(format!(
+        "'doctor {verb}' → 'doctor {flag}' (doctor run-history surface)"
+    ))
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -5300,6 +5339,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 22. **Current-session shorthand**: `current --json` → `sessions --current --json`
 /// 23. **Structured help recovery**: `help search --json` → `robot-docs commands`
 /// 24. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 25. **Doctor run-history verbs**: `doctor ls|undo|diff|gc --before|capabilities` → flags
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -6003,6 +6043,13 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             "'doctor archive-normalize' → 'doctor --archive-normalize' (fingerprinted additive archive metadata normalization)"
                 .into(),
         );
+    }
+    if rest
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
+        && let Some(correction) = rewrite_doctor_history_verb(&mut rest)
+    {
+        corrections.push(correction);
     }
     if rest
         .first()
@@ -6810,6 +6857,78 @@ mod canonical_top_level_command_tests {
             assert_eq!(query, "privacyneedle");
             assert_eq!(include_skill_content, expected);
         }
+    }
+
+    /// `cass robot-docs doctor` documents the run-history surface as verbs;
+    /// every spelling it shows must parse to the matching doctor flag, the
+    /// flag spellings must keep working, and a malformed or unknown verb must
+    /// still be a usage error rather than a plain doctor run.
+    #[test]
+    fn doctor_history_verbs_parse_as_robot_docs_document_them() {
+        let doctor = |args: &[&str]| {
+            let (normalized, _) = normalize_args(args.iter().map(ToString::to_string).collect());
+            Cli::try_parse_from(normalized)
+                .ok()
+                .and_then(|cli| cli.command)
+        };
+        assert!(matches!(
+            doctor(&["cass", "doctor", "ls", "--json"]),
+            Some(Commands::Doctor { ls: true, .. })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "undo", "latest", "--json"]),
+            Some(Commands::Doctor { undo: Some(id), .. }) if id == "latest"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "diff", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "current"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "diff", "run-a..run-b", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "run-a..run-b"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "gc", "--before", "2026-01-01T00:00:00Z", "--yes", "--json"]),
+            Some(Commands::Doctor { gc_before: Some(before), yes: true, .. })
+                if before == "2026-01-01T00:00:00Z"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "gc", "--before=2026-01-01T00:00:00Z", "--yes"]),
+            Some(Commands::Doctor { gc_before: Some(before), yes: true, .. })
+                if before == "2026-01-01T00:00:00Z"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "capabilities", "--json"]),
+            Some(Commands::Doctor {
+                emit_capabilities: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "explain", "latest", "--json"]),
+            Some(Commands::Doctor { explain: Some(id), .. }) if id == "latest"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "watch", "--watch-iterations", "1"]),
+            Some(Commands::Doctor {
+                watch: true,
+                watch_iterations: 1,
+                ..
+            })
+        ));
+        // The flag spellings keep working.
+        assert!(matches!(
+            doctor(&["cass", "doctor", "--ls", "--json"]),
+            Some(Commands::Doctor { ls: true, .. })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "--diff", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "current"
+        ));
+        // `gc` without `--before` must not become a plain doctor run.
+        assert!(doctor(&["cass", "doctor", "gc", "--yes", "--json"]).is_none());
+        // An unknown verb is still a usage error.
+        assert!(doctor(&["cass", "doctor", "frobnicate", "--json"]).is_none());
     }
 
     /// Behavioral pin for the #367 repro: the robot flag must not turn a
