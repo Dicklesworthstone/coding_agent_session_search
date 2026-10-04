@@ -4945,3 +4945,106 @@ paths = ["~/.claude/projects"]
 
     tracker.complete();
 }
+
+/// `cass sources doctor` reports problems in `sources.toml` itself that no
+/// per-host probe can see (bead uojcg.8.5). With no sync transport on PATH an
+/// ssh source cannot sync: that is an error and the doctor exits non-zero. A
+/// `.sources.toml.tmp.*` left beside the config by an interrupted write is a
+/// separate warning, reported only when the file exists.
+#[test]
+#[cfg(unix)]
+fn sources_doctor_reports_config_problems_the_host_probes_cannot_see() {
+    let tracker = tracker_for("sources_doctor_reports_config_problems_the_host_probes_cannot_see");
+    let diagnose = |leftover_temp: bool| -> (Option<i32>, Value) {
+        let tmp = tempfile::TempDir::new().expect("create fixture");
+        let config_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        let empty_bin = tmp.path().join("bin");
+        for dir in [&config_dir, &data_dir, &empty_bin] {
+            fs::create_dir_all(dir).expect("create fixture directory");
+        }
+        create_sources_config(
+            &config_dir,
+            r#"
+[[sources]]
+name = "box"
+type = "ssh"
+host = "fixture@box.test"
+paths = ["~/.claude/projects"]
+
+[[sources.path_mappings]]
+from = "/home/fixture/projects"
+to = "/work/projects"
+"#,
+        );
+        if leftover_temp {
+            fs::write(config_dir.join("cass/.sources.toml.tmp.4242"), b"partial")
+                .expect("write interrupted-write leftover");
+        }
+        let probe_path = tmp.path().join("probe.json");
+        fs::write(
+            &probe_path,
+            serde_json::to_vec(&serde_json::json!({
+                "host": "fixture@box.test",
+                "os": "Linux",
+                "cass_version": env!("CARGO_PKG_VERSION"),
+                "remote_path": "nonempty",
+                "delay_ms": 0,
+            }))
+            .expect("serialize probe"),
+        )
+        .expect("write probe");
+        let mut cmd = tracker.cass_std_command();
+        cmd.args(["sources", "doctor", "--json"])
+            .current_dir(tmp.path())
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("XDG_CACHE_HOME", tmp.path().join("cache"))
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("PATH", &empty_bin)
+            .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("NO_COLOR", "1");
+        let output = util::timeout::spawn_with_timeout_or_diag(
+            cmd,
+            "sources_doctor_config_validation",
+            Some(&data_dir),
+            std::time::Duration::from_secs(30),
+        );
+        let json = serde_json::from_slice::<Value>(&output.stdout);
+        assert!(
+            json.is_ok(),
+            "sources doctor --json stdout must be JSON; stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.code(), json.expect("checked above"))
+    };
+    let kinds = |report: &Value| -> Vec<String> {
+        report["config_validation"]["issues"]
+            .as_array()
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter_map(|issue| issue["kind"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let (code, report) = diagnose(false);
+    assert_eq!(report["config_validation"]["source_count"], 1, "{report}");
+    assert_eq!(report["config_validation"]["valid"], false, "{report}");
+    assert_eq!(kinds(&report), ["missing_transport_tool"], "{report}");
+    assert_eq!(code, Some(1), "an unusable configuration is not healthy");
+
+    let (code, report) = diagnose(true);
+    let found = kinds(&report);
+    assert!(
+        found.iter().any(|kind| kind == "missing_transport_tool")
+            && found.iter().any(|kind| kind == "concurrent_setup_race"),
+        "{report}"
+    );
+    assert_eq!(code, Some(1));
+    tracker.complete();
+}

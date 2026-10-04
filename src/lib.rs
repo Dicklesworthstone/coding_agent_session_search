@@ -118863,6 +118863,53 @@ struct SourcesDoctorOutput<'a> {
     health: &'a crate::source_doctor_health::SourceDoctorReport,
     diagnostics: &'a [SourceDiagnostics],
     budget: &'a crate::robot_budget_envelope::BudgetBlock,
+    /// Problems in `sources.toml` itself that no per-host probe can see.
+    config_validation: &'a crate::sources::config_validation::SourceConfigValidation,
+}
+
+/// Bead uojcg.8.5: validate the parsed source configuration against this
+/// host. The validator is pure; this gathers its environment signals: the
+/// sync transports on PATH, an interrupted `sources setup` (its checkpoint is
+/// removed on completion) and `.sources.toml.tmp.*` files an interrupted
+/// config write left beside the config. `disabled_agents` names are not
+/// checked: they accept aliases (`claude_code`) that raw connector names would
+/// misreport as unknown.
+fn sources_doctor_config_validation(
+    config: &crate::sources::config::SourcesConfig,
+) -> crate::sources::config_validation::SourceConfigValidation {
+    use crate::sources::config_validation::{ConfigValidationContext, validate_sources_config};
+    let on_path = |tool: &str| {
+        let file = if cfg!(target_os = "windows") {
+            format!("{tool}.exe")
+        } else {
+            tool.to_string()
+        };
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&file).is_file()))
+    };
+    let orphaned_temp_files = crate::sources::config::SourcesConfig::config_path()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".sources.toml.tmp")
+                })
+                .count()
+        });
+    let ctx = ConfigValidationContext {
+        rsync_available: on_path("rsync"),
+        scp_available: on_path("scp"),
+        setup_in_progress: matches!(crate::sources::SetupState::load(), Ok(Some(_))),
+        orphaned_temp_files,
+        known_agents: Vec::new(),
+    };
+    validate_sources_config(config, &ctx)
 }
 
 const SOURCE_DOCTOR_FIXTURE_MAX_BYTES: usize = 16 * 1024;
@@ -119196,6 +119243,8 @@ fn run_sources_doctor(
         return Ok(());
     }
 
+    let config_validation = sources_doctor_config_validation(&config);
+
     // Filter sources if specified
     let sources_to_check: Vec<_> = config
         .sources
@@ -119469,6 +119518,7 @@ fn run_sources_doctor(
             health: &health_report,
             diagnostics: &all_diagnostics,
             budget: &budget,
+            config_validation: &config_validation,
         };
         println!(
             "{}",
@@ -119540,6 +119590,22 @@ fn run_sources_doctor(
                 println!("Next bounded probe: {next}");
             }
         }
+        if !config_validation.issues.is_empty() {
+            use crate::sources::config_validation::ConfigIssueSeverity;
+            println!();
+            println!("{}", "Configuration".bold());
+            for issue in &config_validation.issues {
+                let icon = match issue.severity {
+                    ConfigIssueSeverity::Error => "✗".red(),
+                    ConfigIssueSeverity::Warning => "⚠".yellow(),
+                    ConfigIssueSeverity::Info => "ℹ".cyan(),
+                };
+                println!("  {icon} {}", issue.detail);
+                if let Some(command) = issue.safe_next_command.as_deref() {
+                    println!("    {}: {command}", "Next".cyan());
+                }
+            }
+        }
     }
 
     // Set exit code based on results
@@ -119547,6 +119613,7 @@ fn run_sources_doctor(
     if total_failed > 0
         || health_report.summary.unhealthy > 0
         || health_report.summary.unreached > 0
+        || config_validation.has_errors()
     {
         std::process::exit(1);
     }
