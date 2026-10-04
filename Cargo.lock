@@ -1994,9 +1994,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.6.1"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5948706982b578b329edabae039175a93833e532971b81962059d0afb9bfbbaf"
+checksum = "cdaa5082458ba4fcb1baaa96c16da45b11dab35ec060c631677df56c77a73022"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2014,9 +2014,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-core"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8ac23be49a1f027186bef7ed28aa9609efca0c91a439477119a505d5e36f16b"
+checksum = "3d1643f2349b0356e67b989c8c060ef44bc41928bd1841bb20fc36a33fe91c74"
 dependencies = [
  "asupersync",
  "compact_str 0.10.0",
@@ -2031,9 +2031,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e46ab3cdd23bebc47b0a687148ffbc094076f78004dfff5d1fa1a3511d163537"
+checksum = "c5adce183bf36045697d35d32646e71e34f13345c52a1f515600b77ecbc19dc9"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2047,9 +2047,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-fusion"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a34bf3a7fecbeb0ba88aa2ea9df9b3b3b2e3bed1507b87acb8b8f45422482d1f"
+checksum = "f2331270af5dd29774f392c35f66dbb45c121ace4bbf4d8e748cd0d1c92d1265"
 dependencies = [
  "ahash",
  "asupersync",
@@ -2068,9 +2068,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be2bbba1c7e0ae5fe54103ffebcd828db2ea0baf2a44c2eef255083d53c195ad"
+checksum = "96ba5ee4c3ac895ed71946569ff0dca9e35a40a83b159141f40980c2118661a1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2094,9 +2094,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-lexical"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a91a036fc4e1150b8516944efe5b07a68e944b7b0b306b94ae0c2451768a1d0"
+checksum = "38f9f1dc51d32741153820b48118d4b8813662e787042133d065846f5058ccd9"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2109,9 +2109,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-quill"
-version = "0.3.4"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96036d7df045669638139f2f689608128ce67aabdd910844a114fdf580f6026a"
+checksum = "bd769d9d0f76654f43d7ea5ad9d3d6d5856d86c45045d3dd107470b7581c346e"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2137,9 +2137,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e3e252d5a18832e26c1278b558a31c11103341c37eabf60a03877a222c2cd9b"
+checksum = "2e330de21d71047f2bef5c4a11312d03f12fa249fd652e6faf98b8a4f7315819"
 dependencies = [
  "asupersync",
  "bytemuck",

@@ -208,7 +208,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         // crates.io-only exact pin: every source (direct dep, frankensqlite
         // transitive, frankensearch transitive) resolves to a single published
-        // release. SQLite 0.4.x, FAD 0.3.0 and FrankenSearch 0.6.1 use
+        // release. SQLite 0.4.x, FAD 0.3.0 and FrankenSearch 0.7.1 use
         // asupersync 0.5.x native contexts; mixing the old runtime would
         // split caller context, cancellation and capability identity.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
@@ -230,15 +230,14 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Coordinated registry candidate with asupersync 0.5.0. Preserve
-        // explicit native MiniLM, Quill and cass-compat lexical behavior.
-        // The producer's 0.6.1 publication and CASS qualification must finish
-        // before release; a manifest pin alone is not runtime acceptance.
+        // Registry release on asupersync 0.5. Preserve explicit native
+        // MiniLM, Quill and cass-compat lexical behavior; a manifest pin
+        // alone is not runtime acceptance.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.6.1",
+        expected_version: "0.7.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no

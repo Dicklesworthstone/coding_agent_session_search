@@ -384,7 +384,9 @@ enum CassBoolExpr<T> {
     Or(Vec<CassBoolExpr<T>>),
 }
 
-/// The shipping lexer's tokens plus the grouping parentheses it cannot see.
+/// The shipping lexer's operand and operator tokens, plus the grouping
+/// parentheses that [`cass_bool_tokens`] splits off before lexing. `Token`
+/// never holds `LParen` or `RParen`.
 #[derive(Clone, Debug, PartialEq)]
 enum CassBoolToken {
     Token(FsCassQueryToken),
@@ -400,11 +402,17 @@ enum CassBoolToken {
 fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
     fn flush(segment: &mut String, tokens: &mut Vec<CassBoolToken>) {
         if !segment.is_empty() {
-            tokens.extend(
-                fs_cass_parse_boolean_query(segment)
-                    .into_iter()
-                    .map(CassBoolToken::Token),
-            );
+            // The loop below splits every grouping parenthesis off, so the
+            // engine lexer (same grouping rules since frankensearch 0.7)
+            // reports none here. Map any it does report onto the group
+            // tokens anyway: a raw paren token would stall the parser.
+            tokens.extend(fs_cass_parse_boolean_query(segment).into_iter().map(
+                |token| match token {
+                    FsCassQueryToken::LParen => CassBoolToken::Open,
+                    FsCassQueryToken::RParen => CassBoolToken::Close,
+                    token => CassBoolToken::Token(token),
+                },
+            ));
             segment.clear();
         }
     }
@@ -1385,7 +1393,11 @@ pub fn read_query(query: &str) -> QueryReading {
         Ok(match token {
             FsCassQueryToken::Term(text) => Some(text.clone()),
             FsCassQueryToken::Phrase(text) => Some(format!("\"{text}\"")),
-            FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => None,
+            FsCassQueryToken::And
+            | FsCassQueryToken::Or
+            | FsCassQueryToken::Not
+            | FsCassQueryToken::LParen
+            | FsCassQueryToken::RParen => None,
         })
     })
     .ok()
@@ -1543,6 +1555,10 @@ impl QueryExplanation {
                     parsed.operators.push("NOT".to_string());
                     next_negated = true;
                 }
+                // Grouping is reported through `structure` (read_query below).
+                // A parenthesis is not an operand and does not separate two
+                // operands, so implicit-AND adjacency carries across it.
+                FsCassQueryToken::LParen | FsCassQueryToken::RParen => {}
             }
         }
 
@@ -8602,7 +8618,11 @@ impl SearchClient {
                     let parts = normalize_phrase_terms(phrase);
                     (!parts.is_empty()).then_some(SqliteMessageScanOperand::Phrase(parts))
                 }
-                FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => None,
+                FsCassQueryToken::And
+                | FsCassQueryToken::Or
+                | FsCassQueryToken::Not
+                | FsCassQueryToken::LParen
+                | FsCassQueryToken::RParen => None,
             })
         })
         .ok()??;
@@ -9741,7 +9761,11 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
             let phrase_parts = normalize_phrase_terms(p);
             Ok((!phrase_parts.is_empty()).then(|| format!("\"{}\"", phrase_parts.join(" "))))
         }
-        FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => Ok(None),
+        FsCassQueryToken::And
+        | FsCassQueryToken::Or
+        | FsCassQueryToken::Not
+        | FsCassQueryToken::LParen
+        | FsCassQueryToken::RParen => Ok(None),
     })
     .ok()?;
     match expr {
@@ -24787,6 +24811,85 @@ mod tests {
             !explanation.parsed.terms.is_empty(),
             "XSS payload should produce parseable terms"
         );
+    }
+
+    /// frankensearch 0.7's lexer reports grouping parentheses as tokens. The
+    /// fallback lanes split them off first, so a raw paren token (which would
+    /// stall `CassBoolParser`) never reaches the parser, and every lane still
+    /// terminates on unbalanced or code-shaped input.
+    #[test]
+    fn cass_bool_tokens_never_pass_a_raw_paren_token() {
+        for query in [
+            "foo(bar)",
+            "a) (b",
+            "x -(y)",
+            "\"p\"(q)",
+            "(a (b) c",
+            "((a))",
+            "a&&(b||c)",
+            "NOT(a)",
+            ")(",
+            "f(x) OR (g(y) h)",
+            "$(rm -rf /)",
+        ] {
+            let tokens = cass_bool_tokens(query);
+            assert!(
+                !tokens.iter().any(|token| matches!(
+                    token,
+                    CassBoolToken::Token(FsCassQueryToken::LParen | FsCassQueryToken::RParen)
+                )),
+                "{query:?}: {tokens:?}"
+            );
+            let _ = read_query(query);
+            let _ = transpile_to_fts5(query);
+        }
+        // Mid-word parentheses stay part of the term.
+        assert_eq!(
+            cass_bool_tokens("foo(bar)"),
+            vec![CassBoolToken::Token(FsCassQueryToken::Term(
+                "foo(bar)".to_string()
+            ))]
+        );
+    }
+
+    /// `--explain` lexes the raw query, where grouping parentheses now arrive
+    /// as tokens: they add no term, keep implicit-AND adjacency, and the
+    /// grouping shows in `structure`.
+    #[test]
+    fn explain_reports_grouped_operands_as_bare_terms() {
+        let filters = SearchFilters::default();
+        let explanation = QueryExplanation::analyze("(alpha OR beta) gamma", &filters);
+        let terms: Vec<&str> = explanation
+            .parsed
+            .terms
+            .iter()
+            .map(|term| term.text.as_str())
+            .collect();
+        assert_eq!(terms, vec!["alpha", "beta", "gamma"]);
+        assert!(explanation.parsed.implicit_and);
+        assert!(
+            explanation
+                .parsed
+                .structure
+                .as_deref()
+                .is_some_and(|structure| structure.contains("(alpha OR beta)")),
+            "{:?}",
+            explanation.parsed.structure
+        );
+
+        // An explicit OR before the group is not an implicit AND.
+        let explanation = QueryExplanation::analyze("alpha OR (beta)", &filters);
+        assert!(!explanation.parsed.implicit_and);
+
+        // A parenthesis inside a word is not a group.
+        let explanation = QueryExplanation::analyze("foo(bar)", &filters);
+        let terms: Vec<&str> = explanation
+            .parsed
+            .terms
+            .iter()
+            .map(|term| term.text.as_str())
+            .collect();
+        assert_eq!(terms, vec!["foo(bar)"]);
     }
 
     #[test]
