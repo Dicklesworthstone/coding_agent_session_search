@@ -30772,9 +30772,10 @@ fn reindex_paths_with_semantic_delta(
                 conv,
             );
         }
-        if !explicit_watch_once {
-            sort_watch_conversations_for_watermark(&mut convs);
-        }
+        // Watermark order for live watch; a total order (watermark, path,
+        // external id) for every batch, so canonical ids never depend on the
+        // filesystem's directory order (connectors walk unsorted).
+        sort_watch_conversations_for_watermark(&mut convs);
 
         // GH#510: a conversation whose bounded-guard NoMem keeps recurring
         // waits out its deferral backoff instead of re-running the split, solo
