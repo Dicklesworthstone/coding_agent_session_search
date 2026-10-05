@@ -1,0 +1,290 @@
+diff --git a/src/search/query.rs b/src/search/query.rs
+--- a/src/search/query.rs
++++ b/src/search/query.rs
+@@ -963,6 +963,7 @@ impl SemanticTierMode {
+ mod ann_shards;
+ #[cfg(test)]
+ mod ann_shards_integration;
++mod message_stream;
+ mod message_topk;
+ #[cfg(test)]
+ mod message_topk_integration;
+@@ -5440,10 +5441,29 @@ impl SearchClient {
+     fn search_exact_semantic_indexes(
+         context: &SemanticCandidateContext,
+         embedding: &[f32],
+         fetch_limit: usize,
+         fs_filter: Option<&dyn FsSearchFilter>,
++    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
++        Self::search_exact_semantic_indexes_with_refinement(
++            context,
++            embedding,
++            fetch_limit,
++            fs_filter,
++            true,
++        )
++    }
++
++    // Keep the incumbent for unsupported no-WAL widths and same-invocation
++    // comparisons. The pinned backend repairs WAL-shadowed raw windows itself;
++    // a retained delta alone is not a reason to bypass its proven first window.
++    fn search_exact_semantic_indexes_with_refinement(
++        context: &SemanticCandidateContext,
++        embedding: &[f32],
++        fetch_limit: usize,
++        fs_filter: Option<&dyn FsSearchFilter>,
++        streaming: bool,
+     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
+         let (initial, retry) = Self::search_exact_semantic_indexes_initial_window(
+             context,
+             embedding,
+             fetch_limit,
+@@ -5458,6 +5478,23 @@ impl SearchClient {
+                 .saturating_add(artifact.index().wal_record_count())
+         });
+         let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
++        if streaming
++            && let Some(hits) = message_stream::try_collect_retained_messages(
++                &context.artifacts,
++                embedding,
++                return_limit,
++                fs_filter,
++            )?
++        {
++            let has_more_candidates = hits.len() >= return_limit && return_limit < record_count;
++            return Ok((
++                hits,
++                SemanticCandidateRetryState {
++                    has_more_candidates,
++                    exact_window_may_omit_competitor: false,
++                },
++            ));
++        }
+         let mut refills_left = message_topk::MAX_EXACT_MESSAGE_REFILLS;
+         let mut rounds = 0usize;
+         let mut best_by_message = HashMap::<u64, VectorSearchResult>::new();
+diff --git a/src/search/query/message_stream/retained_wal/tests.rs b/src/search/query/message_stream/retained_wal/tests.rs
+index a8706c3..ef1b670 100644
+--- a/src/search/query/message_stream/retained_wal/tests.rs
++++ b/src/search/query/message_stream/retained_wal/tests.rs
+@@ -36,6 +36,9 @@ fn artifact(path: &Path, dimension: usize, quantization: Quantization,
+ fn cut_artifact(path: &Path, dimension: usize, quantization: Quantization,
+     main: &[(String, Vec<f32>)], wal: &[(String, Vec<f32>)]) -> Result<SemanticIndexArtifact> {
+     drop(artifact(path, dimension, quantization, main, &[])?);
++    // Keep a separate, real no-WAL view for the historical late-filter
++    // counterexample. The pinned engine's combined reader is already fixed.
++    std::fs::copy(path, path.with_extension("raw-main.fsvi"))?;
+     let producer = path.with_extension("wal-producer.fsvi");
+     std::fs::copy(path, &producer)?;
+     let mut writer = FsVectorIndex::open_writer(&producer)?;
+@@ -55,6 +58,22 @@ fn context(artifacts: Vec<SemanticIndexArtifact>) -> SemanticCandidateContext {
+             HashMap::new(), HashSet::new()), roles: None }
+ }
+ 
++fn assert_late_shadowing_loses_raw_window(path: &Path, current: &FsVectorIndex,
++    query: &[f32]) -> Result<()> {
++    let raw = FsVectorIndex::open_read_only(&path.with_extension("raw-main.fsvi"))?;
++    assert_eq!(raw.wal_record_count(), 0);
++    let hits = raw.search_top_k(query, 4, None)?;
++    assert!(!hits.is_empty(), "negative control must select obsolete rows first");
++    let shadowed: HashSet<_> = current.wal_records().map(|(id, _)| id).collect();
++    assert!(hits.iter().all(|hit| shadowed.contains(hit.doc_id.as_str())),
++        "late removal of superseded identities must erase every raw winner");
++    // This is the repaired backend control, not a weakened expected answer.
++    // The complete output oracle below still checks every ID, chunk and score.
++    assert!(!current.search_top_k(query, 4, None)?.is_empty(),
++        "native WAL repair must not regress to the historical false-empty result");
++    Ok(())
++}
++
+ fn signature(hits: &[VectorSearchResult]) -> Vec<(u64, u8, u32)> {
+     hits.iter().map(|hit| (hit.message_id, hit.chunk_idx, hit.score.to_bits())).collect()
+ }
+@@ -127,7 +146,7 @@ fn tail_width_scores_and_chunk_ties_match_the_exact_backend_bit_for_bit() -> Res
+ }
+ 
+ #[test]
+-fn legacy_width_live_caller_cannot_certify_an_erased_raw_window_as_empty() -> Result<()> {
++fn legacy_width_live_caller_preserves_native_repair_and_late_filter_negative() -> Result<()> {
+     let tmp = tempfile::tempdir()?;
+     for dimension in [2, 33] {
+         let path = tmp.path().join(format!("erased-{dimension}.fsvi"));
+@@ -137,8 +156,7 @@ fn legacy_width_live_caller_cannot_certify_an_erased_raw_window_as_empty() -> Re
+         let ctx = context(vec![cut_artifact(&path, dimension, Quantization::F16, &main, &wal)?]);
+         let query = vector(dimension, 1.0);
+         let before = files(tmp.path())?;
+-        assert!(ctx.artifacts[0].index().search_top_k(&query, 4, None)?.is_empty(),
+-            "reproducer must erase all raw winners, not merely return a short page");
++        assert_late_shadowing_loses_raw_window(&path, ctx.artifacts[0].index(), &query)?;
+         assert!(super::super::try_collect_exact_messages(&ctx.artifacts, &query, 4, None)?.is_none(),
+             "this regression must exercise the previously unsupported width");
+         let (hits, retry) = SearchClient::search_exact_semantic_indexes(&ctx, &query, 1, None)?;
+@@ -161,7 +179,7 @@ fn large_wal_live_caller_preserves_current_messages_and_pagination() -> Result<(
+     let query = vector(32, 1.0);
+     let before = files(tmp.path())?;
+     assert!(ctx.artifacts[0].index().wal_record_count() > super::super::MAX_WAL_SHADOW_KEYS);
+-    assert!(ctx.artifacts[0].index().search_top_k(&query, 4, None)?.is_empty());
++    assert_late_shadowing_loses_raw_window(&path, ctx.artifacts[0].index(), &query)?;
+     assert!(super::super::try_collect_exact_messages(&ctx.artifacts, &query, 4, None)?.is_none());
+     for requested in [1, 3, 100, 5000] {
+         let (hits, retry) = SearchClient::search_exact_semantic_indexes(&ctx, &query, requested, None)?;
+diff --git a/src/search/query/message_stream/tests.rs b/src/search/query/message_stream/tests.rs
+index 4e7e5ca..a0227ba 100644
+--- a/src/search/query/message_stream/tests.rs
++++ b/src/search/query/message_stream/tests.rs
+@@ -324,27 +324,43 @@ fn streaming_live_driver_matches_incumbent_and_exhaustive_oracle() -> Result<()>
+ }
+ 
+ #[test]
+-fn streaming_live_wal_supersession_cannot_certify_a_false_empty_window() -> Result<()> {
++fn streaming_live_wal_supersession_preserves_repaired_backend_and_late_filter_negative() -> Result<()> {
+     let tmp = tempfile::tempdir()?;
+     let path = tmp.path().join("shadowed-window.fsvi");
+-    // These are valid v1 physical duplicate rows, not forged bytes. The
+-    // writer's best-effort tombstone can leave older duplicates live while
+-    // the durable WAL already supersedes their entire document identity.
++    // Preserve the historical late-shadowing counterexample without asserting
++    // that the pinned engine still has that bug. Its merge_wal_top_k repairs
++    // superseded windows before resolving results (CI 37363073434).
+     let mut rows = vec![(doc(1, 0, 3), vector(32, 1.0)); 32];
+     rows.push((doc(2, 0, 3), vector(32, 0.5)));
+     drop(write_artifact(&path, 32, Quantization::F16, &rows)?);
+-    let mut writer = FsVectorIndex::open_writer(&path)?;
++    let raw_path = tmp.path().join("raw-window.fsvi");
++    std::fs::copy(&path, &raw_path)?;
++    let raw = FsVectorIndex::open_read_only(&raw_path)?;
++    let producer_path = tmp.path().join("wal-producer.fsvi");
++    std::fs::copy(&path, &producer_path)?;
++    let mut writer = FsVectorIndex::open_writer(&producer_path)?;
+     writer.append_batch(&[(doc(1, 0, 3), vector(32, -1.0))])?;
+     drop(writer);
++    std::fs::copy(frankensearch::index::wal_path_for(&producer_path),
++        frankensearch::index::wal_path_for(&path))?;
+     let ctx = context(vec![SemanticIndexArtifact::open(&path, None)?]);
+     let index = ctx.artifacts[0].index();
++    assert_eq!(index.tombstone_count(), 0);
++    assert_eq!(index.wal_record_count(), 1);
+     assert_eq!(index.record_count(), 33);
+     let query = vector(32, 1.0);
+-    assert!(index.search_top_k(&query, 4, None)?.is_empty(),
+-        "negative fixture must lose its raw top-k solely to retained WAL shadowing");
++    let raw_hits = raw.search_top_k(&query, 4, None)?;
++    assert!(!raw_hits.is_empty(), "negative control must first select obsolete rows");
++    let shadowed: HashSet<_> = index.wal_records().map(|(id, _)| id).collect();
++    let late_filtered: Vec<_> = raw_hits.into_iter()
++        .filter(|hit| !shadowed.contains(hit.doc_id.as_str())).collect();
++    assert!(late_filtered.is_empty(), "late shadowing must erase the bounded raw window");
++    assert_eq!(index.search_top_k(&query, 4, None)?.iter()
++        .map(|hit| parse_semantic_doc_id(&hit.doc_id).unwrap().message_id)
++        .collect::<Vec<_>>(), vec![2, 1], "the repaired backend must retain both current messages");
+     let (incumbent, old_retry) = SearchClient::search_exact_semantic_indexes_with_refinement(
+         &ctx, &query, 1, None, false)?;
+-    assert!(incumbent.is_empty());
++    assert_eq!(signature(&incumbent), oracle(&ctx.artifacts, &query, 4, None)?);
+     assert!(!old_retry.exact_window_may_omit_competitor);
+     let before = (std::fs::read(&path)?,
+         std::fs::read(frankensearch::index::wal_path_for(&path))?);
+@@ -352,10 +368,101 @@ fn streaming_live_wal_supersession_cannot_certify_a_false_empty_window() -> Resu
+     let (hits, retry) = SearchClient::search_exact_semantic_indexes(&ctx, &query, 1, Some(&count))?;
+     assert_eq!(signature(&hits), oracle(&ctx.artifacts, &query, 4, None)?);
+     assert_eq!(hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(), vec![2, 1]);
+-    assert_eq!(count.calls.load(AtomicOrdering::Relaxed), 2,
+-        "only the surviving main document and current WAL replacement reach scoring scope");
++    let direct_count = CountingFilter::new();
++    let direct = try_collect_retained_messages(&ctx.artifacts, &query, 4, Some(&direct_count))?
++        .expect("standard-width retained view is supported");
++    assert_eq!(signature(&direct), signature(&hits));
++    assert_eq!(direct_count.calls.load(AtomicOrdering::Relaxed), 2,
++        "the direct collector scores only current main and WAL identities");
+     assert!(!retry.exact_window_may_omit_competitor);
+     assert_eq!((std::fs::read(&path)?,
+         std::fs::read(frankensearch::index::wal_path_for(&path))?), before);
+     Ok(())
+ }
++
++struct HashAwareCountingFilter {
++    hashes: AtomicUsize,
++    strings: AtomicUsize,
++}
++impl HashAwareCountingFilter {
++    fn new() -> Self {
++        Self { hashes: AtomicUsize::new(0), strings: AtomicUsize::new(0) }
++    }
++}
++impl FsSearchFilter for HashAwareCountingFilter {
++    fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool {
++        self.strings.fetch_add(1, AtomicOrdering::Relaxed);
++        true
++    }
++    fn matches_doc_id_hash(&self, _: u64, _: Option<&serde_json::Value>) -> Option<bool> {
++        self.hashes.fetch_add(1, AtomicOrdering::Relaxed);
++        Some(true)
++    }
++    fn name(&self) -> &str { "count-native-and-message-selection-separately" }
++}
++
++#[test]
++fn streaming_wal_queries_keep_a_proven_native_first_window() -> Result<()> {
++    let tmp = tempfile::tempdir()?;
++    // Cover both the optimized collector and the legacy-width/large-WAL lane.
++    for (dimension, delta_count) in [(32, 1), (33, 4100)] {
++        let path = tmp.path().join(format!("proven-{dimension}.fsvi"));
++        let rows: Vec<_> = (1..=32_u64).map(|id|
++            (doc(id, 0, 3), vector(dimension, 1.0 - id as f32 / 64.0))).collect();
++        drop(write_artifact(&path, dimension, Quantization::F32, &rows)?);
++        let mut writer = FsVectorIndex::open_writer(&path)?;
++        let delta: Vec<_> = (0..delta_count).map(|id|
++            (doc(1000 + id, 0, 3), vector(dimension, -0.5))).collect();
++        writer.append_batch(&delta)?;
++        drop(writer);
++        let ctx = context(vec![SemanticIndexArtifact::open(&path, None)?]);
++        let query = vector(dimension, 1.0);
++        let initial_count = HashAwareCountingFilter::new();
++        let (initial, initial_retry) = SearchClient::search_exact_semantic_indexes_initial_window(
++            &ctx, &query, 2, Some(&initial_count))?;
++        assert!(!initial_retry.exact_window_may_omit_competitor,
++            "the first window must actually prove this request");
++        assert!(initial_count.hashes.load(AtomicOrdering::Relaxed) > 0);
++        let live_count = HashAwareCountingFilter::new();
++        let (live, live_retry) = SearchClient::search_exact_semantic_indexes(
++            &ctx, &query, 2, Some(&live_count))?;
++        assert_eq!(signature(&live), signature(&initial));
++        assert_eq!(signature(&live), oracle(&ctx.artifacts, &query, 8, None)?);
++        assert_eq!(live_retry.has_more_candidates, initial_retry.has_more_candidates);
++        assert!(!live_retry.exact_window_may_omit_competitor);
++        assert_eq!(live_count.hashes.load(AtomicOrdering::Relaxed),
++            initial_count.hashes.load(AtomicOrdering::Relaxed));
++        assert_eq!(live_count.strings.load(AtomicOrdering::Relaxed),
++            initial_count.strings.load(AtomicOrdering::Relaxed),
++            "a proven WAL query must not launch a second message-level scan");
++    }
++    Ok(())
++}
++
++#[test]
++fn streaming_unresolved_wal_window_uses_complete_message_refinement() -> Result<()> {
++    let tmp = tempfile::tempdir()?;
++    for dimension in [32, 33] {
++        let path = tmp.path().join(format!("unresolved-{dimension}.fsvi"));
++        let rows: Vec<_> = (1..=16_u64).flat_map(|id| (0..=31_u8).map(move |chunk|
++            (doc(id, chunk, 3), vector(dimension, 1.0 - id as f32 / 32.0)))).collect();
++        drop(write_artifact(&path, dimension, Quantization::F32, &rows)?);
++        let mut writer = FsVectorIndex::open_writer(&path)?;
++        writer.append_batch(&[(doc(100, 0, 3), vector(dimension, -0.5))])?;
++        drop(writer);
++        let ctx = context(vec![SemanticIndexArtifact::open(&path, None)?]);
++        let query = vector(dimension, 1.0);
++        let (_, initial_retry) = SearchClient::search_exact_semantic_indexes_initial_window(
++            &ctx, &query, 2, None)?;
++        assert!(initial_retry.exact_window_may_omit_competitor);
++        let scope = HashAwareCountingFilter::new();
++        let (live, retry) = SearchClient::search_exact_semantic_indexes(
++            &ctx, &query, 2, Some(&scope))?;
++        assert_eq!(signature(&live), oracle(&ctx.artifacts, &query, 8, None)?);
++        assert!(!retry.exact_window_may_omit_competitor);
++        assert!(scope.hashes.load(AtomicOrdering::Relaxed) > 0);
++        assert_eq!(scope.strings.load(AtomicOrdering::Relaxed), rows.len() + 1,
++            "exactly one complete message refinement must follow the native window");
++    }
++    Ok(())
++}

@@ -6,7 +6,7 @@ on:
     paths:
       - 'src/search/query/message_stream.rs'
       - 'src/search/query/message_stream/**'
-      - 'scripts/apply_exact_message_stream.py'
+      - 'scripts/patches/exact-message-stream.patch'
       - '.github/workflows/exact-message-stream.yml'
 permissions:
   contents: write
@@ -31,7 +31,19 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/exact-message-evidence"
           git rev-parse HEAD | tee "$RUNNER_TEMP/exact-message-evidence/tested-base.txt"
-          python3 scripts/apply_exact_message_stream.py | tee "$RUNNER_TEMP/exact-message-evidence/integration.txt"
+          # This reviewed diff supersedes the old unconditional-WAL wrapper.
+          # After activation, rustfmt changes line layout; the runtime tests
+          # below, including separate native/refinement visit counters, still
+          # qualify every subsequent module change on the current main tree.
+          if grep -Fq 'fn streaming_wal_queries_keep_a_proven_native_first_window(' src/search/query/message_stream/tests.rs; then
+            grep -Fq 'a retained delta alone is not a reason to bypass its proven first window.' src/search/query.rs
+            grep -Fq 'fn legacy_width_live_caller_preserves_native_repair_and_late_filter_negative(' src/search/query/message_stream/retained_wal/tests.rs
+            echo 'Reviewed first-window integration already present.' | tee "$RUNNER_TEMP/exact-message-evidence/integration.txt"
+          else
+            git apply --check scripts/patches/exact-message-stream.patch
+            git apply scripts/patches/exact-message-stream.patch
+            echo 'Applied reviewed first-window integration and regression diff.' | tee "$RUNNER_TEMP/exact-message-evidence/integration.txt"
+          fi
           rustc --version | tee "$RUNNER_TEMP/exact-message-evidence/toolchain.txt"
           rustfmt --edition 2024 --config skip_children=true src/search/query.rs
           rustfmt --edition 2024 src/search/query/message_stream.rs
@@ -56,7 +68,7 @@ jobs:
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat(search): activate complete bounded exact message selection' -m 'Preserve the ordinary proven no-WAL first window. Unresolved standard-width cohorts use single-pass message selection; retained-WAL cohorts select current main-plus-delta messages before raw-window exhaustion shortcuts. Legacy widths use the exact backend byte kernels; large WALs use bounded borrowed shadow references or return an explicit resource error. Validate against real FSVI/WAL differential tests, existing exact/ANN regressions and locked lib Clippy. Preserve the false-empty and output assertions while constructing the intended pre-cleanup WAL image from production-serialized files. No dependency or acceptance-gate changes.'
+          git commit -m 'feat(search): activate bounded exact refinement after proven native windows' -m 'Keep the native first-window proof for both main-only and retained-WAL queries. Only unresolved chunk windows use complete bounded message selection, including legacy widths and large deltas. Preserve backend WAL repair; retain late-filter historical negatives without requiring the pinned backend to reproduce an already-fixed bug. Validate exact scores, chunks, scope, immutable artifacts and one-pass routing with locked FSVI/WAL tests, existing exact/ANN regressions and lib Clippy. No dependency or acceptance-gate changes.'
           git push origin HEAD:refs/heads/main
           git rev-parse HEAD | tee "$RUNNER_TEMP/exact-message-evidence/published-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
