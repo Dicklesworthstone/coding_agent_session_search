@@ -34,6 +34,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **A resumed full rebuild that cannot certify its document count rebuilds
+  in the same run (#494).** When a resumed candidate held documents its
+  checkpoint never counted, `cass index --full` replayed the rest of the
+  archive and then exited 9 at `validate_candidate`, and later runs resumed
+  the refused end-of-archive checkpoint into the same refusal. A resume at
+  the end of the archive now checks the count before replaying, and a
+  resume that is refused after replaying keeps the candidate under
+  `.lexical-rebuild-quarantine-*` with the count that failed and rebuilds
+  from zero in the same invocation. A from-zero rebuild whose count is
+  wrong is still refused. The refusal no longer says "only sees" when the
+  reader sees more documents than were counted.
 - **`cass schedule` no longer reports a failing index run as lock contention
   (#509).** Every exit 7 from the index step was reported as "another index
   run already holds the index lock; skipped this cycle". That included a

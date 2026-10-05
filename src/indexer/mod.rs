@@ -9168,13 +9168,96 @@ pub(crate) fn verify_published_lexical_doc_count(
             )
         })?;
     if summary.docs != indexed_docs {
-        return Err(anyhow::anyhow!(
-            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader sees \
-             {}; refusing to certify the generation (GH #457)",
-            summary.docs
-        ));
+        return Err(LexicalDocCountMismatch {
+            publish_mode: publish_mode.to_owned(),
+            counted: indexed_docs,
+            observed: summary.docs,
+        }
+        .into());
     }
     Ok(())
+}
+
+/// GH #457: a fresh reader serves a different number of live documents than
+/// the run counted. Typed so a resumed run can tell a candidate it can never
+/// certify from one it could not open.
+#[derive(Debug)]
+pub(crate) struct LexicalDocCountMismatch {
+    publish_mode: String,
+    counted: usize,
+    observed: usize,
+}
+
+impl std::fmt::Display for LexicalDocCountMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} lexical rebuild published {} docs but a fresh reader sees {}; refusing to \
+             certify the generation (GH #457)",
+            self.publish_mode, self.counted, self.observed
+        )
+    }
+}
+
+impl std::error::Error for LexicalDocCountMismatch {}
+
+/// GH #494: a resumed candidate failed certification, was retained, and the
+/// live checkpoint now restarts from zero. The caller rebuilds once.
+#[derive(Debug)]
+struct ResumedLexicalCandidateRetained {
+    quarantine: PathBuf,
+}
+
+impl std::fmt::Display for ResumedLexicalCandidateRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the resumed lexical candidate cannot be certified; retained it in {} and \
+             rebuilding from zero (GH #494)",
+            self.quarantine.display()
+        )
+    }
+}
+
+/// GH #494: a resumed staged candidate whose live documents disagree with the
+/// count its checkpoint carried after the replay can never be certified by
+/// resuming it again. The resume check catches an EOF checkpoint before the
+/// replay; a surplus in the committed prefix, which the #440 upsert window
+/// never revisits, surfaces only here. Retain the candidate with the
+/// checkpoint that could not certify it, and reset the live checkpoint so even
+/// an interrupted retry replays from zero. If retention fails, the original
+/// refusal stands and nothing is retried.
+fn retain_uncertifiable_resumed_candidate(
+    index_path: &Path,
+    candidate: &Path,
+    rebuild_state: &LexicalRebuildState,
+    db_state: &LexicalRebuildDbState,
+    refusal: anyhow::Error,
+) -> anyhow::Error {
+    let retained = (|| -> Result<PathBuf> {
+        let quarantine = lexical_publish::quarantine_incomplete_candidate(candidate)?;
+        persist_lexical_rebuild_state(&quarantine, rebuild_state)?;
+        persist_lexical_rebuild_state(
+            index_path,
+            &LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE),
+        )?;
+        Ok(quarantine)
+    })();
+    match retained {
+        Ok(quarantine) => {
+            tracing::warn!(
+                quarantine_path = %quarantine.display(),
+                counted_docs = rebuild_state.indexed_docs,
+                error = %format!("{refusal:#}"),
+                "resumed lexical candidate failed certification; retained it and rebuilding from zero (GH #494)"
+            );
+            refusal.context(ResumedLexicalCandidateRetained { quarantine })
+        }
+        Err(retain_error) => refusal.context(format!(
+            "could not retain the uncertifiable resumed lexical candidate, so it was not \
+             rebuilt: {retain_error:#}"
+        )),
+    }
 }
 
 /// GH #457: a run must not certify a hollow generation. Every full rebuild
@@ -25791,6 +25874,42 @@ fn rebuild_tantivy_from_db_with_options(
     options: LexicalRebuildStartupOptions,
     progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
+    match rebuild_tantivy_from_db_once(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress.clone(),
+        options,
+        progress_bump.clone(),
+    ) {
+        // GH #494: the retained candidate's checkpoint now starts at zero, so
+        // this pass is not resumed and cannot be retried again.
+        Err(error)
+            if error
+                .downcast_ref::<ResumedLexicalCandidateRetained>()
+                .is_some() =>
+        {
+            rebuild_tantivy_from_db_once(
+                db_path,
+                data_dir,
+                total_conversations,
+                progress,
+                options,
+                progress_bump,
+            )
+        }
+        outcome => outcome,
+    }
+}
+
+fn rebuild_tantivy_from_db_once(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    options: LexicalRebuildStartupOptions,
+    progress_bump: Option<Arc<AtomicI64>>,
+) -> Result<LexicalRebuildOutcome> {
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let prep_started = Instant::now();
     let mut prep_step_started = Instant::now();
@@ -27084,10 +27203,27 @@ fn rebuild_tantivy_from_db_with_options(
     })?;
     // Refuse an unreadable/hollow candidate before it can replace a usable
     // live generation. Reopen and validate the actual live path again after swap.
-    publication.run("validate_candidate", || {
+    if let Err(refusal) = publication.run("validate_candidate", || {
         crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
         verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
-    })?;
+    }) {
+        // GH #494: only a resumed staged candidate whose count disagrees is
+        // rebuilt. A from-zero build that miscounts is a defect to report, and
+        // a candidate building in the live tree is never moved aside.
+        if resumed_from_checkpoint
+            && staged_build_path.is_some()
+            && refusal.downcast_ref::<LexicalDocCountMismatch>().is_some()
+        {
+            return Err(retain_uncertifiable_resumed_candidate(
+                &index_path,
+                &build_path,
+                &rebuild_state,
+                &db_state,
+                refusal,
+            ));
+        }
+        return Err(refusal);
+    }
 
     // GH #440: indexed_docs omits hard-noise messages from the committed
     // prefix, so prefix docs + newly streamed rows is not an exact canonical
