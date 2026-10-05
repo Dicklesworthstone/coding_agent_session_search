@@ -151,55 +151,119 @@ fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
     assert_eq!(messages(), 2, "a native-ID edit must not append a message");
 }
 
-/// GH #511 (bead b7rhs): a Codebuff transcript the connector cannot interpret
-/// (the reporter's time-of-day timestamps, "01:15 PM") failed the codebuff
-/// scan, and cass reported `unreadable-source` with "check permissions"
-/// against the cass data directory. The failure is in the content, so it must
-/// be `unparseable-source`, not retryable on unchanged bytes, and name a scan
-/// root that holds the transcript.
-#[test]
-fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
-    use serde_json::{Value, json};
-    use std::time::Duration;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    let data = tmp.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let chat = home.join(".config/manicode/projects/probe/chats/2026-03-21T17-14-03.768Z");
+/// The GH #511 reporter's store layout under an isolated home: one native
+/// Codebuff chat in `project` whose run state names `/synthetic/probe`.
+fn gh511_codebuff_chat(
+    home: &Path,
+    project: &str,
+    records: &serde_json::Value,
+) -> std::path::PathBuf {
+    let chat = home
+        .join(".config/manicode/projects")
+        .join(project)
+        .join("chats/2026-03-21T17-14-03.768Z");
     std::fs::create_dir_all(&chat).unwrap();
     let transcript = chat.join("chat-messages.json");
-    let records = json!([
-        {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
-         "timestamp":"01:15 PM"},
-        {"id":"ai-1774113411457", "variant":"ai", "content":"Synthetic probe answer",
-         "timestamp":"01:16 PM"}
-    ]);
-    std::fs::write(&transcript, serde_json::to_vec(&records).unwrap()).unwrap();
+    std::fs::write(&transcript, serde_json::to_vec(records).unwrap()).unwrap();
     std::fs::write(
         chat.join("run-state.json"),
         br#"{"sessionState":{"fileContext":{"projectRoot":"/synthetic/probe"}}}"#,
     )
     .unwrap();
+    transcript
+}
 
+/// `cass` that sees only the isolated home and data dir.
+fn gh511_cass(home: &Path, data: &Path) -> assert_cmd::Command {
     let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     command
         .env_clear()
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("CASS_DATA_DIR", &data)
+        .env("CASS_DATA_DIR", data)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CASS_AUTO_REFRESH", "0")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("RUST_MIN_STACK", "134217728")
-        .current_dir(&home)
-        .timeout(Duration::from_secs(180));
+        .current_dir(home)
+        .timeout(std::time::Duration::from_secs(180));
     if let Ok(system_root) = dotenvy::var("SystemRoot") {
         command.env("SystemRoot", system_root);
     }
-    let output = command
+    command
+}
+
+/// The one Codebuff hit for the message whose content is `content`, from a
+/// search for `needle`. Every message also matches through its conversation
+/// title (the first user message), so a search can return several hits.
+fn gh511_message_hit(home: &Path, data: &Path, needle: &str, content: &str) -> serde_json::Value {
+    let output = gh511_cass(home, data)
+        .args([
+            "search",
+            needle,
+            "--agent",
+            "codebuff",
+            "--mode",
+            "lexical",
+            "--json",
+            "--no-maintenance",
+            "--timeout",
+            "10000",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let hits: Vec<serde_json::Value> = result["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit["content"] == content)
+        .cloned()
+        .collect();
+    assert_eq!(hits.len(), 1, "{result}");
+    hits[0].clone()
+}
+
+/// The reporter's native transcript: `timestamp` is a locale time of day.
+fn gh511_native_records() -> serde_json::Value {
+    serde_json::json!([
+        {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
+         "timestamp":"01:15 PM"},
+        {"id":"ai-1774113411457", "variant":"ai", "content":"Synthetic probe answer",
+         "timestamp":"01:16 PM"}
+    ])
+}
+
+/// GH #511 (bead b7rhs): a Codebuff transcript the connector could not
+/// interpret failed the codebuff scan, and cass reported `unreadable-source`
+/// with "check permissions" against the cass data directory. The failure is in
+/// the content, so it must be `unparseable-source`, not retryable on unchanged
+/// bytes, and name a scan root that holds the transcript. The fixture is the
+/// reporter's second probe: a variant ("assistant") the CLI never writes.
+#[test]
+fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
+    use serde_json::{Value, json};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let transcript = gh511_codebuff_chat(
+        &home,
+        "probe",
+        &json!([
+            {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
+             "timestamp":"2026-03-21T17:15:51.457Z"},
+            {"id":"ai-1774113411457", "variant":"assistant", "content":"Synthetic probe answer",
+             "timestamp":"2026-03-21T17:16:51.457Z"}
+        ]),
+    );
+    let output = gh511_cass(&home, &data)
         .args(["index", "--full", "--json", "--no-progress-events"])
         .output()
         .unwrap();
@@ -215,7 +279,7 @@ fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
     assert!(
         connector["error"]
             .as_str()
-            .is_some_and(|error| error.contains("timestamp")),
+            .is_some_and(|error| error.contains("variant at record 1")),
         "the connector error still names the bad record: {connector}"
     );
 
@@ -252,6 +316,78 @@ fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
             "{diagnostic}"
         );
     }
+}
+
+/// GH #511: native Codebuff writes `timestamp` as a locale time of day
+/// ("01:15 PM"), which franken-agent-detection 0.3.3 rejected for every
+/// native transcript. The reporter's transcript now indexes, and each message
+/// carries the instant its ID's `Date.now()` recorded; nothing is derived
+/// from the time of day.
+#[test]
+fn gh511_native_time_of_day_transcript_indexes_with_its_id_instants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    gh511_codebuff_chat(&home, "probe", &gh511_native_records());
+    gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    for (needle, content, instant) in [
+        (
+            "question",
+            "Synthetic probe question",
+            1_774_113_351_457_i64,
+        ),
+        ("answer", "Synthetic probe answer", 1_774_113_411_457),
+    ] {
+        let hit = gh511_message_hit(&home, &data, needle, content);
+        assert_eq!(hit["created_at"].as_i64(), Some(instant), "{hit}");
+        assert_eq!(hit["workspace"], "/synthetic/probe", "{hit}");
+    }
+}
+
+/// GH #511: one Codebuff transcript that does not parse (here truncated
+/// mid-write) stopped the scan, so every chat after it in path order went
+/// unindexed (franken-agent-detection 0.3.4 and earlier). The bad chat sorts
+/// first here. The good chat now indexes, the run still exits 9, and the
+/// connector error names the bad transcript and its cause.
+#[test]
+fn gh511_one_unparseable_codebuff_transcript_does_not_hide_the_others() {
+    use serde_json::Value;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let truncated = gh511_codebuff_chat(&home, "a-truncated", &serde_json::json!([]));
+    std::fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
+    gh511_codebuff_chat(&home, "probe", &gh511_native_records());
+    let output = gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(9), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let connector = report["indexing_stats"]["connectors"]
+        .as_array()
+        .expect("connector summaries")
+        .iter()
+        .find(|connector| connector["name"] == "codebuff")
+        .expect("codebuff ran");
+    let named = Path::new("a-truncated")
+        .join("chats")
+        .join("2026-03-21T17-14-03.768Z")
+        .join("chat-messages.json");
+    let error = connector["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&named.display().to_string())
+            && error.contains("invalid Codebuff / Freebuff transcript JSON"),
+        "{connector}"
+    );
+    let hit = gh511_message_hit(&home, &data, "question", "Synthetic probe question");
+    assert_eq!(hit["created_at"].as_i64(), Some(1_774_113_351_457), "{hit}");
 }
 
 /// GH #499 (bead 2l1b0.49): once an incremental run tombstones a row inside a

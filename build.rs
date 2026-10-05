@@ -171,11 +171,15 @@ const CONTRACTS: &[DependencyContract] = &[
         // rollout read cap, which 0.3.1 fixed at 100 MiB regardless of
         // CASS_CODEX_MAX_SOURCE_BYTES. 0.3.3 (2026-09-28) indexes OpenCode 2.x
         // sessions from session_v2/session_message (cass#504) and decodes
-        // OpenClaw's zstd-compressed transcript events (FAD#25).
+        // OpenClaw's zstd-compressed transcript events (FAD#25). 0.3.4
+        // (2026-10-05) indexes native Codebuff transcripts, whose timestamps
+        // are a locale time of day, taking each instant from the message ID
+        // (cass#511); 0.3.5 keeps indexing a Codebuff store's other chats when
+        // one transcript does not parse, and names that transcript.
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.3",
+        expected_version: "0.3.5",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[

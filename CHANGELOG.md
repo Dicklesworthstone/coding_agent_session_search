@@ -45,6 +45,19 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   from zero in the same invocation. A from-zero rebuild whose count is
   wrong is still refused. The refusal no longer says "only sees" when the
   reader sees more documents than were counted.
+- **Native Codebuff history indexes, and a connector that cannot parse a
+  source says so (#511).** Codebuff writes each message's
+  `timestamp` as a locale time of day such as "01:15 PM".
+  franken-agent-detection 0.3.3 required a full timestamp, so no native
+  Codebuff transcript was indexed. 0.3.4 takes each message's instant from
+  the `Date.now()` milliseconds in its ID and never guesses a date or zone
+  from the time of day. 0.3.5 keeps indexing a store's other chats when one
+  transcript does not parse, and the failure names that transcript.
+  Separately, every connector scan that failed on
+  content was reported as `unreadable-source` with "check permissions",
+  naming cass's own data directory. It is now `unparseable-source`, not
+  retryable on unchanged bytes, at the connector's scan root. I/O failures
+  stay `unreadable-source` and locks stay `source-locked`.
 - **`cass schedule` no longer reports a failing index run as lock contention
   (#509).** Every exit 7 from the index step was reported as "another index
   run already holds the index lock; skipped this cycle". That included a
