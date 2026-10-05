@@ -30032,6 +30032,56 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(daily_count(day2), 5);
     }
 
+    /// fsqlite before 0.4.7 dropped VDBE register writes above 65,535
+    /// (frankensqlite bd-2eebi, fixed upstream in 1f53ff965), so a multi-row
+    /// INSERT whose compiled program crossed that lost its later rows. The
+    /// FTS shadow is written in FTS5_BATCH_SIZE-row statements; every row of a
+    /// full batch, the last ones included, must round-trip.
+    #[test]
+    fn fts_batch_insert_round_trips_every_row_of_a_full_batch() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("fts-batch.db")).unwrap();
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("create the FTS shadow");
+        let rows = FTS5_BATCH_SIZE as i64;
+        let entries: Vec<FtsEntry> = (0..rows)
+            .map(|i| FtsEntry {
+                content: format!("batchprobe{i} filler words for the batch"),
+                title: format!("title {i}"),
+                agent: "codex".to_string(),
+                workspace: "/ws/batch".to_string(),
+                source_path: format!("/s/batch-{i}.jsonl"),
+                created_at: Some(1_700_000_000_000 + i),
+                message_id: i + 1,
+            })
+            .collect();
+
+        let inserted = franken_batch_insert_fts_on_connection(&storage.conn, &entries).unwrap();
+        assert_eq!(inserted, FTS5_BATCH_SIZE);
+        let count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(count, rows);
+        for i in [0, rows / 2, rows - 2, rows - 1] {
+            let hits = storage
+                .raw()
+                .query(&format!(
+                    "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'batchprobe{i}'"
+                ))
+                .unwrap();
+            assert_eq!(hits.len(), 1, "row {i} of {rows} must be indexed once");
+            assert_eq!(hits[0].get_typed::<i64>(0).unwrap(), i + 1, "row {i}");
+        }
+        storage
+            .raw()
+            .execute("INSERT INTO fts_messages(fts_messages) VALUES('integrity-check')")
+            .expect("FTS5 integrity-check after a full batch");
+    }
+
     #[test]
     #[serial]
     fn insert_conversations_batched_flushes_large_fts_batches() {
