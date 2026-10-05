@@ -1,0 +1,76 @@
+name: Canonical semantic replay cache
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/indexer/semantic/engine/replay_cache.rs'
+      - 'src/indexer/semantic/engine/replay_cache/**'
+      - 'scripts/patches/semantic-replay-cache.patch'
+      - '.github/workflows/semantic-replay-cache.yml'
+permissions:
+  contents: write
+jobs:
+  integrate-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Apply the reviewed manual diff to the recorded main revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/replay-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/replay-evidence/tested-base.txt"
+          if grep -Fq 'mod replay_cache;' src/indexer/semantic/engine.rs; then
+            grep -Fq 'replay_cache: replay_cache::CanonicalReplayCache,' src/indexer/semantic/engine.rs
+            grep -Fq 'self.replay_cache.select(' src/indexer/semantic/engine.rs
+            grep -Fq 'replay_proof.verify(storage)?;' src/indexer/semantic/engine.rs
+          else
+            git apply --check scripts/patches/semantic-replay-cache.patch
+            git apply scripts/patches/semantic-replay-cache.patch
+          fi
+          rustc --version | tee "$RUNNER_TEMP/replay-evidence/toolchain.txt"
+          rustfmt --edition 2024 --config skip_children=true src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs
+          rustfmt --edition 2024 src/indexer/semantic/engine/replay_cache.rs
+          git diff --check
+          git diff -- src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/engine/replay_cache.rs src/indexer/semantic/engine/replay_cache/tests.rs > "$RUNNER_TEMP/replay-evidence/source.diff"
+      - name: Exercise canonical replay, bounded resume and existing identity refusal
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filter in 'replay_cache::' 'gh458_' 'backfill_from_storage'; do
+            logfile="$RUNNER_TEMP/replay-evidence/${filter//:/_}.log"
+            cargo test --locked --lib "$filter" -- --nocapture --test-threads=1 2>&1 | tee "$logfile"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$logfile"
+          done
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/replay-evidence/clippy.log"
+      - name: Publish the tested integration directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/engine/replay_cache.rs src/indexer/semantic/engine/replay_cache/tests.rs
+          if git diff --cached --quiet; then
+            echo 'Integration already present; no commit required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(index): reuse verified canonical identities across bounded backfill batches' -m 'Activate the invocation-local replay inventory. Revalidate descriptor-bound DB/WAL stamps and producer/input identity; reload selected text and recheck a cached observation after embedding. Candidate identity validation, exact coverage, checkpoint caps, serving revocation and publication remain in the existing engine. Validated with locked replay-cache, gh458 and storage-resume tests plus library Clippy. No dependencies, ignored tests, release gates or bead closures changed. Cache work counts are not an owner-scale throughput or RSS guarantee.'
+          git push origin HEAD:refs/heads/main
+          git rev-parse HEAD | tee "$RUNNER_TEMP/replay-evidence/published-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: canonical-replay-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/replay-evidence/
+          if-no-files-found: error
+          retention-days: 14
