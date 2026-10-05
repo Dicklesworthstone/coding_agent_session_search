@@ -16,7 +16,10 @@ fn ample() -> Sample {
 }
 
 fn starved() -> Sample {
-    Sample { available_bytes: Some(0), ..ample() }
+    Sample {
+        available_bytes: Some(0),
+        ..ample()
+    }
 }
 
 fn observe(policy: &mut Policy, sample: Sample) -> Decision {
@@ -28,7 +31,13 @@ fn lost_headroom_does_not_recover_workers_or_bytes() {
     let mut policy = Policy::default();
     assert_eq!(observe(&mut policy, starved()).capacity_pct, 1);
     for _ in 0..30 {
-        let decision = observe(&mut policy, Sample { available_bytes: None, ..ample() });
+        let decision = observe(
+            &mut policy,
+            Sample {
+                available_bytes: None,
+                ..ample()
+            },
+        );
         assert_eq!(decision.capacity_pct, 1);
         assert_eq!(decision.inflight_byte_limit, MIB);
         assert_eq!(decision.healthy_streak, 0);
@@ -47,7 +56,13 @@ fn lost_total_cannot_raise_the_last_cgroup_target_to_an_explicit_limit() {
     for total in [None, Some(0)] {
         for _ in 0..10 {
             let decision = policy.observe(
-                Sample { total_bytes: total, ..ample() }, Some(32 * GIB), MAX, MIB,
+                Sample {
+                    total_bytes: total,
+                    ..ample()
+                },
+                Some(32 * GIB),
+                MAX,
+                MIB,
             );
             assert_eq!(decision.target_resident_bytes, Some(14 * GIB));
             assert_eq!(decision.capacity_pct, 1);
@@ -61,13 +76,23 @@ fn lost_total_cannot_raise_the_last_cgroup_target_to_an_explicit_limit() {
 fn a_surviving_probe_can_still_shrink_during_a_partial_outage() {
     let mut policy = Policy::default();
     observe(&mut policy, ample());
-    let decision = observe(&mut policy, Sample {
-        resident_bytes: Some(13 * GIB), available_bytes: None, ..ample()
-    });
+    let decision = observe(
+        &mut policy,
+        Sample {
+            resident_bytes: Some(13 * GIB),
+            available_bytes: None,
+            ..ample()
+        },
+    );
     assert_eq!(decision.capacity_pct, 50);
-    let decision = observe(&mut policy, Sample {
-        resident_bytes: None, available_bytes: Some(0), ..ample()
-    });
+    let decision = observe(
+        &mut policy,
+        Sample {
+            resident_bytes: None,
+            available_bytes: Some(0),
+            ..ample()
+        },
+    );
     assert_eq!(decision.capacity_pct, 1);
     assert_eq!(decision.inflight_byte_limit, MIB);
 }
@@ -75,21 +100,50 @@ fn a_surviving_probe_can_still_shrink_during_a_partial_outage() {
 #[test]
 fn a_never_supported_headroom_probe_does_not_prevent_resident_only_recovery() {
     let mut policy = Policy::default();
-    let severe = Sample { resident_bytes: Some(16 * GIB), available_bytes: None, total_bytes: None };
-    assert_eq!(policy.observe(severe, Some(8 * GIB), MAX, MIB).capacity_pct, 1);
+    let severe = Sample {
+        resident_bytes: Some(16 * GIB),
+        available_bytes: None,
+        total_bytes: None,
+    };
+    assert_eq!(
+        policy.observe(severe, Some(8 * GIB), MAX, MIB).capacity_pct,
+        1
+    );
     for expected in [1, 1, 11] {
-        let sample = Sample { resident_bytes: Some(GIB), ..severe };
-        assert_eq!(policy.observe(sample, Some(8 * GIB), MAX, MIB).capacity_pct, expected);
+        let sample = Sample {
+            resident_bytes: Some(GIB),
+            ..severe
+        };
+        assert_eq!(
+            policy.observe(sample, Some(8 * GIB), MAX, MIB).capacity_pct,
+            expected
+        );
     }
 }
 
 #[test]
 fn newly_available_headroom_becomes_required_for_subsequent_recovery() {
     let mut policy = Policy::default();
-    observe(&mut policy, Sample { available_bytes: None, ..ample() });
+    observe(
+        &mut policy,
+        Sample {
+            available_bytes: None,
+            ..ample()
+        },
+    );
     observe(&mut policy, starved());
     for _ in 0..6 {
-        assert_eq!(observe(&mut policy, Sample { available_bytes: None, ..ample() }).capacity_pct, 1);
+        assert_eq!(
+            observe(
+                &mut policy,
+                Sample {
+                    available_bytes: None,
+                    ..ample()
+                }
+            )
+            .capacity_pct,
+            1
+        );
     }
 }
 
@@ -101,7 +155,9 @@ fn byte_recovery_waits_then_grows_additively_instead_of_reopening_the_ceiling() 
     for expected in [MIB, MIB, MIB + step, MIB + step, MIB + step, MIB + 2 * step] {
         assert_eq!(observe(&mut policy, ample()).inflight_byte_limit, expected);
     }
-    for _ in 0..60 { observe(&mut policy, ample()); }
+    for _ in 0..60 {
+        observe(&mut policy, ample());
+    }
     assert_eq!(observe(&mut policy, ample()).inflight_byte_limit, MAX);
 }
 
@@ -111,7 +167,13 @@ fn failed_headroom_breaks_a_partially_completed_recovery_streak() {
     observe(&mut policy, starved());
     observe(&mut policy, ample());
     observe(&mut policy, ample());
-    observe(&mut policy, Sample { available_bytes: None, ..ample() });
+    observe(
+        &mut policy,
+        Sample {
+            available_bytes: None,
+            ..ample()
+        },
+    );
     for _ in 0..2 {
         let decision = observe(&mut policy, ample());
         assert_eq!(decision.capacity_pct, 1);
@@ -126,20 +188,35 @@ fn failed_headroom_breaks_a_partially_completed_recovery_streak() {
 fn byte_recovery_never_exceeds_current_slack() {
     let mut policy = Policy::default();
     observe(&mut policy, starved());
-    let sample = Sample { available_bytes: Some(2 * GIB), ..ample() };
+    let sample = Sample {
+        available_bytes: Some(2 * GIB),
+        ..ample()
+    };
     let ceiling = 16 * GIB;
     for _ in 0..100 {
         let decision = policy.observe(sample, None, ceiling, MIB);
         assert!(decision.inflight_byte_limit <= 768 * MIB);
     }
-    assert_eq!(policy.observe(sample, None, ceiling, MIB).inflight_byte_limit, 768 * MIB);
+    assert_eq!(
+        policy
+            .observe(sample, None, ceiling, MIB)
+            .inflight_byte_limit,
+        768 * MIB
+    );
 }
 
 #[test]
 fn losing_total_still_uses_the_last_target_for_severe_resident_pressure() {
     let mut policy = Policy::default();
     observe(&mut policy, ample());
-    let decision = observe(&mut policy, Sample { resident_bytes: Some(15 * GIB), total_bytes: None, ..ample() });
+    let decision = observe(
+        &mut policy,
+        Sample {
+            resident_bytes: Some(15 * GIB),
+            total_bytes: None,
+            ..ample()
+        },
+    );
     assert_eq!(decision.capacity_pct, 1);
     assert_eq!(decision.target_resident_bytes, Some(14 * GIB));
     assert_eq!(decision.reason, "resident_memory_severe");
@@ -160,7 +237,12 @@ fn cold_unsupported_samples_remain_a_noop() {
 fn lowered_configuration_and_zero_requests_apply_during_recovery() {
     let mut policy = Policy::default();
     observe(&mut policy, starved());
-    for _ in 0..3 { observe(&mut policy, ample()); }
-    assert_eq!(policy.observe(ample(), None, 512, MIB).inflight_byte_limit, 512);
+    for _ in 0..3 {
+        observe(&mut policy, ample());
+    }
+    assert_eq!(
+        policy.observe(ample(), None, 512, MIB).inflight_byte_limit,
+        512
+    );
     assert_eq!(policy.observe(ample(), None, 0, MIB).inflight_byte_limit, 0);
 }
