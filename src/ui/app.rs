@@ -6676,6 +6676,7 @@ impl CassApp {
             PaletteResult::OpenBulkActions => ftui::Cmd::msg(CassMsg::BulkActionsOpened),
             PaletteResult::ReloadIndex => ftui::Cmd::msg(CassMsg::IndexRefreshRequested),
             PaletteResult::BookmarkSelectedHit => ftui::Cmd::msg(CassMsg::BookmarkSelectedHit),
+            PaletteResult::OpenSwarm => ftui::Cmd::msg(CassMsg::SwarmEntered),
             PaletteResult::OpenAnalyticsView(target) => {
                 let view = match target {
                     AnalyticsTarget::Dashboard => AnalyticsView::Dashboard,
@@ -7015,7 +7016,8 @@ impl CassApp {
 
         let hint_pairs = [
             (shortcuts::SURFACE_ANALYTICS, "analytics"),
-            (shortcuts::SURFACE_SWARM, "swarm"),
+            // The Swarm tab has no direct key (Alt+W is the workspace
+            // filter); the palette's "Swarm operations cockpit" opens it.
             (shortcuts::SOURCES, "sources"),
             (shortcuts::PALETTE, "palette"),
             (shortcuts::HELP, "help"),
@@ -26377,10 +26379,28 @@ mod tests {
             PaletteResult::Screenshot(ScreenshotTarget::Text),
             PaletteResult::ToggleMacroRecording,
             PaletteResult::OpenSources,
+            PaletteResult::OpenSwarm,
             PaletteResult::Noop,
         ] {
             let _ = app.palette_result_to_cmd(r);
         }
+    }
+
+    /// f0cjq: the Swarm tab has no direct key, so the palette is its keyboard
+    /// route: the default actions list it, and choosing it switches surface.
+    #[test]
+    fn palette_swarm_entry_opens_the_swarm_surface() {
+        let entry = default_actions()
+            .into_iter()
+            .find(|item| matches!(item.action, PaletteAction::OpenSwarm))
+            .expect("the palette lists the swarm cockpit");
+        assert_eq!(entry.label, "Swarm operations cockpit");
+
+        let mut app = CassApp::default();
+        let cmd = app.palette_result_to_cmd(entry.action.dispatch());
+        assert!(matches!(cmd, ftui::Cmd::Msg(CassMsg::SwarmEntered)));
+        let _ = app.update(CassMsg::SwarmEntered);
+        assert_eq!(app.surface, AppSurface::Swarm);
     }
 
     #[test]

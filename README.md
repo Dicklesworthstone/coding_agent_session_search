@@ -1173,7 +1173,9 @@ force-releasing, or taking over work. Suggested commands are robot-safe
 templates, not automatic actions.
 
 The TUI's Swarm tab shows the same live payload for the directory the TUI was
-started in. Entering the tab starts one background read with this collector;
+started in. Open it from the command palette (`Ctrl+P`, "Swarm operations
+cockpit") or by clicking its tab; it has no direct key. Entering the tab
+starts one background read with this collector;
 until it lands, every count shows as `?`. Counts of providers that could not
 be read stay `?`, never zero. `r` reads again. Rendering never runs a provider
 read.
