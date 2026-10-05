@@ -14578,7 +14578,12 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
+                    // Name the root the connector scanned, not the cass data
+                    // dir (GH #511).
+                    let scanned_root = fallback_roots
+                        .first()
+                        .map_or(ctx.data_dir.as_path(), |root| root.path.as_path());
+                    ingest_diagnostics.observe_connector_scan_error(scanned_root, &e);
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -16015,7 +16020,12 @@ fn run_batch_index_with_connector_factories(
                             // Note: agent was counted as discovered but scan failed
                             // This is acceptable as detection succeeded (agent exists)
                             scan_succeeded = false;
-                            ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
+                            // Name the root the connector scanned, not the
+                            // cass data dir (GH #511).
+                            let scanned_root = fallback_roots
+                                .first()
+                                .map_or(ctx.data_dir.as_path(), |root| root.path.as_path());
+                            ingest_diagnostics.observe_connector_scan_error(scanned_root, &e);
                             scan_errors.push(e.to_string());
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }

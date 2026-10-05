@@ -97,6 +97,10 @@ pub enum IngestFailureKind {
     FilenameAssumptionViolated,
     /// The source path exists but could not be read (permissions / I/O).
     UnreadableSource,
+    /// The connector failed on content it could not interpret (an unsupported
+    /// record shape or value); no I/O error caused it, so permissions and
+    /// retries do not help (GH #511).
+    UnparseableSource,
     /// The source is larger than the connector's per-source read budget, so it
     /// was not indexed; raising the budget admits it on the next run.
     SourceOverReadBudget,
@@ -114,6 +118,7 @@ impl IngestFailureKind {
             IngestFailureKind::KeychainUnavailable => "keychain-unavailable",
             IngestFailureKind::FilenameAssumptionViolated => "filename-assumption-violated",
             IngestFailureKind::UnreadableSource => "unreadable-source",
+            IngestFailureKind::UnparseableSource => "unparseable-source",
             IngestFailureKind::SourceOverReadBudget => "source-over-read-budget",
         }
     }
@@ -279,6 +284,16 @@ fn classify_kind(
             true, // permissions/IO may be fixed and retried
             SourceIngestDisposition::Skipped,
             format!("{provider} source path could not be read; check permissions, then re-index"),
+        ),
+        IngestFailureKind::UnparseableSource => (
+            IngestSeverity::Error,
+            false, // the same bytes fail the same way
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} could not interpret a source's content (not a permissions or I/O \
+                 problem); indexing_stats.connectors[].error names the record. Report its shape \
+                 so the connector can parse it, then re-index"
+            ),
         ),
         IngestFailureKind::SourceOverReadBudget => (
             IngestSeverity::Error,
@@ -568,7 +583,32 @@ impl ConnectorIngestRun {
             }
             return;
         }
-        self.observe_scan_error(fallback_path, error);
+        // GH #511: only an I/O cause (or a lock) makes a source unreadable. A
+        // connector error with neither is a content failure, such as a record
+        // value the parser rejects; calling it "check permissions" sent a
+        // reporter after the wrong problem.
+        let io_cause = error
+            .chain()
+            .any(|cause| cause.downcast_ref::<std::io::Error>().is_some());
+        let message = format!("{error:#}");
+        let lower = message.to_ascii_lowercase();
+        if io_cause || lower.contains("locked") || lower.contains("busy") {
+            self.observe_scan_error(fallback_path, message);
+            return;
+        }
+        let diagnostic = classify_path(
+            &self.provider,
+            fallback_path,
+            IngestFailureKind::UnparseableSource,
+        );
+        self.sources.insert(
+            fallback_path.to_path_buf(),
+            ObservedSource {
+                disposition: diagnostic.disposition,
+                malformed: false,
+            },
+        );
+        self.diagnostics.push(diagnostic);
     }
 
     #[must_use]
@@ -924,6 +964,7 @@ mod tests {
             IngestFailureKind::KeychainUnavailable,
             IngestFailureKind::FilenameAssumptionViolated,
             IngestFailureKind::UnreadableSource,
+            IngestFailureKind::UnparseableSource,
             IngestFailureKind::SourceOverReadBudget,
         ];
         let destructive = ["rm ", "--delete", "--purge", "reset", "drop ", "rm -rf"];
@@ -1079,6 +1120,7 @@ mod tests {
             IngestFailureKind::KeychainUnavailable,
             IngestFailureKind::FilenameAssumptionViolated,
             IngestFailureKind::UnreadableSource,
+            IngestFailureKind::UnparseableSource,
             IngestFailureKind::TruncatedSession,
             IngestFailureKind::SourceOverReadBudget,
         ];
@@ -1092,6 +1134,7 @@ mod tests {
                 "keychain-unavailable",
                 "filename-assumption-violated",
                 "unreadable-source",
+                "unparseable-source",
                 "truncated-session",
                 "source-over-read-budget"
             ])
@@ -1116,6 +1159,7 @@ mod tests {
                 "filename-assumption-violated",
             ),
             (IngestFailureKind::UnreadableSource, "unreadable-source"),
+            (IngestFailureKind::UnparseableSource, "unparseable-source"),
             (IngestFailureKind::TruncatedSession, "truncated-session"),
             (
                 IngestFailureKind::SourceOverReadBudget,
@@ -1324,8 +1368,8 @@ mod tests {
     /// A Codex scan that stopped only because rollouts exceeded the read budget
     /// is diagnosed per rejected rollout with the setting that admits it, even
     /// through added context; it used to read as one "unreadable, check
-    /// permissions" entry naming the cass data directory. Any other scan error
-    /// keeps the generic entry.
+    /// permissions" entry naming the cass data directory. An I/O failure keeps
+    /// the unreadable entry.
     #[test]
     fn codex_over_budget_scan_error_is_diagnosed_per_rollout_not_as_the_data_dir() -> TestResult {
         let error = crate::connectors::codex::over_budget_scan_error(&[(
@@ -1353,7 +1397,8 @@ mod tests {
         verify_eq!(report.summary.skipped, 1);
 
         let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
-        run.observe_connector_scan_error(Path::new("/data"), &anyhow::anyhow!("disk went away"));
+        let disk_gone = anyhow::Error::new(std::io::Error::other("disk went away"));
+        run.observe_connector_scan_error(Path::new("/data"), &disk_gone);
         let report = run.finish();
         verify_eq!(report.diagnostics.len(), 1);
         verify_eq!(
@@ -1361,6 +1406,63 @@ mod tests {
             IngestFailureKind::UnreadableSource
         );
         verify_eq!(report.diagnostics[0].source_path, "/data");
+        Ok(())
+    }
+
+    /// GH #511: a connector that read a source but rejected a record value
+    /// ("invalid shared CLI timestamp at record 0", with context and no I/O
+    /// cause) is unparseable, not unreadable: no permissions advice, not
+    /// retryable on the same bytes, at the root it scanned. An I/O cause still
+    /// reads as unreadable and a lock as locked.
+    #[test]
+    fn content_failures_are_unparseable_and_io_failures_stay_unreadable() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let root = Path::new("/home/me/.config/manicode");
+        let parse_error = anyhow::anyhow!("premature end of input")
+            .context("invalid shared CLI timestamp at record 0");
+
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(root, &parse_error);
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::UnparseableSource
+        );
+        verify_eq!(diagnostic.source_path, root.display().to_string());
+        verify!(!diagnostic.retryable);
+        verify_eq!(diagnostic.disposition, SourceIngestDisposition::Skipped);
+        verify!(!diagnostic.safe_next_action.contains("check permissions"));
+        verify!(
+            diagnostic
+                .safe_next_action
+                .contains("indexing_stats.connectors[].error")
+        );
+        verify_eq!(report.summary.skipped, 1);
+
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+        .context("reading chat-messages.json");
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(root, &denied);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        verify!(report.diagnostics[0].retryable);
+
+        let locked = anyhow::anyhow!("database is locked").context("scanning state.vscdb");
+        let mut run = ConnectorIngestRun::begin("cursor", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/cursor"), &locked);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::SourceLocked
+        );
         Ok(())
     }
 }

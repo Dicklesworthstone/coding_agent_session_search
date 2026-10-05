@@ -151,6 +151,109 @@ fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
     assert_eq!(messages(), 2, "a native-ID edit must not append a message");
 }
 
+/// GH #511 (bead b7rhs): a Codebuff transcript the connector cannot interpret
+/// (the reporter's time-of-day timestamps, "01:15 PM") failed the codebuff
+/// scan, and cass reported `unreadable-source` with "check permissions"
+/// against the cass data directory. The failure is in the content, so it must
+/// be `unparseable-source`, not retryable on unchanged bytes, and name a scan
+/// root that holds the transcript.
+#[test]
+fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
+    use serde_json::{Value, json};
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let chat = home.join(".config/manicode/projects/probe/chats/2026-03-21T17-14-03.768Z");
+    std::fs::create_dir_all(&chat).unwrap();
+    let transcript = chat.join("chat-messages.json");
+    let records = json!([
+        {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
+         "timestamp":"01:15 PM"},
+        {"id":"ai-1774113411457", "variant":"ai", "content":"Synthetic probe answer",
+         "timestamp":"01:16 PM"}
+    ]);
+    std::fs::write(&transcript, serde_json::to_vec(&records).unwrap()).unwrap();
+    std::fs::write(
+        chat.join("run-state.json"),
+        br#"{"sessionState":{"fileContext":{"projectRoot":"/synthetic/probe"}}}"#,
+    )
+    .unwrap();
+
+    let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    command
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("CASS_DATA_DIR", &data)
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("RUST_MIN_STACK", "134217728")
+        .current_dir(&home)
+        .timeout(Duration::from_secs(180));
+    if let Ok(system_root) = dotenvy::var("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    let output = command
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(9), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let connector = report["indexing_stats"]["connectors"]
+        .as_array()
+        .expect("connector summaries")
+        .iter()
+        .find(|connector| connector["name"] == "codebuff")
+        .expect("codebuff ran");
+    assert!(
+        connector["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timestamp")),
+        "the connector error still names the bad record: {connector}"
+    );
+
+    let transcript = transcript.canonicalize().unwrap();
+    let codebuff: Vec<&Value> = report["indexing_stats"]["connector_diagnostics"]
+        .as_array()
+        .expect("connector diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["provider"] == "codebuff")
+        .collect();
+    assert!(!codebuff.is_empty(), "{report}");
+    for diagnostic in codebuff {
+        assert_eq!(
+            diagnostic["failure_kind"], "unparseable-source",
+            "{diagnostic}"
+        );
+        assert_eq!(diagnostic["retryable"], false, "{diagnostic}");
+        let source = Path::new(diagnostic["source_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_ne!(source, data.canonicalize().unwrap(), "{diagnostic}");
+        assert!(
+            transcript.starts_with(&source),
+            "the diagnostic must name a root that holds the transcript: {diagnostic}"
+        );
+        // The action may say what the failure is not; it must not send the
+        // reader to fix permissions (v0.10.0: "check permissions, then
+        // re-index").
+        assert!(
+            !diagnostic["safe_next_action"]
+                .as_str()
+                .unwrap()
+                .contains("check permissions"),
+            "{diagnostic}"
+        );
+    }
+}
+
 /// GH #499 (bead 2l1b0.49): once an incremental run tombstones a row inside a
 /// sealed Quill segment, every date-filtered search failed with "posting
 /// cursor invariant failed: Boolean children belong to different segment
