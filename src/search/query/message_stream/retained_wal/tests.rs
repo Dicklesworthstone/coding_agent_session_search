@@ -285,3 +285,40 @@ fn no_wal_unsupported_width_keeps_the_existing_driver() -> Result<()> {
     assert!(super::super::try_collect_retained_messages(&sources, &vector(3, 1.0), 1, None)?.is_none());
     Ok(())
 }
+
+struct CountInclude(AtomicUsize);
+impl FsSearchFilter for CountInclude {
+    fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+    fn name(&self) -> &str { "count-parallel-retained-wal-rows" }
+}
+
+#[test]
+fn large_retained_wal_preserves_physical_ties_across_bounded_worker_pools() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("parallel-retained.fsvi");
+    // Equal scores deliberately spread each message across both physical
+    // partitions. The hash-sorted source order, not task completion, determines
+    // which chunk survives. The retained delta exceeds optimized admission.
+    let main: Vec<_> = (0..65_536_usize).map(|ordinal| {
+        (doc((ordinal % 251) as u64, (ordinal % 256) as u8, 3), vector(33, 0.75))
+    }).collect();
+    let wal: Vec<_> = (10_000..14_100_u64).map(|id| (doc(id, 0, 3), vector(33, 0.5))).collect();
+    let sources = vec![artifact(&path, 33, Quantization::F16, &main, &wal)?];
+    let query = vector(33, 1.0);
+    let before = files(tmp.path())?;
+    let expected = oracle(&sources, &query, 17, None)?;
+    let expected_visits = sources[0].index().record_count() + sources[0].index().wal_record_count();
+    for threads in [1, 2, 8] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
+        let count = CountInclude(AtomicUsize::new(0));
+        let hits = pool.install(|| collect(&sources, &query, 17, Some(&count)))?;
+        assert_eq!(signature(&hits), expected, "Rayon pool {threads}");
+        assert_eq!(count.0.load(Ordering::Relaxed), expected_visits,
+            "each current row must be visited once, not one full scan per worker");
+    }
+    assert_eq!(files(tmp.path())?, before);
+    Ok(())
+}

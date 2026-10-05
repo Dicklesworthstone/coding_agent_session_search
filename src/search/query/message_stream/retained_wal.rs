@@ -8,6 +8,7 @@
 use super::{FsSearchFilter, FsVectorIndex, Selection, SemanticIndexArtifact, VectorSearchResult,
     Winner, parse_semantic_doc_id};
 use anyhow::{Context, Result, ensure};
+use rayon::prelude::*;
 use frankensearch::index::{Quantization, dot_product_f16_bytes_f32,
     dot_product_f32_bytes_f32, dot_product_f32_f32};
 
@@ -99,13 +100,49 @@ impl RowScorer {
     }
 }
 
+/// Each worker owns only its bounded selection and one row of decoding scratch.
+/// The ordered range merge below preserves equal-score first-physical-row ties.
+fn scan_range(
+    index: &FsVectorIndex,
+    embedding: &[f32],
+    filter: Option<&dyn FsSearchFilter>,
+    shadowed: &ShadowIds<'_>,
+    range: std::ops::Range<usize>,
+    limit: usize,
+) -> Result<(Vec<Winner>, usize)> {
+    let mut selection = Selection::new(limit);
+    let mut scorer = RowScorer::new();
+    let mut scored = 0usize;
+    for row in range {
+        if index.is_deleted(row) {
+            continue;
+        }
+        let doc_id = index.doc_id_at(row)?;
+        if shadowed.contains(doc_id)
+            || filter.is_some_and(|filter| !filter.matches(doc_id, None)) {
+            continue;
+        }
+        let identity = parse_semantic_doc_id(doc_id)
+            .context("retained semantic main row has an invalid message identity")?;
+        selection.consider(Winner {
+            message_id: identity.message_id,
+            chunk_idx: identity.chunk_idx,
+            score: scorer.score(index, row, embedding)?,
+        })?;
+        scored += 1;
+    }
+    Ok((selection.finish(), scored))
+}
+
 /// Exact current-message selection over the complete already-opened cohort.
 /// No limit-induced `None`, raw-window exhaustion inference, file reopen,
 /// artifact mutation, model load, or document-text hydration occurs here.
 ///
-/// Selection is O(k); borrowed shadow references are bounded per shard and are
-/// dropped before the next shard. Nonstandard widths additionally retain one
-/// decoded vector plus its wire representation, never an entire decoded slab.
+/// Selection is O(k) plus at most 65,536 parallel partial winners. Borrowed
+/// shadow references are shared within a shard and dropped before the next.
+/// Each worker retains at most one decoded vector plus its wire representation,
+/// never an entire decoded slab. Small cohorts and the backend parallel opt-out
+/// remain serial; fan-out is capped at eight and by the active Rayon pool.
 /// This does not bound the pre-existing WAL/index owner or process RSS.
 pub(super) fn collect(
     artifacts: &[SemanticIndexArtifact],
@@ -124,32 +161,43 @@ pub(super) fn collect(
             "exact semantic query dimension mismatch");
     }
     let mut selection = Selection::new(limit);
-    let mut scorer = RowScorer::new();
+    let mut max_workers = 1usize;
     let mut main_scored = 0usize;
     let mut wal_scored = 0usize;
     for artifact in artifacts {
         let index = artifact.index();
         let shadowed = ShadowIds::new(index)?;
-        // Physical row order preserves the incumbent's best-chunk tie break.
-        // A replacement shadows EVERY duplicate main row, even if the current
-        // WAL value is excluded by the original query's scope.
-        for row in 0..index.record_count() {
-            if index.is_deleted(row) {
-                continue;
+        // The same worker/aggregate-candidate ceilings as the optimized lane
+        // apply here. All workers borrow ONE shadow index, not one WAL copy each.
+        let rows = index.record_count();
+        let workers = if frankensearch::index::SearchParams::default().parallel_enabled {
+            super::worker_count(rows, limit, rayon::current_num_threads())
+        } else {
+            1
+        };
+        max_workers = max_workers.max(workers);
+        let partials: Vec<Result<(Vec<Winner>, usize)>> = if workers == 1 {
+            vec![scan_range(index, embedding, filter, &shadowed, 0..rows, limit)]
+        } else {
+            (0..workers).into_par_iter().map(|worker| {
+                let width = rows / workers;
+                let extra = rows % workers;
+                let start = worker * width + worker.min(extra);
+                let end = start + width + usize::from(worker < extra);
+                scan_range(index, embedding, filter, &shadowed, start..end, limit)
+            }).collect()
+        };
+        // Indexed parallel collection is in physical-range order, regardless
+        // of completion order. Tied chunks keep the same winner as serial scan.
+        for partial in partials {
+            let (hits, scored) = partial?;
+            main_scored = main_scored.saturating_add(scored);
+            for hit in hits {
+                selection.consider(hit)?;
             }
-            let doc_id = index.doc_id_at(row)?;
-            if shadowed.contains(doc_id)
-                || filter.is_some_and(|filter| !filter.matches(doc_id, None)) {
-                continue;
-            }
-            let identity = parse_semantic_doc_id(doc_id)
-                .context("retained semantic main row has an invalid message identity")?;
-            let score = scorer.score(index, row, embedding)?;
-            selection.consider(Winner {
-                message_id: identity.message_id, chunk_idx: identity.chunk_idx, score,
-            })?;
-            main_scored = main_scored.saturating_add(1);
         }
+        // A replacement shadows EVERY duplicate main row, including when its
+        // current WAL value is excluded by the original query's scope.
         for (doc_id, vector) in index.wal_records() {
             if filter.is_some_and(|filter| !filter.matches(doc_id, None)) {
                 continue;
@@ -167,7 +215,7 @@ pub(super) fn collect(
     let hits: Vec<_> = selection.finish().into_iter().map(|hit| VectorSearchResult {
         message_id: hit.message_id, chunk_idx: hit.chunk_idx, score: hit.score,
     }).collect();
-    tracing::debug!(shard_count = artifacts.len(), main_scored, wal_scored,
+    tracing::debug!(shard_count = artifacts.len(), main_scored, wal_scored, max_workers,
         returned = hits.len(), "complete retained-WAL exact message selection");
     Ok(hits)
 }
