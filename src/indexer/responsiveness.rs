@@ -39,6 +39,8 @@
 //! [`user_idle_gate`]. That gate is deliberately *not* consulted by foreground
 //! indexing: a human who typed `cass index` wants it to run now.
 
+mod resident;
+
 use std::collections::VecDeque;
 use std::sync::{
     Arc, LazyLock, Mutex,
@@ -862,6 +864,9 @@ pub(crate) struct GovernorTelemetry {
     /// and the quantiles the conformal policy is emitting for each
     /// signal × severity pairing.
     pub calibration: Option<CalibrationTelemetry>,
+    /// Live resident-memory observation, absent before the sampler has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<resident::MemoryTelemetry>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -1406,6 +1411,7 @@ impl Governor {
 
     fn run(&self) {
         loop {
+            resident::sample(&self.cfg);
             self.step_once();
             thread::sleep(self.cfg.tick);
         }
@@ -1567,6 +1573,7 @@ impl Governor {
             last_reason,
             recent_decisions: recent,
             calibration,
+            memory: resident::telemetry(),
         }
     }
 }
@@ -1593,7 +1600,9 @@ pub(crate) fn current_capacity_pct() -> u32 {
     }
     let g = GOVERNOR.clone();
     g.ensure_started();
-    g.current_capacity.load(Ordering::Relaxed)
+    g.current_capacity
+        .load(Ordering::Relaxed)
+        .min(resident::capacity_pct())
 }
 
 pub(crate) fn disabled_via_env() -> bool {
@@ -1613,7 +1622,11 @@ pub(crate) fn effective_worker_count(desired: usize) -> usize {
 /// producer-side in-flight byte budgets.
 pub(crate) fn effective_inflight_byte_limit(desired_bytes: usize) -> usize {
     let g = GOVERNOR.clone();
-    scale_inflight_byte_limit(desired_bytes, current_capacity_pct(), &g.cfg)
+    resident::limit_inflight_bytes(scale_inflight_byte_limit(
+        desired_bytes,
+        current_capacity_pct(),
+        &g.cfg,
+    ))
 }
 
 /// Return the configured governor policy without starting the background
@@ -1653,6 +1666,7 @@ pub(crate) fn telemetry_snapshot_passive() -> GovernorTelemetry {
         last_reason: None,
         recent_decisions: Vec::new(),
         calibration,
+        memory: resident::telemetry(),
     }
 }
 

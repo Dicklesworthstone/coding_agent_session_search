@@ -1,7 +1,9 @@
 //! Apply resident-memory feedback to the existing responsiveness sampler.
 //! No extra thread, model load or foreground OS probe is introduced here.
 
-use super::{GovernorConfig, available_memory_bytes, process_resident_memory_bytes, total_memory_bytes};
+use super::{
+    GovernorConfig, available_memory_bytes, process_resident_memory_bytes, total_memory_bytes,
+};
 use std::sync::{LazyLock, Mutex};
 
 mod policy;
@@ -25,7 +27,9 @@ static EXPLICIT_LIMIT: LazyLock<Option<u64>> = LazyLock::new(|| {
 /// Darwin's bounded footprint probe must never block a foreground admission.
 pub(super) fn sample(cfg: &GovernorConfig) {
     if cfg.disabled || super::disabled_via_env() {
-        let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = State::default();
         return;
     }
@@ -34,7 +38,9 @@ pub(super) fn sample(cfg: &GovernorConfig) {
         available_bytes: available_memory_bytes(),
         total_bytes: total_memory_bytes(),
     };
-    let mut state = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let prior = state.last;
     let decision = state.policy.observe(
         observation,
@@ -61,16 +67,22 @@ pub(super) fn sample(cfg: &GovernorConfig) {
 }
 
 pub(super) fn capacity_pct() -> u32 {
-    STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-        .last.map_or(100, |last| last.capacity_pct)
+    STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .last
+        .map_or(100, |last| last.capacity_pct)
 }
 
 pub(super) fn limit_inflight_bytes(desired: usize) -> usize {
     if super::disabled_via_env() {
         return desired;
     }
-    let limit = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-        .last.map_or(u64::MAX, |last| last.inflight_byte_limit);
+    let limit = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .last
+        .map_or(u64::MAX, |last| last.inflight_byte_limit);
     desired.min(usize::try_from(limit).unwrap_or(usize::MAX))
 }
 
@@ -92,14 +104,18 @@ pub(super) fn telemetry() -> Option<MemoryTelemetry> {
     if super::disabled_via_env() {
         return None;
     }
-    STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last.map(|last| MemoryTelemetry {
-        capacity_pct: last.capacity_pct,
-        inflight_byte_limit: last.inflight_byte_limit,
-        target_resident_bytes: last.target_resident_bytes,
-        resident_bytes: last.sample.resident_bytes,
-        available_bytes: last.sample.available_bytes,
-        effective_total_bytes: last.sample.total_bytes,
-        healthy_streak: last.healthy_streak,
-        reason: last.reason,
-    })
+    STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .last
+        .map(|last| MemoryTelemetry {
+            capacity_pct: last.capacity_pct,
+            inflight_byte_limit: last.inflight_byte_limit,
+            target_resident_bytes: last.target_resident_bytes,
+            resident_bytes: last.sample.resident_bytes,
+            available_bytes: last.sample.available_bytes,
+            effective_total_bytes: last.sample.total_bytes,
+            healthy_streak: last.healthy_streak,
+            reason: last.reason,
+        })
 }

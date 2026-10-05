@@ -192,7 +192,11 @@ mod tests {
 
     #[test]
     fn effective_cgroup_total_controls_the_target_not_ample_host_memory() {
-        let sample = Sample { available_bytes: Some(97 * GIB), resident_bytes: Some(14 * GIB), ..healthy() };
+        let sample = Sample {
+            available_bytes: Some(97 * GIB),
+            resident_bytes: Some(14 * GIB),
+            ..healthy()
+        };
         let decision = Policy::default().observe(sample, None, CEILING, MIB);
         assert_eq!(decision.capacity_pct, 1);
         assert_eq!(decision.inflight_byte_limit, MIB);
@@ -201,16 +205,25 @@ mod tests {
 
     #[test]
     fn process_pressure_halves_repeatedly_without_a_cpu_signal() {
-        let sample = Sample { resident_bytes: Some(13 * GIB), ..healthy() };
+        let sample = Sample {
+            resident_bytes: Some(13 * GIB),
+            ..healthy()
+        };
         let mut policy = Policy::default();
         for expected in [50, 25, 12, 6, 3, 1, 1] {
-            assert_eq!(policy.observe(sample, None, CEILING, MIB).capacity_pct, expected);
+            assert_eq!(
+                policy.observe(sample, None, CEILING, MIB).capacity_pct,
+                expected
+            );
         }
     }
 
     #[test]
     fn severe_headroom_pressure_engages_even_with_a_small_process() {
-        let sample = Sample { available_bytes: Some(256 * MIB), ..healthy() };
+        let sample = Sample {
+            available_bytes: Some(256 * MIB),
+            ..healthy()
+        };
         let decision = Policy::default().observe(sample, None, CEILING, MIB);
         assert_eq!(decision.capacity_pct, 1);
         assert_eq!(decision.inflight_byte_limit, MIB);
@@ -218,7 +231,10 @@ mod tests {
 
     #[test]
     fn pressure_from_other_processes_also_reduces_admission() {
-        let sample = Sample { available_bytes: Some(GIB), ..healthy() };
+        let sample = Sample {
+            available_bytes: Some(GIB),
+            ..healthy()
+        };
         let decision = Policy::default().observe(sample, None, CEILING, MIB);
         assert_eq!(decision.capacity_pct, 50);
         assert_eq!(decision.inflight_byte_limit, 256 * MIB);
@@ -226,7 +242,10 @@ mod tests {
 
     #[test]
     fn byte_budget_reserves_slack_even_before_severe_pressure() {
-        let sample = Sample { resident_bytes: Some(14 * GIB - 128 * MIB), ..healthy() };
+        let sample = Sample {
+            resident_bytes: Some(14 * GIB - 128 * MIB),
+            ..healthy()
+        };
         let decision = Policy::default().observe(sample, None, CEILING, MIB);
         assert_eq!(decision.capacity_pct, 50);
         assert_eq!(decision.inflight_byte_limit, 64 * MIB);
@@ -235,30 +254,58 @@ mod tests {
     #[test]
     fn recovery_needs_three_new_healthy_samples_for_each_additive_step() {
         let mut policy = Policy::default();
-        policy.observe(Sample { resident_bytes: Some(16 * GIB), ..healthy() }, None, CEILING, MIB);
+        policy.observe(
+            Sample {
+                resident_bytes: Some(16 * GIB),
+                ..healthy()
+            },
+            None,
+            CEILING,
+            MIB,
+        );
         for expected in [1, 1, 11, 11, 11, 21] {
-            assert_eq!(policy.observe(healthy(), None, CEILING, MIB).capacity_pct, expected);
+            assert_eq!(
+                policy.observe(healthy(), None, CEILING, MIB).capacity_pct,
+                expected
+            );
         }
         for _ in 0..100 {
             policy.observe(healthy(), None, CEILING, MIB);
         }
-        assert_eq!(policy.observe(healthy(), None, CEILING, MIB).capacity_pct, 100);
+        assert_eq!(
+            policy.observe(healthy(), None, CEILING, MIB).capacity_pct,
+            100
+        );
     }
 
     #[test]
     fn hysteresis_band_prevents_bounce_and_breaks_a_recovery_streak() {
         let mut policy = Policy::default();
-        policy.observe(Sample { resident_bytes: Some(14 * GIB), ..healthy() }, None, CEILING, MIB);
+        policy.observe(
+            Sample {
+                resident_bytes: Some(14 * GIB),
+                ..healthy()
+            },
+            None,
+            CEILING,
+            MIB,
+        );
         policy.observe(healthy(), None, CEILING, MIB);
         policy.observe(healthy(), None, CEILING, MIB);
-        let band = Sample { resident_bytes: Some(12 * GIB), ..healthy() };
+        let band = Sample {
+            resident_bytes: Some(12 * GIB),
+            ..healthy()
+        };
         for _ in 0..20 {
             let decision = policy.observe(band, None, CEILING, MIB);
             assert_eq!(decision.capacity_pct, 1);
             assert_eq!(decision.healthy_streak, 0);
             assert_eq!(decision.reason, "resident_memory_hysteresis_hold");
         }
-        assert_eq!(policy.observe(healthy(), None, CEILING, MIB).capacity_pct, 1);
+        assert_eq!(
+            policy.observe(healthy(), None, CEILING, MIB).capacity_pct,
+            1
+        );
     }
 
     #[test]
@@ -267,9 +314,25 @@ mod tests {
         let unknown = Policy::default().observe(Sample::default(), None, CEILING, MIB);
         assert_eq!(unknown.capacity_pct, 100);
         assert_eq!(unknown.inflight_byte_limit, CEILING);
-        policy.observe(Sample { resident_bytes: Some(14 * GIB), ..healthy() }, None, CEILING, MIB);
+        policy.observe(
+            Sample {
+                resident_bytes: Some(14 * GIB),
+                ..healthy()
+            },
+            None,
+            CEILING,
+            MIB,
+        );
         for _ in 0..20 {
-            let decision = policy.observe(Sample { resident_bytes: None, ..healthy() }, None, CEILING, MIB);
+            let decision = policy.observe(
+                Sample {
+                    resident_bytes: None,
+                    ..healthy()
+                },
+                None,
+                CEILING,
+                MIB,
+            );
             assert_eq!(decision.capacity_pct, 1);
             assert_eq!(decision.reason, "resident_memory_unknown");
             assert_eq!(decision.inflight_byte_limit, MIB);
@@ -278,20 +341,42 @@ mod tests {
 
     #[test]
     fn missing_resident_sample_does_not_mask_real_headroom_pressure() {
-        let sample = Sample { resident_bytes: None, available_bytes: Some(0), ..healthy() };
-        assert_eq!(Policy::default().observe(sample, None, CEILING, MIB).capacity_pct, 1);
+        let sample = Sample {
+            resident_bytes: None,
+            available_bytes: Some(0),
+            ..healthy()
+        };
+        assert_eq!(
+            Policy::default()
+                .observe(sample, None, CEILING, MIB)
+                .capacity_pct,
+            1
+        );
     }
 
     #[test]
     fn explicit_limit_can_lower_but_not_raise_the_effective_memory_target() {
-        assert_eq!(target_resident_bytes(Some(16 * GIB), Some(8 * GIB)), Some(8 * GIB));
-        assert_eq!(target_resident_bytes(Some(16 * GIB), Some(32 * GIB)), Some(14 * GIB));
-        assert_eq!(target_resident_bytes(Some(16 * GIB), Some(0)), Some(14 * GIB));
+        assert_eq!(
+            target_resident_bytes(Some(16 * GIB), Some(8 * GIB)),
+            Some(8 * GIB)
+        );
+        assert_eq!(
+            target_resident_bytes(Some(16 * GIB), Some(32 * GIB)),
+            Some(14 * GIB)
+        );
+        assert_eq!(
+            target_resident_bytes(Some(16 * GIB), Some(0)),
+            Some(14 * GIB)
+        );
     }
 
     #[test]
     fn explicit_limit_works_without_a_total_memory_probe() {
-        let sample = Sample { resident_bytes: Some(8 * GIB), total_bytes: None, available_bytes: None };
+        let sample = Sample {
+            resident_bytes: Some(8 * GIB),
+            total_bytes: None,
+            available_bytes: None,
+        };
         let decision = Policy::default().observe(sample, Some(8 * GIB), CEILING, MIB);
         assert_eq!(decision.capacity_pct, 1);
         assert_eq!(decision.target_resident_bytes, Some(8 * GIB));
@@ -299,7 +384,11 @@ mod tests {
 
     #[test]
     fn smaller_limits_are_not_raised_by_the_drain_floor() {
-        let sample = Sample { resident_bytes: Some(16 * GIB), available_bytes: Some(0), ..healthy() };
+        let sample = Sample {
+            resident_bytes: Some(16 * GIB),
+            available_bytes: Some(0),
+            ..healthy()
+        };
         for ceiling in [0, 1, 512, MIB - 1, MIB, CEILING] {
             let decision = Policy::default().observe(sample, None, ceiling, MIB);
             assert_eq!(decision.inflight_byte_limit, MIB.min(ceiling));
@@ -308,18 +397,29 @@ mod tests {
 
     #[test]
     fn configured_drain_floor_is_respected_and_capped() {
-        let sample = Sample { resident_bytes: Some(16 * GIB), ..healthy() };
+        let sample = Sample {
+            resident_bytes: Some(16 * GIB),
+            ..healthy()
+        };
         let decision = Policy::default().observe(sample, None, CEILING, 8 * MIB);
         assert_eq!(decision.inflight_byte_limit, 8 * MIB);
         let decision = Policy::default().observe(sample, None, MIB, 8 * MIB);
         assert_eq!(decision.inflight_byte_limit, MIB);
-        assert_eq!(Policy::default().observe(sample, None, CEILING, 0).inflight_byte_limit, 1);
+        assert_eq!(
+            Policy::default()
+                .observe(sample, None, CEILING, 0)
+                .inflight_byte_limit,
+            1
+        );
     }
 
     #[test]
     fn unknown_or_zero_totals_do_not_manufacture_a_zero_quota() {
         for total in [None, Some(0)] {
-            let sample = Sample { total_bytes: total, ..healthy() };
+            let sample = Sample {
+                total_bytes: total,
+                ..healthy()
+            };
             let decision = Policy::default().observe(sample, None, CEILING, MIB);
             assert_eq!(decision.target_resident_bytes, None);
             assert_eq!(decision.capacity_pct, 100);
@@ -330,24 +430,83 @@ mod tests {
     fn target_and_available_boundaries_are_inclusive() {
         let target = 14 * GIB;
         let pressure = fraction(target, 9, 10);
-        assert_eq!(Policy::default().observe(Sample { resident_bytes: Some(pressure - 1), ..healthy() }, None, CEILING, MIB).capacity_pct, 100);
-        assert_eq!(Policy::default().observe(Sample { resident_bytes: Some(pressure), ..healthy() }, None, CEILING, MIB).capacity_pct, 50);
-        assert_eq!(Policy::default().observe(Sample { resident_bytes: Some(target), ..healthy() }, None, CEILING, MIB).capacity_pct, 1);
-        assert_eq!(Policy::default().observe(Sample { available_bytes: Some(GIB / 2), ..healthy() }, None, CEILING, MIB).capacity_pct, 1);
+        assert_eq!(
+            Policy::default()
+                .observe(
+                    Sample {
+                        resident_bytes: Some(pressure - 1),
+                        ..healthy()
+                    },
+                    None,
+                    CEILING,
+                    MIB
+                )
+                .capacity_pct,
+            100
+        );
+        assert_eq!(
+            Policy::default()
+                .observe(
+                    Sample {
+                        resident_bytes: Some(pressure),
+                        ..healthy()
+                    },
+                    None,
+                    CEILING,
+                    MIB
+                )
+                .capacity_pct,
+            50
+        );
+        assert_eq!(
+            Policy::default()
+                .observe(
+                    Sample {
+                        resident_bytes: Some(target),
+                        ..healthy()
+                    },
+                    None,
+                    CEILING,
+                    MIB
+                )
+                .capacity_pct,
+            1
+        );
+        assert_eq!(
+            Policy::default()
+                .observe(
+                    Sample {
+                        available_bytes: Some(GIB / 2),
+                        ..healthy()
+                    },
+                    None,
+                    CEILING,
+                    MIB
+                )
+                .capacity_pct,
+            1
+        );
     }
 
     #[test]
     fn arithmetic_is_bounded_at_u64_extremes() {
         for total in [1, 7, 8, 31, 32, u64::MAX - 1, u64::MAX] {
             for resident in [0, total / 2, total, u64::MAX] {
-                let sample = Sample { resident_bytes: Some(resident), available_bytes: Some(total), total_bytes: Some(total) };
+                let sample = Sample {
+                    resident_bytes: Some(resident),
+                    available_bytes: Some(total),
+                    total_bytes: Some(total),
+                };
                 let decision = Policy::default().observe(sample, None, u64::MAX, MIB);
                 assert!((1..=100).contains(&decision.capacity_pct));
                 assert!(decision.target_resident_bytes.unwrap() <= total);
                 assert!(decision.inflight_byte_limit >= MIB);
             }
         }
-        assert_eq!(fraction(u64::MAX, 7, 8), ((u64::MAX as u128 * 7) / 8) as u64);
+        assert_eq!(
+            fraction(u64::MAX, 7, 8),
+            ((u64::MAX as u128 * 7) / 8) as u64
+        );
     }
 
     #[test]
@@ -355,7 +514,10 @@ mod tests {
         let mut prior_capacity = 100;
         let mut prior_limit = CEILING;
         for step in 0..=4096 {
-            let sample = Sample { resident_bytes: Some(step * 4 * MIB), ..healthy() };
+            let sample = Sample {
+                resident_bytes: Some(step * 4 * MIB),
+                ..healthy()
+            };
             let decision = Policy::default().observe(sample, None, CEILING, MIB);
             assert!(decision.capacity_pct <= prior_capacity);
             assert!(decision.inflight_byte_limit <= prior_limit);
