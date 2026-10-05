@@ -15,7 +15,26 @@ SIGNATURE = '''    fn search_exact_semantic_indexes(
         fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
 '''
-WRAPPER = SIGNATURE + '''        Self::search_exact_semantic_indexes_with_refinement(
+WRAPPER = SIGNATURE + '''        // Post-top-k WAL supersession can erase an entire raw window even
+        // when current messages remain. For bounded standard-width WAL views,
+        // select the retained main+delta view directly before that shortcut.
+        if context.artifacts.iter().any(|artifact| artifact.index().wal_record_count() > 0) {
+            let record_count = context.artifacts.iter().fold(0usize, |total, artifact| {
+                total.saturating_add(artifact.index().record_count())
+                    .saturating_add(artifact.index().wal_record_count())
+            });
+            let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
+            if let Some(hits) = message_stream::try_collect_exact_messages(
+                &context.artifacts, embedding, return_limit, fs_filter,
+            )? {
+                let has_more_candidates = hits.len() >= return_limit && return_limit < record_count;
+                return Ok((hits, SemanticCandidateRetryState {
+                    has_more_candidates,
+                    exact_window_may_omit_competitor: false,
+                }));
+            }
+        }
+        Self::search_exact_semantic_indexes_with_refinement(
             context, embedding, fetch_limit, fs_filter, true,
         )
     }
@@ -59,7 +78,7 @@ def integrate(text: str) -> str:
                'fn search_exact_semantic_indexes_with_refinement(',
                'message_stream::try_collect_exact_messages(']
     counts = [text.count(marker) for marker in markers]
-    if counts == [1, 1, 1]:
+    if counts == [1, 1, 2]:
         return text
     if any(counts):
         raise ValueError('Partial or duplicate exact-message integration; refusing to rewrite')

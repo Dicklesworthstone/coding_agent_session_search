@@ -322,3 +322,40 @@ fn streaming_live_driver_matches_incumbent_and_exhaustive_oracle() -> Result<()>
     }
     Ok(())
 }
+
+#[test]
+fn streaming_live_wal_supersession_cannot_certify_a_false_empty_window() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("shadowed-window.fsvi");
+    // These are valid v1 physical duplicate rows, not forged bytes. The
+    // writer's best-effort tombstone can leave older duplicates live while
+    // the durable WAL already supersedes their entire document identity.
+    let mut rows = vec![(doc(1, 0, 3), vector(32, 1.0)); 32];
+    rows.push((doc(2, 0, 3), vector(32, 0.5)));
+    drop(write_artifact(&path, 32, Quantization::F16, &rows)?);
+    let mut writer = FsVectorIndex::open_writer(&path)?;
+    writer.append_batch(&[(doc(1, 0, 3), vector(32, -1.0))])?;
+    drop(writer);
+    let ctx = context(vec![SemanticIndexArtifact::open(&path, None)?]);
+    let index = ctx.artifacts[0].index();
+    assert_eq!(index.record_count(), 33);
+    let query = vector(32, 1.0);
+    assert!(index.search_top_k(&query, 4, None)?.is_empty(),
+        "negative fixture must lose its raw top-k solely to retained WAL shadowing");
+    let (incumbent, old_retry) = SearchClient::search_exact_semantic_indexes_with_refinement(
+        &ctx, &query, 1, None, false)?;
+    assert!(incumbent.is_empty());
+    assert!(!old_retry.exact_window_may_omit_competitor);
+    let before = (std::fs::read(&path)?,
+        std::fs::read(frankensearch::index::wal_path_for(&path))?);
+    let count = CountingFilter::new();
+    let (hits, retry) = SearchClient::search_exact_semantic_indexes(&ctx, &query, 1, Some(&count))?;
+    assert_eq!(signature(&hits), oracle(&ctx.artifacts, &query, 4, None)?);
+    assert_eq!(hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(), vec![2, 1]);
+    assert_eq!(count.calls.load(AtomicOrdering::Relaxed), 2,
+        "only the surviving main document and current WAL replacement reach scoring scope");
+    assert!(!retry.exact_window_may_omit_competitor);
+    assert_eq!((std::fs::read(&path)?,
+        std::fs::read(frankensearch::index::wal_path_for(&path))?), before);
+    Ok(())
+}

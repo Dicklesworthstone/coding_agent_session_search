@@ -152,7 +152,8 @@ pub(super) fn try_collect_exact_messages(
         let index = artifact.index();
         let shadowed: HashSet<&str> = index.wal_records().map(|(id, _)| id).collect();
         let rows = index.record_count();
-        let workers = if rows < 2 * MIN_ROWS_PER_WORKER || limit > MAX_PARALLEL_SELECTION_KEYS / 2 {
+        let workers = if rows < 2 * MIN_ROWS_PER_WORKER || limit > MAX_PARALLEL_SELECTION_KEYS / 2
+            || !frankensearch::index::SearchParams::default().parallel_enabled {
             1
         } else {
             worker_count(rows, limit, rayon::current_num_threads())
