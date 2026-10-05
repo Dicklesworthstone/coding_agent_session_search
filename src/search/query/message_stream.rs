@@ -12,11 +12,13 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+mod retained_wal;
+
 #[cfg(test)]
 mod tests;
 
 // Borrowed WAL keys are additional per-request state. Larger retained deltas
-// use the existing exact driver, never a partial main-only result.
+// use the bounded cold retained-WAL lane, never a partial main-only result.
 const MAX_WAL_SHADOW_KEYS: usize = 4_096;
 const MAX_SCAN_WORKERS: usize = 8;
 const MIN_ROWS_PER_WORKER: usize = 32_768;
@@ -198,4 +200,23 @@ pub(super) fn try_collect_exact_messages(
         max_workers, selection_limit = limit, returned = hits.len(),
         "single-pass exact semantic message refinement complete");
     Ok(Some(hits))
+}
+
+/// Retained deltas must never fall through to a raw-window emptiness proof.
+/// Keep optimized admission unchanged, then use the complete bounded-scratch
+/// scorer for nonstandard widths or larger WALs. Only a no-WAL unsupported
+/// cohort can decline this entry point; any WAL resource refusal is an error.
+pub(super) fn try_collect_retained_messages(
+    artifacts: &[SemanticIndexArtifact],
+    embedding: &[f32],
+    limit: usize,
+    filter: Option<&dyn FsSearchFilter>,
+) -> Result<Option<Vec<VectorSearchResult>>> {
+    if let Some(hits) = try_collect_exact_messages(artifacts, embedding, limit, filter)? {
+        return Ok(Some(hits));
+    }
+    if !artifacts.iter().any(|artifact| artifact.index().wal_record_count() > 0) {
+        return Ok(None);
+    }
+    retained_wal::collect(artifacts, embedding, limit, filter).map(Some)
 }

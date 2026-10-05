@@ -36,7 +36,7 @@ jobs:
           rustfmt --edition 2024 --config skip_children=true src/search/query.rs
           rustfmt --edition 2024 src/search/query/message_stream.rs
           git diff --check
-          git diff -- src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs > "$RUNNER_TEMP/exact-message-evidence/source.diff"
+          git diff -- src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs src/search/query/message_stream/retained_wal.rs src/search/query/message_stream/retained_wal/tests.rs > "$RUNNER_TEMP/exact-message-evidence/source.diff"
       - name: Differential tests on real FSVI, WAL, and the integrated CASS driver
         shell: bash
         run: |
@@ -49,14 +49,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git add src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs
+          git add src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs src/search/query/message_stream/retained_wal.rs src/search/query/message_stream/retained_wal/tests.rs
           if git diff --cached --quiet; then
             echo 'Integration already present; no commit required.'
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat(search): activate bounded single-pass exact message refinement' -m 'The ordinary proven first window remains unchanged. Unresolved standard-width cohorts select exact message winners during one additional scan, preserving scores, chunk ties, filters, retained WAL shadowing and complete-cohort failure. Unsupported widths and oversized WAL overlays keep the incumbent driver. Validated with locked real-FSVI differential tests, existing exact/ANN regressions and lib Clippy. No dependency or gate changes.'
+          git commit -m 'feat(search): activate complete bounded exact message selection' -m 'Preserve the ordinary proven no-WAL first window. Unresolved standard-width cohorts use single-pass message selection; retained-WAL cohorts select current main-plus-delta messages before raw-window exhaustion shortcuts. Legacy widths use the exact backend byte kernels; large WALs use bounded borrowed shadow references or return an explicit resource error. Validate against real FSVI/WAL differential tests, existing exact/ANN regressions and locked lib Clippy. Preserve the false-empty and output assertions while constructing the intended pre-cleanup WAL image from production-serialized files. No dependency or acceptance-gate changes.'
           git push origin HEAD:refs/heads/main
           git rev-parse HEAD | tee "$RUNNER_TEMP/exact-message-evidence/published-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
