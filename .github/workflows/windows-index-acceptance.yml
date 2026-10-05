@@ -1,0 +1,132 @@
+name: Windows index acceptance
+
+# Native Windows acceptance for beads coding_agent_session_search-aegfi
+# (GH #429: Quill writer admission on Windows) and
+# coding_agent_session_search-4w0ma (GH #406: teardown panic after JSON).
+# scripts/windows_index_acceptance.ps1 drives one cass.exe through a full
+# index, a cold-reopen search, an incremental index, index-busy contention
+# against a running watcher, lock reacquisition and the truth surfaces, and
+# fails on any "panicked at" / "threads should not terminate unexpectedly" /
+# 0xC0000409 exit.
+#
+# released: the latest published release (or the `release` input),
+#   downloaded and checksum-verified, never built.
+# source: this commit, built on the runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release tag to test (default: latest)'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/windows_index_acceptance.ps1'
+      - '.github/workflows/windows-index-acceptance.yml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-index-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  released:
+    name: published release
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Download and verify the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.release }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:REQUESTED
+          if (-not $tag) {
+            $tag = gh release view -R $env:GITHUB_REPOSITORY --json tagName -q .tagName
+            if ($LASTEXITCODE -ne 0 -or -not $tag) { throw 'cannot read the latest release tag' }
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'release'
+          gh release download $tag -R $env:GITHUB_REPOSITORY -p 'cass-windows-amd64.zip' -p 'cass-windows-amd64.zip.sha256' -D $dir
+          if ($LASTEXITCODE -ne 0) { throw "release download failed for $tag" }
+          $expected = ((Get-Content (Join-Path $dir 'cass-windows-amd64.zip.sha256') -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash (Join-Path $dir 'cass-windows-amd64.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "zip sha256 $actual does not match $expected" }
+          Expand-Archive (Join-Path $dir 'cass-windows-amd64.zip') -DestinationPath (Join-Path $dir 'bin')
+          $exe = Get-ChildItem (Join-Path $dir 'bin') -Recurse -Filter 'cass.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'cass.exe is not in the release zip' }
+          Write-Host "release $tag zip sha256 $actual"
+          "CASS_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Index acceptance
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'accept-released'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          ./scripts/windows_index_acceptance.ps1 -Cass $env:CASS_EXE -Fixture 'tests/fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl' -Work $work
+
+      - name: Keep the command logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-index-acceptance-released
+          path: ${{ runner.temp }}/accept-released/*.std*
+          if-no-files-found: ignore
+
+  source:
+    name: this commit
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+        with:
+          toolchain: nightly-2026-08-31
+
+      - name: Configure Windows MSVC CRT for cc-rs
+        shell: pwsh
+        run: |
+          # Same as release.yml: esaxx-rs requests /MT via cc-rs.
+          "CRATE_CC_NO_DEFAULTS=1" >> $env:GITHUB_ENV
+          "CFLAGS=/MD" >> $env:GITHUB_ENV
+          "CXXFLAGS=/MD" >> $env:GITHUB_ENV
+
+      - name: Build cass
+        shell: pwsh
+        run: |
+          cargo build --locked --bin cass
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = (Resolve-Path 'target\debug\cass.exe').Path
+          "CASS_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Index acceptance
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'accept-source'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          ./scripts/windows_index_acceptance.ps1 -Cass $env:CASS_EXE -Fixture 'tests/fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl' -Work $work
+
+      - name: Keep the command logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-index-acceptance-source
+          path: ${{ runner.temp }}/accept-source/*.std*
+          if-no-files-found: ignore
