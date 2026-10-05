@@ -1,0 +1,72 @@
+# The integration patch exists because connector writes carry full files, while
+# responsiveness.rs is concurrently edited. Only exact anchors may be changed.
+name: Resident memory admission
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/indexer/responsiveness/resident.rs'
+      - 'src/indexer/responsiveness/resident/**'
+      - 'scripts/apply_resident_governor.py'
+      - '.github/workflows/resident-memory-admission.yml'
+permissions:
+  contents: write
+jobs:
+  integrate-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - name: Integrate guarded call sites and format only changed modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/resident-evidence"
+          python3 scripts/apply_resident_governor.py | tee "$RUNNER_TEMP/resident-evidence/integration.txt"
+          rustc --version | tee "$RUNNER_TEMP/resident-evidence/toolchain.txt"
+          rustfmt --edition 2024 src/indexer/responsiveness.rs
+          git diff --check
+          git diff -- src/indexer/responsiveness.rs src/indexer/responsiveness/resident.rs src/indexer/responsiveness/resident/policy.rs > "$RUNNER_TEMP/resident-evidence/integration.diff"
+      - name: Execute resident policy on the real Rust compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2024 --test -D warnings src/indexer/responsiveness/resident/policy.rs -o "$RUNNER_TEMP/resident-policy-tests"
+          "$RUNNER_TEMP/resident-policy-tests" --nocapture | tee "$RUNNER_TEMP/resident-evidence/policy-tests.log"
+      - name: Test integrated native governor under the unchanged CASS lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib indexer::responsiveness:: -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/resident-evidence/locked-governor-tests.log"
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/resident-evidence/locked-clippy.log"
+      - name: Commit tested integration directly to main without rewriting concurrent work
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/indexer/responsiveness.rs src/indexer/responsiveness/resident.rs src/indexer/responsiveness/resident/policy.rs
+          if git diff --cached --quiet; then
+            echo 'Integration already present; no commit required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(index): apply tested resident-memory admission to native work' -m 'Wire the memory sampler into the existing governor thread, combine CPU and resident capacity, and bound new in-flight bytes by observed slack. The configured drain floor remains available. Tested: standalone Rust memory policy, locked CASS responsiveness tests, locked lib Clippy. No changes to dependency sources or release gates.'
+          # The remote refuses a non-fast-forward update. Do not rebase or force
+          # a tested tree onto new concurrent changes without testing them.
+          git push origin HEAD:refs/heads/main
+          git rev-parse HEAD | tee "$RUNNER_TEMP/resident-evidence/published-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: resident-admission-${{ github.sha }}
+          path: ${{ runner.temp }}/resident-evidence/
+          if-no-files-found: error
+          retention-days: 14
