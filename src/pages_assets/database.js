@@ -785,17 +785,58 @@ function escapeFts5Query(query) {
   return expression.value;
 }
 
-function normalizeTimestampFilterValue(value) {
+function normalizeTimestampFilterValue(value, bound) {
   if (value === undefined || value === null || value === "") {
     return null;
   }
 
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(numeric)) {
-    return null;
+  const invalid = () => new RangeError(
+    `${bound} must be a non-negative integer timestamp in milliseconds or a valid YYYY-MM-DD date`,
+  );
+  let numeric;
+  if (typeof value === "number") {
+    numeric = value;
+  } else if (typeof value === "string") {
+    const text = value.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+      // Date.parse can normalize impossible dates (for example February 30).
+      // Check the round trip, and use UTC so links do not change across zones.
+      numeric = Date.parse(`${text}T00:00:00.000Z`);
+      if (!Number.isFinite(numeric) || new Date(numeric).toISOString().slice(0, 10) !== text) {
+        throw invalid();
+      }
+      if (bound === "until") {
+        numeric += 24 * 60 * 60 * 1000 - 1;
+      }
+    } else if (/^\d+$/.test(text)) {
+      numeric = Number(text);
+    } else {
+      throw invalid();
+    }
+  } else {
+    // Number(true), Number([]), etc. are not timestamp validation.
+    throw invalid();
   }
-
+  if (!Number.isSafeInteger(numeric) || numeric < 0) {
+    throw invalid();
+  }
   return numeric;
+}
+
+/**
+ * Validate optional, inclusive archive time bounds without silently dropping
+ * a supplied filter. Numeric strings are decimal milliseconds. Date-only
+ * strings mean the beginning of the UTC day for since, and its end for until.
+ * Shared by direct database queries and browser search routes.
+ * @returns {{since: number|null, until: number|null}}
+ */
+export function normalizeSearchTimeRange(since = null, until = null) {
+  const start = normalizeTimestampFilterValue(since, "since");
+  const end = normalizeTimestampFilterValue(until, "until");
+  if (start !== null && end !== null && start > end) {
+    throw new RangeError("since must not be later than until");
+  }
+  return { since: start, until: end };
 }
 
 /**
@@ -810,8 +851,8 @@ function normalizeTimestampFilterValue(value) {
  * @param {number} [options.offset=0] - Result offset for pagination
  * @param {string|null} [options.agent=null] - Filter by agent name
  * @param {SearchMode} [options.searchMode='auto'] - Search mode: 'auto', 'prose', or 'code'
- * @param {number|string|null} [options.since=null] - Earliest conversation start timestamp (ms)
- * @param {number|string|null} [options.until=null] - Latest conversation start timestamp (ms)
+ * @param {number|string|null} [options.since=null] - Earliest conversation start timestamp (ms or YYYY-MM-DD)
+ * @param {number|string|null} [options.until=null] - Latest conversation start timestamp (ms or YYYY-MM-DD)
  * @returns {Array<Object>} Search results
  */
 export function searchConversations(query, options = {}) {
@@ -824,6 +865,7 @@ export function searchConversations(query, options = {}) {
     until = null,
   } = options;
   validatePagination(limit, offset);
+  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
 
   // Parse and escape the query before preparing any database statement.
   const escapedQuery = escapeFts5Query(query);
@@ -866,13 +908,11 @@ export function searchConversations(query, options = {}) {
     params.push(agent);
   }
 
-  const sinceTimestamp = normalizeTimestampFilterValue(since);
   if (sinceTimestamp !== null) {
     sql += " AND c.started_at >= ?";
     params.push(sinceTimestamp);
   }
 
-  const untilTimestamp = normalizeTimestampFilterValue(until);
   if (untilTimestamp !== null) {
     sql += " AND c.started_at <= ?";
     params.push(untilTimestamp);
@@ -892,13 +932,14 @@ export function searchConversations(query, options = {}) {
  * Get conversations by agent
  * @param {string} agent - Agent name
  * @param {number} limit - Maximum results
- * @param {number|string|null} since - Earliest conversation start timestamp (ms)
- * @param {number|string|null} until - Latest conversation start timestamp (ms)
+ * @param {number|string|null} since - Earliest conversation start timestamp (ms or YYYY-MM-DD)
+ * @param {number|string|null} until - Latest conversation start timestamp (ms or YYYY-MM-DD)
  * @param {number} offset - Number of matching conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
 export function getConversationsByAgent(agent, limit = 50, since = null, until = null, offset = 0) {
   validatePagination(limit, offset);
+  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
   let sql = `
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
@@ -906,13 +947,11 @@ export function getConversationsByAgent(agent, limit = 50, since = null, until =
     `;
   const params = [agent];
 
-  const sinceTimestamp = normalizeTimestampFilterValue(since);
   if (sinceTimestamp !== null) {
     sql += " AND started_at >= ?";
     params.push(sinceTimestamp);
   }
 
-  const untilTimestamp = normalizeTimestampFilterValue(until);
   if (untilTimestamp !== null) {
     sql += " AND started_at <= ?";
     params.push(untilTimestamp);
@@ -950,25 +989,24 @@ export function getConversationsByWorkspace(workspace, limit = 50, offset = 0) {
 
 /**
  * Get conversations by time range (either bound may be omitted)
- * @param {number|string|null} since - Start timestamp (ms)
+ * @param {number|string|null} since - Start timestamp (ms or YYYY-MM-DD)
  * @param {number} limit - Maximum results (0-1000)
  * @param {number} offset - Number of matching conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
 export function getConversationsByTimeRange(since, until, limit = 50, offset = 0) {
   validatePagination(limit, offset);
+  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
   let sql = `
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
         WHERE 1 = 1
     `;
   const params = [];
-  const sinceTimestamp = normalizeTimestampFilterValue(since);
   if (sinceTimestamp !== null) {
     sql += " AND started_at >= ?";
     params.push(sinceTimestamp);
   }
-  const untilTimestamp = normalizeTimestampFilterValue(until);
   if (untilTimestamp !== null) {
     sql += " AND started_at <= ?";
     params.push(untilTimestamp);
@@ -1068,6 +1106,7 @@ export default {
   getConversation,
   getConversationMessages,
   searchConversations,
+  normalizeSearchTimeRange,
   detectSearchMode,
   getConversationsByAgent,
   getConversationsByWorkspace,
