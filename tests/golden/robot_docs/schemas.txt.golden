@@ -57,6 +57,9 @@ schemas: (auto-generated from contract)
       - max_fields: integer
       - max_limit: integer
     - mistake_recoveries: array
+    - source_ingest_reuse: object
+      - disabled_by: ?
+      - enabled: boolean
     - version: string
     - workflows: array
   diag:
@@ -3044,6 +3047,7 @@ schemas: (auto-generated from contract)
       - rebuild: object
         - active: boolean
         - engine_incompatible: boolean
+        - expected_docs_scan: ?
         - indexed_docs: ?
         - job_id: ?
         - job_kind: ?
@@ -3576,6 +3580,11 @@ schemas: (auto-generated from contract)
     - rebuild: object
       - active: boolean
       - engine_incompatible: boolean
+      - expected_docs_scan: ?
+        - expected_docs_so_far: integer
+        - last_conversation_id: integer
+        - max_conversation_id: integer
+        - saved_at: ?
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -3973,6 +3982,11 @@ schemas: (auto-generated from contract)
     - rebuild: object
       - active: boolean
       - engine_incompatible: boolean
+      - expected_docs_scan: ?
+        - expected_docs_so_far: integer
+        - last_conversation_id: integer
+        - max_conversation_id: integer
+        - saved_at: ?
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -4241,6 +4255,7 @@ schemas: (auto-generated from contract)
       - rebuild: object
         - active: boolean
         - engine_incompatible: boolean
+        - expected_docs_scan: ?
         - indexed_docs: ?
         - inspected: boolean
         - job_id: ?

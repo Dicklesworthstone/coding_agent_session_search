@@ -462,7 +462,8 @@
         "controller_loadavg_high_watermark_1m": 121.0,
         "controller_loadavg_low_watermark_1m": 120.0,
         "runtime": null
-      }
+      },
+      "expected_docs_scan": null
     },
     "semantic": {
       "status": "not_initialized",

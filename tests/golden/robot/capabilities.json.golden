@@ -3,6 +3,10 @@
   "crate_version": "[VERSION]",
   "build_commit": "[BUILD_COMMIT]",
   "build_commit_date": "[BUILD_COMMIT_DATE]",
+  "source_ingest_reuse": {
+    "enabled": true,
+    "disabled_by": null
+  },
   "api_version": 1,
   "contract_version": "1",
   "features": [

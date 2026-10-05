@@ -1187,6 +1187,9 @@
                   "type": "null"
                 }
               }
+            },
+            "expected_docs_scan": {
+              "type": "null"
             }
           }
         },
