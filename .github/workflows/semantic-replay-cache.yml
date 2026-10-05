@@ -5,7 +5,9 @@ on:
     paths:
       - 'src/indexer/semantic/engine/replay_cache.rs'
       - 'src/indexer/semantic/engine/replay_cache/**'
+      - 'src/indexer/semantic/engine/snapshot_tests.rs'
       - 'scripts/patches/semantic-replay-cache.patch'
+      - 'scripts/patches/semantic-snapshot-reuse.patch'
       - '.github/workflows/semantic-replay-cache.yml'
 permissions:
   contents: write
@@ -24,7 +26,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 1
-      - name: Apply the reviewed manual diff to the recorded main revision
+      - name: Apply the reviewed manual diffs to the recorded main revision
         shell: bash
         run: |
           set -euo pipefail
@@ -38,16 +40,23 @@ jobs:
             git apply --check scripts/patches/semantic-replay-cache.patch
             git apply scripts/patches/semantic-replay-cache.patch
           fi
+          if ! grep -Fq 'fn reconcile_in_private_directory(' src/indexer/semantic/engine.rs; then
+            git apply --check scripts/patches/semantic-snapshot-reuse.patch
+            git apply scripts/patches/semantic-snapshot-reuse.patch
+          fi
+          test "$(grep -Fc 'self.reconcile_in_private_directory(' src/indexer/semantic/engine.rs)" = 2
+          grep -Fq '|| Ok(snapshot_dir)' src/indexer/semantic/engine.rs
+          grep -Fq 'mod snapshot_tests;' src/indexer/semantic/engine.rs
           rustc --version | tee "$RUNNER_TEMP/replay-evidence/toolchain.txt"
           rustfmt --edition 2024 --config skip_children=true src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs
-          rustfmt --edition 2024 src/indexer/semantic/engine/replay_cache.rs
+          rustfmt --edition 2024 src/indexer/semantic/engine/replay_cache.rs src/indexer/semantic/engine/snapshot_tests.rs
           git diff --check
-          git diff -- src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/engine/replay_cache.rs src/indexer/semantic/engine/replay_cache/tests.rs > "$RUNNER_TEMP/replay-evidence/source.diff"
-      - name: Exercise canonical replay, bounded resume and existing identity refusal
+          git diff -- src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/engine/replay_cache.rs src/indexer/semantic/engine/replay_cache/tests.rs src/indexer/semantic/engine/snapshot_tests.rs > "$RUNNER_TEMP/replay-evidence/source.diff"
+      - name: Exercise canonical replay, snapshot ownership and existing identity refusal
         shell: bash
         run: |
           set -euo pipefail
-          for filter in 'replay_cache::' 'gh458_' 'backfill_from_storage'; do
+          for filter in 'replay_cache::' 'snapshot_tests::' 'gh458_' 'backfill_from_storage' 'semantic_reconciliation'; do
             logfile="$RUNNER_TEMP/replay-evidence/${filter//:/_}.log"
             cargo test --locked --lib "$filter" -- --nocapture --test-threads=1 2>&1 | tee "$logfile"
             grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$logfile"
@@ -57,14 +66,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git add src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/engine/replay_cache.rs src/indexer/semantic/engine/replay_cache/tests.rs
+          git add src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/engine/replay_cache.rs src/indexer/semantic/engine/replay_cache/tests.rs src/indexer/semantic/engine/snapshot_tests.rs
           if git diff --cached --quiet; then
             echo 'Integration already present; no commit required.'
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat(index): reuse verified canonical identities across bounded backfill batches' -m 'Activate the invocation-local replay inventory. Revalidate descriptor-bound DB/WAL stamps and producer/input identity; reload selected text and recheck a cached observation after embedding. Candidate identity validation, exact coverage, checkpoint caps, serving revocation and publication remain in the existing engine. Validated with locked replay-cache, gh458 and storage-resume tests plus library Clippy. No dependencies, ignored tests, release gates or bead closures changed. Cache work counts are not an owner-scale throughput or RSS guarantee.'
+          git commit -m 'feat(index): reuse canonical replay and transfer private backfill snapshots' -m 'Activate the invocation-local replay inventory and consume the already owned backfill snapshot instead of copying the full vector index again. Revalidate descriptor-bound DB/WAL stamps and producer/input identity; reload selected text and recheck cached observations after embedding. Preserve validation-before-I/O, independent live-source copies, private scratch writer ownership, exact coverage, checkpoint caps, serving revocation and stale-WAL publication checks. Validated with locked replay-cache and snapshot tests, gh458, storage-resume and semantic-reconciliation regressions plus library Clippy. No dependencies, ignored tests, release gates or bead closures changed. No owner-scale throughput or RSS claim.'
           git push origin HEAD:refs/heads/main
           git rev-parse HEAD | tee "$RUNNER_TEMP/replay-evidence/published-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
