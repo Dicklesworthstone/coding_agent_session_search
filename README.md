@@ -2942,7 +2942,14 @@ cass completions powershell >> $PROFILE
 
 - **CPU**: any x86_64 or ARM64 processor. Semantic search runs on a pure-Rust inference backend (frankensearch/native) with runtime-dispatched SIMD — NEON on Apple Silicon, AVX2/FMA when present on x86, SSE2/scalar fallback otherwise — so there is no AVX requirement and no `SIGILL` hazard (the historical ONNX Runtime dependency was removed in cass#308).
 - **OS**: Linux, macOS, or Windows
-- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine. The install script probes the host's glibc (`ldd --version`) before downloading a Linux prebuilt binary and falls back to build-from-source with a warning when it is older than 2.38; `--from-source` forces that route, and `--artifact-url` bypasses the probe for an explicitly chosen artifact.
+- **Linux glibc**: Pre-built Linux binaries require **glibc 2.28+**: Debian 10+, Ubuntu 20.04+, RHEL/Rocky/Alma 8+, Amazon Linux 2023. They are cross-built against a pinned 2.28 floor (`cargo zigbuild --target <arch>-unknown-linux-gnu.2.28`). On the v0.10.0 artifacts, `objdump -p cass` shows `GLIBC_2.28` for both amd64 and arm64. Older systems (e.g. Ubuntu 18.04 with glibc 2.27) should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. The install script checks the host's glibc (`ldd --version`) before downloading a Linux prebuilt binary. If it is older than 2.28, the script warns and builds from source instead. `--from-source` forces that route, and `--artifact-url` skips the check for an artifact you choose.
+- **`sqlite3` command-line tool (optional)**: four repairs run the stock `sqlite3` binary:
+  - the duplicate FTS schema-row repair, which some opens of an older archive run;
+  - recovering a historical bundle during salvage;
+  - importing that recovered bundle;
+  - the staged FTS metadata scrub.
+
+  Without `sqlite3` on `PATH`, only these repairs fail, with an error that names the missing tool.
 - **Disk**: Sufficient space for the search index (varies with session history size)
 
 ---
