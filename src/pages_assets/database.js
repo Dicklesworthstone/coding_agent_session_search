@@ -595,17 +595,194 @@ function isCodeQuery(query) {
 }
 
 /**
- * Escape query for FTS5 MATCH
- * Wraps each term in double-quotes and escapes internal quotes
+ * Compile the viewer's query language to a bound FTS5 MATCH expression.
+ *
+ * Bare terms are ANDed; quotes preserve a phrase and a trailing * requests a
+ * token prefix. Uppercase AND/OR and binary NOT support grouping with
+ * parentheses (NOT > AND > OR). `a AND NOT b` is also accepted. Standalone
+ * negation has no positive FTS candidate set and is rejected, not dropped.
+ * Quote operator words to search them literally; double a quote inside a
+ * quoted phrase. Other punctuation, paths and column-looking text stay data,
+ * never raw FTS syntax. Attached call parentheses such as foo() stay literal.
+ *
+ * The byte-independent input, token and nesting limits bound parser work on
+ * pasted queries. Invalid syntax is surfaced through the UI's search error
+ * path instead of silently broadening the search or pretending there are no
+ * matches. No term is ever interpolated into SQL.
  * @param {string} query - Search query
- * @returns {string} Escaped query safe for FTS5
+ * @returns {string} Escaped, precedence-preserving expression safe for FTS5
  */
 function escapeFts5Query(query) {
-  return query
-    .split(/\s+/)
-    .filter((t) => t.length > 0)
-    .map((t) => `"${t.replace(/"/g, '""')}"`)
-    .join(" ");
+  if (typeof query !== "string") {
+    throw new TypeError("Search query must be a string");
+  }
+  if (query.length > 4096) {
+    throw new RangeError("Search query exceeds the 4096-character limit");
+  }
+
+  const tokens = [];
+  const operators = new Set(["AND", "OR", "NOT"]);
+  const whitespace = /\s/;
+  let position = 0;
+  while (position < query.length) {
+    const character = query[position];
+    if (whitespace.test(character)) {
+      position += 1;
+      continue;
+    }
+    if (tokens.length >= 128) {
+      throw new RangeError("Search query exceeds the 128-token limit");
+    }
+    if (character === "(" || character === ")") {
+      tokens.push({ kind: character });
+      position += 1;
+      continue;
+    }
+
+    let text = "";
+    let quoted = false;
+    let prefix = false;
+    if (character === '"') {
+      quoted = true;
+      position += 1;
+      let closed = false;
+      while (position < query.length) {
+        const next = query[position++];
+        if (next !== '"') {
+          text += next;
+        } else if (query[position] === '"') {
+          text += '"';
+          position += 1;
+        } else {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) {
+        throw new SyntaxError("Unterminated quoted phrase");
+      }
+      if (!text.trim()) {
+        throw new SyntaxError("Quoted search phrases must not be empty");
+      }
+      if (query[position] === "*") {
+        prefix = true;
+        position += 1;
+      }
+      if (position < query.length && !whitespace.test(query[position]) && query[position] !== ")") {
+        throw new SyntaxError("Separate a quoted phrase from the next term with a space");
+      }
+    } else {
+      let attachedDepth = 0;
+      while (position < query.length && !whitespace.test(query[position])) {
+        const next = query[position];
+        if (next === '"') {
+          // Quotes inside a bare code token are literal, as they were before
+          // phrase support; only a leading quote opens a phrase.
+          text += next;
+        } else if (next === "(") {
+          if (operators.has(text)) {
+            break;
+          }
+          attachedDepth += 1;
+          text += next;
+        } else if (next === ")") {
+          if (attachedDepth === 0) {
+            break;
+          }
+          attachedDepth -= 1;
+          text += next;
+        } else {
+          text += next;
+        }
+        position += 1;
+      }
+      if (text.endsWith("*")) {
+        prefix = true;
+        text = text.slice(0, -1);
+        if (!text || text.includes("*")) {
+          throw new SyntaxError("A prefix search needs a term followed by a single *");
+        }
+      }
+    }
+    tokens.push(
+      !quoted && !prefix && operators.has(text)
+        ? { kind: text }
+        : { kind: "term", value: `"${text.replace(/"/g, '""')}"${prefix ? "*" : ""}` },
+    );
+  }
+  if (tokens.length === 0) {
+    return "";
+  }
+
+  let cursor = 0;
+  const peek = () => tokens[cursor]?.kind;
+  // Render only necessary grouping. Wrapping each link in a long AND chain
+  // would overflow FTS5's parser stack even within our token budget.
+  const combine = (left, operator, right) => {
+    const precedence = { OR: 1, AND: 2, NOT: 3 }[operator];
+    const lhs = left.precedence < precedence ? `(${left.value})` : left.value;
+    const rhs = right.precedence < precedence ||
+      (operator === "NOT" && right.precedence === precedence)
+      ? `(${right.value})` : right.value;
+    return { value: `${lhs} ${operator} ${rhs}`, precedence };
+  };
+
+  function primary(depth) {
+    const token = tokens[cursor++];
+    if (token?.kind === "term") {
+      return { value: token.value, precedence: 4 };
+    }
+    if (token?.kind === "(") {
+      if (depth >= 16) {
+        throw new RangeError("Search groups exceed the 16-level nesting limit");
+      }
+      const expression = disjunction(depth + 1);
+      if (peek() !== ")") {
+        throw new SyntaxError("Missing closing parenthesis in search query");
+      }
+      cursor += 1;
+      return expression;
+    }
+    if (token?.kind === "NOT") {
+      throw new SyntaxError("NOT needs a positive term on its left, such as error NOT timeout");
+    }
+    throw new SyntaxError("Expected a search term or quoted phrase");
+  }
+
+  function exclusion(depth) {
+    let expression = primary(depth);
+    while (peek() === "NOT" || (peek() === "AND" && tokens[cursor + 1]?.kind === "NOT")) {
+      cursor += peek() === "AND" ? 2 : 1;
+      expression = combine(expression, "NOT", primary(depth));
+    }
+    return expression;
+  }
+
+  function conjunction(depth) {
+    let expression = exclusion(depth);
+    while (peek() === "AND" || peek() === "term" || peek() === "(") {
+      if (peek() === "AND") {
+        cursor += 1;
+      }
+      expression = combine(expression, "AND", exclusion(depth));
+    }
+    return expression;
+  }
+
+  function disjunction(depth) {
+    let expression = conjunction(depth);
+    while (peek() === "OR") {
+      cursor += 1;
+      expression = combine(expression, "OR", conjunction(depth));
+    }
+    return expression;
+  }
+
+  const expression = disjunction(0);
+  if (cursor !== tokens.length) {
+    throw new SyntaxError("Unexpected closing parenthesis in search query");
+  }
+  return expression.value;
 }
 
 function normalizeTimestampFilterValue(value) {
@@ -648,7 +825,7 @@ export function searchConversations(query, options = {}) {
   } = options;
   validatePagination(limit, offset);
 
-  // Escape query for FTS5
+  // Parse and escape the query before preparing any database statement.
   const escapedQuery = escapeFts5Query(query);
   if (!escapedQuery) {
     return [];
