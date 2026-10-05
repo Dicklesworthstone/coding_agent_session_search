@@ -1,0 +1,68 @@
+# Qualify the real native caller before publishing its guarded integration.
+name: Exact message streaming
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/search/query/message_stream.rs'
+      - 'src/search/query/message_stream/**'
+      - 'scripts/apply_exact_message_stream.py'
+      - '.github/workflows/exact-message-stream.yml'
+permissions:
+  contents: write
+jobs:
+  integrate-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Integrate exact call sites on the recorded main revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/exact-message-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/exact-message-evidence/tested-base.txt"
+          python3 scripts/apply_exact_message_stream.py | tee "$RUNNER_TEMP/exact-message-evidence/integration.txt"
+          rustc --version | tee "$RUNNER_TEMP/exact-message-evidence/toolchain.txt"
+          rustfmt --edition 2024 --config skip_children=true src/search/query.rs
+          rustfmt --edition 2024 src/search/query/message_stream.rs
+          git diff --check
+          git diff -- src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs > "$RUNNER_TEMP/exact-message-evidence/source.diff"
+      - name: Differential tests on real FSVI, WAL, and the integrated CASS driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib search::query::message_stream:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/streaming.log"
+          cargo test --locked --lib search::query::message_topk -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/existing-exact.log"
+          cargo test --locked --lib search::query::ann_shards -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/existing-ann.log"
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/clippy.log"
+      - name: Publish the tested integration without rewriting concurrent work
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs
+          if git diff --cached --quiet; then
+            echo 'Integration already present; no commit required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(search): activate bounded single-pass exact message refinement' -m 'The ordinary proven first window remains unchanged. Unresolved standard-width cohorts select exact message winners during one additional scan, preserving scores, chunk ties, filters, retained WAL shadowing and complete-cohort failure. Unsupported widths and oversized WAL overlays keep the incumbent driver. Validated with locked real-FSVI differential tests, existing exact/ANN regressions and lib Clippy. No dependency or gate changes.'
+          git push origin HEAD:refs/heads/main
+          git rev-parse HEAD | tee "$RUNNER_TEMP/exact-message-evidence/published-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: exact-message-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/exact-message-evidence/
+          if-no-files-found: error
+          retention-days: 14
