@@ -7171,7 +7171,12 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
                 err.kind(),
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) {
-                err.exit();
+                // Render from the whole tree so the root help also lists the
+                // binary-dispatched subcommands (serve, archive).
+                match cli_command().try_get_matches_from(&normalized_args) {
+                    Err(full) if full.kind() == err.kind() => full.exit(),
+                    _ => err.exit(),
+                }
             }
 
             // Handle bare subcommand invocations (e.g. `cass analytics` without a
@@ -8734,11 +8739,11 @@ async fn execute_cli(
 
             match command {
                 Commands::Completions { shell } => {
-                    let mut cmd = Cli::command();
+                    let mut cmd = cli_command();
                     clap_complete::generate(shell, &mut cmd, "cass", &mut std::io::stdout());
                 }
                 Commands::Man => {
-                    let cmd = Cli::command();
+                    let cmd = cli_command();
                     let man = clap_mangen::Man::new(cmd);
                     man.render(&mut std::io::stdout())
                         .map_err(|e| CliError::unknown(format!("failed to render man: {e}")))?;
@@ -26805,6 +26810,12 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).".to_string(),
             "    --binary-only     Report the same archive-readiness verdict but exit 0 unless the executable itself fails; use selftest to avoid archive access.".to_string(),
             "  cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.".to_string(),
+            "  cass serve --stdio (--index DIR | --data-dir DIR) [--mcp]".to_string(),
+            "                    Keep read-only search readers open for a stream of JSON requests: repeated queries skip".to_string(),
+            "                    reopening and re-verifying the index (docs/SEARCH_SERVICE.md). Semantic search is opt-in.".to_string(),
+            "  cass archive export|verify|search|view|import [--json]".to_string(),
+            "                    Logical canonical backup as private JSONL: export a snapshot, verify it without a DB,".to_string(),
+            "                    search or view its bodies, or restore into a NEW database (docs/LOGICAL_ARCHIVE.md).".to_string(),
             "  cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.".to_string(),
             "                    doctor JSON includes source_inventory; missing upstream provider files are".to_string(),
             "                    source coverage/prune-risk warnings, not proof that archived cass rows are lost.".to_string(),
@@ -97470,14 +97481,47 @@ fn extract_formula_version(body: &str) -> Option<String> {
     None
 }
 
+/// Builds the clap trees of the subcommands the `cass` binary dispatches
+/// before [`parse_cli`] (`serve`, `archive`; see src/main.rs).
+static EXTERNAL_SUBCOMMANDS: std::sync::OnceLock<fn() -> Vec<Command>> = std::sync::OnceLock::new();
+
+/// Called by the `cass` binary so help, completions, the man page,
+/// `capabilities` and `introspect` describe the subcommands it parses itself.
+/// Parsing is unchanged: the binary still dispatches them first.
+pub fn register_external_subcommands(build: fn() -> Vec<Command>) {
+    let _ = EXTERNAL_SUBCOMMANDS.set(build);
+}
+
+fn external_subcommands() -> Vec<Command> {
+    EXTERNAL_SUBCOMMANDS
+        .get()
+        .map(|build| build())
+        .unwrap_or_default()
+}
+
+/// The whole `cass` command tree: this crate's CLI plus the registered
+/// binary-dispatched subcommands.
+fn cli_command() -> Command {
+    Cli::command().subcommands(external_subcommands())
+}
+
 /// Build command schemas for all CLI commands
 fn build_command_schemas() -> Vec<CommandSchema> {
     let root = Cli::command();
     let global_robot_format = root
         .get_arguments()
         .find(|arg| arg.get_id().as_str() == "robot_format");
+    // The binary parses its registered subcommands with their own parsers,
+    // which do not accept this CLI's global --robot-format: list only their
+    // own arguments.
+    let external = external_subcommands();
     root.get_subcommands()
         .map(|cmd| command_schema_from_clap(cmd, global_robot_format))
+        .chain(
+            external
+                .iter()
+                .map(|cmd| command_schema_from_clap(cmd, None)),
+        )
         .collect()
 }
 

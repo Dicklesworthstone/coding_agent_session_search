@@ -115,6 +115,16 @@ enum ServiceCommand {
 
 /// This independent parser follows the existing logical-archive dispatch seam:
 /// no ordinary CLI readiness probe or runtime starts before serving requests.
+/// The `serve` subcommand tree, for the main CLI's help and command schemas.
+pub fn clap_commands() -> Vec<clap::Command> {
+    use clap::CommandFactory;
+    ServiceCli::command()
+        .find_subcommand("serve")
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
 pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
     let cli = match ServiceCli::try_parse_from(args) {
         Ok(cli) => cli,

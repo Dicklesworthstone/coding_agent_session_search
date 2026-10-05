@@ -199,6 +199,21 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
     (9, "logical-archive-error", false)
 }
 
+/// The `archive` subcommand tree, for the main CLI's help and command
+/// schemas. Building first copies this parser's root-level globals (`--db`,
+/// `--data-dir`, `--json`) into the subcommand. Only `archive` is taken:
+/// building also adds clap's own `help` subcommand to this root, which would
+/// collide with the main CLI's.
+pub fn clap_commands() -> Vec<clap::Command> {
+    use clap::CommandFactory;
+    let mut root = Cli::command();
+    root.build();
+    root.find_subcommand("archive")
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
 pub fn run(args: Vec<String>) -> Result<()> {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,

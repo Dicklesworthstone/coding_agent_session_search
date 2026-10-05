@@ -3777,9 +3777,13 @@ fn introspect_commands_match_clap_subcommands() {
             .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
             .collect();
 
+        // The binary also registers the two subcommands it dispatches before
+        // the main CLI parses (src/main.rs).
+        let mut expected = clap_commands;
+        expected.extend(["serve".to_string(), "archive".to_string()]);
         assert_eq!(
-            clap_commands, introspect_commands,
-            "introspect should list exactly the Clap subcommands"
+            expected, introspect_commands,
+            "introspect should list exactly the Clap subcommands plus serve and archive"
         );
 
         // Ensure no help/version pseudo-args leak into schemas
@@ -3792,6 +3796,70 @@ fn introspect_commands_match_clap_subcommands() {
                 "help/version flags should be hidden in introspect"
             );
         }
+    });
+}
+
+/// coding_agent_session_search-8fr1g: the binary parses `serve` and `archive`
+/// before the main CLI, so help, capabilities, introspect and robot-docs never
+/// listed them. They now come from their real parsers, with real arguments.
+#[test]
+fn binary_dispatched_serve_and_archive_are_discoverable() {
+    run_on_large_stack(|| {
+        let introspect = fetch_introspect_json();
+        let serve = find_command(&introspect, "serve");
+        for arg in ["index", "data-dir", "stdio"] {
+            find_arg(serve, arg);
+        }
+        let archive = find_command(&introspect, "archive");
+        // --db, --data-dir and --json are globals on the archive parser's root.
+        for arg in ["db", "data-dir", "json"] {
+            find_arg(archive, arg);
+        }
+        assert_eq!(archive["has_json_output"], true, "{archive}");
+        // Their own parsers reject the main CLI's global --robot-format, so
+        // the schemas must not offer it.
+        for command in [serve, archive] {
+            assert!(
+                command["arguments"]
+                    .as_array()
+                    .expect("arguments")
+                    .iter()
+                    .all(|arg| arg["name"] != "robot-format"),
+                "{command}"
+            );
+        }
+
+        let stdout = |args: &[&str]| -> String {
+            let mut cmd = base_cmd();
+            cmd.args(args);
+            String::from_utf8_lossy(&cmd.assert().success().get_output().stdout).into_owned()
+        };
+        let capabilities: Value =
+            serde_json::from_str(stdout(&["capabilities", "--json"]).trim()).expect("JSON");
+        let names: HashSet<&str> = capabilities["commands"]
+            .as_array()
+            .expect("commands array")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(
+            names.contains("serve") && names.contains("archive"),
+            "{names:?}"
+        );
+
+        let help = stdout(&["--help"]);
+        for name in ["serve", "archive"] {
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{name} "))),
+                "--help must list {name}:\n{help}"
+            );
+        }
+        let docs = stdout(&["robot-docs", "commands"]);
+        assert!(
+            docs.contains("cass serve --stdio") && docs.contains("cass archive export"),
+            "{docs}"
+        );
     });
 }
 
@@ -7376,18 +7444,20 @@ fn introspect_matches_golden_contract_structure() {
             .iter()
             .filter_map(|c| c["name"].as_str())
             .collect();
+        // Plus the two subcommands the binary dispatches itself (src/main.rs).
         let clap_cmd = Cli::command();
-        let expected_cmd_names: HashSet<_> = clap_cmd
+        let mut expected_cmd_names: HashSet<_> = clap_cmd
             .get_subcommands()
             .map(|command| command.get_name().to_string())
             .collect();
+        expected_cmd_names.extend(["serve".to_string(), "archive".to_string()]);
         assert_eq!(
             actual_cmd_names,
             expected_cmd_names
                 .iter()
                 .map(String::as_str)
                 .collect::<HashSet<_>>(),
-            "command names should match clap"
+            "command names should match clap plus serve and archive"
         );
     });
 }

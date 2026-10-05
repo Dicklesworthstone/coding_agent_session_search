@@ -3876,6 +3876,131 @@
         }
       ],
       "has_json_output": true
+    },
+    {
+      "name": "serve",
+      "description": "Reuse read-only search readers for a stream of JSON requests. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "arguments": [
+        {
+          "name": "index",
+          "description": "Published lexical index directory, instead of --data-dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Select the compiled lexical index beneath this explicit data directory. Resolves the path only; never opens or repairs the canonical database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "stdio",
+          "description": "Use newline-delimited JSON requests and responses on standard I/O",
+          "arg_type": "flag",
+          "required": true,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "mcp",
+          "description": "Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "db",
+          "description": "Opt in to canonical view requests against this fixed read-only archive. Search, status and startup still never open the database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "reranker-model",
+          "description": "Opt in to candidate-only refinement with this installed local reranker. Never downloads files; ordinary search, startup and status stay model-free",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "semantic-embedder",
+          "description": "Opt in to retained semantic/hybrid retrieval using installed assets. Requires explicit --data-dir and --db; ordinary search stays lexical",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "minilm",
+            "multilingual-minilm",
+            "hash"
+          ]
+        },
+        {
+          "name": "request-timeout-ms",
+          "description": "Whole-request deadline, from first frame byte through response flush. Expiry exits the worker with code 124; idle sessions are not timed out",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "30000"
+        },
+        {
+          "name": "admission-dir",
+          "description": "Shared local control directory for nonblocking cross-process reader admission. Writes only pool metadata; never place this directory inside a search index",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "admission-slots",
+          "description": "Maximum reader-owning processes sharing the same admission directory",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "max-resident-mib",
+          "description": "Terminate this worker with exit 126 when sampled resident memory exceeds this many MiB. Sampling includes idle readers; it is not a kernel-enforced allocation limit",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "4096"
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "archive",
+      "description": "Export, verify or restore a bounded, versioned logical canonical archive",
+      "arguments": [
+        {
+          "name": "db",
+          "description": "Existing canonical archive. Export never creates or repairs this file",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Explicit canonical archive directory (also accepts CASS_DATA_DIR)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Receipts are JSON regardless of this compatibility flag",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "response_schemas": {

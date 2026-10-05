@@ -71,6 +71,12 @@ commands:
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
     --binary-only     Report the same archive-readiness verdict but exit 0 unless the executable itself fails; use selftest to avoid archive access.
   cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.
+  cass serve --stdio (--index DIR | --data-dir DIR) [--mcp]
+                    Keep read-only search readers open for a stream of JSON requests: repeated queries skip
+                    reopening and re-verifying the index (docs/SEARCH_SERVICE.md). Semantic search is opt-in.
+  cass archive export|verify|search|view|import [--json]
+                    Logical canonical backup as private JSONL: export a snapshot, verify it without a DB,
+                    search or view its bodies, or restore into a NEW database (docs/LOGICAL_ARCHIVE.md).
   cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.
                     doctor JSON includes source_inventory; missing upstream provider files are
                     source coverage/prune-risk warnings, not proof that archived cass rows are lost.
