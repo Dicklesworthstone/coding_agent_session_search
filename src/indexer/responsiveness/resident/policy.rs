@@ -29,6 +29,11 @@ pub struct Policy {
     capacity_pct: u32,
     healthy_streak: u8,
     last_byte_limit: Option<u64>,
+    // Once a probe has worked, losing it is uncertainty, not evidence that
+    // its pressure disappeared. Platforms without that probe still work.
+    observed_total: bool,
+    observed_headroom: bool,
+    last_target: Option<u64>,
 }
 
 impl Default for Policy {
@@ -37,6 +42,9 @@ impl Default for Policy {
             capacity_pct: 100,
             healthy_streak: 0,
             last_byte_limit: None,
+            observed_total: false,
+            observed_headroom: false,
+            last_target: None,
         }
     }
 }
@@ -67,9 +75,23 @@ impl Policy {
         max_inflight_bytes: u64,
         min_inflight_bytes: u64,
     ) -> Decision {
-        let target = target_resident_bytes(sample.total_bytes, explicit_resident_limit);
+        let total = sample.total_bytes.filter(|total| *total > 0);
+        let mut target = target_resident_bytes(total, explicit_resident_limit);
+        if total.is_none() {
+            // An unavailable total must not replace a previously lower
+            // cgroup-derived target with a larger explicit/host allowance.
+            target = match (target, self.last_target) {
+                (Some(current), Some(previous)) => Some(current.min(previous)),
+                (current, previous) => current.or(previous),
+            };
+        }
+        self.last_target = target;
         let resident = sample.resident_bytes.zip(target);
-        let headroom = sample.available_bytes.zip(sample.total_bytes.filter(|total| *total > 0));
+        let headroom = sample.available_bytes.zip(total);
+        self.observed_total |= total.is_some();
+        self.observed_headroom |= headroom.is_some();
+        let probes_complete = (!self.observed_total || total.is_some())
+            && (!self.observed_headroom || headroom.is_some());
         let severe = resident.is_some_and(|(used, target)| used >= target)
             || headroom.is_some_and(|(free, total)| free <= fraction(total, 1, 32));
         let pressured = resident.is_some_and(|(used, target)| used >= fraction(target, 9, 10))
@@ -78,8 +100,10 @@ impl Policy {
         // headroom probe can still shrink admission, but cannot restore it
         // while the process' footprint is unknown. Initially unknown is a
         // no-op, preserving operation on unsupported platforms.
-        let healthy = resident.is_some_and(|(used, target)| used <= fraction(target, 4, 5))
+        let healthy = probes_complete
+            && resident.is_some_and(|(used, target)| used <= fraction(target, 4, 5))
             && headroom.is_none_or(|(free, total)| free >= fraction(total, 1, 8));
+        let mut recovery_tick = false;
 
         let reason = if severe {
             self.capacity_pct = 1;
@@ -93,6 +117,7 @@ impl Policy {
             self.healthy_streak = self.healthy_streak.saturating_add(1);
             if self.healthy_streak >= HEALTHY_TICKS_TO_GROW {
                 self.healthy_streak = 0;
+                recovery_tick = true;
                 self.capacity_pct = self.capacity_pct.saturating_add(10).min(100);
                 "resident_memory_recovery"
             } else {
@@ -100,7 +125,7 @@ impl Policy {
             }
         } else {
             self.healthy_streak = 0;
-            if resident.is_none() {
+            if resident.is_none() || !probes_complete {
                 "resident_memory_unknown"
             } else {
                 "resident_memory_hysteresis_hold"
@@ -118,10 +143,16 @@ impl Policy {
         if let Some((free, total)) = headroom {
             byte_limit = byte_limit.min(free.saturating_sub(fraction(total, 1, 32)) / 2);
         }
-        if !healthy {
-            // Losing telemetry or entering the deadband cannot reopen byte
-            // admission while worker admission is deliberately held down.
-            byte_limit = byte_limit.min(self.last_byte_limit.unwrap_or(max_inflight_bytes));
+        if let Some(previous) = self.last_byte_limit {
+            // Byte admission has the same hysteresis as worker admission.
+            // A single healthy tick used to reopen the full byte budget even
+            // while worker capacity deliberately remained at the severe floor.
+            let permitted = if recovery_tick {
+                previous.saturating_add((max_inflight_bytes / 10).max(1))
+            } else {
+                previous
+            };
+            byte_limit = byte_limit.min(permitted);
         }
         byte_limit = byte_limit.max(min_inflight_bytes.max(1).min(max_inflight_bytes));
         self.last_byte_limit = Some(byte_limit);
@@ -333,3 +364,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
