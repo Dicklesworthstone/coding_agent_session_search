@@ -592,7 +592,12 @@ mod prime_ingestion {
                 "target must be indexed exactly once: {found}"
             );
             assert_eq!(hits[0]["agent"], "prime_agent");
-            assert_eq!(hits[0]["source_path"], target.to_string_lossy().as_ref());
+            // Watch-once indexes the canonical path (#377), which on macOS is
+            // /private/var/... for a temp dir under /var.
+            let indexed = Path::new(hits[0]["source_path"].as_str().unwrap())
+                .canonicalize()
+                .unwrap();
+            assert_eq!(indexed, target.canonicalize().unwrap());
             let excluded = prime_search(home.path(), &data, "primeexcludedneedle");
             assert!(
                 excluded["hits"].as_array().unwrap().is_empty(),

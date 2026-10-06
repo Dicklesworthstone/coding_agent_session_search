@@ -32354,6 +32354,20 @@ fn classify_paths(
             }
         })
         .collect();
+    // A live watch keeps scanning the root as configured, but its events can
+    // arrive in either spelling: macOS FSEvents reports canonical paths
+    // (/private/var/... for a root under /var, the target of a symlinked
+    // root), inotify reports them as watched. Match the canonical spelling
+    // too, or every event under such a root is dropped.
+    let alternate_root_paths: Vec<Option<PathBuf>> = roots
+        .iter()
+        .map(|(_, root)| {
+            (!prefer_explicit_paths)
+                .then(|| std::fs::canonicalize(&root.path).ok())
+                .flatten()
+                .filter(|canonical| canonical != &root.path)
+        })
+        .collect();
 
     for requested in paths {
         let hinted_kind = prefer_explicit_paths
@@ -32387,16 +32401,22 @@ fn classify_paths(
             // transcript, so retain only the deepest root per connector and
             // source provenance. Distinct sources remain distinct scans.
             let mut matching_roots: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
-            for ((kind, root), match_root_path) in roots.iter().zip(&match_root_paths) {
+            for (((kind, root), match_root_path), alternate_root_path) in roots
+                .iter()
+                .zip(&match_root_paths)
+                .zip(&alternate_root_paths)
+            {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
                 {
                     continue;
                 }
-                if p.starts_with(match_root_path)
-                    || (is_database_watch_root(*kind, root)
-                        && database_sidecar_paths(match_root_path).contains(p))
-                {
+                let under = |candidate: &PathBuf| {
+                    p.starts_with(candidate)
+                        || (is_database_watch_root(*kind, root)
+                            && database_sidecar_paths(candidate).contains(p))
+                };
+                if under(match_root_path) || alternate_root_path.as_ref().is_some_and(under) {
                     if let Some(index) =
                         matching_roots
                             .iter()
@@ -61019,6 +61039,35 @@ mod tests {
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Omp);
         assert_eq!(classified[0].1.path, profile_root);
+    }
+
+    /// A live watch must match an event in the canonical spelling of its root:
+    /// macOS FSEvents reports /private/var/... for a root under /var, and the
+    /// target path for a symlinked root, so `cass index --watch` on macOS
+    /// dropped every such event. The scan still uses the configured root, so
+    /// source paths keep the spelling a full scan records.
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_live_watch_matches_a_symlinked_root_by_its_canonical_path() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-sessions");
+        let session = real.join("rollout-2026-10-06T12-00-00.jsonl");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let linked = tmp.path().join("linked-sessions");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let roots = vec![(ConnectorKind::Codex, ScanRoot::local(linked.clone()))];
+
+        // The event arrives under the symlink's target, as FSEvents reports it.
+        let event = std::fs::canonicalize(&session).unwrap();
+        let classified = classify_paths(vec![event], &roots, false);
+        assert_eq!(classified.len(), 1, "{classified:?}");
+        assert_eq!(classified[0].1.path, linked, "scan the configured root");
+
+        // A path under neither spelling is not claimed.
+        let outside = tmp.path().join("elsewhere.jsonl");
+        std::fs::write(&outside, b"{}\n").unwrap();
+        assert!(classify_paths(vec![outside], &roots, false).is_empty());
     }
 
     #[test]
