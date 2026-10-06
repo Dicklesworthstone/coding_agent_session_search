@@ -74,11 +74,17 @@ impl ExternalEmbeddingConfig {
     }
 
     /// Inject configuration without mutating process-global environment in tests.
-    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> EmbedderResult<Option<Self>> {
+    pub fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> EmbedderResult<Option<Self>> {
         match lookup("CASS_EXTERNAL_EMBEDDINGS").as_deref() {
             None | Some("") | Some("0") | Some("false") => return Ok(None),
             Some("1") | Some("true") => {}
-            _ => return Err(unavailable("external_config: CASS_EXTERNAL_EMBEDDINGS must be 0, false, 1, or true")),
+            _ => {
+                return Err(unavailable(
+                    "external_config: CASS_EXTERNAL_EMBEDDINGS must be 0, false, 1, or true",
+                ));
+            }
         }
         let mut required = |key: &str| {
             lookup(key)
@@ -88,8 +94,9 @@ impl ExternalEmbeddingConfig {
         let raw_url = required("CASS_EXTERNAL_EMBEDDING_URL")?;
         let model = required("CASS_EXTERNAL_EMBEDDING_MODEL")?;
         let raw_dimension = required("CASS_EXTERNAL_EMBEDDING_DIMENSION")?;
-        let endpoint = Url::parse(&raw_url)
-            .map_err(|_| unavailable("external_config: CASS_EXTERNAL_EMBEDDING_URL is not a valid URL"))?;
+        let endpoint = Url::parse(&raw_url).map_err(|_| {
+            unavailable("external_config: CASS_EXTERNAL_EMBEDDING_URL is not a valid URL")
+        })?;
         let loopback = match endpoint.host() {
             Some(Host::Ipv4(ip)) => ip.is_loopback(),
             Some(Host::Ipv6(ip)) => ip.is_loopback(),
@@ -104,31 +111,74 @@ impl ExternalEmbeddingConfig {
             || endpoint.fragment().is_some()
             || !endpoint.path().ends_with("/v1/embeddings")
         {
-            return Err(unavailable("external_config: URL must end in /v1/embeddings, use HTTPS (HTTP only on loopback), and contain no credentials, query, or fragment"));
+            return Err(unavailable(
+                "external_config: URL must end in /v1/embeddings, use HTTPS (HTTP only on loopback), and contain no credentials, query, or fragment",
+            ));
         }
         if model.len() > 512 || model.chars().any(char::is_control) {
-            return Err(unavailable("external_config: model must be at most 512 bytes without control characters"));
+            return Err(unavailable(
+                "external_config: model must be at most 512 bytes without control characters",
+            ));
         }
         fn number(raw: &str, key: &str, min: usize, max: usize) -> EmbedderResult<usize> {
             raw.parse::<usize>()
                 .ok()
                 .filter(|n| (min..=max).contains(n))
-                .ok_or_else(|| unavailable(format!("external_config: {key} must be an integer in {min}..={max}")))
+                .ok_or_else(|| {
+                    unavailable(format!(
+                        "external_config: {key} must be an integer in {min}..={max}"
+                    ))
+                })
         }
-        let dimension = number(&raw_dimension, "CASS_EXTERNAL_EMBEDDING_DIMENSION", 1, MAX_DIMENSION)?;
-        let batch_size = number(&lookup("CASS_EXTERNAL_EMBEDDING_BATCH_SIZE").unwrap_or_else(|| "64".into()), "CASS_EXTERNAL_EMBEDDING_BATCH_SIZE", 1, MAX_BATCH_SIZE)?;
-        let max_request_bytes = number(&lookup("CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES").unwrap_or_else(|| "262144".into()), "CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES", 1024, MAX_REQUEST_BYTES)?;
-        let timeout_ms = number(&lookup("CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS").unwrap_or_else(|| "30000".into()), "CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS", 1, 120_000)?;
+        let dimension = number(
+            &raw_dimension,
+            "CASS_EXTERNAL_EMBEDDING_DIMENSION",
+            1,
+            MAX_DIMENSION,
+        )?;
+        let batch_size = number(
+            &lookup("CASS_EXTERNAL_EMBEDDING_BATCH_SIZE").unwrap_or_else(|| "64".into()),
+            "CASS_EXTERNAL_EMBEDDING_BATCH_SIZE",
+            1,
+            MAX_BATCH_SIZE,
+        )?;
+        let max_request_bytes = number(
+            &lookup("CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES").unwrap_or_else(|| "262144".into()),
+            "CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES",
+            1024,
+            MAX_REQUEST_BYTES,
+        )?;
+        let timeout_ms = number(
+            &lookup("CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS").unwrap_or_else(|| "30000".into()),
+            "CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS",
+            1,
+            120_000,
+        )?;
         let revision = lookup("CASS_EXTERNAL_EMBEDDING_REVISION").unwrap_or_else(|| "1".into());
-        if revision.trim().is_empty() || revision.len() > 512 || revision.chars().any(char::is_control) {
-            return Err(unavailable("external_config: revision must be nonempty, at most 512 bytes, and contain no control characters"));
+        if revision.trim().is_empty()
+            || revision.len() > 512
+            || revision.chars().any(char::is_control)
+        {
+            return Err(unavailable(
+                "external_config: revision must be nonempty, at most 512 bytes, and contain no control characters",
+            ));
         }
         let api_key = lookup("CASS_EXTERNAL_EMBEDDING_API_KEY").filter(|key| !key.is_empty());
         if let Some(key) = &api_key {
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-                .map_err(|_| unavailable("external_config: API key is not a valid authorization header"))?;
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| {
+                unavailable("external_config: API key is not a valid authorization header")
+            })?;
         }
-        Ok(Some(Self { endpoint, model, dimension, revision, batch_size, max_request_bytes, timeout: Duration::from_millis(timeout_ms as u64), api_key }))
+        Ok(Some(Self {
+            endpoint,
+            model,
+            dimension,
+            revision,
+            batch_size,
+            max_request_bytes,
+            timeout: Duration::from_millis(timeout_ms as u64),
+            api_key,
+        }))
     }
 
     /// Filesystem-safe, provider/model/dimension/revision-bound namespace. The
@@ -136,22 +186,41 @@ impl ExternalEmbeddingConfig {
     /// diagnostics. Credentials are deliberately excluded so key rotation resumes.
     pub fn identity(&self) -> String {
         let mut hasher = blake3::Hasher::new();
-        for part in [self.endpoint.as_str(), self.model.as_str(), self.revision.as_str()] {
+        for part in [
+            self.endpoint.as_str(),
+            self.model.as_str(),
+            self.revision.as_str(),
+        ] {
             hasher.update(&(part.len() as u64).to_le_bytes());
             hasher.update(part.as_bytes());
         }
-        format!("external-v1-{}-{}", self.dimension, hasher.finalize().to_hex())
+        format!(
+            "external-v1-{}-{}",
+            self.dimension,
+            hasher.finalize().to_hex()
+        )
     }
 
-    pub fn dimension(&self) -> usize { self.dimension }
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
 }
 
 /// Only recognize canonical identities, never arbitrary path-like strings.
 pub fn is_external_identity(id: &str) -> bool {
-    let Some((dimension, digest)) = id.strip_prefix("external-v1-").and_then(|rest| rest.split_once('-')) else { return false; };
-    dimension.parse::<usize>().is_ok_and(|d| (1..=MAX_DIMENSION).contains(&d) && d.to_string() == dimension)
+    let Some((dimension, digest)) = id
+        .strip_prefix("external-v1-")
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    dimension
+        .parse::<usize>()
+        .is_ok_and(|d| (1..=MAX_DIMENSION).contains(&d) && d.to_string() == dimension)
         && digest.len() == 64
-        && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub struct ExternalEmbedder {
@@ -166,7 +235,9 @@ pub struct ExternalEmbedder {
 
 impl fmt::Debug for ExternalEmbedder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExternalEmbedder").field("config", &self.config).finish_non_exhaustive()
+        f.debug_struct("ExternalEmbedder")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
     }
 }
 
@@ -203,8 +274,13 @@ impl ExternalEmbedder {
 
     /// Only returns after the known-input checks pass. Probe requests contain
     /// fixed public strings, never archive contents or a user's search query.
-    pub fn connect(config: ExternalEmbeddingConfig, cancelled: CancelCheck) -> EmbedderResult<Self> {
-        if cancelled() { return Err(unavailable("external_cancelled: before preflight")); }
+    pub fn connect(
+        config: ExternalEmbeddingConfig,
+        cancelled: CancelCheck,
+    ) -> EmbedderResult<Self> {
+        if cancelled() {
+            return Err(unavailable("external_cancelled: before preflight"));
+        }
         crate::ensure_rustls_crypto_provider();
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -213,11 +289,20 @@ impl ExternalEmbedder {
             .timeout(config.timeout)
             .build()
             .map_err(|_| unavailable("external_config: could not create HTTP client"))?;
-        let provider = Self { id: config.identity(), config, client, cancelled, request_gate: Mutex::new(()) };
+        let provider = Self {
+            id: config.identity(),
+            config,
+            client,
+            cancelled,
+            request_gate: Mutex::new(()),
+        };
         let first = provider.embed_batch_sync(PROBES)?;
         let second = provider.embed_batch_sync(PROBES)?;
         for (a, b) in first.iter().zip(&second) {
-            if a.iter().zip(b).any(|(x, y)| (x - y).abs() > REPEATABILITY_TOLERANCE) {
+            if a.iter()
+                .zip(b)
+                .any(|(x, y)| (x - y).abs() > REPEATABILITY_TOLERANCE)
+            {
                 return Err(provider.failure("external_preflight_repeatability: fixed probes changed between requests; verify deterministic inference and model revision"));
             }
         }
@@ -239,16 +324,24 @@ impl ExternalEmbedder {
     }
 
     fn body(&self, texts: &[&str]) -> EmbedderResult<Vec<u8>> {
-        serde_json::to_vec(&EmbeddingRequest { model: &self.config.model, input: texts, encoding_format: "float" })
-            .map_err(|_| self.failure("external_request: could not encode request"))
+        serde_json::to_vec(&EmbeddingRequest {
+            model: &self.config.model,
+            input: texts,
+            encoding_format: "float",
+        })
+        .map_err(|_| self.failure("external_request: could not encode request"))
     }
 
     fn request(&self, body: Vec<u8>, count: usize) -> EmbedderResult<Vec<Vec<f32>>> {
         self.check_cancelled()?;
-        let mut request = self.client.post(self.config.endpoint.clone())
+        let mut request = self
+            .client
+            .post(self.config.endpoint.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
-        if let Some(key) = &self.config.api_key { request = request.bearer_auth(key); }
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(key);
+        }
         let sent = request.send();
         self.check_cancelled()?;
         let response = sent.map_err(|error| self.failure(if error.is_timeout() {
@@ -270,11 +363,16 @@ impl ExternalEmbedder {
             };
             return Err(self.failure(format!("external_http_{status}: {advice}")));
         }
-        if response.content_length().is_some_and(|len| len > MAX_RESPONSE_BYTES) {
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES)
+        {
             return Err(self.failure("external_response_too_large: response exceeds 64 MiB"));
         }
         let mut bytes = Vec::new();
-        let read = response.take(MAX_RESPONSE_BYTES + 1).read_to_end(&mut bytes);
+        let read = response
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes);
         self.check_cancelled()?;
         read.map_err(|_| self.failure("external_response_read: truncated response or request deadline exceeded; checkpoint retained"))?;
         if bytes.len() as u64 > MAX_RESPONSE_BYTES {
@@ -296,36 +394,66 @@ impl ExternalEmbedder {
             if row.embedding.len() != self.config.dimension {
                 return Err(self.failure(format!("external_dimension_mismatch: input {} has {} dimensions, expected {}; entire batch rejected", row.index, row.embedding.len(), self.config.dimension)));
             }
-            let norm_squared: f64 = row.embedding.iter().map(|&value| f64::from(value).powi(2)).sum();
-            if row.embedding.iter().any(|value| !value.is_finite()) || !norm_squared.is_finite() || (norm_squared.sqrt() - 1.0).abs() > NORM_TOLERANCE {
+            let norm_squared: f64 = row
+                .embedding
+                .iter()
+                .map(|&value| f64::from(value).powi(2))
+                .sum();
+            if row.embedding.iter().any(|value| !value.is_finite())
+                || !norm_squared.is_finite()
+                || (norm_squared.sqrt() - 1.0).abs() > NORM_TOLERANCE
+            {
                 return Err(self.failure(format!("external_normalization: input {} is not finite and unit-normalized (tolerance {NORM_TOLERANCE}); entire batch rejected", row.index)));
             }
             ordered[row.index] = Some(row.embedding);
         }
-        ordered.into_iter().map(|row| row.ok_or_else(|| self.failure("external_partial_response: missing input index"))).collect()
+        ordered
+            .into_iter()
+            .map(|row| {
+                row.ok_or_else(|| self.failure("external_partial_response: missing input index"))
+            })
+            .collect()
     }
 }
 
 impl Embedder for ExternalEmbedder {
-    fn id(&self) -> &str { &self.id }
-    fn dimension(&self) -> usize { self.config.dimension }
-    fn is_semantic(&self) -> bool { true }
-    fn category(&self) -> frankensearch::ModelCategory { frankensearch::ModelCategory::TransformerEmbedder }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn dimension(&self) -> usize {
+        self.config.dimension
+    }
+    fn is_semantic(&self) -> bool {
+        true
+    }
+    fn category(&self) -> frankensearch::ModelCategory {
+        frankensearch::ModelCategory::TransformerEmbedder
+    }
 
     fn embed_sync(&self, text: &str) -> EmbedderResult<Vec<f32>> {
-        self.embed_batch_sync(&[text])?.pop().ok_or_else(|| self.failure("external_partial_response: no vector for query"))
+        self.embed_batch_sync(&[text])?
+            .pop()
+            .ok_or_else(|| self.failure("external_partial_response: no vector for query"))
     }
 
     fn embed_batch_sync(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
         self.check_cancelled()?;
-        if texts.is_empty() { return Ok(Vec::new()); }
-        let _guard = self.request_gate.lock().map_err(|_| self.failure("external_internal: request gate poisoned"))?;
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _guard = self
+            .request_gate
+            .lock()
+            .map_err(|_| self.failure("external_internal: request gate poisoned"))?;
         self.check_cancelled()?;
         let overhead = self.body(&[])?.len();
         // Validate all single inputs before disclosing any of this call's text.
         for (index, text) in texts.iter().enumerate() {
-            if text.trim().is_empty() { return Err(self.failure(format!("external_input_empty: input {index}"))); }
-            let encoded = serde_json::to_string(text).map_err(|_| self.failure("external_request: could not encode input"))?;
+            if text.trim().is_empty() {
+                return Err(self.failure(format!("external_input_empty: input {index}")));
+            }
+            let encoded = serde_json::to_string(text)
+                .map_err(|_| self.failure("external_request: could not encode input"))?;
             if overhead + encoded.len() > self.config.max_request_bytes {
                 return Err(self.failure(format!("external_input_too_large: input {index} exceeds request byte limit; no text from this call sent")));
             }
@@ -337,15 +465,19 @@ impl Embedder for ExternalEmbedder {
             let mut end = start;
             let mut bytes = overhead;
             while end < texts.len() && end - start < self.config.batch_size {
-                let encoded = serde_json::to_string(texts[end]).map_err(|_| self.failure("external_request: could not encode input"))?;
+                let encoded = serde_json::to_string(texts[end])
+                    .map_err(|_| self.failure("external_request: could not encode input"))?;
                 let next = bytes + encoded.len() + usize::from(end > start);
-                if next > self.config.max_request_bytes { break; }
+                if next > self.config.max_request_bytes {
+                    break;
+                }
                 bytes = next;
                 end += 1;
             }
             let body = self.body(&texts[start..end])?;
             if body.len() > self.config.max_request_bytes || end == start {
-                return Err(self.failure("external_request_too_large: request exceeds configured byte limit"));
+                return Err(self
+                    .failure("external_request_too_large: request exceeds configured byte limit"));
             }
             result.extend(self.request(body, end - start)?);
             start = end;

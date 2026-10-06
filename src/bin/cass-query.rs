@@ -23,8 +23,11 @@ mod linux {
     const MAX_RESPONSE: usize = 1024 * 1024;
 
     #[derive(Debug, Parser)]
-    #[command(name = "cass-query", version, about =
-        "Fresh lexical client for an explicitly managed local CASS IPC owner")]
+    #[command(
+        name = "cass-query",
+        version,
+        about = "Fresh lexical client for an explicitly managed local CASS IPC owner"
+    )]
     pub struct Args {
         /// Private same-user Unix socket created by scripts/cass_lexical_ipc.py.
         #[arg(long)]
@@ -60,13 +63,19 @@ mod linux {
             let handle = std::thread::Builder::new()
                 .name("cass-query-deadline".into())
                 .spawn(move || {
-                    if matches!(receiver.recv_timeout(timeout), Err(mpsc::RecvTimeoutError::Timeout)) {
+                    if matches!(
+                        receiver.recv_timeout(timeout),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
                         // Do not print first: stderr could itself be blocked.
                         std::process::exit(124);
                     }
                 })
                 .context("start request deadline")?;
-            Ok(Self { cancel, handle: Some(handle) })
+            Ok(Self {
+                cancel,
+                handle: Some(handle),
+            })
         }
     }
 
@@ -112,34 +121,48 @@ mod linux {
             }
         }
         let metadata = directory.metadata()?;
-        ensure!(metadata.uid() == effective_uid() && metadata.mode() & 0o077 == 0,
-            "socket parent must be owned by you and mode 0700");
-        let endpoint = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-            .join(name);
+        ensure!(
+            metadata.uid() == effective_uid() && metadata.mode() & 0o077 == 0,
+            "socket parent must be owned by you and mode 0700"
+        );
+        let endpoint = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
         let metadata = std::fs::symlink_metadata(&endpoint)?;
-        ensure!(metadata.file_type().is_socket()
-            && metadata.uid() == effective_uid()
-            && metadata.mode() & 0o077 == 0, "unsafe lexical socket");
+        ensure!(
+            metadata.file_type().is_socket()
+                && metadata.uid() == effective_uid()
+                && metadata.mode() & 0o077 == 0,
+            "unsafe lexical socket"
+        );
         Ok((directory, endpoint))
     }
 
     #[allow(unsafe_code)]
     fn authenticate_peer(stream: &UnixStream) -> Result<()> {
-        let mut credentials = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
         let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: stream owns a live descriptor. The writable credential buffer
         // and length pointer have exactly the types/sizes expected by SO_PEERCRED.
         let result = unsafe {
             libc::getsockopt(
-                stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
-                (&raw mut credentials).cast(), &raw mut size,
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut credentials).cast(),
+                &raw mut size,
             )
         };
         if result != 0 {
             return Err(std::io::Error::last_os_error()).context("authenticate socket peer");
         }
-        ensure!(size as usize == std::mem::size_of::<libc::ucred>()
-            && credentials.uid == effective_uid(), "socket peer is not the same user");
+        ensure!(
+            size as usize == std::mem::size_of::<libc::ucred>()
+                && credentials.uid == effective_uid(),
+            "socket peer is not the same user"
+        );
         Ok(())
     }
 
@@ -167,37 +190,62 @@ mod linux {
 
     fn validate_response(bytes: &[u8], full_verify: bool) -> Result<bool> {
         let response: Envelope = serde_json::from_slice(bytes).context("decode owner response")?;
-        ensure!(response.schema_version == 1 && response.id == 1,
-            "mismatched response envelope");
+        ensure!(
+            response.schema_version == 1 && response.id == 1,
+            "mismatched response envelope"
+        );
         if !response.ok {
-            ensure!(response.result.is_none() && response.admission.is_none()
-                && response.error.as_ref().is_some_and(Value::is_object),
-                "malformed error response");
+            ensure!(
+                response.result.is_none()
+                    && response.admission.is_none()
+                    && response.error.as_ref().is_some_and(Value::is_object),
+                "malformed error response"
+            );
             return Ok(false);
         }
-        ensure!(response.error.is_none(), "successful response also contains an error");
-        let result = response.result.filter(Value::is_object).context("missing result")?;
+        ensure!(
+            response.error.is_none(),
+            "successful response also contains an error"
+        );
+        let result = response
+            .result
+            .filter(Value::is_object)
+            .context("missing result")?;
         let admission = response.admission.context("missing admission policy")?;
-        ensure!(admission.owner_epoch > 0 && !admission.persistent_proof
-            && admission.file_identity_checked && !admission.immutable_generation_certified
-            && admission.full_verify_requested == full_verify,
-            "unexpected admission contract");
+        ensure!(
+            admission.owner_epoch > 0
+                && !admission.persistent_proof
+                && admission.file_identity_checked
+                && !admission.immutable_generation_certified
+                && admission.full_verify_requested == full_verify,
+            "unexpected admission contract"
+        );
         let reused = match admission.mode.as_str() {
             "strict_full" => false,
             "retained_guarded" if !full_verify => true,
             _ => bail!("owner did not honor the requested verification policy"),
         };
-        ensure!(result.get("reader_reused").and_then(Value::as_bool) == Some(reused),
-            "native reader lifecycle does not match the admission policy");
+        ensure!(
+            result.get("reader_reused").and_then(Value::as_bool) == Some(reused),
+            "native reader lifecycle does not match the admission policy"
+        );
         Ok(true)
     }
 
     fn request(args: &Args) -> Result<Vec<u8>> {
-        ensure!(!args.query.trim().is_empty() && args.query.len() <= 4096,
-            "query must contain 1 to 4096 UTF-8 bytes");
-        ensure!((1..=100).contains(&args.limit)
-            && args.offset.checked_add(args.limit).and_then(|n| n.checked_add(1))
-                .is_some_and(|n| n <= 1024), "invalid pagination budget");
+        ensure!(
+            !args.query.trim().is_empty() && args.query.len() <= 4096,
+            "query must contain 1 to 4096 UTF-8 bytes"
+        );
+        ensure!(
+            (1..=100).contains(&args.limit)
+                && args
+                    .offset
+                    .checked_add(args.limit)
+                    .and_then(|n| n.checked_add(1))
+                    .is_some_and(|n| n <= 1024),
+            "invalid pagination budget"
+        );
         let filters = match args.filters.as_deref() {
             Some(text) => serde_json::from_str::<Value>(text).context("decode --filters")?,
             None => json!({}),
@@ -218,41 +266,47 @@ mod linux {
         let timeout = Duration::from_millis(args.timeout_ms);
         let _deadline = Deadline::start(timeout)?;
         let outcome = (|| -> Result<bool> {
-        let request = request(&args)?;
-        let (_directory, endpoint) = pinned_endpoint(&args.socket)?;
-        let mut stream = UnixStream::connect(endpoint).context("connect lexical owner")?;
-        authenticate_peer(&stream)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-        stream.write_all(&request).context("send lexical request")?;
+            let request = request(&args)?;
+            let (_directory, endpoint) = pinned_endpoint(&args.socket)?;
+            let mut stream = UnixStream::connect(endpoint).context("connect lexical owner")?;
+            authenticate_peer(&stream)?;
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            stream.write_all(&request).context("send lexical request")?;
 
-        // read_until alone is unbounded. fill_buf/consume enforces the cap
-        // before appending bytes, including when a peer never sends a newline.
-        let mut reader = BufReader::new(stream);
-        let mut response = Vec::new();
-        loop {
-            let chunk = reader.fill_buf().context("read lexical response")?;
-            ensure!(!chunk.is_empty(), "truncated lexical response");
-            let newline = chunk.iter().position(|byte| *byte == b'\n');
-            let count = newline.map_or(chunk.len(), |position| position + 1);
-            ensure!(response.len() + count <= MAX_RESPONSE, "response exceeds 1 MiB");
-            response.extend_from_slice(&chunk[..count]);
-            reader.consume(count);
-            if newline.is_some() {
-                ensure!(reader.buffer().is_empty(), "unexpected trailing response");
-                break;
+            // read_until alone is unbounded. fill_buf/consume enforces the cap
+            // before appending bytes, including when a peer never sends a newline.
+            let mut reader = BufReader::new(stream);
+            let mut response = Vec::new();
+            loop {
+                let chunk = reader.fill_buf().context("read lexical response")?;
+                ensure!(!chunk.is_empty(), "truncated lexical response");
+                let newline = chunk.iter().position(|byte| *byte == b'\n');
+                let count = newline.map_or(chunk.len(), |position| position + 1);
+                ensure!(
+                    response.len() + count <= MAX_RESPONSE,
+                    "response exceeds 1 MiB"
+                );
+                response.extend_from_slice(&chunk[..count]);
+                reader.consume(count);
+                if newline.is_some() {
+                    ensure!(reader.buffer().is_empty(), "unexpected trailing response");
+                    break;
+                }
             }
-        }
-        let ok = validate_response(&response, args.full_verify)?;
-        let mut output = std::io::stdout().lock();
-        output.write_all(&response)?;
-        output.flush()?;
-        Ok(ok)
+            let ok = validate_response(&response, args.full_verify)?;
+            let mut output = std::io::stdout().lock();
+            output.write_all(&response)?;
+            output.flush()?;
+            Ok(ok)
         })();
         if let Err(error) = &outcome {
-            eprintln!("{}", json!({
-                "ok": false, "error": {"kind": "lexical_ipc", "message": error.to_string()}
-            }));
+            eprintln!(
+                "{}",
+                json!({
+                    "ok": false, "error": {"kind": "lexical_ipc", "message": error.to_string()}
+                })
+            );
         }
         outcome
     }
@@ -276,18 +330,30 @@ mod linux {
         #[test]
         fn honors_full_verification_and_lifecycle() {
             for (mode, full, reused) in [
-                ("strict_full", false, false), ("strict_full", true, false),
+                ("strict_full", false, false),
+                ("strict_full", true, false),
                 ("retained_guarded", false, true),
             ] {
-                assert!(validate_response(&serde_json::to_vec(&response(mode, full, reused))
-                    .unwrap(), full).unwrap());
+                assert!(
+                    validate_response(
+                        &serde_json::to_vec(&response(mode, full, reused)).unwrap(),
+                        full
+                    )
+                    .unwrap()
+                );
             }
             for (mode, full, reused) in [
-                ("retained_guarded", true, true), ("strict_full", true, true),
+                ("retained_guarded", true, true),
+                ("strict_full", true, true),
                 ("unchecked", false, true),
             ] {
-                assert!(validate_response(&serde_json::to_vec(&response(mode, full, reused))
-                    .unwrap(), full).is_err());
+                assert!(
+                    validate_response(
+                        &serde_json::to_vec(&response(mode, full, reused)).unwrap(),
+                        full
+                    )
+                    .is_err()
+                );
             }
         }
 
@@ -296,10 +362,21 @@ mod linux {
             let mut bad = response("strict_full", false, false);
             bad["admission"]["persistent_proof"] = json!(true);
             assert!(validate_response(&serde_json::to_vec(&bad).unwrap(), false).is_err());
-            assert!(validate_response(
-                br#"{"schema_version":1,"id":1,"ok":true,"ok":false}"#, false).is_err());
-            assert!(validate_response(br#"{"schema_version":1,"id":2,"ok":false,
-                "error":{"kind":"failed"}}"#, false).is_err());
+            assert!(
+                validate_response(
+                    br#"{"schema_version":1,"id":1,"ok":true,"ok":false}"#,
+                    false
+                )
+                .is_err()
+            );
+            assert!(
+                validate_response(
+                    br#"{"schema_version":1,"id":2,"ok":false,
+                "error":{"kind":"failed"}}"#,
+                    false
+                )
+                .is_err()
+            );
         }
 
         #[test]

@@ -95,7 +95,9 @@ impl SemanticIndexer {
         refuse_publication_sidecars(&destination, false)?;
         let previous = RebuildDestination::capture(&destination)?;
         let previous_generation = previous.generation;
-        let parent = destination.parent().context("semantic index has no parent")?;
+        let parent = destination
+            .parent()
+            .context("semantic index has no parent")?;
         fs::create_dir_all(parent)?;
         let scratch = tempfile::Builder::new()
             .prefix(".semantic-full-rebuild-")
@@ -141,25 +143,33 @@ impl SemanticIndexer {
                     content_hash: Some(embedded.content_hash),
                 }
                 .to_doc_id_string();
-                writer.write_record(&doc_id, &embedded.embedding).map_err(|error| {
-                    let message = format!("write fsvi record failed: {error}");
-                    anyhow::Error::new(error).context(message)
-                })?;
+                writer
+                    .write_record(&doc_id, &embedded.embedding)
+                    .map_err(|error| {
+                        let message = format!("write fsvi record failed: {error}");
+                        anyhow::Error::new(error).context(message)
+                    })?;
                 accepted = accepted.saturating_add(1);
                 if let Some(progress) = on_progress.as_mut() {
                     progress(accepted);
                 }
             }
-            writer.finish().context("finish unpublished semantic replacement")?;
+            writer
+                .finish()
+                .context("finish unpublished semantic replacement")?;
         } else {
             // Initial builds can use the original engine's writer unchanged,
             // but ONLY under fresh owned scratch, never the public path. Both
             // progress variants retain the engine's normal streaming behavior.
             let candidate = match on_progress {
                 Some(progress) => self.inner.build_and_save_index_with_progress(
-                    embedded_messages, scratch.path(), progress,
+                    embedded_messages,
+                    scratch.path(),
+                    progress,
                 )?,
-                None => self.inner.build_and_save_index(embedded_messages, scratch.path())?,
+                None => self
+                    .inner
+                    .build_and_save_index(embedded_messages, scratch.path())?,
             };
             drop(candidate);
         }
@@ -168,9 +178,15 @@ impl SemanticIndexer {
         // vector may overflow or lose all signal when encoded to f16. Keep
         // only one decoded row at a time, never another corpus-sized slab.
         let candidate = VectorIndex::open_read_only(&candidate_path)?;
-        ensure!(candidate.wal_record_count() == 0, "unpublished rebuild has a WAL");
+        ensure!(
+            candidate.wal_record_count() == 0,
+            "unpublished rebuild has a WAL"
+        );
         for row in 0..candidate.record_count() {
-            ensure!(candidate.is_vector_usable(row), "unusable persisted semantic vector at row {row}");
+            ensure!(
+                candidate.is_vector_usable(row),
+                "unusable persisted semantic vector at row {row}"
+            );
         }
         drop(candidate);
 
@@ -225,13 +241,18 @@ impl SemanticIndexer {
         // the stored vectors under a retained native reader. In that case no
         // generation or recovery sidecar is being replaced or retired.
         if wal_before.is_none() && embedded_messages.is_empty() {
-            ensure!(!db_fingerprint.trim().is_empty(),
-                "canonical semantic reconciliation requires a DB fingerprint");
-            if let Some(source) = self.retain_unchanged_canonical_index(
-                &destination, current_doc_ids,
-            )? {
-                tracing::info!(tier = tier.as_str(), retained_docs = source.record_count(),
-                    "canonical semantic reconciliation retained unchanged generation");
+            ensure!(
+                !db_fingerprint.trim().is_empty(),
+                "canonical semantic reconciliation requires a DB fingerprint"
+            );
+            if let Some(source) =
+                self.retain_unchanged_canonical_index(&destination, current_doc_ids)?
+            {
+                tracing::info!(
+                    tier = tier.as_str(),
+                    retained_docs = source.record_count(),
+                    "canonical semantic reconciliation retained unchanged generation"
+                );
                 return Ok(source);
             }
         }
@@ -241,22 +262,35 @@ impl SemanticIndexer {
         // case which cannot reset the main generation beside an old WAL.
         if wal_before.is_none() {
             return self.inner.reconcile_index_with_canonical_documents(
-                embedded_messages, data_dir, tier, db_fingerprint, current_doc_ids,
+                embedded_messages,
+                data_dir,
+                tier,
+                db_fingerprint,
+                current_doc_ids,
             );
         }
-        ensure!(!db_fingerprint.trim().is_empty(),
-            "canonical semantic reconciliation requires a DB fingerprint");
+        ensure!(
+            !db_fingerprint.trim().is_empty(),
+            "canonical semantic reconciliation requires a DB fingerprint"
+        );
         let revision = expected_vector_space_revision(self.embedder_id())
             .context("canonical reconciliation has no registered vector-space revision")?;
         let mut replacements = HashMap::new();
         replacements.try_reserve(embedded_messages.len())?;
         // Reject the whole input before reading vectors or preparing a candidate.
         for embedded in embedded_messages {
-            ensure!(embedded.embedding.len() == self.embedder_dimension(),
-                "canonical replacement has the wrong vector dimension");
-            let norm = embedded.embedding.iter().fold(0.0f32, |sum, value| sum + value * value);
-            ensure!(norm.is_finite() && norm > 0.0,
-                "canonical replacement has a non-finite or zero-norm vector");
+            ensure!(
+                embedded.embedding.len() == self.embedder_dimension(),
+                "canonical replacement has the wrong vector dimension"
+            );
+            let norm = embedded
+                .embedding
+                .iter()
+                .fold(0.0f32, |sum, value| sum + value * value);
+            ensure!(
+                norm.is_finite() && norm > 0.0,
+                "canonical replacement has a non-finite or zero-norm vector"
+            );
             let id = SemanticDocId {
                 message_id: embedded.message_id,
                 chunk_idx: embedded.chunk_idx,
@@ -266,42 +300,61 @@ impl SemanticIndexer {
                 role: embedded.role,
                 created_at_ms: embedded.created_at_ms,
                 content_hash: Some(embedded.content_hash),
-            }.to_doc_id_string();
-            ensure!(current_doc_ids.contains(&id),
-                "replacement document is not in the current canonical set");
-            ensure!(replacements.insert(id, embedded).is_none(),
-                "duplicate canonical replacement document");
+            }
+            .to_doc_id_string();
+            ensure!(
+                current_doc_ids.contains(&id),
+                "replacement document is not in the current canonical set"
+            );
+            ensure!(
+                replacements.insert(id, embedded).is_none(),
+                "duplicate canonical replacement document"
+            );
         }
 
         // Unlike an unqualified full rebuild, this call has the exact canonical
         // set needed to retire deleted records and retain acknowledged WAL rows.
         refuse_publication_sidecars(&destination, true)?;
         let previous = RebuildDestination::capture(&destination)?;
-        let generation = previous.generation
+        let generation = previous
+            .generation
             .context("canonical reconciliation requires an existing vector artifact")?;
         // Retain the real source under its shared native lock. No source copy,
         // compaction, tombstone edit or writer-capable source map is necessary.
         let source = VectorIndex::open_read_only(&destination)?;
-        ensure!(RebuildDestination::capture(&destination)? == previous
+        ensure!(
+            RebuildDestination::capture(&destination)? == previous
                 && ObservedSemanticFile::capture(&wal_path)? == wal_before,
-            "semantic source changed while opening canonical reconciliation");
+            "semantic source changed while opening canonical reconciliation"
+        );
         let complete_replacement = replacements.len() == current_doc_ids.len();
-        ensure!(complete_replacement
+        ensure!(
+            complete_replacement
                 || (source.embedder_id() == self.embedder_id()
                     && source.embedder_revision() == revision
                     && source.dimension() == self.embedder_dimension()),
-            "incompatible vector space requires a complete canonical replacement");
+            "incompatible vector space requires a complete canonical replacement"
+        );
 
-        let parent = destination.parent().context("semantic index has no parent")?;
+        let parent = destination
+            .parent()
+            .context("semantic index has no parent")?;
         let scratch = tempfile::Builder::new()
             .prefix(".semantic-reconcile-")
             .tempdir_in(parent)?;
         let candidate_path = scratch.path().join("candidate.fsvi");
         let mut writer = VectorIndex::create_with_revision(
-            &candidate_path, self.embedder_id(), revision,
+            &candidate_path,
+            self.embedder_id(),
+            revision,
             self.embedder_dimension(),
-            if complete_replacement { Quantization::F16 } else { source.quantization() },
-        )?.with_generation(next_generation(generation));
+            if complete_replacement {
+                Quantization::F16
+            } else {
+                source.quantization()
+            },
+        )?
+        .with_generation(next_generation(generation));
         let mut remaining = HashSet::new();
         remaining.try_reserve(current_doc_ids.len())?;
         remaining.extend(current_doc_ids.iter().map(String::as_str));
@@ -327,43 +380,70 @@ impl SemanticIndexer {
                     continue;
                 }
                 let id = source.doc_id_at(row)?;
-                if !current_doc_ids.contains(id) || replacements.contains_key(id) || wal_ids.contains(id) {
+                if !current_doc_ids.contains(id)
+                    || replacements.contains_key(id)
+                    || wal_ids.contains(id)
+                {
                     continue;
                 }
-                ensure!(remaining.remove(id), "duplicate current document in the source index");
+                ensure!(
+                    remaining.remove(id),
+                    "duplicate current document in the source index"
+                );
                 writer.write_record(id, &source.vector_at_f32(row)?)?;
             }
         }
-        ensure!(remaining.is_empty(),
-            "canonical reconciliation lacks vectors for {} current documents", remaining.len());
-        writer.finish().context("finish unpublished canonical generation")?;
+        ensure!(
+            remaining.is_empty(),
+            "canonical reconciliation lacks vectors for {} current documents",
+            remaining.len()
+        );
+        writer
+            .finish()
+            .context("finish unpublished canonical generation")?;
 
         let candidate = VectorIndex::open_read_only(&candidate_path)?;
-        ensure!(candidate.wal_record_count() == 0 && candidate.tombstone_count() == 0
+        ensure!(
+            candidate.wal_record_count() == 0
+                && candidate.tombstone_count() == 0
                 && candidate.record_count() == current_doc_ids.len(),
-            "canonical replacement has incomplete or non-live physical coverage");
+            "canonical replacement has incomplete or non-live physical coverage"
+        );
         remaining.extend(current_doc_ids.iter().map(String::as_str));
         for row in 0..candidate.record_count() {
-            ensure!(remaining.remove(candidate.doc_id_at(row)?),
-                "persisted replacement has an unexpected or duplicate identity");
-            ensure!(candidate.is_vector_usable(row),
-                "unusable persisted canonical vector at row {row}");
+            ensure!(
+                remaining.remove(candidate.doc_id_at(row)?),
+                "persisted replacement has an unexpected or duplicate identity"
+            );
+            ensure!(
+                candidate.is_vector_usable(row),
+                "unusable persisted canonical vector at row {row}"
+            );
         }
-        ensure!(remaining.is_empty(), "persisted replacement lacks canonical identities");
+        ensure!(
+            remaining.is_empty(),
+            "persisted replacement lacks canonical identities"
+        );
         drop(candidate);
 
         // Leave the acknowledged WAL with its original main until the native
         // generation-aware rename invalidates it atomically. Never park/delete
         // it first, and never infer identity from the wrapping generation alone.
         refuse_publication_sidecars(&destination, true)?;
-        ensure!(RebuildDestination::capture(&destination)? == previous
+        ensure!(
+            RebuildDestination::capture(&destination)? == previous
                 && ObservedSemanticFile::capture(&wal_path)? == wal_before,
-            "semantic source changed during canonical reconciliation; retry under the maintenance lock");
+            "semantic source changed during canonical reconciliation; retry under the maintenance lock"
+        );
         let published = VectorIndex::install_replacement(&destination, &candidate_path)
             .context("install complete canonical semantic generation")?;
-        tracing::info!(tier = tier.as_str(), published_docs = published.record_count(),
-            replaced_docs = replacements.len(), retained_wal_rows = source.wal_record_count(),
-            "published canonical semantic reconciliation");
+        tracing::info!(
+            tier = tier.as_str(),
+            published_docs = published.record_count(),
+            replaced_docs = replacements.len(),
+            retained_wal_rows = source.wal_record_count(),
+            "published canonical semantic reconciliation"
+        );
         Ok(published)
     }
 
@@ -385,9 +465,11 @@ impl SemanticIndexer {
         let source = VectorIndex::open_read_only(destination)?;
         // Admission failures never authorize falling through to a mutable
         // snapshot of a source whose owner changed during the observation.
-        ensure!(RebuildDestination::capture(destination)? == before
+        ensure!(
+            RebuildDestination::capture(destination)? == before
                 && ObservedSemanticFile::capture(&wal_path_for(destination))?.is_none(),
-            "semantic source changed while checking unchanged canonical coverage");
+            "semantic source changed while checking unchanged canonical coverage"
+        );
         if source.embedder_id() != self.embedder_id()
             || source.embedder_revision() != revision
             || source.dimension() != self.embedder_dimension()
@@ -413,12 +495,16 @@ impl SemanticIndexer {
             return Ok(None);
         }
         for row in 0..source.record_count() {
-            ensure!(source.is_vector_usable(row),
-                "unchanged canonical coverage has an unusable stored vector at row {row}; rebuild from canonical text");
+            ensure!(
+                source.is_vector_usable(row),
+                "unchanged canonical coverage has an unusable stored vector at row {row}; rebuild from canonical text"
+            );
         }
-        ensure!(RebuildDestination::capture(destination)? == before
+        ensure!(
+            RebuildDestination::capture(destination)? == before
                 && ObservedSemanticFile::capture(&wal_path_for(destination))?.is_none(),
-            "semantic source changed during unchanged canonical validation");
+            "semantic source changed during unchanged canonical validation"
+        );
         Ok(Some(source))
     }
 
@@ -454,18 +540,29 @@ fn refuse_publication_sidecars(destination: &Path, canonical_reconciliation: boo
     // of restoring the old generation. Refuse instead of deleting an entry
     // whose recovery ownership has not been admitted by this API.
     for (path, field, reason) in [
-        (wal_path_for(destination), "wal_sidecar", "full rebuild refuses an existing WAL; reconcile acknowledged vectors before replacement"),
-        (PathBuf::from(fec), "fec_sidecar", "full rebuild refuses an existing FEC sidecar; retire recovery protection through its owner before replacement"),
+        (
+            wal_path_for(destination),
+            "wal_sidecar",
+            "full rebuild refuses an existing WAL; reconcile acknowledged vectors before replacement",
+        ),
+        (
+            PathBuf::from(fec),
+            "fec_sidecar",
+            "full rebuild refuses an existing FEC sidecar; retire recovery protection through its owner before replacement",
+        ),
     ] {
         if canonical_reconciliation && field == "wal_sidecar" {
             continue;
         }
         match fs::symlink_metadata(&path) {
-            Ok(_) => return Err(frankensearch::SearchError::InvalidConfig {
-                field: field.into(),
-                value: path.display().to_string(),
-                reason: reason.into(),
-            }.into()),
+            Ok(_) => {
+                return Err(frankensearch::SearchError::InvalidConfig {
+                    field: field.into(),
+                    value: path.display().to_string(),
+                    reason: reason.into(),
+                }
+                .into());
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("inspect semantic destination sidecar"),
         }
@@ -487,13 +584,17 @@ impl RebuildDestination {
     fn capture(path: &Path) -> Result<Self> {
         let file = ObservedSemanticFile::capture(path)?;
         let generation = if file.is_some() {
-            Some(VectorIndex::peek_compaction_gen(path)
-                .context("inspect semantic destination generation without changing it")?)
+            Some(
+                VectorIndex::peek_compaction_gen(path)
+                    .context("inspect semantic destination generation without changing it")?,
+            )
         } else {
             None
         };
-        ensure!(ObservedSemanticFile::capture(path)? == file,
-            "semantic destination changed while inspecting its generation");
+        ensure!(
+            ObservedSemanticFile::capture(path)? == file,
+            "semantic destination changed while inspecting its generation"
+        );
         Ok(Self { file, generation })
     }
 }
@@ -510,14 +611,19 @@ struct ObservedSemanticFile {
 impl ObservedSemanticFile {
     fn capture(path: &Path) -> Result<Option<Self>> {
         match fs::symlink_metadata(path) {
-            Ok(metadata) => ensure!(metadata.file_type().is_file(),
-                "semantic artifact must be a regular file, not a symlink or directory"),
+            Ok(metadata) => ensure!(
+                metadata.file_type().is_file(),
+                "semantic artifact must be a regular file, not a symlink or directory"
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("inspect semantic artifact"),
         }
         let handle = same_file::Handle::from_path(path)?;
         let metadata = handle.as_file().metadata()?;
-        ensure!(metadata.is_file(), "opened semantic artifact is not a regular file");
+        ensure!(
+            metadata.is_file(),
+            "opened semantic artifact is not a regular file"
+        );
         #[cfg(unix)]
         let changed = {
             use std::os::unix::fs::MetadataExt;
@@ -555,9 +661,12 @@ mod full_rebuild_tests {
         let mut replacement = embedded(&indexer)?;
         replacement[1].embedding[0] = f32::NAN;
         let mut progress = Vec::new();
-        assert!(indexer.build_and_save_index_with_progress(
-            replacement, temp.path(), |accepted| progress.push(accepted),
-        ).is_err());
+        assert!(
+            indexer
+                .build_and_save_index_with_progress(replacement, temp.path(), |accepted| progress
+                    .push(accepted),)
+                .is_err()
+        );
         assert_eq!(progress, vec![1]);
         assert_eq!(fs::read(path)?, before);
         Ok(())
@@ -589,7 +698,9 @@ mod full_rebuild_tests {
         let path = vector_index_path(temp.path(), indexer.embedder_id());
         let mut progress = Vec::new();
         let result = indexer.build_and_save_index_with_progress(
-            embedded(&indexer)?, temp.path(), |accepted| {
+            embedded(&indexer)?,
+            temp.path(),
+            |accepted| {
                 assert!(!path.exists(), "buffered prefix must not be published");
                 progress.push(accepted);
             },

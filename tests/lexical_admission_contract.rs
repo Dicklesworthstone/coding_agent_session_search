@@ -25,17 +25,26 @@ fn fixture(path: &Path) -> PathBuf {
             conversation_id: Some(1),
         })
         .collect();
-    writer.add_cass_documents(&documents).expect("index fixture");
+    writer
+        .add_cass_documents(&documents)
+        .expect("index fixture");
     writer.commit().expect("publish fixture");
     drop(writer);
     assert_eq!(open_cass_reader(path).unwrap().doc_count().unwrap(), 32);
     let manifest = frankensearch::quill::load_manifest_pair(path).unwrap();
     assert!(!manifest.manifest.segments.is_empty());
-    path.join(format!("seg-{:016x}.fslx", manifest.manifest.segments[0].segment_id))
+    path.join(format!(
+        "seg-{:016x}.fslx",
+        manifest.manifest.segments[0].segment_id
+    ))
 }
 
 fn flip_payload(path: &Path) {
-    let mut file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     let length = file.metadata().unwrap().len();
     assert!(length > 256, "fixture needs nontrivial segment payload");
     let offset = length / 2;
@@ -49,10 +58,15 @@ fn flip_payload(path: &Path) {
 }
 
 fn assert_strict_refuses(path: &Path) {
-    assert!(open_cass_reader(path).is_err(), "strict reader admitted corrupt bytes");
+    assert!(
+        open_cass_reader(path).is_err(),
+        "strict reader admitted corrupt bytes"
+    );
     // Writer-open is a separate production API and must remain strict too.
-    assert!(QuillCassIndex::open_or_create(path).is_err(),
-        "maintenance writer admitted corrupt bytes");
+    assert!(
+        QuillCassIndex::open_or_create(path).is_err(),
+        "maintenance writer admitted corrupt bytes"
+    );
 }
 
 #[test]
@@ -91,8 +105,12 @@ fn strict_admission_refuses_rewrite_with_restored_mtime() {
     let segment = fixture(&temp.path().join("index"));
     let before = fs::metadata(&segment).unwrap();
     flip_payload(&segment);
-    File::options().write(true).open(&segment).unwrap()
-        .set_times(FileTimes::new().set_modified(before.modified().unwrap())).unwrap();
+    File::options()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(before.modified().unwrap()))
+        .unwrap();
     let after = fs::metadata(&segment).unwrap();
     assert_eq!(before.len(), after.len());
     assert_eq!(before.modified().unwrap(), after.modified().unwrap());

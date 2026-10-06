@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 // Preserve the local registry and all its regression tests byte-for-byte in a
 // child module. These aliases retain its existing sibling imports.
-use super::{embedder, fastembed_embedder, hash_embedder};
 use super::external_embedder::{
     CancelCheck, EXTERNAL_EMBEDDER, ExternalEmbedder, ExternalEmbeddingConfig,
 };
+use super::{embedder, fastembed_embedder, hash_embedder};
 use embedder::{Embedder, EmbedderInfo, EmbedderResult};
 
 #[path = "embedder_registry/local.rs"]
@@ -85,7 +85,13 @@ mod tests {
 
     #[test]
     fn external_selection_requires_the_explicit_name() {
-        for name in [None, Some("minilm"), Some("hash"), Some("default"), Some("auto")] {
+        for name in [
+            None,
+            Some("minilm"),
+            Some("hash"),
+            Some("default"),
+            Some("auto"),
+        ] {
             assert!(!selects_external(name), "{name:?}");
         }
         for name in ["external", " EXTERNAL "] {
