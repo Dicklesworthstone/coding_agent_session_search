@@ -7,6 +7,8 @@ on:
       - src/indexer/source_ledger_tests.rs
       - src/connectors/**
       - tests/e2e_index_resume.rs
+      - tests/e2e_source_ledger.rs
+      - scripts/test_source_ledger_matcher.py
       - Cargo.toml
       - Cargo.lock
       - build.rs
@@ -16,6 +18,116 @@ on:
 permissions:
   contents: read
 jobs:
+  matcher:
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Prepare reviewed source-reuse follow-up without changing refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess, tarfile, urllib.request
+          from pathlib import Path
+          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def blob(sha):
+              result = request('/git/blobs/' + sha)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert digest(data) == sha
+              return data
+          bases = {
+              'src/indexer/mod.rs': '35518cfac6dd4ad4d5ab9fd1b83fcb0f103d0bc6',
+              'src/connectors/source_dependencies.rs': 'b0a43df34e663fb33483a59c402b1f25582fdcf8',
+              'src/indexer/source_ledger_tests.rs': '941203bbe8a2aa757ca367eea4a1065d06761a00',
+              'src/connectors/source_dependencies/observation.rs': None,
+              'scripts/test_source_ledger_matcher.py': None,
+              'tests/e2e_source_ledger.rs': '2be588df28d92744839c4b47dce19460b302dc5c',
+          }
+          for name, sha in bases.items():
+              path = Path(name)
+              assert not any(parent.is_symlink() for parent in [path, *path.parents]), name
+              assert (digest(path.read_bytes()) if path.exists() else None) == sha, 'source drift: ' + name
+          patch = blob('a88bb17bd3b2c266ec46d059a6e0c0ce012ab47b')
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=patch, check=True)
+          additions = {
+              'src/connectors/source_dependencies/observation.rs': '54abb7ac4442d4a4d6da5aed3f782e31bfb3ab9d',
+              'scripts/test_source_ledger_matcher.py': 'b645b8dfa790471c0d746cdfc7d9c09829b0c3c3',
+          }
+          for name, sha in additions.items():
+              path = Path(name)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(blob(sha))
+          with Path('src/indexer/source_ledger_tests.rs').open('ab') as file:
+              file.write(blob('093400bbe07326ccb81eaa23aece92f1cf2c3595'))
+          expected = {
+              'src/indexer/mod.rs': '023d3a7ba3ad124a1f9d395bee81b5752a463c53',
+              'src/connectors/source_dependencies.rs': '127342c51ab63c28b97c5ed4e82f0dfd8560e6ef',
+              'src/indexer/source_ledger_tests.rs': 'af27a40fc248a32851fb1e5e1cc1257a7ae803e7',
+          }
+          for name, sha in expected.items():
+              assert digest(Path(name).read_bytes()) == sha, 'candidate mismatch: ' + name
+          rust = sorted(name for name in bases if name.endswith('.rs'))
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *rust], check=True)
+          subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *rust], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed <= set(bases), changed
+          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}}
+          for name in sorted(bases):
+              data = Path(name).read_bytes()
+              result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+              assert result['sha'] == digest(data), name
+              receipt['blobs'][name] = result['sha']
+          Path('gh512-followup-source.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          with tarfile.open('gh512-followup-source.tar.gz', 'w:gz') as archive:
+              for name in [*sorted(bases), 'gh512-followup-source.json']:
+                  archive.add(name, arcname=name)
+          print('GH512_FOLLOWUP_SOURCE=' + json.dumps(receipt, sort_keys=True))
+          PY
+      - name: Ensure native linker is available
+        run: |
+          if ! command -v cc >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends gcc libc6-dev
+          fi
+      - name: Native production matcher tests and same-invocation workload benchmark
+        run: |
+          set -o pipefail
+          python3 scripts/test_source_ledger_matcher.py --bench 2>&1 | tee gh512-native-matcher.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: gh512-followup-${{ github.sha }}
+          path: |
+            gh512-followup-source.json
+            gh512-followup-source.tar.gz
+            gh512-native-matcher.log
+          if-no-files-found: error
+          retention-days: 7
   native:
     strategy:
       fail-fast: false
@@ -50,11 +162,13 @@ jobs:
         run: cargo test --locked --lib gh512_benchmark_4159 -- --ignored --nocapture
       - name: Durable source completion and persisted CLI resume regressions
         run: cargo test --locked --test e2e_index_resume -- --nocapture
+      - name: Persisted legacy reuse and primary append through both real providers
+        run: cargo test --locked --test e2e_source_ledger -- --nocapture
       - name: Focused Rust lint gate
         run: cargo clippy --locked --lib -- -D warnings
       - name: Touched source formatting gate
         if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/connectors/mod.rs src/connectors/source_dependencies.rs tests/e2e_index_resume.rs
+        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/connectors/mod.rs src/connectors/source_dependencies.rs tests/e2e_index_resume.rs tests/e2e_source_ledger.rs
       - name: Verify validation did not alter committed sources
         if: always()
         run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
