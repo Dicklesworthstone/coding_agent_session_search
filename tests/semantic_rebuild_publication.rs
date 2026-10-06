@@ -3,8 +3,10 @@
 use anyhow::Result;
 use coding_agent_search::indexer::semantic::{EmbeddedMessage, EmbeddingInput, SemanticIndexer};
 use coding_agent_search::search::vector_index::{SemanticDocId, vector_index_path};
+use coding_agent_search::search::semantic_manifest::TierKind;
 use frankensearch::index::{Quantization, VectorIndex, next_generation, wal_path_for};
 use std::cell::Cell;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -67,6 +69,60 @@ fn assert_no_scratch(parent: &Path) -> Result<()> {
             "completed or rejected public rebuild left private scratch behind"
         );
     }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn same_generation_publication_is_not_overwritten_by_a_full_rebuild() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    drop(indexer.build_and_save_index(rows(&indexer, 1)?, temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    let generation = VectorIndex::peek_compaction_gen(&path)?;
+    let concurrent = temp.path().join("concurrent.fsvi");
+    write_generation(&concurrent, &rows(&indexer, 70)?, generation)?;
+    let expected = fs::read(&concurrent)?;
+    let published = Cell::new(false);
+    let input = rows(&indexer, 20)?.into_iter().inspect(|_| {
+        if !published.replace(true) {
+            fs::rename(&concurrent, &path).unwrap();
+        }
+    });
+    let error = indexer.build_and_save_index(input, temp.path()).unwrap_err();
+    assert!(error.to_string().contains("destination changed"), "{error:#}");
+    assert!(published.get());
+    assert_eq!(VectorIndex::peek_compaction_gen(&path)?, generation);
+    assert_eq!(fs::read(&path)?, expected);
+    assert_no_scratch(path.parent().unwrap())?;
+    Ok(())
+}
+
+#[test]
+fn same_generation_in_place_change_is_not_overwritten_by_a_full_rebuild() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    drop(indexer.build_and_save_index(rows(&indexer, 1)?, temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    let generation = VectorIndex::peek_compaction_gen(&path)?;
+    let concurrent = temp.path().join("concurrent.fsvi");
+    write_generation(&concurrent, &rows(&indexer, 4)?, generation)?;
+    let expected = fs::read(&concurrent)?;
+    assert_eq!(expected.len(), fs::read(&path)?.len());
+    let changed = Cell::new(false);
+    let input = rows(&indexer, 20)?.into_iter().inspect(|_| {
+        if !changed.replace(true) {
+            fs::write(&path, &expected).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH)).unwrap();
+        }
+    });
+    let error = indexer.build_and_save_index(input, temp.path()).unwrap_err();
+    assert!(error.to_string().contains("destination changed"), "{error:#}");
+    assert!(changed.get());
+    assert_eq!(VectorIndex::peek_compaction_gen(&path)?, generation);
+    assert_eq!(fs::read(&path)?, expected);
+    assert_no_scratch(path.parent().unwrap())?;
     Ok(())
 }
 
@@ -345,5 +401,249 @@ fn recovery_parity_cannot_silently_remain_attached_to_a_replacement() -> Result<
         Some(frankensearch::SearchError::InvalidConfig { field, .. }) if field == "fec_sidecar"));
     assert_eq!(fs::read(&path)?, before);
     assert_eq!(fs::read(&fec)?, b"unadmitted recovery protection");
+    Ok(())
+}
+
+fn canonical_ids(rows: &[EmbeddedMessage]) -> HashSet<String> {
+    rows.iter().map(doc_id).collect()
+}
+
+fn vector_bits(index: &VectorIndex) -> Result<BTreeMap<String, Vec<u32>>> {
+    let mut actual = BTreeMap::new();
+    for row in 0..index.record_count() {
+        assert!(!index.is_deleted(row));
+        assert!(actual.insert(index.doc_id_at(row)?.to_owned(),
+            index.vector_at_f32(row)?.into_iter().map(f32::to_bits).collect()).is_none());
+    }
+    assert_eq!(index.wal_record_count(), 0);
+    Ok(actual)
+}
+
+fn retained_log(path: &Path, rows: &[EmbeddedMessage]) -> Result<()> {
+    // Genuine log-before-main-cleanup state: the sibling writer serializes the
+    // log, while the original main remains unchanged. No header/CRC patching.
+    let producer = path.with_extension("producer.fsvi");
+    fs::copy(path, &producer)?;
+    let mut source = VectorIndex::open_writer(&producer)?;
+    source.append_batch(&rows.iter().map(|row| (doc_id(row), row.embedding.clone())).collect::<Vec<_>>())?;
+    assert_eq!(source.wal_record_count(), rows.len());
+    drop(source);
+    fs::copy(wal_path_for(&producer), wal_path_for(path))?;
+    Ok(())
+}
+
+#[test]
+fn canonical_full_replacement_supersedes_retained_wal_at_generation_wrap() -> Result<()> {
+    for generation in [1, 254, 255] {
+        let temp = tempfile::tempdir()?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(path.parent().unwrap())?;
+        let original = rows(&indexer, 1)?;
+        write_generation(&path, &original, generation)?;
+        retained_log(&path, &rows(&indexer, 90)?[..1])?;
+        let retained = VectorIndex::open_read_only(&path)?;
+        let before = signature(&retained, &original[0].embedding)?;
+        assert_eq!(retained.wal_record_count(), 1);
+        let replacements = rows(&indexer, 20)?;
+        let oracle_root = tempfile::tempdir()?;
+        let oracle = indexer.build_and_save_index(replacements.clone(), oracle_root.path())?;
+        let actual = indexer.reconcile_index_with_canonical_documents(
+            replacements.clone(), temp.path(), TierKind::Fast, "canonical-complete", &canonical_ids(&replacements),
+        )?;
+        assert_eq!(VectorIndex::peek_compaction_gen(&path)?, next_generation(generation));
+        assert_eq!(vector_bits(&actual)?, vector_bits(&oracle)?);
+        assert_eq!(signature(&retained, &original[0].embedding)?, before);
+        assert!(!wal_path_for(&path).exists());
+        drop(actual);
+        assert_eq!(vector_bits(&VectorIndex::open_read_only(&path)?)?, vector_bits(&oracle)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_delta_preserves_latest_wal_and_unchanged_vectors_without_resurrection() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    let mut replacement_in_wal = original[1].clone();
+    // Same source identity, different acknowledged vector: the log must win
+    // even though best-effort main tombstoning has not happened in this image.
+    for value in &mut replacement_in_wal.embedding { *value = -*value; }
+    let added_in_wal = rows(&indexer, 90)?[0].clone();
+    retained_log(&path, &[replacement_in_wal.clone(), added_in_wal.clone()])?;
+    let retained = VectorIndex::open_read_only(&path)?;
+    assert_eq!(retained.tombstone_count(), 0);
+    assert_eq!(retained.wal_record_count(), 2);
+    let edited = indexer.embed_messages(&[EmbeddingInput::new(1, "edited canonical compiler message")])?;
+    let expected_rows = vec![edited[0].clone(), replacement_in_wal, added_in_wal];
+    let oracle_root = tempfile::tempdir()?;
+    let oracle = indexer.build_and_save_index(expected_rows.clone(), oracle_root.path())?;
+    let actual = indexer.reconcile_index_with_canonical_documents(
+        edited, temp.path(), TierKind::Fast, "canonical-delta", &canonical_ids(&expected_rows),
+    )?;
+    assert_eq!(vector_bits(&actual)?, vector_bits(&oracle)?);
+    assert!(!vector_bits(&actual)?.contains_key(&doc_id(&original[0])));
+    assert!(!vector_bits(&actual)?.contains_key(&doc_id(&original[2])));
+    assert_eq!(retained.record_count(), 3);
+    assert_eq!(retained.wal_record_count(), 2);
+    Ok(())
+}
+
+#[test]
+fn canonical_missing_coverage_and_invalid_deltas_preserve_main_and_wal_bytes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    retained_log(&path, &rows(&indexer, 90)?[..1])?;
+    let before = (fs::read(&path)?, fs::read(wal_path_for(&path))?);
+    let expected_hits = reopened(&path, &original[0].embedding)?;
+    let missing = rows(&indexer, 80)?[0].clone();
+    let mut ids = canonical_ids(&original);
+    ids.insert(doc_id(&missing));
+    let error = indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "missing", &ids,
+    ).unwrap_err();
+    assert!(error.to_string().contains("lacks vectors"), "{error:#}");
+    for kind in 0..5 {
+        let mut delta = vec![missing.clone()];
+        match kind {
+            0 => { delta[0].embedding.pop(); }
+            1 => delta[0].embedding[0] = f32::NAN,
+            2 => delta[0].embedding.fill(0.0),
+            3 => delta.push(missing.clone()),
+            _ => delta = vec![rows(&indexer, 800)?[0].clone()],
+        }
+        assert!(indexer.reconcile_index_with_canonical_documents(
+            delta, temp.path(), TierKind::Fast, "invalid", &ids,
+        ).is_err());
+        assert_eq!((fs::read(&path)?, fs::read(wal_path_for(&path))?), before);
+        assert_eq!(reopened(&path, &original[0].embedding)?, expected_hits);
+    }
+    assert_eq!((fs::read(&path)?, fs::read(wal_path_for(&path))?), before);
+    Ok(())
+}
+
+#[test]
+fn canonical_persisted_signal_loss_cannot_replace_a_usable_main_and_wal() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    drop(indexer.build_and_save_index(rows(&indexer, 1)?, temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    retained_log(&path, &rows(&indexer, 90)?[..1])?;
+    let before = (fs::read(&path)?, fs::read(wal_path_for(&path))?);
+    for value in [1e-20f32, 70_000.0f32] {
+        let mut replacement = rows(&indexer, 20)?;
+        replacement[1].embedding.fill(value);
+        let ids = canonical_ids(&replacement);
+        let error = indexer.reconcile_index_with_canonical_documents(
+            replacement, temp.path(), TierKind::Fast, "stored-signal", &ids,
+        ).unwrap_err();
+        assert!(error.to_string().contains("unusable persisted"), "{error:#}");
+        assert_eq!((fs::read(&path)?, fs::read(wal_path_for(&path))?), before);
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_partial_reuse_preserves_full_precision_storage() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    fs::create_dir_all(path.parent().unwrap())?;
+    let mut original = rows(&indexer, 1)?;
+    original[0].embedding[0] = 0.123_456_79;
+    let mut writer = VectorIndex::create_with_revision(&path, "fnv1a-384",
+        coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION, 384, Quantization::F32)?;
+    for row in &original { writer.write_record(&doc_id(row), &row.embedding)?; }
+    writer.finish()?;
+    let mut pending = rows(&indexer, 90)?[0].clone();
+    pending.embedding[0] = 0.987_654_3;
+    retained_log(&path, &[pending.clone()])?;
+    let added = rows(&indexer, 20)?[0].clone();
+    let expected_rows = vec![original[0].clone(), pending, added.clone()];
+    let actual = indexer.reconcile_index_with_canonical_documents(
+        vec![added], temp.path(), TierKind::Fast, "f32-retention", &canonical_ids(&expected_rows),
+    )?;
+    assert_eq!(actual.quantization(), Quantization::F32);
+    let expected = expected_rows.iter().map(|row| (doc_id(row),
+        row.embedding.iter().map(|value| value.to_bits()).collect::<Vec<_>>())).collect::<BTreeMap<_, _>>();
+    assert_eq!(vector_bits(&actual)?, expected);
+    Ok(())
+}
+
+#[test]
+fn canonical_foreign_vector_space_requires_all_replacement_vectors() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    fs::create_dir_all(path.parent().unwrap())?;
+    let original = rows(&indexer, 1)?;
+    let mut writer = VectorIndex::create_with_revision(&path, "fnv1a-384", "foreign-revision", 384, Quantization::F16)?;
+    for row in &original { writer.write_record(&doc_id(row), &row.embedding)?; }
+    writer.finish()?;
+    retained_log(&path, &rows(&indexer, 90)?[..1])?;
+    let before = (fs::read(&path)?, fs::read(wal_path_for(&path))?);
+    let ids = canonical_ids(&original);
+    assert!(indexer.reconcile_index_with_canonical_documents(
+        vec![original[0].clone()], temp.path(), TierKind::Fast, "foreign", &ids,
+    ).is_err());
+    assert_eq!((fs::read(&path)?, fs::read(wal_path_for(&path))?), before);
+    let actual = indexer.reconcile_index_with_canonical_documents(
+        original.clone(), temp.path(), TierKind::Fast, "foreign", &ids,
+    )?;
+    assert_eq!(actual.embedder_revision(), coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION);
+    let oracle_root = tempfile::tempdir()?;
+    let oracle = indexer.build_and_save_index(original, oracle_root.path())?;
+    assert_eq!(vector_bits(&actual)?, vector_bits(&oracle)?);
+    Ok(())
+}
+
+#[test]
+fn canonical_empty_set_retires_main_and_wal_membership() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    drop(indexer.build_and_save_index(rows(&indexer, 1)?, temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    retained_log(&path, &rows(&indexer, 90)?[..1])?;
+    let actual = indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "deleted-all", &HashSet::new(),
+    )?;
+    assert_eq!(actual.record_count(), 0);
+    assert_eq!(actual.wal_record_count(), 0);
+    assert!(!wal_path_for(&path).exists());
+    Ok(())
+}
+
+#[test]
+fn canonical_reconciliation_refuses_a_live_writer_and_unowned_recovery_parity() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    retained_log(&path, &rows(&indexer, 90)?[..1])?;
+    let source_writer = VectorIndex::open_writer(&path)?;
+    let before = (fs::read(&path)?, fs::read(wal_path_for(&path))?);
+    assert!(indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "writer-conflict", &canonical_ids(&original),
+    ).is_err());
+    assert_eq!((fs::read(&path)?, fs::read(wal_path_for(&path))?), before);
+    drop(source_writer);
+    let mut fec_path = path.as_os_str().to_os_string();
+    fec_path.push(".fec");
+    let fec_path = std::path::PathBuf::from(fec_path);
+    fs::write(&fec_path, b"unadmitted parity")?;
+    let error = indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "parity-conflict", &canonical_ids(&original),
+    ).unwrap_err();
+    assert!(matches!(error.downcast_ref::<frankensearch::SearchError>(),
+        Some(frankensearch::SearchError::InvalidConfig { field, .. }) if field == "fec_sidecar"));
+    assert_eq!((fs::read(&path)?, fs::read(wal_path_for(&path))?), before);
+    assert_eq!(fs::read(&fec_path)?, b"unadmitted parity");
     Ok(())
 }
