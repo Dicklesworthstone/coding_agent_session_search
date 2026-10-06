@@ -1150,10 +1150,10 @@ fn run_job_with_gate(
         let prerequisites_ok = steps.iter().all(|step| step.ok);
 
         // 3. Semantic backfill (nightly only). Two tiers: the fast (hash)
-        // tier needs no model files; the quality (MiniLM) tier only runs
-        // when the model is installed — requesting it without the model
-        // fails with a model-domain exit code, which must read as "tier not
-        // available", never as a failed nightly.
+        // tier needs no model files. The local quality tier requires an
+        // installed model; its missing-assets exit is an optional tier skip.
+        // Explicit external quality selection is different: endpoint failures
+        // must fail the nightly rather than masquerading as successful work.
         if full {
             if !cfg.semantic {
                 steps.push(skipped_step(
@@ -1171,7 +1171,7 @@ fn run_job_with_gate(
                     "source sync or indexing failed; semantic backfill requires a successful run",
                 ));
             } else {
-                let (probe, model_installed) =
+                let (probe, model_installed, external_quality) =
                     quality_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
                 steps.push(probe);
                 let mut tiers = vec!["fast"];
@@ -1193,7 +1193,7 @@ fn run_job_with_gate(
                         ));
                         break;
                     }
-                    let args = vec![
+                    let mut args = vec![
                         "--db".to_string(),
                         cfg.db_path.display().to_string(),
                         "--color=never".to_string(),
@@ -1208,6 +1208,14 @@ fn run_job_with_gate(
                         cfg.data_dir.display().to_string(),
                         "--json".to_string(),
                     ];
+                    if tier == "fast" {
+                        args.extend(["--embedder".to_string(), "hash".to_string()]);
+                    } else if external_quality {
+                        // Pin the selected provider in the worker invocation so
+                        // a configured endpoint failure cannot be mistaken for
+                        // an optional missing local model. Credentials stay in env.
+                        args.extend(["--embedder".to_string(), "external".to_string()]);
+                    }
                     let mut step = run_step(
                         &format!("semantic-backfill:{tier}:{}", batches + 1),
                         &cfg.binary,
@@ -1317,7 +1325,16 @@ const MODEL_UNAVAILABLE_EXIT_CODES: [i32; 6] = [15, 20, 21, 22, 23, 24];
 /// into a skipped (non-failing) step. Returns true when the conversion
 /// applied, which also ends that tier's loop.
 pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
-    if step.ok {
+    // Endpoint consent, configuration, preflight and transport failures are
+    // failures of an explicitly requested job, not optional asset discovery.
+    let external = step.argv.windows(2).any(|pair| {
+        pair[0] == "--embedder"
+            && crate::search::embedder_registry::selects_external(Some(&pair[1]))
+    }) || step.argv.iter().any(|arg| {
+        arg.strip_prefix("--embedder=")
+            .is_some_and(|name| crate::search::embedder_registry::selects_external(Some(name)))
+    });
+    if external || step.ok {
         return false;
     }
     let Some(code) = step.exit_code else {
@@ -1396,11 +1413,15 @@ fn quality_model_probe(
     binary: &Path,
     data_dir: &Path,
     log: Option<&mut File>,
-) -> (StepReport, bool) {
+) -> (StepReport, bool, bool) {
     let policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
     );
-    quality_model_probe_with_policy(&policy, || minilm_model_probe(binary, data_dir, log))
+    let external =
+        crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder));
+    let (step, available) =
+        quality_model_probe_with_policy(&policy, || minilm_model_probe(binary, data_dir, log));
+    (step, available, external)
 }
 
 fn quality_model_probe_with_policy(
@@ -1798,6 +1819,32 @@ mod tests {
             (skipped_step("models-status", "missing local model"), false)
         });
         assert!(!admitted, "the default must retain local model admission");
+    }
+
+    #[test]
+    fn explicit_external_failures_remain_failures_not_optional_model_skips() {
+        for code in [15, 20, 21, 22, 23, 24, 5, 130, 143] {
+            for selection in [vec!["--embedder", "external"], vec!["--embedder=external"]] {
+                let mut step = StepReport {
+                    name: "semantic-backfill:quality:2".into(),
+                    argv: ["cass", "models", "backfill", "--tier", "quality"]
+                        .into_iter()
+                        .chain(selection)
+                        .map(str::to_owned)
+                        .collect(),
+                    exit_code: Some(code),
+                    ok: false,
+                    duration_ms: 10,
+                    skipped_reason: None,
+                    result: Some(serde_json::json!({"status": "failed", "batches_completed": 1})),
+                    stderr_tail: Some("external_http_503: checkpoint retained".into()),
+                };
+                let before = serde_json::to_value(&step).unwrap();
+                assert!(!soften_model_unavailable_backfill_step(&mut step), "{code}");
+                assert_eq!(serde_json::to_value(&step).unwrap(), before);
+                assert!(!step.ok);
+            }
+        }
     }
 
     #[test]

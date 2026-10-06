@@ -1120,6 +1120,22 @@ fn semantic_conversation_has_message_after(
 }
 
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
+    total_semantic_conversations_with_cancel(storage, None)
+}
+
+fn check_semantic_scan_cancelled(
+    cancelled: Option<&crate::search::external_embedder::CancelCheck>,
+) -> Result<()> {
+    if cancelled.is_some_and(|check| check()) {
+        bail!("external_cancelled: canonical scan interrupted; resume the last durable checkpoint");
+    }
+    Ok(())
+}
+
+fn total_semantic_conversations_with_cancel(
+    storage: &FrankenStorage,
+    cancelled: Option<&crate::search::external_embedder::CancelCheck>,
+) -> Result<u64> {
     // `conversation_tail_state.last_message_idx` is the maintained, schema-v18
     // hot cache for every normal non-empty conversation. Merge that compact
     // table with the legacy parent-row cache in Rust, then resolve only the
@@ -1132,7 +1148,23 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     // reproducing #343: correlated EXISTS under COUNT(*) misses the join-loop
     // memo; COUNT(DISTINCT ...) uses a linear seen-set; and GROUP BY retains
     // every source row in per-group vectors.
-    let hot_tail_ids = semantic_hot_tail_ids(storage)?;
+    check_semantic_scan_cancelled(cancelled)?;
+    let hot_tail_ids = if cancelled.is_none() {
+        semantic_hot_tail_ids(storage)?
+    } else {
+        let mut ids = HashSet::new();
+        storage.raw().query_with_params_for_each(
+            "SELECT conversation_id FROM conversation_tail_state WHERE last_message_idx IS NOT NULL ORDER BY conversation_id ASC",
+            &[] as &[SqliteValue],
+            |row| {
+                check_semantic_scan_cancelled(cancelled)
+                    .map_err(|error| crate::franken_sync::FrankenError::Internal(error.to_string()))?;
+                ids.insert(row.get_typed::<i64>(0)?);
+                Ok(())
+            },
+        )?;
+        ids
+    };
     let mut count = 0_u64;
     let mut missing_tail_ids = Vec::new();
     storage
@@ -1143,6 +1175,9 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
              ORDER BY id ASC",
             &[] as &[SqliteValue],
             |row| {
+                check_semantic_scan_cancelled(cancelled).map_err(|error| {
+                    crate::franken_sync::FrankenError::Internal(error.to_string())
+                })?;
                 let conversation_id: i64 = row.get_typed(0)?;
                 let legacy_last_message_idx: Option<i64> = row.get_typed(1)?;
                 if legacy_last_message_idx.is_some() || hot_tail_ids.contains(&conversation_id) {
@@ -1156,6 +1191,7 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
         .with_context(|| "listing conversations and legacy tail metadata")?;
 
     for conversation_id in missing_tail_ids {
+        check_semantic_scan_cancelled(cancelled)?;
         if semantic_conversation_has_message_after(storage, conversation_id, None)? {
             count = count.saturating_add(1);
         }
@@ -2409,6 +2445,7 @@ pub struct SemanticIndexer {
     // Only the concrete CASS factory admits the hash and English native
     // MiniLM producers. Multilingual retains uncached batches until qualified.
     exact_reuse: bool,
+    external_cancelled: Option<crate::search::external_embedder::CancelCheck>,
 }
 
 impl SemanticIndexer {
@@ -2426,13 +2463,15 @@ impl SemanticIndexer {
         use crate::search::external_embedder::{EXTERNAL_EMBEDDER, ExternalEmbedder};
 
         if embedder_type.trim().eq_ignore_ascii_case(EXTERNAL_EMBEDDER) {
-            let embedder = ExternalEmbedder::from_env_with_cancel(cancelled)
-                .context("external embedding preflight failed; archive text was not sent")?;
+            let embedder =
+                ExternalEmbedder::from_env_with_cancel(std::sync::Arc::clone(&cancelled))
+                    .context("external embedding preflight failed; archive text was not sent")?;
             return Ok(Self {
                 embedder: Box::new(embedder),
                 batch_size: resolved_default_batch_size(),
                 // Endpoint probes do not qualify the local exact-reuse contract.
                 exact_reuse: false,
+                external_cancelled: Some(cancelled),
             });
         }
         let exact_reuse = embedder_type == "hash"
@@ -2455,6 +2494,7 @@ impl SemanticIndexer {
             embedder,
             batch_size: resolved_default_batch_size(),
             exact_reuse,
+            external_cancelled: None,
         })
     }
 
@@ -2464,14 +2504,30 @@ impl SemanticIndexer {
         config: crate::search::external_embedder::ExternalEmbeddingConfig,
         cancelled: crate::search::external_embedder::CancelCheck,
     ) -> Result<Self> {
-        let embedder =
-            crate::search::external_embedder::ExternalEmbedder::connect(config, cancelled)
-                .context("external embedding preflight failed; archive text was not sent")?;
+        let embedder = crate::search::external_embedder::ExternalEmbedder::connect(
+            config,
+            std::sync::Arc::clone(&cancelled),
+        )
+        .context("external embedding preflight failed; archive text was not sent")?;
         Ok(Self {
             embedder: Box::new(embedder),
             batch_size: resolved_default_batch_size(),
             exact_reuse: false,
+            external_cancelled: Some(cancelled),
         })
+    }
+
+    pub(super) fn check_external_cancelled(&self) -> Result<()> {
+        if self
+            .external_cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled())
+        {
+            bail!(
+                "external_cancelled: incomplete batch was not committed; resume the last durable checkpoint"
+            );
+        }
+        Ok(())
     }
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Result<Self> {
@@ -2546,6 +2602,7 @@ impl SemanticIndexer {
     where
         F: FnMut(usize, usize),
     {
+        self.check_external_cancelled()?;
         if messages.is_empty() {
             on_progress(0, 0);
             return Ok(Vec::new());
@@ -2587,6 +2644,7 @@ impl SemanticIndexer {
         // multiple GB. Resolved once per call (not per batch).
         let embed_char_budget = resolved_semantic_embed_batch_char_budget();
         for (window_index, window_slice) in messages.chunks(window).enumerate() {
+            self.check_external_cancelled()?;
             let prepared_window = match prep_memo.as_mut() {
                 Some(cache) => {
                     let stats_before = cache.stats().clone();
@@ -2702,6 +2760,7 @@ impl SemanticIndexer {
             );
         }
 
+        self.check_external_cancelled()?;
         pb.finish_with_message("Embedding complete");
         Ok(embeddings)
     }
@@ -3408,6 +3467,7 @@ impl SemanticIndexer {
                 },
             );
         }
+        self.check_external_cancelled()?;
         let staged_index = self.write_backfill_staging_index(
             embeddings,
             &staging_path,
@@ -3446,6 +3506,10 @@ impl SemanticIndexer {
         progress: BackfillBatchProgress,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        // Cancellation is admitted before the staging write, never halfway
+        // through its durable checkpoint/publication. Once writing begins,
+        // complete that boundary so a signal cannot strand a newer WAL behind
+        // an older cursor. The CLI observes the signal immediately afterward.
         let BackfillBatchProgress {
             prior_checkpoint,
             embedded_docs,
@@ -3763,6 +3827,7 @@ impl SemanticIndexer {
         candidate: (&Path, SemanticCheckpointCaps),
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.check_external_cancelled()?;
         let (candidate_path, caps) = candidate;
         let snapshot_dir = tempfile::Builder::new()
             .prefix(".backfill-reuse-")
@@ -3807,6 +3872,7 @@ impl SemanticIndexer {
         }
         let mut existing_ids = HashSet::new();
         for record in 0..snapshot.record_count() {
+            self.check_external_cancelled()?;
             if !snapshot.is_deleted(record) {
                 let id = snapshot.doc_id_at(record).map_err(|err| {
                     anyhow::anyhow!("read semantic backfill candidate identity: {err}")
@@ -3818,7 +3884,8 @@ impl SemanticIndexer {
         }
         drop(snapshot);
 
-        let total_conversations = total_semantic_conversations(storage)?;
+        let total_conversations =
+            total_semantic_conversations_with_cancel(storage, self.external_cancelled.as_ref())?;
         let mut current_ids = HashSet::new();
         let mut selected_ids = HashSet::new();
         let mut inputs = Vec::new();
@@ -3838,6 +3905,7 @@ impl SemanticIndexer {
             },
         );
         loop {
+            self.check_external_cancelled()?;
             // Page actual parent IDs independently of append-tail metadata:
             // deleting the last message must not strand this scan on a stale
             // tail cache or make a deleted document count as covered.
@@ -3853,6 +3921,7 @@ impl SemanticIndexer {
                 break;
             }
             for conversation_id in conversation_ids {
+                self.check_external_cancelled()?;
                 let (conversation_inputs, _) =
                     packet_embedding_inputs_from_selected_canonical_messages(
                         storage,
@@ -3943,6 +4012,7 @@ impl SemanticIndexer {
             self.embedder_id(),
             &plan.db_fingerprint,
         );
+        self.check_external_cancelled()?;
         let staged_index = self.reconcile_index_at_paths(
             embeddings,
             &snapshot_path,
@@ -4075,6 +4145,7 @@ impl SemanticIndexer {
         caps: SemanticCheckpointCaps,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.check_external_cancelled()?;
         let archive_before = BackfillFilePair::archive(storage);
         let candidate = self.reusable_backfill_candidate(data_dir, manifest, &plan);
         let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
@@ -4219,7 +4290,10 @@ impl SemanticIndexer {
 
         let total_conversations = match cached_total_conversations {
             Some((total, _)) => total,
-            None => match total_semantic_conversations(storage) {
+            None => match total_semantic_conversations_with_cancel(
+                storage,
+                self.external_cancelled.as_ref(),
+            ) {
                 Ok(total) => total,
                 Err(err) => {
                     if sink.is_active() {

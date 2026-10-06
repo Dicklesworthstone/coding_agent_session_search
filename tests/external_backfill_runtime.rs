@@ -550,3 +550,192 @@ fn external_artifact_identity_is_not_an_instruction_to_contact_a_provider() -> R
     );
     Ok(())
 }
+
+#[test]
+fn external_cancelled_empty_batch_preserves_checkpoint_without_http() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let server = Server::start(384)?;
+    let indexer = server.indexer()?;
+    let mut manifest = SemanticManifest::default();
+    let first = indexer.run_backfill_batch(
+        &[EmbeddingInput::new(1, "retained prefix")],
+        dir.path(),
+        &mut manifest,
+        plan(1, false),
+    )?;
+    let staged = fs::read(&first.index_path)?;
+    let ledger = fs::read(SemanticManifest::path(dir.path()))?;
+    server.take_inputs();
+    server.state.cancel.store(true, Ordering::SeqCst);
+    let error = indexer
+        .run_backfill_batch(&[], dir.path(), &mut manifest, plan(2, true))
+        .expect_err("empty batches must not bypass cancellation and publish");
+    assert!(error.to_string().contains("external_cancelled"));
+    assert!(server.take_inputs().is_empty());
+    assert_eq!(fs::read(&first.index_path)?, staged);
+    assert_eq!(fs::read(SemanticManifest::path(dir.path()))?, ledger);
+    assert!(manifest.quality_tier.is_none());
+    assert!(!vector_index_path(dir.path(), indexer.embedder_id()).exists());
+    Ok(())
+}
+
+#[test]
+fn external_cancelled_empty_archive_does_not_publish_and_local_batches_still_drain() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let server = Server::start(384)?;
+    let indexer = server.indexer()?;
+    server.take_inputs();
+    server.state.cancel.store(true, Ordering::SeqCst);
+    assert!(indexer.embed_messages(&[]).is_err());
+    let mut manifest = SemanticManifest::default();
+    assert!(
+        indexer
+            .run_backfill_batch(&[], dir.path(), &mut manifest, plan(2, true))
+            .is_err()
+    );
+    assert!(server.take_inputs().is_empty());
+    assert!(manifest.checkpoint.is_none());
+    assert!(manifest.quality_tier.is_none());
+    assert!(!SemanticManifest::path(dir.path()).exists());
+    let local = SemanticIndexer::new_with_cancel(
+        "hash",
+        None,
+        Arc::new(|| panic!("local inference must retain its drain-before-cancellation contract")),
+    )?;
+    assert!(local.embed_messages(&[])?.is_empty());
+    assert_eq!(
+        local
+            .embed_messages(&[EmbeddingInput::new(1, "local batch")])?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn external_cancelled_canonical_scan_keeps_vectors_and_resumes_exactly() -> Result<()> {
+    use coding_agent_search::indexer::semantic::SemanticBackfillStoragePlan;
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn signature(path: &Path) -> Result<BTreeMap<String, Vec<u32>>> {
+        let index = VectorIndex::open_read_only(path)?;
+        (0..index.record_count())
+            .map(|row| {
+                Ok((
+                    index.doc_id_at(row)?.to_owned(),
+                    index
+                        .vector_at_f32(row)?
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
+    let dir = tempfile::tempdir()?;
+    let storage = FrankenStorage::open(&dir.path().join("agent_search.db"))?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "codex".into(),
+        name: "Codex".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    for ordinal in 0..32 {
+        storage.insert_conversation_tree(
+            agent,
+            None,
+            &Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some(format!("cancel-scan-{ordinal}")),
+                title: None,
+                source_path: format!("/fixture/cancel-scan-{ordinal}.jsonl").into(),
+                started_at: Some(1),
+                ended_at: Some(2),
+                approx_tokens: None,
+                metadata_json: json!({}),
+                source_id: "local".into(),
+                origin_host: None,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1),
+                    content: format!("private canonical conversation {ordinal}"),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+            },
+        )?;
+    }
+    let server = Server::start(384)?;
+    let armed = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let check: CancelCheck = {
+        let armed = armed.clone();
+        let polls = polls.clone();
+        Arc::new(move || armed.load(Ordering::SeqCst) && polls.fetch_add(1, Ordering::SeqCst) >= 19)
+    };
+    let indexer =
+        SemanticIndexer::with_external_config(server.config("fixture-model", 384, "v1")?, check)?;
+    let storage_plan = |max_conversations| SemanticBackfillStoragePlan {
+        tier: TierKind::Quality,
+        db_fingerprint: "cancel-scan-fixture".into(),
+        model_revision: indexer.embedder_id().to_owned(),
+        max_conversations,
+    };
+    let mut manifest = SemanticManifest::default();
+    let first =
+        indexer.run_backfill_from_storage(&storage, dir.path(), &mut manifest, storage_plan(1))?;
+    assert!(first.checkpoint_saved && !first.published);
+    let checkpoint = serde_json::to_value(manifest.checkpoint.as_ref().unwrap())?;
+    let staged = fs::read(&first.index_path)?;
+    server.take_inputs();
+    armed.store(true, Ordering::SeqCst);
+    let error = indexer
+        .run_backfill_from_storage(&storage, dir.path(), &mut manifest, storage_plan(1))
+        .expect_err("count scanning must cooperate before corpus requests");
+    assert!(
+        format!("{error:#}").contains("canonical scan interrupted"),
+        "{error:#}"
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 20);
+    assert!(server.take_inputs().is_empty());
+    assert_eq!(fs::read(&first.index_path)?, staged);
+    let mut restored = SemanticManifest::load(dir.path())?.context("durable manifest")?;
+    assert_eq!(
+        serde_json::to_value(restored.checkpoint.as_ref().unwrap())?,
+        checkpoint
+    );
+    armed.store(false, Ordering::SeqCst);
+    let resumed =
+        indexer.run_backfill_from_storage(&storage, dir.path(), &mut restored, storage_plan(64))?;
+    assert!(resumed.published);
+    assert_eq!(resumed.embedded_docs, 31);
+    let sent = server.take_inputs().concat();
+    assert_eq!(sent.len(), 31);
+    assert!(
+        !sent
+            .iter()
+            .any(|text| text == "private canonical conversation 0")
+    );
+    let independent = tempfile::tempdir()?;
+    let fresh = indexer.run_backfill_from_storage(
+        &storage,
+        independent.path(),
+        &mut SemanticManifest::default(),
+        storage_plan(64),
+    )?;
+    assert!(fresh.published);
+    assert_eq!(
+        signature(&resumed.index_path)?,
+        signature(&fresh.index_path)?
+    );
+    Ok(())
+}

@@ -85,7 +85,10 @@ impl SemanticIndexer {
             &mut SemanticManifest,
         ) -> Result<SemanticBackfillBatchOutcome>,
     {
+        self.inner.check_external_cancelled()?;
         let artifacts = artifacts::BackfillArtifacts::begin(data_dir, manifest)?;
+        // The ownership lease may have waited behind another writer.
+        self.inner.check_external_cancelled()?;
         let result = run(&self.inner, manifest);
         if let Ok(outcome) = &result {
             // A writer returns after manifest.save's file/directory fsync;
@@ -226,7 +229,11 @@ mod external_diagnostic_tests {
     fn external_display_preserves_provider_cause_and_typed_error() {
         let error = external_diagnostic_result::<()>(true, Err(failure())).unwrap_err();
         assert!(error.to_string().contains("external_dimension_mismatch"));
-        assert!(error.to_string().contains("external provider preflight failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("external provider preflight failed")
+        );
         assert!(error.downcast_ref::<std::io::Error>().is_some());
     }
 
