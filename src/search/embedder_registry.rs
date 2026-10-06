@@ -1,705 +1,134 @@
-//! Embedder registry for model selection (bd-2mbe).
+//! Explicit provider selection over the unchanged local model registry.
 //!
-//! This module provides a registry of available embedding backends that allows:
-//! - Listing available embedders with metadata
-//! - Selecting embedder by name from CLI/config
-//! - Validating model availability before use
-//! - Providing a sensible default model
-//!
-//! **Note**: The core types ([`RegisteredEmbedder`], [`EmbedderRegistry`]) are
-//! structurally identical to those in `frankensearch_embed::model_registry`.
-//! They are kept locally for now due to build-system sync constraints (rch does
-//! not sync sibling path dependencies).  See frankensearch-embed for the
-//! canonical definitions, which additionally include reranker support, two
-//! additional Potion embedders, and richer directory-resolution helpers.
-//!
-//! # Supported Embedders
-//!
-//! | Name | ID | Dimension | Type | Notes |
-//! |------|-----|-----------|------|-------|
-//! | minilm | minilm-384 | 384 | ML | Default semantic embedder |
-//! | multilingual-minilm | multilingual-minilm-384 | 384 | ML | Explicit CJK/multilingual model |
-//! | hash | fnv1a-384 | 384 | Hash | Explicit fast/degraded mode |
-//!
-//! # Example
-//!
-//! ```ignore
-//! use crate::search::embedder_registry::{EmbedderRegistry, get_embedder};
-//!
-//! let registry = EmbedderRegistry::new(&data_dir);
-//!
-//! // List available embedders
-//! for info in registry.available() {
-//!     println!("{}: {} ({})", info.name, info.id, info.dimension);
-//! }
-//!
-//! // Get embedder by name
-//! let embedder = get_embedder(&data_dir, Some("minilm"))?;
-//! ```
+//! The static registry describes only installed local models. Dynamic external
+//! identities must never be represented by a static MiniLM record. Only an
+//! explicit `Some("external")` passed to the factory consults endpoint consent;
+//! defaults, availability discovery and model installation remain local.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use super::embedder::{Embedder, EmbedderError, EmbedderInfo, EmbedderResult};
-use super::fastembed_embedder::FastEmbedder;
-use super::hash_embedder::HashEmbedder;
+// Preserve the local registry and all its regression tests byte-for-byte in a
+// child module. These aliases retain its existing sibling imports.
+use super::{embedder, fastembed_embedder, hash_embedder};
+use super::external_embedder::{
+    CancelCheck, EXTERNAL_EMBEDDER, ExternalEmbedder, ExternalEmbeddingConfig,
+};
+use embedder::{Embedder, EmbedderInfo, EmbedderResult};
 
-/// Default embedder name when none specified.
-pub const DEFAULT_EMBEDDER: &str = "minilm";
+#[path = "embedder_registry/local.rs"]
+mod local;
 
-/// Hash embedder name (always available when explicitly requested).
-pub const HASH_EMBEDDER: &str = "hash";
+pub use local::{
+    BAKEOFF_ELIGIBILITY_CUTOFF, DEFAULT_EMBEDDER, EMBEDDERS, EmbedderRegistry, HASH_EMBEDDER,
+    REQUIRED_NATIVE_MODEL_FILES, RegisteredEmbedder,
+};
 
-/// Information about a registered embedder.
-///
-/// Structurally identical to `frankensearch_embed::model_registry::RegisteredEmbedder`.
-#[derive(Debug, Clone)]
-pub struct RegisteredEmbedder {
-    /// Short name for CLI/config (e.g., "minilm", "hash").
-    pub name: &'static str,
-    /// Unique embedder ID (e.g., "minilm-384", "fnv1a-384").
-    pub id: &'static str,
-    /// Output dimension.
-    pub dimension: usize,
-    /// Whether this is a semantic (ML) embedder.
-    pub is_semantic: bool,
-    /// Human-readable description.
-    pub description: &'static str,
-    /// Whether the model files are required (false = always available).
-    pub requires_model_files: bool,
-    /// Release/update date (YYYY-MM-DD format) for bake-off eligibility.
-    pub release_date: &'static str,
-    /// HuggingFace model ID for download/reference.
-    pub huggingface_id: &'static str,
-    /// Approximate model size in bytes.
-    pub size_bytes: u64,
-    /// Whether this is a baseline model (not eligible for bake-off).
-    pub is_baseline: bool,
+fn selects_external(name: Option<&str>) -> bool {
+    name.is_some_and(|name| name.trim().eq_ignore_ascii_case(EXTERNAL_EMBEDDER))
 }
 
-/// Files required for a verified pure-Rust Frankentorch embedder bundle.
-pub const REQUIRED_NATIVE_MODEL_FILES: &[&str] = &[
-    "model.safetensors",
-    "tokenizer.json",
-    "config.json",
-    "special_tokens_map.json",
-    "tokenizer_config.json",
-];
-
-/// Eligibility cutoff for bake-off (models must be released on/after this date).
-pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
-
-impl RegisteredEmbedder {
-    /// Check if this embedder is available in the given data directory.
-    pub fn is_available(&self, data_dir: &Path) -> bool {
-        if !self.requires_model_files {
-            return true;
-        }
-
-        if let Some(model_dir) = self.model_dir(data_dir) {
-            self.required_files()
-                .iter()
-                .all(|f| model_dir.join(f).is_file())
-        } else {
-            false
-        }
-    }
-
-    /// Get the model directory path for this embedder (if applicable).
-    pub fn model_dir(&self, data_dir: &Path) -> Option<PathBuf> {
-        if !self.requires_model_files {
-            return None;
-        }
-
-        FastEmbedder::model_dir_for(data_dir, self.name)
-    }
-
-    /// Get required model files for this embedder.
-    pub fn required_files(&self) -> &'static [&'static str] {
-        if !self.requires_model_files {
-            return &[];
-        }
-        // The native MiniLM embedder uses a safetensors bundle.
-        REQUIRED_NATIVE_MODEL_FILES
-    }
-
-    /// Get missing model files for this embedder.
-    pub fn missing_files(&self, data_dir: &Path) -> Vec<String> {
-        if !self.requires_model_files {
-            return Vec::new();
-        }
-
-        if let Some(model_dir) = self.model_dir(data_dir) {
-            self.required_files()
-                .iter()
-                .filter(|f| !model_dir.join(*f).is_file())
-                .map(|f| (*f).to_string())
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Check if this embedder is eligible for the bake-off.
-    pub fn is_bakeoff_eligible(&self) -> bool {
-        if self.is_baseline {
-            return false;
-        }
-        self.release_date >= BAKEOFF_ELIGIBILITY_CUTOFF
-    }
-
-    /// Convert to bakeoff ModelMetadata.
-    pub fn to_model_metadata(&self) -> crate::bakeoff::ModelMetadata {
-        crate::bakeoff::ModelMetadata {
-            id: self.id.to_string(),
-            name: self.name.to_string(),
-            source: self.huggingface_id.to_string(),
-            release_date: self.release_date.to_string(),
-            dimension: Some(self.dimension),
-            size_bytes: if self.size_bytes > 0 {
-                Some(self.size_bytes)
-            } else {
-                None
-            },
-            is_baseline: self.is_baseline,
-        }
-    }
-}
-
-/// Static registry of all supported embedders.
-///
-/// MiniLM L6 and multilingual MiniLM L12 are the only architectures verified
-/// by the pure-Rust native backend.
-/// Hash vectors remain available for the explicit fast/degraded tier, but are
-/// never selected as a silent substitute for a missing semantic model. The
-/// multilingual model is also opt-in and never replaces the default implicitly.
-pub static EMBEDDERS: &[RegisteredEmbedder] = &[
-    // === Baseline (not eligible for bake-off) ===
-    RegisteredEmbedder {
-        name: "minilm",
-        id: "minilm-384",
-        dimension: 384,
-        is_semantic: true,
-        description: "MiniLM L6 v2 - fast, high-quality semantic embeddings (baseline)",
-        requires_model_files: true,
-        release_date: "2022-08-01",
-        huggingface_id: "sentence-transformers/all-MiniLM-L6-v2",
-        size_bytes: 90_000_000,
-        is_baseline: true,
-    },
-    RegisteredEmbedder {
-        name: "multilingual-minilm",
-        id: "multilingual-minilm-384",
-        dimension: 384,
-        is_semantic: true,
-        description: "Multilingual MiniLM L12 v2 - opt-in CJK and mixed-language embeddings",
-        requires_model_files: true,
-        release_date: "2020-11-01",
-        huggingface_id: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        size_bytes: 479_724_528,
-        is_baseline: false,
-    },
-    // === Explicit fast/degraded tier (always available) ===
-    RegisteredEmbedder {
-        name: "hash",
-        id: "fnv1a-384",
-        dimension: 384,
-        is_semantic: false,
-        description: "FNV-1a feature hashing - explicit fast/degraded vectors, always available",
-        requires_model_files: false,
-        release_date: "2020-01-01",
-        huggingface_id: "",
-        size_bytes: 0,
-        is_baseline: true,
-    },
-];
-
-/// Embedder registry with data directory context.
-pub struct EmbedderRegistry {
-    data_dir: PathBuf,
-}
-
-impl EmbedderRegistry {
-    /// Create a new registry bound to the given data directory.
-    pub fn new(data_dir: &Path) -> Self {
-        Self {
-            data_dir: data_dir.to_path_buf(),
-        }
-    }
-
-    /// Get all registered embedders.
-    pub fn all(&self) -> &'static [RegisteredEmbedder] {
-        EMBEDDERS
-    }
-
-    /// Get only available embedders (model files present).
-    pub fn available(&self) -> Vec<&'static RegisteredEmbedder> {
-        EMBEDDERS
-            .iter()
-            .filter(|e| e.is_available(&self.data_dir))
-            .collect()
-    }
-
-    /// Get embedder info by name.
-    pub fn get(&self, name: &str) -> Option<&'static RegisteredEmbedder> {
-        let name_lower = FastEmbedder::canonical_name(name)
-            .unwrap_or_else(|| name.trim())
-            .to_ascii_lowercase();
-        EMBEDDERS.iter().find(|e| {
-            e.name == name_lower
-                || e.id == name_lower
-                || e.id.starts_with(&format!("{}-", name_lower))
-        })
-    }
-
-    /// Check if an embedder is available by name.
-    pub fn is_available(&self, name: &str) -> bool {
-        self.get(name)
-            .map(|e| e.is_available(&self.data_dir))
-            .unwrap_or(false)
-    }
-
-    /// Get the default embedder info.
-    pub fn default_embedder(&self) -> &'static RegisteredEmbedder {
-        self.get(DEFAULT_EMBEDDER)
-            .expect("default embedder must exist")
-    }
-
-    /// Get the preferred semantic embedder.
-    ///
-    /// This always returns the default MiniLM entry. A missing default fails open
-    /// to lexical search; hash and multilingual vectors must be selected explicitly
-    /// by name or policy so an installed alternate cannot silently change spaces.
-    pub fn best_available(&self) -> &'static RegisteredEmbedder {
-        self.default_embedder()
-    }
-
-    /// Get all bake-off eligible embedders.
-    pub fn bakeoff_eligible(&self) -> Vec<&'static RegisteredEmbedder> {
-        EMBEDDERS
-            .iter()
-            .filter(|e| e.is_bakeoff_eligible())
-            .collect()
-    }
-
-    /// Get available bake-off eligible embedders (model files present).
-    pub fn available_bakeoff_candidates(&self) -> Vec<&'static RegisteredEmbedder> {
-        EMBEDDERS
-            .iter()
-            .filter(|e| e.is_bakeoff_eligible() && e.is_available(&self.data_dir))
-            .collect()
-    }
-
-    /// Get the baseline embedder for bake-off comparison.
-    pub fn baseline_embedder(&self) -> Option<&'static RegisteredEmbedder> {
-        EMBEDDERS.iter().find(|e| e.is_baseline)
-    }
-
-    /// Validate that an embedder is ready to use.
-    ///
-    /// Returns `Ok(())` if available, or an error with details about what's missing.
-    pub fn validate(&self, name: &str) -> EmbedderResult<&'static RegisteredEmbedder> {
-        let embedder = self.get(name).ok_or_else(|| {
-            embedder_unavailable(
-                name,
-                format!(
-                    "unknown embedder. Available: {}",
-                    EMBEDDERS
-                        .iter()
-                        .map(|e| e.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-        })?;
-
-        if !embedder.is_available(&self.data_dir) {
-            let model_dir = FastEmbedder::runtime_model_dir_for(&self.data_dir, embedder.name);
-            let missing = model_dir
-                .as_ref()
-                .map(|dir| {
-                    embedder
-                        .required_files()
-                        .iter()
-                        .filter(|file| !dir.join(*file).is_file())
-                        .map(|file| (*file).to_string())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| embedder.missing_files(&self.data_dir));
-            if missing.is_empty() {
-                return Ok(embedder);
-            }
-            let model_dir = model_dir
-                .or_else(|| embedder.model_dir(&self.data_dir))
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            return Err(embedder_unavailable(
-                name,
-                format!(
-                    "missing files in {}: {}. Run 'cass models install' to download.",
-                    model_dir,
-                    missing.join(", ")
-                ),
-            ));
-        }
-
-        Ok(embedder)
-    }
-}
-
-/// Load an embedder by name (or default if None).
-///
-/// # Arguments
-///
-/// * `data_dir` - The cass data directory containing model files.
-/// * `name` - Optional embedder name. If None, uses the best available.
-///
-/// # Returns
-///
-/// An `Arc<dyn Embedder>` ready for use, or an error if unavailable.
+/// Load the explicitly selected provider. Missing local assets and external
+/// failures are errors, never reasons to switch to another vector space.
 pub fn get_embedder(data_dir: &Path, name: Option<&str>) -> EmbedderResult<Arc<dyn Embedder>> {
-    let registry = EmbedderRegistry::new(data_dir);
-
-    let embedder_info = match name {
-        Some(n) => registry.validate(n)?,
-        None => registry.best_available(),
-    };
-
-    load_embedder_by_name(data_dir, embedder_info.name)
-}
-
-/// Load an embedder by registered name.
-fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn Embedder>> {
-    match name {
-        "hash" => {
-            let embedder = HashEmbedder::default();
-            Ok(Arc::new(embedder))
-        }
-        "minilm" | "multilingual-minilm" => {
-            let embedder = FastEmbedder::load_by_name(data_dir, name)?;
-            Ok(Arc::new(embedder))
-        }
-        _ => Err(embedder_unavailable(name, "embedder not implemented")),
-    }
-}
-
-fn embedder_unavailable(model: &str, reason: impl Into<String>) -> EmbedderError {
-    EmbedderError::EmbedderUnavailable {
-        model: model.to_string(),
-        reason: reason.into(),
-    }
-}
-
-/// Get embedder info for display/logging.
-pub fn get_embedder_info(data_dir: &Path, name: Option<&str>) -> Option<EmbedderInfo> {
-    let registry = EmbedderRegistry::new(data_dir);
-
-    let embedder_info = match name {
-        Some(n) => registry.get(n)?,
-        None => registry.best_available(),
-    };
-
-    Some(EmbedderInfo {
-        id: embedder_info.id.to_string(),
-        dimension: embedder_info.dimension,
-        is_semantic: embedder_info.is_semantic,
+    select_embedder(data_dir, name, || {
+        ExternalEmbedder::from_env().map(|provider| Arc::new(provider) as Arc<dyn Embedder>)
     })
+}
+
+/// Cancellation-aware counterpart for backfill/job owners. The external
+/// constructor completes its public-input preflight before returning a provider.
+/// A blocking in-flight request is bounded by the configured HTTP deadline.
+pub fn get_embedder_with_cancel(
+    data_dir: &Path,
+    name: Option<&str>,
+    cancelled: CancelCheck,
+) -> EmbedderResult<Arc<dyn Embedder>> {
+    select_embedder(data_dir, name, || {
+        ExternalEmbedder::from_env_with_cancel(cancelled)
+            .map(|provider| Arc::new(provider) as Arc<dyn Embedder>)
+    })
+}
+
+fn select_embedder(
+    data_dir: &Path,
+    name: Option<&str>,
+    external: impl FnOnce() -> EmbedderResult<Arc<dyn Embedder>>,
+) -> EmbedderResult<Arc<dyn Embedder>> {
+    if selects_external(name) {
+        external()
+    } else {
+        local::get_embedder(data_dir, name)
+    }
+}
+
+/// Metadata inspection never constructs an HTTP client or sends probe text.
+/// External metadata exists only with explicit selection and valid consented
+/// configuration; it carries the dynamic external identity and dimension.
+pub fn get_embedder_info(data_dir: &Path, name: Option<&str>) -> Option<EmbedderInfo> {
+    if selects_external(name) {
+        let config = ExternalEmbeddingConfig::from_env().ok()??;
+        Some(EmbedderInfo {
+            id: config.identity(),
+            dimension: config.dimension(),
+            is_semantic: true,
+        })
+    } else {
+        local::get_embedder_info(data_dir, name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::embedder::EmbedderError;
     use super::*;
-    use tempfile::{TempDir, tempdir};
 
-    fn registry_fixture() -> (TempDir, EmbedderRegistry) {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
-        (tmp, registry)
+    #[test]
+    fn external_selection_requires_the_explicit_name() {
+        for name in [None, Some("minilm"), Some("hash"), Some("default"), Some("auto")] {
+            assert!(!selects_external(name), "{name:?}");
+        }
+        for name in ["external", " EXTERNAL "] {
+            assert!(selects_external(Some(name)));
+        }
+        // An artifact identity is not itself consent to contact a server.
+        let identity = format!("external-v1-384-{}", "a".repeat(64));
+        assert!(!selects_external(Some(&identity)));
     }
 
     #[test]
-    fn test_registry_all() {
-        let (_tmp, registry) = registry_fixture();
-        assert!(registry.all().len() >= 2);
-    }
-
-    #[test]
-    fn test_registry_get_by_name() {
-        let (_tmp, registry) = registry_fixture();
-
-        let minilm = registry.get("minilm");
-        assert!(minilm.is_some());
-        assert_eq!(minilm.unwrap().dimension, 384);
-
-        let multilingual = registry.get("multilingual-minilm");
-        assert!(multilingual.is_some());
-        assert_eq!(multilingual.unwrap().id, "multilingual-minilm-384");
-
-        let hash = registry.get("hash");
-        assert!(hash.is_some());
-        assert_eq!(hash.unwrap().dimension, 384);
-
-        let unknown = registry.get("unknown");
-        assert!(unknown.is_none());
-    }
-
-    #[test]
-    fn test_registry_get_by_id() {
-        let (_tmp, registry) = registry_fixture();
-
-        let minilm = registry.get("minilm-384");
-        assert!(minilm.is_some());
-        assert_eq!(minilm.unwrap().name, "minilm");
-
-        let hash = registry.get("fnv1a-384");
-        assert!(hash.is_some());
-        assert_eq!(hash.unwrap().name, "hash");
-    }
-
-    #[test]
-    fn test_hash_always_available() {
-        let (_tmp, registry) = registry_fixture();
-
-        assert!(registry.is_available("hash"));
-        let available = registry.available();
-        assert!(available.iter().any(|e| e.name == "hash"));
-    }
-
-    #[test]
-    fn test_minilm_unavailable_without_files() {
-        let (_tmp, registry) = registry_fixture();
-
-        // MiniLM should not be available without model files
-        assert!(!registry.is_available("minilm"));
-
-        let result = registry.validate("minilm");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, EmbedderError::EmbedderUnavailable { .. }));
-    }
-
-    #[test]
-    fn test_embedder_unavailable_helper_shape() {
-        let err = embedder_unavailable("demo", "missing model");
-        match err {
-            EmbedderError::EmbedderUnavailable { model, reason } => {
-                assert_eq!(model, "demo");
-                assert_eq!(reason, "missing model");
-            }
-            other => panic!("unexpected error shape: {other:?}"),
+    fn local_factory_never_consults_the_external_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hash = select_embedder(tmp.path(), Some("hash"), || {
+            panic!("local selection must not read external configuration or send text")
+        })
+        .unwrap();
+        assert_eq!(hash.id(), "fnv1a-384");
+        assert_eq!(hash.embed_sync("private session text").unwrap().len(), 384);
+        for name in [None, Some("minilm"), Some("unknown")] {
+            let result = select_embedder(tmp.path(), name, || {
+                panic!("a missing local model must not fall back to an external server")
+            });
+            assert!(result.is_err());
         }
     }
 
     #[test]
-    fn test_best_available_never_silently_substitutes_hash() {
-        let (_tmp, registry) = registry_fixture();
-
-        // A missing quality model must fail open at the search layer; selecting
-        // a same-dimensional hash vector space here would silently mix contracts.
-        let best = registry.best_available();
-        assert_eq!(best.name, "minilm");
-    }
-
-    #[test]
-    fn installed_multilingual_model_remains_explicit_opt_in() {
-        let (tmp, registry) = registry_fixture();
-        let model_dir = FastEmbedder::model_dir_for(tmp.path(), "multilingual-minilm")
-            .expect("registered multilingual directory");
-        std::fs::create_dir_all(&model_dir).expect("create multilingual model directory");
-        for file in REQUIRED_NATIVE_MODEL_FILES {
-            std::fs::write(model_dir.join(file), b"fixture").expect("write model marker");
-        }
-
-        assert!(registry.is_available("multilingual-minilm"));
-        assert_eq!(registry.best_available().name, "minilm");
-        assert_eq!(
-            registry
-                .validate("multilingual-minilm")
-                .expect("explicit multilingual selection")
-                .id,
-            "multilingual-minilm-384"
-        );
-    }
-
-    #[test]
-    fn test_get_embedder_hash() {
-        let tmp = tempdir().unwrap();
-        let embedder = get_embedder(tmp.path(), Some("hash")).unwrap();
-        assert_eq!(embedder.id(), "fnv1a-384");
-        assert!(!embedder.is_semantic());
-    }
-
-    #[test]
-    fn test_get_embedder_default_no_models_reports_missing_minilm() -> Result<(), String> {
-        let tmp = tempdir().unwrap();
-        let error = match get_embedder(tmp.path(), None) {
-            Ok(_) => return Err("missing MiniLM silently selected an embedder".into()),
+    fn external_consent_failure_never_substitutes_a_local_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        let result = select_embedder(tmp.path(), Some("external"), || {
+            calls += 1;
+            Err(EmbedderError::EmbedderUnavailable {
+                model: EXTERNAL_EMBEDDER.into(),
+                reason: "external_disabled: explicit consent is absent".into(),
+            })
+        });
+        let error = match result {
+            Ok(_) => panic!("consent failure unexpectedly selected a provider"),
             Err(error) => error,
         };
-        if !matches!(error, EmbedderError::EmbedderUnavailable { .. }) {
-            return Err(format!("unexpected error shape: {error:?}"));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_validate_unknown_embedder() {
-        let (_tmp, registry) = registry_fixture();
-
-        let result = registry.validate("nonexistent");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("unknown embedder"));
-        assert!(err.to_string().contains("Available:"));
-    }
-
-    #[test]
-    fn test_registered_embedder_missing_files() {
-        let (tmp, registry) = registry_fixture();
-
-        let minilm = registry.get("minilm").unwrap();
-        let missing = minilm.missing_files(tmp.path());
-        assert!(!missing.is_empty());
-        assert!(missing.contains(&"model.safetensors".to_string()));
-    }
-
-    #[test]
-    fn test_get_embedder_info() {
-        let tmp = tempdir().unwrap();
-
-        let hash_info = get_embedder_info(tmp.path(), Some("hash")).unwrap();
-        assert_eq!(hash_info.id, "fnv1a-384");
-        assert!(!hash_info.is_semantic);
-
-        let minilm_info = get_embedder_info(tmp.path(), Some("minilm")).unwrap();
-        assert_eq!(minilm_info.id, "minilm-384");
-        assert!(minilm_info.is_semantic);
-    }
-
-    // ==================== Bake-off Tests ====================
-
-    #[test]
-    fn test_no_unloadable_embedder_is_bakeoff_eligible() {
-        let (_tmp, registry) = registry_fixture();
-
-        let eligible = registry.bakeoff_eligible();
-        assert!(eligible.is_empty());
-
-        // MiniLM should NOT be in the eligible list (it's the baseline)
-        assert!(
-            !eligible.iter().any(|e| e.name == "minilm"),
-            "minilm should not be in eligible list"
-        );
-
-        // Hash should NOT be in the eligible list (not semantic)
-        assert!(
-            !eligible.iter().any(|e| e.name == "hash"),
-            "hash should not be in eligible list"
-        );
-
-        assert!(
-            !eligible.iter().any(|e| e.name == "multilingual-minilm"),
-            "the frozen opt-in multilingual model predates the bake-off cutoff"
-        );
-    }
-
-    #[test]
-    fn test_baseline_embedder() {
-        let (_tmp, registry) = registry_fixture();
-
-        let baseline = registry.baseline_embedder();
-        assert!(baseline.is_some());
-        let baseline = baseline.unwrap();
-        assert_eq!(baseline.name, "minilm");
-        assert!(baseline.is_baseline);
-        assert!(!baseline.is_bakeoff_eligible());
-    }
-
-    #[test]
-    fn test_bakeoff_eligibility_by_date() {
-        let (_tmp, registry) = registry_fixture();
-
-        // MiniLM was released before cutoff (2022-08-01)
-        let minilm = registry.get("minilm").unwrap();
-        assert!(
-            minilm.release_date < BAKEOFF_ELIGIBILITY_CUTOFF,
-            "minilm should be released before cutoff"
-        );
-
-        // All eligible models should be released after cutoff
-        for e in registry.bakeoff_eligible() {
-            assert!(
-                e.release_date >= BAKEOFF_ELIGIBILITY_CUTOFF,
-                "{} should be released after cutoff (date: {})",
-                e.name,
-                e.release_date
-            );
-        }
-    }
-
-    #[test]
-    fn test_bakeoff_model_metadata_conversion() {
-        let (_tmp, registry) = registry_fixture();
-
-        let minilm = registry.get("minilm").unwrap();
-        let metadata = minilm.to_model_metadata();
-
-        assert_eq!(metadata.id, "minilm-384");
-        assert_eq!(metadata.name, "minilm");
-        assert!(metadata.source.contains("MiniLM"));
-        assert_eq!(metadata.release_date, "2022-08-01");
-        assert_eq!(metadata.dimension, Some(384));
-        assert!(metadata.is_baseline);
-        assert!(!metadata.is_eligible());
-    }
-
-    #[test]
-    fn test_unverified_architectures_are_not_registered() {
-        let (_tmp, registry) = registry_fixture();
-        assert!(registry.get("snowflake-arctic-s").is_none());
-        assert!(registry.get("nomic-embed").is_none());
-    }
-
-    #[test]
-    fn test_all_embedders_have_required_fields() {
-        for e in EMBEDDERS.iter() {
-            // All should have valid release dates
-            assert!(
-                !e.release_date.is_empty(),
-                "{} should have a release date",
-                e.name
-            );
-
-            // All semantic embedders should have HuggingFace IDs
-            if e.is_semantic && e.requires_model_files {
-                assert!(
-                    !e.huggingface_id.is_empty(),
-                    "{} should have a huggingface_id",
-                    e.name
-                );
-            }
-
-            // Dimensions should be reasonable
-            assert!(e.dimension >= 256 && e.dimension <= 2048);
-        }
-    }
-
-    #[test]
-    fn test_model_dir_for_all_embedders() {
-        let tmp = tempdir().unwrap();
-
-        for e in EMBEDDERS.iter() {
-            if e.requires_model_files {
-                let dir = e.model_dir(tmp.path());
-                assert!(dir.is_some(), "{} should have a model directory", e.name);
-                let dir = dir.unwrap();
-                assert!(
-                    dir.starts_with(tmp.path().join("models")),
-                    "{} model dir should be under models/",
-                    e.name
-                );
-            }
-        }
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("external_disabled"));
     }
 }

@@ -6,6 +6,7 @@ on:
       - src/search/external_embedder.rs
       - src/search/external_embedder/**
       - src/search/embedder_registry.rs
+      - src/search/embedder_registry/**
       - src/search/model_manager.rs
       - src/indexer/semantic/**
       - src/lib.rs
@@ -29,7 +30,7 @@ jobs:
           python3 - <<'PY'
           import hashlib, json, os, tarfile
           from pathlib import Path
-          files = ['src/search/external_embedder.rs', 'src/search/external_embedder/tests.rs', 'src/search/embedder_registry.rs', 'src/search/model_manager.rs', 'src/indexer/semantic.rs', 'src/indexer/semantic/engine.rs', 'src/lib.rs']
+          files = ['src/search/external_embedder.rs', 'src/search/external_embedder/tests.rs', 'src/search/embedder_registry.rs', 'src/search/embedder_registry/local.rs', 'src/search/model_manager.rs', 'src/indexer/semantic.rs', 'src/indexer/semantic/engine.rs', 'src/lib.rs']
           def digest(data):
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
           receipt = {'source_commit': os.environ['GITHUB_SHA'], 'blobs': {name: digest(Path(name).read_bytes()) for name in files}}
@@ -53,7 +54,6 @@ jobs:
           if-no-files-found: error
           retention-days: 3
   native:
-    needs: source
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -73,6 +73,8 @@ jobs:
           components: clippy, rustfmt
       - name: External provider fake-server regressions
         run: cargo test --locked --lib search::external_embedder::tests -- --nocapture
+      - name: Provider selection and retained local registry regressions
+        run: cargo test --locked --lib search::embedder_registry -- --nocapture
       - name: External provider formatting
         if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/search/external_embedder.rs src/search/external_embedder/tests.rs
+        run: rustfmt --edition 2024 --check --config skip_children=true src/search/external_embedder.rs src/search/external_embedder/tests.rs src/search/embedder_registry.rs
