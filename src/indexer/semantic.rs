@@ -34,7 +34,11 @@ pub struct SemanticIndexer {
 
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
-        engine::SemanticIndexer::new(embedder_type, data_dir).map(|inner| Self { inner })
+        external_diagnostic_result(
+            crate::search::embedder_registry::selects_external(Some(embedder_type)),
+            engine::SemanticIndexer::new(embedder_type, data_dir),
+        )
+        .map(|inner| Self { inner })
     }
 
     /// Retain the existing artifact lease and checkpoint/publication path while
@@ -44,8 +48,11 @@ impl SemanticIndexer {
         data_dir: Option<&Path>,
         cancelled: crate::search::external_embedder::CancelCheck,
     ) -> Result<Self> {
-        engine::SemanticIndexer::new_with_cancel(embedder_type, data_dir, cancelled)
-            .map(|inner| Self { inner })
+        external_diagnostic_result(
+            crate::search::embedder_registry::selects_external(Some(embedder_type)),
+            engine::SemanticIndexer::new_with_cancel(embedder_type, data_dir, cancelled),
+        )
+        .map(|inner| Self { inner })
     }
 
     /// Explicit, consented configuration for embedding/backfill job owners.
@@ -53,7 +60,11 @@ impl SemanticIndexer {
         config: crate::search::external_embedder::ExternalEmbeddingConfig,
         cancelled: crate::search::external_embedder::CancelCheck,
     ) -> Result<Self> {
-        engine::SemanticIndexer::with_external_config(config, cancelled).map(|inner| Self { inner })
+        external_diagnostic_result(
+            true,
+            engine::SemanticIndexer::with_external_config(config, cancelled),
+        )
+        .map(|inner| Self { inner })
     }
 
     pub fn with_batch_size(self, batch_size: usize) -> Result<Self> {
@@ -83,7 +94,10 @@ impl SemanticIndexer {
             // Never do this in Drop: an error or unwind is not a durable commit.
             artifacts.after_success(manifest, &outcome.index_path);
         }
-        result
+        external_diagnostic_result(
+            crate::search::external_embedder::is_external_identity(self.inner.embedder_id()),
+            result,
+        )
     }
 
     pub fn run_backfill_batch(
@@ -182,3 +196,45 @@ impl SemanticIndexer {
 
 #[cfg(test)]
 mod artifact_lifecycle_tests;
+
+/// Legacy CLI callers display only the outer anyhow context. For an explicitly
+/// selected endpoint, retain its sanitized cause in that display while keeping
+/// the original error chain and typed downcasts intact. Local errors are unchanged.
+fn external_diagnostic_result<T>(external: bool, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if external {
+            let diagnostic = format!("{error:#}");
+            error.context(diagnostic)
+        } else {
+            error
+        }
+    })
+}
+
+#[cfg(test)]
+mod external_diagnostic_tests {
+    use super::*;
+
+    fn failure() -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::other(
+            "external_dimension_mismatch: expected 384 dimensions",
+        ))
+        .context("external provider preflight failed")
+    }
+
+    #[test]
+    fn external_display_preserves_provider_cause_and_typed_error() {
+        let error = external_diagnostic_result::<()>(true, Err(failure())).unwrap_err();
+        assert!(error.to_string().contains("external_dimension_mismatch"));
+        assert!(error.to_string().contains("external provider preflight failed"));
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn local_display_and_success_are_unchanged() {
+        let error = external_diagnostic_result::<()>(false, Err(failure())).unwrap_err();
+        assert_eq!(error.to_string(), "external provider preflight failed");
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(external_diagnostic_result(true, Ok(7)).unwrap(), 7);
+    }
+}

@@ -1172,7 +1172,7 @@ fn run_job_with_gate(
                 ));
             } else {
                 let (probe, model_installed) =
-                    minilm_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
+                    quality_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
                 steps.push(probe);
                 let mut tiers = vec!["fast"];
                 if model_installed {
@@ -1328,7 +1328,7 @@ pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
     }
     step.ok = true;
     step.skipped_reason = Some(format!(
-        "semantic model unavailable (exit {code}); run `cass models install` to enable this tier"
+        "semantic provider unavailable (exit {code}); check the worker diagnostic and external consent/configuration, or run `cass models install` for the selected local model"
     ));
     true
 }
@@ -1388,6 +1388,36 @@ fn bounded_reason(message: &str) -> String {
         reason.push('…');
     }
     reason
+}
+
+/// External selection is explicit policy, not discovery of a configured URL.
+/// The quality worker enforces consent and preflight; planning sends no text.
+fn quality_model_probe(
+    binary: &Path,
+    data_dir: &Path,
+    log: Option<&mut File>,
+) -> (StepReport, bool) {
+    let policy = crate::search::policy::SemanticPolicy::resolve(
+        &crate::search::policy::CliSemanticOverrides::default(),
+    );
+    quality_model_probe_with_policy(&policy, || minilm_model_probe(binary, data_dir, log))
+}
+
+fn quality_model_probe_with_policy(
+    policy: &crate::search::policy::SemanticPolicy,
+    local_probe: impl FnOnce() -> (StepReport, bool),
+) -> (StepReport, bool) {
+    if crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder)) {
+        (
+            skipped_step(
+                "models-status",
+                "external quality provider explicitly selected; consent and preflight are checked by the backfill worker",
+            ),
+            true,
+        )
+    } else {
+        local_probe()
+    }
 }
 
 /// Probe whether the MiniLM model is installed via `models status --json`.
@@ -1748,6 +1778,26 @@ mod tests {
             backfill_worker_attempts(&step(true, Some(paused_after_checkpoint)), 2),
             Some(2)
         );
+    }
+
+    #[test]
+    fn external_quality_schedule_does_not_require_minilm_or_probe_http() {
+        let mut policy = crate::search::policy::SemanticPolicy::compiled_defaults();
+        policy.quality_tier_embedder = "external".into();
+        let (step, admitted) = quality_model_probe_with_policy(&policy, || {
+            panic!("external scheduling must not probe local assets")
+        });
+        assert!(admitted);
+        assert!(
+            step.skipped_reason
+                .unwrap()
+                .contains("consent and preflight")
+        );
+        policy.quality_tier_embedder = "minilm".into();
+        let (_, admitted) = quality_model_probe_with_policy(&policy, || {
+            (skipped_step("models-status", "missing local model"), false)
+        });
+        assert!(!admitted, "the default must retain local model admission");
     }
 
     #[test]

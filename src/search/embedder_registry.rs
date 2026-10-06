@@ -24,8 +24,23 @@ pub use local::{
     REQUIRED_NATIVE_MODEL_FILES, RegisteredEmbedder,
 };
 
-fn selects_external(name: Option<&str>) -> bool {
+pub fn selects_external(name: Option<&str>) -> bool {
     name.is_some_and(|name| name.trim().eq_ignore_ascii_case(EXTERNAL_EMBEDDER))
+}
+
+/// Validate a named selection without constructing a client or sending probes.
+/// External consent/configuration is independent of local model installation.
+pub fn validate_selection(data_dir: &Path, name: &str) -> EmbedderResult<()> {
+    if selects_external(Some(name)) {
+        ExternalEmbeddingConfig::from_env()?
+            .ok_or_else(|| embedder::EmbedderError::EmbedderUnavailable {
+                model: EXTERNAL_EMBEDDER.into(),
+                reason: "external_disabled: set CASS_EXTERNAL_EMBEDDINGS=1 to consent to sending text outside the process".into(),
+            })?;
+        Ok(())
+    } else {
+        EmbedderRegistry::new(data_dir).validate(name).map(|_| ())
+    }
 }
 
 /// Load the explicitly selected provider. Missing local assets and external

@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[path = "external_backfill_runtime/cli.rs"]
+mod cli;
+
 const GOOD: usize = 0;
 const BAD_DIMENSION: usize = 1;
 const PARTIAL: usize = 2;
@@ -31,6 +34,8 @@ struct State {
     good_requests_before_fault: AtomicUsize,
     cancel: Arc<AtomicBool>,
     stopped: AtomicBool,
+    hold_corpus_reply: AtomicBool,
+    corpus_waiting: AtomicBool,
     inputs: Mutex<Vec<Vec<String>>>,
 }
 
@@ -51,6 +56,8 @@ impl Server {
             good_requests_before_fault: AtomicUsize::new(0),
             cancel: Arc::new(AtomicBool::new(false)),
             stopped: AtomicBool::new(false),
+            hold_corpus_reply: AtomicBool::new(false),
+            corpus_waiting: AtomicBool::new(false),
             inputs: Mutex::new(Vec::new()),
         });
         let shared = Arc::clone(&state);
@@ -166,6 +173,20 @@ fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
         .lock()
         .expect("fake inputs")
         .push(inputs.clone());
+    if inputs
+        .iter()
+        .any(|input| input.starts_with("private corpus"))
+        && state.hold_corpus_reply.load(Ordering::SeqCst)
+    {
+        state.corpus_waiting.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.hold_corpus_reply.load(Ordering::SeqCst)
+            && !state.stopped.load(Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     let configured_fault = state.fault.load(Ordering::SeqCst);
     let fault = if configured_fault != GOOD
         && state.good_requests_before_fault.load(Ordering::SeqCst) > 0

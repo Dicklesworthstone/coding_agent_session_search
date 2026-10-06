@@ -10004,6 +10004,8 @@ fn storage_semantic_identity_tier(tier: SemanticTierKind) -> SemanticIdentityTie
 fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
     if embedder_id == "fnv1a-384" {
         "hash".to_string()
+    } else if crate::search::external_embedder::is_external_identity(embedder_id) {
+        embedder_id.to_owned()
     } else {
         crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
             .and_then(crate::search::model_download::ModelManifest::for_embedder)

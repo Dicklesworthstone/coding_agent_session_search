@@ -465,7 +465,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
-        /// Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy
+        /// Embedder for semantic indexing (hash, minilm, multilingual-minilm, external); defaults to semantic policy
         #[arg(long)]
         embedder: Option<String>,
 
@@ -2612,7 +2612,7 @@ pub enum ModelsCommand {
         /// Semantic tier to backfill: fast or quality
         #[arg(long, default_value = "fast")]
         tier: String,
-        /// Embedder implementation: hash, minilm, or multilingual-minilm
+        /// Embedder implementation: hash, minilm, multilingual-minilm, or opt-in external
         #[arg(long)]
         embedder: Option<String>,
         /// Maximum canonical conversations to process in this batch
@@ -31051,13 +31051,16 @@ fn configure_bounded_search_semantics(
         .and_then(|value| {
             if value.trim().eq_ignore_ascii_case("hash") {
                 Some("hash")
+            } else if crate::search::embedder_registry::selects_external(Some(&value)) {
+                Some("external")
             } else {
                 crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
             }
         });
     let requested_model = semantic_opts.model.as_deref().or(env_model);
     if let Some(model_name) = semantic_opts.model.as_deref()
-        && let Err(error) = registry.validate(model_name)
+        && let Err(error) =
+            crate::search::embedder_registry::validate_selection(&data_dir, model_name)
     {
         return Err(CliError {
             code: 15,
@@ -31861,6 +31864,8 @@ fn run_cli_search(
             .and_then(|value| {
                 if value.trim().eq_ignore_ascii_case("hash") {
                     Some("hash")
+                } else if crate::search::embedder_registry::selects_external(Some(&value)) {
+                    Some("external")
                 } else {
                     crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
                 }
@@ -31871,7 +31876,8 @@ fn run_cli_search(
     let requested_model = semantic_opts.model.as_deref().or(env_model);
     if semantic_requested
         && let Some(model_name) = semantic_opts.model.as_deref()
-        && let Err(error) = registry.validate(model_name)
+        && let Err(error) =
+            crate::search::embedder_registry::validate_selection(&data_dir, model_name)
     {
         return Err(CliError {
             code: 15,
@@ -123431,6 +123437,9 @@ fn resolve_semantic_index_embedder(raw: Option<&str>) -> String {
     {
         return "hash".to_string();
     }
+    if crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder)) {
+        return "external".to_string();
+    }
     let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
         &policy.quality_tier_embedder,
     ) else {
@@ -123477,14 +123486,33 @@ fn run_models_backfill(
             fmt
         }
     });
-    let mut shutdown = IndexShutdownSignals::new(true).map_err(|error| CliError {
+    let shutdown = IndexShutdownSignals::new(true).map_err(|error| CliError {
         code: 5,
         kind: CliErrorKind::SemanticBackfill.kind_str(),
         message: format!("Failed to install backfill shutdown signals: {error}"),
         hint: None,
         retryable: true,
     })?;
-    let mut retained = RetainedBackfillModel::default();
+    // The HTTP provider polls the same signal streams before/after each request.
+    // There is no detached listener or inference worker retaining the archive lock.
+    let shutdown = std::sync::Arc::new(std::sync::Mutex::new(shutdown));
+    let exit_code = || {
+        shutdown
+            .lock()
+            .map_or(Some(130), |mut signals| signals.poll_exit_code())
+    };
+    let cancelled: crate::search::external_embedder::CancelCheck = {
+        let shutdown = std::sync::Arc::clone(&shutdown);
+        std::sync::Arc::new(move || {
+            shutdown
+                .lock()
+                .map_or(true, |mut signals| signals.poll_exit_code().is_some())
+        })
+    };
+    let mut retained = RetainedBackfillModel {
+        cancelled: Some(cancelled),
+        ..RetainedBackfillModel::default()
+    };
     let mut attempted = 0u32;
     let mut completed = 0u32;
     let mut last_report = None;
@@ -123494,7 +123522,7 @@ fn run_models_backfill(
     loop {
         // A received signal stops at a durable batch boundary. Each completed
         // helper call has already dropped its archive, manifest and lock.
-        if let Some(code) = shutdown.poll_exit_code() {
+        if let Some(code) = exit_code() {
             failure = Some(CliError {
                 code,
                 kind: CliErrorKind::SemanticBackfill.kind_str(),
@@ -123536,12 +123564,24 @@ fn run_models_backfill(
                     && made_progress;
                 last_report = Some(report);
                 // Still honor a signal delivered during the final batch.
-                if !continue_backfill && shutdown.poll_exit_code().is_none() {
+                if !continue_backfill && exit_code().is_none() {
                     break;
                 }
             }
-            Err(error) if last_report.is_none() => return Err(error),
             Err(error) => {
+                let error = match exit_code() {
+                    Some(code) => CliError {
+                        code,
+                        kind: CliErrorKind::SemanticBackfill.kind_str(),
+                        message: "Semantic backfill cancelled; unfinished HTTP batch was not checkpointed".into(),
+                        hint: Some("Rerun the command to resume from the last durable checkpoint".into()),
+                        retryable: true,
+                    },
+                    None => error,
+                };
+                if last_report.is_none() && !matches!(error.code, 130 | 143) {
+                    return Err(error);
+                }
                 failure = Some(error);
                 break;
             }
@@ -123622,6 +123662,7 @@ fn run_models_backfill(
 struct RetainedBackfillModel {
     indexer: Option<crate::indexer::semantic::SemanticIndexer>,
     initializations: u32,
+    cancelled: Option<crate::search::external_embedder::CancelCheck>,
 }
 
 fn run_models_backfill_batch(
@@ -123673,7 +123714,19 @@ fn run_models_backfill_batch(
             TierKind::Fast => "hash".to_string(),
             TierKind::Quality => resolve_semantic_index_embedder(None),
         });
-    let embedder_valid = embedder_type == "hash"
+    let external = crate::search::embedder_registry::selects_external(Some(&embedder_type));
+    if external && tier != TierKind::Quality {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: "External embeddings require --tier quality; the fast tier remains local"
+                .into(),
+            hint: Some("Use --tier quality --embedder external".into()),
+            retryable: false,
+        });
+    }
+    let embedder_valid = external
+        || embedder_type == "hash"
         || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
             .is_some();
     if !embedder_valid {
@@ -123682,7 +123735,7 @@ fn run_models_backfill_batch(
             kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
             hint: Some(
-                "Use --embedder hash, --embedder minilm (alias fastembed), or --embedder multilingual-minilm"
+                "Use --embedder hash, --embedder minilm (alias fastembed), --embedder multilingual-minilm, or --tier quality --embedder external"
                     .into(),
             ),
             retryable: false,
@@ -123752,18 +123805,25 @@ fn run_models_backfill_batch(
     let RetainedBackfillModel {
         indexer: retained_indexer,
         initializations: model_initializations,
+        cancelled,
     } = retained;
     let indexer = match retained_indexer {
         Some(indexer) => indexer,
         vacant => vacant.insert({
             let indexer =
-                SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
+                SemanticIndexer::new_with_cancel(
+                    &embedder_type,
+                    Some(&data_dir),
+                    cancelled.clone().unwrap_or_else(|| std::sync::Arc::new(|| false)),
+                ).map_err(|e| CliError {
                     code: 20,
                     kind: CliErrorKind::Model.kind_str(),
                     message: format!(
                         "Failed to initialize semantic embedder '{embedder_type}': {e}"
                     ),
-                    hint: Some(if embedder_type == "fastembed" {
+                    hint: Some(if external {
+                        "Check CASS_EXTERNAL_EMBEDDINGS consent and CASS_EXTERNAL_EMBEDDING_* configuration; no local provider is substituted".into()
+                    } else if embedder_type == "fastembed" {
                         "Run 'cass models install -y' or retry with --embedder hash".into()
                     } else {
                         "Use --embedder hash or install the selected embedder model".into()
@@ -123792,7 +123852,13 @@ fn run_models_backfill_batch(
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
-    let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
+    // A corrupt external ledger is not permission to discard durable progress.
+    let mut manifest = if external {
+        SemanticManifest::load(&data_dir).map(Option::unwrap_or_default)
+    } else {
+        SemanticManifest::load_or_default(&data_dir)
+    }
+    .map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::SemanticManifest.kind_str(),
         message: format!("Failed to load semantic manifest: {e}"),
@@ -123803,7 +123869,11 @@ fn run_models_backfill_batch(
         crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
             .and_then(ModelManifest::for_embedder)
             .unwrap_or_else(ModelManifest::minilm_v2);
-    let model_revision = if embedder_type == "hash" {
+    let model_revision = if external {
+        // Bound to this retained provider's endpoint/model/dimension/revision,
+        // never the local MiniLM manifest or a later environment reread.
+        indexer.embedder_id().to_owned()
+    } else if embedder_type == "hash" {
         "hash".to_string()
     } else {
         model_manifest.revision.clone()
