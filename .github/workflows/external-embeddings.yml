@@ -81,6 +81,16 @@ jobs:
           assert set(after) == allowed
           for name, content in after.items():
               assert digest(content.encode()) == payload['results'][name], name
+          # Preserve the provider's sanitized root error through anyhow context.
+          diagnostics = [
+              ("Failed to initialize semantic embedder '{embedder_type}': {e}", "Failed to initialize semantic embedder '{embedder_type}': {e:#}"),
+              ("Semantic backfill failed: {e}", "Semantic backfill failed: {e:#}"),
+          ]
+          for old, new in diagnostics:
+              assert after['src/lib.rs'].count(old) == 1
+              after['src/lib.rs'] = after['src/lib.rs'].replace(old, new, 1)
+          assert digest(after['src/lib.rs'].encode()) == '945839a706c88a44d58f2e1d2fe758bb36aa61b8'
+          for name, content in after.items():
               path = Path(name)
               path.parent.mkdir(parents=True, exist_ok=True)
               path.write_text(content)
