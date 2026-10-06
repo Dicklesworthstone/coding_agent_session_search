@@ -15,6 +15,7 @@ on:
       - 'src/search/semantic_reader/publication/**'
       - 'src/bin/cass-semantic-reclaim.rs'
       - 'tests/semantic_artifact_reclaim_cli.rs'
+      - 'tests/semantic_rebuild_publication.rs'
       - 'scripts/check_dependency_features.py'
       - 'scripts/tests/test_dependency_features.py'
       - '.github/workflows/semantic-artifact-recovery.yml'
@@ -51,6 +52,7 @@ jobs:
         run: |
           git rev-parse HEAD
           git hash-object build.rs Cargo.toml Cargo.lock src/indexer/semantic.rs
+          git hash-object src/indexer/semantic/delegate.rs tests/semantic_rebuild_publication.rs
           rustc --version
           cargo --version
       - name: Run real lifecycle, approval and separate-process CLI regressions
@@ -69,6 +71,9 @@ jobs:
               raise SystemExit('Expected recovery tests did not run; zero tests is not success')
           PY
           }
+          run_suite rebuild-publication --test semantic_rebuild_publication
+          run_suite rebuild-progress --lib indexer::semantic::delegate::full_rebuild_tests
+          cargo clippy --locked --lib -- -D warnings
           run_suite unchanged --lib indexer::semantic::unchanged::tests
           run_suite lease --lib indexer::semantic::artifacts::lease_tests
           run_suite lifecycle --lib indexer::semantic::artifact_lifecycle_tests
