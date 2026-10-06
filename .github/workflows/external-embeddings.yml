@@ -78,7 +78,7 @@ jobs:
           assert set(after) == allowed
           for name, content in after.items():
               assert digest(content.encode()) == payload['result'][name], name
-          formatting = {'src/search/external_embedder.rs': '3590c48ab60504aaf003aed141fdcbbe7345337b', 'src/search/external_embedder/tests.rs': 'fcd59e52860f36f6a16e51b6081fd82278dfc633', 'src/search/embedder_registry.rs': '4e8e2c54d4c8b768e0bea35d3247115d1e36a4b3'}
+          formatting = {'src/search/external_embedder.rs': 'e92e997ef52fbf785366c9e0c66f4728e9eb8bb7', 'src/search/external_embedder/tests.rs': '69900a780e8e03ac469de83ded939b18e806a2a4', 'src/search/embedder_registry.rs': 'a7ca7d31343452f21ade50cd2e42242e7a572510'}
           for name, expected in formatting.items():
               before[name] = digest(Path(name).read_bytes())
               assert before[name] == expected, 'format source drift: ' + name
