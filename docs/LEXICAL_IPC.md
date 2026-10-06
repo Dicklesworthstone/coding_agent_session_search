@@ -64,8 +64,9 @@ target/release/cass-query \
 
 `--full-verify` discards and reaps the retained native process before starting a
 new `cass serve` reader. It is not a flag that merely changes output labeling.
-The native frontend rejects a response that says a retained reader satisfied
-this request. Later requests can reuse the newly admitted reader.
+Both frontends reject a response that says a retained reader satisfied this
+request. The owner also refuses such a report from a freshly spawned native
+worker. Later requests can reuse the newly admitted reader on eligible storage.
 
 To bypass the owner and socket completely, use a fixed index directly:
 
@@ -88,6 +89,21 @@ ctime, and directory membership. Retained handles prevent inode recycling
 from being confused with the admitted file. This includes manifests and
 sidecars, not just segment payloads.
 
+Reuse additionally requires every pinned descriptor, including nested mounts,
+to belong to ext2/3/4, XFS, Btrfs, F2FS or tmpfs. The owner joins each descriptor's
+`/proc/self/fdinfo` mount ID to `/proc/self/mountinfo` and checks its device;
+it never guesses the filesystem from a pathname prefix. It retains the mount
+namespace descriptor and rechecks the exact selected mount records before and
+after reuse. Mount IDs alone are not persistent identities. An unrelated mount
+does not invalidate the reader, but a selected mount or namespace change does.
+
+Unknown filesystems, NFS/CIFS, FUSE and overlay storage always use fresh strict
+workers. Missing, malformed, ambiguous, oversized or unreadable procfs metadata
+also disables reuse without disabling an otherwise valid strict search. Reads
+are capped at 4 MiB/16,384 mount records and 16 KiB per descriptor's metadata.
+This eligibility state is memory-only and is released with the guard; it is
+not a new on-disk receipt or an immutable-generation certificate.
+
 An observed change before a query destroys the old native reader and requires
 fresh strict admission. Corruption is not hidden by falling back to the old
 snapshot. An observed change during a query discards that query's result,
@@ -99,8 +115,8 @@ writes followed by mtime restoration are covered by implementation regressions.
 immutable-publication discipline, like the underlying retained-reader service.
 It does not certify an immutable generation, detect every media fault or shared
 writable-mapping mutation, defend against an attacker preserving change
-metadata, or provide a cross-archive freshness guarantee. Use coherent local
-filesystems; network/cached filesystem behavior is not qualified. A change after
+metadata, or provide a cross-archive freshness guarantee. Unsupported storage
+is excluded from reuse, not promoted to an integrity guarantee. A change after
 the final guard check is a normal concurrency boundary. Use full verification
 or ordinary standalone admission when these retained-reader assumptions are
 not appropriate.
@@ -110,6 +126,13 @@ The response adds `admission.mode` (`strict_full` or `retained_guarded`),
 `persistent_proof: false`, and `immutable_generation_certified: false`.
 `owner_epoch` is a local successful-admission counter, not a database generation.
 The original native `snapshot` metadata is preserved.
+
+The owner derives its admission mode from the native `reader_reused` boolean,
+not merely from the worker process surviving. A service-side reader reclamation
+is reported as a new `strict_full` admission and increments the epoch. Missing,
+non-boolean or contradictory lifecycle reports fail closed; native workers
+cannot supply the owner's admission envelope. The Python client, like the
+native client, checks the complete admission contract before emitting success.
 
 ## Why this design
 
@@ -164,12 +187,17 @@ request is left running as a successful background continuation.
 
 ```sh
 python3 -S -m unittest discover -s scripts -p 'test_cass_lexical_ipc.py' -v
+python3 -S -m unittest discover -s scripts -p 'test_benchmark_lexical_ipc.py' -v
 cargo test --locked --bin cass-query
 ```
 
-The 20 Python tests run the real guard and socket implementation against a
-fake strict worker. They exercise fresh-process reuse, forced verification,
+The 37 IPC tests run the real guard and socket implementation against a
+fake strict worker, plus bounded metadata/protocol parsing tests. They exercise
+fresh-process reuse on real tmpfs, forced verification,
 valid publication, adversarial mutations, corrupted protocol/lock state,
-unsafe paths, timeout/child cleanup, duplicate owners, and descriptor cleanup.
+unsupported/nested filesystems, mount/namespace changes, unsafe paths,
+timeout/child cleanup, duplicate owners, and descriptor cleanup. Eight workload
+harness tests separately check phase separation and rejection of invalid runs;
+the positive workload fixture also uses tmpfs, without skipping the reuse phase.
 They are not Quill tests or CASS performance measurements. Native client tests
 must be run separately; adding their definitions is not execution evidence.

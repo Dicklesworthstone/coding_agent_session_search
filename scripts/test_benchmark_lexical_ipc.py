@@ -18,7 +18,11 @@ class BenchmarkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.home = Path(self.temp.name)
-        self.index = self.home / "index"
+        # The positive comparison must really exercise supported local reuse.
+        # Leave the fake executable on an executable mount, not /dev/shm.
+        self.index_temp = tempfile.TemporaryDirectory(dir="/dev/shm")
+        self.addCleanup(self.index_temp.cleanup)
+        self.index = Path(self.index_temp.name) / "index"
         self.index.mkdir()
         payload = b"alpha beta " * 1024
         (self.index / "segment.qseg").write_bytes(payload)
@@ -87,6 +91,18 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_benchmark_refuses_corrupted_worker_output(self):
         self.mode("bad_json")
+        result, evidence = self.benchmark()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(evidence.exists())
+
+    def test_benchmark_refuses_forged_reuse_on_fresh_admission(self):
+        self.mode("forged_reuse")
+        result, evidence = self.benchmark()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(evidence.exists())
+
+    def test_benchmark_refuses_unmeasured_reader_reclamation(self):
+        self.mode("drop_reader")
         result, evidence = self.benchmark()
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(evidence.exists())

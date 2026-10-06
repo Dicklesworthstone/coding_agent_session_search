@@ -5,6 +5,8 @@ No persistent verification receipt and no alternate search engine. The owner is
 foreground-only. Index files must follow Quill's immutable-publication contract;
 identity guards detect ordinary filesystem changes, not metadata-invisible
 writes or media faults. --full-verify discards the reader before each admission.
+Reuse requires every guarded descriptor to belong to a supported local Linux
+filesystem. Unknown, network, FUSE and overlay storage uses fresh strict readers.
 """
 from __future__ import annotations
 
@@ -28,6 +30,11 @@ REQUEST_LIMIT = 64 * 1024
 RESPONSE_LIMIT = 1024 * 1024
 MAX_FILES = 4096
 MAX_DEPTH = 16
+MOUNTINFO_LIMIT = 4 * 1024 * 1024
+FDINFO_LIMIT = 16 * 1024
+MAX_MOUNTS = 16384
+LOCAL_FILESYSTEMS = frozenset((b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs",
+                               b"f2fs", b"tmpfs"))
 
 
 class Failure(Exception):
@@ -67,14 +74,126 @@ def open_directory(path):
         raise
 
 
+def kernel_bytes(path, limit):
+    """Bound advisory procfs metadata before parsing; failure disables reuse."""
+    with open(path, "rb") as source:
+        data = source.read(limit + 1)
+    if not data or len(data) > limit or not data.endswith(b"\n"):
+        raise ValueError("unavailable or oversized kernel metadata")
+    return data
+
+
+def kernel_number(word):
+    if not word.isdigit() or len(word) > 20:
+        raise ValueError("invalid kernel identifier")
+    return int(word)
+
+
+def mount_records(data):
+    """Parse mount IDs, never infer a filesystem from a pathname prefix.
+
+    Linux documents fdinfo's mnt_id as the mountinfo ID of the opened file.
+    IDs are namespace-local and reusable after unmount; callers retain both
+    the namespace descriptor and the exact records, not just those integers.
+    Unknown optional fields before the separator are intentionally ignored.
+    """
+    if not data or len(data) > MOUNTINFO_LIMIT or not data.endswith(b"\n"):
+        raise ValueError("invalid mount table size or framing")
+    records = {}
+    for line in data.splitlines():
+        fields = line.split(b" - ")
+        if len(fields) != 2 or len(records) >= MAX_MOUNTS:
+            raise ValueError("invalid or oversized mount table")
+        before, after = fields[0].split(), fields[1].split()
+        if len(before) < 6 or len(after) != 3:
+            raise ValueError("incomplete mount record")
+        mount_id = kernel_number(before[0])
+        kernel_number(before[1])
+        device = before[2].split(b":")
+        if len(device) != 2 or not mount_id or mount_id in records:
+            raise ValueError("duplicate or invalid mount identifier")
+        major, minor = map(kernel_number, device)
+        if not before[3].startswith(b"/") or not before[4].startswith(b"/"):
+            raise ValueError("invalid mount root")
+        records[mount_id] = (major, minor, after[0], line)
+    return records
+
+
+def descriptor_mount(fd):
+    data = kernel_bytes(f"/proc/self/fdinfo/{fd}", FDINFO_LIMIT)
+    values = [line.partition(b":")[2].strip() for line in data.splitlines()
+              if line.partition(b":")[0] == b"mnt_id"]
+    if len(values) != 1:
+        raise ValueError("missing or ambiguous descriptor mount")
+    return kernel_number(values[0])
+
+
+def namespace_identity():
+    info = os.stat("/proc/self/ns/mnt")
+    return info.st_dev, info.st_ino
+
+
+class LocalMounts:
+    """Ephemeral eligibility only: no byte witness and no persistent proof."""
+    def __init__(self, nodes):
+        self.namespace_fd = None
+        self.records = {}
+        try:
+            self.namespace_fd = os.open("/proc/self/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
+            info = os.fstat(self.namespace_fd)
+            self.namespace = (info.st_dev, info.st_ino)
+            table = mount_records(kernel_bytes("/proc/self/mountinfo", MOUNTINFO_LIMIT))
+            for fd, _parent, _name, identity, _names in nodes:
+                mount_id = descriptor_mount(fd)
+                record = table.get(mount_id)
+                device = (os.major(identity[0]), os.minor(identity[0]))
+                if (record is None or record[:2] != device or
+                        record[2] not in LOCAL_FILESYSTEMS):
+                    raise ValueError("descriptor is not on supported local storage")
+                self.records[mount_id] = record
+            if not self.unchanged():
+                raise ValueError("mount eligibility changed during capture")
+        except BaseException:
+            self.close()
+            raise
+
+    @classmethod
+    def capture(cls, nodes):
+        try:
+            return cls(nodes)
+        except (OSError, ValueError):
+            # Advisory admission failure must not prevent an ordinary strict
+            # search. In particular, procfs can be absent or permission-limited.
+            return None
+
+    def unchanged(self):
+        if self.namespace_fd is None or not self.records:
+            return False
+        try:
+            if namespace_identity() != self.namespace:
+                return False
+            current = mount_records(kernel_bytes("/proc/self/mountinfo", MOUNTINFO_LIMIT))
+            return (all(current.get(key) == value for key, value in self.records.items())
+                    and namespace_identity() == self.namespace)
+        except (OSError, ValueError):
+            return False
+
+    def close(self):
+        if self.namespace_fd is not None:
+            os.close(self.namespace_fd)
+            self.namespace_fd = None
+
+
 class Guard:
     """Pin every inode, and check both the handles and their directory names."""
     def __init__(self, path):
         self.path = os.path.abspath(path)
         self.nodes = []
+        self.local_mounts = None
         try:
             fd = open_directory(self.path)
             self._capture(fd, None, None, 0)
+            self.local_mounts = LocalMounts.capture(self.nodes)
             if not self.unchanged():
                 raise Failure("index_changed", "Index changed during admission.", True)
         except BaseException:
@@ -119,7 +238,14 @@ class Guard:
         except (OSError, Failure):
             return False
 
+    def reusable(self):
+        return (self.local_mounts is not None and self.local_mounts.unchanged()
+                and self.unchanged())
+
     def close(self):
+        if self.local_mounts is not None:
+            self.local_mounts.close()
+            self.local_mounts = None
         for node in reversed(self.nodes):
             os.close(node[0])
         self.nodes.clear()
@@ -163,6 +289,47 @@ def remaining(deadline):
     return budget
 
 
+def validate_response(response, request_id, full_verify=None):
+    """Validate native lifecycle or the owner's stronger client envelope.
+
+    A process being alive is not evidence that its native reader was reused.
+    The caller must reconcile the native boolean with the process it started;
+    clients additionally require an admission policy matching their request.
+    """
+    allowed = {"schema_version", "id", "ok", "result", "error"}
+    if full_verify is not None:
+        allowed.add("admission")
+    if (set(response) - allowed or type(response.get("id")) is not int or
+            response["id"] != request_id or type(response.get("ok")) is not bool or
+            type(response.get("schema_version")) is not int or response["schema_version"] != 1):
+        raise Failure("worker_protocol", "Mismatched response envelope.")
+    if not response["ok"]:
+        if (not isinstance(response.get("error"), dict) or response.get("result") is not None
+                or response.get("admission") is not None):
+            raise Failure("worker_protocol", "Malformed error response.")
+        return
+    result = response.get("result")
+    if (not isinstance(result, dict) or response.get("error") is not None
+            or type(result.get("reader_reused")) is not bool):
+        raise Failure("worker_protocol", "Missing or contradictory native lifecycle.")
+    if full_verify is None:
+        return
+    admission = response.get("admission")
+    fields = {"mode", "owner_epoch", "full_verify_requested", "persistent_proof",
+              "file_identity_checked", "immutable_generation_certified"}
+    if (not isinstance(admission, dict) or set(admission) != fields or
+            type(admission["owner_epoch"]) is not int or
+            not 0 < admission["owner_epoch"] < 2**64 or
+            admission["full_verify_requested"] is not full_verify or
+            admission["persistent_proof"] is not False or
+            admission["file_identity_checked"] is not True or
+            admission["immutable_generation_certified"] is not False):
+        raise Failure("worker_protocol", "Invalid admission contract.")
+    expected = "retained_guarded" if result["reader_reused"] else "strict_full"
+    if admission["mode"] != expected or (full_verify and result["reader_reused"]):
+        raise Failure("worker_protocol", "Owner did not honor verification policy.")
+
+
 def exchange_pipes(process, request, deadline):
     """Bound the complete write/read, not just one blocking read operation."""
     data = memoryview(encode(request, REQUEST_LIMIT))
@@ -198,16 +365,7 @@ def exchange_pipes(process, request, deadline):
                         if tail or data:
                             raise Failure("worker_protocol", "Unexpected worker output.")
                         response = decode(line)
-                        if (type(response.get("id")) is not int or
-                                response["id"] != request["id"] or
-                                type(response.get("ok")) is not bool or
-                                type(response.get("schema_version")) is not int or
-                                response["schema_version"] != 1):
-                            raise Failure("worker_protocol", "Mismatched worker envelope.")
-                        if response["ok"] and not isinstance(response.get("result"), dict):
-                            raise Failure("worker_protocol", "Missing worker result.")
-                        if not response["ok"] and not isinstance(response.get("error"), dict):
-                            raise Failure("worker_protocol", "Missing worker error.")
+                        validate_response(response, request["id"])
                         return response
 
 
@@ -262,7 +420,7 @@ class Owner:
         deadline = min(deadline or float("inf"), time.monotonic() + self.timeout)
         full = request.get("full_verify", False)
         reused = (not full and self.process is not None and
-                  self.process.poll() is None and self.guard.unchanged())
+                  self.process.poll() is None and self.guard.reusable())
         try:
             if not reused:
                 self.close()
@@ -290,18 +448,28 @@ class Owner:
             remaining(deadline)
             if not self.guard.unchanged():
                 raise Failure("index_changed", "Index changed during the query.", True)
+            if reused and (self.guard.local_mounts is None or
+                           not self.guard.local_mounts.unchanged()):
+                raise Failure("index_changed", "Local reuse eligibility changed during the query.", True)
             if not response["ok"]:
                 self.close()
                 return response
-            if not reused:
+            native_reused = response["result"]["reader_reused"]
+            if native_reused and not reused:
+                raise Failure("worker_protocol", "Fresh worker claimed an existing reader.")
+            # The native service may reclaim its own reader. Report its actual
+            # strict re-admission rather than claiming a hit because the process
+            # survived, and never accept reuse from a newly spawned worker.
+            if not native_reused:
                 self.epoch += 1
             response["admission"] = {
-                "mode": "retained_guarded" if reused else "strict_full",
+                "mode": "retained_guarded" if native_reused else "strict_full",
                 "owner_epoch": self.epoch, "full_verify_requested": full,
                 "persistent_proof": False, "file_identity_checked": True,
                 "immutable_generation_certified": False,
             }
             # Validate the augmented envelope before allowing any output.
+            validate_response(response, request["id"], full)
             encode(response, RESPONSE_LIMIT)
             return response
         except BaseException:
@@ -423,11 +591,7 @@ def query(endpoint, request, timeout):
             check_peer(stream)
             stream.sendall(encode(request, REQUEST_LIMIT))
             response = receive(stream, RESPONSE_LIMIT, deadline)
-            if (type(response.get("id")) is not int or response["id"] != request["id"] or
-                    type(response.get("ok")) is not bool or
-                    type(response.get("schema_version")) is not int or
-                    response["schema_version"] != 1):
-                raise Failure("worker_protocol", "Mismatched IPC response envelope.")
+            validate_response(response, request["id"], request.get("full_verify", False))
             return response
     finally:
         os.close(directory)
