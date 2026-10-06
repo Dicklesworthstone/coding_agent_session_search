@@ -1,0 +1,65 @@
+name: Lexical admission contract
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/search/**'
+      - 'tests/lexical_admission_contract.rs'
+      - 'examples/lexical_admission_fixture.rs'
+      - 'scripts/benchmark_lexical_admission.py'
+      - '.github/workflows/lexical-admission.yml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: lexical-admission-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  admission:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record exact qualification sources
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/cass-commit.txt
+          git archive --format=tar.gz -o evidence/cass-sources.tar.gz HEAD
+          python3 - <<'PY'
+          import hashlib, pathlib, tomllib, urllib.request
+          lock = tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+          p = next(p for p in lock['package'] if p['name'] == 'frankensearch-quill')
+          data = urllib.request.urlopen(f"https://static.crates.io/crates/{p['name']}/{p['name']}-{p['version']}.crate", timeout=60).read()
+          assert hashlib.sha256(data).hexdigest() == p['checksum'], 'registry source checksum mismatch'
+          pathlib.Path('evidence/quill-source.crate').write_bytes(data)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lexical-admission-sources
+          path: evidence/
+          retention-days: 7
+      - name: Install pinned Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and exercise strict production admission
+        run: |
+          cargo test --locked --release --test lexical_admission_contract -- --nocapture
+          cargo build --locked --release --bin cass --example lexical_admission_fixture
+      - name: Measure fresh and retained workloads separately
+        run: |
+          target/release/examples/lexical_admission_fixture "$RUNNER_TEMP/lexical-admission-index" 4096
+          python3 scripts/benchmark_lexical_admission.py --cass target/release/cass \
+            --index "$RUNNER_TEMP/lexical-admission-index" --rounds 3 --output evidence/admission.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lexical-admission-results
+          path: evidence/*.json
+          if-no-files-found: warn
+          retention-days: 14
