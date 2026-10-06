@@ -1,0 +1,65 @@
+name: Guarded lexical IPC
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/*lexical_ipc.py'
+      - 'src/bin/cass-query.rs'
+      - 'src/search_service.rs'
+      - 'src/search/**'
+      - 'tests/lexical_admission_contract.rs'
+      - 'examples/lexical_admission_fixture.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/lexical-ipc.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: lexical-ipc-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise guarded owner and failure-aware workload harness
+        run: python3 -S -m unittest discover -s scripts -p 'test_*lexical_ipc.py' -v
+  native:
+    needs: protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record exact source revision
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/cass-commit.txt
+      - name: Install repository-pinned Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate native client and strict engine admission
+        run: |
+          cargo test --locked --release --bin cass-query
+          cargo test --locked --release --test lexical_admission_contract -- --nocapture
+          cargo build --locked --release --bin cass --bin cass-query --example lexical_admission_fixture
+      - name: Exercise actual CASS and native fresh-client workloads
+        run: |
+          target/release/examples/lexical_admission_fixture "$RUNNER_TEMP/lexical-ipc-index" 4096
+          python3 -S scripts/benchmark_lexical_ipc.py \
+            --cass target/release/cass --client target/release/cass-query \
+            --index "$RUNNER_TEMP/lexical-ipc-index" --query performance --rounds 3 \
+            --output evidence/lexical-ipc.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lexical-ipc-qualification
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
