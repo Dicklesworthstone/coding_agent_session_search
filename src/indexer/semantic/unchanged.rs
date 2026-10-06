@@ -33,6 +33,7 @@ pub(super) fn try_retain_completed(
     plan: &SemanticBackfillStoragePlan,
     sink: &SemanticProgressSink,
 ) -> Result<Option<SemanticBackfillBatchOutcome>> {
+    engine.check_external_cancelled()?;
     // Keep the existing constant-time cache-hit path; do not turn every
     // scheduled no-op into a full canonical scan.
     if engine
@@ -63,6 +64,7 @@ fn prove_unchanged<F>(
 where
     F: FnOnce() -> Result<()>,
 {
+    engine.check_external_cancelled()?;
     if manifest.checkpoint.is_some() || plan.max_conversations == 0 {
         return Ok(None);
     }
@@ -127,6 +129,7 @@ where
     // strings or retaining canonical message bodies. Visit vectors one at a time.
     let mut remaining = HashSet::with_capacity(index.record_count());
     for record in 0..index.record_count() {
+        engine.check_external_cancelled()?;
         if !remaining.insert(index.doc_id_at(record)?) {
             return Ok(None);
         }
@@ -147,6 +150,7 @@ where
     let mut changed = false;
     let mut visited = 0u64;
     engine::visit_packet_embedding_inputs_from_storage(storage, |input| {
+        engine.check_external_cancelled()?;
         if let Some(id) = engine::semantic_doc_id_for_input(&input) {
             visited = visited.saturating_add(1);
             // A duplicate canonical ID also fails: it was already removed.
@@ -164,6 +168,7 @@ where
         }
         Ok(())
     })?;
+    engine.check_external_cancelled()?;
     // Conversation coverage is independent of passage cardinality. Do not
     // preserve stale coverage counters just because a message moved parents.
     let (conversations, last_offset): (i64, i64) = storage.raw().query_row_map(
@@ -173,6 +178,7 @@ where
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
     )?;
     checkpoint()?;
+    engine.check_external_cancelled()?;
     // Detect mutation across the entire proof, including WAL-only commits,
     // restored mtimes, replaced pathnames, and a pinned old SQL snapshot.
     ensure!(
@@ -189,6 +195,8 @@ where
     {
         return Ok(None);
     }
+    // A cancelled proof cannot renew its skip receipt or report completion.
+    engine.check_external_cancelled()?;
     if let Err(error) = cache::refresh(
         data_dir,
         &archive_before,
@@ -287,5 +295,8 @@ impl ArchiveStamp {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cancellation_tests;
 
 mod cache;
