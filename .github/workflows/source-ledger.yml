@@ -13,7 +13,11 @@ permissions:
   contents: read
 jobs:
   native:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
       contents: write
@@ -108,7 +112,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: gh512-source-${{ github.sha }}
+          name: gh512-source-${{ github.sha }}-${{ matrix.os }}
           path: |
             gh512-source.tar.gz
             gh512-source-receipt.json
