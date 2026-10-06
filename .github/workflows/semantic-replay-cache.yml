@@ -8,6 +8,7 @@ on:
       - 'src/indexer/semantic/engine/snapshot_tests.rs'
       - 'scripts/patches/semantic-replay-cache.patch'
       - 'scripts/patches/semantic-snapshot-reuse.patch'
+      - 'scripts/patches/semantic-rebuild-safety.patch'
       - '.github/workflows/semantic-replay-cache.yml'
 permissions:
   contents: write
@@ -81,5 +82,72 @@ jobs:
         with:
           name: canonical-replay-evidence-${{ github.sha }}
           path: ${{ runner.temp }}/replay-evidence/
+          if-no-files-found: error
+          retention-days: 14
+  rebuild-safety:
+    # Qualify the data-preservation fix independently of the replay optimization.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Apply the exact rebuild-safety patch on the recorded main
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rebuild-safety-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/rebuild-safety-evidence/tested-base.txt"
+          patch=scripts/patches/semantic-rebuild-safety.patch
+          if git apply --check "$patch"; then
+            git apply "$patch"
+          else
+            # A separately completed integration is acceptable only if the
+            # production hunk is present and the real tests can be rerun.
+            git apply --reverse --check --include=src/indexer/semantic/engine.rs "$patch"
+            test -f tests/semantic_rebuild_safety.rs
+          fi
+          rustc --version | tee "$RUNNER_TEMP/rebuild-safety-evidence/toolchain.txt"
+          rustfmt --edition 2024 --config skip_children=true src/indexer/semantic/engine.rs
+          rustfmt --edition 2024 tests/semantic_rebuild_safety.rs
+          git diff --check
+          git diff -- src/indexer/semantic/engine.rs > "$RUNNER_TEMP/rebuild-safety-evidence/source.diff"
+          cp tests/semantic_rebuild_safety.rs "$RUNNER_TEMP/rebuild-safety-evidence/semantic_rebuild_safety.rs"
+      - name: Run real rebuild-preservation tests and library checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test semantic_rebuild_safety -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/rebuild-safety-evidence/rebuild-safety.log"
+          grep -Eq 'test result: ok\. 5 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/rebuild-safety-evidence/rebuild-safety.log"
+          cargo test --locked --lib semantic_reconciliation -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/rebuild-safety-evidence/reconciliation.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$RUNNER_TEMP/rebuild-safety-evidence/reconciliation.log"
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/rebuild-safety-evidence/clippy.log"
+      - name: Publish only the tested safety fix and its regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/indexer/semantic/engine.rs tests/semantic_rebuild_safety.rs
+          if git diff --cached --quiet; then
+            echo 'Rebuild safety already integrated; no commit required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(index): preserve the last valid semantic index on rejected rebuild' -m 'Drop the uncommitted FSVI writer without unlinking the prior destination or its acknowledged WAL. Preserve the backend error cause. Five real hash/FSVI regression tests, existing semantic-reconciliation tests and locked library Clippy passed in this run. No dependency or other integration changes.'
+          # A concurrent main update must reject publication, never be overwritten.
+          git push origin HEAD:refs/heads/main
+          git rev-parse HEAD | tee "$RUNNER_TEMP/rebuild-safety-evidence/published-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-rebuild-safety-${{ github.sha }}
+          path: ${{ runner.temp }}/rebuild-safety-evidence/
           if-no-files-found: error
           retention-days: 14
