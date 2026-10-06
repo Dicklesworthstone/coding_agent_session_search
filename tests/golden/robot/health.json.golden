@@ -326,7 +326,8 @@
       "load_severe_q": null,
       "psi_pressured_q": null,
       "psi_severe_q": null
-    }
+    },
+    "memory": "[LIVE_SAMPLE]"
   },
   "parallel_wal_shadow": {
     "recent_chunks": [],

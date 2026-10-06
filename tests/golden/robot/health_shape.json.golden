@@ -795,6 +795,9 @@
               "type": "null"
             }
           }
+        },
+        "memory": {
+          "type": "string"
         }
       }
     },

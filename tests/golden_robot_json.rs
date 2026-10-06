@@ -496,6 +496,15 @@ fn normalize_live_robot_values(value: &mut Value) {
                     ]),
                 );
             }
+            // The governor's resident-memory observation (92bee6cf, cc79e80b)
+            // is omitted until the sampler has run, and once present its
+            // figures follow host RAM, this process's RSS and the live policy
+            // decision. Like last_snapshot, it is a live sample: present or
+            // not, it becomes a placeholder, or the golden fails on every host
+            // but the one that wrote it.
+            if map.contains_key("recent_decisions") && map.contains_key("calibration") {
+                map.insert("memory".to_string(), json!("[LIVE_SAMPLE]"));
+            }
             let redact_result_content = map.contains_key("source_path")
                 && map.contains_key("line_number")
                 && map.contains_key("agent");
