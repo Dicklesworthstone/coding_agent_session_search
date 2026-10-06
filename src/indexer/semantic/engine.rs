@@ -85,6 +85,9 @@ pub fn expected_vector_space_revision(embedder_id: &str) -> Option<&'static str>
         "minilm-384" => Some(MINILM_VECTOR_SPACE_REVISION),
         "multilingual-minilm-384" => Some(MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION),
         "fnv1a-384" => Some(HASH_VECTOR_SPACE_REVISION),
+        id if crate::search::external_embedder::is_external_identity(id) => {
+            Some(crate::search::external_embedder::EXTERNAL_VECTOR_SPACE_REVISION)
+        }
         _ => None,
     }
 }
@@ -2410,6 +2413,28 @@ pub struct SemanticIndexer {
 
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
+        Self::new_with_cancel(embedder_type, data_dir, std::sync::Arc::new(|| false))
+    }
+
+    /// A job owner can share its cancellation flag with endpoint requests.
+    /// Defaults/local choices do not consult external configuration at all.
+    pub fn new_with_cancel(
+        embedder_type: &str,
+        data_dir: Option<&Path>,
+        cancelled: crate::search::external_embedder::CancelCheck,
+    ) -> Result<Self> {
+        use crate::search::external_embedder::{EXTERNAL_EMBEDDER, ExternalEmbedder};
+
+        if embedder_type.trim().eq_ignore_ascii_case(EXTERNAL_EMBEDDER) {
+            let embedder = ExternalEmbedder::from_env_with_cancel(cancelled)
+                .context("external embedding preflight failed; archive text was not sent")?;
+            return Ok(Self {
+                embedder: Box::new(embedder),
+                batch_size: resolved_default_batch_size(),
+                // Endpoint probes do not qualify the local exact-reuse contract.
+                exact_reuse: false,
+            });
+        }
         let exact_reuse = embedder_type == "hash"
             || FastEmbedder::canonical_name(embedder_type) == Some("minilm");
         let embedder: Box<dyn Embedder> = match embedder_type {
@@ -2430,6 +2455,22 @@ impl SemanticIndexer {
             embedder,
             batch_size: resolved_default_batch_size(),
             exact_reuse,
+        })
+    }
+
+    /// Construct a consented provider without global environment mutation.
+    /// Preflight completes before the indexer can read or persist archive rows.
+    pub fn with_external_config(
+        config: crate::search::external_embedder::ExternalEmbeddingConfig,
+        cancelled: crate::search::external_embedder::CancelCheck,
+    ) -> Result<Self> {
+        let embedder =
+            crate::search::external_embedder::ExternalEmbedder::connect(config, cancelled)
+                .context("external embedding preflight failed; archive text was not sent")?;
+        Ok(Self {
+            embedder: Box::new(embedder),
+            batch_size: resolved_default_batch_size(),
+            exact_reuse: false,
         })
     }
 

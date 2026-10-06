@@ -37,6 +37,25 @@ impl SemanticIndexer {
         engine::SemanticIndexer::new(embedder_type, data_dir).map(|inner| Self { inner })
     }
 
+    /// Retain the existing artifact lease and checkpoint/publication path while
+    /// sharing cancellation with the explicitly selected endpoint provider.
+    pub fn new_with_cancel(
+        embedder_type: &str,
+        data_dir: Option<&Path>,
+        cancelled: crate::search::external_embedder::CancelCheck,
+    ) -> Result<Self> {
+        engine::SemanticIndexer::new_with_cancel(embedder_type, data_dir, cancelled)
+            .map(|inner| Self { inner })
+    }
+
+    /// Explicit, consented configuration for embedding/backfill job owners.
+    pub fn with_external_config(
+        config: crate::search::external_embedder::ExternalEmbeddingConfig,
+        cancelled: crate::search::external_embedder::CancelCheck,
+    ) -> Result<Self> {
+        engine::SemanticIndexer::with_external_config(config, cancelled).map(|inner| Self { inner })
+    }
+
     pub fn with_batch_size(self, batch_size: usize) -> Result<Self> {
         self.inner
             .with_batch_size(batch_size)

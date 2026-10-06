@@ -19,103 +19,7 @@ on:
 permissions:
   contents: read
 jobs:
-  source:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Prepare exact reviewed runtime sources and export blobs without changing refs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, gzip, hashlib, json, os, subprocess, tarfile, urllib.request
-          from pathlib import Path
-          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
-          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
-          def request(path, body=None):
-              data = None if body is None else json.dumps(body).encode()
-              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  return json.load(response)
-          def digest(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          payload_sha = '889a6a96c7cc10dfa0eff51d22194f76fa94de71'
-          blob = request('/git/blobs/' + payload_sha)
-          assert blob['encoding'] == 'base64'
-          compressed = base64.b64decode(blob['content'])
-          assert digest(compressed) == payload_sha
-          raw = gzip.decompress(compressed)
-          assert hashlib.sha256(raw).hexdigest() == 'f75e897b798ea3095a9964720218e94128dc8d8756cae5a91a58a678a6c3ed2a'
-          payload = json.loads(raw)
-          allowed = {'src/indexer/semantic/engine.rs', 'src/indexer/semantic.rs', 'src/search/model_manager.rs', 'src/search/model_manager/external.rs', 'src/search/model_manager/external/tests.rs', 'tests/external_backfill_runtime.rs'}
-          assert set(payload['expected']) == set(payload['result']) == allowed
-          before, after = {}, {}
-          for name, expected in payload['expected'].items():
-              path = Path(name)
-              assert not any(parent.is_symlink() for parent in [path, *path.parents]), name
-              before[name] = digest(path.read_bytes()) if path.exists() else None
-              assert before[name] == expected, 'source drift: ' + name
-              if expected is not None:
-                  after[name] = path.read_text()
-          for edit in payload['edits']:
-              name = edit['path']
-              assert name in after and after[name].count(edit['old']) == 1, name
-              after[name] = after[name].replace(edit['old'], edit['new'], 1)
-          for name, content in payload['additions'].items():
-              assert name in allowed and payload['expected'][name] is None, name
-              after[name] = content
-          assert set(after) == allowed
-          for name, content in after.items():
-              assert digest(content.encode()) == payload['result'][name], name
-          formatting = {'src/search/external_embedder.rs': 'e92e997ef52fbf785366c9e0c66f4728e9eb8bb7', 'src/search/external_embedder/tests.rs': '69900a780e8e03ac469de83ded939b18e806a2a4', 'src/search/embedder_registry.rs': 'a7ca7d31343452f21ade50cd2e42242e7a572510'}
-          for name, expected in formatting.items():
-              before[name] = digest(Path(name).read_bytes())
-              assert before[name] == expected, 'format source drift: ' + name
-          for name, content in after.items():
-              path = Path(name)
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(content)
-          files = sorted(before)
-          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *files], check=True)
-          subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *files], check=True)
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          added = set(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines())
-          assert changed | added <= set(files), (changed, added)
-          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': before, 'blobs': {}}
-          for name in files:
-              data = Path(name).read_bytes()
-              result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
-              assert result['sha'] == digest(data), name
-              receipt['blobs'][name] = result['sha']
-          Path('external-source-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-          print('RUNTIME_SOURCE_RECEIPT=' + json.dumps(receipt, sort_keys=True))
-          for line in Path('.beads/issues.jsonl').read_text().splitlines():
-              if 'coding_agent_session_search-gl29d' in line:
-                  print('GL29D_BEAD:', line)
-          with tarfile.open('external-source.tar.gz', 'w:gz') as archive:
-              for path in ['src', 'tests', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo', 'external-source-receipt.json']:
-                  archive.add(path, arcname=path)
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: external-source-${{ github.sha }}
-          path: external-source.tar.gz
-          if-no-files-found: error
-          retention-days: 3
   native:
-    needs: source
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -129,19 +33,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: external-source-${{ github.sha }}
-      - name: Verify exact candidate source
-        run: |
-          tar -xzf external-source.tar.gz
-          python3 - <<'PY'
-          import hashlib, json
-          from pathlib import Path
-          for name, expected in json.loads(Path('external-source-receipt.json').read_text())['blobs'].items():
-              data = Path(name).read_bytes()
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected, name
-          PY
+      # The reviewed runtime candidate is now committed. Test that checkout,
+      # not an uncommitted overlay reconstructed from a pending-patch blob.
+      - name: Verify the committed source revision
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           toolchain: nightly-2026-08-31
@@ -157,3 +52,6 @@ jobs:
       - name: External provider and runtime formatting
         if: always()
         run: rustfmt --edition 2024 --check --config skip_children=true src/search/external_embedder.rs src/search/external_embedder/tests.rs src/search/embedder_registry.rs src/indexer/semantic.rs src/indexer/semantic/engine.rs src/search/model_manager.rs src/search/model_manager/external.rs src/search/model_manager/external/tests.rs tests/external_backfill_runtime.rs
+      - name: Verify validation did not alter the committed sources
+        if: always()
+        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
