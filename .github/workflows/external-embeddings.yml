@@ -22,6 +22,86 @@ on:
 permissions:
   contents: read
 jobs:
+  source-export:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Export exact cancellation and nightly fixes without ref writes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess, tarfile, urllib.request
+          from pathlib import Path
+          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          bases = {
+              'src/indexer/semantic.rs': '38578d6cbd0d50445d1ab72b32c9da88f02ca4c5',
+              'src/indexer/semantic/engine.rs': 'd65be2788ce628eb37a5e895c1f0eb41596f986d',
+              'src/indexer/semantic/shard_publication_tests.rs': '2c788888abc24b0086a7fafcfbbe6468dc1ecc5a',
+              'src/schedule.rs': '8622014a5c3bfb18568ab363e0c3398168eda7ed',
+              'tests/external_backfill_runtime.rs': 'f881ad803164120d4bef6e4f10ebbe57c0ab735c',
+          }
+          results = {
+              'src/indexer/semantic.rs': 'dd0b1807bfb4f37001512ded45df7fdc5dc6d7e5',
+              'src/indexer/semantic/engine.rs': 'c1063497ee26b7636bb67ba7fe72554daef1d282',
+              'src/indexer/semantic/shard_publication_tests.rs': 'c612981b97e8a9da9972ab64c23c148ee13d872a',
+              'src/schedule.rs': '7698a037a758d82285f69e70bdf2473bd3eda387',
+              'tests/external_backfill_runtime.rs': 'b312e5c326f5e9dbc29ef445f181d230736e2b25',
+          }
+          for name, expected in bases.items():
+              path = Path(name)
+              assert not any(p.is_symlink() for p in [path, *path.parents]), name
+              assert digest(path.read_bytes()) == expected, 'source drift: ' + name
+          for sha in ['f68a360ff74710aa463faaa58aaf69a1339a1c0c', 'b1ed0c9bb212ec6a999625319bea1d9c44d27b26']:
+              blob = request('/git/blobs/' + sha)
+              assert blob['encoding'] == 'base64'
+              patch = base64.b64decode(blob['content'])
+              assert digest(patch) == sha
+              subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=patch, check=True)
+          for name, expected in results.items():
+              assert digest(Path(name).read_bytes()) == expected, name
+          files = sorted(results)
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *files], check=True)
+          subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *files], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          assert set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) <= set(files)
+          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}, 'validation': 'source hashes and rustfmt only; native tests are separate'}
+          for name in files:
+              data = Path(name).read_bytes()
+              result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+              assert result['sha'] == digest(data), name
+              receipt['blobs'][name] = result['sha']
+          Path('external-cancel-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print('EXTERNAL_CANCEL_RECEIPT=' + json.dumps(receipt, sort_keys=True))
+          with tarfile.open('external-cancel-source.tar.gz', 'w:gz') as archive:
+              for name in [*files, 'external-cancel-receipt.json']:
+                  archive.add(name, arcname=name)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: external-cancel-source-${{ github.sha }}
+          path: external-cancel-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
   native:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
