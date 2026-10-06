@@ -173,15 +173,16 @@ fn gh511_codebuff_chat(
     transcript
 }
 
-/// `cass` that sees only the isolated home and data dir.
+/// `cass` that sees only the isolated home and data dir. In particular,
+/// `env_clear` leaves XDG_CONFIG_HOME, XDG_DATA_HOME and
+/// CASS_CODEBUFF_DATA_ROOT unset, matching the reporter's macOS default-path
+/// invocation. The Codebuff binary need not be installed to find its history.
 fn gh511_cass(home: &Path, data: &Path) -> assert_cmd::Command {
     let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     command
         .env_clear()
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("CASS_DATA_DIR", data)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CASS_AUTO_REFRESH", "0")
@@ -239,52 +240,30 @@ fn gh511_native_records() -> serde_json::Value {
     ])
 }
 
-/// GH #511 (bead b7rhs): a Codebuff transcript the connector could not
-/// interpret failed the codebuff scan, and cass reported `unreadable-source`
-/// with "check permissions" against the cass data directory. The failure is in
-/// the content, so it must be `unparseable-source`, not retryable on unchanged
-/// bytes, and name a scan root that holds the transcript. The fixture is the
-/// reporter's second probe: a variant ("assistant") the CLI never writes.
-#[test]
-fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
-    use serde_json::{Value, json};
-
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    let data = tmp.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let transcript = gh511_codebuff_chat(
-        &home,
-        "probe",
-        &json!([
-            {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
-             "timestamp":"2026-03-21T17:15:51.457Z"},
-            {"id":"ai-1774113411457", "variant":"assistant", "content":"Synthetic probe answer",
-             "timestamp":"2026-03-21T17:16:51.457Z"}
-        ]),
-    );
-    let output = gh511_cass(&home, &data)
-        .args(["index", "--full", "--json", "--no-progress-events"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(9), "{output:?}");
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-
-    let connector = report["indexing_stats"]["connectors"]
+fn gh511_connector_stats(report: &serde_json::Value) -> &serde_json::Value {
+    report["indexing_stats"]["connectors"]
         .as_array()
         .expect("connector summaries")
         .iter()
         .find(|connector| connector["name"] == "codebuff")
-        .expect("codebuff ran");
-    assert!(
-        connector["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("variant at record 1")),
-        "the connector error still names the bad record: {connector}"
-    );
+        .expect("default discovery found the Codebuff store")
+}
 
+fn gh511_assert_parse_diagnostic(report: &serde_json::Value, data: &Path, transcript: &Path) {
+    let reported_transcript = transcript.to_string_lossy();
     let transcript = transcript.canonicalize().unwrap();
-    let codebuff: Vec<&Value> = report["indexing_stats"]["connector_diagnostics"]
+    let connector = gh511_connector_stats(report);
+    let error = connector["error"].as_str().unwrap();
+    assert!(
+        error.contains(reported_transcript.as_ref())
+            || error.contains(&transcript.display().to_string()),
+        "the connector error must identify the failed transcript: {connector}"
+    );
+    assert_eq!(
+        report["indexing_stats"]["scan_had_errors"], true,
+        "{report}"
+    );
+    let codebuff: Vec<_> = report["indexing_stats"]["connector_diagnostics"]
         .as_array()
         .expect("connector diagnostics")
         .iter()
@@ -296,18 +275,17 @@ fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
             diagnostic["failure_kind"], "unparseable-source",
             "{diagnostic}"
         );
+        assert_eq!(diagnostic["severity"], "error", "{diagnostic}");
         assert_eq!(diagnostic["retryable"], false, "{diagnostic}");
+        assert_eq!(diagnostic["disposition"], "skipped", "{diagnostic}");
         let source = Path::new(diagnostic["source_path"].as_str().unwrap())
             .canonicalize()
             .unwrap();
         assert_ne!(source, data.canonicalize().unwrap(), "{diagnostic}");
         assert!(
             transcript.starts_with(&source),
-            "the diagnostic must name a root that holds the transcript: {diagnostic}"
+            "the diagnostic must identify the transcript or its scan root: {diagnostic}"
         );
-        // The action may say what the failure is not; it must not send the
-        // reader to fix permissions (v0.10.0: "check permissions, then
-        // re-index").
         assert!(
             !diagnostic["safe_next_action"]
                 .as_str()
@@ -316,24 +294,13 @@ fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
             "{diagnostic}"
         );
     }
+    assert_eq!(
+        report["indexing_stats"]["connector_summary"]["codebuff"]["locked"], 0,
+        "{report}"
+    );
 }
 
-/// GH #511: native Codebuff writes `timestamp` as a locale time of day
-/// ("01:15 PM"), which franken-agent-detection 0.3.3 rejected for every
-/// native transcript. The reporter's transcript now indexes, and each message
-/// carries the instant its ID's `Date.now()` recorded; nothing is derived
-/// from the time of day.
-#[test]
-fn gh511_native_time_of_day_transcript_indexes_with_its_id_instants() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    let data = tmp.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    gh511_codebuff_chat(&home, "probe", &gh511_native_records());
-    gh511_cass(&home, &data)
-        .args(["index", "--full", "--json", "--no-progress-events"])
-        .assert()
-        .success();
+fn gh511_assert_native_messages(home: &Path, data: &Path, transcript: &Path) {
     for (needle, content, instant) in [
         (
             "question",
@@ -342,9 +309,223 @@ fn gh511_native_time_of_day_transcript_indexes_with_its_id_instants() {
         ),
         ("answer", "Synthetic probe answer", 1_774_113_411_457),
     ] {
-        let hit = gh511_message_hit(&home, &data, needle, content);
+        let hit = gh511_message_hit(home, data, needle, content);
         assert_eq!(hit["created_at"].as_i64(), Some(instant), "{hit}");
         assert_eq!(hit["workspace"], "/synthetic/probe", "{hit}");
+        assert_eq!(
+            Path::new(hit["source_path"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            transcript.canonicalize().unwrap(),
+            "{hit}"
+        );
+    }
+}
+
+/// GH #511 (bead b7rhs): a Codebuff transcript the connector could not
+/// interpret failed the codebuff scan, and cass reported `unreadable-source`
+/// with "check permissions" against the cass data directory. The failure is in
+/// the content, so it must be `unparseable-source`, not retryable on unchanged
+/// bytes, and name a scan root that holds the transcript. The fixture is the
+/// reporter's second probe: a variant ("assistant") the CLI never writes.
+#[test]
+fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
+    use serde_json::{Value, json};
+
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let transcript = gh511_codebuff_chat(
+            &home,
+            "probe",
+            &json!([
+                {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
+                 "timestamp":"2026-03-21T17:15:51.457Z"},
+                {"id":"ai-1774113411457", "variant":"assistant", "content":"Synthetic probe answer",
+                 "timestamp":"2026-03-21T17:16:51.457Z"}
+            ]),
+        );
+        let before = fs::read(&transcript).unwrap();
+        let output = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "streaming={streaming}: {output:?}"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let connector = gh511_connector_stats(&report);
+        assert!(
+            connector["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("variant at record 1")),
+            "the connector error still names the bad record: {connector}"
+        );
+        gh511_assert_parse_diagnostic(&report, &data, &transcript);
+        assert_eq!(fs::read(&transcript).unwrap(), before);
+    }
+}
+
+/// GH #511: native Codebuff writes `timestamp` as a locale time of day
+/// ("01:15 PM"), which franken-agent-detection 0.3.3 rejected for every
+/// native transcript. The reporter's transcript now indexes, and each message
+/// carries the instant its ID's `Date.now()` recorded; nothing is derived
+/// from the time of day. Both indexing modes must discover the home-relative
+/// store with XDG_CONFIG_HOME and the Codebuff root override unset.
+#[test]
+fn gh511_native_time_of_day_transcript_indexes_with_its_id_instants() {
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let transcript = gh511_codebuff_chat(&home, "probe", &gh511_native_records());
+        let before = fs::read(&transcript).unwrap();
+        let output = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let connector = gh511_connector_stats(&report);
+        assert_eq!(
+            connector["conversations"], 1,
+            "streaming={streaming}: {report}"
+        );
+        assert_eq!(connector["messages"], 2, "streaming={streaming}: {report}");
+        assert!(connector.get("error").is_none(), "{connector}");
+        assert_eq!(
+            report["indexing_stats"]["scan_had_errors"], false,
+            "{report}"
+        );
+        assert_eq!(
+            report["indexing_stats"]["connector_summary"]["codebuff"]["indexed"], 1,
+            "{report}"
+        );
+        gh511_assert_native_messages(&home, &data, &transcript);
+        assert_eq!(fs::read(&transcript).unwrap(), before);
+    }
+}
+
+/// GH #511: a real default-store enumeration failure must name the directory
+/// that could not be read, retaining the I/O cause before any source is found.
+/// Root runs drop only the child process's privileges so chmod is meaningful.
+#[test]
+#[cfg(unix)]
+fn gh511_default_discovery_permission_error_names_the_manicode_directory() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+    use std::os::unix::process::CommandExt;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("cass-gh511-permissions-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let root = fs::metadata(tmp.path()).unwrap().uid() == 0;
+    let binary = if root {
+        // The build tree may be beneath a root-only directory. Copying just
+        // the executable keeps that tree's permissions unchanged.
+        let executable = tmp.path().join("cass");
+        fs::copy(assert_cmd::cargo::cargo_bin!("cass"), &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        executable
+    } else {
+        assert_cmd::cargo::cargo_bin!("cass").to_path_buf()
+    };
+
+    for streaming in ["0", "1"] {
+        let home = tmp.path().join(format!("home-{streaming}"));
+        let data = tmp.path().join(format!("data-{streaming}"));
+        fs::create_dir_all(&data).unwrap();
+        let transcript = gh511_codebuff_chat(&home, "unreadable-project", &gh511_native_records());
+        let before = fs::read(&transcript).unwrap();
+        for path in [
+            home.clone(),
+            home.join(".config"),
+            home.join(".config/manicode"),
+            home.join(".config/manicode/projects"),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let denied = home.join(".config/manicode/projects/unreadable-project");
+        let original_permissions = fs::metadata(&denied).unwrap().permissions();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut command = std::process::Command::new(&binary); // ubs:ignore[rust.security.command-executable] — Cargo's test binary or its byte-identical copy in this private test directory.
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_STREAMING_INDEX", streaming)
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home)
+            .args(["index", "--full", "--json", "--no-progress-events"]);
+        if root {
+            chown(&home, Some(65_534), Some(65_534)).unwrap();
+            chown(&data, Some(65_534), Some(65_534)).unwrap();
+            command.gid(65_534).uid(65_534);
+        }
+        let result = assert_cmd::Command::from(command)
+            .timeout(std::time::Duration::from_secs(180))
+            .output();
+        // Restore access before any assertion, including a subprocess error.
+        fs::set_permissions(&denied, original_permissions).unwrap();
+        let output = result.unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "streaming={streaming}: {output:?}"
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let connector = gh511_connector_stats(&report);
+        let error = connector["error"].as_str().unwrap();
+        assert!(
+            error.contains("cannot enumerate Codebuff / Freebuff history")
+                && error.to_ascii_lowercase().contains("permission denied")
+                && (error.contains(&denied.display().to_string())
+                    || error.contains(&denied.canonicalize().unwrap().display().to_string())),
+            "the discovery error must preserve the failed path and I/O cause: {connector}"
+        );
+        assert_eq!(
+            report["indexing_stats"]["scan_had_errors"], true,
+            "{report}"
+        );
+        let diagnostics: Vec<_> = report["indexing_stats"]["connector_diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["provider"] == "codebuff")
+            .collect();
+        assert!(!diagnostics.is_empty(), "{report}");
+        let mut named_failed_directory = false;
+        for diagnostic in diagnostics {
+            assert_eq!(
+                diagnostic["failure_kind"], "unreadable-source",
+                "{diagnostic}"
+            );
+            assert_eq!(diagnostic["retryable"], true, "{diagnostic}");
+            let source = Path::new(diagnostic["source_path"].as_str().unwrap())
+                .canonicalize()
+                .unwrap();
+            assert_ne!(source, data.canonicalize().unwrap(), "{diagnostic}");
+            assert!(
+                denied.canonicalize().unwrap().starts_with(&source),
+                "{diagnostic}"
+            );
+            named_failed_directory |= source == denied.canonicalize().unwrap();
+        }
+        assert!(named_failed_directory, "{report}");
+        assert_eq!(fs::read(&transcript).unwrap(), before);
     }
 }
 
@@ -352,42 +533,122 @@ fn gh511_native_time_of_day_transcript_indexes_with_its_id_instants() {
 /// mid-write) stopped the scan, so every chat after it in path order went
 /// unindexed (franken-agent-detection 0.3.4 and earlier). The bad chat sorts
 /// first here. The good chat now indexes, the run still exits 9, and the
-/// connector error names the bad transcript and its cause.
+/// connector error names the bad transcript and its cause. Batch mode must
+/// retain FAD's successful callbacks too, and "busy" in a project name must
+/// not turn a parse failure into a lock diagnosis.
 #[test]
 fn gh511_one_unparseable_codebuff_transcript_does_not_hide_the_others() {
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    let data = tmp.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let truncated = gh511_codebuff_chat(&home, "a-truncated", &serde_json::json!([]));
-    std::fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
-    gh511_codebuff_chat(&home, "probe", &gh511_native_records());
-    let output = gh511_cass(&home, &data)
-        .args(["index", "--full", "--json", "--no-progress-events"])
-        .output()
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let truncated = gh511_codebuff_chat(&home, "a-busy-project", &json!([]));
+        fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
+        let good = gh511_codebuff_chat(&home, "z-good", &gh511_native_records());
+        assert!(
+            truncated < good,
+            "the bad transcript must be discovered first"
+        );
+        let modified_before_failure =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_774_113_351);
+        let before: Vec<_> = [
+            truncated.clone(),
+            truncated.with_file_name("run-state.json"),
+            good.clone(),
+            good.with_file_name("run-state.json"),
+        ]
+        .into_iter()
+        .map(|path| {
+            // Both the transcript and its run state predate this scan, so a
+            // fresh sidecar cannot accidentally rescue an advanced watermark.
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified_before_failure)
+                .unwrap();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        let output = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "streaming={streaming}: {output:?}"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let connector = gh511_connector_stats(&report);
+        assert!(
+            connector["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid Codebuff / Freebuff transcript JSON"),
+            "{connector}"
+        );
+        gh511_assert_parse_diagnostic(&report, &data, &truncated);
+        assert_eq!(
+            connector["conversations"], 1,
+            "streaming={streaming}: {report}"
+        );
+        assert_eq!(connector["messages"], 2, "streaming={streaming}: {report}");
+        assert_eq!(
+            report["indexing_stats"]["connector_summary"]["codebuff"]["indexed"], 1,
+            "{report}"
+        );
+        gh511_assert_native_messages(&home, &data, &good);
+        for (path, bytes) in before {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+
+        // A failed scan must not advance the connector watermark. Repair the
+        // bad source but retain its pre-failure mtime: a normal incremental
+        // retry must ingest it and keep the good chat without duplication.
+        fs::write(
+            &truncated,
+            serde_json::to_vec(&json!([
+                {"id":"user-1774113471457", "variant":"user", "content":"Synthetic recovered question",
+                 "timestamp":"01:17 PM"}
+            ]))
+            .unwrap(),
+        )
         .unwrap();
-    assert_eq!(output.status.code(), Some(9), "{output:?}");
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let connector = report["indexing_stats"]["connectors"]
-        .as_array()
-        .expect("connector summaries")
-        .iter()
-        .find(|connector| connector["name"] == "codebuff")
-        .expect("codebuff ran");
-    let named = Path::new("a-truncated")
-        .join("chats")
-        .join("2026-03-21T17-14-03.768Z")
-        .join("chat-messages.json");
-    let error = connector["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains(&named.display().to_string())
-            && error.contains("invalid Codebuff / Freebuff transcript JSON"),
-        "{connector}"
-    );
-    let hit = gh511_message_hit(&home, &data, "question", "Synthetic probe question");
-    assert_eq!(hit["created_at"].as_i64(), Some(1_774_113_351_457), "{hit}");
+        fs::File::options()
+            .write(true)
+            .open(&truncated)
+            .unwrap()
+            .set_modified(modified_before_failure)
+            .unwrap();
+        let retry = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--json", "--no-progress-events"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let retry: Value = serde_json::from_slice(&retry).unwrap();
+        assert_eq!(retry["indexing_stats"]["scan_had_errors"], false, "{retry}");
+        assert!(
+            gh511_connector_stats(&retry).get("error").is_none(),
+            "{retry}"
+        );
+        let recovered =
+            gh511_message_hit(&home, &data, "recovered", "Synthetic recovered question");
+        assert_eq!(
+            recovered["created_at"].as_i64(),
+            Some(1_774_113_471_457),
+            "{recovered}"
+        );
+        gh511_assert_native_messages(&home, &data, &good);
+    }
 }
 
 /// GH #499 (bead 2l1b0.49): once an incremental run tombstones a row inside a
@@ -2409,4 +2670,127 @@ fn multi_connector_empty_connector() {
     );
 
     tracker.complete();
+}
+
+/// GH #511: watch-once uses the same callback contract as initial indexing.
+/// A failed transcript must retain good chats, report the actual error even
+/// when nothing parses, and leave an older repaired source eligible for retry.
+#[test]
+fn gh511_watch_once_retains_good_chats_and_retries_failed_sources() {
+    use serde_json::{Value, json};
+
+    for with_good_chat in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let truncated = gh511_codebuff_chat(&home, "a-busy-project", &json!([]));
+        fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
+        let good =
+            with_good_chat.then(|| gh511_codebuff_chat(&home, "z-good", &gh511_native_records()));
+        let modified_before_failure =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_774_113_351);
+        let source_paths = [truncated.clone()]
+            .into_iter()
+            .chain(good.iter().cloned())
+            .flat_map(|path| [path.with_file_name("run-state.json"), path]);
+        let before: Vec<_> = source_paths
+            .map(|path| {
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(modified_before_failure)
+                    .unwrap();
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let projects = home.join(".config/manicode/projects");
+        let output = gh511_cass(&home, &data)
+            .args(["index", "--watch", "--watch-once"])
+            .arg(&projects)
+            .args(["--json", "--no-progress-events"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "with_good_chat={with_good_chat}: {output:?}"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        gh511_assert_parse_diagnostic(&report, &data, &truncated);
+        assert_eq!(report["success"], false, "{report}");
+        assert_eq!(report["partial"], true, "{report}");
+        assert_eq!(report["coverage_status"], "incomplete", "{report}");
+        let connector = gh511_connector_stats(&report);
+        assert_eq!(
+            connector["conversations"],
+            usize::from(with_good_chat),
+            "{report}"
+        );
+        assert_eq!(
+            connector["messages"],
+            2 * usize::from(with_good_chat),
+            "{report}"
+        );
+        assert!(
+            connector["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid Codebuff / Freebuff transcript JSON"),
+            "{connector}"
+        );
+        assert!(!data.join("watch_state.json").exists());
+        if let Some(good) = &good {
+            gh511_assert_native_messages(&home, &data, good);
+        }
+        for (path, bytes) in before {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+
+        fs::write(
+            &truncated,
+            serde_json::to_vec(&json!([
+                {"id":"user-1774113471457", "variant":"user", "content":"Synthetic watch recovered question",
+                 "timestamp":"01:17 PM"}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&truncated)
+            .unwrap()
+            .set_modified(modified_before_failure)
+            .unwrap();
+        let retry = gh511_cass(&home, &data)
+            .args(["index", "--watch", "--watch-once"])
+            .arg(&projects)
+            .args(["--json", "--no-progress-events"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let retry: Value = serde_json::from_slice(&retry).unwrap();
+        assert_eq!(retry["indexing_stats"]["scan_had_errors"], false, "{retry}");
+        assert!(
+            gh511_connector_stats(&retry).get("error").is_none(),
+            "{retry}"
+        );
+        assert_ne!(retry["partial"], true, "{retry}");
+        assert!(!data.join("watch_state.json").exists());
+        let recovered = gh511_message_hit(
+            &home,
+            &data,
+            "recovered",
+            "Synthetic watch recovered question",
+        );
+        assert_eq!(recovered["created_at"].as_i64(), Some(1_774_113_471_457));
+        assert_eq!(recovered["workspace"], "/synthetic/probe");
+        if let Some(good) = &good {
+            gh511_assert_native_messages(&home, &data, good);
+        }
+    }
 }

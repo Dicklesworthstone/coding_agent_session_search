@@ -1314,6 +1314,13 @@ impl std::fmt::Display for IndexInterrupted {
 
 impl std::error::Error for IndexInterrupted {}
 
+/// A connector rejected a source after any successfully parsed neighbors were
+/// committed. Keep the original cause without confusing its path with an
+/// archive storage failure at the CLI boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("one or more watch source scans failed; completed conversations were retained")]
+pub(crate) struct ConnectorScanFailure(#[source] anyhow::Error);
+
 impl IndexingProgress {
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
@@ -14670,7 +14677,7 @@ fn spawn_connector_producer(
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
-                        error: e.to_string(),
+                        error: format!("{e:#}"),
                     });
                 }
             }
@@ -14806,7 +14813,7 @@ fn spawn_connector_producer(
                     );
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
-                        error: format!("remote scan failed for {}: {}", root.path.display(), e),
+                        error: format!("remote scan failed for {}: {e:#}", root.path.display()),
                     });
                 }
             }
@@ -16071,47 +16078,44 @@ fn run_batch_index_with_connector_factories(
                         active_source_filter.as_ref(),
                     );
                     active_source_skipped |= preparse_active_source_skipped;
-                    match conn.scan(&ctx) {
-                        Ok(mut local_convs) => {
-                            let local_origin = Origin::local();
-                            let conversations_before_active_filter = local_convs.len();
-                            local_convs.retain(|conv| {
-                                !should_skip_active_session_source(
-                                    active_source_filter.as_ref(),
-                                    SourceKind::Local,
-                                    &conv.source_path,
-                                )
-                            });
-                            active_source_skipped |=
-                                local_convs.len() < conversations_before_active_filter;
-                            local_convs.retain(|conv| !should_skip_subagent(conv));
-                            for conversation in &mut local_convs {
-                                ingest_diagnostics.observe_conversation(conversation);
-                            }
-                            for conv in &mut local_convs {
-                                prepare_conversation_for_ingest(
-                                    &data_dir,
-                                    name,
-                                    &local_origin,
-                                    None,
-                                    conv,
-                                );
-                            }
-                            convs.extend(local_convs);
+                    let local_origin = Origin::local();
+                    // GH #511: the callback can yield good chats before
+                    // reporting another transcript's failure. Keep those
+                    // chats and retain the failure to hold the watermark.
+                    if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                        if should_skip_active_session_source(
+                            active_source_filter.as_ref(),
+                            SourceKind::Local,
+                            &conversation.source_path,
+                        ) {
+                            active_source_skipped = true;
+                            return Ok(());
                         }
-                        Err(e) => {
-                            // Note: agent was counted as discovered but scan failed
-                            // This is acceptable as detection succeeded (agent exists)
-                            scan_succeeded = false;
-                            // Name the root the connector scanned, not the
-                            // cass data dir (GH #511).
-                            let scanned_root = fallback_roots
-                                .first()
-                                .map_or(ctx.data_dir.as_path(), |root| root.path.as_path());
-                            ingest_diagnostics.observe_connector_scan_error(scanned_root, &e);
-                            scan_errors.push(e.to_string());
-                            tracing::warn!("scan failed for {}: {}", name, e);
+                        if should_skip_subagent(&conversation) {
+                            return Ok(());
                         }
+                        ingest_diagnostics.observe_conversation(&mut conversation);
+                        prepare_conversation_for_ingest(
+                            &data_dir,
+                            name,
+                            &local_origin,
+                            None,
+                            &mut conversation,
+                        );
+                        convs.push(conversation);
+                        Ok(())
+                    }) {
+                        // Note: agent was counted as discovered but scan failed
+                        // This is acceptable as detection succeeded (agent exists)
+                        scan_succeeded = false;
+                        // Name the root the connector scanned, not the
+                        // cass data dir (GH #511).
+                        let scanned_root = fallback_roots
+                            .first()
+                            .map_or(ctx.data_dir.as_path(), |root| root.path.as_path());
+                        ingest_diagnostics.observe_connector_scan_error(scanned_root, &e);
+                        scan_errors.push(format!("{e:#}"));
+                        tracing::warn!("scan failed for {}: {}", name, e);
                     }
                     record_connector_ingest_report(
                         progress_ref,
@@ -16151,48 +16155,41 @@ fn run_batch_index_with_connector_factories(
                             active_source_filter.as_ref(),
                         );
                         active_source_skipped |= preparse_active_source_skipped;
-                        match conn.scan(&ctx) {
-                            Ok(mut remote_convs) => {
-                                let conversations_before_active_filter = remote_convs.len();
-                                remote_convs.retain(|conv| {
-                                    !should_skip_active_session_source(
-                                        active_source_filter.as_ref(),
-                                        root.origin.kind,
-                                        &conv.source_path,
-                                    )
-                                });
-                                active_source_skipped |=
-                                    remote_convs.len() < conversations_before_active_filter;
-                                remote_convs.retain(|conv| !should_skip_subagent(conv));
-                                for conversation in &mut remote_convs {
-                                    ingest_diagnostics.observe_conversation(conversation);
-                                }
-                                for conv in &mut remote_convs {
-                                    prepare_conversation_for_ingest(
-                                        &data_dir,
-                                        name,
-                                        &root.origin,
-                                        Some(root),
-                                        conv,
-                                    );
-                                }
-                                convs.extend(remote_convs);
+                        if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                            if should_skip_active_session_source(
+                                active_source_filter.as_ref(),
+                                root.origin.kind,
+                                &conversation.source_path,
+                            ) {
+                                active_source_skipped = true;
+                                return Ok(());
                             }
-                            Err(e) => {
-                                scan_succeeded = false;
-                                ingest_diagnostics
+                            if should_skip_subagent(&conversation) {
+                                return Ok(());
+                            }
+                            ingest_diagnostics.observe_conversation(&mut conversation);
+                            prepare_conversation_for_ingest(
+                                &data_dir,
+                                name,
+                                &root.origin,
+                                Some(root),
+                                &mut conversation,
+                            );
+                            convs.push(conversation);
+                            Ok(())
+                        }) {
+                            scan_succeeded = false;
+                            ingest_diagnostics
                                 .observe_connector_scan_error(&root.path, &e);
-                                scan_errors.push(format!(
-                                    "remote scan failed for {}: {}",
-                                    root.path.display(),
-                                    e
-                                ));
-                                tracing::warn!(
-                                    connector = name,
-                                    root = %root.path.display(),
-                                    "remote scan failed: {e}"
-                                );
-                            }
+                            scan_errors.push(format!(
+                                "remote scan failed for {}: {e:#}",
+                                root.path.display(),
+                            ));
+                            tracing::warn!(
+                                connector = name,
+                                root = %root.path.display(),
+                                "remote scan failed: {e}"
+                            );
                         }
                         record_connector_ingest_report(
                             progress_ref,
@@ -30812,6 +30809,7 @@ fn reindex_paths_with_semantic_delta(
     }
 
     let mut total_indexed = 0usize;
+    let mut first_source_scan_error = None;
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
@@ -30921,20 +30919,52 @@ fn reindex_paths_with_semantic_delta(
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
-        let mut convs = match conn.scan(&ctx) {
-            Ok(c) => c,
-            Err(e) => {
-                ingest_diagnostics.observe_connector_scan_error(&root.path, &e);
-                tracing::debug!(
-                    "watch scan failed for {:?} at {}: {}",
-                    kind,
-                    root.path.display(),
-                    e
+        let mut convs = Vec::new();
+        let scan_error = match conn.scan_with_callback(&ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        }) {
+            Ok(()) => None,
+            Err(error) => {
+                ingest_diagnostics.observe_connector_scan_error(&root.path, &error);
+                let message = format!("{error:#}");
+                tracing::warn!(
+                    ?kind,
+                    scan_root = %root.path.display(),
+                    "watch scan failed: {message}"
                 );
-                Vec::new()
+                first_source_scan_error.get_or_insert(error);
+                Some(message)
             }
         };
         let scan_ms = scan_start.elapsed().as_millis() as u64;
+        // Publish the source error before persistence can fail for a separate
+        // reason, including the all-bad case that has no ingest phase below.
+        let failed_stats_index = if let Some(error) = &scan_error
+            && let Some(progress) = &opts.progress
+            && let Ok(mut stats) = progress.stats.lock()
+        {
+            stats.scan_had_errors = true;
+            stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+            let index = stats.connectors.len();
+            stats.connectors.push(ConnectorStats {
+                name: kind.slug().to_string(),
+                conversations: 0,
+                messages: 0,
+                scan_ms,
+                error: Some(error.clone()),
+            });
+            if !stats
+                .agents_discovered
+                .iter()
+                .any(|name| name == kind.slug())
+            {
+                stats.agents_discovered.push(kind.slug().to_string());
+            }
+            Some(index)
+        } else {
+            None
+        };
 
         let pre_active_filter_count = convs.len();
         convs.retain(|conv| {
@@ -30955,7 +30985,8 @@ fn reindex_paths_with_semantic_delta(
         }
         let preserve_this_watch_watermark = preserve_watch_watermark
             || preparse_active_source_skipped
-            || active_sources_skipped > 0;
+            || active_sources_skipped > 0
+            || scan_error.is_some();
 
         convs.retain(|conv| !should_skip_subagent(conv));
 
@@ -31022,6 +31053,18 @@ fn reindex_paths_with_semantic_delta(
         // `last_indexed_at`, and must not trigger downstream optimize/merge.
         // See issue #194.
         if conv_count == 0 {
+            if scan_error.is_some() {
+                // A later successful sibling may advance the shared provider
+                // watermark. Keep this source eligible for an unfiltered retry
+                // even when it had no valid conversation to publish today.
+                let storage = storage
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                persist_watch_lexical_replay_debt(
+                    &storage,
+                    &WatchLexicalReplayDebt::for_root(kind, &root),
+                )?;
+            }
             continue;
         }
 
@@ -31189,6 +31232,10 @@ fn reindex_paths_with_semantic_delta(
                     tracing::warn!(
                         "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
                     );
+                } else if scan_error.is_some() {
+                    tracing::warn!(
+                        "skipping watch last_indexed_at update after incomplete source scan"
+                    );
                 } else {
                     persist::with_ephemeral_writer(
                         &storage,
@@ -31226,7 +31273,7 @@ fn reindex_paths_with_semantic_delta(
                     tracing::debug!(
                         ?kind,
                         active_sources_skipped,
-                        "preserving partial watch watermark because scan exclusions or active source skips are active"
+                        "preserving partial watch watermark because a source failed or was excluded"
                     );
                 }
             }
@@ -31256,17 +31303,24 @@ fn reindex_paths_with_semantic_delta(
                 .first()
                 .map(|conv| conv.agent_slug.clone())
                 .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
-            stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+            if failed_stats_index.is_none() {
+                stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+            }
             stats.index_ms = stats.index_ms.saturating_add(index_ms);
             stats.total_conversations = stats.total_conversations.saturating_add(conv_count);
             stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
-            stats.connectors.push(ConnectorStats {
+            let connector_stats = ConnectorStats {
                 name: connector_name.clone(),
                 conversations: conv_count,
                 messages: inserted_messages,
                 scan_ms,
-                error: None,
-            });
+                error: scan_error,
+            };
+            if let Some(index) = failed_stats_index {
+                stats.connectors[index] = connector_stats;
+            } else {
+                stats.connectors.push(connector_stats);
+            }
             if !stats
                 .agents_discovered
                 .iter()
@@ -31320,7 +31374,7 @@ fn reindex_paths_with_semantic_delta(
             tracing::info!(
                 ?kind,
                 active_sources_skipped,
-                "preserving final watch watermark because scan exclusions or active source skips are active"
+                "preserving final watch watermark because a source failed or was excluded"
             );
         }
     }
@@ -31328,7 +31382,10 @@ fn reindex_paths_with_semantic_delta(
     // Reset phase to idle if progress exists
     reset_progress_to_idle(opts.progress.as_ref());
 
-    Ok(total_indexed)
+    match first_source_scan_error {
+        Some(error) => Err(ConnectorScanFailure(error).into()),
+        None => Ok(total_indexed),
+    }
 }
 
 fn explicit_watch_once_root_unchanged_after_last_index(
@@ -31401,10 +31458,14 @@ fn explicit_watch_once_root_unchanged_after_last_index(
 
 const WATCH_LEXICAL_REPLAY_DEBT_PREFIX: &str = "watch_lexical_replay_v1:";
 
-/// One connector's selected source may have canonical rows newer than its
-/// published lexical documents. Shared scan roots serve several connectors;
-/// completing one connector must not discharge another connector's debt.
-/// Keep this separate from archive-wide rebuild state.
+/// One connector's selected source needs an unfiltered retry: it may have
+/// canonical rows newer than its published lexical documents, or a failed
+/// scan that left some source content unread. Failed scans retain this marker
+/// even when no conversation parsed, so a successful sibling cannot hide an
+/// older repaired source by advancing the shared provider watermark.
+/// Shared scan roots serve several connectors; completing one connector must
+/// not discharge another connector's debt. Keep this separate from archive-wide
+/// rebuild state.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct WatchLexicalReplayDebt {
     connector: ConnectorKind,
@@ -32845,7 +32906,7 @@ fn capture_connector_sources_before_parse(
         Err(error) => {
             tracing::warn!(
                 provider,
-                error = %error,
+                error = %format_args!("{error:#}"),
                 "provider source discovery failed; falling back to legacy explicit-root preparse capture"
             );
             for root in fallback_roots {
@@ -32857,12 +32918,29 @@ fn capture_connector_sources_before_parse(
                     active_source_filter,
                 );
             }
-            (Vec::new(), Some(error.to_string()))
+            (Vec::new(), Some(error))
         }
     };
     let mut run = ConnectorIngestRun::begin(provider, data_dir, ctx, &observed_sources);
     if let Some(error) = discovery_error {
-        run.observe_scan_error(&ctx.data_dir, &error);
+        // GH #511: discovery can fail before any transcript is returned. Keep
+        // its I/O cause and the failed directory instead of blaming CASS's own
+        // output directory. WalkDir names the precise operation when possible.
+        let source_path = error
+            .chain()
+            .find_map(|cause| {
+                cause
+                    .downcast_ref::<walkdir::Error>()
+                    .and_then(walkdir::Error::path)
+            })
+            .or_else(|| {
+                fallback_roots
+                    .first()
+                    .or_else(|| ctx.scan_roots.first())
+                    .map(|root| root.path.as_path())
+            })
+            .unwrap_or_else(|| Path::new("(source root unavailable)"));
+        run.observe_connector_scan_error(source_path, &error);
     }
     (run, active_source_skipped)
 }

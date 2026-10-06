@@ -339,6 +339,77 @@ fn classify_path(
     classify(provider, source_path.to_string_lossy().as_ref(), kind)
 }
 
+/// Recognize backend error messages, not arbitrary occurrences of lock words
+/// in source paths or parser context. Typed causes take precedence below.
+fn is_database_lock_message(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    [
+        "database is locked",
+        "database is busy",
+        "database table is locked",
+        "database schema is locked",
+        "sqlite_busy",
+        "sqlite_busy_recovery",
+        "sqlite_busy_snapshot",
+        "sqlite_busy_timeout",
+        "sqlite_locked",
+        "sqlite_locked_sharedcache",
+        "sqlite_locked_vtab",
+    ]
+    .iter()
+    .any(|&prefix| {
+        lower.strip_prefix(prefix).is_some_and(|suffix| {
+            let suffix = suffix.trim_start();
+            suffix.is_empty() || suffix.starts_with(':') || suffix.starts_with('(')
+        })
+    })
+}
+
+fn connector_scan_failure_kind(error: &anyhow::Error) -> IngestFailureKind {
+    use crate::franken_sync::FrankenError;
+
+    if let Some(io) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        return if matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ResourceBusy
+        ) {
+            IngestFailureKind::SourceLocked
+        } else {
+            IngestFailureKind::UnreadableSource
+        };
+    }
+    // A parser may quote source content that itself names a lock. Its type
+    // proves this is still a content failure, regardless of that message.
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+    {
+        return IngestFailureKind::UnparseableSource;
+    }
+    let database_locked = error.chain().any(|cause| {
+        cause.downcast_ref::<FrankenError>().is_some_and(|error| {
+            matches!(
+                error,
+                FrankenError::Busy
+                    | FrankenError::BusyRecovery
+                    | FrankenError::BusySnapshot { .. }
+                    | FrankenError::DatabaseLocked { .. }
+                    | FrankenError::LockFailed { .. }
+                    | FrankenError::WriteConflict { .. }
+                    | FrankenError::SerializationFailure { .. }
+            )
+        })
+    });
+    if database_locked || is_database_lock_message(&error.root_cause().to_string()) {
+        IngestFailureKind::SourceLocked
+    } else {
+        IngestFailureKind::UnparseableSource
+    }
+}
+
 impl ConnectorIngestDiagnostic {
     /// Attach workspace/source provenance.
     pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
@@ -542,9 +613,7 @@ impl ConnectorIngestRun {
 
     /// Attach a scan-level error without converting it into a fake success.
     pub fn observe_scan_error(&mut self, source_path: &Path, error: impl std::fmt::Display) {
-        let error = error.to_string();
-        let lower = error.to_ascii_lowercase();
-        let kind = if lower.contains("locked") || lower.contains("busy") {
+        let kind = if is_database_lock_message(&error.to_string()) {
             IngestFailureKind::SourceLocked
         } else {
             IngestFailureKind::UnreadableSource
@@ -583,23 +652,13 @@ impl ConnectorIngestRun {
             }
             return;
         }
-        // GH #511: only an I/O cause (or a lock) makes a source unreadable. A
-        // connector error with neither is a content failure, such as a record
-        // value the parser rejects; calling it "check permissions" sent a
-        // reporter after the wrong problem.
-        let io_cause = error
-            .chain()
-            .any(|cause| cause.downcast_ref::<std::io::Error>().is_some());
-        let message = format!("{error:#}");
-        let lower = message.to_ascii_lowercase();
-        if io_cause || lower.contains("locked") || lower.contains("busy") {
-            self.observe_scan_error(fallback_path, message);
-            return;
-        }
+        // GH #511: FAD's top message includes the failing path. Classify the
+        // cause, so a project called "busy" cannot turn a parse or permission
+        // failure into a retryable database lock.
         let diagnostic = classify_path(
             &self.provider,
             fallback_path,
-            IngestFailureKind::UnparseableSource,
+            connector_scan_failure_kind(error),
         );
         self.sources.insert(
             fallback_path.to_path_buf(),
@@ -720,9 +779,9 @@ impl ConnectorIngestRun {
             connection.query_row_map("SELECT 1 FROM sqlite_master LIMIT 1", &[], |_row| Ok(()))
         });
         if let Err(error) = probe {
-            let lower = error.to_string().to_ascii_lowercase();
-            if lower.contains("locked") || lower.contains("busy") {
-                self.observe_scan_error(path, error);
+            let error = anyhow::Error::new(error);
+            if connector_scan_failure_kind(&error) == IngestFailureKind::SourceLocked {
+                self.observe_connector_scan_error(path, &error);
             }
         }
     }
@@ -1463,6 +1522,125 @@ mod tests {
             report.diagnostics[0].failure_kind,
             IngestFailureKind::SourceLocked
         );
+        Ok(())
+    }
+
+    /// FAD 0.3.5 includes the failing transcript path in its top message.
+    /// Project names are not evidence of a database lock, even when a host
+    /// has flattened the contextual error into one display string.
+    #[test]
+    fn gh511_project_names_cannot_turn_parse_failures_into_locks() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        for project in ["a-busy-project", "unlocked-project"] {
+            let transcript = PathBuf::from("/home/me/.config/manicode/projects")
+                .join(project)
+                .join("chats/2026-03-21T17-14-03.768Z/chat-messages.json");
+            let parse_error =
+                serde_json::from_str::<serde_json::Value>(r#"[{"id":"user-1774113351457""#)
+                    .expect_err("truncated native transcript must fail JSON parsing");
+            let error = anyhow::Error::new(parse_error)
+                .context("invalid Codebuff / Freebuff transcript JSON");
+            let summary = format!("{}: {error:#}", transcript.display());
+            let error = error.context(summary.clone());
+            for error in [error, anyhow::anyhow!(summary)] {
+                let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+                run.observe_connector_scan_error(&transcript, &error);
+                let report = run.finish();
+                verify_eq!(report.diagnostics.len(), 1);
+                let diagnostic = &report.diagnostics[0];
+                verify_eq!(
+                    diagnostic.failure_kind,
+                    IngestFailureKind::UnparseableSource
+                );
+                verify_eq!(diagnostic.source_path, transcript.display().to_string());
+                verify!(!diagnostic.retryable);
+                verify_eq!(report.summary.skipped, 1);
+                verify_eq!(report.summary.locked, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh511_permission_errors_under_busy_paths_stay_unreadable() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let transcript = Path::new(
+            "/home/me/.config/manicode/projects/a-busy-project/chats/unlocked/chat-messages.json",
+        );
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let summary = format!("{}: {error:#}", transcript.display());
+        let error = error.context(summary);
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(transcript, &error);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        verify!(report.diagnostics[0].retryable);
+        verify_eq!(report.summary.skipped, 1);
+        verify_eq!(report.summary.locked, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh511_json_error_content_cannot_claim_a_database_lock() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let error = <serde_json::Error as serde::de::Error>::custom("database is locked");
+        let error =
+            anyhow::Error::new(error).context("invalid Codebuff / Freebuff transcript JSON");
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/codebuff/chat-messages.json"), &error);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnparseableSource
+        );
+        verify!(!report.diagnostics[0].retryable);
+        verify_eq!(report.summary.locked, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh511_database_lock_causes_remain_retryable() -> TestResult {
+        use crate::franken_sync::FrankenError;
+
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let path = Path::new("/cursor/state.vscdb");
+        for error in [
+            anyhow::Error::new(FrankenError::Busy),
+            anyhow::Error::new(FrankenError::BusyRecovery),
+            anyhow::Error::new(FrankenError::BusySnapshot {
+                conflicting_pages: "12".to_string(),
+            }),
+            anyhow::Error::new(FrankenError::DatabaseLocked {
+                path: path.to_path_buf(),
+            }),
+            anyhow::Error::new(FrankenError::LockFailed {
+                detail: "F_SETLK contention".to_string(),
+            }),
+            anyhow::anyhow!("database is locked (SQLITE_BUSY)"),
+            anyhow::anyhow!("database is busy (recovery in progress)"),
+            anyhow::anyhow!("database table is locked"),
+            anyhow::anyhow!("SQLITE_BUSY"),
+            anyhow::anyhow!("SQLITE_BUSY_SNAPSHOT"),
+            anyhow::anyhow!("SQLITE_LOCKED"),
+            anyhow::anyhow!("SQLITE_LOCKED_SHAREDCACHE"),
+        ] {
+            let error = error.context("reading /cursor/state.vscdb");
+            let mut run = ConnectorIngestRun::begin("cursor", Path::new("/data"), &ctx, &[]);
+            run.observe_connector_scan_error(path, &error);
+            let report = run.finish();
+            verify_eq!(
+                report.diagnostics[0].failure_kind,
+                IngestFailureKind::SourceLocked
+            );
+            verify!(report.diagnostics[0].retryable);
+            verify_eq!(report.summary.locked, 1);
+        }
         Ok(())
     }
 }

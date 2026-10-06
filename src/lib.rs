@@ -109006,6 +109006,13 @@ fn run_index_with_data(
                     retryable: true,
                 };
             }
+            if e.downcast_ref::<indexer::ConnectorScanFailure>().is_some()
+                && let Err(error) = index_result::require_complete_scan(true, &[])
+            {
+                // The source error and its path remain in connector stats.
+                // A project named "busy" is not canonical-storage contention.
+                return error;
+            }
             let chain = e
                 .chain()
                 .map(std::string::ToString::to_string)
