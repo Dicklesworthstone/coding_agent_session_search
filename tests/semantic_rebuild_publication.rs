@@ -647,3 +647,235 @@ fn canonical_reconciliation_refuses_a_live_writer_and_unowned_recovery_parity() 
     assert_eq!(fs::read(&fec_path)?, b"unadmitted parity");
     Ok(())
 }
+
+#[test]
+fn canonical_unchanged_reconciliation_retains_the_same_inode_and_shared_readers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    fs::create_dir_all(path.parent().unwrap())?;
+    write_generation(&path, &original, 254)?;
+    let owner = same_file::Handle::from_path(&path)?;
+    let before = fs::read(&path)?;
+    let modified = owner.as_file().metadata()?.modified()?;
+    let retained = VectorIndex::open_read_only(&path)?;
+    let expected = signature(&retained, &original[0].embedding)?;
+    for _ in 0..3 {
+        let unchanged = indexer.reconcile_index_with_canonical_documents(
+            Vec::new(), temp.path(), TierKind::Fast, "unchanged-current", &canonical_ids(&original),
+        )?;
+        assert_eq!(same_file::Handle::from_path(&path)?, owner,
+            "an unchanged reconciliation must not install a copied inode");
+        assert_eq!(fs::metadata(&path)?.modified()?, modified);
+        assert_eq!(fs::read(&path)?, before);
+        assert_eq!(VectorIndex::peek_compaction_gen(&path)?, 254);
+        assert_eq!(signature(&unchanged, &original[0].embedding)?, expected);
+        // A retained generation is a query owner, not an exclusive writer
+        // which prevents every new query until its result handle is dropped.
+        let fresh = VectorIndex::open_read_only(&path)?;
+        assert_eq!(signature(&fresh, &original[0].embedding)?, expected);
+        assert_eq!(signature(&retained, &original[0].embedding)?, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_unchanged_reconciliation_preserves_recovery_parity_without_retiring_it() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    let owner = same_file::Handle::from_path(&path)?;
+    let before = fs::read(&path)?;
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".fec");
+    let fec = std::path::PathBuf::from(name);
+    // Presence stands for protection whose format/ownership this API does
+    // not interpret. A no-op may retain it, but must never authorize removal.
+    fs::write(&fec, b"opaque owner-managed parity")?;
+    let ids = canonical_ids(&original);
+    let unchanged = indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "unchanged-parity", &ids,
+    )?;
+    assert_eq!(same_file::Handle::from_path(&path)?, owner);
+    assert_eq!(vector_bits(&unchanged)?.len(), original.len());
+    assert_eq!(fs::read(&path)?, before);
+    assert_eq!(fs::read(&fec)?, b"opaque owner-managed parity");
+    drop(unchanged);
+    // A deletion also has an empty embedding delta, but is not unchanged.
+    let mut reduced = ids;
+    reduced.remove(&doc_id(&original[1]));
+    let error = indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "deleted-parity", &reduced,
+    ).unwrap_err();
+    assert!(matches!(error.downcast_ref::<frankensearch::SearchError>(),
+        Some(frankensearch::SearchError::InvalidConfig { field, .. }) if field == "fec_sidecar"));
+    assert_eq!(same_file::Handle::from_path(&path)?, owner);
+    assert_eq!(fs::read(&path)?, before);
+    assert_eq!(fs::read(&fec)?, b"opaque owner-managed parity");
+    Ok(())
+}
+
+#[test]
+fn canonical_empty_delta_does_not_skip_same_count_identity_changes_or_missing_coverage() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    let before = fs::read(&path)?;
+    for variant in 0..5 {
+        let mut current = original.clone();
+        match variant {
+            0 => current[1].content_hash[0] ^= 1,
+            1 => current[1].role ^= 1,
+            2 => current[1].agent_id += 1,
+            3 => current[1].source_id += 1,
+            _ => current[1].workspace_id += 1,
+        }
+        let ids = canonical_ids(&current);
+        assert_eq!(ids.len(), original.len());
+        assert!(indexer.reconcile_index_with_canonical_documents(
+            Vec::new(), temp.path(), TierKind::Fast, "same-coarse-fingerprint", &ids,
+        ).is_err(), "an unchanged count cannot vouch for identity variant {variant}");
+        assert_eq!(fs::read(&path)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_empty_delta_still_removes_deleted_documents() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    let ids = canonical_ids(&original[..1]);
+    let result = indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "deleted-with-no-embedding", &ids,
+    )?;
+    assert_eq!(vector_bits(&result)?.keys().cloned().collect::<HashSet<_>>(), ids);
+    drop(result);
+    assert_eq!(VectorIndex::open_read_only(&path)?.record_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn canonical_supplied_same_identity_vector_is_not_discarded_as_a_noop() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let mut replacement = original[1].clone();
+    for component in &mut replacement.embedding { *component = -*component; }
+    let mut expected = original.clone();
+    expected[1] = replacement.clone();
+    let oracle_root = tempfile::tempdir()?;
+    let oracle = indexer.build_and_save_index(expected, oracle_root.path())?;
+    let result = indexer.reconcile_index_with_canonical_documents(
+        vec![replacement], temp.path(), TierKind::Fast, "same-identity-new-vector", &canonical_ids(&original),
+    )?;
+    assert_eq!(vector_bits(&result)?, vector_bits(&oracle)?);
+    Ok(())
+}
+
+#[test]
+fn canonical_unchanged_reconciliation_admits_empty_and_f32_generations_without_reencoding() -> Result<()> {
+    for empty in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(path.parent().unwrap())?;
+        let mut original = if empty { Vec::new() } else { rows(&indexer, 1)? };
+        if !empty { original[0].embedding[0] = 0.123_456_79; }
+        let mut writer = VectorIndex::create_with_revision(
+            &path, "fnv1a-384",
+            coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION,
+            384, Quantization::F32,
+        )?.with_generation(255);
+        for row in &original { writer.write_record(&doc_id(row), &row.embedding)?; }
+        writer.finish()?;
+        let owner = same_file::Handle::from_path(&path)?;
+        let before = fs::read(&path)?;
+        let result = indexer.reconcile_index_with_canonical_documents(
+            Vec::new(), temp.path(), TierKind::Fast, "same-f32", &canonical_ids(&original),
+        )?;
+        assert_eq!(result.quantization(), Quantization::F32);
+        assert_eq!(result.record_count(), original.len());
+        assert_eq!(same_file::Handle::from_path(&path)?, owner);
+        assert_eq!(VectorIndex::peek_compaction_gen(&path)?, 255);
+        assert_eq!(fs::read(&path)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_unchanged_admission_rejects_unusable_persisted_vectors() -> Result<()> {
+    for value in [1e-20f32, 70_000.0f32] {
+        let temp = tempfile::tempdir()?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(path.parent().unwrap())?;
+        let mut original = rows(&indexer, 1)?;
+        original[1].embedding.fill(value);
+        // Native serialization creates the negative: the input is finite,
+        // but its persisted F16 representation cannot supply useful signal.
+        write_generation(&path, &original, 8)?;
+        let before = fs::read(&path)?;
+        assert!((0..original.len()).all(|row| original[row].embedding.iter().all(|x| x.is_finite())));
+        let error = indexer.reconcile_index_with_canonical_documents(
+            Vec::new(), temp.path(), TierKind::Fast, "bad-stored-signal", &canonical_ids(&original),
+        ).unwrap_err();
+        assert!(error.to_string().contains("unusable stored vector"), "{error:#}");
+        assert_eq!(fs::read(&path)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_unchanged_admission_requires_unique_rows_matching_the_current_space() -> Result<()> {
+    for foreign in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let original = rows(&indexer, 1)?;
+        let path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(path.parent().unwrap())?;
+        let revision = if foreign { "foreign-revision" } else {
+            coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION
+        };
+        let mut writer = VectorIndex::create_with_revision(&path, "fnv1a-384", revision, 384, Quantization::F16)?;
+        let duplicate_rows = vec![original[0].clone(), original[0].clone(), original[2].clone()];
+        let physical_rows = if foreign { &original } else { &duplicate_rows };
+        for row in physical_rows { writer.write_record(&doc_id(row), &row.embedding)?; }
+        writer.finish()?;
+        let before = fs::read(&path)?;
+        assert!(indexer.reconcile_index_with_canonical_documents(
+            Vec::new(), temp.path(), TierKind::Fast, "same-row-count", &canonical_ids(&original),
+        ).is_err());
+        assert_eq!(fs::read(&path)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_unchanged_admission_refuses_live_writers_and_absent_authority() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let original = rows(&indexer, 1)?;
+    drop(indexer.build_and_save_index(original.clone(), temp.path())?);
+    let path = vector_index_path(temp.path(), indexer.embedder_id());
+    let before = fs::read(&path)?;
+    let writer = VectorIndex::open_writer(&path)?;
+    assert!(indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "current", &canonical_ids(&original),
+    ).is_err());
+    assert_eq!(fs::read(&path)?, before);
+    drop(writer);
+    assert!(indexer.reconcile_index_with_canonical_documents(
+        Vec::new(), temp.path(), TierKind::Fast, "  ", &canonical_ids(&original),
+    ).is_err());
+    assert_eq!(fs::read(&path)?, before);
+    Ok(())
+}

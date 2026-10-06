@@ -206,6 +206,9 @@ impl SemanticIndexer {
         self.inner.append_to_index(embedded_messages, data_dir)
     }
 
+    /// Reconcile against the caller's authoritative canonical identity set.
+    /// An exactly unchanged, log-free generation is returned as a shared
+    /// query owner without replacing its file or retiring recovery protection.
     pub fn reconcile_index_with_canonical_documents(
         &self,
         embedded_messages: Vec<EmbeddedMessage>,
@@ -215,9 +218,24 @@ impl SemanticIndexer {
         current_doc_ids: &HashSet<String>,
     ) -> Result<VectorIndex> {
         let destination = vector_index_path(data_dir, self.embedder_id());
-        refuse_publication_sidecars(&destination, true)?;
         let wal_path = wal_path_for(&destination);
         let wal_before = ObservedSemanticFile::capture(&wal_path)?;
+        // An empty embedding delta is not proof of unchanged coverage. Admit
+        // a no-op only after comparing every current identity and checking
+        // the stored vectors under a retained native reader. In that case no
+        // generation or recovery sidecar is being replaced or retired.
+        if wal_before.is_none() && embedded_messages.is_empty() {
+            ensure!(!db_fingerprint.trim().is_empty(),
+                "canonical semantic reconciliation requires a DB fingerprint");
+            if let Some(source) = self.retain_unchanged_canonical_index(
+                &destination, current_doc_ids,
+            )? {
+                tracing::info!(tier = tier.as_str(), retained_docs = source.record_count(),
+                    "canonical semantic reconciliation retained unchanged generation");
+                return Ok(source);
+            }
+        }
+        refuse_publication_sidecars(&destination, true)?;
         // Keep the established no-WAL implementation. The generation-bound
         // merge below addresses retained deltas, including the full-replacement
         // case which cannot reset the main generation beside an old WAL.
@@ -347,6 +365,61 @@ impl SemanticIndexer {
             replaced_docs = replacements.len(), retained_wal_rows = source.wal_record_count(),
             "published canonical semantic reconciliation");
         Ok(published)
+    }
+
+    /// Return a shared, query-only owner when no vector or identity changes
+    /// are necessary. Never infer this from the record count, fingerprint, or
+    /// an empty embedding delta alone. Callers retain their maintenance lock
+    /// and canonical-set authority; subsequent mutation needs a writer open.
+    fn retain_unchanged_canonical_index(
+        &self,
+        destination: &Path,
+        current_doc_ids: &HashSet<String>,
+    ) -> Result<Option<VectorIndex>> {
+        let before = RebuildDestination::capture(destination)?;
+        if before.file.is_none() {
+            return Ok(None);
+        }
+        let revision = expected_vector_space_revision(self.embedder_id())
+            .context("canonical reconciliation has no registered vector-space revision")?;
+        let source = VectorIndex::open_read_only(destination)?;
+        // Admission failures never authorize falling through to a mutable
+        // snapshot of a source whose owner changed during the observation.
+        ensure!(RebuildDestination::capture(destination)? == before
+                && ObservedSemanticFile::capture(&wal_path_for(destination))?.is_none(),
+            "semantic source changed while checking unchanged canonical coverage");
+        if source.embedder_id() != self.embedder_id()
+            || source.embedder_revision() != revision
+            || source.dimension() != self.embedder_dimension()
+            || source.record_count() != current_doc_ids.len()
+            || source.tombstone_count() != 0
+            || source.wal_record_count() != 0
+        {
+            return Ok(None);
+        }
+
+        // Borrow IDs from the caller instead of retaining a second string
+        // inventory. Explicit removal also detects duplicate physical rows;
+        // equal counts or adjacent-only duplicate checks are insufficient.
+        let mut remaining = HashSet::new();
+        remaining.try_reserve(current_doc_ids.len())?;
+        remaining.extend(current_doc_ids.iter().map(String::as_str));
+        for row in 0..source.record_count() {
+            if !remaining.remove(source.doc_id_at(row)?) {
+                return Ok(None);
+            }
+        }
+        if !remaining.is_empty() {
+            return Ok(None);
+        }
+        for row in 0..source.record_count() {
+            ensure!(source.is_vector_usable(row),
+                "unchanged canonical coverage has an unusable stored vector at row {row}; rebuild from canonical text");
+        }
+        ensure!(RebuildDestination::capture(destination)? == before
+                && ObservedSemanticFile::capture(&wal_path_for(destination))?.is_none(),
+            "semantic source changed during unchanged canonical validation");
+        Ok(Some(source))
     }
 
     pub fn build_hnsw_index(
