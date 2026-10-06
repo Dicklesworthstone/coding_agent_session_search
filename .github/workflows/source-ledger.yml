@@ -65,8 +65,8 @@ jobs:
           }
           for name, sha in additions.items():
               Path(name).write_bytes(blob(sha))
-          script = blob('5e107e415753354f8b05411d25afce1a56235f16')
-          exec(compile(script, 'reviewed-gh512-candidate', 'exec'), {'__name__': '__main__'})
+          script = blob('e4e8571a385716577ca75f6fc772297a66e7dfc8')
+          exec(compile(script, 'reviewed-gh512-candidate', 'exec'), {'__name__': '__main__', 'blob': blob})
           files = sorted(expected)
           subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *files], check=True)
           subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *files], check=True)
