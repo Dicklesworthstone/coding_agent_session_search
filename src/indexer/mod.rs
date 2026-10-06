@@ -11,6 +11,8 @@ pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
+#[cfg(test)]
+mod source_ledger_tests;
 pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
@@ -14119,11 +14121,70 @@ fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bo
     let Some(files) = saved["dependencies"].as_array() else {
         return false;
     };
+    // Older rows include the implicit parent. Do not force one last reparse
+    // just to remove it for a self-contained connector. All explicit sidecars
+    // and the primary/producer checks above retain their existing semantics.
+    let ignored_parent = (!source_folder_is_dependency(source))
+        .then(|| source.source_path.parent())
+        .flatten();
     files.iter().all(|file| {
-        file["path"]
-            .as_str()
-            .is_some_and(|path| source_file_observation(Path::new(path)).as_ref() == Some(file))
+        file["path"].as_str().is_some_and(|path| {
+            Some(Path::new(path)) == ignored_parent
+                || source_file_observation(Path::new(path)).as_ref() == Some(file)
+        })
     })
+}
+
+/// A connector capability, not an inference from this scan's sidecar list.
+fn source_folder_is_dependency(source: &DiscoveredSourceFile) -> bool {
+    crate::connectors::source_dependencies::source_dependency_policy(&source.provider_slug)
+        .observes_parent_directory()
+}
+
+fn source_parent_observation(source: &DiscoveredSourceFile) -> Option<serde_json::Value> {
+    if source_folder_is_dependency(source) {
+        source
+            .source_path
+            .parent()
+            .and_then(source_file_observation)
+    } else {
+        None
+    }
+}
+
+/// Capture the reconstruction dependencies after a source finishes parsing.
+/// Folder growth must not withhold a self-contained source's durable marker,
+/// but changes to the primary or any declared sidecar must still withhold it.
+fn source_observations_after_scan(
+    source: &DiscoveredSourceFile,
+    sidecars: &[DiscoveredSourceFile],
+    primary_before: Option<&serde_json::Value>,
+    parent_before: Option<&serde_json::Value>,
+    dependencies_before: &HashMap<PathBuf, serde_json::Value>,
+) -> Option<(serde_json::Value, Vec<serde_json::Value>)> {
+    let primary = source_file_observation(&source.source_path)?;
+    if Some(&primary) != primary_before || source.fs_metadata_changed() {
+        return None;
+    }
+    let mut dependencies = Vec::new();
+    if source_folder_is_dependency(source) {
+        let parent = source_parent_observation(source)?;
+        if Some(&parent) != parent_before {
+            return None;
+        }
+        dependencies.push(parent);
+    }
+    for sidecar in sidecars {
+        if sidecar.fs_metadata_changed() {
+            return None;
+        }
+        let observation = source_file_observation(&sidecar.source_path)?;
+        if dependencies_before.get(&sidecar.source_path) != Some(&observation) {
+            return None;
+        }
+        dependencies.push(observation);
+    }
+    Some((primary, dependencies))
 }
 
 /// Keep only the final bounded batch until the connector certifies a source.
@@ -14172,10 +14233,7 @@ fn scan_with_durable_source_boundaries(
             return false;
         }
         filtered.set(scan_path_exclusions_active());
-        *before.borrow_mut() = source
-            .source_path
-            .parent()
-            .and_then(source_file_observation);
+        *before.borrow_mut() = source_parent_observation(source);
         *primary_before.borrow_mut() = source_file_observation(&source.source_path);
         let skip = env!("CASS_SOURCE_INGEST_REUSE") == "true"
             && !filtered.get()
@@ -14197,30 +14255,15 @@ fn scan_with_durable_source_boundaries(
         {
             return sender.borrow_mut().flush();
         }
-        let Some(primary) = source_file_observation(&completion.source.source_path) else {
+        let Some((primary, dependencies)) = source_observations_after_scan(
+            &completion.source,
+            &completion.required_sidecars,
+            primary_before.borrow().as_ref(),
+            before.borrow().as_ref(),
+            &dependencies_before,
+        ) else {
             return sender.borrow_mut().flush();
         };
-        if Some(&primary) != primary_before.borrow().as_ref() {
-            return sender.borrow_mut().flush();
-        }
-        let parent = completion
-            .source
-            .source_path
-            .parent()
-            .and_then(source_file_observation);
-        if parent.is_none() || parent != *before.borrow() {
-            return sender.borrow_mut().flush();
-        }
-        let mut dependencies = vec![parent.expect("checked parent")];
-        for sidecar in &completion.required_sidecars {
-            let Some(observation) = source_file_observation(&sidecar.source_path) else {
-                return sender.borrow_mut().flush();
-            };
-            if dependencies_before.get(&sidecar.source_path) != Some(&observation) {
-                return sender.borrow_mut().flush();
-            }
-            dependencies.push(observation);
-        }
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
             key: source_ledger_key(&completion.source, &ctx),
             observation: serde_json::json!({"primary":primary,"dependencies":dependencies,

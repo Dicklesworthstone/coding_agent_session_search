@@ -7,67 +7,15 @@ on:
       - src/indexer/source_ledger_tests.rs
       - src/connectors/**
       - tests/e2e_index_resume.rs
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - rust-toolchain.toml
       - .github/workflows/source-ledger.yml
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  rebase-object:
-    runs-on: ubuntu-slim
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - name: Export exact reconciled source without ref changes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, urllib.request
-          from pathlib import Path
-          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
-          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
-          def request(path, body=None):
-              data = None if body is None else json.dumps(body).encode()
-              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  return json.load(response)
-          def digest(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          def blob(sha):
-              result = request('/git/blobs/' + sha)
-              assert result['encoding'] == 'base64'
-              data = base64.b64decode(result['content'])
-              assert digest(data) == sha
-              return data.decode()
-          expected = 'df52b2ab0316f6582bfab17026b28dc8d4b91acd'
-          observed = request('/contents/src/indexer/mod.rs?ref=' + os.environ['GITHUB_SHA'])
-          assert observed['sha'] == expected, 'source drift'
-          baseline = blob('d69d69cf1334c55ae34c608a1b79f39692913a2e')
-          current = blob(expected)
-          candidate = blob('bbe6ec4df19ca084a6611f322406ba1fef3b90a3')
-          old = '    if embedder_id == "fnv1a-384" {\n        "hash".to_string()\n    } else {'
-          new = '    if embedder_id == "fnv1a-384" {\n        "hash".to_string()\n    } else if crate::search::external_embedder::is_external_identity(embedder_id) {\n        embedder_id.to_owned()\n    } else {'
-          assert baseline.count(old) == candidate.count(old) == 1
-          assert baseline.replace(old, new, 1) == current, 'unexpected concurrent source delta'
-          data = candidate.replace(old, new, 1).encode()
-          expected_result = '35518cfac6dd4ad4d5ab9fd1b83fcb0f103d0bc6'
-          assert digest(data) == expected_result
-          result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
-          assert result['sha'] == expected_result
-          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'base': expected, 'candidate': 'bbe6ec4df19ca084a6611f322406ba1fef3b90a3', 'result': expected_result, 'validation': 'exact source composition only; native gates are separate'}
-          Path('gh512-rebased-source.json').write_text(json.dumps(receipt, indent=2) + '\n')
-          Path('gh512-rebased-indexer.rs').write_bytes(data)
-          print('GH512_REBASED_SOURCE=' + json.dumps(receipt, sort_keys=True))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: gh512-rebased-source-${{ github.sha }}
-          path: |
-            gh512-rebased-source.json
-            gh512-rebased-indexer.rs
-          if-no-files-found: error
-          retention-days: 7
   native:
     strategy:
       fail-fast: false
@@ -75,8 +23,6 @@ jobs:
         os: [ubuntu-24.04, macos-14, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    permissions:
-      contents: write
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -88,97 +34,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify the committed source revision
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           toolchain: nightly-2026-08-31
           components: clippy, rustfmt
-      - name: Prepare exact GH512 candidate without changing refs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, hashlib, json, os, subprocess, tarfile, urllib.request
-          from pathlib import Path
-          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
-          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
-          def request(path, body=None):
-              data = None if body is None else json.dumps(body).encode()
-              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  return json.load(response)
-          def digest(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          def blob(sha):
-              result = request('/git/blobs/' + sha)
-              assert result['encoding'] == 'base64'
-              data = base64.b64decode(result['content'])
-              assert digest(data) == sha
-              return data
-          expected = {
-              'src/indexer/mod.rs': 'df52b2ab0316f6582bfab17026b28dc8d4b91acd',
-              'src/connectors/mod.rs': '563ffb0b9251db54b5898056e370129049c4bd92',
-              'src/connectors/source_dependencies.rs': None,
-              'src/indexer/source_ledger_tests.rs': None,
-              'tests/e2e_index_resume.rs': 'e0a5d686a7cd64804b44c5a08c243de8264c1fa8',
-          }
-          for name, sha in expected.items():
-              path = Path(name)
-              assert not any(part.is_symlink() for part in [path, *path.parents]), name
-              assert (digest(path.read_bytes()) if path.exists() else None) == sha, 'source drift: ' + name
-          additions = {
-              'src/connectors/source_dependencies.rs': 'a985a1a8c49cfe0e559683d481a3e038eda5929d',
-              'src/indexer/source_ledger_tests.rs': '4d8bfdd1201dcec04ffa6bc8398cc62065a23735',
-          }
-          for name, sha in additions.items():
-              Path(name).write_bytes(blob(sha))
-          script = blob('f04393b966e91baef228478dba23c593779fc685')
-          exec(compile(script, 'reviewed-gh512-candidate', 'exec'), {'__name__': '__main__', 'blob': blob})
-          candidate = {
-              'src/indexer/mod.rs': '2da17c6a837072974a09ec3fa40831223c48b973',
-              'src/connectors/mod.rs': '3d22cbea8114dcf9ccaa351c098db6cfe474fa03',
-              'src/connectors/source_dependencies.rs': 'a985a1a8c49cfe0e559683d481a3e038eda5929d',
-              'src/indexer/source_ledger_tests.rs': 'b3d3d0b6d55f57716b4819c8d2ca45c9afdd2099',
-              'tests/e2e_index_resume.rs': '601819e495257792d5a74f0a8ded431c6d6003df',
-          }
-          for name, sha in candidate.items():
-              assert digest(Path(name).read_bytes()) == sha, 'candidate mismatch: ' + name
-          files = sorted(expected)
-          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *files], check=True)
-          subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *files], check=True)
-          assert digest(Path('src/indexer/mod.rs').read_bytes()) == '35518cfac6dd4ad4d5ab9fd1b83fcb0f103d0bc6'
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          assert changed <= set(files), changed
-          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': expected, 'blobs': {}}
-          for name in files:
-              data = Path(name).read_bytes()
-              result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
-              assert result['sha'] == digest(data), name
-              receipt['blobs'][name] = result['sha']
-          Path('gh512-source-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-          Path('gh512-candidate.diff').write_bytes(subprocess.check_output(['git', 'diff', '--', *files]))
-          print('GH512_SOURCE_RECEIPT=' + json.dumps(receipt, sort_keys=True))
-          for line in Path('.beads/issues.jsonl').read_text().splitlines():
-              if 'gh512' in line.lower() or '#512' in line:
-                  print('GH512_BEAD:', line)
-          with tarfile.open('gh512-source.tar.gz', 'w:gz') as archive:
-              for name in ['src', 'tests', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo', 'gh512-source-receipt.json']:
-                  archive.add(name, arcname=name)
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: gh512-source-${{ github.sha }}-${{ matrix.os }}
-          path: |
-            gh512-source.tar.gz
-            gh512-source-receipt.json
-            gh512-original-ledger.txt
-            gh512-candidate-ledger.txt
-            gh512-candidate.diff
-          if-no-files-found: error
-          retention-days: 7
-      - name: Source ledger and real connector regressions
+      - name: Source ledger regressions
         run: cargo test --locked --lib source_ledger -- --nocapture
       - name: Existing primary identity and sidecar observation guards
         run: cargo test --locked --lib gh426_source_observation -- --nocapture
@@ -193,13 +55,6 @@ jobs:
       - name: Touched source formatting gate
         if: always()
         run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/connectors/mod.rs src/connectors/source_dependencies.rs tests/e2e_index_resume.rs
-      - name: Verify tested source hashes
+      - name: Verify validation did not alter committed sources
         if: always()
-        run: |
-          python3 - <<'PY'
-          import hashlib, json
-          from pathlib import Path
-          for name, expected in json.loads(Path('gh512-source-receipt.json').read_text())['blobs'].items():
-              data = Path(name).read_bytes()
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected, name
-          PY
+        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
