@@ -7167,16 +7167,19 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
         Err(err) => {
             // Let clap handle help/version natively (exit 0, print to stdout)
             use clap::error::ErrorKind;
-            if matches!(
-                err.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            ) {
-                // Render from the whole tree so the root help also lists the
-                // binary-dispatched subcommands (serve, archive).
-                match cli_command().try_get_matches_from(&normalized_args) {
-                    Err(full) if full.kind() == err.kind() => full.exit(),
-                    _ => err.exit(),
-                }
+            let is_display = |kind: ErrorKind| {
+                matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion)
+            };
+            // Help renders from the whole tree: the root help then lists the
+            // binary-dispatched subcommands (serve, archive), and `cass help
+            // serve`, an unknown subcommand to this CLI alone, shows its help.
+            if let Err(full) = cli_command().try_get_matches_from(&normalized_args)
+                && is_display(full.kind())
+            {
+                full.exit();
+            }
+            if is_display(err.kind()) {
+                err.exit();
             }
 
             // Handle bare subcommand invocations (e.g. `cass analytics` without a

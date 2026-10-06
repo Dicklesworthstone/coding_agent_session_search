@@ -3855,6 +3855,18 @@ fn binary_dispatched_serve_and_archive_are_discoverable() {
                 "--help must list {name}:\n{help}"
             );
         }
+        // `cass help <name>` reaches the main CLI, which alone does not know them.
+        for name in ["serve", "archive"] {
+            let help = stdout(&["help", name]);
+            assert!(help.contains(&format!("cass {name}")), "{help}");
+        }
+        // clap_complete's bash script routes each subcommand with a
+        // `<parent>,<name>)` case label.
+        let completions = stdout(&["completions", "bash"]);
+        assert!(
+            completions.contains("cass,serve)") && completions.contains("cass,archive)"),
+            "bash completions must offer serve and archive"
+        );
         let docs = stdout(&["robot-docs", "commands"]);
         assert!(
             docs.contains("cass serve --stdio") && docs.contains("cass archive export"),

@@ -3997,7 +3997,10 @@
           "description": "Receipts are JSON regardless of this compatibility flag",
           "arg_type": "flag",
           "required": false,
-          "default": "false"
+          "enum_values": [
+            "true",
+            "false"
+          ]
         }
       ],
       "has_json_output": true

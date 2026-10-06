@@ -200,16 +200,22 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
 }
 
 /// The `archive` subcommand tree, for the main CLI's help and command
-/// schemas. Building first copies this parser's root-level globals (`--db`,
-/// `--data-dir`, `--json`) into the subcommand. Only `archive` is taken:
-/// building also adds clap's own `help` subcommand to this root, which would
-/// collide with the main CLI's.
+/// schemas. This parser's root-level globals (`--db`, `--data-dir`, `--json`)
+/// are copied onto the subcommand unbuilt. Building this root first instead
+/// adds clap's own `help` subcommand (a duplicate under the main CLI) and
+/// freezes the subtree, so the main CLI's propagated `--robot-format` stays
+/// unbuilt and `cass help archive` panics inside clap.
 pub fn clap_commands() -> Vec<clap::Command> {
     use clap::CommandFactory;
-    let mut root = Cli::command();
-    root.build();
+    let root = Cli::command();
+    let globals: Vec<clap::Arg> = root
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .cloned()
+        .collect();
     root.find_subcommand("archive")
         .cloned()
+        .map(|archive| archive.args(globals))
         .into_iter()
         .collect()
 }
