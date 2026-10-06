@@ -268,11 +268,17 @@ class Owner:
                 self.close()
                 self.guard = Guard(self.index)
                 remaining(deadline)
+                # Open exactly the directory captured by the guard, not a
+                # pathname an ancestor rename could temporarily redirect.
+                # Only this root capability crosses exec; the guard's other
+                # descriptors and the owner's socket/lock remain private.
+                root_fd = self.guard.nodes[0][0]
                 self.process = subprocess.Popen(
-                    [self.cass, "serve", "--stdio", "--index", self.index,
+                    [self.cass, "serve", "--stdio", "--index",
+                     f"/proc/self/fd/{root_fd}",
                      "--request-timeout-ms", str(int(self.timeout * 1000))],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=None, close_fds=True)
+                    stderr=None, close_fds=True, pass_fds=(root_fd,))
                 os.set_blocking(self.process.stdin.fileno(), False)
                 os.set_blocking(self.process.stdout.fileno(), False)
             self.sequence += 1

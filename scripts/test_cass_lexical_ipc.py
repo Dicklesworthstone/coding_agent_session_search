@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("cass_lexical_ipc.py")
 spec = importlib.util.spec_from_file_location("cass_lexical_ipc", MODULE_PATH)
@@ -28,6 +29,23 @@ import hashlib, json, os, pathlib, sys, time
 index = pathlib.Path(sys.argv[sys.argv.index('--index') + 1])
 home = pathlib.Path(__file__).parent
 mode = (home / 'mode').read_text() if (home / 'mode').exists() else 'normal'
+if mode == 'root_probe':
+    # Capture at process startup, while the test has redirected an ancestor.
+    retained_bytes = (index / 'segment.qseg').read_bytes()
+    retained_manifest = (index / 'quill.manifest.json').read_text()
+    root_info = index.stat()
+    inherited = []
+    for name in os.listdir('/proc/self/fd'):
+        try:
+            os.fstat(int(name))
+        except OSError:
+            continue
+        if int(name) > 2:
+            inherited.append(int(name))
+    root_probe = {'identity': [root_info.st_dev, root_info.st_ino],
+                  'sha256': hashlib.sha256(retained_bytes).hexdigest(),
+                  'inherited': sorted(inherited)}
+    (home / 'root_ready').write_text(json.dumps(root_probe))
 loaded = False
 for line in sys.stdin:
     request = json.loads(line)
@@ -53,8 +71,10 @@ for line in sys.stdin:
     if not loaded:
         with (home / 'opens').open('a') as log:
             log.write(str(os.getpid()) + '\n')
-        expected = json.loads((index / 'quill.manifest.json').read_text())
-        actual = hashlib.sha256((index / 'segment.qseg').read_bytes()).hexdigest()
+        expected = json.loads(retained_manifest if mode == 'root_probe' else
+                              (index / 'quill.manifest.json').read_text())
+        actual = hashlib.sha256(retained_bytes if mode == 'root_probe' else
+                                (index / 'segment.qseg').read_bytes()).hexdigest()
         if actual != expected['hash']:
             print(json.dumps(dict(schema_version=1, id=request['id'], ok=False,
                                   error={'kind':'corrupt', 'message':'full hash failed'})), flush=True)
@@ -63,6 +83,9 @@ for line in sys.stdin:
         with (index / 'segment.qseg').open('r+b') as changed:
             changed.write(b'Z')
     result = {'hits':[{'content': 'alpha', 'score':1.0}], 'reader_reused':loaded}
+    if mode == 'root_probe':
+        result['root_probe'] = root_probe
+        result['current_root'] = [index.stat().st_dev, index.stat().st_ino]
     print(json.dumps(dict(schema_version=1, id=request['id'], ok=True, result=result)), flush=True)
     loaded = True
 """
@@ -145,6 +168,75 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(response["admission"]["mode"], "strict_full")
         self.assertEqual(response["admission"]["owner_epoch"], 2)
         self.assertEqual(len(self.opens()), 2)
+
+    def test_ancestor_aba_cannot_redirect_native_admission(self):
+        # Moving the ancestor away and back does not change the guarded root's
+        # metadata. Pathname checks alone therefore cannot catch this ABA.
+        live = self.home / "live"
+        alternate = self.home / "alternate"
+        saved = self.home / "saved"
+        live.mkdir()
+        alternate.mkdir()
+        self.index.rename(live / "index")
+        self.index = live / "index"
+        self.segment = self.index / "segment.qseg"
+        other = alternate / "index"
+        other.mkdir()
+        other_bytes = b"different but valid published index"
+        (other / "segment.qseg").write_bytes(other_bytes)
+        (other / "quill.manifest.json").write_text(json.dumps({
+            "hash": hashlib.sha256(other_bytes).hexdigest()}))
+        expected = ipc.stamp(self.index.stat())
+        expected_hash = hashlib.sha256(self.segment.read_bytes()).hexdigest()
+        self.owner = ipc.Owner(str(self.cass), self.index, 2)
+        self.mode("root_probe")
+        real_popen = subprocess.Popen
+
+        def redirected_spawn(*args, **kwargs):
+            live.rename(saved)
+            alternate.rename(live)
+            process = None
+            try:
+                process = real_popen(*args, **kwargs)
+                deadline = time.monotonic() + 2
+                while not (self.home / "root_ready").exists():
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        self.fail("worker did not sample the redirected root")
+                    time.sleep(0.005)
+                return process
+            except BaseException:
+                if process is not None:
+                    process.kill()
+                    process.communicate(timeout=2)
+                raise
+            finally:
+                live.rename(alternate)
+                saved.rename(live)
+
+        with mock.patch.object(ipc.subprocess, "Popen", side_effect=redirected_spawn):
+            first = self.search()
+        self.assertEqual(ipc.stamp(self.index.stat()), expected)
+        self.assertTrue(self.owner.guard.unchanged())
+        self.assertEqual(first["result"]["root_probe"]["identity"], list(expected[:2]))
+        self.assertEqual(first["result"]["root_probe"]["sha256"], expected_hash)
+        second = self.search()
+        self.assertEqual(second["admission"]["mode"], "retained_guarded")
+        self.assertEqual(second["result"]["root_probe"], first["result"]["root_probe"])
+        self.assertEqual(len(self.opens()), 1)
+
+    def test_worker_retains_only_the_guarded_root_descriptor(self):
+        self.mode("root_probe")
+        unrelated = os.open(self.cass, os.O_RDONLY)
+        os.set_inheritable(unrelated, True)
+        try:
+            first, second = self.search(), self.search()
+        finally:
+            os.close(unrelated)
+        root_fd = self.owner.guard.nodes[0][0]
+        identity = list(ipc.stamp(self.index.stat())[:2])
+        self.assertEqual(first["result"]["root_probe"]["inherited"], [root_fd])
+        self.assertEqual(second["result"]["current_root"], identity)
+        self.assertEqual(len(self.opens()), 1)
 
     def test_adversarial_segment_changes_force_strict_failure(self):
         cases = ("replacement", "truncation", "same_length", "restored_mtime")
