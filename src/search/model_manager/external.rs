@@ -45,9 +45,13 @@ fn recorded_artifact(
     let artifact = manifest
         .quality_tier
         .ok_or_else(|| stale("no completed external quality artifact; run external backfill"))?;
+    // The CLI records the retained endpoint identity as its model revision.
+    // The FSVI header revision describes only the transport/input contract and
+    // cannot stand in for the model/endpoint/dimension/revision identity.
     let expected_path = vector_index_path(data_dir, &id);
     if artifact.tier != TierKind::Quality
         || artifact.embedder_id != id
+        || artifact.model_revision != id
         || artifact.dimension != config.dimension()
         || !artifact.ready
         || artifact.schema_version != SEMANTIC_SCHEMA_VERSION

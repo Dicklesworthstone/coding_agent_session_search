@@ -31,7 +31,7 @@ fn publication(data_dir: &Path, config: &ExternalEmbeddingConfig) -> ArtifactRec
     ArtifactRecord {
         tier: TierKind::Quality,
         embedder_id: config.identity(),
-        model_revision: crate::search::external_embedder::EXTERNAL_VECTOR_SPACE_REVISION.into(),
+        model_revision: config.identity(),
         schema_version: SEMANTIC_SCHEMA_VERSION,
         chunking_version: CHUNKING_STRATEGY_VERSION,
         dimension: config.dimension(),
@@ -200,4 +200,86 @@ fn external_query_immutable_generation_gate_still_precedes_endpoint_access() {
     ));
     assert!(result.context.is_none());
     assert_no_http(&listener);
+}
+
+#[test]
+fn external_publication_admits_the_cli_producer_identity_without_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = fixture_config(&listener);
+    let record = publication(dir.path(), &config);
+    let mut manifest = SemanticManifest::default();
+    manifest.quality_tier = Some(record.clone());
+    manifest.save(dir.path()).unwrap();
+    let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+
+    // Match actual CLI publication, not the generic header contract string.
+    assert_eq!(record.model_revision, config.identity());
+    assert_eq!(recorded_artifact(dir.path(), &config).unwrap(), record);
+    let result = load_with_config(
+        dir.path(),
+        &dir.path().join("missing.db"),
+        true,
+        config,
+        Arc::new(|| panic!("ledger admission alone must not authorize HTTP")),
+    );
+    assert!(result.context.is_none());
+    assert!(matches!(
+        result.availability,
+        SemanticAvailability::IndexMissing { .. }
+    ));
+    assert_eq!(
+        std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+        before
+    );
+    assert_no_http(&listener);
+}
+
+#[test]
+fn external_query_refuses_unbound_publication_revisions_before_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = fixture_config(&listener);
+    let other_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    other_listener.set_nonblocking(true).unwrap();
+    let other_identity = fixture_config(&other_listener).identity();
+    assert_ne!(config.identity(), other_identity);
+
+    for revision in [
+        String::new(),
+        "hash".into(),
+        "local-model-revision".into(),
+        crate::search::external_embedder::EXTERNAL_VECTOR_SPACE_REVISION.into(),
+        other_identity,
+    ] {
+        let mut record = publication(dir.path(), &config);
+        record.model_revision = revision.clone();
+        let mut manifest = SemanticManifest::default();
+        manifest.quality_tier = Some(record);
+        manifest.save(dir.path()).unwrap();
+        let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+        let result = load_with_config(
+            dir.path(),
+            &dir.path().join("missing.db"),
+            true,
+            config.clone(),
+            Arc::new(|| panic!("a foreign producer revision must not reach preflight")),
+        );
+        assert!(result.context.is_none(), "{revision}");
+        match result.availability {
+            SemanticAvailability::IndexStale { reason, .. } => {
+                assert!(reason.contains("artifact identity"), "{revision}: {reason}");
+            }
+            other => panic!("wrong ledger-revision refusal for {revision}: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+            before,
+            "admission must not rewrite the ledger for {revision}"
+        );
+        assert_no_http(&listener);
+        assert_no_http(&other_listener);
+    }
 }
