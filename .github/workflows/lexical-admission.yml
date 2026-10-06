@@ -7,7 +7,9 @@ on:
       - 'tests/lexical_admission_contract.rs'
       - 'examples/lexical_admission_fixture.rs'
       - 'scripts/benchmark_lexical_admission.py'
+      - 'scripts/test_benchmark_lexical_admission.py'
       - '.github/workflows/lexical-admission.yml'
+      - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
 permissions:
@@ -26,6 +28,8 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
+      - name: Validate benchmark failure handling
+        run: python3 -W error::ResourceWarning -m unittest discover -s scripts -p test_benchmark_lexical_admission.py -v
       - name: Record exact qualification sources
         run: |
           mkdir -p evidence
@@ -51,7 +55,7 @@ jobs:
         run: |
           cargo test --locked --release --test lexical_admission_contract -- --nocapture
           cargo build --locked --release --bin cass --example lexical_admission_fixture
-      - name: Measure fresh and retained workloads separately
+      - name: Measure fresh and retained baseline workloads separately
         run: |
           target/release/examples/lexical_admission_fixture "$RUNNER_TEMP/lexical-admission-index" 4096
           python3 scripts/benchmark_lexical_admission.py --cass target/release/cass \
