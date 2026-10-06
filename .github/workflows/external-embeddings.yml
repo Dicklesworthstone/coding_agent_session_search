@@ -1,0 +1,92 @@
+name: External embedding contract
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/search/external_embedder.rs
+      - src/search/external_embedder/**
+      - src/indexer/semantic/**
+      - tests/external_embeddings.rs
+      - .github/workflows/external-embeddings.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Format provider and export exact-source receipt (no ref writes)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess, tarfile, urllib.request
+          from pathlib import Path
+          files = ['src/search/external_embedder.rs','src/search/external_embedder/tests.rs']
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          bases = {name: digest(Path(name).read_bytes()) for name in files}
+          subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',*files], check=True)
+          subprocess.run(['rustfmt','--edition','2024','--check','--config','skip_children=true',*files], check=True)
+          receipt = {'source_commit':os.environ['GITHUB_SHA'],'bases':bases,'blobs':{}}
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          for name in files:
+              data = Path(name).read_bytes()
+              body = json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode()
+              request = urllib.request.Request(api+'/git/blobs', data=body, headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['sha'] == digest(data), name
+              receipt['blobs'][name] = result['sha']
+          Path('external-source-receipt.json').write_text(json.dumps(receipt, indent=2)+'\n')
+          print(json.dumps(receipt, indent=2))
+          for line in Path('.beads/issues.jsonl').read_text().splitlines():
+              if 'coding_agent_session_search-gl29d' in line:
+                  print('GL29D_BEAD:', line)
+          with tarfile.open('external-source.tar.gz','w:gz') as archive:
+              for path in ['src','tests','Cargo.toml','Cargo.lock','build.rs','rust-toolchain.toml','.cargo','external-source-receipt.json']:
+                  archive.add(path, arcname=path)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: external-source-${{ github.sha }}
+          path: external-source.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+  native:
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: external-source-${{ github.sha }}
+      - run: tar -xzf external-source.tar.gz
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: clippy, rustfmt
+      - name: External provider fake-server regressions
+        run: cargo test --locked --lib search::external_embedder::tests -- --nocapture
