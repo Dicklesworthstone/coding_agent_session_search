@@ -444,3 +444,5 @@ fn external_malformed_json_is_sanitized() {
     assert!(error.contains("external_response_json"));
     assert!(!error.contains("SECRET"));
 }
+
+mod admission;

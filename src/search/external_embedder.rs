@@ -7,8 +7,8 @@
 
 use std::fmt;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const NORM_TOLERANCE: f64 = 1e-3;
 const REPEATABILITY_TOLERANCE: f32 = 1e-5;
+const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PROBES: &[&str] = &[
     "cass external embedding probe: the quick brown fox",
     "fn add(left: i32, right: i32) -> i32 { left + right }",
@@ -323,6 +324,34 @@ impl ExternalEmbedder {
         Ok(())
     }
 
+    /// Waiting behind another caller is bounded independently of that caller's
+    /// requests. A blocking Mutex::lock here would hide cancellation for an
+    /// entire multi-request batch, not just one configured HTTP deadline.
+    fn acquire_request_gate(&self) -> EmbedderResult<MutexGuard<'_, ()>> {
+        let started = Instant::now();
+        loop {
+            self.check_cancelled()?;
+            let remaining = self.config.timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(self.failure(
+                    "external_queue_timeout: provider busy; no text from this call sent; retry from the retained checkpoint",
+                ));
+            }
+            match self.request_gate.try_lock() {
+                Ok(guard) => {
+                    self.check_cancelled()?;
+                    return Ok(guard);
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(self.failure("external_internal: request gate poisoned"));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(remaining.min(ADMISSION_POLL_INTERVAL));
+                }
+            }
+        }
+    }
+
     fn body(&self, texts: &[&str]) -> EmbedderResult<Vec<u8>> {
         serde_json::to_vec(&EmbeddingRequest {
             model: &self.config.model,
@@ -441,14 +470,12 @@ impl Embedder for ExternalEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let _guard = self
-            .request_gate
-            .lock()
-            .map_err(|_| self.failure("external_internal: request gate poisoned"))?;
+        let _guard = self.acquire_request_gate()?;
         self.check_cancelled()?;
         let overhead = self.body(&[])?.len();
         // Validate all single inputs before disclosing any of this call's text.
         for (index, text) in texts.iter().enumerate() {
+            self.check_cancelled()?;
             if text.trim().is_empty() {
                 return Err(self.failure(format!("external_input_empty: input {index}")));
             }

@@ -51,7 +51,14 @@ the quality manifest's model revision records the retained provider's identity.
 
 ## Bounded work, interruption, and resume
 
-HTTP requests are serial per provider. `CASS_EXTERNAL_EMBEDDING_BATCH_SIZE`
+HTTP requests are serial per provider. A concurrent caller waiting for the
+provider checks cancellation while queued and uses the configured timeout as a
+separate admission deadline. `external_queue_timeout` means none of that call's
+text was sent; it does not cancel or detach the active caller's request. A caller
+that gains admission still has the full configured deadline for each HTTP
+request. Cancellation remains cooperative, not a hard real-time guarantee.
+
+`CASS_EXTERNAL_EMBEDDING_BATCH_SIZE`
 defaults to 64 rows and is limited to 1–128. The serialized request byte budget
 `CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES` defaults to 262144 and is limited to
 1024–4194304; JSON escaping counts against it. Responses are limited to 64 MiB.
