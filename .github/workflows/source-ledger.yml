@@ -12,6 +12,62 @@ on:
 permissions:
   contents: read
 jobs:
+  rebase-object:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Export exact reconciled source without ref changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, urllib.request
+          from pathlib import Path
+          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def blob(sha):
+              result = request('/git/blobs/' + sha)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert digest(data) == sha
+              return data.decode()
+          expected = 'df52b2ab0316f6582bfab17026b28dc8d4b91acd'
+          observed = request('/contents/src/indexer/mod.rs?ref=' + os.environ['GITHUB_SHA'])
+          assert observed['sha'] == expected, 'source drift'
+          baseline = blob('d69d69cf1334c55ae34c608a1b79f39692913a2e')
+          current = blob(expected)
+          candidate = blob('bbe6ec4df19ca084a6611f322406ba1fef3b90a3')
+          old = '    if embedder_id == "fnv1a-384" {\n        "hash".to_string()\n    } else {'
+          new = '    if embedder_id == "fnv1a-384" {\n        "hash".to_string()\n    } else if crate::search::external_embedder::is_external_identity(embedder_id) {\n        embedder_id.to_owned()\n    } else {'
+          assert baseline.count(old) == candidate.count(old) == 1
+          assert baseline.replace(old, new, 1) == current, 'unexpected concurrent source delta'
+          data = candidate.replace(old, new, 1).encode()
+          expected_result = '35518cfac6dd4ad4d5ab9fd1b83fcb0f103d0bc6'
+          assert digest(data) == expected_result
+          result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+          assert result['sha'] == expected_result
+          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'base': expected, 'candidate': 'bbe6ec4df19ca084a6611f322406ba1fef3b90a3', 'result': expected_result, 'validation': 'exact source composition only; native gates are separate'}
+          Path('gh512-rebased-source.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          Path('gh512-rebased-indexer.rs').write_bytes(data)
+          print('GH512_REBASED_SOURCE=' + json.dumps(receipt, sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh512-rebased-source-${{ github.sha }}
+          path: |
+            gh512-rebased-source.json
+            gh512-rebased-indexer.rs
+          if-no-files-found: error
+          retention-days: 7
   native:
     strategy:
       fail-fast: false
