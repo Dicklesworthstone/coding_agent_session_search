@@ -4,6 +4,8 @@
 //! collecting scan cannot expose per-file completions, so admit each discovered
 //! transcript through CASS's ledger before delegating its parsing back to FAD.
 
+mod watch_scope;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -75,16 +77,41 @@ impl CodebuffConnector {
         exclusions.validate()?;
         let mut scoped = ctx.clone();
         if !ctx.use_default_detection() {
-            scoped.scan_roots.retain(|root| !exclusions.excludes(&root.path));
+            scoped
+                .scan_roots
+                .retain(|root| !exclusions.excludes(&root.path));
             if scoped.scan_roots.is_empty() {
                 // Empty *selected* roots must never fall through to FAD's
                 // implicit home discovery, even when that home has history.
                 return Ok(Vec::new());
             }
         }
+        // A watch event can name the run state or its chat directory, while
+        // FAD's exact-file entry point accepts only chat-messages.json. Keep
+        // this a single reconstruction unit, never a scan of the whole store.
+        // Filter the requested selector before translating it, and preserve
+        // its provenance/path mappings when source_context narrows it again.
+        let requested_roots = scoped.scan_roots.clone();
+        for root in &mut scoped.scan_roots {
+            root.path = watch_scope::transcript_selector(&root.path);
+        }
         // Keep FAD's layout recognition and metadata-only enumeration. Do not
         // turn a real discovery failure into a purported complete empty scan.
         let mut sources = self.inner.discover_source_files(&scoped)?;
+        for source in &mut sources {
+            if let Some((_, requested)) = scoped
+                .scan_roots
+                .iter()
+                .zip(&requested_roots)
+                .find(|(root, _)| {
+                    root.path == source.scan_root
+                        && root.origin == source.origin
+                        && root.platform == source.platform
+                })
+            {
+                source.scan_root = requested.path.clone();
+            }
+        }
         sources.retain(|source| !Self::source_excluded(source, exclusions));
         Ok(sources)
     }
@@ -324,7 +351,11 @@ mod tests {
     fn collect(
         connector: &dyn Connector,
         ctx: &ScanContext,
-    ) -> (Vec<NormalizedConversation>, Vec<SourceCompletion>, Result<()>) {
+    ) -> (
+        Vec<NormalizedConversation>,
+        Vec<SourceCompletion>,
+        Result<()>,
+    ) {
         let mut conversations = Vec::new();
         let mut completions = Vec::new();
         let result = connector.scan_with_source_boundaries(
@@ -373,13 +404,22 @@ mod tests {
             serde_json::to_value(&upstream).unwrap()
         );
         assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].messages[0].created_at, Some(1_774_113_351_457));
-        assert_eq!(conversations[0].messages[1].created_at, Some(1_774_113_411_457));
+        assert_eq!(
+            conversations[0].messages[0].created_at,
+            Some(1_774_113_351_457)
+        );
+        assert_eq!(
+            conversations[0].messages[1].created_at,
+            Some(1_774_113_411_457)
+        );
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].conversations_emitted, 1);
         assert_eq!(completions[0].source, discovered[0]);
         assert_eq!(completions[0].source.scan_root, root);
-        assert_eq!(completions[0].required_sidecars, vec![discovered[1].clone()]);
+        assert_eq!(
+            completions[0].required_sidecars,
+            vec![discovered[1].clone()]
+        );
         assert_eq!(fs::read(path).unwrap(), before);
     }
 
@@ -541,7 +581,10 @@ mod tests {
         let (conversations, completions, result) =
             collect(&CodebuffConnector::new(), &context(&root));
         result.unwrap();
-        assert_eq!(conversations[0].workspace.as_deref(), Some(Path::new("/late/workspace")));
+        assert_eq!(
+            conversations[0].workspace.as_deref(),
+            Some(Path::new("/late/workspace"))
+        );
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].required_sidecars[0].source_path, state);
     }
@@ -624,11 +667,8 @@ mod metadata_tests {
         invalid[0] = b'[';
         let old = UNIX_EPOCH + Duration::from_secs(1_774_113_351);
         let connector = CodebuffConnector::new();
-        let ctx = ScanContext::with_roots(
-            temp.path().join("data"),
-            vec![ScanRoot::local(root)],
-            None,
-        );
+        let ctx =
+            ScanContext::with_roots(temp.path().join("data"), vec![ScanRoot::local(root)], None);
         for (bytes, expected_completions) in [(&invalid[..], 0), (&valid[..], 1)] {
             fs::write(&state, bytes).unwrap();
             fs::File::options()

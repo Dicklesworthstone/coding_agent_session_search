@@ -50,7 +50,11 @@ impl Fixture {
                 br#"{"sessionState":{"fileContext":{"projectRoot":"/synthetic/probe"}}}"#,
             );
         }
-        Self { home, private, public }
+        Self {
+            home,
+            private,
+            public,
+        }
     }
 
     fn data(&self) -> PathBuf {
@@ -84,8 +88,11 @@ impl Fixture {
             .env("RUST_MIN_STACK", "134217728")
             .current_dir(home)
             .timeout(Duration::from_secs(180));
-        // No XDG variables or Codebuff root override: also exercise the
-        // home-relative default store, including on native macOS.
+        // Windows resolves FOLDERID_Profile through the OS, not USERPROFILE.
+        // Keep the test isolated through the supported root override there;
+        // Linux/macOS still exercise default discovery with no XDG override.
+        #[cfg(windows)]
+        command.env("CASS_CODEBUFF_DATA_ROOT", self.projects());
         command
     }
 
@@ -98,7 +105,10 @@ impl Fixture {
         let output = command.assert().success().get_output().stdout.clone();
         let report: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(report["success"], true, "{report}");
-        assert_eq!(report["indexing_stats"]["scan_had_errors"], false, "{report}");
+        assert_eq!(
+            report["indexing_stats"]["scan_had_errors"], false,
+            "{report}"
+        );
         report
     }
 
@@ -110,7 +120,10 @@ impl Fixture {
             .map(|row| row.source_path.canonicalize().unwrap())
             .collect();
         actual.sort();
-        let mut expected: Vec<_> = expected.iter().map(|path| path.canonicalize().unwrap()).collect();
+        let mut expected: Vec<_> = expected
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
         expected.sort();
         assert_eq!(actual, expected, "canonical sources must honor exclusions");
         for row in rows {
@@ -121,21 +134,41 @@ impl Fixture {
     }
 
     fn assert_hits(&self, token: &str, expected: usize) {
-        let output = self.command("1", "")
-            .args(["search", token, "--agent", "codebuff", "--mode", "lexical", "--json", "--no-maintenance"])
-            .assert().success().get_output().stdout.clone();
+        let output = self
+            .command("1", "")
+            .args([
+                "search",
+                token,
+                "--agent",
+                "codebuff",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
         let result: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(result["hits"].as_array().unwrap().len(), expected, "{result}");
+        assert_eq!(
+            result["hits"].as_array().unwrap().len(),
+            expected,
+            "{result}"
+        );
     }
 
     fn source_snapshot(&self) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
-        [&self.private, &self.public].into_iter().flat_map(|primary| {
-            [primary.clone(), primary.with_file_name("run-state.json")]
-        }).map(|path| {
-            let bytes = fs::read(&path).unwrap();
-            let mtime = fs::metadata(&path).unwrap().modified().unwrap();
-            (path, bytes, mtime)
-        }).collect()
+        [&self.private, &self.public]
+            .into_iter()
+            .flat_map(|primary| [primary.clone(), primary.with_file_name("run-state.json")])
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, mtime)
+            })
+            .collect()
     }
 }
 
@@ -155,8 +188,12 @@ fn files_containing(root: &Path, token: &str) -> Vec<PathBuf> {
             let kind = entry.file_type().unwrap();
             if kind.is_dir() {
                 pending.push(entry.path());
-            } else if kind.is_file() && fs::read(entry.path()).unwrap()
-                .windows(token.len()).any(|bytes| bytes == token.as_bytes()) {
+            } else if kind.is_file()
+                && fs::read(entry.path())
+                    .unwrap()
+                    .windows(token.len())
+                    .any(|bytes| bytes == token.as_bytes())
+            {
                 found.push(entry.path());
             }
         }
@@ -177,7 +214,10 @@ fn codebuff_exclusions_keep_private_bytes_out_and_resume_without_source_mutation
         fixture.assert_hits(PRIVATE, 0);
         fixture.assert_hits(PUBLIC, 1);
         assert!(files_containing(&fixture.data(), PRIVATE).is_empty());
-        assert!(!files_containing(&fixture.data(), PUBLIC).is_empty(), "positive byte-sweep control");
+        assert!(
+            !files_containing(&fixture.data(), PUBLIC).is_empty(),
+            "positive byte-sweep control"
+        );
         assert_eq!(storage_summary(&fixture.data()).invalid_manifest_count, 0);
         assert_unchanged(&snapshot);
 
@@ -212,11 +252,17 @@ fn codebuff_exclusions_on_primary_or_sidecar_prevent_malformed_chat_parsing() {
             // file. No replacement parser or mock is involved.
             let context = coding_agent_search::connectors::ScanContext::with_roots(
                 fixture.data(),
-                vec![coding_agent_search::connectors::ScanRoot::local(fixture.projects())],
+                vec![coding_agent_search::connectors::ScanRoot::local(
+                    fixture.projects(),
+                )],
                 None,
             );
             use coding_agent_search::connectors::Connector;
-            assert!(franken_agent_detection::CodebuffConnector::new().scan(&context).is_err());
+            assert!(
+                franken_agent_detection::CodebuffConnector::new()
+                    .scan(&context)
+                    .is_err()
+            );
 
             write_old(&fixture.private, &original);
             fixture.index(mode, "", false);
@@ -250,30 +296,148 @@ fn codebuff_exclusions_watch_once_uses_the_same_admission_as_initial_indexing() 
         fixture.index(mode, policy.to_str().unwrap(), true);
         // This unrequested default-store chat did not exist at initial index.
         // Empty explicit roots must not silently turn into default discovery.
-        let unrelated = fixture.projects()
+        let unrelated = fixture
+            .projects()
             .join("out-of-scope/chats/2026-03-21T17-14-03.768Z/chat-messages.json");
         fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
         let unrelated_bytes = serde_json::to_vec(&json!([
             {"id":"user-1774113351457", "variant":"user", "content":"unrequestedcodebuffproof",
              "timestamp":"01:15 PM"}
-        ])).unwrap();
+        ]))
+        .unwrap();
         write_old(&unrelated, &unrelated_bytes);
         // Ensure this targeted event cannot be dismissed by an unchanged-root
         // fast path. The malformed file must never reach FAD's parser.
         fs::write(&fixture.private, b"[").unwrap();
-        fs::File::options().write(true).open(&fixture.private).unwrap()
-            .set_modified(std::time::SystemTime::now() + Duration::from_secs(10)).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&fixture.private)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
         let snapshot = fixture.source_snapshot();
-        let output = fixture.command(mode, policy.to_str().unwrap())
+        let output = fixture
+            .command(mode, policy.to_str().unwrap())
             .args(["index", "--watch-once"])
             .arg(&fixture.private)
             .args(["--json", "--no-progress-events"])
-            .assert().success().get_output().stdout.clone();
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
         let report: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(report["success"], true, "{report}");
         fixture.assert_sources(&[&fixture.public]);
         fixture.assert_hits(PUBLIC, 1);
         assert_eq!(fs::read(&unrelated).unwrap(), unrelated_bytes);
         assert_unchanged(&snapshot);
+    }
+}
+
+/// Targeted run-state/chat events must rebuild exactly their own conversation.
+/// An unrelated broken chat makes accidental fallback to default discovery fail.
+#[test]
+fn codebuff_metadata_watch_updates_workspace_without_reimporting_other_chats() {
+    use std::collections::BTreeMap;
+
+    for mode in ["0", "1"] {
+        for directory in [false, true] {
+            let fixture = Fixture::new();
+            fixture.index(mode, "", true);
+            let canonical_ids = || {
+                let storage =
+                    SqliteStorage::open_readonly(&fixture.data().join("agent_search.db")).unwrap();
+                let mut ids = BTreeMap::new();
+                for conversation in storage.list_conversations(100, 0).unwrap() {
+                    let id = conversation.id.unwrap();
+                    for message in storage.fetch_messages(id).unwrap() {
+                        assert!(
+                            ids.insert(message.content, (id, message.id.unwrap()))
+                                .is_none(),
+                            "metadata watch must not duplicate native message identities"
+                        );
+                    }
+                }
+                ids
+            };
+            let before_ids = canonical_ids();
+            let primary_bytes = fs::read(&fixture.public).unwrap();
+            let primary_mtime = fs::metadata(&fixture.public).unwrap().modified().unwrap();
+            let sidecar = fixture.public.with_file_name("run-state.json");
+            let updated =
+                br#"{"sessionState":{"fileContext":{"projectRoot":"/metadata/watch-updated"}}}"#;
+            fs::write(&sidecar, updated).unwrap();
+            // Force an actual event beyond the previous indexing timestamp;
+            // the primary remains untouched, with its original March mtime.
+            fs::File::options()
+                .write(true)
+                .open(&sidecar)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(10))
+                .unwrap();
+            let unrelated = fixture
+                .projects()
+                .join("unrequested/chats/2026-03-21T17-14-03.768Z/chat-messages.json");
+            fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+            fs::write(&unrelated, b"[").unwrap();
+            let selected = if directory {
+                fixture.public.parent().unwrap().to_path_buf()
+            } else {
+                sidecar.clone()
+            };
+            let output = fixture
+                .command(mode, "")
+                .args(["index", "--watch-once"])
+                .arg(&selected)
+                .args(["--json", "--no-progress-events"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let report: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["success"], true, "{report}");
+            assert_eq!(
+                report["indexing_stats"]["scan_had_errors"], false,
+                "{report}"
+            );
+            assert_eq!(canonical_ids(), before_ids);
+            fixture.assert_sources(&[&fixture.private, &fixture.public]);
+            let storage =
+                SqliteStorage::open_readonly(&fixture.data().join("agent_search.db")).unwrap();
+            let conversations = storage.list_conversations(100, 0).unwrap();
+            assert_eq!(conversations.len(), 2);
+            drop(storage);
+            let output = fixture
+                .command(mode, "")
+                .args([
+                    "search",
+                    PUBLIC,
+                    "--agent",
+                    "codebuff",
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--no-maintenance",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let result: Value = serde_json::from_slice(&output).unwrap();
+            let hits = result["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1, "{result}");
+            assert_eq!(hits[0]["workspace"], "/metadata/watch-updated", "{result}");
+            assert_eq!(hits[0]["created_at"].as_i64(), Some(1_774_113_351_457));
+            assert_eq!(fs::read(&fixture.public).unwrap(), primary_bytes);
+            assert_eq!(
+                fs::metadata(&fixture.public).unwrap().modified().unwrap(),
+                primary_mtime
+            );
+            assert_eq!(fs::read(&sidecar).unwrap(), updated);
+            assert_eq!(fs::read(&unrelated).unwrap(), b"[");
+        }
     }
 }
