@@ -782,6 +782,18 @@
           ]
         },
         {
+          "name": "rebuild-profile",
+          "description": "Lexical-rebuild settings preset (GH #483). `bounded` is the single-core, low-memory recipe for a wedged or memory-starved archive: one rebuild worker and one page-prep thread, a one-page pipeline, 64 conversations per fetch and a durable commit every 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still wins over the preset. Applies to any lexical rebuild this run performs (`--full`, or resuming an interrupted rebuild); it never changes what gets indexed. `--json` reports the values used under `rebuild_profile`",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "default",
+          "enum_values": [
+            "default",
+            "bounded"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -30677,6 +30689,66 @@
         "indexing_stats": {
           "type": "object",
           "additionalProperties": true
+        },
+        "rebuild_profile": {
+          "type": "object",
+          "description": "--rebuild-profile echo (GH #483): the selected preset, where each of its knobs came from, and the lexical-rebuild settings this process would use after the responsiveness governor at report time",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "default | bounded"
+            },
+            "settings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "env": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "integer"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "profile, or env when an explicit environment value overrides the preset"
+                  }
+                }
+              }
+            },
+            "effective": {
+              "type": "object",
+              "properties": {
+                "workers": {
+                  "type": "integer"
+                },
+                "page_prep_workers": {
+                  "type": "integer"
+                },
+                "staged_shard_builders": {
+                  "type": "integer"
+                },
+                "staged_merge_workers": {
+                  "type": "integer"
+                },
+                "tantivy_writer_threads": {
+                  "type": "integer"
+                },
+                "pipeline_channel_size": {
+                  "type": "integer"
+                },
+                "steady_batch_fetch_conversations": {
+                  "type": "integer"
+                },
+                "steady_commit_every_message_bytes": {
+                  "type": "integer"
+                },
+                "pipeline_max_message_bytes_in_flight": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
         },
         "error": {
           "type": [

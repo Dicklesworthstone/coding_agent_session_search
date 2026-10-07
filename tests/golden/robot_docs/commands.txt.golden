@@ -63,6 +63,9 @@ commands:
                     Tune with --progress-interval-ms N (250..60000, default 2000),
                     disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.
                     Add --robot-trace-ingest for per-batch wall_ms, batch_msgs, and duplicate-lookup counters on stderr.
+                    Add --rebuild-profile bounded for a single-core, low-memory lexical rebuild of a wedged or
+                    memory-starved archive; explicit CASS_TANTIVY_REBUILD_* values still win, and --json
+                    reports the values used under rebuild_profile.
                     From another shell: `cass status --json` shows live progress.
   cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]
   cass capabilities [--json]   First-stop self-description: workflows, mistake recoveries, commands, flags, exit codes, env vars, limits.

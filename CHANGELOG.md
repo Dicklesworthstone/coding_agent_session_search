@@ -34,6 +34,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **`cass index --rebuild-profile bounded` (#483).** One flag now runs the
+  documented single-core, low-memory lexical rebuild for a wedged or
+  memory-starved archive: one rebuild worker, one page-prep thread, a
+  one-page pipeline, 64 conversations per fetch and a durable commit every
+  64 MiB of text. An explicit `CASS_TANTIVY_REBUILD_*` value still wins over
+  the preset. `cass index --json` reports `rebuild_profile`: each preset
+  knob with its source (`profile` or `env`), and the effective rebuild
+  settings.
+
 - **Pi durable-harness conversations are indexed (franken_agent_detection
   #28).** Stores written by Pi's experimental durable harness
   (`@earendil-works/pi-durable`) were invisible to cass. With

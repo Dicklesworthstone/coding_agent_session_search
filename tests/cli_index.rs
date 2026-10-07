@@ -2797,6 +2797,233 @@ fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget()
     }
 }
 
+/// GH #483: `cass index --full --rebuild-profile bounded` runs the documented
+/// single-core, low-memory rebuild on a skewed corpus (one long conversation
+/// ahead of many small ones), indexes every message, reports the settings it
+/// used and where each came from, and leaves both kinds of conversation
+/// searchable. An explicit `CASS_TANTIVY_REBUILD_*` value still beats the
+/// preset; the default run reports no preset values; an unknown preset is a
+/// usage error.
+///
+/// No-claim: this proves the preset reaches the live rebuild on a tiny
+/// corpus. It does not measure peak RSS or wall time on the reporter's 504K
+/// message archive, and resume after SIGTERM is the source-ledger's contract.
+#[test]
+#[serial]
+fn gh483_bounded_rebuild_profile_indexes_a_skewed_corpus_and_reports_its_settings() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let codex_root = data_dir.join(".codex").join("sessions");
+    fs::create_dir_all(&codex_root).unwrap();
+
+    let write_session = |name: &str, session_id: &str, turns: &[(String, String)]| {
+        let mut sample = serde_json::to_string(&serde_json::json!({
+            "timestamp": "2025-09-30T15:42:34.559Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": "/test/workspace", "cli_version": "0.42.0"}
+        }))
+        .unwrap();
+        sample.push('\n');
+        for (user, assistant) in turns {
+            for (role, kind, text) in [
+                ("user", "input_text", user),
+                ("assistant", "text", assistant),
+            ] {
+                sample.push_str(
+                    &serde_json::to_string(&serde_json::json!({
+                        "timestamp": "2025-09-30T15:42:36.190Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": role,
+                            "content": [{"type": kind, "text": text}]
+                        }
+                    }))
+                    .unwrap(),
+                );
+                sample.push('\n');
+            }
+        }
+        fs::write(codex_root.join(name), sample).unwrap();
+    };
+    let giant_turns: Vec<(String, String)> = (0..600)
+        .map(|turn| {
+            (
+                format!("gh483 giant question {turn} about the wedged archive"),
+                format!("gh483 giant answer {turn}"),
+            )
+        })
+        .chain(std::iter::once((
+            "gh483 giant late needle".to_string(),
+            "gh483 giant closing answer".to_string(),
+        )))
+        .collect();
+    write_session("rollout-giant.jsonl", "gh483-giant", &giant_turns);
+    for small in 0..40 {
+        write_session(
+            &format!("rollout-small-{small:02}.jsonl"),
+            &format!("gh483-small-{small:02}"),
+            &[(
+                format!("gh483 small marker {small:02}"),
+                format!("gh483 small reply {small:02}"),
+            )],
+        );
+    }
+    let expected_messages = 2 * giant_turns.len() + 2 * 40;
+
+    let index = |extra_env: &[(&str, &str)], profile: Option<&str>| {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.env("CODEX_HOME", data_dir.join(".codex"));
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.args([
+            "index",
+            "--full",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--json",
+            "--no-progress-events",
+        ]);
+        if let Some(profile) = profile {
+            cmd.args(["--rebuild-profile", profile]);
+        }
+        let output = cmd
+            .timeout(std::time::Duration::from_secs(600))
+            .output()
+            .expect("run cass index");
+        assert!(
+            output.status.success(),
+            "index --full {profile:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("index json")
+    };
+    let settings_by_env = |report: &serde_json::Value| {
+        report["rebuild_profile"]["settings"]
+            .as_array()
+            .expect("settings array")
+            .iter()
+            .map(|setting| {
+                (
+                    setting["env"].as_str().unwrap().to_string(),
+                    (
+                        setting["value"].as_u64().unwrap(),
+                        setting["source"].clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    let bounded = index(&[], Some("bounded"));
+    assert_eq!(bounded["conversations"], 41, "{bounded}");
+    assert_eq!(bounded["messages"], expected_messages, "{bounded}");
+    let profile = &bounded["rebuild_profile"];
+    assert_eq!(profile["name"], "bounded");
+    let settings = settings_by_env(&bounded);
+    assert_eq!(settings.len(), 5, "{profile}");
+    for (env, expected) in [
+        ("CASS_TANTIVY_REBUILD_WORKERS", 1),
+        ("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", 1),
+        ("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", 1),
+        ("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", 64),
+        ("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", 64 << 20),
+    ] {
+        assert_eq!(
+            settings.get(env),
+            Some(&(expected, serde_json::json!("profile"))),
+            "{env}: {profile}"
+        );
+    }
+    let effective = &profile["effective"];
+    assert_eq!(effective["workers"], 1, "{profile}");
+    assert_eq!(effective["page_prep_workers"], 1, "{profile}");
+    assert_eq!(effective["staged_merge_workers"], 1, "{profile}");
+    assert_eq!(effective["pipeline_channel_size"], 1, "{profile}");
+    assert_eq!(
+        effective["steady_batch_fetch_conversations"], 64,
+        "{profile}"
+    );
+    assert_eq!(
+        effective["steady_commit_every_message_bytes"],
+        64 << 20,
+        "{profile}"
+    );
+
+    for needle in ["gh483 giant late needle", "gh483 small marker 37"] {
+        let output = base_cmd(tmp.path())
+            .env("CODEX_HOME", data_dir.join(".codex"))
+            .args([
+                "search",
+                needle,
+                "--json",
+                "--mode",
+                "lexical",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run cass search");
+        assert!(
+            output.status.success(),
+            "search {needle:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hits = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .expect("search json")["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            hits.iter().any(|hit| hit["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(needle))),
+            "no hit for {needle:?} after the bounded rebuild: {hits:?}"
+        );
+    }
+
+    // An explicit operator value beats the preset, and says so.
+    let overridden = index(&[("CASS_TANTIVY_REBUILD_WORKERS", "2")], Some("bounded"));
+    assert_eq!(overridden["messages"], expected_messages);
+    let settings = settings_by_env(&overridden);
+    assert_eq!(
+        settings.get("CASS_TANTIVY_REBUILD_WORKERS"),
+        Some(&(2, serde_json::json!("env")))
+    );
+    assert_eq!(
+        settings.get("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE"),
+        Some(&(1, serde_json::json!("profile")))
+    );
+    assert_eq!(overridden["rebuild_profile"]["effective"]["workers"], 2);
+
+    // Without the flag nothing is preset.
+    let default = index(&[], None);
+    assert_eq!(default["messages"], expected_messages);
+    assert_eq!(default["rebuild_profile"]["name"], "default");
+    assert_eq!(
+        default["rebuild_profile"]["settings"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        default["rebuild_profile"]["effective"]["pipeline_channel_size"],
+        4
+    );
+
+    base_cmd(tmp.path())
+        .args([
+            "index",
+            "--full",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--json",
+            "--rebuild-profile",
+            "tiny",
+        ])
+        .assert()
+        .code(2);
+}
+
 /// GH #439 / WS-B.2c: the post-publish fallback-FTS repair runs after the
 /// lexical generation is published, in phase 0, and used to emit no liveness
 /// signal — so the stall watchdog killed healthy `cass index --full` runs on

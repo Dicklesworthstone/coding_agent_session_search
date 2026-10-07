@@ -3103,6 +3103,19 @@ schemas: (auto-generated from contract)
     - lexical_update_deferred: boolean
     - messages: ?
     - quarantined_conversations: integer
+    - rebuild_profile: object
+      - effective: object
+        - page_prep_workers: integer
+        - pipeline_channel_size: integer
+        - pipeline_max_message_bytes_in_flight: integer
+        - staged_merge_workers: integer
+        - staged_shard_builders: integer
+        - steady_batch_fetch_conversations: integer
+        - steady_commit_every_message_bytes: integer
+        - tantivy_writer_threads: integer
+        - workers: integer
+      - name: string
+      - settings: array
     - success: boolean
   introspect:
     - api_version: integer

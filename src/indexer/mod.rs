@@ -7473,10 +7473,7 @@ fn lexical_rebuild_initial_commit_interval_messages() -> usize {
 }
 
 fn lexical_rebuild_commit_interval_message_bytes() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES")
         .unwrap_or(512 * 1024 * 1024)
 }
 
@@ -7530,10 +7527,7 @@ fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
     // the writer path even after prep parallelism improved. Scale the default
     // with the writer-thread hint while still capping at `page_size` so we
     // never fetch beyond what's been paged from the conversations table.
-    dotenvy::var("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS")
         .unwrap_or_else(|| {
             lexical_rebuild_default_batch_fetch_conversation_limit(
                 page_size,
@@ -7620,16 +7614,170 @@ fn lexical_rebuild_configured_worker_parallelism_for_available(
     )
 }
 
-fn lexical_rebuild_worker_parallelism() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_WORKERS")
-        .ok()
+/// GH #483: a named set of lexical-rebuild settings for `cass index
+/// --rebuild-profile`. A profile only supplies values for knobs the operator
+/// left unset: an explicit positive `CASS_TANTIVY_REBUILD_*` value still wins,
+/// and the responsiveness governor can still lower the result. It adds no
+/// second pipeline; it is the documented environment recipe under one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LexicalRebuildProfile {
+    /// The host-sized defaults.
+    #[default]
+    Default,
+    /// The single-core, low-memory recipe for a wedged or memory-starved
+    /// archive: one worker, one page-prep thread, a one-page channel, 64
+    /// conversations per fetch and a durable commit every 64 MiB of text.
+    Bounded,
+}
+
+impl LexicalRebuildProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bounded => "bounded",
+        }
+    }
+
+    /// The knobs this profile sets, by their environment variable names.
+    pub fn settings(self) -> &'static [(&'static str, usize)] {
+        match self {
+            Self::Default => &[],
+            Self::Bounded => &[
+                ("CASS_TANTIVY_REBUILD_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", 1),
+                ("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", 64),
+                (
+                    "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
+                    64 * 1024 * 1024,
+                ),
+            ],
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Bounded,
+            _ => Self::Default,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Bounded => 1,
+        }
+    }
+}
+
+static LEXICAL_REBUILD_PROFILE: AtomicU8 = AtomicU8::new(0);
+
+/// Select the rebuild profile for this process. `cass index` calls it once,
+/// before any rebuild setting is read.
+pub fn set_lexical_rebuild_profile(profile: LexicalRebuildProfile) {
+    LEXICAL_REBUILD_PROFILE.store(profile.to_u8(), Ordering::Relaxed);
+}
+
+pub fn lexical_rebuild_profile() -> LexicalRebuildProfile {
+    LexicalRebuildProfile::from_u8(LEXICAL_REBUILD_PROFILE.load(Ordering::Relaxed))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalRebuildSettingSource {
+    Env,
+    Profile,
+}
+
+impl LexicalRebuildSettingSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Profile => "profile",
+        }
+    }
+}
+
+/// An explicit positive environment value wins; otherwise the profile's
+/// value; `None` leaves the knob at its computed default.
+fn resolve_lexical_rebuild_setting(
+    env_value: Option<&str>,
+    profile: LexicalRebuildProfile,
+    name: &str,
+) -> Option<(usize, LexicalRebuildSettingSource)> {
+    if let Some(value) = env_value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            lexical_rebuild_configured_worker_parallelism_for_available(
-                lexical_rebuild_available_parallelism(),
-            )
+    {
+        return Some((value, LexicalRebuildSettingSource::Env));
+    }
+    profile
+        .settings()
+        .iter()
+        .find(|(setting, _)| *setting == name)
+        .map(|&(_, value)| (value, LexicalRebuildSettingSource::Profile))
+}
+
+fn lexical_rebuild_setting(name: &str) -> Option<usize> {
+    resolve_lexical_rebuild_setting(
+        dotenvy::var(name).ok().as_deref(),
+        lexical_rebuild_profile(),
+        name,
+    )
+    .map(|(value, _)| value)
+}
+
+/// What `cass index --json` reports under `rebuild_profile`: the selected
+/// profile, where each of its knobs came from, and the settings a lexical
+/// rebuild in this process would run with (after the governor).
+pub fn lexical_rebuild_profile_report() -> serde_json::Value {
+    lexical_rebuild_profile_report_for(
+        lexical_rebuild_profile(),
+        |name| dotenvy::var(name).ok(),
+        &lexical_rebuild_pipeline_settings_snapshot(),
+    )
+}
+
+fn lexical_rebuild_profile_report_for(
+    profile: LexicalRebuildProfile,
+    env: impl Fn(&str) -> Option<String>,
+    effective: &LexicalRebuildPipelineSettingsSnapshot,
+) -> serde_json::Value {
+    let settings: Vec<serde_json::Value> = profile
+        .settings()
+        .iter()
+        .filter_map(|&(name, _)| {
+            let (value, source) =
+                resolve_lexical_rebuild_setting(env(name).as_deref(), profile, name)?;
+            Some(serde_json::json!({
+                "env": name,
+                "value": value,
+                "source": source.as_str(),
+            }))
         })
+        .collect();
+    serde_json::json!({
+        "name": profile.as_str(),
+        "settings": settings,
+        "effective": {
+            "workers": effective.workers,
+            "page_prep_workers": effective.page_prep_workers,
+            "staged_shard_builders": effective.staged_shard_builders,
+            "staged_merge_workers": effective.staged_merge_workers,
+            "tantivy_writer_threads": effective.tantivy_writer_threads,
+            "pipeline_channel_size": effective.pipeline_channel_size,
+            "steady_batch_fetch_conversations": effective.steady_batch_fetch_conversations,
+            "steady_commit_every_message_bytes": effective.steady_commit_every_message_bytes,
+            "pipeline_max_message_bytes_in_flight": effective.pipeline_max_message_bytes_in_flight,
+        },
+    })
+}
+
+fn lexical_rebuild_worker_parallelism() -> usize {
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_WORKERS").unwrap_or_else(|| {
+        lexical_rebuild_configured_worker_parallelism_for_available(
+            lexical_rebuild_available_parallelism(),
+        )
+    })
 }
 
 fn build_lexical_rebuild_worker_pool() -> Result<Option<ThreadPool>> {
@@ -8795,10 +8943,7 @@ fn lexical_rebuild_content_bounded_page_conversation_limit(
 }
 
 fn lexical_rebuild_pipeline_channel_size() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE")
         // Two slots left the ordered page producer spending ~5s stalled on
         // sink handoff after the final-frontier publish work moved out of the
         // critical path. Four keeps the queue explicitly bounded while giving
@@ -8831,10 +8976,7 @@ fn lexical_rebuild_page_prep_worker_parallelism() -> usize {
 }
 
 fn lexical_rebuild_page_prep_worker_parallelism_configured() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
         .unwrap_or_else(|| {
             // Keep page-prep fanout bounded and conservative, but decouple it
             // from the tiny ordered pipeline channel. The channel size limits
@@ -46289,6 +46431,164 @@ mod tests {
             responsiveness::effective_worker_count(3).max(1)
         );
         assert_eq!(snapshot.pipeline_max_message_bytes_in_flight, 777777);
+    }
+
+    /// GH #483: an explicit positive environment value beats the profile, the
+    /// profile beats the computed default, and a knob the profile does not
+    /// name keeps its default.
+    #[test]
+    fn rebuild_profile_settings_resolve_env_over_profile_over_default() {
+        use LexicalRebuildProfile::{Bounded, Default as HostSized};
+        use LexicalRebuildSettingSource::{Env, Profile};
+        const WORKERS: &str = "CASS_TANTIVY_REBUILD_WORKERS";
+        assert_eq!(
+            resolve_lexical_rebuild_setting(None, Bounded, WORKERS),
+            Some((1, Profile))
+        );
+        assert_eq!(
+            resolve_lexical_rebuild_setting(None, HostSized, WORKERS),
+            None
+        );
+        for profile in [Bounded, HostSized] {
+            assert_eq!(
+                resolve_lexical_rebuild_setting(Some("3"), profile, WORKERS),
+                Some((3, Env))
+            );
+        }
+        // Values the readers always ignored stay ignored; the profile fills in.
+        for ignored in ["0", "abc", "-2", ""] {
+            assert_eq!(
+                resolve_lexical_rebuild_setting(Some(ignored), Bounded, WORKERS),
+                Some((1, Profile)),
+                "{ignored:?}"
+            );
+            assert_eq!(
+                resolve_lexical_rebuild_setting(Some(ignored), HostSized, WORKERS),
+                None
+            );
+        }
+        assert_eq!(
+            resolve_lexical_rebuild_setting(
+                None,
+                Bounded,
+                "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES"
+            ),
+            None
+        );
+        assert!(HostSized.settings().is_empty());
+        assert_eq!(
+            Bounded.settings(),
+            &[
+                ("CASS_TANTIVY_REBUILD_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", 1),
+                ("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", 64),
+                ("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", 64 << 20),
+            ]
+        );
+    }
+
+    struct RebuildProfileGuard;
+
+    impl Drop for RebuildProfileGuard {
+        fn drop(&mut self) {
+            set_lexical_rebuild_profile(LexicalRebuildProfile::Default);
+        }
+    }
+
+    /// GH #483: the bounded profile reaches every reader the live rebuild
+    /// uses, including the settings derived from the worker count, and the
+    /// `cass index --json` report names where each value came from.
+    #[test]
+    #[serial]
+    fn bounded_rebuild_profile_drives_the_live_settings_and_its_report() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let _cleared: Vec<EnvGuard> = [
+            "CASS_TANTIVY_REBUILD_WORKERS",
+            "CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS",
+            "CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE",
+            "CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS",
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+            "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
+            "CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS",
+            "CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS",
+        ]
+        .into_iter()
+        .map(unset_env_var)
+        .collect();
+        let _profile = RebuildProfileGuard;
+
+        let default = lexical_rebuild_pipeline_settings_snapshot();
+        assert_eq!(
+            default.workers,
+            lexical_rebuild_configured_worker_parallelism_for_available(
+                lexical_rebuild_available_parallelism()
+            ),
+            "the default profile keeps host-sized workers"
+        );
+        assert_eq!(default.pipeline_channel_size, 4);
+
+        set_lexical_rebuild_profile(LexicalRebuildProfile::Bounded);
+        let bounded = lexical_rebuild_pipeline_settings_snapshot();
+        assert_eq!(bounded.workers, 1);
+        assert_eq!(
+            bounded.page_prep_workers,
+            responsiveness::effective_worker_count(1).max(1)
+        );
+        assert_eq!(bounded.pipeline_channel_size, 1);
+        assert_eq!(bounded.steady_batch_fetch_conversations, 64);
+        assert_eq!(bounded.startup_batch_fetch_conversations, 32);
+        assert_eq!(bounded.steady_commit_every_message_bytes, 64 << 20);
+        assert_eq!(bounded.startup_commit_every_message_bytes, 64 << 20);
+        assert_eq!(
+            bounded.pipeline_max_message_bytes_in_flight,
+            responsiveness::effective_inflight_byte_limit(2 * (64 << 20)).max(1),
+            "one page in the channel plus one at the sink"
+        );
+        assert_eq!(
+            lexical_rebuild_staged_shard_builder_parallelism_configured(),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(1)
+        );
+        assert_eq!(
+            lexical_rebuild_staged_merge_worker_parallelism_configured(),
+            1
+        );
+
+        let report = lexical_rebuild_profile_report();
+        assert_eq!(report["name"], "bounded");
+        assert_eq!(report["settings"].as_array().map(Vec::len), Some(5));
+        assert!(
+            report["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|setting| setting["source"] == "profile"),
+            "{report}"
+        );
+        assert_eq!(report["effective"]["workers"], 1);
+        assert_eq!(report["effective"]["pipeline_channel_size"], 1);
+
+        // An explicit operator value still wins under the profile.
+        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "2");
+        assert_eq!(lexical_rebuild_pipeline_settings_snapshot().workers, 2);
+        let report = lexical_rebuild_profile_report();
+        let workers = report["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|setting| setting["env"] == "CASS_TANTIVY_REBUILD_WORKERS")
+            .unwrap();
+        assert_eq!(workers["value"], 2);
+        assert_eq!(workers["source"], "env");
+        assert_eq!(report["effective"]["workers"], 2);
+        assert_eq!(report["effective"]["pipeline_channel_size"], 1);
+
+        set_lexical_rebuild_profile(LexicalRebuildProfile::Default);
+        let report = lexical_rebuild_profile_report();
+        assert_eq!(report["name"], "default");
+        assert_eq!(report["settings"], serde_json::json!([]));
     }
 
     #[test]

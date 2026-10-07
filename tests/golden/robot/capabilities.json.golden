@@ -414,6 +414,18 @@
           ]
         },
         {
+          "name": "rebuild-profile",
+          "description": "Lexical-rebuild settings preset (GH #483). `bounded` is the single-core, low-memory recipe for a wedged or memory-starved archive: one rebuild worker and one page-prep thread, a one-page pipeline, 64 conversations per fetch and a durable commit every 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still wins over the preset. Applies to any lexical rebuild this run performs (`--full`, or resuming an interrupted rebuild); it never changes what gets indexed. `--json` reports the values used under `rebuild_profile`",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "default",
+          "enum_values": [
+            "default",
+            "bounded"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",

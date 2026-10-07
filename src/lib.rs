@@ -504,6 +504,18 @@ pub enum Commands {
         /// indexed.
         #[arg(long, default_value_t = false)]
         background: bool,
+
+        /// Lexical-rebuild settings preset (GH #483). `bounded` is the
+        /// single-core, low-memory recipe for a wedged or memory-starved
+        /// archive: one rebuild worker and one page-prep thread, a one-page
+        /// pipeline, 64 conversations per fetch and a durable commit every
+        /// 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still
+        /// wins over the preset. Applies to any lexical rebuild this run
+        /// performs (`--full`, or resuming an interrupted rebuild); it never
+        /// changes what gets indexed. `--json` reports the values used under
+        /// `rebuild_profile`.
+        #[arg(long, value_enum, default_value_t = RebuildProfileArg::Default)]
+        rebuild_profile: RebuildProfileArg,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -2841,6 +2853,25 @@ pub enum AgentsAction {
         /// Agent slug to re-enable
         agent: String,
     },
+}
+
+/// `cass index --rebuild-profile` (GH #483).
+#[derive(Copy, Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum RebuildProfileArg {
+    /// Host-sized defaults
+    #[default]
+    Default,
+    /// Single-core, low-memory rebuild for a wedged or memory-starved archive
+    Bounded,
+}
+
+impl From<RebuildProfileArg> for indexer::LexicalRebuildProfile {
+    fn from(profile: RebuildProfileArg) -> Self {
+        match profile {
+            RebuildProfileArg::Default => Self::Default,
+            RebuildProfileArg::Bounded => Self::Bounded,
+        }
+    }
 }
 
 /// Time bucketing for analytics aggregation.
@@ -7713,8 +7744,11 @@ async fn execute_cli(
                     no_progress_events,
                     robot_trace_ingest,
                     background,
+                    rebuild_profile,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
+                    // Before any rebuild setting is read in this process.
+                    indexer::set_lexical_rebuild_profile(rebuild_profile.into());
                     if let Some(conversation_id) = reconcile_conversation {
                         return run_lexical_reconcile_cli(
                             cli.db.clone(),
@@ -26800,6 +26834,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "                    Tune with --progress-interval-ms N (250..60000, default 2000),".to_string(),
             "                    disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.".to_string(),
             "                    Add --robot-trace-ingest for per-batch wall_ms, batch_msgs, and duplicate-lookup counters on stderr.".to_string(),
+            "                    Add --rebuild-profile bounded for a single-core, low-memory lexical rebuild of a wedged or".to_string(),
+            "                    memory-starved archive; explicit CASS_TANTIVY_REBUILD_* values still win, and --json".to_string(),
+            "                    reports the values used under rebuild_profile.".to_string(),
             "                    From another shell: `cass status --json` shows live progress.".to_string(),
             "  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]"
                 .to_string(),
@@ -101996,6 +102033,38 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "quarantined_conversations": { "type": "integer" },
                 "lexical_update_deferred": { "type": "boolean" },
                 "indexing_stats": response_schema_opaque_object(),
+                "rebuild_profile": {
+                    "type": "object",
+                    "description": "--rebuild-profile echo (GH #483): the selected preset, where each of its knobs came from, and the lexical-rebuild settings this process would use after the responsiveness governor at report time",
+                    "properties": {
+                        "name": { "type": "string", "description": "default | bounded" },
+                        "settings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "env": { "type": "string" },
+                                    "value": { "type": "integer" },
+                                    "source": { "type": "string", "description": "profile, or env when an explicit environment value overrides the preset" }
+                                }
+                            }
+                        },
+                        "effective": {
+                            "type": "object",
+                            "properties": {
+                                "workers": { "type": "integer" },
+                                "page_prep_workers": { "type": "integer" },
+                                "staged_shard_builders": { "type": "integer" },
+                                "staged_merge_workers": { "type": "integer" },
+                                "tantivy_writer_threads": { "type": "integer" },
+                                "pipeline_channel_size": { "type": "integer" },
+                                "steady_batch_fetch_conversations": { "type": "integer" },
+                                "steady_commit_every_message_bytes": { "type": "integer" },
+                                "pipeline_max_message_bytes_in_flight": { "type": "integer" }
+                            }
+                        }
+                    }
+                },
                 "error": { "type": ["string", "null"] }
             }
         }),
@@ -108424,6 +108493,12 @@ fn run_index_with_data(
         robot_trace_ingest.hash(&mut hasher);
         mirror_source_ids.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
+        // Only a non-default profile enters the hash, so keys cached before
+        // --rebuild-profile existed keep matching their default-profile runs.
+        let rebuild_profile = indexer::lexical_rebuild_profile();
+        if rebuild_profile != indexer::LexicalRebuildProfile::Default {
+            rebuild_profile.as_str().hash(&mut hasher);
+        }
         hasher.finish()
     };
 
@@ -109144,6 +109219,8 @@ fn run_index_with_data(
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
             }
+            // A stalled or failed bounded run should still say what it used.
+            payload["rebuild_profile"] = indexer::lexical_rebuild_profile_report();
             if emit_progress_events {
                 let mut event = payload.clone();
                 if let serde_json::Value::Object(ref mut m) = event {
@@ -109202,6 +109279,7 @@ fn run_index_with_data(
             "messages": messages,
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
+            "rebuild_profile": indexer::lexical_rebuild_profile_report(),
         });
 
         // Add structured indexing stats if available (T7.4)
