@@ -11,8 +11,8 @@
 //! * **nightly** (default 03:00 local): remote syncs that are due, a full
 //!   `cass index --full --background`, then bounded semantic backfill batches
 //!   (`cass models backfill --scheduled --max-batches N`) in one worker per
-//!   tier — first the fast (hash) tier, then
-//!   the quality (MiniLM) tier when the model is installed — until the
+//!   tier — resume the pending checkpoint's owner first, otherwise start with
+//!   the fast (hash) tier, then the configured quality tier — until the
 //!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
 //! Priority is delegated to the OS: launchd uses `Nice=15` without
@@ -1171,18 +1171,40 @@ fn run_job_with_gate(
                     "source sync or indexing failed; semantic backfill requires a successful run",
                 ));
             } else {
-                let (probe, model_installed, external_quality) =
+                let (probe, model_installed, quality_policy) =
                     quality_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
+                let external_quality = crate::search::embedder_registry::selects_external(Some(
+                    &quality_policy.quality_tier_embedder,
+                ));
                 steps.push(probe);
-                let mut tiers = vec!["fast"];
-                if model_installed {
-                    tiers.push("quality");
-                } else {
+                if !model_installed {
                     steps.push(skipped_step(
                         "semantic-backfill:quality",
                         "MiniLM model not installed (`cass models install`); quality tier skipped",
                     ));
                 }
+                let tiers = match nightly_backfill_order(&cfg.data_dir, model_installed, || {
+                    scheduled_quality_identity(&cfg.data_dir, &quality_policy)
+                }) {
+                    Ok(tiers) => tiers,
+                    Err(reason) => {
+                        steps.push(StepReport {
+                            name: "semantic-backfill-plan".to_string(),
+                            argv: Vec::new(),
+                            exit_code: None,
+                            ok: false,
+                            duration_ms: 0,
+                            skipped_reason: None,
+                            result: Some(serde_json::json!({
+                                "status": "failed",
+                                "reason": "semantic_checkpoint_resume_required",
+                                "semantic_workers_started": false,
+                            })),
+                            stderr_tail: Some(reason),
+                        });
+                        Vec::new()
+                    }
+                };
                 let mut batches = 0u32;
                 for tier in tiers {
                     let remaining = cfg.max_backfill_batches - batches;
@@ -1221,7 +1243,7 @@ fn run_job_with_gate(
                         &cfg.binary,
                         &cfg.data_dir,
                         &args,
-                        &[],
+                        &[(crate::indexer::semantic::SCHEDULE_PRESERVE_CHECKPOINT, "1")],
                         log.as_mut(),
                     );
                     let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
@@ -1239,14 +1261,9 @@ fn run_job_with_gate(
                         break;
                     };
                     batches += attempted;
-                    let paused = step.result.as_ref().is_some_and(|result| {
-                        matches!(
-                            result.get("status").and_then(serde_json::Value::as_str),
-                            Some("paused" | "disabled")
-                        )
-                    });
+                    let stop = backfill_worker_retains_tier(&step);
                     steps.push(step);
-                    if paused {
+                    if stop {
                         break;
                     }
                 }
@@ -1413,21 +1430,120 @@ fn quality_model_probe(
     binary: &Path,
     data_dir: &Path,
     log: Option<&mut File>,
-) -> (StepReport, bool, bool) {
+) -> (StepReport, bool, crate::search::policy::SemanticPolicy) {
     let policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
     );
-    let external =
-        crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder));
     let (step, available) =
         quality_model_probe_with_policy(&policy, || minilm_model_probe(binary, data_dir, log));
-    (step, available, external)
+    (step, available, policy)
+}
+
+/// Resolve only the explicitly selected producer's identity; never create an
+/// HTTP client or load model weights. Called lazily for a quality checkpoint.
+fn scheduled_quality_identity(
+    data_dir: &Path,
+    policy: &crate::search::policy::SemanticPolicy,
+) -> Result<String, String> {
+    use crate::search::embedder_registry::{EmbedderRegistry, selects_external};
+    use crate::search::external_embedder::ExternalEmbeddingConfig;
+
+    if selects_external(Some(&policy.quality_tier_embedder)) {
+        return ExternalEmbeddingConfig::from_env()
+            .map_err(|error| error.to_string())?
+            .map(|config| config.identity())
+            .ok_or_else(|| {
+                "external_disabled: consent is required to resume the external checkpoint".into()
+            });
+    }
+    // Match the CLI's default resolution, including its legacy fastembed alias.
+    let name = if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        "hash"
+    } else {
+        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&policy.quality_tier_embedder)
+            .unwrap_or("minilm")
+    };
+    EmbedderRegistry::new(data_dir)
+        .get(name)
+        .map(|info| info.id.to_string())
+        .ok_or_else(|| "the selected quality provider has no registered identity".into())
+}
+
+/// The legacy manifest has one checkpoint slot for both tiers. Starting fast
+/// unconditionally can replace an interrupted quality build and authorize GC
+/// of its staged vectors. Resume its owner first; a changed/disabled producer
+/// is an explicit refusal, not permission to run another tier.
+fn nightly_backfill_order(
+    data_dir: &Path,
+    quality_available: bool,
+    quality_identity: impl FnOnce() -> Result<String, String>,
+) -> Result<Vec<&'static str>, String> {
+    use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+
+    let checkpoint = SemanticManifest::load(data_dir)
+        .map_err(|_| {
+            "cannot read the durable semantic checkpoint; no semantic worker was started; repair the ledger before retrying".to_string()
+        })?
+        .and_then(|manifest| manifest.checkpoint);
+    if let Some(checkpoint) = checkpoint {
+        let expected = match checkpoint.tier {
+            TierKind::Fast => "fnv1a-384".to_string(),
+            TierKind::Quality => {
+                if !quality_available {
+                    return Err("unfinished quality checkpoint retained: its provider is unavailable; restore it before starting another tier".into());
+                }
+                quality_identity()
+                    .map_err(|reason| format!("unfinished quality checkpoint retained: {reason}"))?
+            }
+        };
+        if checkpoint.embedder_id != expected {
+            return Err("unfinished semantic checkpoint retained: selected provider differs from its owner; resume with the original provider configuration before switching tiers".into());
+        }
+        if checkpoint.tier == TierKind::Quality {
+            // Do not reject an old DB fingerprint here. Its matching owner
+            // must reconcile canonical edits/additions through the normal path.
+            return Ok(vec!["quality", "fast"]);
+        }
+    }
+    Ok(if quality_available {
+        vec!["fast", "quality"]
+    } else {
+        vec!["fast"]
+    })
+}
+
+fn backfill_worker_retains_tier(step: &StepReport) -> bool {
+    // Even with unused budget, a worker that stopped on a checkpoint has not
+    // released the single cursor slot. Pauses/disablement keep the same rule.
+    step.result.as_ref().is_some_and(|result| {
+        matches!(
+            result.get("status").and_then(serde_json::Value::as_str),
+            Some("paused" | "disabled" | "checkpointed")
+        )
+    })
 }
 
 fn quality_model_probe_with_policy(
     policy: &crate::search::policy::SemanticPolicy,
     local_probe: impl FnOnce() -> (StepReport, bool),
 ) -> (StepReport, bool) {
+    if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        return (
+            skipped_step(
+                "models-status",
+                "hash quality provider requires no model files",
+            ),
+            true,
+        );
+    }
     if crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder)) {
         (
             skipped_step(
@@ -1814,11 +1930,156 @@ mod tests {
                 .unwrap()
                 .contains("consent and preflight")
         );
+        policy.quality_tier_embedder = "hash".into();
+        let (_, admitted) = quality_model_probe_with_policy(&policy, || {
+            panic!("an explicit hash quality checkpoint needs no model files")
+        });
+        assert!(admitted);
         policy.quality_tier_embedder = "minilm".into();
         let (_, admitted) = quality_model_probe_with_policy(&policy, || {
             (skipped_step("models-status", "missing local model"), false)
         });
         assert!(!admitted, "the default must retain local model admission");
+    }
+
+    fn checkpoint_fixture(
+        data_dir: &Path,
+        tier: crate::search::semantic_manifest::TierKind,
+        id: &str,
+    ) {
+        use crate::search::semantic_manifest::{BuildCheckpoint, SemanticManifest};
+        let mut manifest = SemanticManifest::default();
+        manifest.checkpoint = Some(BuildCheckpoint {
+            tier,
+            embedder_id: id.into(),
+            last_offset: 1,
+            docs_embedded: 1,
+            conversations_processed: 1,
+            total_conversations: 3,
+            db_fingerprint: "previous-canonical-snapshot".into(),
+            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+            saved_at_ms: 1,
+            last_message_id: Some(1),
+            cursor_exhausted: false,
+        });
+        manifest.save(data_dir).unwrap();
+    }
+
+    #[test]
+    fn nightly_default_and_fast_resume_do_not_resolve_external_configuration() {
+        use crate::search::semantic_manifest::TierKind;
+        let dir = tempfile::tempdir().unwrap();
+        for quality in [false, true] {
+            let expected = if quality {
+                vec!["fast", "quality"]
+            } else {
+                vec!["fast"]
+            };
+            assert_eq!(
+                nightly_backfill_order(dir.path(), quality, || panic!("no quality checkpoint"))
+                    .unwrap(),
+                expected
+            );
+        }
+        checkpoint_fixture(dir.path(), TierKind::Fast, "fnv1a-384");
+        assert_eq!(
+            nightly_backfill_order(dir.path(), true, || panic!("fast checkpoint is local"))
+                .unwrap(),
+            ["fast", "quality"]
+        );
+    }
+
+    #[test]
+    fn nightly_resumes_quality_before_fast_without_rewriting_the_checkpoint() {
+        use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["minilm-384", "external-fixture-identity"] {
+            checkpoint_fixture(dir.path(), TierKind::Quality, id);
+            let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+            let mut lookups = 0;
+            assert_eq!(
+                nightly_backfill_order(dir.path(), true, || {
+                    lookups += 1;
+                    Ok(id.to_string())
+                })
+                .unwrap(),
+                ["quality", "fast"]
+            );
+            assert_eq!(lookups, 1);
+            assert_eq!(
+                std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn nightly_foreign_or_unavailable_checkpoint_owner_blocks_all_tiers() {
+        use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+        let dir = tempfile::tempdir().unwrap();
+        checkpoint_fixture(dir.path(), TierKind::Quality, "original-external-identity");
+        let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+        assert!(nightly_backfill_order(dir.path(), false, || panic!("missing provider")).is_err());
+        for id in ["minilm-384", "fnv1a-384", "another-model-or-endpoint-identity"] {
+            assert!(nightly_backfill_order(dir.path(), true, || Ok(id.into())).is_err());
+        }
+        assert!(
+            nightly_backfill_order(dir.path(), true, || Err("external_disabled".into()))
+                .unwrap_err()
+                .contains("external_disabled")
+        );
+        assert_eq!(
+            std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+            before
+        );
+        checkpoint_fixture(dir.path(), TierKind::Fast, "not-the-hash-space");
+        assert!(nightly_backfill_order(dir.path(), true, || panic!("foreign fast owner")).is_err());
+    }
+
+    #[test]
+    fn nightly_corrupt_ledger_never_becomes_permission_to_start_fast() {
+        use crate::search::semantic_manifest::SemanticManifest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = SemanticManifest::path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{truncated checkpoint").unwrap();
+        assert!(
+            nightly_backfill_order(dir.path(), true, || panic!("unreadable checkpoint")).is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"{truncated checkpoint");
+    }
+
+    #[test]
+    fn nightly_checkpointed_worker_does_not_release_the_cursor_slot() {
+        for (status, stop) in [
+            ("checkpointed", true),
+            ("paused", true),
+            ("disabled", true),
+            ("published", false),
+            ("unchanged", false),
+            ("idle", false),
+        ] {
+            let mut step = skipped_step("semantic-backfill", "fixture");
+            step.result = Some(serde_json::json!({"status": status}));
+            assert_eq!(backfill_worker_retains_tier(&step), stop, "{status}");
+        }
+    }
+
+    #[test]
+    fn nightly_local_checkpoint_identity_matches_cli_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = crate::search::policy::SemanticPolicy::compiled_defaults();
+        for (name, id) in [
+            ("minilm", "minilm-384"),
+            ("fastembed", "minilm-384"),
+            ("multilingual-minilm", "multilingual-minilm-384"),
+            ("HASH", "fnv1a-384"),
+            ("unrecognized-policy", "minilm-384"),
+        ] {
+            policy.quality_tier_embedder = name.into();
+            assert_eq!(scheduled_quality_identity(dir.path(), &policy).unwrap(), id);
+        }
     }
 
     #[test]

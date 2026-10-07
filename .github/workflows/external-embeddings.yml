@@ -22,7 +22,7 @@ jobs:
       run: |
         python3 - <<'PY'
         import base64, hashlib, json, os, urllib.request
-        sha = 'e3cf97821f08f1c91462afa548b9b0d3ad6a8910'
+        sha = '60fb20aa623f0c95073cac488672fd8a5e38c349'
         url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
         request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -135,7 +135,7 @@ jobs:
       run: |
         python3 - <<'PY'
         import base64, hashlib, json, os, urllib.request
-        sha = 'e3cf97821f08f1c91462afa548b9b0d3ad6a8910'
+        sha = '60fb20aa623f0c95073cac488672fd8a5e38c349'
         url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
         request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
         with urllib.request.urlopen(request, timeout=60) as response:

@@ -23,8 +23,26 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::indexer::semantic_progress::SemanticProgressSink;
-use crate::search::semantic_manifest::SemanticManifest;
+use crate::search::semantic_manifest::{SemanticManifest, TierKind};
 use crate::storage::sqlite::FrankenStorage;
+
+/// Internal parent/worker contract. A nightly worker may finish the active
+/// checkpoint, but must not replace another tier's or producer's cursor.
+pub(crate) const SCHEDULE_PRESERVE_CHECKPOINT: &str = "CASS_SCHEDULE_PRESERVE_CHECKPOINT";
+
+fn ensure_scheduled_checkpoint_owner(
+    manifest: &SemanticManifest,
+    tier: TierKind,
+    embedder_id: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        manifest.checkpoint.as_ref().is_none_or(|checkpoint| {
+            checkpoint.tier == tier && checkpoint.embedder_id == embedder_id
+        }),
+        "semantic_checkpoint_owned: another tier or embedding space has unfinished work; resume its configured provider before switching; the scheduled worker did not replace its checkpoint"
+    );
+    Ok(())
+}
 
 /// Semantic indexer with lock-scoped ownership of backfill scratch artifacts.
 /// Embedding and non-backfill operations retain the engine's existing API.
@@ -73,6 +91,17 @@ impl SemanticIndexer {
             .map(|inner| Self { inner })
     }
 
+    fn admit_scheduled_checkpoint(
+        &self,
+        manifest: &SemanticManifest,
+        tier: TierKind,
+    ) -> Result<()> {
+        if matches!(std::env::var(SCHEDULE_PRESERVE_CHECKPOINT).as_deref(), Ok("1")) {
+            ensure_scheduled_checkpoint_owner(manifest, tier, self.inner.embedder_id())?;
+        }
+        Ok(())
+    }
+
     fn with_backfill_artifacts<F>(
         &self,
         data_dir: &Path,
@@ -86,6 +115,9 @@ impl SemanticIndexer {
         ) -> Result<SemanticBackfillBatchOutcome>,
     {
         self.inner.check_external_cancelled()?;
+        // begin validates this exact input checkpoint against the durable
+        // ledger under its lease BEFORE reclamation. A new owner appearing
+        // after the scheduler planned the run therefore cannot be overwritten.
         let artifacts = artifacts::BackfillArtifacts::begin(data_dir, manifest)?;
         // The ownership lease may have waited behind another writer.
         self.inner.check_external_cancelled()?;
@@ -129,6 +161,7 @@ impl SemanticIndexer {
         last_message_id: Option<i64>,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.admit_scheduled_checkpoint(manifest, plan.tier)?;
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
             engine.run_backfill_batch_with_sink(
                 messages,
@@ -165,6 +198,7 @@ impl SemanticIndexer {
         plan: SemanticBackfillStoragePlan,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.admit_scheduled_checkpoint(manifest, plan.tier)?;
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
             #[cfg(unix)]
             if let Some(outcome) =
@@ -184,6 +218,7 @@ impl SemanticIndexer {
         plan: SemanticBackfillStoragePlan,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.admit_scheduled_checkpoint(manifest, plan.tier)?;
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
             #[cfg(unix)]
             if let Some(outcome) =
@@ -243,5 +278,43 @@ mod external_diagnostic_tests {
         assert_eq!(error.to_string(), "external provider preflight failed");
         assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(external_diagnostic_result(true, Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn scheduled_guard_requires_both_the_checkpoint_tier_and_producer() {
+        use crate::search::semantic_manifest::BuildCheckpoint;
+        let mut manifest = SemanticManifest::default();
+        assert!(
+            ensure_scheduled_checkpoint_owner(&manifest, TierKind::Fast, "fnv1a-384").is_ok()
+        );
+        manifest.checkpoint = Some(BuildCheckpoint {
+            tier: TierKind::Quality,
+            embedder_id: "original-producer".into(),
+            last_offset: 1,
+            docs_embedded: 1,
+            conversations_processed: 1,
+            total_conversations: 3,
+            db_fingerprint: "old-archive-fingerprint".into(),
+            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+            saved_at_ms: 1,
+            last_message_id: Some(1),
+            cursor_exhausted: false,
+        });
+        let before = serde_json::to_vec(&manifest).unwrap();
+        for (tier, id) in [
+            (TierKind::Fast, "original-producer"),
+            (TierKind::Fast, "fnv1a-384"),
+            (TierKind::Quality, "changed-producer"),
+        ] {
+            let error = ensure_scheduled_checkpoint_owner(&manifest, tier, id).unwrap_err();
+            assert!(error.to_string().contains("semantic_checkpoint_owned"));
+            assert_eq!(serde_json::to_vec(&manifest).unwrap(), before);
+        }
+        assert!(
+            ensure_scheduled_checkpoint_owner(&manifest, TierKind::Quality, "original-producer")
+                .is_ok()
+        );
+        assert_eq!(serde_json::to_vec(&manifest).unwrap(), before);
     }
 }

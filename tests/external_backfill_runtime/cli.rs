@@ -458,3 +458,259 @@ fn external_cli_signals_stop_after_inflight_request_and_resume_from_checkpoint()
     }
     Ok(())
 }
+
+fn scheduled_fast(server: &Server, dir: &Path, db: &Path, batches: u32) -> Command {
+    let mut command = process(server, dir, db);
+    command
+        .args([
+            "models",
+            "backfill",
+            "--tier",
+            "fast",
+            "--embedder",
+            "hash",
+            "--batch-conversations",
+            "1",
+            "--scheduled",
+            "--json",
+            "--max-batches",
+        ])
+        .arg(batches.to_string())
+        .arg("--data-dir")
+        .arg(dir)
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CASS_SCHEDULE_PRESERVE_CHECKPOINT", "1");
+    command
+}
+
+#[test]
+fn external_cli_stale_scheduled_worker_cannot_erase_another_checkpoint() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = seed(dir.path())?;
+    let server = Server::start(384)?;
+    let mut first = backfill(&server, dir.path(), &db, 1);
+    first.args(["--embedder", "external"]);
+    let first_report = success(run(first)?)?;
+    let staging = PathBuf::from(
+        first_report["index_path"]
+            .as_str()
+            .context("staging path")?,
+    );
+    let manifest_path = SemanticManifest::path(dir.path());
+    let manifest_before = fs::read(&manifest_path)?;
+    let vectors_before = fs::read(&staging)?;
+    let wal = frankensearch::index::wal_path_for(&staging);
+    let wal_before = fs::read(&wal).ok();
+    server.take_inputs();
+
+    // This is the worker a stale fast-first schedule would have launched.
+    let refused = run(scheduled_fast(&server, dir.path(), &db, 1))?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("semantic_checkpoint_owned"));
+    assert!(
+        server.take_inputs().is_empty(),
+        "a hash worker must send no HTTP"
+    );
+    assert_eq!(fs::read(&manifest_path)?, manifest_before);
+    assert_eq!(fs::read(&staging)?, vectors_before);
+    assert_eq!(fs::read(&wal).ok(), wal_before);
+    assert!(!vector_index_path(dir.path(), "fnv1a-384").exists());
+
+    // A same-tier worker whose endpoint revision changed is not the owner either.
+    let mut changed = backfill(&server, dir.path(), &db, 1);
+    changed
+        .args(["--embedder", "external", "--scheduled"])
+        .env("CASS_EXTERNAL_EMBEDDING_REVISION", "v2")
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CASS_SCHEDULE_PRESERVE_CHECKPOINT", "1");
+    let refused = run(changed)?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("semantic_checkpoint_owned"));
+    assert!(
+        corpus(&server).is_empty(),
+        "only fixed preflight probes may precede admission"
+    );
+    assert_eq!(fs::read(&manifest_path)?, manifest_before);
+    assert_eq!(fs::read(&staging)?, vectors_before);
+    assert_eq!(fs::read(&wal).ok(), wal_before);
+
+    let mut resume = backfill(&server, dir.path(), &db, 10);
+    resume
+        .args(["--embedder", "external", "--scheduled"])
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CASS_SCHEDULE_PRESERVE_CHECKPOINT", "1");
+    assert_eq!(success(run(resume)?)?["published"], true);
+    let resumed = corpus(&server);
+    assert_eq!(resumed.len(), 4);
+    assert!(resumed.iter().all(|text| !text.contains("conversation 1")));
+    let quality = SemanticManifest::load(dir.path())?
+        .unwrap()
+        .quality_tier
+        .unwrap();
+    let signature_before = signature(&dir.path().join(&quality.index_path))?;
+    assert_eq!(
+        success(run(scheduled_fast(&server, dir.path(), &db, 10))?)?["published"],
+        true
+    );
+    assert!(server.take_inputs().is_empty());
+    assert_eq!(
+        SemanticManifest::load(dir.path())?.unwrap().quality_tier,
+        Some(quality.clone())
+    );
+    assert_eq!(
+        signature(&dir.path().join(&quality.index_path))?,
+        signature_before
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn nightly(server: &Server, dir: &Path, db: &Path) -> Command {
+    let mut command = process(server, dir, db);
+    // A real nightly invokes connector discovery. Carry only the explicit
+    // fixture settings, not agent-home overrides from the developer's shell.
+    let environment: Vec<_> = command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| (key.to_os_string(), value.to_os_string()))
+        })
+        .collect();
+    command
+        .env_clear()
+        .envs(environment)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .args([
+            "schedule",
+            "run",
+            "--job",
+            "nightly",
+            "--force",
+            "--json",
+            "--data-dir",
+        ])
+        .arg(dir)
+        .env("CASS_SEMANTIC_EMBEDDER", "external")
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT", "1")
+        .env("CASS_SCHEDULE_MAX_BACKFILL_BATCHES", "1");
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn external_cli_nightly_resumes_quality_across_budget_boundaries_before_starting_fast()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = seed(dir.path())?;
+    let server = Server::start(384)?;
+    let mut first = backfill(&server, dir.path(), &db, 1);
+    first.args(["--embedder", "external"]);
+    success(run(first)?)?;
+    let original = SemanticManifest::load(dir.path())?
+        .unwrap()
+        .checkpoint
+        .unwrap();
+    assert_eq!(original.docs_embedded, 1);
+    server.take_inputs();
+
+    for (night, corpus_count) in [(1, 3), (2, 1)] {
+        let report = success(run(nightly(&server, dir.path(), &db))?)?;
+        let workers: Vec<_> = report["steps"]
+            .as_array()
+            .context("nightly steps")?
+            .iter()
+            .filter(|step| {
+                step["name"].as_str().is_some_and(|name| {
+                    name.starts_with("semantic-backfill:fast:")
+                        || name.starts_with("semantic-backfill:quality:")
+                })
+            })
+            .collect();
+        assert_eq!(
+            workers.len(),
+            1,
+            "one worker in the shared nightly budget: {report}"
+        );
+        assert_eq!(
+            workers[0]["result"]["tier"], "quality",
+            "night {night}: {report}"
+        );
+        let sent = corpus(&server);
+        assert_eq!(sent.len(), corpus_count, "night {night}");
+        assert!(sent.iter().all(|text| !text.contains("conversation 1")));
+        let manifest = SemanticManifest::load(dir.path())?.context("nightly manifest")?;
+        assert!(
+            manifest.fast_tier.is_none(),
+            "fast cannot preempt unfinished quality work"
+        );
+        if night == 1 {
+            let checkpoint = manifest.checkpoint.context("bounded quality continuation")?;
+            assert_eq!(checkpoint.embedder_id, original.embedder_id);
+            assert_eq!(checkpoint.tier, TierKind::Quality);
+            assert_eq!(checkpoint.docs_embedded, 4);
+        } else {
+            assert!(manifest.checkpoint.is_none());
+            let artifact = manifest.quality_tier.context("completed external quality")?;
+            assert_eq!(artifact.doc_count, 5);
+            assert!(artifact.ready);
+        }
+    }
+    let fresh = tempfile::tempdir()?;
+    let fresh_db = seed(fresh.path())?;
+    let mut independent = backfill(&server, fresh.path(), &fresh_db, 10);
+    independent.args(["--embedder", "external"]);
+    let expected = success(run(independent)?)?;
+    assert_eq!(
+        signature(&vector_index_path(dir.path(), &original.embedder_id))?,
+        signature(Path::new(expected["index_path"].as_str().unwrap()))?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn external_cli_nightly_refuses_disabled_or_changed_resume_configuration_without_http()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = seed(dir.path())?;
+    let server = Server::start(384)?;
+    let mut first = backfill(&server, dir.path(), &db, 1);
+    first.args(["--embedder", "external"]);
+    let checkpoint = success(run(first)?)?;
+    let staged = PathBuf::from(
+        checkpoint["index_path"]
+            .as_str()
+            .context("staging path")?,
+    );
+    let manifest_before = fs::read(SemanticManifest::path(dir.path()))?;
+    let vectors_before = fs::read(&staged)?;
+    server.take_inputs();
+    for (key, value) in [
+        ("CASS_EXTERNAL_EMBEDDINGS", "0"),
+        ("CASS_EXTERNAL_EMBEDDING_REVISION", "another-revision"),
+    ] {
+        let mut command = nightly(&server, dir.path(), &db);
+        command.env(key, value);
+        let output = run(command)?;
+        assert!(!output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["ok"], false);
+        let failure = report["steps"]
+            .as_array()
+            .context("nightly steps")?
+            .iter()
+            .find(|step| step["name"] == "semantic-backfill-plan")
+            .context("a named checkpoint admission failure")?;
+        assert_eq!(failure["result"]["semantic_workers_started"], false);
+        assert!(
+            server.take_inputs().is_empty(),
+            "planning cannot send even probes"
+        );
+        assert_eq!(
+            fs::read(SemanticManifest::path(dir.path()))?,
+            manifest_before
+        );
+        assert_eq!(fs::read(&staged)?, vectors_before);
+    }
+    Ok(())
+}

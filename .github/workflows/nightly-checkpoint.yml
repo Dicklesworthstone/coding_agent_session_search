@@ -13,47 +13,13 @@ on:
 permissions:
   contents: read
 jobs:
-  source-export:
-    runs-on: ubuntu-slim
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Export reviewed checkpoint-owner sources without ref writes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, urllib.request
-          sha = 'eb6117c16a2852c97d336518e73194d3d4b3a79e'
-          url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
-          req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(req, timeout=60) as response:
-              value = json.load(response)
-          assert value['encoding'] == 'base64'
-          source = base64.b64decode(value['content'])
-          assert hashlib.sha1(b'blob ' + str(len(source)).encode() + b'\0' + source).hexdigest() == sha
-          exec(compile(source, 'reviewed-nightly-checkpoint-export', 'exec'))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: nightly-checkpoint-source-slim-${{ github.sha }}
-          path: nightly-checkpoint-source.tar.gz
-          if-no-files-found: error
-          retention-days: 7
   native:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    permissions:
-      contents: write
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -65,35 +31,21 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify the committed source revision
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           toolchain: nightly-2026-08-31
           components: rustfmt
-      - name: Export reviewed checkpoint-owner sources without ref writes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, urllib.request
-          sha = 'eb6117c16a2852c97d336518e73194d3d4b3a79e'
-          url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
-          req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(req, timeout=60) as response:
-              value = json.load(response)
-          assert value['encoding'] == 'base64'
-          source = base64.b64decode(value['content'])
-          assert hashlib.sha1(b'blob ' + str(len(source)).encode() + b'\0' + source).hexdigest() == sha
-          exec(compile(source, 'reviewed-nightly-checkpoint-export', 'exec'))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: nightly-checkpoint-source-${{ github.sha }}
-          path: nightly-checkpoint-source.tar.gz
-          if-no-files-found: error
-          retention-days: 7
       - name: Scheduler checkpoint order and failure regressions
         run: cargo test --locked --lib schedule::tests -- --nocapture
       - name: Semantic engine and artifact ownership regressions
         run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
       - name: Real nightly, checkpoint, external transport and CLI regressions
         run: cargo test --locked --test external_backfill_runtime -- --nocapture
+      - name: Check checkpoint-owner source formatting
+        if: always()
+        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
+      - name: Verify validation did not alter committed sources
+        if: always()
+        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
