@@ -709,9 +709,17 @@ impl Connector for GrokSummaryAtAdmission {
                 .as_mut()
                 .is_none_or(|callback| callback(source))
         };
+        // Forward completion through a local closure too: both hooks must
+        // share this call's lifetime, which the caller's hooks outlive.
+        let original_complete = &mut hooks.on_source_complete;
+        let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
+            original_complete
+                .as_mut()
+                .map_or(Ok(()), |callback| callback(completion))
+        };
         let mut forwarded = franken_agent_detection::SourceScanHooks {
             should_scan_source: Some(&mut inject),
-            on_source_complete: hooks.on_source_complete.as_deref_mut(),
+            on_source_complete: Some(&mut complete),
         };
         crate::connectors::grok::GrokConnector::new().scan_with_source_boundaries(
             ctx,
