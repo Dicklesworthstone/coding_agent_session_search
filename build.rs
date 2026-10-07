@@ -177,10 +177,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // (cass#511); 0.3.5 keeps indexing a Codebuff store's other chats when
         // one transcript does not parse, and names that transcript. 0.3.6
         // (codex-zstd) reads Codex rollouts compressed to .jsonl.zst (cass#513).
+        // 0.3.7 adds the pi_durable connector (FAD#28; its SQLite stores need
+        // pi-durable) and pi_agent_rust SQLite sessions (pi-sqlite).
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.6",
+        expected_version: "0.3.7",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[
@@ -197,6 +199,8 @@ const CONTRACTS: &[DependencyContract] = &[
             "hermes",
             "openclaw-sqlite",
             "opencode",
+            "pi-durable",
+            "pi-sqlite",
             "shelley",
         ],
         expected_default_features: None,

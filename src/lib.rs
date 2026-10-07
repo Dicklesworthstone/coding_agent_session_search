@@ -51853,14 +51853,15 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         source_path.as_deref(),
     );
 
-    if matches!(provider.as_str(), "shelley" | "grok_bot") {
+    if matches!(provider.as_str(), "shelley" | "grok_bot" | "pi_durable") {
         receipt.action = "disabled_sensitive_container".to_string();
         receipt.warnings.push(
-            if provider == "shelley" {
-                "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path."
-            } else {
-                "Grok Bot replicas mix chat with secret and approval payloads. Raw mirror capture and linking are disabled; index the original local replica directly with CASS_GROK_BOT_DATA_ROOT."
-            }.to_string(),
+            match provider.as_str() {
+                "shelley" => "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path.",
+                "grok_bot" => "Grok Bot replicas mix chat with secret and approval payloads. Raw mirror capture and linking are disabled; index the original local replica directly with CASS_GROK_BOT_DATA_ROOT.",
+                _ => "Pi durable stores keep system prompts, agent instructions, task checkpoints and application documents alongside conversations. Raw mirror capture and linking are disabled; index the original store directly (default <agent dir>/experimental/durable-sessions, agent dir from PI_CODING_AGENT_DIR) or a local source path.",
+            }
+            .to_string(),
         );
         return receipt;
     }
@@ -80706,7 +80707,7 @@ paths = ["~/.claude/projects"]
         std::fs::write(&source_path, bytes).unwrap();
         let before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
         let mut cache = HashMap::new();
-        for provider in ["shelley", "grok_bot"] {
+        for provider in ["shelley", "grok_bot", "pi_durable"] {
             for origin in ["local", "ssh"] {
                 for apply in [false, true] {
                     let candidate = DoctorRawMirrorBackfillCandidate {
@@ -80733,10 +80734,10 @@ paths = ["~/.claude/projects"]
                     assert!(!receipt.raw_source_captured);
                     assert!(!receipt.raw_mirror_db_linked);
                     assert!(!receipt.db_projection_only);
-                    let variable = if provider == "shelley" {
-                        "CASS_SHELLEY_DB"
-                    } else {
-                        "CASS_GROK_BOT_DATA_ROOT"
+                    let variable = match provider {
+                        "shelley" => "CASS_SHELLEY_DB",
+                        "grok_bot" => "CASS_GROK_BOT_DATA_ROOT",
+                        _ => "PI_CODING_AGENT_DIR",
                     };
                     assert!(
                         receipt

@@ -32,6 +32,29 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## [Unreleased]
 
+### Added
+
+- **Pi durable-harness conversations are indexed (franken_agent_detection
+  #28).** Stores written by Pi's experimental durable harness
+  (`@earendil-works/pi-durable`) were invisible to cass. With
+  franken_agent_detection 0.3.7 the new `pi_durable` connector reads them:
+  - SQLite stores at
+    `<agent dir>/experimental/durable-sessions/<cwd-hash>/<ms>-<uuid>/session.sqlite`,
+    with the agent dir from `PI_CODING_AGENT_DIR` or `~/.pi/agent`;
+  - JSONL commit-log stores under explicit roots.
+
+  Each conversation in a store, whether the lead, a fork or a task-owned
+  child, is its own conversation. Only committed state is read.
+  System prompts, task checkpoints and application documents are never
+  indexed, and like Shelley and Grok Bot stores, these stores are not
+  raw-mirrored, because doing so would copy the parts cass deliberately
+  leaves out.
+
+  The same release also:
+  - indexes `pi_agent_rust` SQLite sessions;
+  - keeps Pi and Oh My Pi compaction summaries, custom messages, shell runs
+    and branch provenance (franken_agent_detection #27).
+
 ### Fixed
 
 - **Codex sessions compressed to `.jsonl.zst` are indexed (#513).** Codex's

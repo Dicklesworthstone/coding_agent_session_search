@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Prime Agent, Oh My Pi, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Muse Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, and Kiro CLI into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Pi Durable, Prime Agent, Oh My Pi, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Muse Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, and Kiro CLI into a single, searchable timeline.
 
 <div align="center">
 
@@ -390,7 +390,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 32 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 33 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` and `~/.codex/archived_sessions` (Rollout JSONL, plain or zstd-compressed `.jsonl.zst`)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -404,7 +404,8 @@ Ingests history from 32 local agent connectors, normalizing them into a unified 
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
-- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
+- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content; `pi_agent_rust` SQLite sessions too)
+- **Pi Durable (`pi_durable`)**: Pi's experimental durable harness (`@earendil-works/pi-durable`). SQLite stores at `<agent dir>/experimental/durable-sessions/<cwd-hash>/<ms>-<uuid>/session.sqlite` (agent dir `PI_CODING_AGENT_DIR` or `~/.pi/agent`); JSONL commit-log stores under explicit roots. Each conversation in a store (lead, forks, task-owned children) is its own conversation. System prompts, task checkpoints and application documents are never indexed, and the stores are not raw-mirrored
 - **Prime Agent (`prime_agent`)**: `~/.prime/agent/sessions/<session-id>.jsonl` (versions 1–3). Indexes the active branch with omission counts for abandoned siblings; preserves thinking, tool results and context summaries. Overrides, in precedence order: `PRIME_AGENT_SESSION_DIR`, legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `PRIME_AGENT_CODING_AGENT_DIR` (with `/sessions` appended). Prime retains its own agent identity.
 - **Oh My Pi (`omp`)**: OMP v18's default `~/.omp/agent/sessions`, named profiles under `~/.omp/profiles/<name>/agent/sessions`, XDG stores under `$XDG_DATA_HOME/omp`, and explicit OMP-only archive roots via `CASS_OMP_DATA_ROOT` (pi-family JSONL, including per-session sub-agent transcripts)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
@@ -2469,7 +2470,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 32 coding-agent connectors (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Prime Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, Kiro CLI); `cass capabilities --json` lists them as `connectors`.
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 33 coding-agent connectors (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Pi Durable, Prime Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, Kiro CLI); `cass capabilities --json` lists them as `connectors`.
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation. cass turns on the engine's concurrent mode (`PRAGMA fsqlite.concurrent_mode = ON`), so a plain `BEGIN` runs as `BEGIN CONCURRENT`. Indexing still has one writer at a time, because `index-run.lock` admits a single indexer. `BEGIN IMMEDIATE` appears only in the daemon job queue and in logical-archive import/migrate. An experimental opt-in parallel persist path (`CASS_INDEXER_BEGIN_CONCURRENT=1`, off by default) exists but is not the default.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -3642,7 +3643,7 @@ The manifests and lockfile pin the entire SQLite family used by CASS (including
 `fsqlite-types`) at `=0.4.9`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
-archive. `franken-agent-detection =0.3.6` is published and accepts the 0.4.9
+archive. `franken-agent-detection =0.3.7` is published and accepts the 0.4.9
 family. SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only
 opens (GH#477) and 0.4.4 adds durable pending-freelist repairs. 0.4.6 stops a
 live B-tree page from being freed and granted again across a WAL generation
@@ -3670,7 +3671,7 @@ uniform SQLite 0.4.9 versions, a single resolution per package, and registry sou
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.9` (tag v0.4.9 = `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
-| `franken-agent-detection` | crates.io `=0.3.6`, feature `codex-zstd` (compressed Codex rollouts) |
+| `franken-agent-detection` | crates.io `=0.3.7`, features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
 | `frankensearch` | crates.io `=0.7.1`, resolving `frankensearch-quill 0.4.0` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, plus concurrent segment verification on open for GH #501), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |

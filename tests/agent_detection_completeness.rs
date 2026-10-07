@@ -133,6 +133,7 @@ fn connector_factories_all_instantiate_and_detect() {
         "amp",
         "aider",
         "pi_agent",
+        "pi_durable",
         "factory",
         "omp",
         "openclaw",
@@ -165,7 +166,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 32, "Expected 32 connector factories");
+    assert_eq!(slugs.len(), 33, "Expected 33 connector factories");
 }
 
 // ---------------------------------------------------------------------------
@@ -220,13 +221,14 @@ fn probe_paths_cover_all_factory_connectors() {
 fn probe_paths_are_tilde_relative() {
     let paths = franken_agent_detection::default_probe_paths_tilde();
     for (slug, paths) in &paths {
-        if *slug == "shelley" {
+        if matches!(*slug, "shelley" | "pi_durable") {
             // A live SQLite database and WAL cannot yet be copied as a
-            // consistent remote bundle (GH #415). Local detection remains
-            // available, but advertising remote paths would be unsafe.
+            // consistent remote bundle (GH #415; Pi durable stores, FAD #28).
+            // Local detection remains available, but advertising remote paths
+            // would be unsafe.
             assert!(
                 paths.is_empty(),
-                "Shelley remote probes must remain disabled"
+                "{slug} remote probes must remain disabled"
             );
             continue;
         }

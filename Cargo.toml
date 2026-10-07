@@ -157,7 +157,9 @@ frankensearch = { version = "=0.7.1", default-features = false, features = ["has
 # Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
 # Keep both readers unconditional, including --no-default-features builds.
 # codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
-franken-agent-detection = { version = "=0.3.6", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd"] }
+# pi-durable reads Pi durable-harness SQLite stores (FAD #28); pi-sqlite reads
+# pi_agent_rust SQLite sessions.
+franken-agent-detection = { version = "=0.3.7", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

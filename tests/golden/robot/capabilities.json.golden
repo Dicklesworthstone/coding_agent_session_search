@@ -58,6 +58,7 @@
     "factory",
     "openclaw",
     "antigravity",
+    "pi_durable",
     "prime_agent",
     "kimi",
     "kiro",
@@ -342,7 +343,7 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy",
+          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm, external); defaults to semantic policy",
           "arg_type": "option",
           "value_type": "string",
           "required": false
