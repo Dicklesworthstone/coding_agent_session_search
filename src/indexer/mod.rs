@@ -8900,6 +8900,42 @@ fn lexical_rebuild_runtime_pipeline_budget_snapshot(
     )
 }
 
+/// GH #496: the message bytes one prepared page may hold, for the first
+/// durable slice and for steady state, derived by the same budget path the
+/// live rebuild uses (the commit-bytes interval, clamped to an equal share
+/// of the in-flight budget). `status` reports both so a memory cap's effect
+/// on page prep is visible, not only on the in-flight total.
+pub(crate) fn lexical_rebuild_page_fetch_message_bytes(
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> (usize, usize) {
+    let page_bytes = |conversations, messages, message_bytes, commit_conversations| {
+        lexical_rebuild_runtime_pipeline_budget_snapshot(
+            conversations,
+            messages,
+            message_bytes,
+            settings.pipeline_channel_size,
+            commit_conversations,
+            messages,
+            message_bytes,
+        )
+        .batch_fetch_message_bytes_limit
+    };
+    (
+        page_bytes(
+            settings.startup_batch_fetch_conversations,
+            settings.startup_commit_every_messages,
+            settings.startup_commit_every_message_bytes,
+            settings.startup_commit_every_conversations,
+        ),
+        page_bytes(
+            settings.steady_batch_fetch_conversations,
+            settings.steady_commit_every_messages,
+            settings.steady_commit_every_message_bytes,
+            settings.steady_commit_every_conversations,
+        ),
+    )
+}
+
 fn bounded_lexical_rebuild_page_reservation_limits(
     configured_batch_fetch_message_bytes_limit: usize,
     max_message_bytes_in_flight: usize,

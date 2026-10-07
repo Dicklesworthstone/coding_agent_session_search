@@ -1186,6 +1186,12 @@
                 "controller_loadavg_low_watermark_1m": {
                   "type": "number"
                 },
+                "startup_page_fetch_message_bytes": {
+                  "type": "string"
+                },
+                "steady_page_fetch_message_bytes": {
+                  "type": "string"
+                },
                 "runtime": {
                   "type": "null"
                 }

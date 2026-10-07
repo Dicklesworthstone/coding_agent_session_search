@@ -22592,6 +22592,17 @@ fn state_meta_json_inner(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
+        // GH #496: the per-page byte budget page prep fetches against.
+        let (startup_page_bytes, steady_page_bytes) =
+            crate::indexer::lexical_rebuild_page_fetch_message_bytes(&lexical_rebuild_pipeline);
+        pipeline.insert(
+            "startup_page_fetch_message_bytes".to_string(),
+            serde_json::json!(startup_page_bytes),
+        );
+        pipeline.insert(
+            "steady_page_fetch_message_bytes".to_string(),
+            serde_json::json!(steady_page_bytes),
+        );
         let runtime_value = lexical_rebuild_pipeline_runtime
             .map(|runtime| {
                 let queue_capacity = lexical_rebuild_pipeline.pipeline_channel_size;
@@ -88601,6 +88612,18 @@ mod cli_read_db_tests {
         assert_eq!(
             pipeline["pipeline_max_message_bytes_in_flight"].as_u64(),
             Some(888888)
+        );
+        // GH #496: a page holds at most an equal share of the in-flight
+        // budget across the channel slots plus the sink (888888 / 5): the
+        // steady 610000-byte commit interval is clamped, the 61000-byte
+        // startup one is not.
+        assert_eq!(
+            pipeline["startup_page_fetch_message_bytes"].as_u64(),
+            Some(61000)
+        );
+        assert_eq!(
+            pipeline["steady_page_fetch_message_bytes"].as_u64(),
+            Some(888888 / 5)
         );
         assert_eq!(pipeline["runtime"], serde_json::Value::Null);
     }

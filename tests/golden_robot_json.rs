@@ -1084,6 +1084,9 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         "available_bytes",
         "max_inflight_bytes",
         "pipeline_max_message_bytes_in_flight",
+        // A page's byte budget is a share of the in-flight budget above.
+        "startup_page_fetch_message_bytes",
+        "steady_page_fetch_message_bytes",
         // WS-B.4a: the archive footprint depends on the engine's page layout
         // and on whether a WAL sidecar happens to exist; keep the keys, scrub
         // the values.
