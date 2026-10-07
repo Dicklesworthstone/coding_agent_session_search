@@ -149,6 +149,9 @@ impl CanonicalProjection<'_> {
         Ok(summary)
     }
 
+    // Keep the original complete replay as an independent test comparator.
+    // Production uses publication-bound durable progress below.
+    #[cfg(test)]
     fn publish(
         &self,
         index: &mut TantivyIndex,
@@ -209,6 +212,8 @@ pub(crate) struct LexicalReconcileReport {
     pub attempt: u32,
     pub message_count: usize,
     pub expected_docs: usize,
+    /// First-pass documents submitted in this invocation, excluding a resumed
+    /// prefix. Zero is valid when resuming the verification replay pass.
     pub upserted_docs: usize,
     pub doc_count_before: u64,
     pub doc_count_after: u64,
@@ -398,13 +403,20 @@ pub(crate) fn run_lexical_conversation_reconcile(
     // 3. Upsert the full source doc set and publish a successor generation.
     let mut index = TantivyIndex::open_or_create(&index_path)?;
     let doc_count_before = index.doc_count()?;
-    let upserted_docs = projection.publish(&mut index, &checkpoint)?;
-    let doc_count_after_first = index.doc_count()?;
-
-    // 4. Preserve the existing replay invariant until the CASS adapter exposes
-    // Quill's writer-side per-document witnesses. Counts alone do not prove
-    // that every expected projected document is present with matching content.
-    projection.publish(&mut index, &checkpoint)?;
+    // 4. Both passes retain publication-bound cursors. A retry validates the
+    // canonical prefix and resumes only writes justified by the same admitted
+    // manifest; changed publication authority safely restarts a full replay.
+    // This retains the existing count/endpoint invariant, not a full engine
+    // content-witness audit of every document.
+    let published = checkpoint::progress::publish(
+        &projection,
+        &mut index,
+        &checkpoint,
+        &index_path,
+        &checkpoint_path,
+    )?;
+    let upserted_docs = published.upserted_docs;
+    let doc_count_after_first = published.first_pass_live_docs;
     // Reuse one admitted reader for final accounting and both endpoint checks.
     // No refresh or path reopen may split these observations across generations.
     let reader = index.reader()?;
@@ -422,6 +434,9 @@ pub(crate) fn run_lexical_conversation_reconcile(
 
     let canaries_ok = early_canary_ok && late_canary_ok;
     let checkpoint_cleared = if converged && canaries_ok {
+        // Remove the optional cursor first. A crash between these operations
+        // can only cause an extra replay, never leave completion without proof.
+        checkpoint::progress::clear(&checkpoint_path)?;
         clear_checkpoint(&checkpoint_path)?;
         true
     } else {

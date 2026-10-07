@@ -4,6 +4,8 @@ use super::LexicalReconcileCheckpoint;
 use anyhow::{Result, ensure};
 use frankensearch::quill::cass::CassDocument;
 
+pub(super) mod progress;
+
 pub(super) const VERSION: u32 = 2;
 
 /// Incremental version-two binding. Batch boundaries are deliberately absent
