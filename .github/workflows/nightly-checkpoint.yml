@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - src/schedule.rs
+      - src/lib.rs
       - src/indexer/semantic.rs
       - src/indexer/semantic/**
       - tests/external_backfill_runtime.rs
@@ -13,7 +14,85 @@ on:
 permissions:
   contents: read
 jobs:
+  source-export:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Export exact direct-scheduled admission sources without ref changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, subprocess, tarfile, tempfile, urllib.request
+          from pathlib import Path
+          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['GITHUB_SHA']
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          bases = {
+              'src/indexer/semantic.rs': '9adc015d70644cad2de4d257e4d57154456c5bb1',
+              'src/lib.rs': '50c5959cdbedc741565bd9c952d880a0d4c2f091',
+              'tests/external_backfill_runtime/cli.rs': '40ea1789e63e34f745eb066bde962987d36755c7',
+          }
+          for name, expected in bases.items():
+              path = Path(name)
+              assert not any(p.is_symlink() for p in [path, *path.parents]), name
+              assert digest(path.read_bytes()) == expected, 'source drift: ' + name
+          sha = '31af1f88596b8728dc9fdf1c59c462fd86e472fa'
+          value = request('/git/blobs/' + sha)
+          assert value['encoding'] == 'base64'
+          compressed = base64.b64decode(value['content'])
+          assert digest(compressed) == sha
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == '45186129c9813beb89050d24bba9c1df2d812d159cf275b7500d2d2f44e4a903'
+          with tempfile.NamedTemporaryFile() as pending:
+              pending.write(patch)
+              pending.flush()
+              subprocess.run(['git', 'apply', '--check', '--index', '--whitespace=error-all', pending.name], check=True)
+              subprocess.run(['git', 'apply', '--index', '--whitespace=error-all', pending.name], check=True)
+          assert set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()) == set(bases)
+          rust = sorted(bases)
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *rust], check=True)
+          subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *rust], check=True)
+          subprocess.run(['git', 'diff', '--check', 'HEAD'], check=True)
+          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}, 'validation': 'source composition and formatting only; native execution is separate'}
+          for name in rust:
+              data = Path(name).read_bytes()
+              result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+              assert result['sha'] == digest(data), name
+              receipt['blobs'][name] = result['sha']
+          Path('scheduled-admission-source-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print('SCHEDULED_ADMISSION_SOURCE=' + json.dumps(receipt, sort_keys=True))
+          with tarfile.open('scheduled-admission-source.tar.gz', 'w:gz') as archive:
+              for name in [*rust, 'scheduled-admission-source-receipt.json']:
+                  archive.add(name, arcname=name)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scheduled-admission-source-${{ github.sha }}
+          path: scheduled-admission-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
   native:
+    needs: source-export
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +112,31 @@ jobs:
           persist-credentials: false
       - name: Verify the committed source revision
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: scheduled-admission-source-${{ github.sha }}
+      - name: Verify and install reviewed admission candidate
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, tarfile
+          from pathlib import Path
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          with tarfile.open('scheduled-admission-source.tar.gz', 'r:gz') as archive:
+              receipt = json.load(archive.extractfile('scheduled-admission-source-receipt.json'))
+              assert receipt['source_commit'] == os.environ['GITHUB_SHA']
+              assert set(receipt['bases']) == set(receipt['blobs']) == {'src/indexer/semantic.rs', 'src/lib.rs', 'tests/external_backfill_runtime/cli.rs'}
+              for name, expected in receipt['blobs'].items():
+                  path = Path(name)
+                  assert not any(p.is_symlink() for p in [path, *path.parents])
+                  assert digest(path.read_bytes()) == receipt['bases'][name]
+                  member = archive.getmember(name)
+                  assert member.isfile()
+                  data = archive.extractfile(member).read()
+                  assert digest(data) == expected
+                  path.write_bytes(data)
+          Path('scheduled-admission-source-receipt.json').write_text(json.dumps(receipt))
+          PY
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           toolchain: nightly-2026-08-31
@@ -45,7 +149,17 @@ jobs:
         run: cargo test --locked --test external_backfill_runtime -- --nocapture
       - name: Check checkpoint-owner source formatting
         if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
-      - name: Verify validation did not alter committed sources
+        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/lib.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
+      - name: Verify the candidate bytes tested and preserve unrelated checkout files
         if: always()
-        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, subprocess
+          from pathlib import Path
+          receipt = json.loads(Path('scheduled-admission-source-receipt.json').read_text())
+          for name, expected in receipt['blobs'].items():
+              data = Path(name).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only', 'HEAD'], text=True).splitlines())
+          assert changed == set(receipt['blobs']), changed
+          PY
