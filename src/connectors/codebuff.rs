@@ -6,6 +6,7 @@
 
 mod discovery;
 mod scan_failures;
+mod source_contexts;
 mod watch_scope;
 
 use std::collections::HashMap;
@@ -119,6 +120,8 @@ impl CodebuffConnector {
         Ok(sources)
     }
 
+    // Retain the original constructor as an independent regression comparator.
+    #[cfg(test)]
     fn source_context(ctx: &ScanContext, source: &DiscoveredSourceFile) -> ScanContext {
         let root = ctx
             .scan_roots
@@ -234,6 +237,7 @@ impl Connector for CodebuffConnector {
                     .push(source.clone());
             }
         }
+        let mut source_contexts = source_contexts::SourceContexts::new(ctx);
         for source in sources {
             if source.role != DiscoveredSourceRole::PrimarySessionLog
                 || Self::source_excluded(&source, &exclusions)
@@ -251,14 +255,14 @@ impl Connector for CodebuffConnector {
             let sidecars = dependencies
                 .remove(&source_group(&source))
                 .unwrap_or_default();
-            let single = Self::source_context(ctx, &source);
+            let single = source_contexts.for_source(&source);
             let directory_before = parent_modified(&source);
             let mut conversations_emitted = 0usize;
             let mut delivery_failed = false;
             let mut metadata_unavailable = false;
             let result = self
                 .inner
-                .scan_with_callback(&single, &mut |conversation| {
+                .scan_with_callback(single, &mut |conversation| {
                     // FAD retains chat text when optional run state cannot be
                     // read. Do not freeze that degraded result into a durable
                     // completion: permissions can be repaired without changing
@@ -280,7 +284,7 @@ impl Connector for CodebuffConnector {
                     if Self::source_excluded(&source, &exclusions) {
                         return Ok(false);
                     }
-                    self.unchanged(&single, &source, &sidecars, directory_before)
+                    self.unchanged(single, &source, &sidecars, directory_before)
                 });
             match result {
                 Err(error) if delivery_failed => return Err(error),
