@@ -99,15 +99,16 @@ impl CodebuffConnector {
         // turn a real discovery failure into a purported complete empty scan.
         let mut sources = self.inner.discover_source_files(&scoped)?;
         for source in &mut sources {
-            if let Some((_, requested)) = scoped
-                .scan_roots
-                .iter()
-                .zip(&requested_roots)
-                .find(|(root, _)| {
-                    root.path == source.scan_root
-                        && root.origin == source.origin
-                        && root.platform == source.platform
-                })
+            if let Some((_, requested)) =
+                scoped
+                    .scan_roots
+                    .iter()
+                    .zip(&requested_roots)
+                    .find(|(root, _)| {
+                        root.path == source.scan_root
+                            && root.origin == source.origin
+                            && root.platform == source.platform
+                    })
             {
                 source.scan_root = requested.path.clone();
             }

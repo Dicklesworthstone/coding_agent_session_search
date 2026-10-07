@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 /// their existing interpretation. Do not follow a run-state symlink to choose
 /// the chat: reconstruction reads the transcript beside the selected sidecar.
 pub(super) fn transcript_selector(path: &Path) -> PathBuf {
-    let chat = if path.file_name().is_some_and(|name| name == "run-state.json") {
+    let chat = if path
+        .file_name()
+        .is_some_and(|name| name == "run-state.json")
+    {
         path.parent()
     } else if path.is_dir() {
         Some(path)
@@ -42,7 +45,9 @@ mod tests {
     use std::fs;
 
     fn transcript(projects: &Path, project: &str) -> PathBuf {
-        let chat = projects.join(project).join("chats/2026-03-21T17-14-03.768Z");
+        let chat = projects
+            .join(project)
+            .join("chats/2026-03-21T17-14-03.768Z");
         fs::create_dir_all(&chat).unwrap();
         let transcript = chat.join("chat-messages.json");
         fs::write(
@@ -142,7 +147,11 @@ mod tests {
             );
             let connector = CodebuffConnector::new();
             let discovered = connector.discover_source_files(&ctx).unwrap();
-            assert_eq!(discovered.len(), 2, "overlapping selectors must deduplicate");
+            assert_eq!(
+                discovered.len(),
+                2,
+                "overlapping selectors must deduplicate"
+            );
             assert!(discovered.iter().all(|source| source.scan_root == paths[0]));
             assert_eq!(connector.scan(&ctx).unwrap().len(), 1);
         }
