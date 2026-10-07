@@ -30303,7 +30303,7 @@ impl ConnectorKind {
             Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
-            Self::Codebuff => Box::new(franken_agent_detection::CodebuffConnector::new()),
+            Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
         }
     }
 }
