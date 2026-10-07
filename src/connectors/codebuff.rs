@@ -179,7 +179,8 @@ impl Connector for CodebuffConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        self.discover_allowed(ctx, &ScanExclusions::from_env())
+        let exclusions = ScanExclusions::from_env();
+        discovery::discover_for_inventory(ctx, |scope| self.discover_allowed(scope, &exclusions))
     }
 
     fn supports_streaming_scan(&self) -> bool {

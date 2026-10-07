@@ -50,6 +50,32 @@ pub(super) fn discover_for_scan(
     Ok(sources)
 }
 
+/// The indexer inventories inputs before invoking the parser so it can mirror
+/// known files and capture reconstruction dependencies. This is a preparatory
+/// inventory, not proof that every selected store was scanned successfully.
+/// Keep known inputs when another selected root fails; the actual scan visits
+/// every root again and remains authoritative for the run's error result.
+pub(super) fn discover_for_inventory(
+    ctx: &ScanContext,
+    discover: impl FnMut(&ScanContext) -> anyhow::Result<Vec<DiscoveredSourceFile>>,
+) -> anyhow::Result<Vec<DiscoveredSourceFile>> {
+    let mut failures = ScanFailures::default();
+    let sources = discover_for_scan(ctx, &mut failures, discover)?;
+    if let Err(error) = failures.finish() {
+        if sources.is_empty() {
+            // No known input is not a successful empty inventory when any
+            // selected root failed. Default discovery also fails above.
+            return Err(error);
+        }
+        tracing::warn!(
+            error = %error,
+            known_sources = sources.len(),
+            "partial Codebuff source inventory; the scan will retry failed roots"
+        );
+    }
+    Ok(sources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,7 +179,9 @@ mod tests {
             ],
             None,
         );
-        let expected = connector.discover_source_files(&ctx).unwrap();
+        // The comparator is the original one-call FAD inventory, not the
+        // public entry point that now uses the same per-root recovery helper.
+        let expected = connector.discover_allowed(&ctx, &exclusions).unwrap();
         let mut failures = ScanFailures::default();
         let found = discover_for_scan(&ctx, &mut failures, |scope| {
             connector.discover_allowed(scope, &exclusions)
@@ -186,5 +214,49 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(error.to_string(), "default discovery sentinel");
         failures.finish().unwrap();
+    }
+
+    #[test]
+    fn gh511_preparse_inventory_retains_known_inputs_without_certifying_an_empty_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = fixture(&temp.path().join("healthy"), "preparsehealthyproof");
+        let healthy = primary.ancestors().nth(4).unwrap().to_path_buf();
+        let denied = temp.path().join("denied/projects");
+        let connector = CodebuffConnector::new();
+        let exclusions = ScanExclusions::from_env();
+        let ctx = ScanContext::with_roots(
+            temp.path().join("data"),
+            vec![ScanRoot::local(denied.clone()), ScanRoot::local(healthy)],
+            None,
+        );
+        let mut discover = |scope: &ScanContext| {
+            if scope.scan_roots[0].path == denied {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "preparse permission sentinel",
+                )
+                .into())
+            } else {
+                connector.discover_allowed(scope, &exclusions)
+            }
+        };
+        // The host can snapshot/mirror the healthy reconstruction unit before
+        // calling scan_with_source_boundaries. Previously its inventory ?
+        // stopped the pipeline before healthy callbacks could be reached.
+        let known = discover_for_inventory(&ctx, &mut discover).unwrap();
+        assert_eq!(known.len(), 2);
+        assert_eq!(known[0].source_path, primary);
+        assert_eq!(known[1].source_path, primary.with_file_name("run-state.json"));
+        let mut failures = ScanFailures::default();
+        let scanned = discover_for_scan(&ctx, &mut failures, &mut discover).unwrap();
+        assert_eq!(known, scanned);
+        let error = failures.finish().unwrap_err();
+        assert!(error.to_string().contains("preparse permission sentinel"));
+        assert!(error.chain().any(|cause| cause.is::<std::io::Error>()));
+
+        let mut failed_only = ctx;
+        failed_only.scan_roots.truncate(1);
+        let error = discover_for_inventory(&failed_only, &mut discover).unwrap_err();
+        assert!(error.to_string().contains("preparse permission sentinel"));
     }
 }
