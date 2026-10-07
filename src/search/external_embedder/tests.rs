@@ -10,6 +10,7 @@ struct Reply {
     status: u16,
     body: String,
     delay: Duration,
+    retry_after: Option<&'static str>,
 }
 
 impl Reply {
@@ -18,6 +19,7 @@ impl Reply {
             status: 200,
             body: value.to_string(),
             delay: Duration::ZERO,
+            retry_after: None,
         }
     }
 }
@@ -89,6 +91,7 @@ impl Drop for Server {
 }
 
 fn serve(mut stream: TcpStream, seen: &Mutex<Vec<Value>>, reply: &impl Fn(usize, &Value) -> Reply) {
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
@@ -127,10 +130,14 @@ fn serve(mut stream: TcpStream, seen: &Mutex<Vec<Value>>, reply: &impl Fn(usize,
     };
     let response = reply(index, &input);
     thread::sleep(response.delay);
+    let retry_after = response
+        .retry_after
+        .map(|value| format!("Retry-After: {value}\r\n"))
+        .unwrap_or_default();
     // Timeout/cancellation tests may have closed the peer already.
     let _ = write!(
         stream,
-        "HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} Test\r\n{retry_after}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         response.status,
         response.body.len(),
         response.body
@@ -323,6 +330,7 @@ fn external_later_failure_returns_no_partial_batch_and_redacts_body() {
                 status: 503,
                 body: "SECRET SESSION TEXT; secret API key".into(),
                 delay: Duration::ZERO,
+                retry_after: None,
             }
         } else {
             Reply::ok(success(input))
@@ -437,6 +445,7 @@ fn external_malformed_json_is_sanitized() {
         status: 200,
         body: "{SECRET USER TEXT".into(),
         delay: Duration::ZERO,
+        retry_after: None,
     });
     let error = ExternalEmbedder::connect(server.config(&[]), Arc::new(|| false))
         .unwrap_err()
@@ -446,3 +455,4 @@ fn external_malformed_json_is_sanitized() {
 }
 
 mod admission;
+mod retries;

@@ -64,6 +64,23 @@ defaults to 64 rows and is limited to 1–128. The serialized request byte budge
 1024–4194304; JSON escaping counts against it. Responses are limited to 64 MiB.
 `CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS` defaults to 30000 and is limited to 1–120000.
 
+For unattended runs, `CASS_EXTERNAL_EMBEDDING_MAX_RETRIES=2` opts into retrying
+HTTP 429, 500, 502, 503 and 504. The default is **0**; the maximum is 5 retries
+after the initial attempt. Only the failed HTTP sub-batch is resent, with the
+same endpoint, model, authorization and inputs. A retry can cause additional
+server execution or billing. Tuning retries does not change vector identity.
+
+All attempts, backoff and response reading for one HTTP sub-batch share its
+original timeout; retries do not multiply the time budget. Backoff starts at
+100 ms and doubles. A valid `Retry-After` (seconds or IMF-fixdate) is a minimum
+wait, never shortened to fit the budget. Invalid, ambiguous or unsupported
+headers, or waits that cannot fit, fail explicitly without another attempt.
+Cancellation is polled during backoff. Transport errors, timeouts, redirects,
+authentication errors and malformed vectors are not retried. Exhaustion
+rejects the complete embedding call, preserving the last durable checkpoint
+and preventing later sub-batches from being sent. Fixed-probe preflight uses
+the same bounded policy and must still pass all output-contract checks.
+
 These HTTP limits do not replace canonical backfill limits. Use
 `--batch-conversations`, `--max-batches`, `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT`
 and `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` to bound admitted work. The existing

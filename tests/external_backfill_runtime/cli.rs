@@ -197,7 +197,14 @@ fn external_cli_policy_builds_without_minilm_and_retains_one_provider() -> Resul
 #[test]
 fn external_cli_canonical_resume_rejects_partial_batches_and_preserves_durable_vectors()
 -> Result<()> {
-    for fault in [PARTIAL, SERVER_FAILURE, BAD_DIMENSION] {
+    for (fault, retries) in [
+        (PARTIAL, 0),
+        (SERVER_FAILURE, 0),
+        (BAD_DIMENSION, 0),
+        (PARTIAL, 2),
+        (SERVER_FAILURE, 2),
+        (BAD_DIMENSION, 2),
+    ] {
         let dir = tempfile::tempdir()?;
         let db = seed(dir.path())?;
         let server = Server::start(384)?;
@@ -224,10 +231,16 @@ fn external_cli_canonical_resume_rejects_partial_batches_and_preserves_durable_v
             .store(5, Ordering::SeqCst);
         server.state.fault.store(fault, Ordering::SeqCst);
         let mut failing = backfill(&server, dir.path(), &db, 10);
-        failing.args(["--embedder", "external"]);
+        failing
+            .args(["--embedder", "external"])
+            .env("CASS_EXTERNAL_EMBEDDING_MAX_RETRIES", retries.to_string());
         let error = run(failing)?;
         assert!(!error.status.success());
-        assert_eq!(corpus(&server).len(), 3);
+        assert_eq!(
+            corpus(&server).len(),
+            3 + if fault == SERVER_FAILURE { retries } else { 0 },
+            "only the one-input transient failure may be retried"
+        );
         assert_eq!(fs::read(&staging)?, before);
         let retained = SemanticManifest::load(dir.path())?
             .unwrap()

@@ -16,6 +16,8 @@ use url::{Host, Url};
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
 
+mod retry;
+
 pub const EXTERNAL_EMBEDDER: &str = "external";
 pub const EXTERNAL_VECTOR_SPACE_REVISION: &str = "external-openai-v1:unit-norm:passages-v2";
 const MAX_DIMENSION: usize = 16_384;
@@ -45,6 +47,7 @@ pub struct ExternalEmbeddingConfig {
     batch_size: usize,
     max_request_bytes: usize,
     timeout: Duration,
+    max_retries: usize,
     api_key: Option<String>,
 }
 
@@ -56,6 +59,7 @@ impl fmt::Debug for ExternalEmbeddingConfig {
             .field("batch_size", &self.batch_size)
             .field("max_request_bytes", &self.max_request_bytes)
             .field("timeout", &self.timeout)
+            .field("max_retries", &self.max_retries)
             .finish_non_exhaustive()
     }
 }
@@ -155,6 +159,12 @@ impl ExternalEmbeddingConfig {
             1,
             120_000,
         )?;
+        let max_retries = number(
+            &lookup("CASS_EXTERNAL_EMBEDDING_MAX_RETRIES").unwrap_or_else(|| "0".into()),
+            "CASS_EXTERNAL_EMBEDDING_MAX_RETRIES",
+            0,
+            5,
+        )?;
         let revision = lookup("CASS_EXTERNAL_EMBEDDING_REVISION").unwrap_or_else(|| "1".into());
         if revision.trim().is_empty()
             || revision.len() > 512
@@ -178,6 +188,7 @@ impl ExternalEmbeddingConfig {
             batch_size,
             max_request_bytes,
             timeout: Duration::from_millis(timeout_ms as u64),
+            max_retries,
             api_key,
         }))
     }
@@ -285,6 +296,8 @@ impl ExternalEmbedder {
         crate::ensure_rustls_crypto_provider();
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // Only this provider may retry; disable implicit protocol retries.
+            .retry(reqwest::retry::never())
             .no_proxy()
             .connect_timeout(config.timeout.min(Duration::from_secs(10)))
             .timeout(config.timeout)
@@ -362,22 +375,7 @@ impl ExternalEmbedder {
     }
 
     fn request(&self, body: Vec<u8>, count: usize) -> EmbedderResult<Vec<Vec<f32>>> {
-        self.check_cancelled()?;
-        let mut request = self
-            .client
-            .post(self.config.endpoint.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-        if let Some(key) = &self.config.api_key {
-            request = request.bearer_auth(key);
-        }
-        let sent = request.send();
-        self.check_cancelled()?;
-        let response = sent.map_err(|error| self.failure(if error.is_timeout() {
-            "external_timeout: request deadline exceeded; checkpoint retained, check server load or timeout configuration"
-        } else {
-            "external_transport: request failed; check server reachability and TLS; checkpoint retained"
-        }))?;
+        let response = self.send_with_retry(body)?;
         if !response.status().is_success() {
             // Never include the response body, URL, headers, or reqwest error:
             // servers/proxies may echo session text and credentials there.

@@ -64,7 +64,7 @@ jobs:
         run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
       - name: External provider and CLI formatting
         if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/search/external_embedder.rs src/search/external_embedder/tests.rs src/search/embedder_registry.rs src/indexer/semantic.rs src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/unchanged.rs src/indexer/semantic/unchanged/cancellation_tests.rs src/search/model_manager.rs src/search/model_manager/external.rs src/search/model_manager/external/tests.rs tests/external_backfill_runtime.rs tests/external_backfill_runtime/cli.rs src/lib.rs src/indexer/mod.rs src/schedule.rs
+        run: rustfmt --edition 2024 --check --config skip_children=true src/search/external_embedder.rs src/search/external_embedder/retry.rs src/search/external_embedder/tests.rs src/search/external_embedder/tests/admission.rs src/search/external_embedder/tests/retries.rs src/search/embedder_registry.rs src/indexer/semantic.rs src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/unchanged.rs src/indexer/semantic/unchanged/cancellation_tests.rs src/search/model_manager.rs src/search/model_manager/external.rs src/search/model_manager/external/tests.rs tests/external_backfill_runtime.rs tests/external_backfill_runtime/cli.rs src/lib.rs src/indexer/mod.rs src/schedule.rs
       - name: Verify validation did not alter the committed sources
         if: always()
         run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
