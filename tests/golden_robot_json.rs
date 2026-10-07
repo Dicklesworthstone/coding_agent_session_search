@@ -472,6 +472,9 @@ fn normalize_live_robot_values(value: &mut Value) {
                     topology.insert("source".to_string(), json!("fallback"));
                     topology.insert("memory_total_bytes".to_string(), Value::Null);
                     topology.insert("memory_available_bytes".to_string(), Value::Null);
+                    // Host RAM and the process's cgroup path differ per runner.
+                    topology.insert("host_memory_total_bytes".to_string(), Value::Null);
+                    topology.insert("memory_limit_source".to_string(), Value::Null);
                 }
                 if let Some(policy) = map
                     .get_mut("reserved_core_policy")
@@ -751,7 +754,9 @@ fn live_value_scrubbing_normalizes_host_topology_without_erasing_its_shape() {
                 "llc_groups": 4,
                 "smt_threads_per_core": 2,
                 "memory_total_bytes": 123,
-                "memory_available_bytes": 45
+                "memory_available_bytes": 45,
+                "host_memory_total_bytes": 678,
+                "memory_limit_source": "cgroup_v2:/user.slice/run-r1.scope"
             },
             "reserved_core_policy": {
                 "reserved_cores": 8,
@@ -784,6 +789,8 @@ fn live_value_scrubbing_normalizes_host_topology_without_erasing_its_shape() {
     assert_eq!(topology_budget["topology"]["source"], "fallback");
     assert!(topology_budget["topology"]["memory_total_bytes"].is_null());
     assert!(topology_budget["topology"]["memory_available_bytes"].is_null());
+    assert!(topology_budget["topology"]["host_memory_total_bytes"].is_null());
+    assert!(topology_budget["topology"]["memory_limit_source"].is_null());
     assert_eq!(topology_budget["fallback_active"], true);
     assert!(topology_budget["reserved_core_policy"].is_object());
     assert!(topology_budget["advisory_budgets"].is_object());

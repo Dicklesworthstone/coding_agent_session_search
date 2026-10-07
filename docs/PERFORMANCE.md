@@ -261,7 +261,7 @@ Indexing and search runtime benchmarks:
 
 1. **Tune cache sizes**: Set `CASS_CACHE_TOTAL_CAP` based on available memory
 2. **Use byte limits**: Set `CASS_CACHE_BYTE_CAP` to prevent unbounded growth
-3. **Monitor memory**: cass does not report its own memory use. `cass status --json` → `topology_budget` shows host memory and the derived cache and in-flight byte budgets; measure process RSS with OS tools (for example `/usr/bin/time -v`)
+3. **Monitor memory**: cass does not report its own memory use. `cass status --json` → `topology_budget.topology` shows the memory cass sizes its budgets from (`memory_total_bytes`, `memory_available_bytes`: host figures clamped to the tightest cgroup limit on the process's chain), the host's own total (`host_memory_total_bytes`), and what set the total (`memory_limit_source`: `host`, or the `cgroup_v2:/…` / `cgroup_v1:/…` level whose limit applies). Under a `systemd-run -p MemoryMax=…` or container limit, check that `memory_limit_source` names that scope; if it says `host` (or another level) although your limit is the tightest one, the limit did not reach the cass process. The derived cache and in-flight byte budgets are in `topology_budget` and `rebuild.pipeline`; measure process RSS with OS tools (for example `/usr/bin/time -v`)
 
 ### Database Performance
 

@@ -98129,8 +98129,10 @@ fn response_schema_topology_budget() -> serde_json::Value {
                     "numa_nodes": { "type": "integer" },
                     "llc_groups": { "type": "integer" },
                     "smt_threads_per_core": { "type": "integer" },
-                    "memory_total_bytes": { "type": ["integer", "null"] },
-                    "memory_available_bytes": { "type": ["integer", "null"] }
+                    "memory_total_bytes": { "type": ["integer", "null"], "description": "Memory budgets are sized from: the host total clamped to the tightest cgroup limit on this process's chain" },
+                    "memory_available_bytes": { "type": ["integer", "null"] },
+                    "host_memory_total_bytes": { "type": ["integer", "null"], "description": "The host's own total before any cgroup limit" },
+                    "memory_limit_source": { "type": ["string", "null"], "description": "What set memory_total_bytes: host, or cgroup_v2:/<path> / cgroup_v1:/<path> for the level whose limit is below the host total" }
                 }
             },
             "reserved_core_policy": {

@@ -748,6 +748,12 @@
             },
             "memory_available_bytes": {
               "type": "integer"
+            },
+            "host_memory_total_bytes": {
+              "type": "integer"
+            },
+            "memory_limit_source": {
+              "type": "string"
             }
           }
         },

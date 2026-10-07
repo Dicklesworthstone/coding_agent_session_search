@@ -61,6 +61,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   - keeps Pi and Oh My Pi compaction summaries, custom messages, shell runs
     and branch provenance (franken_agent_detection #27).
 
+- **`cass status` says whether a memory limit reached cass (#496).**
+  `topology_budget.topology` now reports `host_memory_total_bytes` and
+  `memory_limit_source`, next to the cgroup-clamped `memory_total_bytes`.
+  The source is `host`, or the cgroup level whose limit applies (for
+  example `cgroup_v2:/user.slice/run-r1.scope`). Before this, a run under
+  `systemd-run -p MemoryMax=16G` that landed outside the scope looked the
+  same as one inside it.
+
 ### Fixed
 
 - **Codex sessions compressed to `.jsonl.zst` are indexed (#513).** Codex's

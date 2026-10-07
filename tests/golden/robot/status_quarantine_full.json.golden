@@ -283,7 +283,9 @@
       "llc_groups": 8,
       "smt_threads_per_core": 2,
       "memory_total_bytes": null,
-      "memory_available_bytes": null
+      "memory_available_bytes": null,
+      "host_memory_total_bytes": null,
+      "memory_limit_source": null
     },
     "reserved_core_policy": {
       "reserved_cores": "[LIVE_COUNTER]",

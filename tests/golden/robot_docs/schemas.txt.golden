@@ -3758,9 +3758,11 @@ schemas: (auto-generated from contract)
         - reserved_cores: integer
       - schema_version: string
       - topology: object
+        - host_memory_total_bytes: ?
         - llc_groups: integer
         - logical_cpus: integer
         - memory_available_bytes: ?
+        - memory_limit_source: ?
         - memory_total_bytes: ?
         - numa_nodes: integer
         - physical_cores: integer
@@ -4160,9 +4162,11 @@ schemas: (auto-generated from contract)
         - reserved_cores: integer
       - schema_version: string
       - topology: object
+        - host_memory_total_bytes: ?
         - llc_groups: integer
         - logical_cpus: integer
         - memory_available_bytes: ?
+        - memory_limit_source: ?
         - memory_total_bytes: ?
         - numa_nodes: integer
         - physical_cores: integer
