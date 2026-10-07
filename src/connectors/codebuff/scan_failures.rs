@@ -39,6 +39,28 @@ impl ScanFailures {
     }
 }
 
+// Keep the aggregate private to this adapter. The host borrows the bounded
+// samples rather than reparsing error text or following only Error::source(),
+// which necessarily exposes just the first cause.
+impl super::CodebuffConnector {
+    pub(crate) fn for_each_source_failure(
+        error: &anyhow::Error,
+        mut observe: impl FnMut(&std::path::Path, &anyhow::Error),
+    ) -> bool {
+        let Some(failures) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ScanFailures>())
+            .filter(|failures| !failures.samples.is_empty())
+        else {
+            return false;
+        };
+        for failure in &failures.samples {
+            observe(&failure.path, &failure.error);
+        }
+        true
+    }
+}
+
 impl fmt::Display for ScanFailures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Some(first) = self.samples.first() else {
@@ -232,3 +254,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod diagnostic_tests;

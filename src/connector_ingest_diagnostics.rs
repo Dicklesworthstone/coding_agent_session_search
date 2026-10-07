@@ -726,6 +726,38 @@ impl ConnectorIngestRun {
             }
             return;
         }
+        // Codebuff retains bounded typed failures for independently scanned
+        // inputs. Classify EACH cause at its recorded path, not the first cause
+        // at a fallback root. Never parse paths or copy payloads from Display.
+        if self.provider == "codebuff"
+            && crate::connectors::codebuff::CodebuffConnector::for_each_source_failure(
+                error,
+                |path, cause| {
+                    let mut diagnostic =
+                        classify_path(&self.provider, path, connector_scan_failure_kind(cause));
+                    let state = self
+                        .sources
+                        .entry(path.to_path_buf())
+                        .or_insert(ObservedSource {
+                            disposition: SourceIngestDisposition::Discovered,
+                            malformed: false,
+                        });
+                    // An observation can fail after delivery. Do not erase
+                    // content that this run already observed for that source.
+                    if matches!(
+                        state.disposition,
+                        SourceIngestDisposition::Indexed
+                            | SourceIngestDisposition::PartiallyIndexed
+                    ) {
+                        diagnostic.disposition = SourceIngestDisposition::PartiallyIndexed;
+                    }
+                    state.disposition = diagnostic.disposition;
+                    self.diagnostics.push(diagnostic);
+                },
+            )
+        {
+            return;
+        }
         // GH #511: FAD's top message includes the failing path. Classify the
         // cause, so a project called "busy" cannot turn a parse or permission
         // failure into a retryable database lock.
