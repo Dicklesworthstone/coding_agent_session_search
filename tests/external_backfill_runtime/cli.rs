@@ -571,9 +571,7 @@ fn nightly(server: &Server, dir: &Path, db: &Path) -> Command {
     // fixture settings, not agent-home overrides from the developer's shell.
     let environment: Vec<_> = command
         .get_envs()
-        .filter_map(|(key, value)| {
-            value.map(|value| (key.to_os_string(), value.to_os_string()))
-        })
+        .filter_map(|(key, value)| value.map(|value| (key.to_os_string(), value.to_os_string())))
         .collect();
     command
         .env_clear()
@@ -598,8 +596,8 @@ fn nightly(server: &Server, dir: &Path, db: &Path) -> Command {
 
 #[cfg(unix)]
 #[test]
-fn external_cli_nightly_resumes_quality_across_budget_boundaries_before_starting_fast()
--> Result<()> {
+fn external_cli_nightly_resumes_quality_across_budget_boundaries_before_starting_fast() -> Result<()>
+{
     let dir = tempfile::tempdir()?;
     let db = seed(dir.path())?;
     let server = Server::start(384)?;
@@ -644,13 +642,17 @@ fn external_cli_nightly_resumes_quality_across_budget_boundaries_before_starting
             "fast cannot preempt unfinished quality work"
         );
         if night == 1 {
-            let checkpoint = manifest.checkpoint.context("bounded quality continuation")?;
+            let checkpoint = manifest
+                .checkpoint
+                .context("bounded quality continuation")?;
             assert_eq!(checkpoint.embedder_id, original.embedder_id);
             assert_eq!(checkpoint.tier, TierKind::Quality);
             assert_eq!(checkpoint.docs_embedded, 4);
         } else {
             assert!(manifest.checkpoint.is_none());
-            let artifact = manifest.quality_tier.context("completed external quality")?;
+            let artifact = manifest
+                .quality_tier
+                .context("completed external quality")?;
             assert_eq!(artifact.doc_count, 5);
             assert!(artifact.ready);
         }
@@ -669,19 +671,15 @@ fn external_cli_nightly_resumes_quality_across_budget_boundaries_before_starting
 
 #[cfg(unix)]
 #[test]
-fn external_cli_nightly_refuses_disabled_or_changed_resume_configuration_without_http()
--> Result<()> {
+fn external_cli_nightly_refuses_disabled_or_changed_resume_configuration_without_http() -> Result<()>
+{
     let dir = tempfile::tempdir()?;
     let db = seed(dir.path())?;
     let server = Server::start(384)?;
     let mut first = backfill(&server, dir.path(), &db, 1);
     first.args(["--embedder", "external"]);
     let checkpoint = success(run(first)?)?;
-    let staged = PathBuf::from(
-        checkpoint["index_path"]
-            .as_str()
-            .context("staging path")?,
-    );
+    let staged = PathBuf::from(checkpoint["index_path"].as_str().context("staging path")?);
     let manifest_before = fs::read(SemanticManifest::path(dir.path()))?;
     let vectors_before = fs::read(&staged)?;
     server.take_inputs();

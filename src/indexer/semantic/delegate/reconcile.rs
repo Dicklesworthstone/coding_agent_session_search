@@ -34,8 +34,7 @@ pub(super) fn run(
             &destination,
             current_doc_ids,
             &mut check_cancelled,
-        )?
-        {
+        )? {
             tracing::info!(
                 tier = tier.as_str(),
                 retained_docs = source.record_count(),
@@ -154,7 +153,9 @@ pub(super) fn run(
                 continue;
             }
             let id = source.doc_id_at(row)?;
-            if !current_doc_ids.contains(id) || replacements.contains_key(id) || wal_ids.contains(id)
+            if !current_doc_ids.contains(id)
+                || replacements.contains_key(id)
+                || wal_ids.contains(id)
             {
                 continue;
             }

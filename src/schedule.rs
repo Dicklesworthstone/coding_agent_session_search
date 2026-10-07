@@ -1464,8 +1464,10 @@ fn scheduled_quality_identity(
     {
         "hash"
     } else {
-        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&policy.quality_tier_embedder)
-            .unwrap_or("minilm")
+        crate::search::fastembed_embedder::FastEmbedder::canonical_name(
+            &policy.quality_tier_embedder,
+        )
+        .unwrap_or("minilm")
     };
     EmbedderRegistry::new(data_dir)
         .get(name)
@@ -1948,21 +1950,23 @@ mod tests {
         id: &str,
     ) {
         use crate::search::semantic_manifest::{BuildCheckpoint, SemanticManifest};
-        let mut manifest = SemanticManifest::default();
-        manifest.checkpoint = Some(BuildCheckpoint {
-            tier,
-            embedder_id: id.into(),
-            last_offset: 1,
-            docs_embedded: 1,
-            conversations_processed: 1,
-            total_conversations: 3,
-            db_fingerprint: "previous-canonical-snapshot".into(),
-            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
-            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
-            saved_at_ms: 1,
-            last_message_id: Some(1),
-            cursor_exhausted: false,
-        });
+        let mut manifest = SemanticManifest {
+            checkpoint: Some(BuildCheckpoint {
+                tier,
+                embedder_id: id.into(),
+                last_offset: 1,
+                docs_embedded: 1,
+                conversations_processed: 1,
+                total_conversations: 3,
+                db_fingerprint: "previous-canonical-snapshot".into(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                saved_at_ms: 1,
+                last_message_id: Some(1),
+                cursor_exhausted: false,
+            }),
+            ..SemanticManifest::default()
+        };
         manifest.save(data_dir).unwrap();
     }
 
@@ -2021,7 +2025,11 @@ mod tests {
         checkpoint_fixture(dir.path(), TierKind::Quality, "original-external-identity");
         let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
         assert!(nightly_backfill_order(dir.path(), false, || panic!("missing provider")).is_err());
-        for id in ["minilm-384", "fnv1a-384", "another-model-or-endpoint-identity"] {
+        for id in [
+            "minilm-384",
+            "fnv1a-384",
+            "another-model-or-endpoint-identity",
+        ] {
             assert!(nightly_backfill_order(dir.path(), true, || Ok(id.into())).is_err());
         }
         assert!(

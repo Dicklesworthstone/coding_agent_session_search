@@ -79,7 +79,10 @@ fn index(
         command.env("CASS_EXCLUDE_PATHS", excluded);
     }
     let output = command
-        .env("CASS_TRACE_FILTER", "warn,coding_agent_search::indexer=debug")
+        .env(
+            "CASS_TRACE_FILTER",
+            "warn,coding_agent_search::indexer=debug",
+        )
         .arg("--trace-file")
         .arg(&trace)
         .args(["index", "--json", "--no-progress-events"])
@@ -90,7 +93,10 @@ fn index(
         .clone();
     let report: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(report["success"], true, "{report}");
-    assert_eq!(report["indexing_stats"]["scan_had_errors"], false, "{report}");
+    assert_eq!(
+        report["indexing_stats"]["scan_had_errors"], false,
+        "{report}"
+    );
     let log = fs::read_to_string(trace).unwrap();
     let mut skipped = 0;
     let mut parsed = 0;
@@ -215,7 +221,8 @@ fn codebuff_reuses_admitted_sources_without_freezing_sidecars_or_excluded_histor
         // Same old mtime, unchanged primary, changed sidecar length. A
         // whole-source exclusion promise is NOT a self-containment promise.
         let state = public.with_file_name("run-state.json");
-        let changed_state = br#"{"sessionState":{"fileContext":{"projectRoot":"/synthetic/changed-workspace"}}}"#;
+        let changed_state =
+            br#"{"sessionState":{"fileContext":{"projectRoot":"/synthetic/changed-workspace"}}}"#;
         write_old(&state, changed_state);
         index(home, mode, "metadata-change", Some(&excluded), 1, 1);
         assert_eq!(archive(home), original_ids);

@@ -352,8 +352,8 @@ impl ObservedSemanticFile {
 mod full_rebuild_tests {
     use super::*;
 
-    mod canonical;
     mod cancellation;
+    mod canonical;
 
     fn embedded(indexer: &SemanticIndexer) -> Result<Vec<EmbeddedMessage>> {
         indexer.embed_messages(&[

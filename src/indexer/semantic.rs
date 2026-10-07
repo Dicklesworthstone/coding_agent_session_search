@@ -96,7 +96,10 @@ impl SemanticIndexer {
         manifest: &SemanticManifest,
         tier: TierKind,
     ) -> Result<()> {
-        if matches!(std::env::var(SCHEDULE_PRESERVE_CHECKPOINT).as_deref(), Ok("1")) {
+        if matches!(
+            std::env::var(SCHEDULE_PRESERVE_CHECKPOINT).as_deref(),
+            Ok("1")
+        ) {
             ensure_scheduled_checkpoint_owner(manifest, tier, self.inner.embedder_id())?;
         }
         Ok(())
@@ -284,9 +287,7 @@ mod external_diagnostic_tests {
     fn scheduled_guard_requires_both_the_checkpoint_tier_and_producer() {
         use crate::search::semantic_manifest::BuildCheckpoint;
         let mut manifest = SemanticManifest::default();
-        assert!(
-            ensure_scheduled_checkpoint_owner(&manifest, TierKind::Fast, "fnv1a-384").is_ok()
-        );
+        assert!(ensure_scheduled_checkpoint_owner(&manifest, TierKind::Fast, "fnv1a-384").is_ok());
         manifest.checkpoint = Some(BuildCheckpoint {
             tier: TierKind::Quality,
             embedder_id: "original-producer".into(),

@@ -3129,6 +3129,11 @@ impl SemanticIndexer {
     /// back successfully. The live FSVI and WAL are copied into a private
     /// same-filesystem staging directory before compaction, so reconciliation
     /// never mutates the published artifact before the atomic candidate swap.
+    ///
+    /// Test-only since f6ae407b: production reconciles through
+    /// `delegate::reconcile::run`. The tests here still drive the shared
+    /// `reconcile_index_at_paths` path through this wrapper.
+    #[cfg(test)]
     pub fn reconcile_index_with_canonical_documents(
         &self,
         embedded_messages: Vec<EmbeddedMessage>,

@@ -115,8 +115,10 @@ fn external_query_refuses_foreign_same_dimension_and_wrong_revision_headers() {
         .to_doc_id_string();
         writer.write_record(&doc_id, &vector).unwrap();
         writer.finish().unwrap();
-        let mut manifest = SemanticManifest::default();
-        manifest.quality_tier = Some(publication(dir.path(), &config));
+        let mut manifest = SemanticManifest {
+            quality_tier: Some(publication(dir.path(), &config)),
+            ..SemanticManifest::default()
+        };
         manifest.save(dir.path()).unwrap();
         let result = load_with_config(
             dir.path(),
@@ -146,22 +148,24 @@ fn external_query_pending_checkpoint_cannot_be_certified_by_ready_quality_record
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let config = fixture_config(&listener);
-    let mut manifest = SemanticManifest::default();
-    manifest.quality_tier = Some(publication(dir.path(), &config));
-    manifest.checkpoint = Some(BuildCheckpoint {
-        tier: TierKind::Quality,
-        embedder_id: config.identity(),
-        last_offset: 1,
-        docs_embedded: 1,
-        conversations_processed: 1,
-        total_conversations: 2,
-        db_fingerprint: "fixture-not-a-real-archive".into(),
-        schema_version: SEMANTIC_SCHEMA_VERSION,
-        chunking_version: CHUNKING_STRATEGY_VERSION,
-        saved_at_ms: 3,
-        last_message_id: Some(1),
-        cursor_exhausted: false,
-    });
+    let mut manifest = SemanticManifest {
+        quality_tier: Some(publication(dir.path(), &config)),
+        checkpoint: Some(BuildCheckpoint {
+            tier: TierKind::Quality,
+            embedder_id: config.identity(),
+            last_offset: 1,
+            docs_embedded: 1,
+            conversations_processed: 1,
+            total_conversations: 2,
+            db_fingerprint: "fixture-not-a-real-archive".into(),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
+            saved_at_ms: 3,
+            last_message_id: Some(1),
+            cursor_exhausted: false,
+        }),
+        ..SemanticManifest::default()
+    };
     manifest.save(dir.path()).unwrap();
     let result = load_with_config(
         dir.path(),
@@ -209,8 +213,10 @@ fn external_publication_admits_the_cli_producer_identity_without_http() {
     listener.set_nonblocking(true).unwrap();
     let config = fixture_config(&listener);
     let record = publication(dir.path(), &config);
-    let mut manifest = SemanticManifest::default();
-    manifest.quality_tier = Some(record.clone());
+    let mut manifest = SemanticManifest {
+        quality_tier: Some(record.clone()),
+        ..SemanticManifest::default()
+    };
     manifest.save(dir.path()).unwrap();
     let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
 
@@ -256,8 +262,10 @@ fn external_query_refuses_unbound_publication_revisions_before_http() {
     ] {
         let mut record = publication(dir.path(), &config);
         record.model_revision = revision.clone();
-        let mut manifest = SemanticManifest::default();
-        manifest.quality_tier = Some(record);
+        let mut manifest = SemanticManifest {
+            quality_tier: Some(record),
+            ..SemanticManifest::default()
+        };
         manifest.save(dir.path()).unwrap();
         let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
         let result = load_with_config(

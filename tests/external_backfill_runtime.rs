@@ -772,7 +772,11 @@ fn fake_endpoint_reads_fragmented_requests_on_inherited_nonblocking_sockets() ->
         write!(client, "POST /v1/embeddings HTTP/1.1\r\nContent-Length: ")?;
         client.flush()?;
         thread::sleep(Duration::from_millis(30));
-        write!(client, "{}\r\nContent-Type: application/json\r\n\r\n", body.len())?;
+        write!(
+            client,
+            "{}\r\nContent-Type: application/json\r\n\r\n",
+            body.len()
+        )?;
         let split = body.len() / 2;
         client.write_all(&body[..split])?;
         client.flush()?;
@@ -792,7 +796,10 @@ fn fake_endpoint_reads_fragmented_requests_on_inherited_nonblocking_sockets() ->
     assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(
         server.take_inputs(),
-        vec![vec!["delayed first".to_owned(), "delayed second".to_owned()]]
+        vec![vec![
+            "delayed first".to_owned(),
+            "delayed second".to_owned()
+        ]]
     );
     Ok(())
 }

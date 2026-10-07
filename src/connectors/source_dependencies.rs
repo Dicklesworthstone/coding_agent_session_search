@@ -183,7 +183,10 @@ mod tests {
                 can_reuse_with_path_exclusions(registration.name, registration.source_slug),
                 registration.whole_source_exclusions,
             );
-            if !matches!(registration.source_slug, "claude_code" | "codex" | "codebuff") {
+            if !matches!(
+                registration.source_slug,
+                "claude_code" | "codex" | "codebuff"
+            ) {
                 assert!(!registration.whole_source_exclusions);
             }
         }

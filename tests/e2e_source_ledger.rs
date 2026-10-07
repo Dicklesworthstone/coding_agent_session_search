@@ -306,7 +306,6 @@ fn gh512_persisted_legacy_reuse_and_primary_append_reach_search_in_both_modes() 
     }
 }
 
-
 #[test]
 fn gh512_whole_source_exclusions_reuse_allowed_files_without_losing_deferred_sources() {
     let reusable = env!("CASS_SOURCE_INGEST_REUSE") == "true";
@@ -324,14 +323,7 @@ fn gh512_whole_source_exclusions_reuse_allowed_files_without_losing_deferred_sou
             let excluded = transcript(&directory, provider, 1);
             let excluded_bytes = fs::read(&excluded).unwrap();
             let excluded_mtime = fs::metadata(&excluded).unwrap().modified().unwrap();
-            index_with_exclusion(
-                home,
-                streaming,
-                "excluded-initial",
-                0,
-                1,
-                Some(&excluded),
-            );
+            index_with_exclusion(home, streaming, "excluded-initial", 0, 1, Some(&excluded));
             let initial = archive(home, 1, false);
             let initial_ledger = source_ledger(home);
             assert_eq!(

@@ -39,8 +39,8 @@ fn configured_max_bytes() -> Result<usize> {
     match dotenvy::var(MAX_BYTES_ENV) {
         Ok(value) => {
             let bytes = value.parse::<usize>().ok().filter(|bytes| *bytes > 0);
-            let bytes = bytes
-                .with_context(|| format!("{MAX_BYTES_ENV} must be a positive byte count"))?;
+            let bytes =
+                bytes.with_context(|| format!("{MAX_BYTES_ENV} must be a positive byte count"))?;
             Ok(bytes.min(DEFAULT_MAX_BYTES))
         }
         Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(DEFAULT_MAX_BYTES),

@@ -181,7 +181,10 @@ fn every_rebuild_cancellation_boundary_preserves_the_selected_generation() -> Re
                 Ok(())
             },
         )?);
-        assert!(probe_count > 12, "must cover input, finish, validation, install");
+        assert!(
+            probe_count > 12,
+            "must cover input, finish, validation, install"
+        );
         for fail_at in 1..=probe_count {
             let root = tempfile::tempdir()?;
             let (path, before) = installed_fixture(&indexer, root.path(), existing)?;
@@ -259,7 +262,11 @@ fn duplicate_full_rebuild_identities_are_rejected_without_replacing_data() -> Re
             // Non-adjacent input must be caught after native physical sorting.
             rows.push(repeated);
             let error = indexer.build_and_save_index(rows, root.path()).unwrap_err();
-            assert!(error.to_string().contains("duplicate semantic document identity"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate semantic document identity")
+            );
             assert_eq!(file_bytes(&path)?, before);
             assert!(!wal_path_for(&path).exists());
         }

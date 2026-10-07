@@ -60,7 +60,11 @@ fn cold_view(path: &Path) -> Result<BTreeMap<String, Vec<u32>>> {
         if !index.is_deleted(row) {
             values.insert(
                 index.doc_id_at(row)?.to_owned(),
-                index.vector_at_f32(row)?.into_iter().map(f32::to_bits).collect(),
+                index
+                    .vector_at_f32(row)?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect(),
             );
         }
     }
@@ -127,7 +131,11 @@ fn repeated_input_retains_only_one_vector_per_identity() -> Result<()> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let row = rows(&indexer, 1, 1)?.remove(0);
     let one = Prepared::collect(
-        [row.clone()], 384, Quantization::F16, DEFAULT_MAX_BYTES, || Ok(()),
+        [row.clone()],
+        384,
+        Quantization::F16,
+        DEFAULT_MAX_BYTES,
+        || Ok(()),
     )?;
     let limit = one.owned_bytes;
     let prepared = Prepared::collect(
@@ -179,14 +187,25 @@ fn budget_refusal_preserves_the_entire_live_batch_and_retry_is_complete() -> Res
     let input = rows(&indexer, 200, 3)?;
     let before = bytes(&path)?;
     let limit = Prepared::collect(
-        [input[0].clone()], 384, Quantization::F16, DEFAULT_MAX_BYTES, || Ok(()),
-    )?.owned_bytes;
+        [input[0].clone()],
+        384,
+        Quantization::F16,
+        DEFAULT_MAX_BYTES,
+        || Ok(()),
+    )?
+    .owned_bytes;
     let error = run_with_limit(&indexer, input.clone(), root.path(), limit, || Ok(())).unwrap_err();
     assert!(matches!(error.downcast_ref::<SearchError>(),
         Some(SearchError::InvalidConfig { field, .. }) if field == "semantic_append.max_bytes"));
     assert_eq!(bytes(&path)?, before);
     assert_eq!(
-        run_with_limit(&indexer, input.clone(), root.path(), DEFAULT_MAX_BYTES, || Ok(()))?,
+        run_with_limit(
+            &indexer,
+            input.clone(),
+            root.path(),
+            DEFAULT_MAX_BYTES,
+            || Ok(())
+        )?,
         3,
     );
     let actual = cold_view(&path)?;
@@ -248,7 +267,10 @@ fn f32_storage_does_not_inherit_f16_range_or_signal_limits() -> Result<()> {
     for row in input {
         assert_eq!(
             actual[&id(&row)],
-            row.embedding.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            row.embedding
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
         );
     }
     Ok(())
@@ -275,13 +297,19 @@ fn public_append_matches_native_atomic_batch_after_restart() -> Result<()> {
         input.push(different_scope);
         let mut native = VectorIndex::open_writer(&oracle_path)?;
         native.append_batch(
-            &input.iter().map(|row| (id(row), row.embedding.clone())).collect::<Vec<_>>(),
+            &input
+                .iter()
+                .map(|row| (id(row), row.embedding.clone()))
+                .collect::<Vec<_>>(),
         )?;
         if native.needs_compaction() {
             native.compact()?;
         }
         drop(native);
-        assert_eq!(indexer.append_to_index(input.clone(), root.path())?, input.len());
+        assert_eq!(
+            indexer.append_to_index(input.clone(), root.path())?,
+            input.len()
+        );
         assert_eq!(cold_view(&path)?, cold_view(&oracle_path)?);
     }
     Ok(())
@@ -342,7 +370,11 @@ fn conflicting_shared_owner_prevents_commit_without_a_prefix() -> Result<()> {
     let (root, indexer, path) = seeded_source(Quantization::F16)?;
     let retained = VectorIndex::open_read_only(&path)?;
     let before = bytes(&path)?;
-    assert!(indexer.append_to_index(rows(&indexer, 200, 3)?, root.path()).is_err());
+    assert!(
+        indexer
+            .append_to_index(rows(&indexer, 200, 3)?, root.path())
+            .is_err()
+    );
     assert_eq!(bytes(&path)?, before);
     drop(retained);
     Ok(())
@@ -354,12 +386,13 @@ fn a_foreign_source_is_refused_before_consuming_the_input() -> Result<()> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let path = vector_index_path(root.path(), indexer.embedder_id());
     fs::create_dir_all(path.parent().unwrap())?;
-    VectorIndex::create_with_revision(
-        &path, "fnv1a-384", "foreign", 384, Quantization::F16,
-    )?.finish()?;
+    VectorIndex::create_with_revision(&path, "fnv1a-384", "foreign", 384, Quantization::F16)?
+        .finish()?;
     let consumed = Cell::new(0);
     let before = bytes(&path)?;
-    let input = rows(&indexer, 200, 2)?.into_iter().inspect(|_| consumed.set(consumed.get() + 1));
+    let input = rows(&indexer, 200, 2)?
+        .into_iter()
+        .inspect(|_| consumed.set(consumed.get() + 1));
     assert!(indexer.append_to_index(input, root.path()).is_err());
     assert_eq!(consumed.get(), 0);
     assert_eq!(bytes(&path)?, before);

@@ -63,7 +63,10 @@ fn transient_statuses_retry_only_the_failed_sub_batch_and_keep_order() {
         )
         .unwrap();
         let texts = ["a", "b", "c", "d", "e", "f", "g"];
-        assert_eq!(provider.embed_batch_sync(&texts).unwrap(), texts.map(vector));
+        assert_eq!(
+            provider.embed_batch_sync(&texts).unwrap(),
+            texts.map(vector)
+        );
         let requests = server.seen.lock().unwrap();
         assert_eq!(requests.len(), 7);
         assert_eq!(requests[2]["input"], json!(["a", "b", "c"]));
@@ -101,7 +104,11 @@ fn exhausted_retries_return_no_partial_vectors_or_later_requests() {
     assert!(!error.contains(&server.url));
     let requests = server.seen.lock().unwrap();
     assert_eq!(requests.len(), 6);
-    assert!(requests.iter().all(|request| request["input"] != json!(["g"])));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["input"] != json!(["g"]))
+    );
 }
 
 #[test]
@@ -318,6 +325,9 @@ fn preflight_retry_does_not_bypass_repeatability_validation() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("external_preflight_repeatability"), "{error}");
+    assert!(
+        error.contains("external_preflight_repeatability"),
+        "{error}"
+    );
     assert_eq!(server.count(), 3);
 }

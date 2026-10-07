@@ -93,7 +93,10 @@ fn initial_canonical_publication_requires_complete_valid_coverage() -> Result<()
     let indexer = SemanticIndexer::new("hash", None)?;
     let rows = embedded(&indexer)?;
     assert!(reconcile(&indexer, &root, rows[..1].to_vec(), &rows).is_err());
-    assert!(!root.exists(), "missing coverage must fail before scratch I/O");
+    assert!(
+        !root.exists(),
+        "missing coverage must fail before scratch I/O"
+    );
     let mut invalid = rows.clone();
     invalid[1].embedding[0] = f32::NAN;
     assert!(reconcile(&indexer, &root, invalid, &rows).is_err());
@@ -101,7 +104,11 @@ fn initial_canonical_publication_requires_complete_valid_coverage() -> Result<()
     assert!(
         indexer
             .reconcile_index_with_canonical_documents(
-                rows.clone(), &root, TierKind::Fast, "", &ids(&rows),
+                rows.clone(),
+                &root,
+                TierKind::Fast,
+                "",
+                &ids(&rows),
             )
             .is_err()
     );
@@ -115,7 +122,10 @@ fn initial_canonical_publication_requires_complete_valid_coverage() -> Result<()
     assert_eq!(actual.path(), path);
     assert_eq!(VectorIndex::peek_compaction_gen(&path)?, 1);
     drop(actual);
-    assert_eq!(bit_map(&VectorIndex::open_read_only(&path)?)?, bit_map(&oracle)?);
+    assert_eq!(
+        bit_map(&VectorIndex::open_read_only(&path)?)?,
+        bit_map(&oracle)?
+    );
     Ok(())
 }
 
@@ -144,7 +154,13 @@ fn no_wal_full_replacement_advances_generation_and_rejects_a_delayed_old_log() -
         let indexer = SemanticIndexer::new("hash", None)?;
         let original = embedded(&indexer)?;
         let path = vector_index_path(temp.path(), indexer.embedder_id());
-        write_source(&path, &original, Quantization::F16, generation, HASH_VECTOR_SPACE_REVISION)?;
+        write_source(
+            &path,
+            &original,
+            Quantization::F16,
+            generation,
+            HASH_VECTOR_SPACE_REVISION,
+        )?;
         // Serialize a genuine old-generation WAL on an independent sibling.
         // It is deliberately absent at the destination until AFTER publication.
         let producer = temp.path().join("old-log-producer.fsvi");
@@ -161,15 +177,26 @@ fn no_wal_full_replacement_advances_generation_and_rejects_a_delayed_old_log() -
         let oracle_root = tempfile::tempdir()?;
         let oracle = indexer.build_and_save_index(replacements.clone(), oracle_root.path())?;
         let actual = reconcile(&indexer, temp.path(), replacements.clone(), &replacements)?;
-        assert_eq!(VectorIndex::peek_compaction_gen(&path)?, next_generation(generation));
+        assert_eq!(
+            VectorIndex::peek_compaction_gen(&path)?,
+            next_generation(generation)
+        );
         assert_eq!(bit_map(&actual)?, bit_map(&oracle)?);
         assert_eq!(bit_map(&retained)?, original_bits);
         drop(actual);
         fs::write(wal_path_for(&path), &delayed_log)?;
         let reopened = VectorIndex::open_read_only(&path)?;
-        assert_eq!(reopened.wal_record_count(), 0, "old WAL cannot resurrect deleted rows");
+        assert_eq!(
+            reopened.wal_record_count(),
+            0,
+            "old WAL cannot resurrect deleted rows"
+        );
         assert_eq!(bit_map(&reopened)?, bit_map(&oracle)?);
-        assert_eq!(fs::read(wal_path_for(&path))?, delayed_log, "reader must not clean fixtures");
+        assert_eq!(
+            fs::read(wal_path_for(&path))?,
+            delayed_log,
+            "reader must not clean fixtures"
+        );
     }
     Ok(())
 }
@@ -181,7 +208,13 @@ fn no_wal_delta_preserves_f32_bits_and_old_readers_while_retiring_tombstones() -
     let mut original = embedded(&indexer)?;
     original[0].embedding[0] = 0.123_456_79;
     let path = vector_index_path(temp.path(), indexer.embedder_id());
-    write_source(&path, &original, Quantization::F32, 41, HASH_VECTOR_SPACE_REVISION)?;
+    write_source(
+        &path,
+        &original,
+        Quantization::F32,
+        41,
+        HASH_VECTOR_SPACE_REVISION,
+    )?;
     let mut writer = VectorIndex::open_writer(&path)?;
     assert!(writer.soft_delete(&id(&original[2]))?);
     drop(writer);
@@ -195,9 +228,18 @@ fn no_wal_delta_preserves_f32_bits_and_old_readers_while_retiring_tombstones() -
     assert_eq!(actual.quantization(), Quantization::F32);
     assert_eq!(actual.tombstone_count(), 0);
     assert_eq!(VectorIndex::peek_compaction_gen(&path)?, 42);
-    let expected_bits = expected.iter().map(|row| {
-        (id(row), row.embedding.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
-    }).collect::<BTreeMap<_, _>>();
+    let expected_bits = expected
+        .iter()
+        .map(|row| {
+            (
+                id(row),
+                row.embedding
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(bit_map(&actual)?, expected_bits);
     assert_eq!(retained.tombstone_count(), 1);
     assert_eq!(bit_map(&retained)?, old_bits);
@@ -210,7 +252,13 @@ fn no_wal_partial_reuse_cannot_invent_missing_or_tombstoned_vectors() -> Result<
     let indexer = SemanticIndexer::new("hash", None)?;
     let original = embedded(&indexer)?;
     let path = vector_index_path(temp.path(), indexer.embedder_id());
-    write_source(&path, &original, Quantization::F16, 19, HASH_VECTOR_SPACE_REVISION)?;
+    write_source(
+        &path,
+        &original,
+        Quantization::F16,
+        19,
+        HASH_VECTOR_SPACE_REVISION,
+    )?;
     let mut writer = VectorIndex::open_writer(&path)?;
     writer.soft_delete(&id(&original[2]))?;
     drop(writer);
@@ -232,7 +280,13 @@ fn no_wal_complete_replacement_respects_live_writer_ownership() -> Result<()> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let original = embedded(&indexer)?;
     let path = vector_index_path(temp.path(), indexer.embedder_id());
-    write_source(&path, &original, Quantization::F16, 7, HASH_VECTOR_SPACE_REVISION)?;
+    write_source(
+        &path,
+        &original,
+        Quantization::F16,
+        7,
+        HASH_VECTOR_SPACE_REVISION,
+    )?;
     let writer = VectorIndex::open_writer(&path)?;
     let before = fs::read(&path)?;
     let replacements = vec![extra(&indexer, 40)?];
@@ -254,12 +308,20 @@ fn no_wal_replacement_rejects_bad_input_and_f16_signal_loss_before_install() -> 
     let indexer = SemanticIndexer::new("hash", None)?;
     let original = embedded(&indexer)?;
     let path = vector_index_path(temp.path(), indexer.embedder_id());
-    write_source(&path, &original, Quantization::F16, 19, HASH_VECTOR_SPACE_REVISION)?;
+    write_source(
+        &path,
+        &original,
+        Quantization::F16,
+        19,
+        HASH_VECTOR_SPACE_REVISION,
+    )?;
     let before = fs::read(&path)?;
     for failure in 0..7 {
         let mut replacement = original.clone();
         match failure {
-            0 => { replacement[1].embedding.pop(); }
+            0 => {
+                replacement[1].embedding.pop();
+            }
             1 => replacement[1].embedding[0] = f32::NAN,
             2 => replacement[1].embedding[0] = f32::INFINITY,
             3 => replacement[1].embedding.fill(0.0),
@@ -270,7 +332,10 @@ fn no_wal_replacement_rejects_bad_input_and_f16_signal_loss_before_install() -> 
         let error = reconcile(&indexer, temp.path(), replacement, &original)
             .expect_err("rejected input or stored representation must not replace the source");
         if failure == 4 || failure == 5 {
-            assert!(error.to_string().contains("unusable persisted"), "{error:#}");
+            assert!(
+                error.to_string().contains("unusable persisted"),
+                "{error:#}"
+            );
         }
         assert_eq!(fs::read(&path)?, before, "failure {failure}");
         assert!(!wal_path_for(&path).exists());
@@ -285,19 +350,38 @@ fn no_wal_duplicate_source_requires_replacement_of_the_ambiguous_identity() -> R
     let original = embedded(&indexer)?;
     let path = vector_index_path(temp.path(), indexer.embedder_id());
     let mut duplicate = original[0].clone();
-    for value in &mut duplicate.embedding { *value = -*value; }
-    write_source(&path, &[original[0].clone(), duplicate, original[1].clone()],
-        Quantization::F32, 11, HASH_VECTOR_SPACE_REVISION)?;
+    for value in &mut duplicate.embedding {
+        *value = -*value;
+    }
+    write_source(
+        &path,
+        &[original[0].clone(), duplicate, original[1].clone()],
+        Quantization::F32,
+        11,
+        HASH_VECTOR_SPACE_REVISION,
+    )?;
     let before = fs::read(&path)?;
     let current = &original[..2];
     let error = reconcile(&indexer, temp.path(), vec![original[1].clone()], current)
         .expect_err("duplicate retained identities cannot be resolved by arbitrary row order");
-    assert!(error.to_string().contains("duplicate current document"), "{error:#}");
+    assert!(
+        error.to_string().contains("duplicate current document"),
+        "{error:#}"
+    );
     assert_eq!(fs::read(&path)?, before);
     let actual = reconcile(&indexer, temp.path(), vec![original[0].clone()], current)?;
-    let expected = current.iter().map(|row| {
-        (id(row), row.embedding.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
-    }).collect::<BTreeMap<_, _>>();
+    let expected = current
+        .iter()
+        .map(|row| {
+            (
+                id(row),
+                row.embedding
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(bit_map(&actual)?, expected);
     Ok(())
 }
@@ -308,11 +392,20 @@ fn no_wal_foreign_space_requires_complete_replacement_and_a_successor() -> Resul
     let indexer = SemanticIndexer::new("hash", None)?;
     let original = embedded(&indexer)?;
     let path = vector_index_path(temp.path(), indexer.embedder_id());
-    write_source(&path, &original, Quantization::F32, 73, "foreign-input-contract")?;
+    write_source(
+        &path,
+        &original,
+        Quantization::F32,
+        73,
+        "foreign-input-contract",
+    )?;
     let before = fs::read(&path)?;
     let error = reconcile(&indexer, temp.path(), original[..1].to_vec(), &original)
         .expect_err("same dimensions do not authorize partial foreign-space reuse");
-    assert!(error.to_string().contains("incompatible vector space"), "{error:#}");
+    assert!(
+        error.to_string().contains("incompatible vector space"),
+        "{error:#}"
+    );
     assert_eq!(fs::read(&path)?, before);
     let actual = reconcile(&indexer, temp.path(), original.clone(), &original)?;
     assert_eq!(actual.embedder_revision(), HASH_VECTOR_SPACE_REVISION);
@@ -326,7 +419,13 @@ fn initial_canonical_publication_preserves_an_orphaned_acknowledged_wal() -> Res
     let indexer = SemanticIndexer::new("hash", None)?;
     let original = embedded(&indexer)?;
     let producer = temp.path().join("wal-owner.fsvi");
-    write_source(&producer, &original, Quantization::F16, 1, HASH_VECTOR_SPACE_REVISION)?;
+    write_source(
+        &producer,
+        &original,
+        Quantization::F16,
+        1,
+        HASH_VECTOR_SPACE_REVISION,
+    )?;
     let mut writer = VectorIndex::open_writer(&producer)?;
     let pending = extra(&indexer, 40)?;
     writer.append_batch(&[(id(&pending), pending.embedding)])?;
@@ -360,7 +459,13 @@ fn no_wal_differential_deltas_match_independent_quantized_builds() -> Result<()>
         for round in 0u64..24 {
             let temp = tempfile::tempdir()?;
             let path = vector_index_path(temp.path(), indexer.embedder_id());
-            write_source(&path, &original, quantization, 37, HASH_VECTOR_SPACE_REVISION)?;
+            write_source(
+                &path,
+                &original,
+                quantization,
+                37,
+                HASH_VECTOR_SPACE_REVISION,
+            )?;
             let retained = VectorIndex::open_read_only(&path)?;
             let before = bit_map(&retained)?;
             let mut replacements = Vec::new();
@@ -388,12 +493,22 @@ fn no_wal_differential_deltas_match_independent_quantized_builds() -> Result<()>
             replacements.push(added.clone());
             current.push(added);
             let oracle_path = temp.path().join("independent.fsvi");
-            write_source(&oracle_path, &current, quantization, 38, HASH_VECTOR_SPACE_REVISION)?;
+            write_source(
+                &oracle_path,
+                &current,
+                quantization,
+                38,
+                HASH_VECTOR_SPACE_REVISION,
+            )?;
             let oracle = VectorIndex::open_read_only(&oracle_path)?;
             let actual = reconcile(&indexer, temp.path(), replacements, &current)?;
             assert_eq!(actual.quantization(), quantization);
             assert_eq!(actual.tombstone_count(), 0);
-            assert_eq!(bit_map(&actual)?, bit_map(&oracle)?, "{quantization:?}, round {round}");
+            assert_eq!(
+                bit_map(&actual)?,
+                bit_map(&oracle)?,
+                "{quantization:?}, round {round}"
+            );
             assert_eq!(bit_map(&retained)?, before);
             assert_eq!(VectorIndex::peek_compaction_gen(&path)?, 38);
         }

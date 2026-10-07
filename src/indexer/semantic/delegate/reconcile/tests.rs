@@ -103,7 +103,10 @@ impl Fixture {
                 (new.clone(), vec![new[0].clone(), pending, new[1].clone()])
             }
             4 => {
-                fs::write(path.with_extension("fsvi.fec"), b"untouched recovery fixture")?;
+                fs::write(
+                    path.with_extension("fsvi.fec"),
+                    b"untouched recovery fixture",
+                )?;
                 (Vec::new(), original)
             }
             5 => (Vec::new(), Vec::new()),
@@ -189,15 +192,16 @@ fn every_canonical_cancellation_boundary_preserves_main_wal_and_readers() -> Res
                 None
             };
             let mut observed = 0usize;
-            let error = fixture.run(&indexer, || {
-                observed += 1;
-                if observed == fail_at {
-                    Err(interrupted())
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err();
+            let error = fixture
+                .run(&indexer, || {
+                    observed += 1;
+                    if observed == fail_at {
+                        Err(interrupted())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
             assert_interrupted(&error);
             assert_eq!(observed, fail_at);
             fixture.assert_preserved()?;
@@ -223,22 +227,26 @@ fn cancellation_after_native_finish_does_not_install_complete_candidate() -> Res
     for scenario in [0, 1, 2, 3, 5] {
         let fixture = Fixture::new(&indexer, scenario)?;
         let mut observed_candidate = false;
-        let error = fixture.run(&indexer, || {
-            let parent = fixture.path.parent().unwrap();
-            if parent.exists() {
-                for entry in fs::read_dir(parent)? {
-                    let entry = entry?;
-                    if entry.file_name().to_string_lossy().starts_with(".semantic-reconcile-")
-                        && entry.path().join("candidate.fsvi").exists()
-                    {
-                        observed_candidate = true;
-                        return Err(interrupted());
+        let error = fixture
+            .run(&indexer, || {
+                let parent = fixture.path.parent().unwrap();
+                if parent.exists() {
+                    for entry in fs::read_dir(parent)? {
+                        let entry = entry?;
+                        if entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".semantic-reconcile-")
+                            && entry.path().join("candidate.fsvi").exists()
+                        {
+                            observed_candidate = true;
+                            return Err(interrupted());
+                        }
                     }
                 }
-            }
-            Ok(())
-        })
-        .unwrap_err();
+                Ok(())
+            })
+            .unwrap_err();
         assert_interrupted(&error);
         assert!(observed_candidate, "must cancel after real writer finish");
         fixture.assert_preserved()?;
@@ -290,12 +298,9 @@ fn replacement_handoff_borrows_canonical_keys_and_releases_original_vectors() ->
         Quantization::F16,
     )?;
     let mut remaining = fixture.current.iter().map(String::as_str).collect();
-    write_replacements(
-        &mut replacements,
-        &mut writer,
-        &mut remaining,
-        &mut || Ok(()),
-    )?;
+    write_replacements(&mut replacements, &mut writer, &mut remaining, &mut || {
+        Ok(())
+    })?;
     assert!(remaining.is_empty());
     assert!(replacements.values().all(Option::is_none));
     assert_eq!(replacements.len(), fixture.current.len());
@@ -330,23 +335,21 @@ fn cancelled_handoff_never_finishes_a_partial_replacement() -> Result<()> {
     )?;
     let mut remaining = fixture.current.iter().map(String::as_str).collect();
     let mut probes = 0;
-    let error = write_replacements(
-        &mut replacements,
-        &mut writer,
-        &mut remaining,
-        &mut || {
-            probes += 1;
-            if probes == 2 {
-                Err(interrupted())
-            } else {
-                Ok(())
-            }
-        },
-    )
+    let error = write_replacements(&mut replacements, &mut writer, &mut remaining, &mut || {
+        probes += 1;
+        if probes == 2 {
+            Err(interrupted())
+        } else {
+            Ok(())
+        }
+    })
     .unwrap_err();
     assert_interrupted(&error);
     assert_eq!(
-        replacements.values().filter(|value| value.is_none()).count(),
+        replacements
+            .values()
+            .filter(|value| value.is_none())
+            .count(),
         1
     );
     assert_eq!(remaining.len(), fixture.current.len() - 1);
