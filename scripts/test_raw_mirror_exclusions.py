@@ -60,7 +60,13 @@ def main() -> None:
         else:
             spec = dict(spec)
         if name == "franken-agent-detection":
-            spec = {"version": spec["version"], "default-features": False, "features": ["connectors"]}
+            # codex-zstd: the staged Codex consumer reads .jsonl.zst rollouts
+            # through FAD (GH #513), exactly as the full application builds it.
+            spec = {
+                "version": spec["version"],
+                "default-features": False,
+                "features": ["connectors", "codex-zstd"],
+            }
         fields = []
         for key in ("version", "package", "default-features", "features"):
             if key in spec:
