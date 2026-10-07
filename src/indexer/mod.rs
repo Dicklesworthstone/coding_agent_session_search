@@ -14052,6 +14052,9 @@ struct StreamingBatchSender<'a> {
     content_bytes: usize,
     retained_bytes: usize,
     byte_reservation: usize,
+    /// Sources skipped because the source ledger shows them unchanged, for
+    /// the scope's ingest report.
+    reused_sources: Vec<PathBuf>,
 }
 
 fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_name: &'static str) {
@@ -14229,6 +14232,12 @@ fn scan_with_durable_source_boundaries(
                 .get(&source_ledger_key(source, &ctx))
                 .is_some_and(|saved| source_ledger_matches(saved, source));
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
+        if skip {
+            sender
+                .borrow_mut()
+                .reused_sources
+                .push(source.source_path.clone());
+        }
         !skip
     };
     let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
@@ -14303,6 +14312,7 @@ impl<'a> StreamingBatchSender<'a> {
             content_bytes: 0,
             retained_bytes: 0,
             byte_reservation: 0,
+            reused_sources: Vec::new(),
         }
     }
 
@@ -14713,6 +14723,8 @@ fn spawn_connector_producer(
                     });
                 }
             }
+            ingest_diagnostics
+                .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
             record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
         }
 
@@ -14849,6 +14861,8 @@ fn spawn_connector_producer(
                     });
                 }
             }
+            ingest_diagnostics
+                .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
             record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
         }
 

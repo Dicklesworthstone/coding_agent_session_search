@@ -50,6 +50,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   raw-mirrored, because doing so would copy the parts cass deliberately
   leaves out.
 
+  A store cass cannot read is reported instead of looking empty: `cass index
+  --json` lists it under `indexing_stats.connector_diagnostics` with kind
+  `unsupported-store-format` (a durable schema or format version newer than
+  the connector reads, or a Pi Session Store V2 sidecar) or
+  `unreadable-source`, and a `detail` naming the version found.
+
   The same release also:
   - indexes `pi_agent_rust` SQLite sessions;
   - keeps Pi and Oh My Pi compaction summaries, custom messages, shell runs

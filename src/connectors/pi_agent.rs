@@ -27,6 +27,19 @@ impl PiAgentConnector {
             inner: franken_agent_detection::PiAgentConnector::new(),
         }
     }
+
+    /// Pi stores under this scan's roots that the connector does not read,
+    /// without stores the Pi-family ownership policy assigns to OMP.
+    #[must_use]
+    pub fn unsupported_store_diagnostics(
+        &self,
+        ctx: &ScanContext,
+    ) -> Vec<franken_agent_detection::connectors::pi_agent::UnsupportedPiStore> {
+        let ownership = super::omp::PiFamilyOwnership::live();
+        let mut stores = self.inner.unsupported_store_diagnostics(ctx);
+        stores.retain(|store| ownership.owner(&store.path) != super::omp::PiFamilyOwner::Omp);
+        stores
+    }
 }
 
 impl Connector for PiAgentConnector {

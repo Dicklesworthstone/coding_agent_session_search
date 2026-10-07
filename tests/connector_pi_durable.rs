@@ -202,6 +202,31 @@ fn pi_durable_conversations(home: &Path, data: &Path) -> Value {
         .map_or(Value::Null, |row| row["count"].clone())
 }
 
+/// Runs `cass index --full --json`; returns its pi_durable connector
+/// diagnostics and source summary.
+fn index_full(home: &Path, data: &Path) -> (Vec<Value>, Value) {
+    let output = cass(home, data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    let stats = &report["indexing_stats"];
+    let diagnostics = stats["connector_diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|diagnostic| diagnostic["provider"] == "pi_durable")
+        .cloned()
+        .collect();
+    (
+        diagnostics,
+        stats["connector_summary"]["pi_durable"].clone(),
+    )
+}
+
 fn files_holding(root: &Path, needle: &str) -> Vec<PathBuf> {
     walkdir::WalkDir::new(root)
         .into_iter()
@@ -230,10 +255,9 @@ fn a_durable_store_indexes_its_lead_and_child_conversations() {
     write_store(&store, 1);
     let before = fs::read(&store).unwrap();
 
-    cass(&home, &data)
-        .args(["index", "--full", "--json", "--no-progress-events"])
-        .assert()
-        .success();
+    let (diagnostics, summary) = index_full(&home, &data);
+    assert_eq!(diagnostics, Vec::<Value>::new(), "a readable store");
+    assert_eq!(summary["indexed"], 1, "{summary}");
     assert_eq!(pi_durable_conversations(&home, &data), 2);
 
     let lead = hits(&home, &data, "piduraleleadanswer");
@@ -312,16 +336,35 @@ fn a_durable_store_is_not_raw_mirrored() {
 }
 
 #[test]
-fn a_durable_store_with_an_unsupported_schema_version_is_not_indexed() {
+fn a_durable_store_with_an_unsupported_schema_version_is_reported_not_indexed() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let data = tmp.path().join("data");
     fs::create_dir_all(&data).unwrap();
-    write_store(&default_store_path(&home), 2);
-    cass(&home, &data)
-        .args(["index", "--full", "--json", "--no-progress-events"])
-        .assert()
-        .success();
+    let store = default_store_path(&home);
+    write_store(&store, 2);
+    let before = fs::read(&store).unwrap();
+
+    let (diagnostics, summary) = index_full(&home, &data);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["failure_kind"], "unsupported-store-format");
+    assert_eq!(diagnostic["disposition"], "skipped");
+    assert_eq!(diagnostic["retryable"], false);
+    assert_eq!(
+        diagnostic["source_path"],
+        store.display().to_string(),
+        "{diagnostic}"
+    );
+    let detail = diagnostic["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("unsupported_version: ") && detail.contains("durable schema version 2"),
+        "{diagnostic}"
+    );
+    assert_eq!(summary["skipped"], 1, "{summary}");
+    assert_eq!(summary["indexed"], 0, "{summary}");
+
     assert_eq!(pi_durable_conversations(&home, &data), Value::Null);
     assert!(hits(&home, &data, "piduraleleadanswer").is_empty());
+    assert_eq!(fs::read(&store).unwrap(), before, "the store was modified");
 }
