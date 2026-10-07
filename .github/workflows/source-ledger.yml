@@ -18,6 +18,90 @@ on:
 permissions:
   contents: read
 jobs:
+  discovery-source:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Export exact discovery-window fix without changing refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess, tarfile, tempfile, urllib.request
+          from pathlib import Path
+          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def blob(sha):
+              result = request('/git/blobs/' + sha)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert digest(data) == sha
+              return data
+          bases = {
+              'src/indexer/mod.rs': 'd5aabca367f665afff7913e314646d72ea8cdd46',
+              'src/indexer/source_ledger_tests.rs': '3121bfbc9f686866729a6fceb372c00fe98869da',
+              'src/connectors/source_dependencies/observation.rs': '70f2abc6bf852f1f7c1579c7b8b1014bab66efe1',
+          }
+          candidates = {
+              'src/indexer/mod.rs': '47aeceb1d594b7a27c70d44433feb43d3e5ccdbf',
+              'src/indexer/source_ledger_tests.rs': 'e85d62cdd941ebecb6304c66a83b166d027ca7cf',
+              'src/connectors/source_dependencies/observation.rs': '34a243d3355360df17b1a3585a4740edb7684e58',
+          }
+          patch = blob('911d697aa337ec35bec13e46590888d393716748')
+          output = Path(os.environ['GITHUB_WORKSPACE'])
+          with tempfile.TemporaryDirectory(prefix='gh512-discovery-') as directory:
+              work = Path(directory)
+              subprocess.run(['git', 'init', '-q'], cwd=work, check=True)
+              for name, sha in bases.items():
+                  current = request('/contents/' + name + '?ref=' + os.environ['GITHUB_SHA'])
+                  assert current['sha'] == sha, 'source drift: ' + name
+                  path = work / name
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(blob(sha))
+              subprocess.run(['git', 'add', '--', *sorted(bases)], cwd=work, check=True)
+              subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], cwd=work, input=patch, check=True)
+              subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], cwd=work, input=patch, check=True)
+              for name, sha in candidates.items():
+                  assert digest((work / name).read_bytes()) == sha, 'candidate mismatch: ' + name
+              subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *sorted(bases)], cwd=work, check=True)
+              subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *sorted(bases)], cwd=work, check=True)
+              subprocess.run(['git', 'diff', '--check'], cwd=work, check=True)
+              changed = set(subprocess.check_output(['git', 'diff', '--name-only'], cwd=work, text=True).splitlines())
+              assert changed == set(bases), changed
+              receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}}
+              for name in sorted(bases):
+                  data = (work / name).read_bytes()
+                  result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+                  assert result['sha'] == digest(data), name
+                  receipt['blobs'][name] = result['sha']
+              (output / 'gh512-discovery-source.json').write_text(json.dumps(receipt, indent=2) + '\n')
+              with tarfile.open(output / 'gh512-discovery-source.tar.gz', 'w:gz') as archive:
+                  for name in sorted(bases):
+                      archive.add(work / name, arcname=name)
+              print('GH512_DISCOVERY_SOURCE=' + json.dumps(receipt, sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh512-discovery-${{ github.sha }}
+          path: |
+            gh512-discovery-source.json
+            gh512-discovery-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
   matcher:
     runs-on: ubuntu-slim
     timeout-minutes: 15
