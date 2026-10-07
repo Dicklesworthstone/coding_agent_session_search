@@ -30452,6 +30452,7 @@ impl ConnectorKind {
             "crush" => Some(Self::Crush),
             "hermes" => Some(Self::Hermes),
             "codebuff" => Some(Self::Codebuff),
+            "pi_durable" => Some(Self::PiDurable),
             _ => None,
         }
     }
@@ -30490,6 +30491,7 @@ impl ConnectorKind {
             Self::Crush => "crush",
             Self::Hermes => "hermes",
             Self::Codebuff => "codebuff",
+            Self::PiDurable => "pi_durable",
         }
     }
 
@@ -30529,6 +30531,7 @@ impl ConnectorKind {
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
             Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
+            Self::PiDurable => Box::new(franken_agent_detection::PiDurableConnector::new()),
         }
     }
 }
@@ -32210,6 +32213,9 @@ enum ConnectorKind {
     /// Shared Codebuff / Freebuff (Manicode) CLI history (GH #423).
     #[serde(rename = "bf", alias = "Codebuff")]
     Codebuff,
+    /// Pi durable-harness stores (franken_agent_detection #28).
+    #[serde(rename = "pd", alias = "PiDurable")]
+    PiDurable,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
