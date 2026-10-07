@@ -109,7 +109,7 @@ impl Drop for CancelOnDrop<'_> {
 }
 
 #[test]
-fn cancellation_in_iterator_drop_is_checked_before_native_finish() -> Result<()> {
+fn cancellation_in_iterator_drop_is_checked_before_publication() -> Result<()> {
     let indexer = SemanticIndexer::new("hash", None)?;
     for existing in [false, true] {
         let root = tempfile::tempdir()?;

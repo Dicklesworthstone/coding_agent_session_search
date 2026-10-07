@@ -74,6 +74,7 @@ jobs:
           run_suite append-admission --lib indexer::semantic::delegate::append::tests
           run_suite rebuild-publication --test semantic_rebuild_publication
           run_suite rebuild-progress --lib indexer::semantic::delegate::full_rebuild_tests
+          run_suite reconcile-cancellation --lib indexer::semantic::delegate::reconcile::tests
           cargo clippy --locked --lib -- -D warnings
           run_suite unchanged --lib indexer::semantic::unchanged::tests
           run_suite lease --lib indexer::semantic::artifacts::lease_tests

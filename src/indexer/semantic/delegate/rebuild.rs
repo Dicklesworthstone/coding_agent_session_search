@@ -36,41 +36,55 @@ where
         .tempdir_in(parent)?;
     let candidate_path = vector_index_path(scratch.path(), indexer.embedder_id());
     fs::create_dir_all(candidate_path.parent().context("candidate has no parent")?)?;
-    let mut writer = VectorIndex::create_with_revision(
-        &candidate_path,
-        indexer.embedder_id(),
-        revision,
-        indexer.embedder_dimension(),
-        Quantization::F16,
-    )?
-    .with_generation(previous.generation.map_or(1, next_generation));
+    if previous.generation.is_none() {
+        // Keep the engine's existing first-generation/progress interface live.
+        // It accepts an infallible iterator, so a cancelled adapter stops input
+        // and retains the exact error. Any finished prefix remains private and
+        // is rejected before candidate admission or installation.
+        build_initial(
+            indexer,
+            messages,
+            scratch.path(),
+            &mut on_progress,
+            &mut check_cancelled,
+        )?;
+    } else {
+        let mut writer = VectorIndex::create_with_revision(
+            &candidate_path,
+            indexer.embedder_id(),
+            revision,
+            indexer.embedder_dimension(),
+            Quantization::F16,
+        )?
+        .with_generation(previous.generation.map_or(1, next_generation));
 
-    // into_iter(), next(), and the progress callback are arbitrary caller code.
-    // In particular, final None must not hide a cancellation from publication.
-    check_cancelled()?;
-    let mut messages = messages.into_iter();
-    let mut accepted = 0usize;
-    loop {
+        // into_iter(), next(), and the progress callback are arbitrary caller code.
+        // In particular, final None must not hide a cancellation from publication.
         check_cancelled()?;
-        let embedded = messages.next();
-        check_cancelled()?;
-        let Some(embedded) = embedded else {
-            break;
-        };
-        write_record(&mut writer, &embedded, indexer.embedder_dimension())?;
-        accepted = accepted.saturating_add(1);
-        if let Some(progress) = on_progress.as_mut() {
-            progress(accepted);
+        let mut messages = messages.into_iter();
+        let mut accepted = 0usize;
+        loop {
+            check_cancelled()?;
+            let embedded = messages.next();
+            check_cancelled()?;
+            let Some(embedded) = embedded else {
+                break;
+            };
+            write_record(&mut writer, &embedded, indexer.embedder_dimension())?;
+            accepted = accepted.saturating_add(1);
+            if let Some(progress) = on_progress.as_mut() {
+                progress(accepted);
+            }
+            check_cancelled()?;
         }
+        // Drop arbitrary iterator state before the final cancellation fence too.
+        drop(messages);
+        check_cancelled()?;
+        writer
+            .finish()
+            .context("finish unpublished semantic replacement")?;
         check_cancelled()?;
     }
-    // Drop arbitrary iterator state before the final cancellation fence too.
-    drop(messages);
-    check_cancelled()?;
-    writer
-        .finish()
-        .context("finish unpublished semantic replacement")?;
-    check_cancelled()?;
 
     let candidate = VectorIndex::open_read_only(&candidate_path)?;
     validate_candidate(&candidate, &mut check_cancelled)?;
@@ -83,6 +97,49 @@ where
     check_cancelled()?;
     VectorIndex::install_replacement(&destination, &candidate_path)
         .context("install complete semantic rebuild")
+}
+
+fn build_initial<I, F>(
+    indexer: &SemanticIndexer,
+    messages: I,
+    scratch: &Path,
+    on_progress: &mut Option<F>,
+    check_cancelled: &mut impl FnMut() -> Result<()>,
+) -> Result<()>
+where
+    I: IntoIterator<Item = EmbeddedMessage>,
+    F: FnMut(usize),
+{
+    check_cancelled()?;
+    let mut messages = messages.into_iter();
+    let mut cancellation = None;
+    let checked = std::iter::from_fn(|| {
+        if cancellation.is_some() {
+            return None;
+        }
+        if let Err(error) = check_cancelled() {
+            cancellation = Some(error);
+            return None;
+        }
+        let message = messages.next();
+        if let Err(error) = check_cancelled() {
+            cancellation = Some(error);
+            return None;
+        }
+        message
+    });
+    let result = match on_progress.as_mut() {
+        Some(progress) => indexer
+            .inner
+            .build_and_save_index_with_progress(checked, scratch, progress),
+        None => indexer.inner.build_and_save_index(checked, scratch),
+    };
+    drop(messages);
+    if let Some(error) = cancellation {
+        return Err(error);
+    }
+    check_cancelled()?;
+    result.map(drop)
 }
 
 fn write_record(
