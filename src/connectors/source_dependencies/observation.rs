@@ -2,7 +2,41 @@
 //! so the exact production matcher can be tested without the search/UI runtime.
 
 use serde_json::Value;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// Evidence captured before the connector starts its own discovery and parsing.
+/// Optional sidecars may be selected before `should_scan_source` is called, so
+/// a parent observed only in that hook cannot cover the whole reconstruction.
+#[derive(Default)]
+pub(crate) struct DependencyObservations {
+    pub(crate) files: HashMap<PathBuf, Value>,
+    parents: HashMap<PathBuf, Option<Value>>,
+}
+
+impl DependencyObservations {
+    pub(crate) fn capture(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut observations = Self::default();
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                // Sample a shared directory once, including failed observations.
+                // Never move the beginning of its observation window forward.
+                observations
+                    .parents
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| file_observation(parent));
+            }
+            if let Some(observation) = file_observation(&path) {
+                observations.files.entry(path).or_insert(observation);
+            }
+        }
+        observations
+    }
+
+    pub(crate) fn parent_for(&self, source_path: &Path) -> Option<&Value> {
+        self.parents.get(source_path.parent()?)?.as_ref()
+    }
+}
 
 pub(crate) fn file_observation(path: &Path) -> Option<Value> {
     match std::fs::metadata(path) {
@@ -181,6 +215,58 @@ mod tests {
         }
         let row = saved(&path, vec![file_observation(temp.path()).unwrap()]);
         assert!(ledger_matches(&row, &path, true, CONTRACT));
+    }
+
+    #[test]
+    fn dependency_snapshot_spans_discovery_and_keeps_the_first_parent() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::write(&first, b"first transcript").unwrap();
+        fs::write(&second, b"second transcript").unwrap();
+        let before = file_observation(temp.path()).unwrap();
+        let paths = [first.clone(), second.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                if index == 1 {
+                    grow(temp.path(), "between-observations");
+                }
+                path
+            });
+        let snapshot = DependencyObservations::capture(paths);
+        assert_eq!(snapshot.parents.len(), 1, "one snapshot per folder");
+        assert_eq!(snapshot.parent_for(&first), Some(&before));
+        assert_eq!(snapshot.parent_for(&second), Some(&before));
+        assert_ne!(
+            snapshot.parent_for(&first),
+            file_observation(temp.path()).as_ref()
+        );
+        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(snapshot.files[&first], file_observation(&first).unwrap());
+    }
+
+    #[test]
+    fn unknown_or_unobservable_parent_has_no_discovery_authority() {
+        let temp = TempDir::new().unwrap();
+        let known = temp.path().join("known/primary");
+        let unknown = temp.path().join("new-folder/primary");
+        fs::create_dir_all(known.parent().unwrap()).unwrap();
+        fs::write(&known, b"transcript").unwrap();
+        let snapshot = DependencyObservations::capture([known.clone()]);
+        fs::create_dir_all(unknown.parent().unwrap()).unwrap();
+        fs::write(&unknown, b"discovered later").unwrap();
+        assert!(snapshot.parent_for(&known).is_some());
+        assert!(snapshot.parent_for(&unknown).is_none());
+        let invalid = PathBuf::from("invalid\0directory/primary");
+        let snapshot = DependencyObservations::capture([invalid.clone(), invalid.clone()]);
+        assert_eq!(
+            snapshot.parents.len(),
+            1,
+            "failed observations are retained too"
+        );
+        assert!(snapshot.parent_for(&invalid).is_none());
+        assert!(snapshot.files.is_empty());
     }
 
     #[test]

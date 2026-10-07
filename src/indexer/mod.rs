@@ -14179,23 +14179,20 @@ fn scan_with_durable_source_boundaries(
     // inventory and stat/JSON map solely to prove the absence of dependencies.
     // Unexpected completion sidecars remain unobserved and withhold the marker.
     // Other and unknown connector registrations keep the discovery-time guard.
-    let dependencies_before: HashMap<_, _> =
-        if crate::connectors::source_dependencies::source_dependency_policy(
-            sender.borrow().connector_name,
-        )
-        .observes_parent_directory()
-        {
+    let dependencies_before = if crate::connectors::source_dependencies::source_dependency_policy(
+        sender.borrow().connector_name,
+    )
+    .observes_parent_directory()
+    {
+        crate::connectors::source_dependencies::observation::DependencyObservations::capture(
             connector
                 .discover_source_files(&ctx)?
                 .into_iter()
-                .filter_map(|source| {
-                    source_file_observation(&source.source_path)
-                        .map(|observation| (source.source_path, observation))
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+                .map(|source| source.source_path),
+        )
+    } else {
+        Default::default()
+    };
     let flush_error = std::cell::RefCell::new(None);
     let mut should_scan = |source: &DiscoveredSourceFile| {
         if config
@@ -14210,7 +14207,10 @@ fn scan_with_durable_source_boundaries(
             return false;
         }
         filtered.set(scan_path_exclusions_active());
-        *before.borrow_mut() = source_parent_observation(source);
+        // The connector may already have selected its sidecars by this hook.
+        // Use the pre-discovery parent, not a later snapshot that could bless
+        // an untracked sidecar appearing between discovery and admission.
+        *before.borrow_mut() = dependencies_before.parent_for(&source.source_path).cloned();
         *primary_before.borrow_mut() = source_file_observation(&source.source_path);
         let skip = env!("CASS_SOURCE_INGEST_REUSE") == "true"
             && !filtered.get()
@@ -14237,7 +14237,7 @@ fn scan_with_durable_source_boundaries(
             &completion.required_sidecars,
             primary_before.borrow().as_ref(),
             before.borrow().as_ref(),
-            &dependencies_before,
+            &dependencies_before.files,
         ) else {
             return sender.borrow_mut().flush();
         };

@@ -126,8 +126,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cass-source-ledger-") as directory:
         work = Path(directory)
         (work / "observation.rs").write_bytes(source_bytes)
-        (work / "Cargo.toml").write_text(manifest)
-        (work / "Cargo.lock").write_text(harness_lock)
+        # Preserve TOML bytes without Windows text-mode newline translation:
+        # checked-out dependency blocks can already contain valid CRLF endings.
+        (work / "Cargo.toml").write_bytes(manifest.encode("utf-8"))
+        (work / "Cargo.lock").write_bytes(harness_lock.encode("utf-8"))
         env = os.environ.copy()
         toolchain = tomllib.loads((root / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
         env["RUSTUP_TOOLCHAIN"] = toolchain

@@ -627,3 +627,205 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
     }
     Ok(())
 }
+
+/// The real Grok parser selects existing sidecars BEFORE calling should_scan.
+/// Create a summary in precisely that gap, without replacing discovery or parsing.
+struct GrokSummaryAtAdmission {
+    summary: PathBuf,
+    injected: std::cell::Cell<bool>,
+}
+
+impl Connector for GrokSummaryAtAdmission {
+    fn detect(&self) -> crate::connectors::DetectionResult {
+        crate::connectors::grok::GrokConnector::new().detect()
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        crate::connectors::grok::GrokConnector::new().scan(ctx)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        crate::connectors::grok::GrokConnector::new().discover_source_files(ctx)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut franken_agent_detection::SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let original_should_scan = &mut hooks.should_scan_source;
+        let mut inject = |source: &DiscoveredSourceFile| {
+            if !self.injected.replace(true) {
+                fs::write(&self.summary, r#"{"generated_title":"late summary"}"#).unwrap();
+                grow_directory(self.summary.parent().unwrap(), "admission-clock");
+            }
+            original_should_scan
+                .as_mut()
+                .is_none_or(|callback| callback(source))
+        };
+        let mut forwarded = franken_agent_detection::SourceScanHooks {
+            should_scan_source: Some(&mut inject),
+            on_source_complete: hooks.on_source_complete.as_deref_mut(),
+        };
+        crate::connectors::grok::GrokConnector::new().scan_with_source_boundaries(
+            ctx,
+            &mut forwarded,
+            on_conversation,
+        )
+    }
+}
+
+fn collect_ledger_scan(
+    connector: &dyn Connector,
+    ctx: &ScanContext,
+    config: &StreamingProducerConfig,
+    name: &'static str,
+) -> Result<(
+    Vec<NormalizedConversation>,
+    Vec<crate::storage::sqlite::SourceIngestLedgerEntry>,
+)> {
+    let limiter = Arc::clone(&config.flow_limiter);
+    let (tx, rx) = bounded(8);
+    let mut sender = StreamingBatchSender::new(&tx, Arc::clone(&limiter), name, true);
+    scan_with_durable_source_boundaries(connector, ctx, config, &mut sender, |conversation| {
+        Ok(Some(conversation))
+    })?;
+    sender.flush()?;
+    let mut conversations = Vec::new();
+    let mut entries = Vec::new();
+    for message in rx.try_iter() {
+        match message {
+            IndexMessage::Batch {
+                conversations: batch,
+                byte_reservation,
+                ..
+            } => {
+                conversations.extend(batch);
+                limiter.release(byte_reservation);
+            }
+            IndexMessage::SourceComplete {
+                conversations: batch,
+                completion,
+                byte_reservation,
+                ..
+            } => {
+                conversations.extend(batch);
+                entries.push(completion);
+                limiter.release(byte_reservation);
+            }
+            _ => panic!("unexpected source producer message"),
+        }
+    }
+    Ok((conversations, entries))
+}
+
+#[test]
+fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_file() -> Result<()> {
+    let temp = TempDir::new()?;
+    let directory = temp.path().join("grok/sessions/%2Fwork%2Fledger/session");
+    fs::create_dir_all(&directory)?;
+    let primary = directory.join("updates.jsonl");
+    fs::write(
+        &primary,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": 1_784_388_056,
+                "method": "session/update",
+                "params": {"sessionId": "ledger-grok", "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "retained Grok transcript"}
+                }}
+            })
+        ),
+    )?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let ctx = ScanContext::with_roots(
+        data_dir.clone(),
+        vec![ScanRoot::local(directory.clone())],
+        None,
+    );
+    let mut config = StreamingProducerConfig {
+        source_ledger: Arc::new(HashMap::new()),
+        flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+        data_dir,
+        additional_scan_roots: Vec::new(),
+        local_connector_roots: None,
+        since_ts: None,
+        local_since_ts_by_connector: Arc::new(HashMap::new()),
+        progress: None,
+        active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+    };
+    let connector = GrokSummaryAtAdmission {
+        summary: directory.join("summary.json"),
+        injected: std::cell::Cell::new(false),
+    };
+    let primary_before = source_file_observation(&primary).unwrap();
+    let (conversations, entries) = collect_ledger_scan(&connector, &ctx, &config, "grok")?;
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].title.as_deref(), Some("late summary"));
+    assert_eq!(
+        source_file_observation(&primary),
+        Some(primary_before.clone())
+    );
+    assert!(
+        entries.is_empty(),
+        "a parsed but untracked sidecar must withhold completion"
+    );
+
+    // A subsequent stable scan discovers and records the sidecar normally.
+    let (conversations, mut entries) = collect_ledger_scan(&connector, &ctx, &config, "grok")?;
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(entries.len(), 1);
+    let entry = entries.pop().unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&entry.observation)?;
+    let dependencies = saved["dependencies"].as_array().unwrap();
+    assert!(dependencies.contains(&source_file_observation(&directory).unwrap()));
+    assert!(dependencies.contains(&source_file_observation(&connector.summary).unwrap()));
+    let source = discovered(&primary, "grok");
+    assert!(source_ledger_matches(&entry.observation, &source));
+    config.source_ledger = Arc::new(HashMap::from([(entry.key, entry.observation)]));
+
+    // An in-place edit does NOT change the folder. Without the explicit
+    // sidecar observation, the wrongly certified first scan would now skip it.
+    let parent_before = source_file_observation(&directory).unwrap();
+    fs::write(
+        &connector.summary,
+        r#"{"generated_title":"updated metadata title"}"#,
+    )?;
+    assert_eq!(source_file_observation(&directory), Some(parent_before));
+    assert_eq!(source_file_observation(&primary), Some(primary_before));
+    let (conversations, mut entries) = collect_ledger_scan(&connector, &ctx, &config, "grok")?;
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(
+        conversations[0].title.as_deref(),
+        Some("updated metadata title")
+    );
+    assert_eq!(entries.len(), 1);
+    let entry = entries.pop().unwrap();
+    config.source_ledger = Arc::new(HashMap::from([(entry.key, entry.observation)]));
+    let (conversations, entries) = collect_ledger_scan(&connector, &ctx, &config, "grok")?;
+    let expected = usize::from(env!("CASS_SOURCE_INGEST_REUSE") != "true");
+    assert_eq!(conversations.len(), expected);
+    assert_eq!(entries.len(), expected);
+
+    fs::remove_file(&connector.summary)?;
+    let (conversations, entries) = collect_ledger_scan(&connector, &ctx, &config, "grok")?;
+    assert_eq!(
+        conversations.len(),
+        1,
+        "sidecar deletion must also invalidate reuse"
+    );
+    assert_ne!(
+        conversations[0].title.as_deref(),
+        Some("updated metadata title")
+    );
+    assert_eq!(entries.len(), 1);
+    Ok(())
+}
