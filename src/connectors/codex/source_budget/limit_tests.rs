@@ -139,6 +139,76 @@ fn configured_preflight_refuses_before_parsing_or_completing_a_source() -> Resul
     Ok(())
 }
 
+/// One zstd frame holding `len` newlines as a single RLE block: a file of
+/// 14 bytes whose header declares `len` bytes of text (GH #513).
+fn rle_zstd_frame(len: u32) -> Vec<u8> {
+    assert!(len <= 128 * 1024, "one block holds at most 128 KiB");
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD]; // magic number
+    frame.push(0xA0); // 4-byte content size, single segment
+    frame.extend_from_slice(&len.to_le_bytes());
+    let block = 1 | (1 << 1) | (len << 3); // last block, RLE, `len` repeats
+    frame.extend_from_slice(&block.to_le_bytes()[..3]);
+    frame.push(b'\n');
+    frame
+}
+
+#[test]
+fn compressed_rollouts_are_admitted_by_their_declared_text_length() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("rollout-budget.jsonl.zst");
+    let text_len: u64 = 100_000;
+    fs::write(&path, rle_zstd_frame(text_len as u32))?;
+    let file_len = fs::metadata(&path)?.len();
+    assert!(file_len < 32, "the file is far smaller than its text");
+
+    // The opened-handle recheck sizes the source by its declared text.
+    let error = SourceSnapshot::capture_with_limit(&path, text_len - 1)
+        .err()
+        .expect("declared text one byte over the limit");
+    assert_eq!(
+        error
+            .downcast_ref::<EnrichmentBudgetExceeded>()
+            .unwrap()
+            .observed_bytes,
+        text_len
+    );
+    assert!(SourceSnapshot::capture_with_limit(&path, text_len).is_ok());
+
+    // So does the path preflight of a real scan: a typed budget rejection
+    // under the JSONL budget, before anything is parsed or completed.
+    let ctx = ScanContext::with_roots(
+        root.path().join("cass"),
+        vec![franken_agent_detection::ScanRoot::local(path.clone())],
+        None,
+    );
+    let admission = ScanAdmission {
+        exclusions: ScanExclusions::from_env(),
+        limits: ScanLimits {
+            jsonl_bytes: text_len - 1,
+        },
+    };
+    assert_eq!(admission.limits.for_path(&path), text_len - 1);
+    let mut complete = |_: &SourceCompletion| panic!("rejected source cannot complete");
+    let mut hooks = SourceScanHooks {
+        should_scan_source: None,
+        on_source_complete: Some(&mut complete),
+    };
+    let error = scan_with_admission(
+        &franken_agent_detection::CodexConnector::new(),
+        &ctx,
+        &mut hooks,
+        &mut |_| panic!("rejected source cannot emit"),
+        &admission,
+        |_| panic!("rejected source cannot enrich"),
+    )
+    .unwrap_err();
+    let report = error.downcast_ref::<IncompleteScan>().unwrap();
+    assert_eq!(report.rejected_source_count, 1);
+    assert_eq!(report.rejected_sources[0].observed_bytes, text_len);
+    assert!(report.rejected_sources[0].limit_bytes.is_none());
+    Ok(())
+}
+
 #[test]
 fn legacy_refusal_records_its_lower_effective_limit() -> Result<()> {
     let root = tempfile::tempdir()?;

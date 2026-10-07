@@ -391,7 +391,7 @@ cass export-html session.jsonl --json
 
 ### 🔗 Universal Connectors
 Ingests history from 32 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
-- **Codex**: `~/.codex/sessions` (Rollout JSONL)
+- **Codex**: `~/.codex/sessions` and `~/.codex/archived_sessions` (Rollout JSONL, plain or zstd-compressed `.jsonl.zst`)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
 - **Claude Code**: `~/.claude/projects` (Session JSONL), plus macOS Desktop metadata sidecars under
@@ -2836,7 +2836,7 @@ Each file system event is routed to the appropriate connector:
 
 ```
 ~/.claude/projects/foo.jsonl  → ClaudeCodeConnector
-~/.codex/sessions/rollout-*.jsonl → CodexConnector
+~/.codex/sessions/rollout-*.jsonl[.zst] → CodexConnector
 ~/.aider.chat.history.md → AiderConnector
 ```
 
