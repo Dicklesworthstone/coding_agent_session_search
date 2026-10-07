@@ -225,6 +225,9 @@ impl SemanticIndexer {
     /// Reconcile against the caller's authoritative canonical identity set.
     /// An exactly unchanged, log-free generation is returned as a shared
     /// query owner without replacing its file or retiring recovery protection.
+    /// Changed generations are assembled directly from a retained read-only
+    /// source, without copying it into a second mutable snapshot. A first
+    /// publication requires complete replacement coverage and no orphan WAL.
     pub fn reconcile_index_with_canonical_documents(
         &self,
         embedded_messages: Vec<EmbeddedMessage>,
@@ -257,18 +260,6 @@ impl SemanticIndexer {
             }
         }
         refuse_publication_sidecars(&destination, true)?;
-        // Keep the established no-WAL implementation. The generation-bound
-        // merge below addresses retained deltas, including the full-replacement
-        // case which cannot reset the main generation beside an old WAL.
-        if wal_before.is_none() {
-            return self.inner.reconcile_index_with_canonical_documents(
-                embedded_messages,
-                data_dir,
-                tier,
-                db_fingerprint,
-                current_doc_ids,
-            );
-        }
         ensure!(
             !db_fingerprint.trim().is_empty(),
             "canonical semantic reconciliation requires a DB fingerprint"
@@ -316,29 +307,44 @@ impl SemanticIndexer {
         // set needed to retire deleted records and retain acknowledged WAL rows.
         refuse_publication_sidecars(&destination, true)?;
         let previous = RebuildDestination::capture(&destination)?;
-        let generation = previous
-            .generation
-            .context("canonical reconciliation requires an existing vector artifact")?;
-        // Retain the real source under its shared native lock. No source copy,
-        // compaction, tombstone edit or writer-capable source map is necessary.
-        let source = VectorIndex::open_read_only(&destination)?;
+        let complete_replacement = replacements.len() == current_doc_ids.len();
+        // The same reader-owned merge serves both WAL and log-free sources.
+        // Even a complete replacement must respect the existing artifact's
+        // reader/writer lock and header admission, rather than overwriting an
+        // unreadable generation. An absent main is not authority over its WAL.
+        let source = if previous.file.is_some() {
+            Some(VectorIndex::open_read_only(&destination)?)
+        } else {
+            ensure!(
+                wal_before.is_none(),
+                "canonical reconciliation refuses an orphan WAL; recover its main generation first"
+            );
+            ensure!(
+                complete_replacement,
+                "initial canonical reconciliation lacks vectors for {} current documents",
+                current_doc_ids.len().saturating_sub(replacements.len())
+            );
+            None
+        };
         ensure!(
             RebuildDestination::capture(&destination)? == previous
                 && ObservedSemanticFile::capture(&wal_path)? == wal_before,
             "semantic source changed while opening canonical reconciliation"
         );
-        let complete_replacement = replacements.len() == current_doc_ids.len();
         ensure!(
             complete_replacement
-                || (source.embedder_id() == self.embedder_id()
-                    && source.embedder_revision() == revision
-                    && source.dimension() == self.embedder_dimension()),
+                || source.as_ref().is_some_and(|source| {
+                    source.embedder_id() == self.embedder_id()
+                        && source.embedder_revision() == revision
+                        && source.dimension() == self.embedder_dimension()
+                }),
             "incompatible vector space requires a complete canonical replacement"
         );
 
         let parent = destination
             .parent()
             .context("semantic index has no parent")?;
+        fs::create_dir_all(parent)?;
         let scratch = tempfile::Builder::new()
             .prefix(".semantic-reconcile-")
             .tempdir_in(parent)?;
@@ -351,10 +357,13 @@ impl SemanticIndexer {
             if complete_replacement {
                 Quantization::F16
             } else {
-                source.quantization()
+                source
+                    .as_ref()
+                    .context("canonical partial reuse requires a source index")?
+                    .quantization()
             },
         )?
-        .with_generation(next_generation(generation));
+        .with_generation(previous.generation.map_or(1, next_generation));
         let mut remaining = HashSet::new();
         remaining.try_reserve(current_doc_ids.len())?;
         remaining.extend(current_doc_ids.iter().map(String::as_str));
@@ -364,6 +373,9 @@ impl SemanticIndexer {
         }
 
         if !complete_replacement {
+            let source = source
+                .as_ref()
+                .context("canonical partial reuse requires a source index")?;
             let mut wal_ids = HashSet::new();
             wal_ids.try_reserve(source.wal_record_count())?;
             // The native reader has already applied last-write-wins within the
@@ -441,7 +453,7 @@ impl SemanticIndexer {
             tier = tier.as_str(),
             published_docs = published.record_count(),
             replaced_docs = replacements.len(),
-            retained_wal_rows = source.wal_record_count(),
+            retained_wal_rows = source.as_ref().map_or(0, VectorIndex::wal_record_count),
             "published canonical semantic reconciliation"
         );
         Ok(published)
@@ -642,6 +654,8 @@ impl ObservedSemanticFile {
 #[cfg(test)]
 mod full_rebuild_tests {
     use super::*;
+
+    mod canonical;
 
     fn embedded(indexer: &SemanticIndexer) -> Result<Vec<EmbeddedMessage>> {
         indexer.embed_messages(&[
