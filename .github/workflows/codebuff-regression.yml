@@ -138,6 +138,7 @@ jobs:
           run_gate dependency-features command python scripts/check_dependency_features.py
           run_gate fmt command rustfmt --edition 2024 --check --config skip_children=true \
             build.rs src/lib.rs src/connector_ingest_diagnostics.rs src/dependency_drift.rs \
+            src/connectors/mod.rs src/connectors/codebuff.rs \
             src/indexer/mod.rs tests/e2e_multi_connector.rs \
             tests/codebuff_timestamp_contract.rs \
             tests/docs_dependency_pins_match_cargo.rs tests/agent_detection_completeness.rs
@@ -146,6 +147,7 @@ jobs:
           run_gate native-updates test "${cargo_cmd[@]}" test --locked --test e2e_multi_connector \
             codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages -- --exact --nocapture --test-threads=1
           run_gate connector-diagnostics test "${cargo_cmd[@]}" test --locked --lib connector_ingest_diagnostics::tests -- --nocapture --test-threads=1
+          run_gate codebuff-boundaries test "${cargo_cmd[@]}" test --locked --lib connectors::codebuff:: -- --nocapture --test-threads=1
           run_gate dependency-drift test "${cargo_cmd[@]}" test --locked --lib dependency_drift::tests -- --nocapture --test-threads=1
           run_gate indexer-progress test "${cargo_cmd[@]}" test --locked --lib -- \
             batch_index_does_not_watermark_failed_discovered_connector \

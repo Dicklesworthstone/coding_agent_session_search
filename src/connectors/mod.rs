@@ -240,6 +240,7 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
+pub mod codebuff;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
@@ -271,6 +272,10 @@ fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
 }
 
+fn codebuff_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(codebuff::CodebuffConnector::new())
+}
+
 fn omp_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(omp::OmpConnector::new())
 }
@@ -296,6 +301,7 @@ fn copilot_connector_factory() -> Box<dyn Connector + Send> {
 /// OpenClaw passes through its native-store WAL and state-directory adapter.
 /// Copilot passes through a detection widening that also recognises VS Code's
 /// native chat stores, which the upstream scanner reads but never detected.
+/// Codebuff delegates parsing to FAD while adding per-transcript checkpoints.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     get_connector_registrations()
@@ -318,6 +324,7 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
                 }
                 "codex" => ConnectorRegistration::new(name, codex_connector_factory)
                     .with_source_capability::<codex::CodexConnector>("codex"),
+                "codebuff" => ConnectorRegistration::new(name, codebuff_connector_factory),
                 "omp" => ConnectorRegistration::new(name, omp_connector_factory),
                 "pi_agent" => ConnectorRegistration::new(name, pi_agent_connector_factory),
                 "grok_bot" => ConnectorRegistration::new(name, grok_bot_connector_factory),
