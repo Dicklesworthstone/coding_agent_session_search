@@ -18,6 +18,7 @@ on:
       - src/indexer/**
       - src/lib.rs
       - tests/e2e_multi_connector.rs
+      - tests/codebuff_timestamp_contract.rs
       - tests/docs_dependency_pins_match_cargo.rs
       - tests/agent_detection_completeness.rs
       - tests/util/**
@@ -138,8 +139,10 @@ jobs:
           run_gate fmt command rustfmt --edition 2024 --check --config skip_children=true \
             build.rs src/lib.rs src/connector_ingest_diagnostics.rs src/dependency_drift.rs \
             src/indexer/mod.rs tests/e2e_multi_connector.rs \
+            tests/codebuff_timestamp_contract.rs \
             tests/docs_dependency_pins_match_cargo.rs tests/agent_detection_completeness.rs
           run_gate gh511 test "${cargo_cmd[@]}" test --locked --test e2e_multi_connector gh511_ -- --nocapture --test-threads=1
+          run_gate timestamp-contract test "${cargo_cmd[@]}" test --locked --test codebuff_timestamp_contract -- --nocapture --test-threads=1
           run_gate native-updates test "${cargo_cmd[@]}" test --locked --test e2e_multi_connector \
             codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages -- --exact --nocapture --test-threads=1
           run_gate connector-diagnostics test "${cargo_cmd[@]}" test --locked --lib connector_ingest_diagnostics::tests -- --nocapture --test-threads=1
@@ -154,7 +157,7 @@ jobs:
           run_gate documentation-pins test "${cargo_cmd[@]}" test --locked --test docs_dependency_pins_match_cargo -- --nocapture --test-threads=1
           run_gate detection-completeness test "${cargo_cmd[@]}" test --locked --test agent_detection_completeness -- --nocapture --test-threads=1
           run_gate clippy command "${cargo_cmd[@]}" clippy --locked --lib --bin cass \
-            --test e2e_multi_connector --test docs_dependency_pins_match_cargo \
+            --test e2e_multi_connector --test codebuff_timestamp_contract --test docs_dependency_pins_match_cargo \
             --test agent_detection_completeness -- -D warnings
           run_gate source-unchanged command git diff --exit-code
           printf 'STAGE=job-complete EXIT=%s\n' "$failed" | tee -a "$evidence/receipt.log" || failed=1
