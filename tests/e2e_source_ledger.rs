@@ -67,8 +67,23 @@ fn transcript(directory: &Path, provider: &str, source: usize) -> PathBuf {
 }
 
 fn index(home: &Path, streaming: &str, step: &str, skipped: usize, parsed: usize) {
+    index_with_exclusion(home, streaming, step, skipped, parsed, None);
+}
+
+fn index_with_exclusion(
+    home: &Path,
+    streaming: &str,
+    step: &str,
+    skipped: usize,
+    parsed: usize,
+    excluded: Option<&Path>,
+) {
     let trace = home.join(format!("{step}.trace.jsonl"));
-    let output = cass(home, streaming)
+    let mut command = cass(home, streaming);
+    if let Some(excluded) = excluded {
+        command.env("CASS_EXCLUDE_PATHS", excluded);
+    }
+    let output = command
         .env(
             "CASS_TRACE_FILTER",
             "warn,coding_agent_search::indexer=debug",
@@ -110,6 +125,18 @@ fn index(home: &Path, streaming: &str, step: &str, skipped: usize, parsed: usize
 
 /// Canonical IDs as well as content must survive skipped and replayed sources.
 fn archive(home: &Path, sources: usize, appended: bool) -> BTreeMap<String, (i64, i64)> {
+    let contents = archive_contents(home, sources);
+    assert_eq!(contents.len(), sources + usize::from(appended));
+    for source in 0..sources {
+        assert!(contents.contains_key(&format!("ghledger{source:03}message000z")));
+    }
+    if appended {
+        assert!(contents.contains_key("ghledger000message001z"));
+    }
+    contents
+}
+
+fn archive_contents(home: &Path, sources: usize) -> BTreeMap<String, (i64, i64)> {
     let storage = SqliteStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
     let conversations = storage.list_conversations(100, 0).unwrap();
     assert_eq!(conversations.len(), sources);
@@ -124,14 +151,12 @@ fn archive(home: &Path, sources: usize, appended: bool) -> BTreeMap<String, (i64
             );
         }
     }
-    assert_eq!(contents.len(), sources + usize::from(appended));
-    for source in 0..sources {
-        assert!(contents.contains_key(&format!("ghledger{source:03}message000z")));
-    }
-    if appended {
-        assert!(contents.contains_key("ghledger000message001z"));
-    }
     contents
+}
+
+fn source_ledger(home: &Path) -> std::collections::HashMap<String, String> {
+    let storage = SqliteStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
+    storage.source_ingest_ledger_entries().unwrap()
 }
 
 fn assert_searchable(home: &Path, marker: &str) {
@@ -277,6 +302,117 @@ fn gh512_persisted_legacy_reuse_and_primary_append_reach_search_in_both_modes() 
                 if reusable { 0 } else { 3 },
             );
             assert_eq!(archive(home, 3, true), appended_ids);
+        }
+    }
+}
+
+
+#[test]
+fn gh512_whole_source_exclusions_reuse_allowed_files_without_losing_deferred_sources() {
+    let reusable = env!("CASS_SOURCE_INGEST_REUSE") == "true";
+    for provider in ["claude_code", "codex"] {
+        for streaming in ["0", "1"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let directory = home.join(if provider == "claude_code" {
+                ".claude/projects/ledger"
+            } else {
+                ".codex/sessions/2026/08/01"
+            });
+            fs::create_dir_all(&directory).unwrap();
+            let first = transcript(&directory, provider, 0);
+            let excluded = transcript(&directory, provider, 1);
+            let excluded_bytes = fs::read(&excluded).unwrap();
+            let excluded_mtime = fs::metadata(&excluded).unwrap().modified().unwrap();
+            index_with_exclusion(
+                home,
+                streaming,
+                "excluded-initial",
+                0,
+                1,
+                Some(&excluded),
+            );
+            let initial = archive(home, 1, false);
+            let initial_ledger = source_ledger(home);
+            assert_eq!(
+                initial_ledger.len(),
+                1,
+                "a whole admitted source must be certified"
+            );
+
+            transcript(&directory, provider, 2);
+            index_with_exclusion(
+                home,
+                streaming,
+                "excluded-grown",
+                usize::from(reusable),
+                if reusable { 1 } else { 2 },
+                Some(&excluded),
+            );
+            let grown = archive_contents(home, 2);
+            assert_eq!(grown.len(), 2);
+            assert_eq!(
+                grown.get("ghledger000message000z"),
+                initial.get("ghledger000message000z")
+            );
+            assert!(grown.contains_key("ghledger002message000z"));
+            assert!(!grown.contains_key("ghledger001message000z"));
+            let grown_ledger = source_ledger(home);
+            assert_eq!(grown_ledger.len(), 2);
+            for (key, value) in &initial_ledger {
+                assert_eq!(
+                    grown_ledger.get(key),
+                    Some(value),
+                    "no cleanup reparse or row rewrite"
+                );
+            }
+            assert_searchable(home, "ghledger002message000z");
+
+            let mut content = fs::read_to_string(&first).unwrap();
+            content.push_str(&format!("{}\n", row(provider, 0, 1)));
+            fs::write(&first, content).unwrap();
+            index_with_exclusion(
+                home,
+                streaming,
+                "excluded-appended",
+                usize::from(reusable),
+                if reusable { 1 } else { 2 },
+                Some(&excluded),
+            );
+            let appended = archive_contents(home, 2);
+            assert_eq!(appended.len(), 3);
+            for (content, id) in &grown {
+                assert_eq!(appended.get(content), Some(id));
+            }
+            assert!(!appended.contains_key("ghledger001message000z"));
+            assert_searchable(home, "ghledger000message001z");
+
+            assert_eq!(fs::read(&excluded).unwrap(), excluded_bytes);
+            assert_eq!(
+                fs::metadata(&excluded).unwrap().modified().unwrap(),
+                excluded_mtime
+            );
+            index(
+                home,
+                streaming,
+                "exclusion-removed",
+                if reusable { 2 } else { 0 },
+                if reusable { 1 } else { 3 },
+            );
+            let recovered = archive(home, 3, true);
+            for (content, id) in &appended {
+                assert_eq!(recovered.get(content), Some(id));
+            }
+            assert_eq!(source_ledger(home).len(), 3);
+            assert_searchable(home, "ghledger001message000z");
+            index(
+                home,
+                streaming,
+                "exclusion-final",
+                if reusable { 3 } else { 0 },
+                if reusable { 0 } else { 3 },
+            );
+            assert_eq!(archive(home, 3, true), recovered);
         }
     }
 }

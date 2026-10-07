@@ -624,6 +624,47 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
         drop(conversations);
         limiter.release(byte_reservation);
         assert!(rx.try_recv().is_err());
+
+        // Whole-source exclusion capability never certifies a projection that
+        // the host actually filtered. A later unfiltered attempt must still run.
+        config.source_ledger = Arc::new(HashMap::new());
+        let mut filtered_count = 0;
+        scan_with_durable_source_boundaries(
+            &connector,
+            &ctx,
+            &config,
+            &mut sender,
+            |_| {
+                filtered_count += 1;
+                Ok(None)
+            },
+        )?;
+        sender.flush()?;
+        assert_eq!(filtered_count, 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "filtered content must not acquire a completion"
+        );
+        scan_with_durable_source_boundaries(
+            &connector,
+            &ctx,
+            &config,
+            &mut sender,
+            |conversation| Ok(Some(conversation)),
+        )?;
+        sender.flush()?;
+        let IndexMessage::SourceComplete {
+            conversations,
+            byte_reservation,
+            ..
+        } = rx.try_recv()?
+        else {
+            panic!("a stable unfiltered retry must acquire the completion");
+        };
+        assert_eq!(conversations.len(), 1);
+        drop(conversations);
+        limiter.release(byte_reservation);
+        assert!(rx.try_recv().is_err());
     }
     Ok(())
 }

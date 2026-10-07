@@ -14206,7 +14206,17 @@ fn scan_with_durable_source_boundaries(
             *flush_error.borrow_mut() = Some(error);
             return false;
         }
-        filtered.set(scan_path_exclusions_active());
+        // Some connectors exclude complete source files before this hook. An
+        // unrelated exclusion does not make an admitted transcript partial.
+        // Keep conservative behavior for unknown/partial-source filters; the
+        // prepare callback below still withholds any actually filtered source.
+        filtered.set(
+            scan_path_exclusions_active()
+                && !crate::connectors::source_dependencies::can_reuse_with_path_exclusions(
+                    sender.borrow().connector_name,
+                    &source.provider_slug,
+                ),
+        );
         // The connector may already have selected its sidecars by this hook.
         // Use the pre-discovery parent, not a later snapshot that could bless
         // an untracked sidecar appearing between discovery and admission.

@@ -33,16 +33,27 @@ impl SourceDependencyPolicy {
 /// Explicit opt-in owned by the concrete connector adapter.
 pub(crate) trait SourceDependencyCapability {
     const SOURCE_DEPENDENCIES: SourceDependencyPolicy;
+
+    /// Exclusions are applied to the entire source BEFORE its admission hook,
+    /// never to messages or reconstruction inputs within an admitted source.
+    /// This is independent of self-containment: a single-file container could
+    /// still apply exclusions to only some of the sessions stored inside it.
+    const WHOLE_SOURCE_EXCLUSIONS: bool = false;
 }
 
 // Both adapters delegate source boundaries to FAD's single-transcript readers.
 // Revisit these declarations if either adapter starts consulting sibling files.
 impl SourceDependencyCapability for super::claude_code::ClaudeCodeConnector {
     const SOURCE_DEPENDENCIES: SourceDependencyPolicy = SourceDependencyPolicy::SelfContained;
+    // FAD rejects the session path before should_scan, then parses it whole.
+    const WHOLE_SOURCE_EXCLUSIONS: bool = true;
 }
 
 impl SourceDependencyCapability for super::codex::CodexConnector {
     const SOURCE_DEPENDENCIES: SourceDependencyPolicy = SourceDependencyPolicy::SelfContained;
+    // The CASS budget/exclusion adapter rejects the rollout before either
+    // parser pass or the host hook. Archived rollouts use the same admission.
+    const WHOLE_SOURCE_EXCLUSIONS: bool = true;
 }
 
 pub(crate) struct ConnectorRegistration {
@@ -50,6 +61,7 @@ pub(crate) struct ConnectorRegistration {
     pub(crate) source_slug: &'static str,
     pub(crate) factory: ConnectorFactory,
     pub(crate) source_dependencies: SourceDependencyPolicy,
+    whole_source_exclusions: bool,
 }
 
 impl ConnectorRegistration {
@@ -59,6 +71,7 @@ impl ConnectorRegistration {
             source_slug: name,
             factory,
             source_dependencies: SourceDependencyPolicy::default(),
+            whole_source_exclusions: false,
         }
     }
 
@@ -68,26 +81,51 @@ impl ConnectorRegistration {
     ) -> Self {
         self.source_slug = source_slug;
         self.source_dependencies = T::SOURCE_DEPENDENCIES;
+        self.whole_source_exclusions = T::WHOLE_SOURCE_EXCLUSIONS;
         self
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct SourceCapabilities {
+    dependencies: SourceDependencyPolicy,
+    whole_source_exclusions: bool,
+}
+
 /// Resolve source slugs from the same registrations that construct connectors.
 /// Initialization happens once, not once per transcript on the reuse fast path.
-pub(crate) fn source_dependency_policy(source_slug: &str) -> SourceDependencyPolicy {
-    static POLICIES: OnceLock<HashMap<&'static str, SourceDependencyPolicy>> = OnceLock::new();
-    POLICIES
+fn source_capabilities(source_slug: &str) -> SourceCapabilities {
+    static CAPABILITIES: OnceLock<HashMap<&'static str, SourceCapabilities>> = OnceLock::new();
+    CAPABILITIES
         .get_or_init(|| {
             let mut policies = HashMap::new();
             for registration in super::get_connector_registrations() {
-                policies.insert(registration.name, registration.source_dependencies);
-                policies.insert(registration.source_slug, registration.source_dependencies);
+                let capabilities = SourceCapabilities {
+                    dependencies: registration.source_dependencies,
+                    whole_source_exclusions: registration.whole_source_exclusions,
+                };
+                policies.insert(registration.name, capabilities);
+                policies.insert(registration.source_slug, capabilities);
             }
             policies
         })
         .get(source_slug)
         .copied()
         .unwrap_or_default()
+}
+
+pub(crate) fn source_dependency_policy(source_slug: &str) -> SourceDependencyPolicy {
+    source_capabilities(source_slug).dependencies
+}
+
+/// An unrelated exclusion must not force every admitted transcript to reparse.
+/// Require an explicit declaration from both the running registration and its
+/// source identity. Unknown adapters cannot borrow a known provider's promise.
+/// The indexer still withholds completion if its own prepare callback filters
+/// any conversation; aggregate scan watermarks must also remain conservative.
+pub(crate) fn can_reuse_with_path_exclusions(connector_name: &str, source_slug: &str) -> bool {
+    source_capabilities(connector_name).whole_source_exclusions
+        && source_capabilities(source_slug).whole_source_exclusions
 }
 
 #[cfg(test)]
@@ -118,5 +156,40 @@ mod tests {
             source_dependency_policy("future-connector"),
             SourceDependencyPolicy::ObserveParentDirectory
         );
+    }
+
+    #[test]
+    fn gh512_whole_source_exclusions_require_explicit_runtime_capabilities() {
+        for (registration, source) in [("claude", "claude_code"), ("codex", "codex")] {
+            assert!(can_reuse_with_path_exclusions(registration, source));
+            assert!(!can_reuse_with_path_exclusions("unknown", source));
+            assert!(!can_reuse_with_path_exclusions(registration, "unknown"));
+        }
+        for registration in super::super::get_connector_registrations() {
+            assert_eq!(
+                can_reuse_with_path_exclusions(registration.name, registration.source_slug),
+                registration.whole_source_exclusions,
+            );
+            if !matches!(registration.source_slug, "claude_code" | "codex") {
+                assert!(!registration.whole_source_exclusions);
+            }
+        }
+    }
+
+    #[test]
+    fn gh512_self_containment_does_not_imply_whole_source_filtering() {
+        struct PartiallyFilteredContainer;
+        impl SourceDependencyCapability for PartiallyFilteredContainer {
+            const SOURCE_DEPENDENCIES: SourceDependencyPolicy =
+                SourceDependencyPolicy::SelfContained;
+        }
+        let factory = super::super::get_connector_factories()[0].1;
+        let registration = ConnectorRegistration::new("fixture", factory)
+            .with_source_capability::<PartiallyFilteredContainer>("fixture");
+        assert_eq!(
+            registration.source_dependencies,
+            SourceDependencyPolicy::SelfContained
+        );
+        assert!(!registration.whole_source_exclusions);
     }
 }
