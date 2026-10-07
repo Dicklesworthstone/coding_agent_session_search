@@ -53,6 +53,17 @@ pub(crate) fn ledger_matches(
     let Some(files) = saved["dependencies"].as_array() else {
         return false;
     };
+    if observes_parent_directory
+        && !files.iter().any(|file| {
+            file["path"]
+                .as_str()
+                .is_some_and(|path| Some(Path::new(path)) == source_path.parent())
+        })
+    {
+        // A sidecar-aware parse is not reusable without its directory evidence,
+        // even if all explicitly listed files (or an empty list) still match.
+        return false;
+    }
     // Old rows retain their exact shape. Only a self-contained connector's
     // implicit immediate parent is irrelevant; explicit files remain evidence,
     // including absence observations for sidecars that have not appeared yet.
@@ -150,6 +161,38 @@ mod tests {
         }
         let row = saved(&path, vec![serde_json::json!({"path": 7})]);
         assert!(!ledger_matches(&row, &path, false, CONTRACT));
+    }
+
+    #[test]
+    fn sidecar_aware_reuse_requires_the_parent_observation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("primary");
+        let sidecar = temp.path().join("metadata");
+        fs::write(&path, b"transcript").unwrap();
+        fs::write(&sidecar, b"metadata").unwrap();
+        for dependencies in [vec![], vec![file_observation(&sidecar).unwrap()]] {
+            let row = saved(&path, dependencies);
+            assert!(ledger_matches(&row, &path, false, CONTRACT));
+            assert!(!ledger_matches(&row, &path, true, CONTRACT));
+            // Even unchanged explicitly listed files cannot prove that some
+            // previously absent optional file has not appeared in the folder.
+            grow(temp.path(), "new-optional-dependency");
+            assert!(!ledger_matches(&row, &path, true, CONTRACT));
+        }
+        let row = saved(&path, vec![file_observation(temp.path()).unwrap()]);
+        assert!(ledger_matches(&row, &path, true, CONTRACT));
+    }
+
+    #[test]
+    fn removing_a_previously_certified_primary_invalidates_every_policy() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("primary");
+        fs::write(&path, b"transcript").unwrap();
+        let row = saved(&path, vec![file_observation(temp.path()).unwrap()]);
+        fs::remove_file(&path).unwrap();
+        for observes_parent in [false, true] {
+            assert!(!ledger_matches(&row, &path, observes_parent, CONTRACT));
+        }
     }
 
     // Pre-GH512 decision logic, kept live in the SAME benchmark invocation.
