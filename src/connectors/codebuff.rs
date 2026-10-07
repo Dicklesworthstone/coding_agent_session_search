@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
 
+use super::codex::path_policy::ScanExclusions;
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
     ScanContext, ScanRoot,
@@ -54,6 +55,38 @@ impl CodebuffConnector {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn source_excluded(source: &DiscoveredSourceFile, exclusions: &ScanExclusions) -> bool {
+        // FAD always consults the adjacent run state when reconstructing a
+        // chat. Excluding either input defers the whole reconstruction unit;
+        // do not read an excluded sidecar or synthesize replacement metadata.
+        // Check even a currently absent sidecar so its later creation cannot
+        // turn an admitted transcript into an excluded-input read.
+        exclusions.excludes(&source.source_path.with_file_name("chat-messages.json"))
+            || exclusions.excludes(&source.source_path.with_file_name("run-state.json"))
+    }
+
+    fn discover_allowed(
+        &self,
+        ctx: &ScanContext,
+        exclusions: &ScanExclusions,
+    ) -> Result<Vec<DiscoveredSourceFile>> {
+        exclusions.validate()?;
+        let mut scoped = ctx.clone();
+        if !ctx.use_default_detection() {
+            scoped.scan_roots.retain(|root| !exclusions.excludes(&root.path));
+            if scoped.scan_roots.is_empty() {
+                // Empty *selected* roots must never fall through to FAD's
+                // implicit home discovery, even when that home has history.
+                return Ok(Vec::new());
+            }
+        }
+        // Keep FAD's layout recognition and metadata-only enumeration. Do not
+        // turn a real discovery failure into a purported complete empty scan.
+        let mut sources = self.inner.discover_source_files(&scoped)?;
+        sources.retain(|source| !Self::source_excluded(source, exclusions));
+        Ok(sources)
     }
 
     fn source_context(ctx: &ScanContext, source: &DiscoveredSourceFile) -> ScanContext {
@@ -116,7 +149,7 @@ impl Connector for CodebuffConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        self.inner.discover_source_files(ctx)
+        self.discover_allowed(ctx, &ScanExclusions::from_env())
     }
 
     fn supports_streaming_scan(&self) -> bool {
@@ -128,7 +161,12 @@ impl Connector for CodebuffConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        self.inner.scan(ctx)
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        Ok(conversations)
     }
 
     fn scan_with_callback(
@@ -136,7 +174,7 @@ impl Connector for CodebuffConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner.scan_with_callback(ctx, on_conversation)
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
     }
 
     fn scan_with_source_boundaries(
@@ -145,13 +183,14 @@ impl Connector for CodebuffConnector {
         hooks: &mut SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        let exclusions = ScanExclusions::from_env();
         let mut discovery = ctx.clone();
         if hooks.should_scan_source.is_some() {
             // A durable source predicate, not a global time cutoff, owns resume.
             // Otherwise an old failed source can be excluded before admission.
             discovery.since_ts = None;
         }
-        let sources = self.inner.discover_source_files(&discovery)?;
+        let sources = self.discover_allowed(&discovery, &exclusions)?;
         let mut dependencies: HashMap<_, Vec<_>> = HashMap::new();
         for source in &sources {
             if source.role == DiscoveredSourceRole::MetadataSidecar {
@@ -164,8 +203,17 @@ impl Connector for CodebuffConnector {
         let mut first_failure: Option<anyhow::Error> = None;
         let mut failures = 0usize;
         for source in sources {
-            if source.role != DiscoveredSourceRole::PrimarySessionLog || !hooks.should_scan(&source)
+            if source.role != DiscoveredSourceRole::PrimarySessionLog
+                || Self::source_excluded(&source, &exclusions)
+                || !hooks.should_scan(&source)
             {
+                continue;
+            }
+            // Re-resolve aliases after the host's admission hook and before
+            // opening any content. A prior callback can retarget a later
+            // source's symlink; a discovery-time decision is not a cache.
+            // This is admission enforcement, not a handle-bound sandbox.
+            if Self::source_excluded(&source, &exclusions) {
                 continue;
             }
             let sidecars = dependencies
@@ -191,7 +239,17 @@ impl Connector for CodebuffConnector {
                     conversations_emitted += 1;
                     Ok(())
                 })
-                .and_then(|()| self.unchanged(&single, &source, &sidecars, directory_before));
+                .and_then(|()| {
+                    if hooks.on_source_complete.is_none() {
+                        // Plain streaming/collecting callers do not certify
+                        // source reuse and need no post-parse discovery.
+                        return Ok(false);
+                    }
+                    if Self::source_excluded(&source, &exclusions) {
+                        return Ok(false);
+                    }
+                    self.unchanged(&single, &source, &sidecars, directory_before)
+                });
             match result {
                 Err(error) if delivery_failed => return Err(error),
                 Err(error) => {
