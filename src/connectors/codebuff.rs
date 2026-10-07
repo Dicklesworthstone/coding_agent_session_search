@@ -4,6 +4,8 @@
 //! collecting scan cannot expose per-file completions, so admit each discovered
 //! transcript through CASS's ledger before delegating its parsing back to FAD.
 
+mod discovery;
+mod scan_failures;
 mod watch_scope;
 
 use std::collections::HashMap;
@@ -218,7 +220,10 @@ impl Connector for CodebuffConnector {
             // Otherwise an old failed source can be excluded before admission.
             discovery.since_ts = None;
         }
-        let sources = self.discover_allowed(&discovery, &exclusions)?;
+        let mut failures = scan_failures::ScanFailures::default();
+        let sources = discovery::discover_for_scan(&discovery, &mut failures, |scope| {
+            self.discover_allowed(scope, &exclusions)
+        })?;
         let mut dependencies: HashMap<_, Vec<_>> = HashMap::new();
         for source in &sources {
             if source.role == DiscoveredSourceRole::MetadataSidecar {
@@ -228,8 +233,6 @@ impl Connector for CodebuffConnector {
                     .push(source.clone());
             }
         }
-        let mut first_failure: Option<anyhow::Error> = None;
-        let mut failures = 0usize;
         for source in sources {
             if source.role != DiscoveredSourceRole::PrimarySessionLog
                 || Self::source_excluded(&source, &exclusions)
@@ -281,8 +284,7 @@ impl Connector for CodebuffConnector {
             match result {
                 Err(error) if delivery_failed => return Err(error),
                 Err(error) => {
-                    failures += 1;
-                    first_failure.get_or_insert(error);
+                    failures.record(source.source_path.clone(), error);
                 }
                 Ok(false) => {
                     // Messages may have been emitted, but changed/unobservable
@@ -299,14 +301,7 @@ impl Connector for CodebuffConnector {
                 })?,
             }
         }
-        match first_failure {
-            None => Ok(()),
-            Some(error) if failures == 1 => Err(error),
-            Some(error) => {
-                let summary = format!("{error:#} (and {} more failed transcripts)", failures - 1);
-                Err(error.context(summary))
-            }
-        }
+        failures.finish()
     }
 }
 
