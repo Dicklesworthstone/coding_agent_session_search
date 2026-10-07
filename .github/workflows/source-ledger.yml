@@ -19,10 +19,17 @@ permissions:
   contents: read
 jobs:
   discovery-source:
-    runs-on: ubuntu-slim
-    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-slim, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
@@ -66,6 +73,7 @@ jobs:
           with tempfile.TemporaryDirectory(prefix='gh512-discovery-') as directory:
               work = Path(directory)
               subprocess.run(['git', 'init', '-q'], cwd=work, check=True)
+              subprocess.run(['git', 'config', 'core.autocrlf', 'false'], cwd=work, check=True)
               for name, sha in bases.items():
                   current = request('/contents/' + name + '?ref=' + os.environ['GITHUB_SHA'])
                   assert current['sha'] == sha, 'source drift: ' + name
@@ -96,11 +104,41 @@ jobs:
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: gh512-discovery-${{ github.sha }}
+          name: gh512-discovery-${{ github.sha }}-${{ matrix.os }}
           path: |
             gh512-discovery-source.json
             gh512-discovery-source.tar.gz
           if-no-files-found: error
+          retention-days: 7
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: matcher-source
+      - name: Stage the exact exported observation module
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, tarfile
+          from pathlib import Path
+          name = 'src/connectors/source_dependencies/observation.rs'
+          receipt = json.loads(Path('gh512-discovery-source.json').read_text())
+          with tarfile.open('gh512-discovery-source.tar.gz', 'r:gz') as archive:
+              member = archive.getmember(name)
+              assert member.isfile()
+              data = archive.extractfile(member).read()
+          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == receipt['blobs'][name]
+          Path('matcher-source', name).write_bytes(data)
+          PY
+      - name: Exact candidate native module tests and workload benchmark
+        run: |
+          set -o pipefail
+          python3 matcher-source/scripts/test_source_ledger_matcher.py --bench 2>&1 | tee gh512-candidate-matcher.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: gh512-candidate-matcher-${{ github.sha }}-${{ matrix.os }}
+          path: gh512-candidate-matcher.log
+          if-no-files-found: warn
           retention-days: 7
   matcher:
     runs-on: ubuntu-slim
