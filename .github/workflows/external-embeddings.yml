@@ -1,32 +1,132 @@
 name: External embedding contract
-on:
-  push:
-    branches: [main]
-    paths:
-      - src/search/external_embedder.rs
-      - src/search/external_embedder/**
-      - src/search/embedder_registry.rs
-      - src/search/embedder_registry/**
-      - src/search/model_manager.rs
-      - src/search/model_manager/**
-      - src/indexer/semantic.rs
-      - src/indexer/semantic/**
-      - src/indexer/mod.rs
-      - src/lib.rs
-      - src/schedule.rs
-      - tests/external_backfill_runtime.rs
-      - tests/external_backfill_runtime/**
-      - tests/e2e_external_embeddings.rs
-      - .github/workflows/external-embeddings.yml
-  workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  source-export:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+      with:
+        toolchain: nightly-2026-08-31
+        components: rustfmt
+    - name: Export exact reconciled producer continuity sources without ref writes
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        python3 - <<'PY'
+        import base64, gzip, hashlib, json, os, subprocess, tarfile, urllib.request
+        from pathlib import Path
+
+        assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+        api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+        def request(path, body=None):
+            data = None if body is None else json.dumps(body).encode()
+            req = urllib.request.Request(api + path, data=data, headers={
+                'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        def digest(data):
+            return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+        def blob(sha):
+            value = request('/git/blobs/' + sha)
+            assert value['encoding'] == 'base64'
+            data = base64.b64decode(value['content'])
+            assert digest(data) == sha
+            return data
+        parts = ['aab53eabf0dbaa834980b04fde8768ec13006cc2', 'b8690afd70e6b6c885b7f7fa7ec6263d63b13d93',
+                 '37df1ecbfeb67b1404fc402764985ad058e9cb26', 'ed56fa2a49dce984f131a348b5c1abb10c5cb882',
+                 '05f37bb46d01fb8bd2c577c38ae1eb98af65829f', 'efff22dc93f7fecf0386cbc572fd23a85f8beca1',
+                 '99728a9fcda183b3c1d5ebc4c9bec7634265d004', '6bb7ad78a9ac9f93ce96b8317e84840fcb7b1575',
+                 'cf7a57c30e840d7dfd6bc32cd105283d1cd16146']
+        compressed = base64.b64decode(b''.join(blob(part) for part in parts), validate=True)
+        assert digest(compressed) == '9a70002a0c0fb6d887928287779c29f3a58b3aba'
+        raw = gzip.decompress(compressed)
+        assert hashlib.sha256(raw).hexdigest() == '23f154c8dbf77e11b4e677838032851ec5a98b15a9ca191c44dd18d1c8f8c26c'
+        payload = json.loads(raw)
+        allowed = {'src/indexer/semantic.rs', 'src/indexer/semantic/engine.rs', 'src/indexer/semantic/delegate.rs',
+                   'src/indexer/semantic/shard_publication_tests.rs', 'src/search/external_embedder.rs',
+                   'src/search/external_embedder/evidence.rs', 'src/search/model_manager/external.rs',
+                   'src/search/model_manager/external/tests.rs', 'src/search/model_manager/external/tests/probe_binding.rs',
+                   'docs/EXTERNAL_EMBEDDINGS.md'}
+        assert set(payload['bases']) == set(payload['results']) == allowed
+        # Preserve the exact intervening append change from 90ab4c33. No fuzzy merge.
+        delegate = 'src/indexer/semantic/delegate.rs'
+        append_edits = [
+            ('impl SemanticIndexer {', 'mod append;\n\nimpl SemanticIndexer {'),
+            ('    pub fn append_to_index(\n', '    /// Prepare one bounded, validated, last-write-wins batch before taking the\n    /// live writer lock. Oversized requests are refused, never partially split.\n    /// CASS_SEMANTIC_APPEND_MAX_BYTES can lower the 64 MiB retained-payload cap.\n    pub fn append_to_index(\n'),
+            ('        self.inner.append_to_index(embedded_messages, data_dir)', '        append::run(self, embedded_messages, data_dir)'),
+        ]
+        after, bases = {}, {}
+        for name, expected in payload['bases'].items():
+            path = Path(name)
+            assert not any(parent.is_symlink() for parent in [path, *path.parents]), name
+            observed = digest(path.read_bytes()) if path.exists() else None
+            bases[name] = observed
+            content = path.read_text() if observed is not None else None
+            if name == delegate:
+                assert observed == '0097875d17b9b07ad0fef6df0a88e68e9802e641', 'delegate source drift'
+                for old, new in reversed(append_edits):
+                    assert content.count(new) == 1
+                    content = content.replace(new, old, 1)
+                assert digest(content.encode()) == expected
+            else:
+                assert observed == expected, 'source drift: ' + name
+            if content is not None:
+                after[name] = content
+        for edit in payload['edits']:
+            name = edit['path']
+            assert name in after and after[name].count(edit['old']) == edit['count'] == 1, name
+            after[name] = after[name].replace(edit['old'], edit['new'], 1)
+        for name, content in payload['additions'].items():
+            assert name in allowed and bases[name] is None, name
+            after[name] = content
+        assert set(after) == allowed
+        for name, content in after.items():
+            assert digest(content.encode()) == payload['results'][name], name
+        for old, new in append_edits:
+            assert after[delegate].count(old) == 1
+            after[delegate] = after[delegate].replace(old, new, 1)
+        for name, content in after.items():
+            path = Path(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        rust = sorted(name for name in after if name.endswith('.rs'))
+        subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *rust], check=True)
+        subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *rust], check=True)
+        subprocess.run(['git', 'diff', '--check'], check=True)
+        receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}}
+        for name in sorted(after):
+            data = Path(name).read_bytes()
+            result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+            assert result['sha'] == digest(data), name
+            receipt['blobs'][name] = result['sha']
+        Path('external-probe-source-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        print('EXTERNAL_PROBE_SOURCE_RECEIPT=' + json.dumps(receipt, sort_keys=True))
+        with tarfile.open('external-probe-source.tar.gz', 'w:gz') as archive:
+            for path in [*sorted(after), 'external-probe-source-receipt.json']:
+                archive.add(path, arcname=path)
+        PY
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: external-probe-source-${{ github.sha }}
+        path: external-probe-source.tar.gz
+        if-no-files-found: error
+        retention-days: 7
   native:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os:
+        - ubuntu-24.04
+        - macos-15
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -36,35 +136,86 @@ jobs:
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '134217728'
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Verify the committed source revision
-        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: clippy, rustfmt
-      - name: External provider fake-server regressions
-        run: cargo test --locked --lib search::external_embedder::tests -- --nocapture
-      - name: Provider selection and retained local registry regressions
-        run: cargo test --locked --lib search::embedder_registry -- --nocapture
-      - name: External canonical backfill, query and signal regressions
-        run: cargo test --locked --test external_backfill_runtime -- --nocapture
-      - name: External query admission and zero-HTTP refusal regressions
-        run: cargo test --locked --lib search::model_manager::external::tests -- --nocapture
-      - name: External diagnostic cause and typed-error preservation
-        run: cargo test --locked --lib indexer::semantic::external_diagnostic_tests -- --nocapture
-      - name: Scheduler regression tests
-        run: cargo test --locked --lib schedule::tests -- --nocapture
-      - name: Existing local backfill CLI regressions
-        run: cargo test --locked --test e2e_semantic_backfill_robot -- --nocapture
-      - name: Semantic engine and artifact ownership regressions
-        run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
-      - name: External provider and CLI formatting
-        if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/search/external_embedder.rs src/search/external_embedder/retry.rs src/search/external_embedder/tests.rs src/search/external_embedder/tests/admission.rs src/search/external_embedder/tests/retries.rs src/search/embedder_registry.rs src/indexer/semantic.rs src/indexer/semantic/engine.rs src/indexer/semantic/shard_publication_tests.rs src/indexer/semantic/unchanged.rs src/indexer/semantic/unchanged/cancellation_tests.rs src/search/model_manager.rs src/search/model_manager/external.rs src/search/model_manager/external/tests.rs tests/external_backfill_runtime.rs tests/external_backfill_runtime/cli.rs src/lib.rs src/indexer/mod.rs src/schedule.rs
-      - name: Verify validation did not alter the committed sources
-        if: always()
-        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Verify the committed source revision
+      run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: external-probe-source-${{ github.sha }}
+    - name: Verify and install exact producer continuity candidate
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, tarfile
+        from pathlib import Path
+        with tarfile.open('external-probe-source.tar.gz', 'r:gz') as archive:
+            receipt = json.load(archive.extractfile('external-probe-source-receipt.json'))
+            def digest(data):
+                return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+            assert set(receipt['bases']) == set(receipt['blobs'])
+            for name, expected in receipt['blobs'].items():
+                path = Path(name)
+                assert not path.is_absolute() and '..' not in path.parts
+                assert not any(p.is_symlink() for p in [path, *path.parents])
+                assert (digest(path.read_bytes()) if path.exists() else None) == receipt['bases'][name]
+                member = archive.getmember(name)
+                assert member.isfile()
+                data = archive.extractfile(member).read()
+                assert digest(data) == expected
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+        PY
+    - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+      with:
+        toolchain: nightly-2026-08-31
+        components: clippy, rustfmt
+    - name: External provider fake-server regressions
+      run: cargo test --locked --lib search::external_embedder::tests -- --nocapture
+    - name: Persisted external producer admission regressions
+      run: cargo test --locked --lib search::external_embedder::evidence::tests -- --nocapture
+    - name: Provider selection and retained local registry regressions
+      run: cargo test --locked --lib search::embedder_registry -- --nocapture
+    - name: External canonical backfill, query and signal regressions
+      run: cargo test --locked --test external_backfill_runtime -- --nocapture
+    - name: External query admission and zero-HTTP refusal regressions
+      run: cargo test --locked --lib search::model_manager::external::tests -- --nocapture
+    - name: External diagnostic cause and typed-error preservation
+      run: cargo test --locked --lib indexer::semantic::external_diagnostic_tests -- --nocapture
+    - name: Scheduler regression tests
+      run: cargo test --locked --lib schedule::tests -- --nocapture
+    - name: Existing local backfill CLI regressions
+      run: cargo test --locked --test e2e_semantic_backfill_robot -- --nocapture
+    - name: Semantic engine and artifact ownership regressions
+      run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
+    - name: External provider and CLI formatting
+      if: always()
+      run: rustfmt --edition 2024 --check --config skip_children=true src/search/external_embedder.rs src/search/external_embedder/evidence.rs
+        src/search/external_embedder/retry.rs src/search/external_embedder/tests.rs src/search/external_embedder/tests/admission.rs src/search/external_embedder/tests/retries.rs
+        src/search/embedder_registry.rs src/indexer/semantic.rs src/indexer/semantic/engine.rs src/indexer/semantic/delegate.rs src/indexer/semantic/shard_publication_tests.rs
+        src/indexer/semantic/unchanged.rs src/indexer/semantic/unchanged/cancellation_tests.rs src/search/model_manager.rs src/search/model_manager/external.rs
+        src/search/model_manager/external/tests.rs src/search/model_manager/external/tests/probe_binding.rs tests/external_backfill_runtime.rs
+        tests/external_backfill_runtime/cli.rs src/lib.rs src/indexer/mod.rs src/schedule.rs
+    needs: source-export
+'on':
+  push:
+    branches:
+    - main
+    paths:
+    - src/search/external_embedder.rs
+    - src/search/external_embedder/**
+    - src/search/embedder_registry.rs
+    - src/search/embedder_registry/**
+    - src/search/model_manager.rs
+    - src/search/model_manager/**
+    - src/indexer/semantic.rs
+    - src/indexer/semantic/**
+    - src/indexer/mod.rs
+    - src/lib.rs
+    - src/schedule.rs
+    - tests/external_backfill_runtime.rs
+    - tests/external_backfill_runtime/**
+    - tests/e2e_external_embeddings.rs
+    - .github/workflows/external-embeddings.yml
+  workflow_dispatch: null
