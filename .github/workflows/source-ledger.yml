@@ -115,7 +115,11 @@ jobs:
         if: always()
         run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
   exclusion-source:
-    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-slim]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     permissions:
       contents: write
@@ -198,7 +202,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: gh512-exclusions-source-${{ github.sha }}
+          name: gh512-exclusions-source-${{ github.sha }}-${{ matrix.os }}
           path: |
             gh512-exclusions-source.json
             gh512-exclusions-source.tar.gz
