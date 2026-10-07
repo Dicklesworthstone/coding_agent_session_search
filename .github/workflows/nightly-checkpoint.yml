@@ -1,0 +1,112 @@
+name: Nightly checkpoint preservation
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/schedule.rs
+      - src/indexer/semantic.rs
+      - src/indexer/semantic/**
+      - tests/external_backfill_runtime.rs
+      - tests/external_backfill_runtime/**
+      - .github/workflows/nightly-checkpoint.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Apply reviewed patch and export exact source objects without ref writes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, subprocess, tarfile, tempfile, urllib.request
+          from pathlib import Path
+          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          bases = {
+              'src/indexer/semantic.rs': '5217e692a61b0ed325d8bb47a9516e4599c8aa4e',
+              'src/schedule.rs': '432c8c73b3d915dbf334f941b511e7d9cf9ed1ea',
+              'tests/external_backfill_runtime/cli.rs': '35679148264c631ef2a3f6a6b23c462959b1aeb1',
+          }
+          results = {
+              'src/indexer/semantic.rs': '03676f8923e55da68a51ca0e92635bf8e1125939',
+              'src/schedule.rs': 'f0d738560cafff84a3e56c54e2c590250797ea22',
+              'tests/external_backfill_runtime/cli.rs': '40f41a434b227f9dd2e5a576d897fed7a404a171',
+          }
+          for name, expected in bases.items():
+              path = Path(name)
+              assert not any(p.is_symlink() for p in [path, *path.parents]), name
+              assert digest(path.read_bytes()) == expected, 'source drift: ' + name
+          sha = 'b054cd96d0219c3b83b2a930a6ed187054195b87'
+          value = request('/git/blobs/' + sha)
+          assert value['encoding'] == 'base64'
+          compressed = base64.b64decode(value['content'])
+          assert digest(compressed) == sha
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == '2172bfc40bba22bed0995e2e8d03d82ab4d7891fa0c3f3a818bc6ff8cd8e61c8'
+          with tempfile.NamedTemporaryFile() as pending:
+              pending.write(patch)
+              pending.flush()
+              subprocess.run(['git', 'apply', '--check', '--index', '--whitespace=error-all', pending.name], check=True)
+              subprocess.run(['git', 'apply', '--index', '--whitespace=error-all', pending.name], check=True)
+          changed = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert set(changed) == set(bases)
+          for name, expected in results.items():
+              assert digest(Path(name).read_bytes()) == expected, name
+          rust = sorted(bases)
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *rust], check=True)
+          subprocess.run(['rustfmt', '--edition', '2024', '--check', '--config', 'skip_children=true', *rust], check=True)
+          subprocess.run(['git', 'diff', '--check', 'HEAD'], check=True)
+          receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}}
+          for name in rust:
+              data = Path(name).read_bytes()
+              result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+              assert result['sha'] == digest(data), name
+              receipt['blobs'][name] = result['sha']
+          Path('nightly-checkpoint-source-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print('NIGHTLY_CHECKPOINT_SOURCE=' + json.dumps(receipt, sort_keys=True))
+          with tarfile.open('nightly-checkpoint-source.tar.gz', 'w:gz') as archive:
+              for name in [*rust, 'nightly-checkpoint-source-receipt.json']:
+                  archive.add(name, arcname=name)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nightly-checkpoint-source-${{ github.sha }}
+          path: nightly-checkpoint-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Scheduler checkpoint order and failure regressions
+        run: cargo test --locked --lib schedule::tests -- --nocapture
+      - name: Semantic engine and artifact ownership regressions
+        run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
+      - name: Real nightly, checkpoint, external transport and CLI regressions
+        run: cargo test --locked --test external_backfill_runtime -- --nocapture
