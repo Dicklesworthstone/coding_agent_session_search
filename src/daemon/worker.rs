@@ -4,6 +4,7 @@
 //! Adapted from xf's async worker to cass's sync daemon architecture.
 
 mod embedding_source;
+mod existing_index;
 mod work_queue;
 
 use std::collections::{HashMap, HashSet};
@@ -14,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use self::embedding_source::{EmbeddingMessageSource, SqliteEmbeddingSource};
+use self::existing_index::ExistingIndexState;
 use self::work_queue::{JobControl, Receiver, Sender};
 use crate::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
@@ -155,39 +157,6 @@ enum WorkerEmbedderKind {
         embedder_id: String,
         dimension: usize,
     },
-}
-
-#[derive(Debug, Default)]
-struct ExistingIndexState {
-    path_exists: bool,
-    readable: bool,
-    compatible: bool,
-    active_doc_counts: HashMap<String, usize>,
-    record_count: usize,
-    tombstone_count: usize,
-    wal_record_count: usize,
-}
-
-impl ExistingIndexState {
-    fn active_count(&self, doc_id: &str) -> usize {
-        if !self.compatible {
-            return 0;
-        }
-        self.active_doc_counts.get(doc_id).copied().unwrap_or(0)
-    }
-
-    fn exactly_matches(&self, current_doc_ids: &HashSet<String>) -> bool {
-        self.path_exists
-            && self.readable
-            && self.compatible
-            && self.tombstone_count == 0
-            && self.wal_record_count == 0
-            && self.record_count == current_doc_ids.len()
-            && self.active_doc_counts.len() == current_doc_ids.len()
-            && current_doc_ids
-                .iter()
-                .all(|doc_id| self.active_count(doc_id) == 1)
-    }
 }
 
 fn resolve_embedder_kind(
@@ -522,7 +491,10 @@ impl EmbeddingWorker {
             return Ok(EmbeddingPassOutcome::Cancelled);
         }
         let embedder_kind = resolve_embedder_kind(model_name, use_semantic)?;
-        let existing_state = self.load_existing_index_state(index_path, &embedder_kind);
+        let Some(existing_state) = ExistingIndexState::open(index_path, &embedder_kind, &cancelled)?
+        else {
+            return Ok(EmbeddingPassOutcome::Cancelled);
+        };
         let mut current_doc_ids = HashSet::new();
         let mut pending_passages: HashMap<u64, usize> = HashMap::new();
         let mut skipped_count = 0usize;
@@ -560,6 +532,7 @@ impl EmbeddingWorker {
             return Ok(EmbeddingPassOutcome::Cancelled);
         }
         if existing_state.exactly_matches(&current_doc_ids) {
+            existing_state.ensure_current()?;
             storage
                 .update_job_progress(job_id, saturating_i64_from_usize(messages.total_docs()))?;
             info!(
@@ -571,6 +544,7 @@ impl EmbeddingWorker {
         }
         storage.update_job_progress(job_id, completed)?;
         if input_count == 0 && !existing_state.path_exists {
+            existing_state.ensure_current()?;
             info!(
                 model = model_name,
                 skipped = skipped_count,
@@ -645,6 +619,9 @@ impl EmbeddingWorker {
             anyhow::bail!("daemon embedding source did not yield every planned passage");
         }
 
+        // Planning owns the original read-only index throughout both replays.
+        // A different publication must not inherit its vector-reuse decisions.
+        existing_state.ensure_current()?;
         // Preserve the existing private-candidate/atomic-publication path:
         // stale identities disappear and unchanged vectors retain exact bits.
         let save_path = vector_index_path(index_path, indexer.embedder_id());
@@ -679,79 +656,6 @@ impl EmbeddingWorker {
             "Saved vector index"
         );
         Ok(EmbeddingPassOutcome::Completed)
-    }
-
-    /// Load exact active document identities from an existing vector index.
-    fn load_existing_index_state(
-        &self,
-        index_path: &Path,
-        embedder_kind: &WorkerEmbedderKind,
-    ) -> ExistingIndexState {
-        let embedder_id = match embedder_kind {
-            WorkerEmbedderKind::Hash => "fnv1a-384",
-            WorkerEmbedderKind::FastEmbed { embedder_id, .. } => embedder_id.as_str(),
-        };
-        let expected_dimension = match embedder_kind {
-            WorkerEmbedderKind::Hash => crate::search::hash_embedder::DEFAULT_DIMENSION,
-            WorkerEmbedderKind::FastEmbed { dimension, .. } => *dimension,
-        };
-
-        let fsvi_path = vector_index_path(index_path, embedder_id);
-
-        if !fsvi_path.exists() {
-            return ExistingIndexState::default();
-        }
-
-        match VectorIndex::open(&fsvi_path) {
-            Ok(index) => {
-                let compatible =
-                    expected_vector_space_revision(embedder_id).is_some_and(|expected_revision| {
-                        index.embedder_id() == embedder_id
-                            && index.dimension() == expected_dimension
-                            && index.embedder_revision() == expected_revision
-                    });
-                let mut active_doc_counts = HashMap::new();
-                for idx in 0..index.record_count() {
-                    if index.is_deleted(idx) {
-                        continue;
-                    }
-                    let doc_id_str = match index.doc_id_at(idx) {
-                        Ok(doc_id) => doc_id,
-                        Err(_) => continue,
-                    };
-                    *active_doc_counts.entry(doc_id_str.to_owned()).or_insert(0) += 1;
-                }
-                debug!(
-                    path = %fsvi_path.display(),
-                    active = active_doc_counts.len(),
-                    records = index.record_count(),
-                    tombstones = index.tombstone_count(),
-                    wal_records = index.wal_record_count(),
-                    compatible,
-                    "Loaded existing semantic identities for reconciliation"
-                );
-                ExistingIndexState {
-                    path_exists: true,
-                    readable: true,
-                    compatible,
-                    active_doc_counts,
-                    record_count: index.record_count(),
-                    tombstone_count: index.tombstone_count(),
-                    wal_record_count: index.wal_record_count(),
-                }
-            }
-            Err(e) => {
-                warn!(
-                    path = %fsvi_path.display(),
-                    error = %e,
-                    "Failed to load existing index for reconciliation"
-                );
-                ExistingIndexState {
-                    path_exists: true,
-                    ..ExistingIndexState::default()
-                }
-            }
-        }
     }
 }
 
