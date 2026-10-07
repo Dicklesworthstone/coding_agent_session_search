@@ -29,7 +29,13 @@ fn cass(home: &Path, mode: &str) -> assert_cmd::Command {
             command.env(name, value);
         }
     }
-    // Leave both XDG variables and CASS_CODEBUFF_DATA_ROOT unset.
+    // Windows uses the OS profile rather than USERPROFILE. Isolate that
+    // platform via the public override; Unix keeps default-path coverage.
+    #[cfg(windows)]
+    command.env(
+        "CASS_CODEBUFF_DATA_ROOT",
+        home.join(".config/manicode/projects"),
+    );
     command
 }
 

@@ -27,7 +27,13 @@ fn cass(home: &Path, data: &Path, streaming: &str) -> Command {
     if let Ok(system_root) = dotenvy::var("SystemRoot") {
         command.env("SystemRoot", system_root);
     }
-    // XDG_CONFIG_HOME, XDG_DATA_HOME and CASS_CODEBUFF_DATA_ROOT stay unset.
+    // Windows uses the OS profile rather than USERPROFILE. Isolate that
+    // platform via the public override; Unix keeps default-path coverage.
+    #[cfg(windows)]
+    command.env(
+        "CASS_CODEBUFF_DATA_ROOT",
+        home.join(".config/manicode/projects"),
+    );
     command
 }
 
