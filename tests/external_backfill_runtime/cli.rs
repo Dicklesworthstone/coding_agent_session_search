@@ -527,8 +527,8 @@ fn external_cli_stale_scheduled_worker_cannot_erase_another_checkpoint() -> Resu
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("semantic_checkpoint_owned"));
     assert!(
-        corpus(&server).is_empty(),
-        "only fixed preflight probes may precede admission"
+        server.take_inputs().is_empty(),
+        "a foreign nightly producer must be refused before even fixed preflight probes"
     );
     assert_eq!(fs::read(&manifest_path)?, manifest_before);
     assert_eq!(fs::read(&staging)?, vectors_before);
@@ -710,5 +710,72 @@ fn external_cli_nightly_refuses_disabled_or_changed_resume_configuration_without
         );
         assert_eq!(fs::read(&staged)?, vectors_before);
     }
+    Ok(())
+}
+
+#[test]
+fn external_cli_protected_worker_refuses_ledger_and_consent_before_storage_or_http() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = seed(dir.path())?;
+    let server = Server::start(384)?;
+    let mut first = backfill(&server, dir.path(), &db, 1);
+    first.args(["--embedder", "external"]);
+    let first_report = success(run(first)?)?;
+    let staging = PathBuf::from(first_report["index_path"].as_str().context("staging path")?);
+    let ledger = SemanticManifest::path(dir.path());
+    let ledger_before = fs::read(&ledger)?;
+    let vectors_before = fs::read(&staging)?;
+    let database_before = fs::read(&db)?;
+    let sidecar = |suffix: &str| {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let wal = sidecar("-wal");
+    let shm = sidecar("-shm");
+    let sidecars_before = (fs::read(&wal).ok(), fs::read(&shm).ok());
+    server.take_inputs();
+
+    let mut disabled = backfill(&server, dir.path(), &db, 1);
+    disabled
+        .args(["--embedder", "external", "--scheduled"])
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CASS_SCHEDULE_PRESERVE_CHECKPOINT", "1")
+        .env("CASS_EXTERNAL_EMBEDDINGS", "0");
+    let refused = run(disabled)?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("external_disabled"));
+    assert!(server.take_inputs().is_empty());
+    assert_eq!(fs::read(&ledger)?, ledger_before);
+
+    fs::write(&ledger, b"{broken-worker-ledger")?;
+    // The external worker must not open the archive before discovering that
+    // its ledger cannot be admitted. Local workers retain their old late gate.
+    let mut external = backfill(&server, dir.path(), &db, 1);
+    external
+        .args(["--embedder", "external", "--scheduled"])
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CASS_SCHEDULE_PRESERVE_CHECKPOINT", "1");
+    let refused = run(external)?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("semantic_checkpoint_unreadable"));
+    assert!(server.take_inputs().is_empty());
+    assert_eq!(fs::read(&ledger)?, b"{broken-worker-ledger");
+    assert_eq!(fs::read(&staging)?, vectors_before);
+    assert_eq!(fs::read(&db)?, database_before);
+    assert_eq!((fs::read(&wal).ok(), fs::read(&shm).ok()), sidecars_before);
+    // Restore the same checkpoint and prove this refusal did not destroy resume.
+    fs::write(&ledger, &ledger_before)?;
+    let mut resume = backfill(&server, dir.path(), &db, 10);
+    resume
+        .args(["--embedder", "external", "--scheduled"])
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CASS_SCHEDULE_PRESERVE_CHECKPOINT", "1");
+    let resumed = success(run(resume)?)?;
+    assert_eq!(resumed["published"], true);
+    assert_eq!(resumed["model_initializations"], 1);
+    let sent = corpus(&server);
+    assert_eq!(sent.len(), 4);
+    assert!(sent.iter().all(|text| !text.contains("conversation 1")));
     Ok(())
 }

@@ -122,3 +122,45 @@ jobs:
           changed = set(subprocess.check_output(['git', 'diff', '--name-only', 'HEAD'], text=True).splitlines())
           assert changed == set(receipt['blobs']), changed
           PY
+  committed-worker:
+    # Test the shipped worker boundary independently of the still-unlanded
+    # direct-CLI candidate above. Never apply an overlay to this checkout.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify committed worker source
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - name: Committed scheduler ownership and budget regressions
+        run: cargo test --locked --lib schedule::tests -- --nocapture
+      - name: Committed startup admission and all semantic ownership regressions
+        run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
+      - name: Committed real nightly and external backfill CLI regressions
+        run: cargo test --locked --test external_backfill_runtime -- --nocapture
+      - name: Committed library Clippy
+        run: cargo clippy --locked --lib -- -D warnings
+      - name: Check worker source formatting
+        if: always()
+        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs tests/external_backfill_runtime/cli.rs
+      - name: Verify tests did not alter committed sources
+        if: always()
+        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
