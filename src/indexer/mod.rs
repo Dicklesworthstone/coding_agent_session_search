@@ -15491,6 +15491,9 @@ fn run_streaming_consumer(
                             "preserving this connector's scan watermark while allowing unrelated connectors to advance"
                         );
                     }
+                    if scan_start_ts.is_some() && !connector_watermark_safe {
+                        record_scan_contract_with_watermark_held(storage, connector_name, true);
+                    }
                 } else if !effective_scan_succeeded {
                     ingest_outcome.scan_had_errors = true;
                 }
@@ -16374,6 +16377,9 @@ fn run_batch_index_with_connector_factories(
                 path_exclusions_active = scan_path_exclusions_active(),
                 "preserving this completed batch connector's watermark while allowing unrelated connectors to advance"
             );
+            if persistence_completed && scan_start_ts.is_some() {
+                record_scan_contract_with_watermark_held(storage, pending.name, !opts.watch);
+            }
         }
         tracing::info!(
             connector = pending.name,
@@ -16466,22 +16472,23 @@ fn connector_local_scan_since_ts_map(
     connector_factories
         .iter()
         .map(|(name, _)| {
-            let (connector_last_scan_ts, connector_has_conversations) = connector_states
-                .get(*name)
-                .copied()
-                .unwrap_or((None, false));
+            let state = connector_states.get(*name).copied().unwrap_or_default();
             // OMP is newly split from the legacy Pi Agent identity. The
             // archive upgrade can legitimately create `omp` rows before the
             // dedicated connector has ever completed a scan; do one full OMP
             // scan until its own watermark exists so older profile/XDG roots
             // are not skipped by the global Pi-era cutoff.
-            let local_since_ts = if *name == "omp" && connector_last_scan_ts.is_none() {
+            let local_since_ts = if *name == "omp" && state.last_scan_ts.is_none() {
+                None
+            } else if state.scan_contract_pending {
+                // A source form this build reads can predate any cutoff (GH
+                // #513: compressed Codex rollouts keep old modification times).
                 None
             } else {
                 connector_local_scan_since_ts_from_state(
                     fallback_since_ts,
-                    connector_last_scan_ts,
-                    connector_has_conversations,
+                    state.last_scan_ts,
+                    state.has_conversations,
                 )
             };
             Ok((
@@ -16490,6 +16497,32 @@ fn connector_local_scan_since_ts_map(
             ))
         })
         .collect()
+}
+
+/// A successful scan under a connector's current scan contract read every
+/// source form the contract names, even when path exclusions or a skipped
+/// active source withheld its watermark (whose write otherwise records the
+/// contract). Without this such a connector would never get a cutoff again.
+fn record_scan_contract_with_watermark_held(
+    storage: &FrankenStorage,
+    connector_name: &str,
+    defer_checkpoints: bool,
+) {
+    if crate::storage::sqlite::connector_scan_contract(connector_name).is_none() {
+        return;
+    }
+    if let Err(error) = persist::with_ephemeral_writer(
+        storage,
+        defer_checkpoints,
+        "recording connector scan contract",
+        |writer| writer.record_connector_scan_contract(connector_name),
+    ) {
+        tracing::warn!(
+            connector = connector_name,
+            error = %error,
+            "connector scan contract save failed; the next run scans this connector without a cutoff again"
+        );
+    }
 }
 
 fn explicit_scan_root_since_ts(
@@ -52499,6 +52532,40 @@ mod tests {
                 Some(input)
             );
         }
+        Ok(())
+    }
+
+    /// GH #513: compressed Codex rollouts keep old modification times, so an
+    /// archive whose Codex watermark predates the contract scans Codex
+    /// without a cutoff until a scan under the contract succeeds.
+    #[test]
+    fn a_pending_codex_scan_contract_lifts_only_the_codex_cutoff() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("contract.sqlite"))?;
+        let watermark = 1_700_001_000_500;
+        storage.set_connector_last_scan_ts("claude", watermark)?;
+        // The Codex watermark an older build wrote, without the contract.
+        storage.raw().execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            &[
+                ParamValue::from("last_scan_ts:connector:codex"),
+                ParamValue::from(watermark.to_string()),
+            ],
+        )?;
+        let factories = get_connector_factories()
+            .into_iter()
+            .filter(|(name, _)| matches!(*name, "codex" | "claude"))
+            .collect::<Vec<_>>();
+        assert_eq!(factories.len(), 2);
+
+        let cutoffs = connector_local_scan_since_ts_map(&storage, Some(watermark), &factories)?;
+        assert_eq!(cutoffs["codex"], None, "the backlog needs an uncut scan");
+        assert_eq!(cutoffs["claude"], Some(watermark - 1));
+
+        // A succeeded scan whose watermark was held back still settles it.
+        record_scan_contract_with_watermark_held(&storage, "codex", false);
+        let cutoffs = connector_local_scan_since_ts_map(&storage, Some(watermark), &factories)?;
+        assert_eq!(cutoffs["codex"], Some(watermark - 1));
         Ok(())
     }
 

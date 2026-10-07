@@ -156,7 +156,8 @@ bytemuck = "1.25.0"
 frankensearch = { version = "=0.7.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 # Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
 # Keep both readers unconditional, including --no-default-features builds.
-franken-agent-detection = { version = "=0.3.5", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff"] }
+# codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
+franken-agent-detection = { version = "=0.3.6", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -246,6 +247,9 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
+# GH513 writes rollouts the way Codex compresses them; production reads them
+# through franken-agent-detection's codex-zstd feature.
+zstd = { version = "0.13", default-features = false }
 # GH470 measures native model input tokens without padding or silent truncation.
 # Reuse the tokenizer and regex backend already resolved by native MiniLM.
 tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }

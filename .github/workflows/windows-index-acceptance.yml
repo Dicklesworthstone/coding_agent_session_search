@@ -7,7 +7,9 @@ name: Windows index acceptance
 # index, a cold-reopen search, an incremental index, index-busy contention
 # against a running watcher, lock reacquisition and the truth surfaces, and
 # fails on any "panicked at" / "threads should not terminate unexpectedly" /
-# 0xC0000409 exit.
+# 0xC0000409 exit. The source job also proves Codex CASS_EXCLUDE_PATHS on
+# Windows (-CodexExclusions; bead coding_agent_session_search-2l1b0.37,
+# GH #486); the published release keeps the original journey.
 #
 # released: the latest published release (or the `release` input),
 #   downloaded and checksum-verified, never built.
@@ -121,7 +123,7 @@ jobs:
         run: |
           $work = Join-Path $env:RUNNER_TEMP 'accept-source'
           New-Item -ItemType Directory -Force -Path $work | Out-Null
-          ./scripts/windows_index_acceptance.ps1 -Cass $env:CASS_EXE -Fixture 'tests/fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl' -Work $work
+          ./scripts/windows_index_acceptance.ps1 -Cass $env:CASS_EXE -Fixture 'tests/fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl' -Work $work -CodexExclusions
 
       - name: Keep the command logs
         if: always()

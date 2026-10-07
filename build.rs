@@ -175,16 +175,18 @@ const CONTRACTS: &[DependencyContract] = &[
         // (2026-10-05) indexes native Codebuff transcripts, whose timestamps
         // are a locale time of day, taking each instant from the message ID
         // (cass#511); 0.3.5 keeps indexing a Codebuff store's other chats when
-        // one transcript does not parse, and names that transcript.
+        // one transcript does not parse, and names that transcript. 0.3.6
+        // (codex-zstd) reads Codex rollouts compressed to .jsonl.zst (cass#513).
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.5",
+        expected_version: "0.3.6",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[
             "chatgpt",
             "codebuff",
+            "codex-zstd",
             "connectors",
             "copilot-vscdb",
             "crush",

@@ -10,14 +10,20 @@
 #   4. while `cass index --watch` holds the index, a second `cass index`
 #      exits 7 with kind `index-busy`; after the watcher is stopped, the next
 #      `cass index` reacquires the lock and exits 0;
-#   5. status and health print parseable JSON.
+#   5. status and health print parseable JSON;
+#   6. with -CodexExclusions (bead 2l1b0.37 / GH #486): with CASS_EXCLUDE_PATHS
+#      naming a Codex session directory, given with backslashes and again with
+#      forward slashes, a full index finds the included Codex control session,
+#      and no byte of the data dir or of any command's output holds the
+#      excluded sessions' words (one of them in a Unicode-named rollout).
 # Every command must also be free of the GH #406 teardown panic: no
 # "panicked at" or "threads should not terminate unexpectedly" on stderr and
 # no 0xC0000409 exit, including after valid JSON was printed.
 param(
     [Parameter(Mandatory = $true)][string]$Cass,
     [Parameter(Mandatory = $true)][string]$Fixture,
-    [Parameter(Mandatory = $true)][string]$Work
+    [Parameter(Mandatory = $true)][string]$Work,
+    [switch]$CodexExclusions
 )
 $ErrorActionPreference = 'Stop'
 
@@ -133,9 +139,56 @@ $null = Get-Json 'status' $r.Stdout
 $r = Invoke-Cass 'health' @('health', '--json', '--data-dir', $data) @(0, 1)
 $null = Get-Json 'health' $r.Stdout
 
+# 6. Codex exclusions hold before parsing and raw capture (GH #486).
+if ($CodexExclusions) {
+    $codexHome = Join-Path $Work 'codex-home'
+    $excludedDay = Join-Path $codexHome 'sessions\2026\08\01'
+    $includedDay = Join-Path $codexHome 'sessions\2026\08\02'
+    New-Item -ItemType Directory -Force -Path $excludedDay, $includedDay | Out-Null
+    function New-Rollout {
+        param([string]$Path, [string]$Word)
+        $lines = @(
+            '{"timestamp":"2026-08-01T10:00:00Z","type":"session_meta","payload":{"cwd":"C:\\work"}}',
+            ('{"timestamp":"2026-08-01T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question ' + $Word + '"}]}}')
+        )
+        [IO.File]::WriteAllText($Path, ($lines -join "`n") + "`n")
+    }
+    New-Rollout (Join-Path $excludedDay 'rollout-2026-08-01T10-00-00-excluded.jsonl') 'codexexcludedsentinel'
+    New-Rollout (Join-Path $excludedDay 'rollout-2026-08-01T11-00-00-日本語.jsonl') 'codexunicodesentinel'
+    New-Rollout (Join-Path $includedDay 'rollout-2026-08-02T10-00-00-included.jsonl') 'codexincludedcontrol'
+    $env:CODEX_HOME = $codexHome
+    foreach ($variant in @(
+            @{ Name = 'backslash'; Path = $excludedDay },
+            @{ Name = 'slash'; Path = ($excludedDay -replace '\\', '/') })) {
+        $label = "codex-exclude-$($variant.Name)"
+        $variantData = Join-Path $Work "codex-data-$($variant.Name)"
+        New-Item -ItemType Directory -Force -Path $variantData | Out-Null
+        $env:CASS_EXCLUDE_PATHS = $variant.Path
+        $r = Invoke-Cass "$label-index" @('index', '--full', '--data-dir', $variantData, '--json') @(0)
+        $null = Get-Json "$label-index" $r.Stdout
+        $r = Invoke-Cass "$label-control" @('search', 'codexincludedcontrol', '--data-dir', $variantData, '--robot', '--mode', 'lexical', '--agent', 'codex', '--limit', '5') @(0)
+        $json = Get-Json "$label-control" $r.Stdout
+        $count = if ($json -and $json.hits) { @($json.hits).Count } else { 0 }
+        Write-Host "[$label-control] hits=$count"
+        if ($count -lt 1) { $failures.Add("$label found no hit for the included Codex control") }
+        $scanned = @(Get-ChildItem $variantData -Recurse -File) + @(Get-ChildItem $Work -File -Filter "$label-*")
+        foreach ($word in 'codexexcludedsentinel', 'codexunicodesentinel') {
+            $holders = @($scanned | Where-Object {
+                    [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($_.FullName)).Contains($word)
+                })
+            Write-Host "[$label] '$word' in $($holders.Count) of $($scanned.Count) files"
+            if ($holders.Count -gt 0) {
+                $failures.Add("$label stored the excluded word '$word' in $(($holders.FullName) -join ', ')")
+            }
+        }
+    }
+    Remove-Item Env:CASS_EXCLUDE_PATHS
+}
+
 if ($failures.Count -gt 0) {
     Write-Host "`nFAILED ($($failures.Count)):"
     $failures | ForEach-Object { Write-Host "  - $_" }
     exit 1
 }
-Write-Host "`nPASSED: index, cold search, incremental, contention and reacquisition, truth surfaces, no teardown panic"
+$codexPhase = if ($CodexExclusions) { ', Codex exclusions' } else { '' }
+Write-Host "`nPASSED: index, cold search, incremental, contention and reacquisition, truth surfaces$codexPhase, no teardown panic"

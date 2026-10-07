@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use franken_agent_detection::DiscoveredSourceRole;
+use franken_agent_detection::connectors::codex;
 use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
 use serde::Serialize;
 
@@ -80,9 +81,12 @@ impl ScanLimits {
         // FAD 0.3.0 selects its streaming parser only for lowercase jsonl.
         // Its other branch uses read_capped; raising that ceiling here would
         // silently certify skipped legacy data as successfully consumed.
+        // FAD 0.3.6 streams a compressed .jsonl.zst too, holding its decoded
+        // text to this same budget (GH #513).
         if path
             .extension()
             .is_some_and(|extension| extension == "jsonl")
+            || codex::is_compressed_rollout(path)
         {
             self.jsonl_bytes
         } else {
@@ -264,21 +268,49 @@ fn observed_over_limit(source: &DiscoveredSourceFile) -> Option<u64> {
 }
 
 fn observed_over_limit_with_limit(source: &DiscoveredSourceFile, limit: u64) -> Option<u64> {
+    let compressed = codex::is_compressed_rollout(&source.source_path);
     if source.provider_slug != "codex"
         || source.role != DiscoveredSourceRole::PrimarySessionLog
-        || !source
-            .source_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("jsonl") || extension.eq_ignore_ascii_case("json")
-            })
+        || !(compressed
+            || source
+                .source_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("jsonl")
+                        || extension.eq_ignore_ascii_case("json")
+                }))
     {
         return None;
     }
     // Refuse before primary parsing; never emit a truncated prefix as complete.
     let metadata = std::fs::metadata(&source.source_path).ok()?;
-    (metadata.is_file() && metadata.len() > limit).then_some(metadata.len())
+    if !metadata.is_file() {
+        return None;
+    }
+    let observed = if compressed {
+        std::fs::File::open(&source.source_path).map_or(metadata.len(), |file| {
+            text_len(&source.source_path, &file, metadata.len())
+        })
+    } else {
+        metadata.len()
+    };
+    (observed > limit).then_some(observed)
+}
+
+/// The length of a rollout's text: its file length or, for a compressed
+/// rollout, the decoded length its zstd frame header declares. Codex records
+/// that length when it compresses a rollout; one that declares none is sized
+/// by its file (FAD still holds its decoded text to the budget).
+fn text_len(path: &Path, file: &std::fs::File, file_len: u64) -> u64 {
+    if !codex::is_compressed_rollout(path) {
+        return file_len;
+    }
+    let mut source = file;
+    codex::compressed_rollout_declared_len(&mut source)
+        .ok()
+        .flatten()
+        .unwrap_or(file_len)
 }
 
 pub(super) fn scan(

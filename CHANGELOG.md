@@ -34,6 +34,20 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **Codex sessions compressed to `.jsonl.zst` are indexed (#513).** Codex's
+  `local_thread_store_compression` replaces a finished session's
+  `rollout-*.jsonl` with `rollout-*.jsonl.zst`. cass found only `.jsonl` and
+  `.json` rollouts, so a session compressed before cass first saw it was
+  never indexed, while `cass index` still reported success (the reporter had
+  20 of 1,609 sessions). franken-agent-detection 0.3.6 (`codex-zstd`) reads
+  them, and cass's enrichment pass reads the same decoded text. A compressed
+  session keeps the id of its plain form, so a session indexed before Codex
+  compressed it is not added again. Compressed files keep the plain file's old
+  modification time, which an incremental scan skips, so the first index run
+  on this version scans Codex with no cutoff; unchanged files already in the
+  index are still skipped. Decoded text is held to `CASS_CODEX_MAX_SOURCE_BYTES`
+  (100 MiB by default), and a larger session is reported as over the read
+  budget instead of being indexed short.
 - **A resumed full rebuild that cannot certify its document count rebuilds
   in the same run (#494).** When a resumed candidate held documents its
   checkpoint never counted, `cass index --full` replayed the rest of the

@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use franken_agent_detection::connectors::codex::rollout_session_path;
 
 use super::{Connector, DiscoveredSourceFile, Result, ScanContext, ScanRoot};
 
@@ -146,13 +147,15 @@ pub(super) fn session_id(ctx: &ScanContext, source: &DiscoveredSourceFile) -> Op
         return Some(id);
     }
     Path::new(ARCHIVE)
-        .join(relative.with_extension(""))
+        .join(rollout_session_path(relative))
         .to_str()
         .map(str::to_owned)
 }
 
 fn native_session_id(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    // A compressed rollout (GH #513) names the same session as its plain form.
+    let session = rollout_session_path(path);
+    let stem = session.file_name()?.to_str()?;
     let suffix = stem.strip_prefix("rollout-")?;
     let timestamp = suffix.get(..19)?;
     chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H-%M-%S").ok()?;

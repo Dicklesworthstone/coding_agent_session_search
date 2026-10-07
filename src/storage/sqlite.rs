@@ -1830,6 +1830,32 @@ pub fn is_user_data_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Connectors whose reader learned a source form that can already be on disk
+/// with an old modification time, which an incremental scan skips. Until a
+/// scan of the connector under its current contract succeeds, the connector
+/// is scanned without a cutoff; durable source reuse still skips unchanged
+/// files. codex: a rollout Codex compresses to `.jsonl.zst` keeps the plain
+/// rollout's modification time (GH #513).
+const CONNECTOR_SCAN_CONTRACTS: &[(&str, &str)] = &[("codex", "rollout-jsonl-zst")];
+
+/// The scan contract a connector's watermark must be recorded under.
+pub fn connector_scan_contract(connector_name: &str) -> Option<&'static str> {
+    let name = connector_name.trim();
+    CONNECTOR_SCAN_CONTRACTS
+        .iter()
+        .find(|(connector, _)| connector.eq_ignore_ascii_case(name))
+        .map(|(_, contract)| *contract)
+}
+
+/// What the indexer needs to choose a connector's incremental cutoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectorScanState {
+    pub last_scan_ts: Option<i64>,
+    pub has_conversations: bool,
+    /// The connector has a scan contract this archive has not recorded.
+    pub scan_contract_pending: bool,
+}
+
 /// SQL to register the FTS5 virtual table on a frankensqlite connection.
 ///
 /// FrankenSQLite skips virtual-table entries (rootpage=0) when loading
@@ -10025,12 +10051,51 @@ impl FrankenStorage {
     }
 
     /// Set the timestamp of the last successful scan for a specific connector.
+    /// The scan succeeded, so it also records the connector's scan contract.
     pub fn set_connector_last_scan_ts(&self, connector_name: &str, ts: i64) -> Result<()> {
         let key = Self::connector_last_scan_ts_meta_key(connector_name);
-        self.conn.execute_compat(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-            fparams![key.as_str(), ts.to_string()],
-        )?;
+        match connector_scan_contract(connector_name) {
+            Some(contract) => {
+                let contract_key = Self::connector_scan_contract_meta_key(connector_name);
+                self.conn.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2), (?3, ?4)",
+                    fparams![
+                        key.as_str(),
+                        ts.to_string(),
+                        contract_key.as_str(),
+                        contract
+                    ],
+                )?;
+            }
+            None => {
+                self.conn.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![key.as_str(), ts.to_string()],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn connector_scan_contract_meta_key(connector_name: &str) -> String {
+        format!(
+            "scan_contract:connector:{}",
+            connector_name.trim().to_ascii_lowercase()
+        )
+    }
+
+    /// Record that a scan of this connector under its current scan contract
+    /// succeeded, for a scan whose watermark was withheld (path exclusions, a
+    /// skipped active source): those hold back the watermark, not what the
+    /// scan read. No-op for a connector without a contract.
+    pub fn record_connector_scan_contract(&self, connector_name: &str) -> Result<()> {
+        if let Some(contract) = connector_scan_contract(connector_name) {
+            let key = Self::connector_scan_contract_meta_key(connector_name);
+            self.conn.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![key.as_str(), contract],
+            )?;
+        }
         Ok(())
     }
 
@@ -10074,7 +10139,7 @@ impl FrankenStorage {
     pub fn connector_scan_states(
         &self,
         connector_names: &[&str],
-    ) -> Result<HashMap<String, (Option<i64>, bool)>> {
+    ) -> Result<HashMap<String, ConnectorScanState>> {
         let requested = connector_names
             .iter()
             .map(|name| name.trim().to_ascii_lowercase())
@@ -10082,7 +10147,13 @@ impl FrankenStorage {
             .collect::<HashSet<_>>();
         let mut states = requested
             .iter()
-            .map(|name| (name.clone(), (None, false)))
+            .map(|name| {
+                let state = ConnectorScanState {
+                    scan_contract_pending: connector_scan_contract(name).is_some(),
+                    ..ConnectorScanState::default()
+                };
+                (name.clone(), state)
+            })
             .collect::<HashMap<_, _>>();
         if states.is_empty() {
             return Ok(states);
@@ -10090,7 +10161,8 @@ impl FrankenStorage {
 
         let mut tx = self.conn.transaction()?;
         let watermark_rows: Vec<(String, String)> = tx.query_map_collect(
-            "SELECT key, value FROM meta WHERE key LIKE 'last_scan_ts:connector:%'",
+            "SELECT key, value FROM meta
+             WHERE key LIKE 'last_scan_ts:connector:%' OR key LIKE 'scan_contract:connector:%'",
             fparams![],
             |row| {
                 let key: String = row.get_typed(0)?;
@@ -10100,13 +10172,18 @@ impl FrankenStorage {
         )?;
 
         for (key, value) in watermark_rows {
-            let Some(connector_name) = key.strip_prefix("last_scan_ts:connector:") else {
-                continue;
-            };
-            if let Some((last_scan_ts, _)) =
-                states.get_mut(connector_name.trim().to_ascii_lowercase().as_str())
+            if let Some(connector_name) = key.strip_prefix("last_scan_ts:connector:") {
+                if let Some(state) =
+                    states.get_mut(connector_name.trim().to_ascii_lowercase().as_str())
+                {
+                    state.last_scan_ts = value.parse().ok();
+                }
+            } else if let Some(connector_name) = key.strip_prefix("scan_contract:connector:")
+                && let Some(state) =
+                    states.get_mut(connector_name.trim().to_ascii_lowercase().as_str())
+                && connector_scan_contract(connector_name) == Some(value.as_str())
             {
-                *last_scan_ts = value.parse().ok();
+                state.scan_contract_pending = false;
             }
         }
 
@@ -10126,9 +10203,9 @@ impl FrankenStorage {
             if Self::connector_agent_slug_candidates(&connector_name)
                 .iter()
                 .any(|slug| archived_agent_slugs.contains(slug))
-                && let Some((_, has_conversations)) = states.get_mut(connector_name.as_str())
+                && let Some(state) = states.get_mut(connector_name.as_str())
             {
-                *has_conversations = true;
+                state.has_conversations = true;
             }
         }
 
@@ -41032,19 +41109,66 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let states = storage.connector_scan_states(&["codex", "claude", "gemini"])?;
         assert_eq!(
             states.get("codex").copied(),
-            Some((Some(1_700_000_123_456), false)),
+            Some(ConnectorScanState {
+                last_scan_ts: Some(1_700_000_123_456),
+                ..ConnectorScanState::default()
+            }),
             "bulk state should preserve connector-specific watermarks"
         );
         assert_eq!(
             states.get("claude").copied(),
-            Some((None, true)),
+            Some(ConnectorScanState {
+                has_conversations: true,
+                ..ConnectorScanState::default()
+            }),
             "bulk state should honor known connector slug aliases"
         );
         assert_eq!(
             states.get("gemini").copied(),
-            Some((None, false)),
+            Some(ConnectorScanState::default()),
             "bulk state should identify newly enabled connectors with no archived rows"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_codex_watermark_from_before_its_scan_contract_leaves_the_contract_pending()
+    -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
+        let pending = |storage: &SqliteStorage| -> anyhow::Result<bool> {
+            Ok(storage.connector_scan_states(&["codex"])?["codex"].scan_contract_pending)
+        };
+        assert!(pending(&storage)?, "a fresh archive has not recorded it");
+
+        // A watermark an older build wrote, without the contract.
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams!["last_scan_ts:connector:codex", "1700000000000"],
+        )?;
+        let state = storage.connector_scan_states(&["codex"])?["codex"];
+        assert_eq!(state.last_scan_ts, Some(1_700_000_000_000));
+        assert!(state.scan_contract_pending);
+
+        // Another contract's marker does not satisfy this one.
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams!["scan_contract:connector:codex", "some-older-contract"],
+        )?;
+        assert!(pending(&storage)?);
+
+        storage.record_connector_scan_contract("codex")?;
+        assert!(!pending(&storage)?);
+
+        // A watermark written by this build records the contract with it.
+        let other = TempDir::new()?;
+        let fresh = SqliteStorage::open(&other.path().join("test.db"))?;
+        fresh.set_connector_last_scan_ts("CODEX", 1_700_000_000_001)?;
+        assert!(!pending(&fresh)?);
+
+        // A connector without a contract is never pending.
+        storage.record_connector_scan_contract("claude")?;
+        assert!(!storage.connector_scan_states(&["claude"])?["claude"].scan_contract_pending);
         Ok(())
     }
 

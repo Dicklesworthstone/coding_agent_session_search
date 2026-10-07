@@ -651,6 +651,304 @@ fn gh511_one_unparseable_codebuff_transcript_does_not_hide_the_others() {
     }
 }
 
+/// A Codex rollout holding one question with `needle` and its answer.
+fn gh513_rollout_text(needle: &str) -> String {
+    [
+        serde_json::json!({"timestamp": "2026-08-01T10:00:00Z", "type": "session_meta",
+            "payload": {"cwd": "/synthetic/gh513"}}),
+        serde_json::json!({"timestamp": "2026-08-01T10:00:01Z", "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": format!("question {needle}")}]}}),
+        serde_json::json!({"timestamp": "2026-08-01T10:00:02Z", "type": "response_item",
+            "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "the answer"}]}}),
+    ]
+    .iter()
+    .map(|record| format!("{record}\n"))
+    .collect()
+}
+
+/// A session as Codex's `local_thread_store_compression` leaves it:
+/// `rollout-*.jsonl.zst`, one zstd frame that records the decoded length,
+/// with the plain rollout's modification time (here 30 days ago).
+fn gh513_compressed_rollout(home: &Path, name: &str, text: &str) -> std::path::PathBuf {
+    let day = home.join(".codex/sessions/2026/08/01");
+    fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-2026-08-01T10-00-00-{name}.jsonl.zst"));
+    fs::write(&path, zstd::bulk::compress(text.as_bytes(), 3).unwrap()).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    path
+}
+
+/// Codex hits for `needle`, as `(source_path, conversation_id)`.
+fn gh513_hits(home: &Path, data: &Path, needle: &str) -> Vec<(String, serde_json::Value)> {
+    let output = gh511_cass(home, data)
+        .args([
+            "search",
+            needle,
+            "--agent",
+            "codex",
+            "--mode",
+            "lexical",
+            "--json",
+            "--no-maintenance",
+            "--timeout",
+            "10000",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    result["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| {
+            (
+                hit["source_path"].as_str().unwrap_or_default().to_owned(),
+                hit["conversation_id"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn gh513_codex_conversations(home: &Path, data: &Path) -> serde_json::Value {
+    let output = gh511_cass(home, data)
+        .args(["stats", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stats: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    stats["by_agent"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["agent"] == "codex")
+        .map_or(serde_json::Value::Null, |row| row["count"].clone())
+}
+
+/// GH #513: both Codex passes (franken-agent-detection's parse and cass's
+/// enrichment) read a compressed rollout's decoded text, so the connector
+/// gives the same conversation, id included, for either form of one rollout.
+#[test]
+fn gh513_a_compressed_rollout_scans_and_enriches_like_its_plain_form() {
+    use coding_agent_search::connectors::{
+        Connector, ScanContext, ScanRoot, codex::CodexConnector,
+    };
+    let response = |payload: serde_json::Value| {
+        serde_json::json!({"type": "response_item", "timestamp": "2026-08-01T10:00:05.000Z",
+            "payload": payload})
+    };
+    let text = [
+        response(serde_json::json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "compressed parity question"}]})),
+        response(
+            serde_json::json!({"type": "custom_tool_call", "name": "apply_patch",
+            "call_id": "patch-1", "input": "*** Begin Patch\n+compressed_parity\n*** End Patch\n"}),
+        ),
+        response(
+            serde_json::json!({"type": "function_call_output", "call_id": "patch-1",
+            "output": "patch applied"}),
+        ),
+    ]
+    .iter()
+    .map(|record| format!("{record}\n"))
+    .collect::<String>();
+    let scan = |compressed: bool, enrich: bool| -> Vec<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".codex");
+        let day = home.join("sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let plain = day.join("rollout-2026-08-01T10-00-00-parity.jsonl");
+        let written = if compressed {
+            plain.with_extension("jsonl.zst")
+        } else {
+            plain
+        };
+        if compressed {
+            fs::write(&written, zstd::bulk::compress(text.as_bytes(), 3).unwrap()).unwrap();
+        } else {
+            fs::write(&written, &text).unwrap();
+        }
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(home)],
+            None,
+        );
+        let conversations = if enrich {
+            CodexConnector::new().scan(&ctx).unwrap()
+        } else {
+            franken_agent_detection::CodexConnector::new()
+                .scan(&ctx)
+                .unwrap()
+        };
+        conversations
+            .into_iter()
+            .map(|conversation| {
+                assert_eq!(conversation.source_path, written);
+                let mut value = serde_json::to_value(conversation).unwrap();
+                value.as_object_mut().unwrap().remove("source_path");
+                value
+            })
+            .collect()
+    };
+    let plain = scan(false, true);
+    assert_eq!(plain.len(), 1);
+    assert_eq!(
+        plain[0]["external_id"],
+        "2026/08/01/rollout-2026-08-01T10-00-00-parity"
+    );
+    // The fixture needs the enrichment pass: without it the messages differ.
+    assert_ne!(plain[0]["messages"], scan(false, false)[0]["messages"]);
+    assert_eq!(scan(true, true), plain);
+}
+
+/// GH #513 (bead 3u22z): a Codex home holding only compressed sessions (the
+/// reporter's 1,599 of 1,609) indexes every one of them, searchably.
+#[test]
+fn gh513_codex_sessions_compressed_to_jsonl_zst_are_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let first = gh513_compressed_rollout(&home, "first", &gh513_rollout_text("gh513firstneedle"));
+    gh513_compressed_rollout(&home, "second", &gh513_rollout_text("gh513secondneedle"));
+    gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    assert_eq!(gh513_codex_conversations(&home, &data), 2);
+    let hits = gh513_hits(&home, &data, "gh513firstneedle");
+    assert!(
+        !hits.is_empty(),
+        "the compressed session's text is searchable"
+    );
+    let name = first.file_name().unwrap();
+    assert!(
+        hits.iter()
+            .all(|(path, _)| Path::new(path).file_name() == Some(name)),
+        "{hits:?}"
+    );
+}
+
+/// GH #513: a session indexed as `rollout-*.jsonl` that Codex then compresses
+/// (plain file removed, modification time kept) is the same session, not a
+/// second one.
+#[test]
+fn gh513_a_session_compressed_after_indexing_is_not_duplicated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let text = gh513_rollout_text("gh513sameneedle");
+    let packed = gh513_compressed_rollout(&home, "same", &text);
+    let plain = packed.with_extension("");
+    let mtime = fs::metadata(&packed).unwrap().modified().unwrap();
+    fs::rename(&packed, packed.with_extension("parked")).unwrap();
+    fs::write(&plain, &text).unwrap();
+    gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    let before = gh513_hits(&home, &data, "gh513sameneedle");
+    assert!(!before.is_empty());
+    // The comparison below needs a real id, not two missing ones.
+    assert!(before[0].1.is_i64(), "{before:?}");
+
+    // Codex compresses it: the compressed file keeps the plain file's mtime.
+    fs::remove_file(&plain).unwrap();
+    fs::rename(packed.with_extension("parked"), &packed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&packed)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    assert_eq!(gh513_codex_conversations(&home, &data), 1);
+    let after = gh513_hits(&home, &data, "gh513sameneedle");
+    assert!(
+        after.iter().all(|(_, id)| *id == before[0].1),
+        "before {before:?} after {after:?}"
+    );
+}
+
+/// GH #513: an archive whose Codex watermark an older build recorded picks
+/// up compressed sessions older than that watermark on its next plain
+/// `cass index`, in both ingest modes, and records the scan contract so the
+/// run after it has a cutoff again.
+#[test]
+fn gh513_an_older_codex_watermark_does_not_hide_old_compressed_sessions() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let plain_day = home.join(".codex/sessions/2026/10/01");
+        fs::create_dir_all(&plain_day).unwrap();
+        fs::write(
+            plain_day.join("rollout-2026-10-01T10-00-00-plain.jsonl"),
+            gh513_rollout_text("gh513plainneedle"),
+        )
+        .unwrap();
+        gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .assert()
+            .success();
+        let db = data.join("agent_search.db");
+        {
+            // Leave the archive as an older build would: a Codex watermark
+            // recorded without the scan contract.
+            let storage = FrankenStorage::open(&db).unwrap();
+            let state = storage.connector_scan_states(&["codex"]).unwrap()["codex"];
+            assert!(state.last_scan_ts.is_some(), "streaming={streaming}");
+            assert!(!state.scan_contract_pending, "streaming={streaming}");
+            storage
+                .raw()
+                .execute("DELETE FROM meta WHERE key = 'scan_contract:connector:codex'")
+                .unwrap();
+            assert!(
+                storage.connector_scan_states(&["codex"]).unwrap()["codex"].scan_contract_pending
+            );
+        }
+
+        // Compressed long ago, so older than the watermark.
+        let packed =
+            gh513_compressed_rollout(&home, "backlog", &gh513_rollout_text("gh513backlogneedle"));
+        gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--json", "--no-progress-events"])
+            .assert()
+            .success();
+        let hits = gh513_hits(&home, &data, "gh513backlogneedle");
+        assert!(
+            hits.iter()
+                .any(|(path, _)| Path::new(path).file_name() == packed.file_name()),
+            "streaming={streaming}: {hits:?}"
+        );
+        let storage = FrankenStorage::open_readonly(&db).unwrap();
+        assert!(
+            !storage.connector_scan_states(&["codex"]).unwrap()["codex"].scan_contract_pending,
+            "streaming={streaming}: the scan recorded the contract"
+        );
+    }
+}
+
 /// GH #499 (bead 2l1b0.49): once an incremental run tombstones a row inside a
 /// sealed Quill segment, every date-filtered search failed with "posting
 /// cursor invariant failed: Boolean children belong to different segment

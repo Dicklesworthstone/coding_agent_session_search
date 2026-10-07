@@ -929,6 +929,7 @@ dependencies = [
  "wide",
  "xxhash-rust",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]
@@ -1913,9 +1914,9 @@ dependencies = [
 
 [[package]]
 name = "franken-agent-detection"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c74a6fa641dd29447fc7fc795328667280c3f8770e3c792a79e5bc59bd4cd2"
+checksum = "960b2f47f6bb6ae4bffe311a0ae29f0e59ac26ab9ae883a997d189ad8d78a0fc"
 dependencies = [
  "aes-gcm",
  "anyhow",

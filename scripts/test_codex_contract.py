@@ -87,9 +87,10 @@ def main() -> None:
             source = f'version = {json.dumps(version)}'
             if fad_checkout is not None:
                 source = f'version = {json.dumps("=" + fad_version)}, path = {json.dumps(fad_checkout.as_posix(), ensure_ascii=False)}'
+            # codex-zstd: the Codex connector reads compressed rollouts (GH #513).
             lines.append(
                 f'{name} = {{ {source}, '
-                'default-features = false, features = ["connectors"] }'
+                'default-features = false, features = ["connectors", "codex-zstd"] }'
             )
         elif name == "serde":
             lines.append(f'{name} = {{ version = {json.dumps(version)}, features = ["derive"] }}')

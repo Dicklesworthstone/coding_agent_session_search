@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 
 use anyhow::{Context, Result};
+use franken_agent_detection::connectors::codex as codex_rollouts;
 use serde_json::Value;
 use tracing::warn;
 
@@ -118,11 +119,13 @@ fn augment_modern_codex_messages(
     conversation: &mut NormalizedConversation,
     progress_tick: Option<&(dyn Fn() + Send + Sync)>,
 ) -> Result<()> {
-    if conversation
-        .source_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_none_or(|ext| !ext.eq_ignore_ascii_case("jsonl"))
+    let compressed = codex_rollouts::is_compressed_rollout(&conversation.source_path);
+    if !compressed
+        && conversation
+            .source_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("jsonl"))
     {
         return Ok(());
     }
@@ -141,24 +144,36 @@ fn augment_modern_codex_messages(
         )
         .into());
     }
-    if before.len() > MAX_AUGMENT_ROLLOUT_BYTES {
-        return Err(source_budget::EnrichmentBudgetExceeded {
-            observed_bytes: before.len(),
-        }
-        .into());
-    }
-
-    // The first pass belongs to FAD; this pass owns only the opened prefix.
-    // Never follow appends indefinitely. Consumers receive the conversation
-    // only after enrichment and these observable-snapshot checks succeed.
-    let mut reader = BufReader::new((&file).take(before.len()));
-    let bytes_read = augment_modern_codex_reader(conversation, progress_tick, &mut reader)?;
-    if bytes_read != before.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Codex enrichment source was truncated while reading; retry this source",
+    if compressed {
+        // GH #513: FAD decoded this text under its rollout budget, which the
+        // source policy sets, so the same budget holds here. The decoder ends
+        // cleanly only after the whole opened prefix; a cut-short read fails.
+        let mut reader = codex_rollouts::decompressed_rollout(
+            (&file).take(before.len()),
+            codex_rollouts::codex_rollout_byte_budget(),
         )
-        .into());
+        .context("decode compressed Codex enrichment source")?;
+        augment_modern_codex_reader(conversation, progress_tick, &mut reader)?;
+    } else {
+        if before.len() > MAX_AUGMENT_ROLLOUT_BYTES {
+            return Err(source_budget::EnrichmentBudgetExceeded {
+                observed_bytes: before.len(),
+            }
+            .into());
+        }
+
+        // The first pass belongs to FAD; this pass owns only the opened prefix.
+        // Never follow appends indefinitely. Consumers receive the conversation
+        // only after enrichment and these observable-snapshot checks succeed.
+        let mut reader = BufReader::new((&file).take(before.len()));
+        let bytes_read = augment_modern_codex_reader(conversation, progress_tick, &mut reader)?;
+        if bytes_read != before.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Codex enrichment source was truncated while reading; retry this source",
+            )
+            .into());
+        }
     }
     let after = file
         .metadata()
