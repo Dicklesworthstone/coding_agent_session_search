@@ -1,5 +1,6 @@
-//! Explicit external query selection. Admission remains read-only and occurs
-//! before HTTP: an unavailable/stale/foreign index never sends even probes.
+//! Explicit external query selection. Initial admission precedes HTTP; archive
+//! and publication gates are checked again after public-input preflight. No
+//! user query is disclosed until both read-only admission phases succeed.
 use super::*;
 use crate::search::external_embedder::{CancelCheck, ExternalEmbedder, ExternalEmbeddingConfig};
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -92,6 +93,59 @@ fn open_recorded(
     Ok(artifact)
 }
 
+fn require_current_archive(
+    storage: &FrankenStorage,
+    record: &ArtifactRecord,
+) -> Result<(), SemanticAvailability> {
+    let invalidated = storage
+        .semantic_identity_rebuild_required(SemanticIdentityTier::Quality)
+        .map_err(|error| failed(format!("external canonical identity check: {error}")))?;
+    // Unlike the legacy manifest-less path, a dynamic endpoint requires
+    // an authoritative fingerprint: inability to read it is a refusal.
+    let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(storage)
+        .map_err(|error| failed(format!("external canonical fingerprint: {error}")))?;
+    if invalidated || record.db_fingerprint != fingerprint {
+        return Err(SemanticAvailability::IndexStale {
+            embedder_id: record.embedder_id.clone(),
+            reason: "canonical archive changed; resume/rebuild this external embedding space"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// HTTP preflight may outlive an archive update or the start of another
+/// backfill. It is not a lease on the state admitted before the request.
+/// Recheck with a fresh read-only connection, not a potentially retained DB
+/// snapshot, and never replace the already-admitted FSVI reader on success.
+/// This is admission revalidation, not a transaction or a post-load watcher.
+fn revalidate_after_preflight(
+    data_dir: &Path,
+    db_path: &Path,
+    config: &ExternalEmbeddingConfig,
+    record: &ArtifactRecord,
+) -> Result<(), SemanticAvailability> {
+    let storage = FrankenStorage::open_strict_readonly(db_path).map_err(|error| {
+        SemanticAvailability::DatabaseUnavailable {
+            db_path: db_path.to_path_buf(),
+            error: error.to_string(),
+        }
+    })?;
+    require_current_archive(&storage, record)?;
+    // An unrelated fast-tier checkpoint/backlog update must not invalidate
+    // quality. Compare the exact admitted quality record, not ledger bytes.
+    if recorded_artifact(data_dir, config)? != *record {
+        return Err(SemanticAvailability::IndexStale {
+            embedder_id: record.embedder_id.clone(),
+            reason: "external_admission_changed: completed publication changed during preflight; retry against the current external index".into(),
+        });
+    }
+    if let Some(availability) = selected_generation_owner_requirement(data_dir) {
+        return Err(availability);
+    }
+    Ok(())
+}
+
 pub(super) fn probe(data_dir: &Path) -> SemanticAvailability {
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return availability;
@@ -145,26 +199,21 @@ pub(super) fn load_with_config(
             db_path: db_path.to_path_buf(),
             error: error.to_string(),
         })?;
-        let invalidated = storage
-            .semantic_identity_rebuild_required(SemanticIdentityTier::Quality)
-            .map_err(|error| failed(format!("external canonical identity check: {error}")))?;
-        // Unlike the legacy manifest-less path, a dynamic endpoint requires
-        // an authoritative fingerprint: inability to read it is a refusal.
-        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)
-            .map_err(|error| failed(format!("external canonical fingerprint: {error}")))?;
-        if invalidated || record.db_fingerprint != fingerprint {
-            return Err(SemanticAvailability::IndexStale {
-                embedder_id: config.identity(),
-                reason: "canonical archive changed; resume/rebuild this external embedding space"
-                    .into(),
-            });
-        }
+        require_current_archive(&storage, &record)?;
         let filter_maps = SemanticFilterMaps::from_storage(&storage)
             .map_err(|error| failed(format!("external filter maps: {error}")))?;
+        drop(storage);
         // No user query is passed to this constructor. Its only traffic is the
         // fixed public preflight. A failure never loads local MiniLM or hash.
-        let embedder = ExternalEmbedder::connect(config, cancelled)
+        let embedder = ExternalEmbedder::connect(config.clone(), Arc::clone(&cancelled))
             .map_err(|error| failed(format!("external query preflight: {error}")))?;
+        if cancelled() {
+            return Err(failed("external_cancelled: query admission was cancelled"));
+        }
+        revalidate_after_preflight(data_dir, db_path, &config, &record)?;
+        if cancelled() {
+            return Err(failed("external_cancelled: query admission was cancelled"));
+        }
         let id = embedder.id().to_owned();
         Ok::<_, SemanticAvailability>((
             id,

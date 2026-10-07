@@ -151,6 +151,50 @@ jobs:
         path: external-probe-source.tar.gz
         if-no-files-found: error
         retention-days: 7
+  committed-query:
+    # Qualify the actual checkout independently of the separate, uncommitted
+    # producer-continuity candidate. Neither job replaces the other's gates.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Verify the committed source revision
+      run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+    - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+      with:
+        toolchain: nightly-2026-08-31
+        components: clippy, rustfmt
+    - name: Committed external query admission and preflight races
+      run: cargo test --locked --lib search::model_manager::external::tests -- --nocapture
+    - name: Committed provider, bounded retries and cancellation
+      run: cargo test --locked --lib search::external_embedder::tests -- --nocapture
+    - name: Committed library Clippy
+      run: cargo clippy --locked --lib -- -D warnings
+    - name: Changed query source formatting
+      if: always()
+      run: >-
+        rustfmt --edition 2024 --check --config skip_children=true
+        src/search/model_manager/external.rs
+        src/search/model_manager/external/tests.rs
+        src/search/model_manager/external/tests/admission_races.rs
+    - name: Verify validation did not alter committed sources
+      if: always()
+      run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
 'on':
   push:
     branches:

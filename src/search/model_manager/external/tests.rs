@@ -2,6 +2,8 @@ use super::*;
 use frankensearch::index::{Quantization, VectorIndex};
 use std::net::TcpListener;
 
+mod admission_races;
+
 fn fixture_config(listener: &TcpListener) -> ExternalEmbeddingConfig {
     ExternalEmbeddingConfig::from_lookup(|key| match key {
         "CASS_EXTERNAL_EMBEDDINGS" => Some("1".into()),
