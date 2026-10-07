@@ -14,6 +14,7 @@ use crate::search::semantic_manifest::TierKind;
 use crate::search::vector_index::{SemanticDocId, vector_index_path};
 
 mod append;
+mod rebuild;
 
 impl SemanticIndexer {
     pub fn batch_size(&self) -> usize {
@@ -80,127 +81,21 @@ impl SemanticIndexer {
         self.publish_full_rebuild(embedded_messages, data_dir, Some(on_progress))
     }
 
-    /// The caller's existing maintenance lock must cover selection and this
-    /// publication. This method does not grant permission to discard pending
-    /// WAL writes: those require canonical reconciliation, not a full writer.
+    /// The maintenance lock still spans selection through publication. Both
+    /// first builds and replacements use cancellable, private preparation.
     fn publish_full_rebuild<I, F>(
         &self,
         embedded_messages: I,
         data_dir: &Path,
-        mut on_progress: Option<F>,
+        on_progress: Option<F>,
     ) -> Result<VectorIndex>
     where
         I: IntoIterator<Item = EmbeddedMessage>,
         F: FnMut(usize),
     {
-        let destination = vector_index_path(data_dir, self.embedder_id());
-        refuse_publication_sidecars(&destination, false)?;
-        let previous = RebuildDestination::capture(&destination)?;
-        let previous_generation = previous.generation;
-        let parent = destination
-            .parent()
-            .context("semantic index has no parent")?;
-        fs::create_dir_all(parent)?;
-        let scratch = tempfile::Builder::new()
-            .prefix(".semantic-full-rebuild-")
-            .tempdir_in(parent)?;
-        let candidate_path = vector_index_path(scratch.path(), self.embedder_id());
-
-        if let Some(generation) = previous_generation {
-            // A fresh writer's default generation is not a successor of the
-            // existing destination. Stamp the successor at construction, not
-            // by editing a finished header or deleting the destination's WAL.
-            fs::create_dir_all(candidate_path.parent().context("candidate has no parent")?)?;
-            let revision = expected_vector_space_revision(self.embedder_id())
-                .context("full rebuild has no registered vector-space revision")?;
-            let mut writer = VectorIndex::create_with_revision(
-                &candidate_path,
-                self.embedder_id(),
-                revision,
-                self.embedder_dimension(),
-                Quantization::F16,
-            )?
-            .with_generation(next_generation(generation));
-            let mut accepted = 0usize;
-            for embedded in embedded_messages {
-                ensure!(
-                    embedded.embedding.len() == self.embedder_dimension(),
-                    "embedding dimension mismatch: expected {}, got {}",
-                    self.embedder_dimension(),
-                    embedded.embedding.len()
-                );
-                ensure!(
-                    embedded.embedding.iter().all(|value| value.is_finite()),
-                    "embedding for message {} contains a non-finite value",
-                    embedded.message_id
-                );
-                let doc_id = SemanticDocId {
-                    message_id: embedded.message_id,
-                    chunk_idx: embedded.chunk_idx,
-                    agent_id: embedded.agent_id,
-                    workspace_id: embedded.workspace_id,
-                    source_id: embedded.source_id,
-                    role: embedded.role,
-                    created_at_ms: embedded.created_at_ms,
-                    content_hash: Some(embedded.content_hash),
-                }
-                .to_doc_id_string();
-                writer
-                    .write_record(&doc_id, &embedded.embedding)
-                    .map_err(|error| {
-                        let message = format!("write fsvi record failed: {error}");
-                        anyhow::Error::new(error).context(message)
-                    })?;
-                accepted = accepted.saturating_add(1);
-                if let Some(progress) = on_progress.as_mut() {
-                    progress(accepted);
-                }
-            }
-            writer
-                .finish()
-                .context("finish unpublished semantic replacement")?;
-        } else {
-            // Initial builds can use the original engine's writer unchanged,
-            // but ONLY under fresh owned scratch, never the public path. Both
-            // progress variants retain the engine's normal streaming behavior.
-            let candidate = match on_progress {
-                Some(progress) => self.inner.build_and_save_index_with_progress(
-                    embedded_messages,
-                    scratch.path(),
-                    progress,
-                )?,
-                None => self
-                    .inner
-                    .build_and_save_index(embedded_messages, scratch.path())?,
-            };
-            drop(candidate);
-        }
-
-        // Validate the persisted representation too: a finite nonzero f32
-        // vector may overflow or lose all signal when encoded to f16. Keep
-        // only one decoded row at a time, never another corpus-sized slab.
-        let candidate = VectorIndex::open_read_only(&candidate_path)?;
-        ensure!(
-            candidate.wal_record_count() == 0,
-            "unpublished rebuild has a WAL"
-        );
-        for row in 0..candidate.record_count() {
-            ensure!(
-                candidate.is_vector_usable(row),
-                "unusable persisted semantic vector at row {row}"
-            );
-        }
-        drop(candidate);
-
-        // Do not reclassify a missing/corrupt/replaced destination as permission
-        // to overwrite it. The native installer also rechecks the generation.
-        refuse_publication_sidecars(&destination, false)?;
-        ensure!(
-            RebuildDestination::capture(&destination)? == previous,
-            "semantic destination changed during full rebuild; retry under the maintenance lock"
-        );
-        VectorIndex::install_replacement(&destination, &candidate_path)
-            .context("install complete semantic rebuild")
+        rebuild::run(self, embedded_messages, data_dir, on_progress, || {
+            self.inner.check_external_cancelled()
+        })
     }
 
     pub fn build_and_save_index_shards<I>(
@@ -661,6 +556,7 @@ mod full_rebuild_tests {
     use super::*;
 
     mod canonical;
+    mod cancellation;
 
     fn embedded(indexer: &SemanticIndexer) -> Result<Vec<EmbeddedMessage>> {
         indexer.embed_messages(&[
