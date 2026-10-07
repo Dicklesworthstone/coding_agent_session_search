@@ -14084,55 +14084,16 @@ fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String
 }
 
 fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            let observation = serde_json::json!({
-            "path":path,"size":metadata.len(),
-            "mtime_ns":metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos().to_string(),
-            });
-            #[cfg(unix)]
-            let observation = {
-                use std::os::unix::fs::MetadataExt;
-                let mut observation = observation;
-                observation["device"] = serde_json::json!(metadata.dev());
-                observation["inode"] = serde_json::json!(metadata.ino());
-                observation["ctime"] = serde_json::json!([metadata.ctime(), metadata.ctime_nsec()]);
-                observation
-            };
-            Some(observation)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Some(serde_json::json!({"path":path,"absent":true}))
-        }
-        Err(_) => None,
-    }
+    crate::connectors::source_dependencies::observation::file_observation(path)
 }
 
 fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
-    let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
-        return false;
-    };
-    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
-        return false;
-    }
-    if saved["primary"] != source_file_observation(&source.source_path).unwrap_or_default() {
-        return false;
-    }
-    let Some(files) = saved["dependencies"].as_array() else {
-        return false;
-    };
-    // Older rows include the implicit parent. Do not force one last reparse
-    // just to remove it for a self-contained connector. All explicit sidecars
-    // and the primary/producer checks above retain their existing semantics.
-    let ignored_parent = (!source_folder_is_dependency(source))
-        .then(|| source.source_path.parent())
-        .flatten();
-    files.iter().all(|file| {
-        file["path"].as_str().is_some_and(|path| {
-            Some(Path::new(path)) == ignored_parent
-                || source_file_observation(Path::new(path)).as_ref() == Some(file)
-        })
-    })
+    crate::connectors::source_dependencies::observation::ledger_matches(
+        observation,
+        &source.source_path,
+        source_folder_is_dependency(source),
+        env!("CASS_SOURCE_INGEST_CONTRACT"),
+    )
 }
 
 /// A connector capability, not an inference from this scan's sidecar list.
@@ -14163,7 +14124,10 @@ fn source_observations_after_scan(
     dependencies_before: &HashMap<PathBuf, serde_json::Value>,
 ) -> Option<(serde_json::Value, Vec<serde_json::Value>)> {
     let primary = source_file_observation(&source.source_path)?;
-    if Some(&primary) != primary_before || source.fs_metadata_changed() {
+    if primary["absent"].as_bool() == Some(true)
+        || Some(&primary) != primary_before
+        || source.fs_metadata_changed()
+    {
         return None;
     }
     let mut dependencies = Vec::new();
@@ -14211,14 +14175,27 @@ fn scan_with_durable_source_boundaries(
     let filtered = std::cell::Cell::new(false);
     let before = std::cell::RefCell::new(None);
     let primary_before = std::cell::RefCell::new(None);
-    let dependencies_before: HashMap<_, _> = connector
-        .discover_source_files(&ctx)?
-        .into_iter()
-        .filter_map(|source| {
-            source_file_observation(&source.source_path)
-                .map(|observation| (source.source_path, observation))
-        })
-        .collect();
+    // A self-contained parser cannot consult sidecars. Avoid a second full
+    // inventory and stat/JSON map solely to prove the absence of dependencies.
+    // Unexpected completion sidecars remain unobserved and withhold the marker.
+    // Other and unknown connector registrations keep the discovery-time guard.
+    let dependencies_before: HashMap<_, _> =
+        if crate::connectors::source_dependencies::source_dependency_policy(
+            sender.borrow().connector_name,
+        )
+        .observes_parent_directory()
+        {
+            connector
+                .discover_source_files(&ctx)?
+                .into_iter()
+                .filter_map(|source| {
+                    source_file_observation(&source.source_path)
+                        .map(|observation| (source.source_path, observation))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
     let flush_error = std::cell::RefCell::new(None);
     let mut should_scan = |source: &DiscoveredSourceFile| {
         if config

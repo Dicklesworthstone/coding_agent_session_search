@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+pub(crate) mod observation;
+
 use super::ConnectorFactory;
 
 /// Whether discovery of a new sibling can change a source's parsed result.

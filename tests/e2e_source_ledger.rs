@@ -46,13 +46,20 @@ fn row(provider: &str, source: usize, message: usize) -> Value {
 }
 
 fn transcript(directory: &Path, provider: &str, source: usize) -> PathBuf {
-    let name = if provider == "claude_code" { "session" } else { "rollout" };
+    let name = if provider == "claude_code" {
+        "session"
+    } else {
+        "rollout"
+    };
     let path = directory.join(format!("{name}-{source}.jsonl"));
     let mut content = String::new();
     if provider == "codex" {
-        content.push_str(&format!("{}\n", json!({"timestamp":"2026-08-01T10:00:00Z",
+        content.push_str(&format!(
+            "{}\n",
+            json!({"timestamp":"2026-08-01T10:00:00Z",
             "type":"session_meta", "payload":{"id":format!("ledger-{source}"),
-            "cwd":"/work/ledger"}})));
+            "cwd":"/work/ledger"}})
+        ));
     }
     content.push_str(&format!("{}\n", row(provider, source, 0)));
     fs::write(&path, content).unwrap();
@@ -62,7 +69,10 @@ fn transcript(directory: &Path, provider: &str, source: usize) -> PathBuf {
 fn index(home: &Path, streaming: &str, step: &str, skipped: usize, parsed: usize) {
     let trace = home.join(format!("{step}.trace.jsonl"));
     let output = cass(home, streaming)
-        .env("CASS_TRACE_FILTER", "warn,coding_agent_search::indexer=debug")
+        .env(
+            "CASS_TRACE_FILTER",
+            "warn,coding_agent_search::indexer=debug",
+        )
         .arg("--trace-file")
         .arg(&trace)
         .args(["index", "--json"])
@@ -80,12 +90,22 @@ fn index(home: &Path, streaming: &str, step: &str, skipped: usize, parsed: usize
             let event: Value = serde_json::from_str(line).unwrap();
             assert_ne!(event["event"], "trace_truncated", "{log}");
             (event["fields"]["message"] == "source_ingest_observation").then(|| {
-                event["fields"]["skipped"].as_bool().expect("boolean reuse decision")
+                event["fields"]["skipped"]
+                    .as_bool()
+                    .expect("boolean reuse decision")
             })
         })
         .collect();
-    assert_eq!(observations.iter().filter(|&&value| value).count(), skipped, "{log}");
-    assert_eq!(observations.iter().filter(|&&value| !value).count(), parsed, "{log}");
+    assert_eq!(
+        observations.iter().filter(|&&value| value).count(),
+        skipped,
+        "{log}"
+    );
+    assert_eq!(
+        observations.iter().filter(|&&value| !value).count(),
+        parsed,
+        "{log}"
+    );
 }
 
 /// Canonical IDs as well as content must survive skipped and replayed sources.
@@ -97,7 +117,11 @@ fn archive(home: &Path, sources: usize, appended: bool) -> BTreeMap<String, (i64
     for conversation in conversations {
         let id = conversation.id.unwrap();
         for message in storage.fetch_messages(id).unwrap() {
-            assert!(contents.insert(message.content, (id, message.id.unwrap())).is_none());
+            assert!(
+                contents
+                    .insert(message.content, (id, message.id.unwrap()))
+                    .is_none()
+            );
         }
     }
     assert_eq!(contents.len(), sources + usize::from(appended));
@@ -112,7 +136,15 @@ fn archive(home: &Path, sources: usize, appended: bool) -> BTreeMap<String, (i64
 
 fn assert_searchable(home: &Path, marker: &str) {
     let output = cass(home, "1")
-        .args(["search", marker, "--mode", "lexical", "--json", "--no-maintenance", "--no-daemon"])
+        .args([
+            "search",
+            marker,
+            "--mode",
+            "lexical",
+            "--json",
+            "--no-maintenance",
+            "--no-daemon",
+        ])
         .assert()
         .success()
         .get_output()
@@ -170,10 +202,16 @@ fn gh512_persisted_legacy_reuse_and_primary_append_reach_search_in_both_modes() 
                 // never authorize a completion from an incompatible parser.
                 saved["dependencies"] = json!([parent_before.clone()]);
                 let legacy = saved.to_string();
-                storage.raw().execute_with_params(
-                    "UPDATE meta SET value = ?1 WHERE key = ?2",
-                    &[SqliteValue::Text(legacy.clone().into()), SqliteValue::Text(key.clone().into())],
-                ).unwrap();
+                storage
+                    .raw()
+                    .execute_with_params(
+                        "UPDATE meta SET value = ?1 WHERE key = ?2",
+                        &[
+                            SqliteValue::Text(legacy.clone().into()),
+                            SqliteValue::Text(key.clone().into()),
+                        ],
+                    )
+                    .unwrap();
                 legacy_rows.push((key, legacy));
             }
             drop(storage);
@@ -181,33 +219,63 @@ fn gh512_persisted_legacy_reuse_and_primary_append_reach_search_in_both_modes() 
             // Force an observable directory change even on coarse timestamp
             // filesystems. Non-transcript siblings are not parse candidates.
             for attempt in 0..1024 {
-                if directory_observation(&directory) != parent_before { break; }
+                if directory_observation(&directory) != parent_before {
+                    break;
+                }
                 fs::write(directory.join(format!("clock-{attempt}.tmp")), b"sibling").unwrap();
             }
             assert_ne!(directory_observation(&directory), parent_before);
-            index(home, streaming, "grown", if reusable { 2 } else { 0 }, if reusable { 1 } else { 3 });
+            index(
+                home,
+                streaming,
+                "grown",
+                if reusable { 2 } else { 0 },
+                if reusable { 1 } else { 3 },
+            );
             let grown_ids = archive(home, 3, false);
-            for (content, id) in &initial_ids { assert_eq!(grown_ids.get(content), Some(id)); }
+            for (content, id) in &initial_ids {
+                assert_eq!(grown_ids.get(content), Some(id));
+            }
             let storage = SqliteStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
             let grown_rows = storage.source_ingest_ledger_entries().unwrap();
             assert_eq!(grown_rows.len(), 3);
             if reusable {
                 for (key, legacy) in legacy_rows {
-                    assert_eq!(grown_rows.get(&key), Some(&legacy), "reuse must not require rewriting legacy rows");
+                    assert_eq!(
+                        grown_rows.get(&key),
+                        Some(&legacy),
+                        "reuse must not require rewriting legacy rows"
+                    );
                 }
             }
             drop(storage);
-            for source in 0..3 { assert_searchable(home, &format!("ghledger{source:03}message000z")); }
+            for source in 0..3 {
+                assert_searchable(home, &format!("ghledger{source:03}message000z"));
+            }
             // An actual new message, not a whitespace-only rewrite, must be
             // imported despite its old timestamp and previously certified row.
             let mut content = fs::read_to_string(&first).unwrap();
             content.push_str(&format!("{}\n", row(provider, 0, 1)));
             fs::write(&first, content).unwrap();
-            index(home, streaming, "primary-appended", if reusable { 2 } else { 0 }, if reusable { 1 } else { 3 });
+            index(
+                home,
+                streaming,
+                "primary-appended",
+                if reusable { 2 } else { 0 },
+                if reusable { 1 } else { 3 },
+            );
             let appended_ids = archive(home, 3, true);
-            for (content, id) in &grown_ids { assert_eq!(appended_ids.get(content), Some(id)); }
+            for (content, id) in &grown_ids {
+                assert_eq!(appended_ids.get(content), Some(id));
+            }
             assert_searchable(home, "ghledger000message001z");
-            index(home, streaming, "unchanged-again", if reusable { 3 } else { 0 }, if reusable { 0 } else { 3 });
+            index(
+                home,
+                streaming,
+                "unchanged-again",
+                if reusable { 3 } else { 0 },
+                if reusable { 0 } else { 3 },
+            );
             assert_eq!(archive(home, 3, true), appended_ids);
         }
     }

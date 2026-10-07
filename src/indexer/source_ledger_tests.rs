@@ -398,3 +398,232 @@ fn gh512_incumbent_source_ledger_matches(observation: &str, source: &DiscoveredS
             .is_some_and(|path| source_file_observation(Path::new(path)).as_ref() == Some(file))
     })
 }
+
+/// Count the indexer's dependency preflight separately from the connector's
+/// own discovery inside scan_with_source_boundaries.
+struct LedgerDiscoveryCounter {
+    inner: Box<dyn Connector + Send>,
+    discoveries: std::cell::Cell<usize>,
+}
+
+impl Connector for LedgerDiscoveryCounter {
+    fn detect(&self) -> crate::connectors::DetectionResult {
+        self.inner.detect()
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        self.inner.scan(ctx)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        self.inner.supports_source_boundaries()
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        self.discoveries.set(self.discoveries.get() + 1);
+        self.inner.discover_source_files(ctx)
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut franken_agent_detection::SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.inner
+            .scan_with_source_boundaries(ctx, hooks, on_conversation)
+    }
+}
+
+#[test]
+fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() -> Result<()> {
+    let factories: Vec<_> = crate::connectors::get_connector_factories()
+        .into_iter()
+        .filter(|(name, _)| matches!(*name, "claude" | "codex"))
+        .collect();
+    assert_eq!(factories.len(), 2);
+    for (name, factory) in factories {
+        let temp = TempDir::new()?;
+        let source_path = if name == "claude" {
+            temp.path().join("claude/projects/gh512/session.jsonl")
+        } else {
+            temp.path()
+                .join("codex/sessions/2026/10/06/rollout-gh512.jsonl")
+        };
+        let parent = source_path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&parent)?;
+        let transcript = if name == "claude" {
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"gh512\",\"uuid\":\"gh512-message\",",
+                "\"timestamp\":\"2026-08-01T10:00:00Z\",\"cwd\":\"/work/gh512\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"retained transcript\"}}\n",
+            )
+        } else {
+            concat!(
+                "{\"timestamp\":\"2026-08-01T10:00:00Z\",\"type\":\"session_meta\",",
+                "\"payload\":{\"id\":\"gh512\",\"cwd\":\"/work/gh512\"}}\n",
+                "{\"timestamp\":\"2026-08-01T10:00:01Z\",\"type\":\"response_item\",",
+                "\"payload\":{\"type\":\"message\",\"role\":\"user\",",
+                "\"content\":[{\"type\":\"input_text\",\"text\":\"retained transcript\"}]}}\n",
+            )
+        };
+        fs::write(&source_path, transcript)?;
+        let data_dir = temp.path().join("data");
+        fs::create_dir(&data_dir)?;
+        let ctx = ScanContext::with_roots(
+            data_dir.clone(),
+            vec![ScanRoot::local(source_path.clone())],
+            None,
+        );
+        let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let mut config = StreamingProducerConfig {
+            source_ledger: Arc::new(HashMap::new()),
+            flow_limiter: Arc::clone(&limiter),
+            data_dir,
+            additional_scan_roots: Vec::new(),
+            local_connector_roots: None,
+            since_ts: None,
+            local_since_ts_by_connector: Arc::new(HashMap::new()),
+            progress: None,
+            active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+        };
+        let connector = LedgerDiscoveryCounter {
+            inner: factory(),
+            discoveries: std::cell::Cell::new(0),
+        };
+        let (tx, rx) = bounded(8);
+        let mut sender = StreamingBatchSender::new(&tx, Arc::clone(&limiter), name, true);
+        let mut emitted = 0;
+        scan_with_durable_source_boundaries(
+            &connector,
+            &ctx,
+            &config,
+            &mut sender,
+            |conversation| {
+                emitted += 1;
+                // This writer runs between the real pre-parse and completion hooks.
+                thread::scope(|scope| {
+                    scope
+                        .spawn(|| grow_directory(&parent, "during-parse"))
+                        .join()
+                        .unwrap();
+                });
+                Ok(Some(conversation))
+            },
+        )?;
+        sender.flush()?;
+        assert_eq!(emitted, 1, "{name}");
+        assert_eq!(
+            connector.discoveries.get(),
+            0,
+            "{name}: no sidecar inventory needed"
+        );
+        let IndexMessage::SourceComplete {
+            completion,
+            conversations,
+            byte_reservation,
+            ..
+        } = rx.try_recv()?
+        else {
+            panic!("{name}: folder growth must not discard the durable source marker");
+        };
+        assert_eq!(conversations.len(), 1);
+        let observation: serde_json::Value = serde_json::from_str(&completion.observation)?;
+        assert_eq!(observation["dependencies"], serde_json::json!([]));
+        drop(conversations);
+        limiter.release(byte_reservation);
+        assert!(rx.try_recv().is_err());
+        config.source_ledger = Arc::new(HashMap::from([(completion.key, completion.observation)]));
+        grow_directory(&parent, "after-completion");
+        let mut rescanned = 0;
+        scan_with_durable_source_boundaries(
+            &connector,
+            &ctx,
+            &config,
+            &mut sender,
+            |conversation| {
+                rescanned += 1;
+                Ok(Some(conversation))
+            },
+        )?;
+        sender.flush()?;
+        let reusable = env!("CASS_SOURCE_INGEST_REUSE") == "true";
+        assert_eq!(rescanned, usize::from(!reusable), "{name}");
+        assert_eq!(connector.discoveries.get(), 0);
+        if reusable {
+            assert!(rx.try_recv().is_err());
+        } else {
+            let IndexMessage::SourceComplete {
+                conversations,
+                byte_reservation,
+                ..
+            } = rx.try_recv()?
+            else {
+                panic!("mutable dependency replay must still certify stable source bytes");
+            };
+            drop(conversations);
+            limiter.release(byte_reservation);
+        }
+        // Unknown registrations keep the old conservative discovery path,
+        // even when a test adapter happens to delegate to a single-file parser.
+        let mut conservative =
+            StreamingBatchSender::new(&tx, Arc::clone(&limiter), "future-connector", true);
+        scan_with_durable_source_boundaries(
+            &connector,
+            &ctx,
+            &config,
+            &mut conservative,
+            |conversation| Ok(Some(conversation)),
+        )?;
+        conservative.flush()?;
+        assert_eq!(
+            connector.discoveries.get(),
+            1,
+            "unknown connector must still discover dependencies"
+        );
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                IndexMessage::Batch {
+                    conversations,
+                    byte_reservation,
+                    ..
+                }
+                | IndexMessage::SourceComplete {
+                    conversations,
+                    byte_reservation,
+                    ..
+                } => {
+                    drop(conversations);
+                    limiter.release(byte_reservation);
+                }
+                _ => panic!("unexpected producer message"),
+            }
+        }
+        // Make the primary differ from the saved row, then mutate it again
+        // after parsing: only an ordinary batch may cross this boundary.
+        fs::write(&source_path, format!("{transcript}\n"))?;
+        scan_with_durable_source_boundaries(
+            &connector,
+            &ctx,
+            &config,
+            &mut sender,
+            |conversation| {
+                fs::write(&source_path, format!("{transcript}\n\n"))?;
+                Ok(Some(conversation))
+            },
+        )?;
+        sender.flush()?;
+        let IndexMessage::Batch {
+            conversations,
+            byte_reservation,
+            ..
+        } = rx.try_recv()?
+        else {
+            panic!("{name}: changing primary bytes must never certify a completion");
+        };
+        drop(conversations);
+        limiter.release(byte_reservation);
+        assert!(rx.try_recv().is_err());
+    }
+    Ok(())
+}
