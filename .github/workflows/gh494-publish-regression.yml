@@ -130,6 +130,28 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/rebuild-regressions.log"
+      - name: Execute durable targeted repair and exact endpoint regressions
+        if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib lexical_reconcile:: -- --list 2>&1 | tee "$RUNNER_TEMP/gh494-results/targeted-repair-list.log"
+          for name in \
+            interrupted_publication_resumes_only_the_suffix_across_new_batch_boundaries \
+            interrupted_replay_never_repeats_the_completed_first_pass \
+            publication_between_commit_and_receipt_forces_safe_replay \
+            wrong_prefix_is_rejected_before_any_more_index_mutation \
+            failed_cursor_persistence_never_claims_a_completed_pass \
+            malformed_progress_and_nonregular_state_are_retained \
+            unsupported_and_inconsistent_cursor_states_are_rejected \
+            exact_endpoint_beyond_4096_ranked_candidates_still_verifies \
+            exact_endpoint_checks_every_stored_field_and_optional_absence \
+            exact_endpoint_snapshot_survives_tombstones_without_reopening \
+            exact_endpoint_admission_refuses_missing_or_corrupt_indexes_without_writes
+          do
+            grep -F "$name: test" "$RUNNER_TEMP/gh494-results/targeted-repair-list.log"
+          done
+          cargo test --locked --lib lexical_reconcile:: -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/targeted-repair.log"
       - name: Execute CLI EOF resume and repeated read-only searches
         if: ${{ !cancelled() && steps.rebuild-list.outcome == 'success' }}
         shell: bash

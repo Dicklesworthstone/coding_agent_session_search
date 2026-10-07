@@ -221,8 +221,8 @@ pub(crate) struct LexicalReconcileReport {
     /// unchanged. This is a replay invariant, not a full content-witness audit.
     pub converged: bool,
     /// Early/late endpoints observed at the exact source/message identity with
-    /// matching stored previews. New runs always emit Some(bool), using bounded
-    /// keyword discovery when no text token is available. The optional shape
+    /// matching stored previews. New runs always emit Some(bool), resolving
+    /// native document identities even without a text token. The optional shape
     /// is retained for compatibility with older reports, not a success bypass.
     pub early_canary_ok: Option<bool>,
     pub late_canary_ok: Option<bool>,
@@ -271,6 +271,7 @@ fn clear_checkpoint(path: &Path) -> Result<()> {
 }
 
 /// First lowercase alphanumeric token (>= 4 chars) usable as a search canary.
+#[cfg(test)]
 fn canary_token(content: &str) -> Option<String> {
     content
         .split(|c: char| !c.is_alphanumeric())
@@ -370,8 +371,6 @@ pub(crate) fn run_lexical_conversation_reconcile(
     let digest = fingerprint.finish()?;
     let early_doc = early_doc.ok_or_else(|| anyhow!("missing early reconcile endpoint"))?;
     let late_doc = late_doc.ok_or_else(|| anyhow!("missing late reconcile endpoint"))?;
-    let early_token = canary_token(&early_doc.content);
-    let late_token = canary_token(&late_doc.content);
 
     // 2. Durable checkpoint BEFORE publication; on retry, converge only when
     // the complete projected content and metadata are unchanged. A legacy
@@ -417,16 +416,17 @@ pub(crate) fn run_lexical_conversation_reconcile(
     )?;
     let upserted_docs = published.upserted_docs;
     let doc_count_after_first = published.first_pass_live_docs;
-    // Reuse one admitted reader for final accounting and both endpoint checks.
-    // No refresh or path reopen may split these observations across generations.
-    let reader = index.reader()?;
-    let doc_count_after = reader.doc_count()?;
+    // One native admission supplies identity lookup, stored columns and live
+    // accounting. Never rank endpoint discovery: an exact message can fall
+    // below every page of a bounded common-term query on a large archive.
+    let published = canary::exact::PublishedSnapshot::open(&index_path)?;
+    let doc_count_after = published.doc_count();
     let converged = doc_count_after.cmp(&doc_count_after_first).is_eq();
 
     // 5. Early/late endpoints against the published snapshot. Tokenless
     // messages must be verified too; unknown evidence cannot clear recovery.
-    let early_canary_ok = canary::verify(&reader, &early_doc, early_token.as_deref())?;
-    let late_canary_ok = canary::verify(&reader, &late_doc, late_token.as_deref())?;
+    let early_canary_ok = published.verify(&early_doc)?;
+    let late_canary_ok = published.verify(&late_doc)?;
 
     // Release explicitly before clearing recovery: a failed transaction
     // cleanup is not a successful repair. Early errors release through Drop.
