@@ -135,6 +135,10 @@ impl Drop for Server {
 }
 
 fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
+    // BSD-derived systems may inherit the listener's nonblocking mode.
+    // The accept loop polls, but this bounded request parser uses blocking I/O.
+    // A read timeout does not itself clear O_NONBLOCK on the accepted socket.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -736,6 +740,59 @@ fn external_cancelled_canonical_scan_keeps_vectors_and_resumes_exactly() -> Resu
     assert_eq!(
         signature(&resumed.index_path)?,
         signature(&fresh.index_path)?
+    );
+    Ok(())
+}
+
+#[test]
+fn fake_endpoint_reads_fragmented_requests_on_inherited_nonblocking_sockets() -> Result<()> {
+    // Force the BSD accepted-socket state on every platform. There must be no
+    // request bytes ready when serve starts; ignoring WouldBlock is not a fix.
+    let server = Server::start(8)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let mut client = TcpStream::connect(listener.local_addr()?)?;
+    client.set_read_timeout(Some(Duration::from_secs(2)))?;
+    client.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let (stream, _) = listener.accept()?;
+    stream.set_nonblocking(true)?;
+    let state = Arc::clone(&server.state);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        started_tx.send(()).expect("fixture receiver exists");
+        serve(stream, &state)
+    });
+    let exchange = (|| -> Result<String> {
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        thread::sleep(Duration::from_millis(30));
+        let body = serde_json::to_vec(&json!({
+            "model": "fixture-model",
+            "encoding_format": "float",
+            "input": ["delayed first", "delayed second"],
+        }))?;
+        write!(client, "POST /v1/embeddings HTTP/1.1\r\nContent-Length: ")?;
+        client.flush()?;
+        thread::sleep(Duration::from_millis(30));
+        write!(client, "{}\r\nContent-Type: application/json\r\n\r\n", body.len())?;
+        let split = body.len() / 2;
+        client.write_all(&body[..split])?;
+        client.flush()?;
+        thread::sleep(Duration::from_millis(30));
+        client.write_all(&body[split..])?;
+        client.flush()?;
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        Ok(response)
+    })();
+    // Join even when either peer fails: the I/O deadlines bound both sides.
+    let served = worker.join().expect("fragmented-request worker panicked");
+    served.context("the parser must wait for delayed request fragments")?;
+    let response = exchange?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    let body: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1)?;
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        server.take_inputs(),
+        vec![vec!["delayed first".to_owned(), "delayed second".to_owned()]]
     );
     Ok(())
 }

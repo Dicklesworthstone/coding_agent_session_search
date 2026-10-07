@@ -36,6 +36,8 @@ impl Endpoint {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                // The listener polls; accepted request streams use bounded blocking I/O.
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 let mut reader = BufReader::new(&mut stream);
@@ -68,9 +70,11 @@ impl Endpoint {
                     .enumerate()
                     .map(|(index, text)| {
                         let mut vector = vec![0.0_f32; 8];
-                        let slot = text.as_str().unwrap().bytes().fold(0usize, |n, b| {
-                            (n + usize::from(b)) % 8
-                        });
+                        let slot = text
+                            .as_str()
+                            .unwrap()
+                            .bytes()
+                            .fold(0usize, |n, b| (n + usize::from(b)) % 8);
                         vector[slot] = 1.0;
                         json!({"index": index, "embedding": vector})
                     })
@@ -78,7 +82,11 @@ impl Endpoint {
                 let body = serde_json::to_vec(&json!({
                     "model": request["model"], "data": data,
                 }))?;
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )?;
                 stream.write_all(&body)?;
             }
             Ok(())
@@ -166,7 +174,9 @@ fn cancelled_read_only_proof_preserves_publication_and_cannot_refresh_receipt() 
     let check: CancelCheck = {
         let polls = Arc::clone(&polls);
         let cancel_at = Arc::clone(&cancel_at);
-        Arc::new(move || polls.fetch_add(1, Ordering::SeqCst) + 1 >= cancel_at.load(Ordering::SeqCst))
+        Arc::new(move || {
+            polls.fetch_add(1, Ordering::SeqCst) + 1 >= cancel_at.load(Ordering::SeqCst)
+        })
     };
     let engine = engine::SemanticIndexer::with_external_config(endpoint.config()?, check)?;
     let plan = SemanticBackfillStoragePlan {
@@ -195,32 +205,25 @@ fn cancelled_read_only_proof_preserves_publication_and_cannot_refresh_receipt() 
     for (threshold, final_checkpoint) in [(3, false), (7, false), (usize::MAX, true)] {
         polls.store(0, Ordering::SeqCst);
         cancel_at.store(threshold, Ordering::SeqCst);
-        let error = prove_unchanged(
-            &engine,
-            &storage,
-            data,
-            &manifest,
-            &plan,
-            &sink,
-            || {
-                if final_checkpoint {
-                    cancel_at.store(0, Ordering::SeqCst);
-                }
-                Ok(())
-            },
-        )
+        let error = prove_unchanged(&engine, &storage, data, &manifest, &plan, &sink, || {
+            if final_checkpoint {
+                cancel_at.store(0, Ordering::SeqCst);
+            }
+            Ok(())
+        })
         .expect_err("a cancelled proof must not announce completion");
-        assert!(format!("{error:#}").contains("external_cancelled"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("external_cancelled"),
+            "{error:#}"
+        );
         assert_eq!(fs::read(&built.index_path)?, vectors_before);
         assert_eq!(fs::read(SemanticManifest::path(data))?, manifest_before);
         assert_eq!(fs::read(&receipt)?, b"incomplete skip receipt");
         assert_eq!(endpoint.requests.load(Ordering::SeqCst), sent_before);
     }
     cancel_at.store(usize::MAX, Ordering::SeqCst);
-    let outcome = prove_unchanged(
-        &engine, &storage, data, &manifest, &plan, &sink, || Ok(()),
-    )?
-    .context("uncancelled proof must retain the completed generation")?;
+    let outcome = prove_unchanged(&engine, &storage, data, &manifest, &plan, &sink, || Ok(()))?
+        .context("uncancelled proof must retain the completed generation")?;
     assert!(outcome.unchanged && outcome.published);
     assert_eq!(outcome.embedded_docs, 0);
     assert_eq!(fs::read(&built.index_path)?, vectors_before);
