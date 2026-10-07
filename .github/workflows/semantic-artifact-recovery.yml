@@ -71,6 +71,7 @@ jobs:
               raise SystemExit('Expected recovery tests did not run; zero tests is not success')
           PY
           }
+          run_suite append-admission --lib indexer::semantic::delegate::append::tests
           run_suite rebuild-publication --test semantic_rebuild_publication
           run_suite rebuild-progress --lib indexer::semantic::delegate::full_rebuild_tests
           cargo clippy --locked --lib -- -D warnings

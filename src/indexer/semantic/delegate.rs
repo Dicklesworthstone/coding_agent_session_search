@@ -13,6 +13,8 @@ use frankensearch::index::{Quantization, VectorIndex, next_generation, wal_path_
 use crate::search::semantic_manifest::TierKind;
 use crate::search::vector_index::{SemanticDocId, vector_index_path};
 
+mod append;
+
 impl SemanticIndexer {
     pub fn batch_size(&self) -> usize {
         self.inner.batch_size()
@@ -214,12 +216,15 @@ impl SemanticIndexer {
             .build_and_save_index_shards(embedded_messages, data_dir, plan)
     }
 
+    /// Prepare one bounded, validated, last-write-wins batch before taking the
+    /// live writer lock. Oversized requests are refused, never partially split.
+    /// CASS_SEMANTIC_APPEND_MAX_BYTES can lower the 64 MiB retained-payload cap.
     pub fn append_to_index(
         &self,
         embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
         data_dir: &Path,
     ) -> Result<usize> {
-        self.inner.append_to_index(embedded_messages, data_dir)
+        append::run(self, embedded_messages, data_dir)
     }
 
     /// Reconcile against the caller's authoritative canonical identity set.
