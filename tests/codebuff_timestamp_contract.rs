@@ -222,3 +222,160 @@ fn gh511_corrupt_absolute_timestamp_is_not_hidden_by_a_valid_message_id() {
         message_hit(&home, &data, streaming, "Synthetic probe answer");
     }
 }
+
+/// Multiple bad sources must be visible in one CLI result. Repairing one must
+/// neither hide the remaining failure nor duplicate the already retained chat.
+#[test]
+fn gh511_multiple_failures_recover_independently_across_indexing_modes() {
+    use coding_agent_search::storage::sqlite::SqliteStorage;
+    use std::collections::BTreeMap;
+
+    fn archive(data: &Path) -> BTreeMap<String, (i64, i64)> {
+        let storage = SqliteStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        let mut messages = BTreeMap::new();
+        for conversation in storage.list_conversations(20, 0).unwrap() {
+            let conversation_id = conversation.id.unwrap();
+            for message in storage.fetch_messages(conversation_id).unwrap() {
+                assert!(
+                    messages
+                        .insert(message.content, (conversation_id, message.id.unwrap()))
+                        .is_none(),
+                    "retry must not duplicate canonical messages"
+                );
+            }
+        }
+        messages
+    }
+
+    fn error_summary(report: &Value) -> &str {
+        assert_eq!(report["indexing_stats"]["scan_had_errors"], true, "{report}");
+        report["indexing_stats"]["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connector| connector["name"] == "codebuff")
+            .unwrap()["error"]
+            .as_str()
+            .unwrap()
+    }
+
+    fn names_path(message: &str, path: &Path) -> bool {
+        message.contains(path.to_string_lossy().as_ref())
+            || message.contains(path.canonicalize().unwrap().to_string_lossy().as_ref())
+    }
+
+    for (first_mode, retry_mode) in [("0", "1"), ("1", "0")] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let root = home.join(".config/manicode/projects");
+        let slot = "chats/2026-03-21T17-14-03.768Z/chat-messages.json";
+        let bad_json = root.join("a-bad-json").join(slot);
+        let good = root.join("middle-good").join(slot);
+        let bad_iso = root.join("z-bad-iso").join(slot);
+        let old = UNIX_EPOCH + Duration::from_secs(1_774_113_351);
+        let write_old = |path: &Path, bytes: &[u8]| {
+            fs::write(path, bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        let state = br#"{"sessionState":{"fileContext":{"projectRoot":"/synthetic/probe"}}}"#;
+        for primary in [&bad_json, &good, &bad_iso] {
+            fs::create_dir_all(primary.parent().unwrap()).unwrap();
+            write_old(&primary.with_file_name("run-state.json"), state);
+        }
+        let records = |id: &str, content: &str, timestamp: &str| {
+            serde_json::to_vec(&json!([{
+                "id":id, "variant":"user", "content":content, "timestamp":timestamp
+            }]))
+            .unwrap()
+        };
+        let healthy = records("user-1774113351457", "multifailurehealthyproof", "01:15 PM");
+        let invalid_iso = records(
+            "user-1774113471457",
+            "multirepairedisoproof",
+            "2026-13-45T99:00:00Z",
+        );
+        write_old(&bad_json, b"[");
+        write_old(&good, &healthy);
+        write_old(&bad_iso, &invalid_iso);
+        let index = |mode: &str, full: bool, exit: i32| {
+            let mut command = cass(&home, &data, mode);
+            command.args(["index", "--json", "--no-progress-events"]);
+            if full {
+                command.arg("--full");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(exit), "{output:?}");
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        };
+        let first = index(first_mode, true, 9);
+        let error = error_summary(&first);
+        assert!(names_path(error, &bad_json), "{first}");
+        assert!(names_path(error, &bad_iso), "{first}");
+        assert!(error.contains("invalid Codebuff / Freebuff transcript JSON"), "{first}");
+        assert!(error.contains("unparseable ISO-8601 timestamp"), "{first}");
+        let healthy_ids = archive(&data);
+        assert_eq!(healthy_ids.len(), 1);
+        let hit = message_hit(&home, &data, first_mode, "multifailurehealthyproof");
+        assert_eq!(hit["created_at"].as_i64(), Some(1_774_113_351_457));
+
+        // Neither an unchanged retry nor a mode switch is proof of recovery.
+        let unchanged = index(retry_mode, false, 9);
+        let error = error_summary(&unchanged);
+        assert!(names_path(error, &bad_json) && names_path(error, &bad_iso), "{unchanged}");
+        assert_eq!(archive(&data), healthy_ids);
+        assert_eq!(fs::read(&bad_json).unwrap(), b"[");
+        assert_eq!(fs::read(&bad_iso).unwrap(), invalid_iso);
+
+        let repaired_json = records(
+            "user-1774113411457",
+            "multirepairedjsonproof",
+            "01:16 PM",
+        );
+        write_old(&bad_json, &repaired_json);
+        let partial = index(retry_mode, false, 9);
+        let error = error_summary(&partial);
+        assert!(names_path(error, &bad_iso), "{partial}");
+        assert!(!names_path(error, &bad_json), "{partial}");
+        let partial_ids = archive(&data);
+        assert_eq!(partial_ids.len(), 2);
+        for (content, identity) in &healthy_ids {
+            assert_eq!(partial_ids.get(content), Some(identity));
+        }
+        let hit = message_hit(&home, &data, retry_mode, "multirepairedjsonproof");
+        assert_eq!(hit["created_at"].as_i64(), Some(1_774_113_411_457));
+
+        let repaired_iso = records(
+            "user-1774113471457",
+            "multirepairedisoproof",
+            "2026-09-01T12:00:00.000Z",
+        );
+        write_old(&bad_iso, &repaired_iso);
+        let complete = index(first_mode, false, 0);
+        assert_eq!(complete["indexing_stats"]["scan_had_errors"], false, "{complete}");
+        let final_ids = archive(&data);
+        assert_eq!(final_ids.len(), 3);
+        for (content, identity) in &partial_ids {
+            assert_eq!(final_ids.get(content), Some(identity));
+        }
+        let hit = message_hit(&home, &data, first_mode, "multirepairedisoproof");
+        assert_eq!(hit["created_at"].as_i64(), Some(1_788_264_000_000));
+        index(retry_mode, false, 0);
+        assert_eq!(archive(&data), final_ids);
+        assert_eq!(fs::read(&good).unwrap(), healthy);
+        assert_eq!(fs::read(&bad_json).unwrap(), repaired_json);
+        assert_eq!(fs::read(&bad_iso).unwrap(), repaired_iso);
+        for primary in [&bad_json, &good, &bad_iso] {
+            let sidecar = primary.with_file_name("run-state.json");
+            assert_eq!(fs::read(&sidecar).unwrap(), state);
+            assert_eq!(fs::metadata(primary).unwrap().modified().unwrap(), old);
+            assert_eq!(fs::metadata(sidecar).unwrap().modified().unwrap(), old);
+        }
+    }
+}
