@@ -69,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14, ubuntu-24.04-arm]
+        os: [ubuntu-24.04, macos-14, ubuntu-24.04-arm, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -78,7 +78,12 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '134217728'
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Preserve repository source bytes on every platform
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
@@ -99,7 +104,7 @@ jobs:
         run: cargo test --locked --lib gh512_benchmark_4159 -- --ignored --nocapture
       - name: Durable source completion and persisted CLI resume regressions
         run: cargo test --locked --test e2e_index_resume -- --nocapture
-      - name: Persisted legacy reuse and primary append through both real providers
+      - name: Persisted legacy reuse, exclusions and primary append through both real providers
         run: cargo test --locked --test e2e_source_ledger -- --nocapture
       - name: Focused Rust lint gate
         run: cargo clippy --locked --lib -- -D warnings
@@ -109,3 +114,93 @@ jobs:
       - name: Verify validation did not alter committed sources
         if: always()
         run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
+  exclusion-source:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Export reviewed whole-source exclusion fix without changing refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, subprocess, tarfile, tempfile, urllib.request
+          from pathlib import Path
+          assert os.environ['GITHUB_REPOSITORY'] == 'Dicklesworthstone/coding_agent_session_search'
+          api = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def request(path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def blob(sha):
+              result = request('/git/blobs/' + sha)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert digest(data) == sha
+              return data
+          bases = {
+              'src/connectors/source_dependencies.rs': '127342c51ab63c28b97c5ed4e82f0dfd8560e6ef',
+              'src/indexer/mod.rs': '47aeceb1d594b7a27c70d44433feb43d3e5ccdbf',
+              'src/indexer/source_ledger_tests.rs': '3b6fb5dcd091528093f12d121ca72cffdb7cb787',
+              'tests/e2e_source_ledger.rs': 'babcedb282bf45525c300b1e81ab86b9ab40f277',
+          }
+          expected = {
+              'src/connectors/source_dependencies.rs': 'd4b79ecf38d52f3e01089bb50a5f7881efa98ed1',
+              'src/indexer/mod.rs': 'b28c3e2dc0b81e47ccd2c883017d301ab20a1a2c',
+              'src/indexer/source_ledger_tests.rs': '3a9b08627452582e6c571e780220395408176c1a',
+              'tests/e2e_source_ledger.rs': '0c0fd946127e819b7b7f2a171ac8bfa2588a1d0a',
+          }
+          destination = Path.cwd()
+          with tempfile.TemporaryDirectory(prefix='gh512-exclusions-') as directory:
+              root = Path(directory)
+              for name, sha in bases.items():
+                  current = request('/contents/' + name + '?ref=' + os.environ['GITHUB_SHA'])
+                  assert current['sha'] == sha, 'source drift: ' + name
+                  path = root / name
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(blob(sha))
+              subprocess.run(['git', 'init', '-q', str(root)], check=True)
+              subprocess.run(['git', '-C', str(root), 'config', 'core.autocrlf', 'false'], check=True)
+              subprocess.run(['git', '-C', str(root), 'add', '--', *bases], check=True)
+              patch = gzip.decompress(blob('79961512b009eb63e6321d227f7062ba5745f8f2'))
+              assert hashlib.sha256(patch).hexdigest() == '6f645e23a2df3403f314ac7f0bf28919d8e7e0c0fbdb37f6fede49238ba5078b'
+              for options in [['--check'], []]:
+                  subprocess.run(['git', '-C', str(root), 'apply', *options, '--whitespace=error-all', '-'], input=patch, check=True)
+              for name, sha in expected.items():
+                  assert digest((root / name).read_bytes()) == sha, name
+              for options in [[], ['--check']]:
+                  subprocess.run(['rustfmt', '--edition', '2024', *options, '--config', 'skip_children=true', *bases], cwd=root, check=True)
+              subprocess.run(['git', '-C', str(root), 'diff', '--check'], check=True)
+              receipt = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}}
+              for name in bases:
+                  data = (root / name).read_bytes()
+                  result = request('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})
+                  assert result['sha'] == digest(data), name
+                  receipt['blobs'][name] = result['sha']
+              receipt_path = destination / 'gh512-exclusions-source.json'
+              receipt_path.write_bytes((json.dumps(receipt, indent=2) + '\n').encode())
+              with tarfile.open(destination / 'gh512-exclusions-source.tar.gz', 'w:gz') as archive:
+                  for name in bases:
+                      archive.add(root / name, arcname=name)
+                  archive.add(receipt_path, arcname=receipt_path.name)
+              print('GH512_EXCLUSIONS_SOURCE=' + json.dumps(receipt, sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh512-exclusions-source-${{ github.sha }}
+          path: |
+            gh512-exclusions-source.json
+            gh512-exclusions-source.tar.gz
+          if-no-files-found: error
+          retention-days: 7
