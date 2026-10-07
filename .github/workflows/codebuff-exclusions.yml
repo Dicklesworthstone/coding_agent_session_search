@@ -12,9 +12,13 @@ permissions:
 
 jobs:
   native:
-    name: Codebuff admission and watch (Windows)
-    runs-on: windows-2025
-    timeout-minutes: 110
+    name: Codebuff admission (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-slim]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 110 || 15 }}
     # Prepare immutable source objects only. This job never creates commits or
     # changes refs; publication remains an explicit expected-head GitHub action.
     permissions:
@@ -121,15 +125,19 @@ jobs:
       - name: Retain exact reviewed source objects
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: codebuff-admission-source-${{ github.sha }}-${{ github.run_attempt }}
+          name: codebuff-admission-source-${{ github.sha }}-${{ matrix.os }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/codebuff-admission/source.*
           if-no-files-found: error
           retention-days: 7
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+        if: matrix.os == 'windows-2025'
         with:
           key: codebuff-admission-windows
           cache-on-failure: true
       - name: Run full locked CASS connector and indexing gates
+        # The independent slim job qualifies exact source application and
+        # pinned formatting only. It never substitutes for native CASS gates.
+        if: matrix.os == 'windows-2025'
         timeout-minutes: 95
         run: |
           set +e
@@ -183,7 +191,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: codebuff-admission-receipts-${{ github.sha }}-${{ github.run_attempt }}
+          name: codebuff-admission-receipts-${{ github.sha }}-${{ matrix.os }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/codebuff-admission/
           if-no-files-found: error
           retention-days: 7
