@@ -601,8 +601,11 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
         }
         // Make the primary differ from the saved row, then mutate it again
         // after parsing: only an ordinary batch may cross this boundary.
+        // Codex also fails the scan, so the run reports the source and keeps
+        // its watermark (snapshot.rs:
+        // sink_mutation_returns_failure_without_certifying_completion).
         fs::write(&source_path, format!("{transcript}\n"))?;
-        scan_with_durable_source_boundaries(
+        let mutated = scan_with_durable_source_boundaries(
             &connector,
             &ctx,
             &config,
@@ -611,7 +614,18 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
                 fs::write(&source_path, format!("{transcript}\n\n"))?;
                 Ok(Some(conversation))
             },
-        )?;
+        );
+        if name == "codex" {
+            let error = mutated.expect_err("codex: a source changed after delivery fails the scan");
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)),
+                "{error:#}"
+            );
+        } else {
+            mutated?;
+        }
         sender.flush()?;
         let IndexMessage::Batch {
             conversations,
@@ -629,16 +643,10 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
         // the host actually filtered. A later unfiltered attempt must still run.
         config.source_ledger = Arc::new(HashMap::new());
         let mut filtered_count = 0;
-        scan_with_durable_source_boundaries(
-            &connector,
-            &ctx,
-            &config,
-            &mut sender,
-            |_| {
-                filtered_count += 1;
-                Ok(None)
-            },
-        )?;
+        scan_with_durable_source_boundaries(&connector, &ctx, &config, &mut sender, |_| {
+            filtered_count += 1;
+            Ok(None)
+        })?;
         sender.flush()?;
         assert_eq!(filtered_count, 1);
         assert!(
