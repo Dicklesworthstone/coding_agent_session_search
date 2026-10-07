@@ -515,7 +515,7 @@ impl EmbeddingWorker {
                         "daemon embedding input contains duplicate canonical document IDs"
                     );
                 }
-                if existing_state.active_count(&doc_id) == 1 {
+                if existing_state.active_count(&doc_id)? == 1 {
                     skipped_count += 1;
                 } else {
                     pending += 1;
@@ -531,7 +531,7 @@ impl EmbeddingWorker {
         if !planned || cancelled() {
             return Ok(EmbeddingPassOutcome::Cancelled);
         }
-        if existing_state.exactly_matches(&current_doc_ids) {
+        if existing_state.exactly_matches(&current_doc_ids)? {
             existing_state.ensure_current()?;
             storage
                 .update_job_progress(job_id, saturating_i64_from_usize(messages.total_docs()))?;
@@ -595,7 +595,7 @@ impl EmbeddingWorker {
                     if !current_doc_ids.contains(&doc_id) {
                         anyhow::bail!("daemon embedding source changed after identity planning");
                     }
-                    if existing_state.active_count(&doc_id) != 1 {
+                    if existing_state.active_count(&doc_id)? != 1 {
                         inputs.push(input);
                         if inputs.len() == EMBED_PROGRESS_CHUNK_SIZE {
                             embed_chunk(&inputs)?;

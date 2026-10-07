@@ -8,8 +8,12 @@
 use super::*;
 use anyhow::{Context, ensure};
 use frankensearch::index::wal_path_for;
+
 use std::fs;
 use std::path::PathBuf;
+
+mod main_coverage;
+use main_coverage::MainCoverage;
 
 #[derive(Debug)]
 struct Coverage {
@@ -24,8 +28,9 @@ pub(super) struct ExistingIndexState {
     path: PathBuf,
     before: SourceFiles,
     compatible: bool,
-    active: HashMap<String, Coverage>,
-    tombstones: usize,
+    // The main file already owns its IDs. Only WAL overrides need a map.
+    wal_coverage: HashMap<String, Coverage>,
+    main: MainCoverage,
 }
 
 impl ExistingIndexState {
@@ -65,8 +70,8 @@ impl ExistingIndexState {
             path,
             before,
             compatible: false,
-            active: HashMap::new(),
-            tombstones: 0,
+            wal_coverage: HashMap::new(),
+            main: MainCoverage::default(),
         };
         state.ensure_current()?;
         if cancelled() {
@@ -81,30 +86,20 @@ impl ExistingIndexState {
                 && source.dimension() == dimension
         });
         if state.compatible {
-            let mut shadowed = HashSet::new();
-            shadowed.try_reserve(source.wal_record_count())?;
             for (id, vector) in source.wal_records() {
                 if cancelled() {
                     return Ok(None);
                 }
-                ensure!(shadowed.insert(id), "duplicate daemon semantic WAL identity");
-                note_row(&mut state.active, id, usable(vector))?;
+                ensure!(
+                    !state.wal_coverage.contains_key(id),
+                    "duplicate daemon semantic WAL identity"
+                );
+                note_row(&mut state.wal_coverage, id, usable(vector))?;
             }
-            for row in 0..source.record_count() {
-                if cancelled() {
-                    return Ok(None);
-                }
-                if source.is_deleted(row) {
-                    state.tombstones += 1;
-                    continue;
-                }
-                let id = source.doc_id_at(row)?;
-                // Even an unusable current WAL row supersedes the main row.
-                // Re-embed it; never resurrect a usable but superseded value.
-                if !shadowed.contains(id) {
-                    note_row(&mut state.active, id, source.is_vector_usable(row))?;
-                }
-            }
+            let Some(main) = MainCoverage::inspect(source, cancelled)? else {
+                return Ok(None);
+            };
+            state.main = main;
         }
         state.ensure_current()?;
         if cancelled() {
@@ -113,26 +108,44 @@ impl ExistingIndexState {
         Ok(Some(state))
     }
 
-    pub(super) fn active_count(&self, id: &str) -> usize {
+    pub(super) fn active_count(&self, id: &str) -> anyhow::Result<usize> {
         if !self.compatible {
-            return 0;
+            return Ok(0);
         }
-        self.active
-            .get(id)
-            .filter(|coverage| coverage.usable)
-            .map_or(0, |coverage| coverage.occurrences)
+        // An unusable current WAL value still shadows every main-file value.
+        if let Some(coverage) = self.wal_coverage.get(id) {
+            return Ok(if coverage.usable {
+                coverage.occurrences
+            } else {
+                0
+            });
+        }
+        let source = self
+            .source
+            .as_ref()
+            .context("missing admitted semantic source")?;
+        self.main.active_count(source, id)
     }
 
-    pub(super) fn exactly_matches(&self, current: &HashSet<String>) -> bool {
-        self.compatible
-            && self.before.wal.is_none()
-            && self.tombstones == 0
-            && self
+    pub(super) fn exactly_matches(&self, current: &HashSet<String>) -> anyhow::Result<bool> {
+        if !self.compatible
+            || self.before.wal.is_some()
+            || self.main.tombstones() != 0
+            || self
                 .source
                 .as_ref()
-                .is_some_and(|source| source.record_count() == current.len())
-            && self.active.len() == current.len()
-            && current.iter().all(|id| self.active_count(id) == 1)
+                .is_none_or(|source| source.record_count() != current.len())
+        {
+            return Ok(false);
+        }
+        // Equal physical count plus unique usable coverage for EVERY canonical
+        // ID proves the bijection without copying all main-file identities.
+        for id in current {
+            if self.active_count(id)? != 1 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn ensure_current(&self) -> anyhow::Result<()> {

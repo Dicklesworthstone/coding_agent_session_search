@@ -99,8 +99,8 @@ fn reuse_planning_coexists_with_readers_and_keeps_a_shared_owner() -> anyhow::Re
     let before = fs::read(&path)?;
     let old_reader = VectorIndex::open_read_only(&path)?;
     let state = open(temp.path())?;
-    assert!(state.exactly_matches(&HashSet::from([id(&rows[0])])));
-    assert_eq!(state.active_count(&id(&rows[0])), 1);
+    assert!(state.exactly_matches(&HashSet::from([id(&rows[0])]))?);
+    assert_eq!(state.active_count(&id(&rows[0]))?, 1);
     drop(old_reader);
     let next_reader = VectorIndex::open_read_only(&path)?;
     assert_eq!(bits(&next_reader)?, bits(state.source.as_ref().unwrap())?);
@@ -172,8 +172,8 @@ fn wal_supersedes_main_before_cleanup_and_invalid_wal_never_revives_main() -> an
     let state = open(temp.path())?;
     assert_eq!(state.source.as_ref().unwrap().tombstone_count(), 0);
     assert_eq!(state.source.as_ref().unwrap().wal_record_count(), 1);
-    assert_eq!(state.active_count(&id(&original)), 0);
-    assert!(!state.exactly_matches(&HashSet::from([id(&original)])));
+    assert_eq!(state.active_count(&id(&original))?, 0);
+    assert!(!state.exactly_matches(&HashSet::from([id(&original)]))?);
     assert_eq!((fs::read(&path)?, fs::read(wal_path_for(&path))?), before);
     Ok(())
 }
@@ -201,7 +201,7 @@ fn stale_and_torn_wal_observation_never_mutates_the_log() -> anyhow::Result<()> 
         .write_all(b"torn incomplete trailer")?;
     let before = fs::read(wal_path_for(&path))?;
     let state = open(temp.path())?;
-    assert_eq!(state.active_count(&id(&pending)), 1);
+    assert_eq!(state.active_count(&id(&pending))?, 1);
     assert_eq!(fs::read(wal_path_for(&path))?, before);
     drop(state);
 
@@ -215,8 +215,8 @@ fn stale_and_torn_wal_observation_never_mutates_the_log() -> anyhow::Result<()> 
     )?;
     fs::rename(&newer, &path)?;
     let state = open(temp.path())?;
-    assert_eq!(state.active_count(&id(&pending)), 0);
-    assert!(!state.exactly_matches(&HashSet::from([id(&original)])));
+    assert_eq!(state.active_count(&id(&pending))?, 0);
+    assert!(!state.exactly_matches(&HashSet::from([id(&original)]))?);
     assert_eq!(fs::read(wal_path_for(&path))?, before);
     Ok(())
 }
@@ -238,8 +238,8 @@ fn unusable_duplicate_and_foreign_rows_cannot_certify_an_unchanged_index() -> an
         write(&path, &rows, Quantization::F16, space, 1)?;
         let before = fs::read(&path)?;
         let state = open(temp.path())?;
-        assert_ne!(state.active_count(&id(&original)), 1);
-        assert!(!state.exactly_matches(&current));
+        assert_ne!(state.active_count(&id(&original))?, 1);
+        assert!(!state.exactly_matches(&current)?);
         assert_eq!(fs::read(&path)?, before);
     }
     Ok(())
