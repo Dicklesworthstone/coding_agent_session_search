@@ -5,6 +5,20 @@ on:
     branches: [main]
     paths:
       - .github/workflows/codebuff-exclusions.yml
+      - .cargo/config.toml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - build.rs
+      - src/connectors/**
+      - src/connector_ingest_diagnostics.rs
+      - src/indexer/**
+      - tests/codebuff_exclusions.rs
+      - tests/codebuff_source_reuse.rs
+      - tests/codebuff_timestamp_contract.rs
+      - tests/e2e_multi_connector.rs
+      - scripts/check_dependency_features.py
+      - scripts/gate.sh
   workflow_dispatch:
 
 permissions:
@@ -19,10 +33,6 @@ jobs:
         os: [windows-2025, ubuntu-slim]
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.os == 'windows-2025' && 110 || 15 }}
-    # Prepare immutable source objects only. This job never creates commits or
-    # changes refs; publication remains an explicit expected-head GitHub action.
-    permissions:
-      contents: write
     defaults:
       run:
         shell: bash
@@ -46,9 +56,13 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
-      - name: Read repository toolchain
+      - name: Read repository toolchain and record the source
         id: toolchain
         run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/codebuff-admission"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/codebuff-admission/revision.txt"
+          cp Cargo.lock "$RUNNER_TEMP/codebuff-admission/Cargo.lock"
           python - <<'PY'
           import os, tomllib
           from pathlib import Path
@@ -60,85 +74,18 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
-      - name: Apply the reviewed watch-routing change and format exact sources
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python - <<'PY'
-          import hashlib, json, os, subprocess, tarfile, urllib.request
-          from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'codebuff-admission'
-          evidence.mkdir(parents=True, exist_ok=True)
-          def blob(path):
-              data = Path(path).read_bytes()
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          bases = {
-              'src/connectors/codebuff.rs': 'ca6e5036a731a9c2380b5671ac73e7ebb6f5f815',
-              'tests/codebuff_exclusions.rs': 'd8bb3817162571fdc8f1280a26f201a4e471af0c',
-              'src/indexer/mod.rs': '47aeceb1d594b7a27c70d44433feb43d3e5ccdbf',
-          }
-          for path, expected in bases.items():
-              if blob(path) != expected:
-                  raise SystemExit(f'concurrent source change: {path}')
-          patch = b'''diff --git a/src/indexer/mod.rs b/src/indexer/mod.rs
-          --- a/src/indexer/mod.rs
-          +++ b/src/indexer/mod.rs
-          @@ -30293,7 +30293,7 @@ impl ConnectorKind {
-                       Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
-                       Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
-                       Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
-          -            Self::Codebuff => Box::new(franken_agent_detection::CodebuffConnector::new()),
-          +            Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
-                   }
-               }
-           }
-          '''
-          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=patch, check=True)
-          if blob('src/indexer/mod.rs') != '0676ea8fc50368fdc1f8fdc4f2c034b937109761':
-              raise SystemExit('watch-routing result does not match the reviewed source')
-          paths = list(bases)
-          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', *paths], check=True)
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          result = {'source_commit': os.environ['GITHUB_SHA'], 'bases': bases, 'blobs': {}}
-          for path in paths:
-              payload = json.dumps({'content': Path(path).read_text(encoding='utf-8'), 'encoding': 'utf-8'}).encode()
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/git/blobs',
-                  data=payload, method='POST', headers={
-                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                      'Accept': 'application/vnd.github+json',
-                      'Content-Type': 'application/json',
-                      'X-GitHub-Api-Version': '2022-11-28',
-                  })
-              with urllib.request.urlopen(request, timeout=120) as response:
-                  uploaded = json.load(response)['sha']
-              if uploaded != blob(path):
-                  raise SystemExit(f'uploaded source mismatch: {path}')
-              result['blobs'][path] = uploaded
-          (evidence / 'source.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
-          with tarfile.open(evidence / 'source.tar.gz', 'w:gz') as archive:
-              for path in paths:
-                  archive.add(path, arcname=path)
-          print(json.dumps(result, indent=2))
-          PY
-      - name: Retain exact reviewed source objects
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: codebuff-admission-source-${{ github.sha }}-${{ matrix.os }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/codebuff-admission/source.*
-          if-no-files-found: error
-          retention-days: 7
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
         if: matrix.os == 'windows-2025'
         with:
           key: codebuff-admission-windows
           cache-on-failure: true
-      - name: Run full locked CASS connector and indexing gates
-        # The independent slim job qualifies exact source application and
-        # pinned formatting only. It never substitutes for native CASS gates.
-        if: matrix.os == 'windows-2025'
-        timeout-minutes: 95
+      - name: Check committed source and run native CASS gates
+        # Watch routing is committed. Test that checkout without a candidate
+        # patch, source rewriting, API object uploads, or write permissions.
+        # The slim runner checks formatting only, never native functionality.
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 95 || 10 }}
+        env:
+          RUN_NATIVE: ${{ matrix.os == 'windows-2025' && '1' || '0' }}
         run: |
           set +e
           set -uo pipefail
@@ -150,6 +97,7 @@ jobs:
           run_gate() {
             local stage="$1" kind="$2" rc counts
             shift 2
+            { printf 'STAGE=%s COMMAND=' "$stage"; printf ' %q' "$@"; printf '\n'; } | tee -a "$evidence/receipt.log" || failed=1
             "$@" 2>&1 | tee "$evidence/$stage.log"
             local statuses=("${PIPESTATUS[@]}")
             rc=${statuses[0]}
@@ -164,27 +112,25 @@ jobs:
             printf 'STAGE=%s EXIT=%s\n' "$stage" "$rc" | tee -a "$evidence/receipt.log" || failed=1
             [ "$rc" -eq 0 ] || failed=1
           }
+          run_gate compiler command rustc --version --verbose
           run_gate dependency-features command python scripts/check_dependency_features.py
-          run_gate exclusions test "${cargo_cmd[@]}" test --locked --test codebuff_exclusions -- --nocapture --test-threads=1
-          run_gate gh511 test "${cargo_cmd[@]}" test --locked --test e2e_multi_connector gh511_ -- --nocapture --test-threads=1
-          run_gate timestamp-contract test "${cargo_cmd[@]}" test --locked --test codebuff_timestamp_contract -- --nocapture --test-threads=1
-          run_gate boundaries test "${cargo_cmd[@]}" test --locked --lib connectors::codebuff:: -- --nocapture --test-threads=1
-          run_gate diagnostics test "${cargo_cmd[@]}" test --locked --lib connector_ingest_diagnostics::tests -- --nocapture --test-threads=1
-          run_gate dependency-drift test "${cargo_cmd[@]}" test --locked --lib dependency_drift::tests -- --nocapture --test-threads=1
-          run_gate clippy command "${cargo_cmd[@]}" clippy --locked --lib --bin cass --test codebuff_exclusions -- -D warnings
-          run_gate source-unchanged command python - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          source = json.loads((Path(os.environ['RUNNER_TEMP']) / 'codebuff-admission/source.json').read_text())
-          for path, expected in source['blobs'].items():
-              data = Path(path).read_bytes()
-              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              if actual != expected:
-                  raise SystemExit(f'test modified prepared source: {path}')
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          if changed - set(source['blobs']):
-              raise SystemExit(f'test changed unrelated files: {changed}')
-          PY
+          run_gate fmt command rustfmt --edition 2024 --check --config skip_children=true \
+            src/connectors/mod.rs src/connectors/codebuff.rs src/connectors/source_dependencies.rs \
+            src/indexer/mod.rs tests/codebuff_exclusions.rs tests/codebuff_source_reuse.rs
+          if [ "$RUN_NATIVE" = 1 ]; then
+            run_gate exclusions test "${cargo_cmd[@]}" test --locked --test codebuff_exclusions -- --nocapture --test-threads=1
+            run_gate source-reuse test "${cargo_cmd[@]}" test --locked --test codebuff_source_reuse -- --nocapture --test-threads=1
+            run_gate gh511 test "${cargo_cmd[@]}" test --locked --test e2e_multi_connector gh511_ -- --nocapture --test-threads=1
+            run_gate timestamp-contract test "${cargo_cmd[@]}" test --locked --test codebuff_timestamp_contract -- --nocapture --test-threads=1
+            run_gate boundaries test "${cargo_cmd[@]}" test --locked --lib connectors::codebuff:: -- --nocapture --test-threads=1
+            run_gate source-capabilities test "${cargo_cmd[@]}" test --locked --lib connectors::source_dependencies::tests -- --nocapture --test-threads=1
+            run_gate diagnostics test "${cargo_cmd[@]}" test --locked --lib connector_ingest_diagnostics::tests -- --nocapture --test-threads=1
+            run_gate dependency-drift test "${cargo_cmd[@]}" test --locked --lib dependency_drift::tests -- --nocapture --test-threads=1
+            run_gate clippy command "${cargo_cmd[@]}" clippy --locked --lib --bin cass \
+              --test codebuff_exclusions --test codebuff_source_reuse --test codebuff_timestamp_contract \
+              --test e2e_multi_connector -- -D warnings
+          fi
+          run_gate source-unchanged command git diff --exit-code
           printf 'STAGE=job-complete EXIT=%s\n' "$failed" | tee -a "$evidence/receipt.log" || failed=1
           exit "$failed"
       - name: Retain native receipts

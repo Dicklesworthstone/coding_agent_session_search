@@ -56,6 +56,15 @@ impl SourceDependencyCapability for super::codex::CodexConnector {
     const WHOLE_SOURCE_EXCLUSIONS: bool = true;
 }
 
+// Codebuff excludes the entire chat if either its transcript or consulted
+// run-state path is excluded, before calling the host's admission predicate.
+// The optional sidecar still affects reconstruction: keep parent observation.
+impl SourceDependencyCapability for super::codebuff::CodebuffConnector {
+    const SOURCE_DEPENDENCIES: SourceDependencyPolicy =
+        SourceDependencyPolicy::ObserveParentDirectory;
+    const WHOLE_SOURCE_EXCLUSIONS: bool = true;
+}
+
 pub(crate) struct ConnectorRegistration {
     pub(crate) name: &'static str,
     pub(crate) source_slug: &'static str,
@@ -160,7 +169,11 @@ mod tests {
 
     #[test]
     fn gh512_whole_source_exclusions_require_explicit_runtime_capabilities() {
-        for (registration, source) in [("claude", "claude_code"), ("codex", "codex")] {
+        for (registration, source) in [
+            ("claude", "claude_code"),
+            ("codex", "codex"),
+            ("codebuff", "codebuff"),
+        ] {
             assert!(can_reuse_with_path_exclusions(registration, source));
             assert!(!can_reuse_with_path_exclusions("unknown", source));
             assert!(!can_reuse_with_path_exclusions(registration, "unknown"));
@@ -170,10 +183,21 @@ mod tests {
                 can_reuse_with_path_exclusions(registration.name, registration.source_slug),
                 registration.whole_source_exclusions,
             );
-            if !matches!(registration.source_slug, "claude_code" | "codex") {
+            if !matches!(registration.source_slug, "claude_code" | "codex" | "codebuff") {
                 assert!(!registration.whole_source_exclusions);
             }
         }
+    }
+
+    #[test]
+    fn gh511_whole_chat_exclusions_do_not_make_codebuff_self_contained() {
+        assert!(can_reuse_with_path_exclusions("codebuff", "codebuff"));
+        assert_eq!(
+            source_dependency_policy("codebuff"),
+            SourceDependencyPolicy::ObserveParentDirectory
+        );
+        assert!(!can_reuse_with_path_exclusions("codebuff", "unknown"));
+        assert!(!can_reuse_with_path_exclusions("unknown", "codebuff"));
     }
 
     #[test]
