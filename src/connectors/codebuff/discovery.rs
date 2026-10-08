@@ -25,6 +25,17 @@ pub(super) fn discover_for_scan(
     for root in &ctx.scan_roots {
         scoped.scan_roots.clear();
         scoped.scan_roots.push(root.clone());
+        // A targeted metadata/chat selector requests reconstruction of that
+        // one chat. A deleted sidecar has no mtime, and copied/repaired state
+        // can keep an old one; neither may hide the unchanged primary behind
+        // the watch watermark. Reset per root so broad/primary selections
+        // still honor their own cutoff. Durable source admission stays later.
+        scoped.since_ts = ctx.since_ts;
+        if scoped.since_ts.is_some()
+            && super::watch_scope::transcript_selector(&root.path) != root.path
+        {
+            scoped.since_ts = None;
+        }
         match discover(&scoped) {
             Ok(found) => {
                 for source in found {
@@ -260,3 +271,6 @@ mod tests {
         assert!(error.to_string().contains("preparse permission sentinel"));
     }
 }
+
+#[cfg(test)]
+mod replay_tests;
