@@ -49,7 +49,7 @@ jobs:
           # or move refs; direct-main publication remains an expected-head action.
           python3 - <<'PY'
           import base64, hashlib, json, os, urllib.request
-          sha = '22a07fbe5661b3c648f659830d70dba55b2d4d33'
+          sha = 'ef932a6d7ec10d939b5a996ad9669b545db07581'
           request = urllib.request.Request(
               'https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/git/blobs/' + sha,
               headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
