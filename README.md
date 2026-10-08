@@ -3531,7 +3531,7 @@ Update check state is stored in `update_state.json` in the data directory:
 
 - **Cache debug**: set `CASS_DEBUG_CACHE_METRICS=1` to emit cache hit/miss/shortfall/reload stats via tracing (debug level).
 
-- **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to skip during source discovery and parsing. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed.
+- **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to keep out of the archive: no conversation from an excluded source is stored, indexed or raw-mirrored, whichever connector found it. The Claude Code, Codex, Codebuff and Pi readers skip an excluded file without opening it; other connectors read it, and cass discards its conversations before storing anything. Entries match whole path components (`sess` does not exclude `sessions`), a relative entry is taken from the working directory, and symlinks and other aliases of an existing directory are resolved on both sides, so a `..`, symlinked or (on Windows) differently-cased spelling of a directory excludes it too. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed.
 - **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.
@@ -3644,7 +3644,7 @@ The manifests and lockfile pin the entire SQLite family used by CASS (including
 `fsqlite-types`) at `=0.4.9`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
-archive. `franken-agent-detection =0.3.7` is published and accepts the 0.4.9
+archive. `franken-agent-detection =0.3.8` is published and accepts the 0.4.9
 family. SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only
 opens (GH#477) and 0.4.4 adds durable pending-freelist repairs. 0.4.6 stops a
 live B-tree page from being freed and granted again across a WAL generation
@@ -3672,7 +3672,7 @@ uniform SQLite 0.4.9 versions, a single resolution per package, and registry sou
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.9` (tag v0.4.9 = `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
-| `franken-agent-detection` | crates.io `=0.3.7`, features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
+| `franken-agent-detection` | crates.io `=0.3.8`, features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
 | `frankensearch` | crates.io `=0.7.1`, resolving `frankensearch-quill 0.4.0` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, plus concurrent segment verification on open for GH #501), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |

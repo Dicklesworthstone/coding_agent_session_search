@@ -1,5 +1,7 @@
 //! GH #486: the CLI must exclude raw copies as well as canonical/search rows.
 //! GH #506: `CASS_RAW_MIRROR=0` stops raw copies without excluding any rows.
+//! Bead 0f1k0: an exclusion covers every connector (Gemini included) and every
+//! spelling of the directory (`..`, relative, symlink alias).
 //! Run with `cargo test --test e2e_codex_exclusion_capture` in a full CASS build.
 
 use coding_agent_search::raw_mirror::storage_summary;
@@ -314,5 +316,147 @@ fn raw_mirror_switch_indexes_without_raw_copies_and_doctor_discloses_it() {
         control.index(streaming, "", true);
         let captured = storage_summary(&control.home.path().join("data"));
         assert_eq!(captured.manifest_count, 3, "streaming={streaming}");
+    }
+}
+
+/// Bead 0f1k0: an excluded directory stays out of the data dir for every
+/// connector and every spelling of the directory: as written, through a `..`
+/// path, as a relative path and through a symlink alias. Before the fix the
+/// Gemini reader, which never consults `CASS_EXCLUDE_PATHS`, indexed an
+/// exactly named excluded project, and FAD 0.3.7's Claude reader indexed the
+/// `..`, relative and alias spellings; the raw mirror withheld both, so the
+/// sessions were searchable while their raw copies were refused.
+#[test]
+fn every_spelling_of_an_exclusion_covers_claude_codex_and_gemini_sessions() {
+    fn gemini_session(path: &Path, session: &str, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let project = path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let record = json!({
+            "sessionId": session,
+            "projectHash": project,
+            "startTime": "2026-08-01T10:00:00Z",
+            "lastUpdated": "2026-08-01T10:01:00Z",
+            "messages": [
+                {"type": "user", "content": text, "timestamp": "2026-08-01T10:00:00Z"},
+            ],
+        });
+        fs::write(path, record.to_string()).unwrap();
+    }
+
+    fn claude_session(path: &Path, session: &str, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = json!({
+            "parentUuid": null,
+            "cwd": "/work",
+            "sessionId": session,
+            "version": "2.0.37",
+            "type": "user",
+            "message": {"role": "user", "content": text},
+            "uuid": format!("{session}-1"),
+            "timestamp": "2026-08-01T10:00:00.000Z",
+        });
+        fs::write(path, format!("{record}\n")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn alias_dir(target: &Path, link: &Path) -> Option<()> {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        Some(())
+    }
+    // Creating a Windows symlink needs a privilege CI runners may lack.
+    #[cfg(not(unix))]
+    fn alias_dir(_: &Path, _: &Path) -> Option<()> {
+        None
+    }
+
+    // The excluded directories, relative to HOME, which is also the working
+    // directory the harness runs cass in.
+    const EXCLUDED: [&str; 3] = [
+        ".claude/projects/-secret",
+        ".codex/sessions/private",
+        ".gemini/tmp/secrethash",
+    ];
+    // Spells one excluded directory (relative to HOME) as an exclusion entry;
+    // `None` when the platform cannot express that spelling.
+    type Spelling = fn(&Path, &str) -> Option<String>;
+    let spellings: [(&str, Spelling); 4] = [
+        ("exact", |home, dir| {
+            Some(home.join(dir).display().to_string())
+        }),
+        ("dotdot", |home, dir| {
+            let dir = Path::new(dir);
+            let parent = dir.parent()?;
+            let spelled = home
+                .join(parent)
+                .join("..")
+                .join(parent.file_name()?)
+                .join(dir.file_name()?);
+            Some(spelled.display().to_string())
+        }),
+        ("relative", |_, dir| Some(dir.to_string())),
+        ("alias", |home, dir| {
+            let link = home.join("aliases").join(dir.replace('/', "-"));
+            fs::create_dir_all(link.parent()?).unwrap();
+            alias_dir(&home.join(dir), &link)?;
+            Some(link.display().to_string())
+        }),
+    ];
+
+    for (name, spelling) in spellings {
+        for streaming in ["0", "1"] {
+            let fixture = Fixture::new();
+            let home = fixture.home.path();
+            claude_session(
+                &home.join(".claude/projects/-secret/secret.jsonl"),
+                "secret",
+                "cassclaudesecret6z",
+            );
+            claude_session(
+                &home.join(".claude/projects/-open/open.jsonl"),
+                "open",
+                "cassclaudeopen5z",
+            );
+            gemini_session(
+                &home.join(".gemini/tmp/secrethash/chats/session-secret.json"),
+                "secret",
+                "cassgeminisecret4z",
+            );
+            gemini_session(
+                &home.join(".gemini/tmp/openhash/chats/session-open.json"),
+                "open",
+                "cassgeminiopen3z",
+            );
+            let Some(entries) = EXCLUDED
+                .iter()
+                .map(|dir| spelling(home, dir))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let exclusions = entries.join(",");
+            fixture.index(streaming, &exclusions, true);
+            let data = home.join("data");
+            for excluded in [
+                "cassclaudesecret6z",
+                "cassprivateproof9z",
+                "cassgeminisecret4z",
+            ] {
+                assert_eq!(
+                    files_containing(&data, excluded),
+                    Vec::<PathBuf>::new(),
+                    "{excluded} leaked into the data dir ({name}: {exclusions}, streaming={streaming})"
+                );
+            }
+            // Positive controls: the sibling sessions are indexed and found.
+            for included in ["cassclaudeopen5z", "casspublicproof7z", "cassgeminiopen3z"] {
+                fixture.assert_hits(included, 1);
+            }
+        }
     }
 }

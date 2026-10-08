@@ -11,11 +11,12 @@
 #      exits 7 with kind `index-busy`; after the watcher is stopped, the next
 #      `cass index` reacquires the lock and exits 0;
 #   5. status and health print parseable JSON;
-#   6. with -CodexExclusions (bead 2l1b0.37 / GH #486): with CASS_EXCLUDE_PATHS
-#      naming a Codex session directory, given with backslashes, with forward
-#      slashes and upper-cased, a full index finds the included Codex control session,
-#      and no byte of the data dir or of any command's output holds the
-#      excluded sessions' words (one of them in a Unicode-named rollout).
+#   6. with -CodexExclusions (bead 2l1b0.37 / GH #486, 0f1k0): with
+#      CASS_EXCLUDE_PATHS naming a Codex session directory and a Claude Code
+#      project directory, given with backslashes, with forward slashes and
+#      upper-cased, a full index finds the included Codex and Claude control
+#      sessions, and no byte of the data dir or of any command's output holds
+#      the excluded sessions' words (one of them in a Unicode-named rollout).
 # Every command must also be free of the GH #406 teardown panic: no
 # "panicked at" or "threads should not terminate unexpectedly" on stderr and
 # no 0xC0000409 exit, including after valid JSON was printed.
@@ -157,25 +158,36 @@ if ($CodexExclusions) {
     New-Rollout (Join-Path $excludedDay 'rollout-2026-08-01T11-00-00-日本語.jsonl') 'codexunicodesentinel'
     New-Rollout (Join-Path $includedDay 'rollout-2026-08-02T10-00-00-included.jsonl') 'codexincludedcontrol'
     $env:CODEX_HOME = $codexHome
+    # A second Claude Code project beside the fixture's; the fixture project
+    # stays included as the Claude control.
+    $claudeSecret = Join-Path $claude 'projects\-secret-project'
+    New-Item -ItemType Directory -Force -Path $claudeSecret | Out-Null
+    [IO.File]::WriteAllText((Join-Path $claudeSecret 'agent-secret.jsonl'),
+        '{"parentUuid":null,"cwd":"/secret","sessionId":"secret-session","version":"2.0.37","type":"user","message":{"role":"user","content":"claudeexcludedsentinel private"},"uuid":"msg-secret-1","timestamp":"2025-11-12T18:31:18.697Z"}' + "`n")
+    $excluded = @($excludedDay, $claudeSecret)
     foreach ($variant in @(
-            @{ Name = 'backslash'; Path = $excludedDay },
-            @{ Name = 'slash'; Path = ($excludedDay -replace '\\', '/') },
+            @{ Name = 'backslash'; Paths = $excluded },
+            @{ Name = 'slash'; Paths = @($excluded | ForEach-Object { $_ -replace '\\', '/' }) },
             # NTFS resolves names case-insensitively, so a differently-cased
             # spelling names the same directory and must exclude it too.
-            @{ Name = 'case'; Path = $excludedDay.ToUpperInvariant() })) {
+            @{ Name = 'case'; Paths = @($excluded | ForEach-Object { $_.ToUpperInvariant() }) })) {
         $label = "codex-exclude-$($variant.Name)"
         $variantData = Join-Path $Work "codex-data-$($variant.Name)"
         New-Item -ItemType Directory -Force -Path $variantData | Out-Null
-        $env:CASS_EXCLUDE_PATHS = $variant.Path
+        $env:CASS_EXCLUDE_PATHS = $variant.Paths -join ','
         $r = Invoke-Cass "$label-index" @('index', '--full', '--data-dir', $variantData, '--json') @(0)
         $null = Get-Json "$label-index" $r.Stdout
-        $r = Invoke-Cass "$label-control" @('search', 'codexincludedcontrol', '--data-dir', $variantData, '--robot', '--mode', 'lexical', '--agent', 'codex', '--limit', '5') @(0)
-        $json = Get-Json "$label-control" $r.Stdout
-        $count = if ($json -and $json.hits) { @($json.hits).Count } else { 0 }
-        Write-Host "[$label-control] hits=$count"
-        if ($count -lt 1) { $failures.Add("$label found no hit for the included Codex control") }
+        foreach ($control in @(
+                @{ Agent = 'codex'; Word = 'codexincludedcontrol' },
+                @{ Agent = 'claude_code'; Word = 'smartedgar' })) {
+            $r = Invoke-Cass "$label-control-$($control.Agent)" @('search', $control.Word, '--data-dir', $variantData, '--robot', '--mode', 'lexical', '--agent', $control.Agent, '--limit', '5') @(0)
+            $json = Get-Json "$label-control-$($control.Agent)" $r.Stdout
+            $count = if ($json -and $json.hits) { @($json.hits).Count } else { 0 }
+            Write-Host "[$label-control-$($control.Agent)] hits=$count"
+            if ($count -lt 1) { $failures.Add("$label found no hit for the included $($control.Agent) control") }
+        }
         $scanned = @(Get-ChildItem $variantData -Recurse -File) + @(Get-ChildItem $Work -File -Filter "$label-*")
-        foreach ($word in 'codexexcludedsentinel', 'codexunicodesentinel') {
+        foreach ($word in 'codexexcludedsentinel', 'codexunicodesentinel', 'claudeexcludedsentinel') {
             $holders = @($scanned | Where-Object {
                     [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($_.FullName)).Contains($word)
                 })

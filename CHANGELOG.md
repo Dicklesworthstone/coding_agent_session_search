@@ -80,6 +80,21 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`CASS_EXCLUDE_PATHS` now keeps excluded sessions out of the index for
+  every connector.** Only the Claude Code, Codex, Codebuff and Pi readers
+  consulted the variable. For Gemini, Cursor, OpenCode, Aider and the other
+  connectors, an excluded session was withheld from the raw mirror but still
+  stored in the database and searchable, and `cass index` exited 0. Even for
+  Claude Code and Pi, an entry given through a symlink, a `..` path or a
+  relative path was not applied (and on Windows, neither was a
+  differently-cased spelling of a directory). cass now drops every
+  conversation whose source an exclusion covers before anything is stored,
+  using the same rules as the raw mirror: whole path components, a relative
+  entry taken from the working directory, and aliases of an existing
+  directory resolved on both sides. franken_agent_detection 0.3.8 applies
+  those rules in the Claude Code, Codex and Pi readers, which therefore no
+  longer read such files at all.
+
 - **Codex sessions compressed to `.jsonl.zst` are indexed (#513).** Codex's
   `local_thread_store_compression` replaces a finished session's
   `rollout-*.jsonl` with `rollout-*.jsonl.zst`. cass found only `.jsonl` and

@@ -178,11 +178,13 @@ const CONTRACTS: &[DependencyContract] = &[
         // one transcript does not parse, and names that transcript. 0.3.6
         // (codex-zstd) reads Codex rollouts compressed to .jsonl.zst (cass#513).
         // 0.3.7 adds the pi_durable connector (FAD#28; its SQLite stores need
-        // pi-durable) and pi_agent_rust SQLite sessions (pi-sqlite).
+        // pi-durable) and pi_agent_rust SQLite sessions (pi-sqlite). 0.3.8
+        // resolves `..`, relative and symlink-alias CASS_EXCLUDE_PATHS
+        // entries for the Claude, Pi and Codex readers (cass 0f1k0).
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.7",
+        expected_version: "0.3.8",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[

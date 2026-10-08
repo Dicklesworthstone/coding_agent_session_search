@@ -279,6 +279,28 @@ fn should_skip_active_session_source(
     true
 }
 
+/// GH #486 / bead 0f1k0: `CASS_EXCLUDE_PATHS` covers every connector. The
+/// Claude Code, Codex, Codebuff and Pi readers skip an excluded file before
+/// parsing it, but the other connectors read every source they find, so each
+/// conversation is checked here before it is counted, stored or indexed. The
+/// policy is the one raw-mirror capture applies: whole path components, a
+/// relative entry taken from the working directory, aliases of an existing
+/// directory resolved on both sides, and an unusable policy excluding
+/// everything. Scan watermarks are already held while exclusions are set
+/// (`scan_watermark_preservation_active`), so a skipped source is picked up
+/// once its exclusion is removed.
+fn should_skip_excluded_source(source_path: &Path) -> bool {
+    let excluded =
+        crate::connectors::codex::path_policy::ScanExclusions::from_env().excludes(source_path);
+    if excluded {
+        tracing::debug!(
+            source_path = %source_path.display(),
+            "skipping a conversation whose source CASS_EXCLUDE_PATHS excludes"
+        );
+    }
+    excluded
+}
+
 /// Whether `CASS_SKIP_SUBAGENTS` is enabled (#292). Subagent transcripts
 /// (Claude Code's `<project>/<session>/subagents/agent-*.jsonl`) are ephemeral
 /// one-task scratchpads whose conclusions already live in the parent session;
@@ -14836,7 +14858,9 @@ fn spawn_connector_producer(
                         active_source_skipped = true;
                         return Ok(None);
                     }
-                    if should_skip_subagent(&conversation) {
+                    if should_skip_subagent(&conversation)
+                        || should_skip_excluded_source(&conversation.source_path)
+                    {
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
@@ -14955,7 +14979,9 @@ fn spawn_connector_producer(
                         active_source_skipped = true;
                         return Ok(None);
                     }
-                    if should_skip_subagent(&conversation) {
+                    if should_skip_subagent(&conversation)
+                        || should_skip_excluded_source(&conversation.source_path)
+                    {
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
@@ -16318,7 +16344,9 @@ fn run_batch_index_with_connector_factories(
                             active_source_skipped = true;
                             return Ok(());
                         }
-                        if should_skip_subagent(&conversation) {
+                        if should_skip_subagent(&conversation)
+                            || should_skip_excluded_source(&conversation.source_path)
+                        {
                             return Ok(());
                         }
                         ingest_diagnostics.observe_conversation(&mut conversation);
@@ -16391,7 +16419,9 @@ fn run_batch_index_with_connector_factories(
                                 active_source_skipped = true;
                                 return Ok(());
                             }
-                            if should_skip_subagent(&conversation) {
+                            if should_skip_subagent(&conversation)
+                                || should_skip_excluded_source(&conversation.source_path)
+                            {
                                 return Ok(());
                             }
                             ingest_diagnostics.observe_conversation(&mut conversation);
@@ -31248,7 +31278,9 @@ fn reindex_paths_with_semantic_delta(
             || active_sources_skipped > 0
             || scan_error.is_some();
 
-        convs.retain(|conv| !should_skip_subagent(conv));
+        convs.retain(|conv| {
+            !should_skip_subagent(conv) && !should_skip_excluded_source(&conv.source_path)
+        });
 
         for conversation in &mut convs {
             ingest_diagnostics.observe_conversation(conversation);
