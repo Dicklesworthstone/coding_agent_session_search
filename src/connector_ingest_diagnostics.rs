@@ -1917,7 +1917,12 @@ mod tests {
     }
 
     fn v2_sidecar(agent_dir: &Path) -> std::io::Result<PathBuf> {
-        let sidecar = agent_dir.join("sessions/--work--/2026-01-01T00-00-00-000Z_0123abcd.v2");
+        // One component at a time: the diagnostic's path comes from a walk,
+        // which spells Windows separators as `\`.
+        let sidecar = agent_dir
+            .join("sessions")
+            .join("--work--")
+            .join("2026-01-01T00-00-00-000Z_0123abcd.v2");
         std::fs::create_dir_all(&sidecar)?;
         std::fs::write(sidecar.join("manifest.json"), "{}")?;
         Ok(sidecar)
