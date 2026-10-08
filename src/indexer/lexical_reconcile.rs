@@ -16,8 +16,8 @@
 //!    then publish a successor generation;
 //! 4. on retry, re-read the checkpoint and converge to exactly one live doc
 //!    per identity (upsert replaces; never appends);
-//! 5. verify exact endpoint canaries and the replay live-doc count before clearing the
-//!    durable checkpoint.
+//! 5. verify every projected document's native content witness, exact endpoint
+//!    canaries and the replay live-doc count before clearing the checkpoint.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -149,6 +149,56 @@ impl CanonicalProjection<'_> {
         Ok(summary)
     }
 
+    /// Audit every expected identity on ONE immutable published view while
+    /// re-reading the caller-pinned canonical snapshot in bounded batches.
+    /// Neither a stable global count nor two correct endpoints establishes
+    /// that an interior message exists with all of its projected content.
+    fn verify_published(
+        &self,
+        published: &canary::exact::PublishedSnapshot,
+        checkpoint: &LexicalReconcileCheckpoint,
+    ) -> Result<usize> {
+        anyhow::ensure!(
+            checkpoint.version == checkpoint::VERSION
+                && checkpoint.expected_docs > 0
+                && self.conversation_id == checkpoint.conversation_id
+                && self.row.source_id == checkpoint.source_id
+                && self.row.source_path.to_string_lossy().as_ref() == checkpoint.source_path,
+            "invalid lexical verification binding; checkpoint retained"
+        );
+        let mut fingerprint = checkpoint::ProjectionFingerprint::new(checkpoint.expected_docs);
+        let mut verified_docs = 0usize;
+        let summary = self.visit(|docs| {
+            fingerprint.update(docs)?;
+            for document in docs {
+                anyhow::ensure!(
+                    published.verify_content(document)?,
+                    "lexical repair content witness mismatch for conversation {} message {}; \
+                     checkpoint retained",
+                    self.conversation_id,
+                    document.msg_idx
+                );
+            }
+            verified_docs = verified_docs
+                .checked_add(docs.len())
+                .ok_or_else(|| anyhow!("lexical verification document count overflow"))?;
+            tracing::debug!(
+                conversation_id = self.conversation_id,
+                verified_docs,
+                expected_docs = checkpoint.expected_docs,
+                "lexical repair content audit progressed"
+            );
+            Ok(())
+        })?;
+        let digest = fingerprint.finish()?;
+        anyhow::ensure!(
+            summary.matches_checkpoint(checkpoint)
+                && checkpoint.projection_blake3.as_deref() == Some(digest.as_str()),
+            "canonical lexical projection changed during verification; checkpoint retained"
+        );
+        Ok(verified_docs)
+    }
+
     // Keep the original complete replay as an independent test comparator.
     // Production uses publication-bound durable progress below.
     #[cfg(test)]
@@ -215,6 +265,11 @@ pub(crate) struct LexicalReconcileReport {
     /// First-pass documents submitted in this invocation, excluding a resumed
     /// prefix. Zero is valid when resuming the verification replay pass.
     pub upserted_docs: usize,
+    /// Every expected identity checked against native full-document witnesses
+    /// and stored columns on one immutable publication, without ranking.
+    pub verified_docs: usize,
+    /// Names the non-cryptographic engine witness, not a posting-level audit.
+    pub verification_kind: &'static str,
     pub doc_count_before: u64,
     pub doc_count_after: u64,
     /// True when a second upsert of the identical set left the live-doc count
@@ -405,8 +460,8 @@ pub(crate) fn run_lexical_conversation_reconcile(
     // 4. Both passes retain publication-bound cursors. A retry validates the
     // canonical prefix and resumes only writes justified by the same admitted
     // manifest; changed publication authority safely restarts a full replay.
-    // This retains the existing count/endpoint invariant, not a full engine
-    // content-witness audit of every document.
+    // Keep the existing replay invariant as well as the read-only content
+    // audit below. A saved publication cursor is not a verification receipt.
     let published = checkpoint::progress::publish(
         &projection,
         &mut index,
@@ -427,6 +482,9 @@ pub(crate) fn run_lexical_conversation_reconcile(
     // messages must be verified too; unknown evidence cannot clear recovery.
     let early_canary_ok = published.verify(&early_doc)?;
     let late_canary_ok = published.verify(&late_doc)?;
+    // Completed/resumed publication passes must pass this audit afresh. The
+    // audit never opens a writer, refreshes the pinned view, or clears recovery.
+    let verified_docs = projection.verify_published(&published, &checkpoint)?;
 
     // Release explicitly before clearing recovery: a failed transaction
     // cleanup is not a successful repair. Early errors release through Drop.
@@ -451,6 +509,8 @@ pub(crate) fn run_lexical_conversation_reconcile(
         message_count: summary.message_count,
         expected_docs: summary.expected_docs,
         upserted_docs,
+        verified_docs,
+        verification_kind: "quill-idmap-schema-v1-xxh3-64-and-stored-columns",
         doc_count_before,
         doc_count_after,
         converged,
@@ -539,6 +599,204 @@ mod tests {
         let (provenance, _) =
             super::super::lexical_rebuild_packet_provenance_from_canonical(&row, &HashMap::new());
         Ok((storage, row, provenance))
+    }
+
+    fn bound_projection(
+        projection: &CanonicalProjection<'_>,
+    ) -> Result<(LexicalReconcileCheckpoint, Vec<CassDocument>)> {
+        let mut docs = Vec::new();
+        let summary = projection.visit(|batch| {
+            docs.extend_from_slice(batch);
+            Ok(())
+        })?;
+        Ok((
+            LexicalReconcileCheckpoint {
+                version: checkpoint::VERSION,
+                conversation_id: projection.conversation_id,
+                source_id: projection.row.source_id.clone(),
+                source_path: projection.row.source_path.to_string_lossy().into_owned(),
+                message_count: summary.message_count,
+                max_message_idx: summary.max_message_idx,
+                content_bytes: summary.content_bytes,
+                expected_docs: summary.expected_docs,
+                projection_blake3: Some(checkpoint::projection_fingerprint(&docs)),
+                started_at_ms: 1,
+                attempt: 1,
+            },
+            docs,
+        ))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_audit_refuses_interior_loss_and_stale_text_despite_valid_endpoints() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let prefix = "meridian evidence unicode λ ".repeat(1024);
+        let (storage, row, provenance) = stored_projection(
+            &tmp,
+            vec![
+                message(0, "meridian early endpoint"),
+                message(7, &format!("{prefix}alpha")),
+                message(13, "meridian late endpoint"),
+            ],
+        )?;
+        let projection = CanonicalProjection {
+            storage: &storage,
+            row: &row,
+            provenance: &provenance,
+            conversation_id: row.id.context("test identity")?,
+            max_content_bytes: 64,
+            max_messages: 2,
+        };
+        let (checkpoint, docs) = bound_projection(&projection)?;
+        assert_eq!(docs.len(), 3);
+        for case in 0..2 {
+            let path = tmp.path().join(format!("index-{case}"));
+            let mut index = TantivyIndex::open_or_create(&path)?;
+            let mut actual = docs.clone();
+            if case == 0 {
+                // A foreign identity balances the count of the missing middle.
+                actual[1].conversation_id = Some(projection.conversation_id + 100);
+            } else {
+                actual[1].content = format!("{prefix}bravo");
+                assert_eq!(actual[1].content.len(), docs[1].content.len());
+            }
+            index.add_prebuilt_documents_slice(&actual)?;
+            index.commit()?;
+            let checkpoint_path =
+                lexical_reconcile_checkpoint_path(&path, projection.conversation_id);
+            super::super::write_json_pretty_atomically(&checkpoint_path, &checkpoint)?;
+            let recovery = std::fs::read(&checkpoint_path)?;
+            let manifest = std::fs::read(path.join("MANIFEST"))?;
+            let published = canary::exact::PublishedSnapshot::open(&path)?;
+            assert_eq!(published.doc_count(), 3);
+            assert!(published.verify(&docs[0])?);
+            assert!(published.verify(&docs[2])?);
+            if case == 1 {
+                assert!(
+                    published.verify(&docs[1])?,
+                    "the preview comparator must pass"
+                );
+            }
+            let error = projection
+                .verify_published(&published, &checkpoint)
+                .unwrap_err();
+            assert!(error.to_string().contains("message 7"));
+            assert!(error.to_string().contains("checkpoint retained"));
+            assert_eq!(std::fs::read(&checkpoint_path)?, recovery);
+            assert_eq!(std::fs::read(path.join("MANIFEST"))?, manifest);
+            // Repairing the actual omitted/changed row admits the audit again;
+            // unrelated identities do not count as witnesses for this source.
+            index.upsert_prebuilt_documents_slice(&docs)?;
+            index.commit()?;
+            let repaired = canary::exact::PublishedSnapshot::open(&path)?;
+            assert_eq!(projection.verify_published(&repaired, &checkpoint)?, 3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_audit_is_snapshot_pinned_and_batch_independent() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let (storage, row, provenance) = stored_projection(
+            &tmp,
+            vec![
+                message(0, "meridian early endpoint"),
+                message(3, ""),
+                message(7, "meridian middle λ"),
+                message(13, &"meridian late oversized ".repeat(300)),
+            ],
+        )?;
+        let projection = CanonicalProjection {
+            storage: &storage,
+            row: &row,
+            provenance: &provenance,
+            conversation_id: row.id.context("test identity")?,
+            max_content_bytes: 64,
+            max_messages: 2,
+        };
+        let (checkpoint, docs) = bound_projection(&projection)?;
+        assert_eq!(docs.len(), 3);
+        let path = tmp.path().join("index");
+        let mut index = TantivyIndex::open_or_create(&path)?;
+        index.add_prebuilt_documents_slice(&docs)?;
+        index.commit()?;
+        let before = canary::exact::PublishedSnapshot::open(&path)?;
+        let original_manifest = std::fs::read(path.join("MANIFEST"))?;
+        for (max_messages, max_content_bytes) in [(1, 32), (2, 64), (8, 32_768)] {
+            let repartitioned = CanonicalProjection {
+                max_messages,
+                max_content_bytes,
+                ..projection
+            };
+            assert_eq!(
+                repartitioned.verify_published(&before, &checkpoint)?,
+                docs.len()
+            );
+        }
+        assert_eq!(std::fs::read(path.join("MANIFEST"))?, original_manifest);
+        let mut changed = docs[1].clone();
+        changed.content = "meridian different middle".into();
+        index.upsert_prebuilt_documents_slice(&[changed])?;
+        index.commit()?;
+        let after = canary::exact::PublishedSnapshot::open(&path)?;
+        assert_eq!(projection.verify_published(&before, &checkpoint)?, docs.len());
+        assert!(projection.verify_published(&after, &checkpoint).is_err());
+        for case in 0..4 {
+            let mut wrong = checkpoint.clone();
+            match case {
+                0 => wrong.projection_blake3 = Some("0".repeat(64)),
+                1 => wrong.expected_docs += 1,
+                2 => wrong.content_bytes += 1,
+                _ => wrong.conversation_id += 1,
+            }
+            assert!(
+                projection.verify_published(&before, &wrong).is_err(),
+                "binding {case}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_audit_production_reconcile_reports_verified_documents_before_clearing() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let (storage, row, _) = stored_projection(
+            &tmp,
+            vec![
+                message(0, "meridian early endpoint"),
+                message(7, "meridian middle λ"),
+                message(13, "1234 5678"),
+            ],
+        )?;
+        let conversation_id = row.id.context("test identity")?;
+        drop(storage);
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data)?;
+        let report = run_lexical_conversation_reconcile(
+            &data,
+            &tmp.path().join("archive.db"),
+            conversation_id,
+        )?;
+        assert_eq!(report.expected_docs, 3);
+        assert_eq!(report.verified_docs, report.expected_docs);
+        assert!(report.converged);
+        assert_eq!(report.early_canary_ok, Some(true));
+        assert_eq!(report.late_canary_ok, Some(true));
+        assert!(report.checkpoint_cleared);
+        let checkpoint_path =
+            lexical_reconcile_checkpoint_path(&expected_index_dir(&data), conversation_id);
+        assert!(!checkpoint_path.exists());
+        assert!(!checkpoint_path.with_extension("progress.json").exists());
+        let json = serde_json::to_value(report)?;
+        assert_eq!(json["verified_docs"], 3);
+        assert_eq!(
+            json["verification_kind"],
+            "quill-idmap-schema-v1-xxh3-64-and-stored-columns"
+        );
+        Ok(())
     }
 
     #[test]

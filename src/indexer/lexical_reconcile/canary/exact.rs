@@ -3,18 +3,62 @@
 //! A single admitted immutable Keeper view supplies identities, tombstones,
 //! stored metadata and final live-document accounting. This replaces the
 //! final ranked reader; it is not a second full index open for each endpoint.
-//! It verifies stored previews and provenance, not all content beyond previews.
+//! The full-document lane also compares the native IDMAP content witness.
+//! That witness covers every projected byte, including text beyond previews;
+//! it is not a cryptographic authenticity proof or a posting-level audit.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use frankensearch::quill::cass::{
-    CassConversationKey, CassDerivedColumns, CassDocument, cass_document_identity, field,
+    CassConversationKey, CassDerivedColumns, CassDocument, CassFieldValues,
+    cass_document_identity, field,
 };
+use frankensearch::quill::quiver::NumericValue;
 use frankensearch::quill::{
     CASS_SEMANTIC_SCHEMA, KeeperSnapshot, QuillSearchSnapshot, SnapshotPublisher,
 };
+use xxhash_rust::xxh3::Xxh3;
+
+/// Quill 0.4.0's schema-v1 IDMAP witness encoding. Quill exposes the stored
+/// witness but not the schema-document encoder (IngestDoc::content_hash).
+/// Borrow the engine's own CASS column projection and preserve its order;
+/// sorting columns or substituting the default-schema hash changes the wire
+/// contract. Actual-engine parity regressions below guard this boundary.
+/// An incompatible encoder causes verification to refuse, never to fall back
+/// to preview/count-only completion.
+fn content_witness(
+    identity: &str,
+    document: &CassDocument,
+    derived: &CassDerivedColumns,
+) -> Result<u64> {
+    let values = CassFieldValues::build(document.as_ref(), derived);
+    let mut hasher = Xxh3::new();
+    hasher.update(b"frankensearch.quill.idmap-content.schema.v1\0");
+    let mut field = |ordinal: u16, bytes: &[u8]| -> Result<()> {
+        let len = u64::try_from(bytes.len()).context("repair field length exceeds u64")?;
+        hasher.update(&ordinal.to_le_bytes());
+        hasher.update(&len.to_le_bytes());
+        hasher.update(bytes);
+        Ok(())
+    };
+    field(u16::MAX, identity.as_bytes())?;
+    for value in &values.indexed {
+        field(value.field_ord, value.text.as_bytes())?;
+    }
+    for value in &values.numeric {
+        let bytes = match value.value {
+            NumericValue::I64(value) => value.to_le_bytes(),
+            NumericValue::U64(value) => value.to_le_bytes(),
+        };
+        field(value.field_ord, &bytes)?;
+    }
+    for value in &values.stored {
+        field(value.field_ord, value.bytes)?;
+    }
+    Ok(hasher.digest())
+}
 
 pub(in crate::indexer::lexical_reconcile) struct PublishedSnapshot {
     view: Arc<QuillSearchSnapshot>,
@@ -41,6 +85,19 @@ impl PublishedSnapshot {
         &self,
         document: &CassDocument,
     ) -> Result<bool> {
+        self.verify_document(document, false)
+    }
+
+    /// Verify the full projected document, not only its stored preview. The
+    /// source text remains borrowed from the caller's bounded canonical batch.
+    pub(in crate::indexer::lexical_reconcile) fn verify_content(
+        &self,
+        document: &CassDocument,
+    ) -> Result<bool> {
+        self.verify_document(document, true)
+    }
+
+    fn verify_document(&self, document: &CassDocument, full_content: bool) -> Result<bool> {
         let identity = cass_document_identity(
             &document.source_id,
             CassConversationKey::for_document(document.as_ref()),
@@ -52,7 +109,12 @@ impl PublishedSnapshot {
             return Ok(false);
         };
         let id = resolved.global_docid;
-        let preview = CassDerivedColumns::derive(document.as_ref()).preview;
+        let derived = CassDerivedColumns::derive(document.as_ref());
+        if full_content
+            && content_witness(&identity, document, &derived)? != resolved.content_hash
+        {
+            return Ok(false);
+        }
         for (field, expected) in [
             (field::AGENT, Some(document.agent.as_str())),
             (field::SOURCE_ID, Some(document.source_id.as_str())),
@@ -62,7 +124,7 @@ impl PublishedSnapshot {
             (field::ORIGIN_KIND, Some(document.origin_kind.as_str())),
             (field::ORIGIN_HOST, document.origin_host.as_deref()),
             (field::TITLE, document.title.as_deref()),
-            (field::PREVIEW, Some(preview.as_str())),
+            (field::PREVIEW, Some(derived.preview.as_str())),
         ] {
             if self.text(field, id)?.as_deref() != expected {
                 return Ok(false);
@@ -116,6 +178,131 @@ mod tests {
             origin_host: None,
             conversation_id: Some(id),
         }
+    }
+
+    #[test]
+    fn full_content_witness_rejects_same_length_rewrites_beyond_preview() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("index");
+        let mut index = TantivyIndex::open_or_create(&path)?;
+        let prefix = "common evidence unicode λ ".repeat(1024);
+        let expected = document(42, &format!("{prefix}alpha"));
+        let actual = document(42, &format!("{prefix}bravo"));
+        assert_eq!(expected.content.len(), actual.content.len());
+        assert_eq!(
+            CassDerivedColumns::derive(expected.as_ref()).preview,
+            CassDerivedColumns::derive(actual.as_ref()).preview
+        );
+        index.add_prebuilt_documents_slice(std::slice::from_ref(&actual))?;
+        index.commit()?;
+        let before = PublishedSnapshot::open(&path)?;
+        // The actual incumbent passes in this same invocation. Native IDMAP
+        // evidence must detect bytes which stored-preview checks cannot see.
+        assert!(before.verify(&expected)?);
+        assert!(!before.verify_content(&expected)?);
+        assert!(before.verify_content(&actual)?);
+        assert!(!before.verify_content(&document(43, "absent identity"))?);
+        index.upsert_prebuilt_documents_slice(std::slice::from_ref(&expected))?;
+        index.commit()?;
+        let after = PublishedSnapshot::open(&path)?;
+        assert_eq!(after.doc_count(), 1);
+        assert!(after.verify_content(&expected)?);
+        assert!(!after.verify_content(&actual)?);
+        assert!(!before.verify_content(&expected)?);
+        assert!(before.verify_content(&actual)?);
+        Ok(())
+    }
+
+    #[test]
+    fn full_content_witness_matches_native_schema_projection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("index");
+        let mut index = TantivyIndex::open_or_create(&path)?;
+        let mut sparse = document(2, "1234 5678");
+        sparse.title = None;
+        sparse.workspace = None;
+        sparse.workspace_original = None;
+        sparse.created_at = None;
+        sparse.conversation_id = None;
+        let mut empty_options = document(3, "x=1; y=2;");
+        empty_options.title = Some(String::new());
+        empty_options.workspace = Some(String::new());
+        empty_options.workspace_original = Some(String::new());
+        empty_options.origin_host = Some(String::new());
+        let mut extremes = document(4, "你好 世界 λ \0 meridian");
+        extremes.msg_idx = u64::MAX;
+        extremes.created_at = Some(i64::MIN);
+        extremes.origin_kind = "remote".into();
+        extremes.origin_host = Some("host-λ".into());
+        extremes.title = Some("title\0λ".into());
+        let docs = [
+            document(1, "ordinary meridian text"),
+            sparse,
+            empty_options,
+            extremes,
+        ];
+        // This goes through Quill's actual CASS ingest encoder, not the
+        // consumer encoder above. Successful full verification is the parity
+        // oracle for field ordering, numeric widths and optional presence.
+        index.add_prebuilt_documents_slice(&docs)?;
+        index.commit()?;
+        for _ in 0..2 {
+            let published = PublishedSnapshot::open(&path)?;
+            for doc in &docs {
+                assert!(published.verify_content(doc)?);
+                let mut changed = doc.clone();
+                changed.content.push_str(" changed after publication");
+                assert!(!published.verify_content(&changed)?);
+            }
+            index.upsert_prebuilt_documents_slice(&docs)?;
+            index.commit()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_content_witness_frames_field_boundaries_and_optional_presence() -> Result<()> {
+        let original = document(42, "alpha");
+        let hash = |doc: &CassDocument| {
+            let identity = cass_document_identity(
+                &doc.source_id,
+                CassConversationKey::for_document(doc.as_ref()),
+                doc.msg_idx,
+            );
+            content_witness(&identity, doc, &CassDerivedColumns::derive(doc.as_ref()))
+        };
+        let expected = hash(&original)?;
+        for field in 0..13 {
+            let mut changed = original.clone();
+            match field {
+                0 => changed.content = "bravo".into(),
+                1 => changed.title = Some("other title".into()),
+                2 => changed.agent = "other".into(),
+                3 => changed.workspace = None,
+                4 => changed.workspace_original = None,
+                5 => changed.source_path = "/other".into(),
+                6 => changed.source_id = "foreign".into(),
+                7 => changed.origin_kind = "remote".into(),
+                8 => changed.origin_host = Some(String::new()),
+                9 => changed.created_at = None,
+                10 => changed.conversation_id = None,
+                11 => changed.msg_idx = 1,
+                _ => changed.content.push('\0'),
+            }
+            assert_ne!(hash(&changed)?, expected, "field {field}");
+        }
+        let mut a = original.clone();
+        a.title = Some("ab".into());
+        a.content = "c".into();
+        let mut b = a.clone();
+        b.title = Some("a".into());
+        b.content = "bc".into();
+        assert_ne!(hash(&a)?, hash(&b)?);
+        a.title = None;
+        b = a.clone();
+        b.title = Some(String::new());
+        assert_ne!(hash(&a)?, hash(&b)?);
+        Ok(())
     }
 
     #[test]
