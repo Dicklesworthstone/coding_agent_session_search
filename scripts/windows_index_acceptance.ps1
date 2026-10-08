@@ -12,8 +12,8 @@
 #      `cass index` reacquires the lock and exits 0;
 #   5. status and health print parseable JSON;
 #   6. with -CodexExclusions (bead 2l1b0.37 / GH #486): with CASS_EXCLUDE_PATHS
-#      naming a Codex session directory, given with backslashes and again with
-#      forward slashes, a full index finds the included Codex control session,
+#      naming a Codex session directory, given with backslashes, with forward
+#      slashes and upper-cased, a full index finds the included Codex control session,
 #      and no byte of the data dir or of any command's output holds the
 #      excluded sessions' words (one of them in a Unicode-named rollout).
 # Every command must also be free of the GH #406 teardown panic: no
@@ -159,7 +159,10 @@ if ($CodexExclusions) {
     $env:CODEX_HOME = $codexHome
     foreach ($variant in @(
             @{ Name = 'backslash'; Path = $excludedDay },
-            @{ Name = 'slash'; Path = ($excludedDay -replace '\\', '/') })) {
+            @{ Name = 'slash'; Path = ($excludedDay -replace '\\', '/') },
+            # NTFS resolves names case-insensitively, so a differently-cased
+            # spelling names the same directory and must exclude it too.
+            @{ Name = 'case'; Path = $excludedDay.ToUpperInvariant() })) {
         $label = "codex-exclude-$($variant.Name)"
         $variantData = Join-Path $Work "codex-data-$($variant.Name)"
         New-Item -ItemType Directory -Force -Path $variantData | Out-Null
