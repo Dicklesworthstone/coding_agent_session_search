@@ -1,0 +1,91 @@
+name: Metadata-only ingestion regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ingest-metadata-regression.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Exact ingestion source snapshot
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Retain tracked sources without modifying the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ingest-metadata-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/ingest-metadata-source/revision.txt"
+          git ls-tree -r HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo > "$RUNNER_TEMP/ingest-metadata-source/tree.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/ingest-metadata-source/source.tar.gz" HEAD src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ingest-metadata-source-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ingest-metadata-source/
+          if-no-files-found: error
+          retention-days: 7
+  native:
+    name: Locked metadata-only CLI regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+      RUSTFLAGS: '-Zthreads=1'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the pinned toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          channel = tomllib.loads(Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'channel={channel}\n')
+          PY
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+        with:
+          key: codebuff-native-ubuntu-24.04
+          cache-on-failure: true
+      - name: Run existing runtime assertions unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/ingest-metadata-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD | tee "$evidence/revision.txt"
+          cp Cargo.lock "$evidence/Cargo.lock"
+          cargo test --locked --config 'profile.dev.package.asupersync.codegen-units=256' --config 'profile.dev.package.asupersync.opt-level=0' --test codebuff_source_reuse --test codebuff_exclusions -- --nocapture --test-threads=1 2>&1 | tee "$evidence/tests.log"
+          bash scripts/gate.sh --verify-test-log "$evidence/tests.log"
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ingest-metadata-native-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ingest-metadata-evidence/
+          if-no-files-found: error
+          retention-days: 7
