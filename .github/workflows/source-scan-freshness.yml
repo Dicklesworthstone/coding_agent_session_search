@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   assemble-reviewed-patch:
-    if: startsWith(github.event.head_commit.message, 'build: assemble the reviewed source-freshness patch')
+    if: >-
+      startsWith(github.event.head_commit.message, 'build: assemble the reviewed source-freshness patch')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
