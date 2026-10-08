@@ -7,8 +7,21 @@
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
+
+// One component per join, as discovery builds paths: a '/' inside a fragment
+// survives on Windows, so an error naming the discovered path would not
+// contain the fixture's spelling of it.
+fn codebuff_projects(home: &Path) -> PathBuf {
+    home.join(".config").join("manicode").join("projects")
+}
+
+fn chat_dir(root: &Path, project: &str) -> PathBuf {
+    root.join(project)
+        .join("chats")
+        .join("2026-03-21T17-14-03.768Z")
+}
 
 fn cass(home: &Path, data: &Path, streaming: &str) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -30,10 +43,7 @@ fn cass(home: &Path, data: &Path, streaming: &str) -> Command {
     // Windows uses the OS profile rather than USERPROFILE. Isolate that
     // platform via the public override; Unix keeps default-path coverage.
     #[cfg(windows)]
-    command.env(
-        "CASS_CODEBUFF_DATA_ROOT",
-        home.join(".config/manicode/projects"),
-    );
+    command.env("CASS_CODEBUFF_DATA_ROOT", codebuff_projects(home));
     command
 }
 
@@ -76,9 +86,9 @@ fn gh511_corrupt_absolute_timestamp_is_not_hidden_by_a_valid_message_id() {
         let home = temp.path().join("home");
         let data = temp.path().join("data");
         fs::create_dir_all(&data).unwrap();
-        let root = home.join(".config/manicode/projects");
-        let good = root.join("a-good/chats/2026-03-21T17-14-03.768Z");
-        let bad = root.join("z-corrupt-iso/chats/2026-03-21T17-14-03.768Z");
+        let root = codebuff_projects(&home);
+        let good = chat_dir(&root, "a-good");
+        let bad = chat_dir(&root, "z-corrupt-iso");
         let old_mtime = UNIX_EPOCH + Duration::from_secs(1_774_113_351);
         for chat in [&good, &bad] {
             fs::create_dir_all(chat).unwrap();
@@ -248,7 +258,10 @@ fn gh511_multiple_failures_recover_independently_across_indexing_modes() {
     }
 
     fn error_summary(report: &Value) -> &str {
-        assert_eq!(report["indexing_stats"]["scan_had_errors"], true, "{report}");
+        assert_eq!(
+            report["indexing_stats"]["scan_had_errors"], true,
+            "{report}"
+        );
         report["indexing_stats"]["connectors"]
             .as_array()
             .unwrap()
@@ -269,11 +282,10 @@ fn gh511_multiple_failures_recover_independently_across_indexing_modes() {
         let home = temp.path().join("home");
         let data = temp.path().join("data");
         fs::create_dir_all(&data).unwrap();
-        let root = home.join(".config/manicode/projects");
-        let slot = "chats/2026-03-21T17-14-03.768Z/chat-messages.json";
-        let bad_json = root.join("a-bad-json").join(slot);
-        let good = root.join("middle-good").join(slot);
-        let bad_iso = root.join("z-bad-iso").join(slot);
+        let root = codebuff_projects(&home);
+        let bad_json = chat_dir(&root, "a-bad-json").join("chat-messages.json");
+        let good = chat_dir(&root, "middle-good").join("chat-messages.json");
+        let bad_iso = chat_dir(&root, "z-bad-iso").join("chat-messages.json");
         let old = UNIX_EPOCH + Duration::from_secs(1_774_113_351);
         let write_old = |path: &Path, bytes: &[u8]| {
             fs::write(path, bytes).unwrap();
@@ -318,7 +330,10 @@ fn gh511_multiple_failures_recover_independently_across_indexing_modes() {
         let error = error_summary(&first);
         assert!(names_path(error, &bad_json), "{first}");
         assert!(names_path(error, &bad_iso), "{first}");
-        assert!(error.contains("invalid Codebuff / Freebuff transcript JSON"), "{first}");
+        assert!(
+            error.contains("invalid Codebuff / Freebuff transcript JSON"),
+            "{first}"
+        );
         assert!(error.contains("unparseable ISO-8601 timestamp"), "{first}");
         let healthy_ids = archive(&data);
         assert_eq!(healthy_ids.len(), 1);
@@ -328,16 +343,15 @@ fn gh511_multiple_failures_recover_independently_across_indexing_modes() {
         // Neither an unchanged retry nor a mode switch is proof of recovery.
         let unchanged = index(retry_mode, false, 9);
         let error = error_summary(&unchanged);
-        assert!(names_path(error, &bad_json) && names_path(error, &bad_iso), "{unchanged}");
+        assert!(
+            names_path(error, &bad_json) && names_path(error, &bad_iso),
+            "{unchanged}"
+        );
         assert_eq!(archive(&data), healthy_ids);
         assert_eq!(fs::read(&bad_json).unwrap(), b"[");
         assert_eq!(fs::read(&bad_iso).unwrap(), invalid_iso);
 
-        let repaired_json = records(
-            "user-1774113411457",
-            "multirepairedjsonproof",
-            "01:16 PM",
-        );
+        let repaired_json = records("user-1774113411457", "multirepairedjsonproof", "01:16 PM");
         write_old(&bad_json, &repaired_json);
         let partial = index(retry_mode, false, 9);
         let error = error_summary(&partial);
@@ -358,7 +372,10 @@ fn gh511_multiple_failures_recover_independently_across_indexing_modes() {
         );
         write_old(&bad_iso, &repaired_iso);
         let complete = index(first_mode, false, 0);
-        assert_eq!(complete["indexing_stats"]["scan_had_errors"], false, "{complete}");
+        assert_eq!(
+            complete["indexing_stats"]["scan_had_errors"], false,
+            "{complete}"
+        );
         let final_ids = archive(&data);
         assert_eq!(final_ids.len(), 3);
         for (content, identity) in &partial_ids {

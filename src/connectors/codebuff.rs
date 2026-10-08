@@ -319,7 +319,12 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     fn fixture(root: &Path, project: &str) -> PathBuf {
-        let chat = root.join(project).join("chats/2026-03-21T17-14-03.768Z");
+        // One component per join, as discovery builds it: a '/' inside a
+        // fragment survives on Windows and the paths would not compare equal.
+        let chat = root
+            .join(project)
+            .join("chats")
+            .join("2026-03-21T17-14-03.768Z");
         fs::create_dir_all(&chat).unwrap();
         let transcript = chat.join("chat-messages.json");
         fs::write(

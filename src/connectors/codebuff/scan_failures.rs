@@ -105,7 +105,12 @@ mod tests {
     use std::path::Path;
 
     fn transcript(root: &Path, project: &str, bytes: &[u8]) -> PathBuf {
-        let chat = root.join(project).join("chats/2026-03-21T17-14-03.768Z");
+        // One component per join, as discovery builds it: a '/' inside a
+        // fragment survives on Windows and the paths would not compare equal.
+        let chat = root
+            .join(project)
+            .join("chats")
+            .join("2026-03-21T17-14-03.768Z");
         fs::create_dir_all(&chat).unwrap();
         let path = chat.join("chat-messages.json");
         fs::write(&path, bytes).unwrap();
@@ -136,11 +141,8 @@ mod tests {
             "z-bad-variant",
             &native_record("assistant", "01:15 PM"),
         );
-        let ctx = ScanContext::with_roots(
-            temp.path().join("data"),
-            vec![ScanRoot::local(root)],
-            None,
-        );
+        let ctx =
+            ScanContext::with_roots(temp.path().join("data"), vec![ScanRoot::local(root)], None);
         let mut delivered = Vec::new();
         let mut completed = Vec::new();
         let error = CodebuffConnector::new()
@@ -177,7 +179,10 @@ mod tests {
                 .find(|sample| &sample.path == path)
                 .unwrap();
             assert!(format!("{:#}", failure.error).contains(cause), "{message}");
-            assert!(message.contains(path.to_string_lossy().as_ref()), "{message}");
+            assert!(
+                message.contains(path.to_string_lossy().as_ref()),
+                "{message}"
+            );
             assert!(message.contains(cause), "{message}");
         }
         assert!(error.chain().any(|cause| cause.is::<serde_json::Error>()));
@@ -206,7 +211,8 @@ mod tests {
         assert!(message.contains("7 additional source failures omitted"));
         assert!(message.contains("39 total"));
         assert!(error.chain().any(|cause| {
-            cause.downcast_ref::<std::io::Error>()
+            cause
+                .downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
         }));
     }
@@ -218,11 +224,8 @@ mod tests {
         transcript(&root, "a-bad", b"[");
         transcript(&root, "middle-good", &native_record("user", "01:15 PM"));
         transcript(&root, "z-later", &native_record("user", "01:15 PM"));
-        let ctx = ScanContext::with_roots(
-            temp.path().join("data"),
-            vec![ScanRoot::local(root)],
-            None,
-        );
+        let ctx =
+            ScanContext::with_roots(temp.path().join("data"), vec![ScanRoot::local(root)], None);
         for fail_completion in [false, true] {
             let mut delivered = 0;
             let mut completed = 0;
