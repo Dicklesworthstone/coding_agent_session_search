@@ -1,0 +1,121 @@
+name: Source scan freshness
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/source-scan-freshness.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  assemble-reviewed-patch:
+    if: startsWith(github.event.head_commit.message, 'build: assemble the reviewed source-freshness patch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Apply the fixed patch and create unreferenced objects only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-scan-receipt"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+
+          repository = os.environ['REPOSITORY']
+          assert repository == 'Dicklesworthstone/coding_agent_session_search'
+          prefix = 'https://api.github.com/repos/' + repository
+          patch_blob = '8bc8a15103dcc7f772212694e1bfbcbc18ab4b5b'
+          patch_digest = 'c4cacb90efa5b368aa18d08d6293d4750029431f79c0d109bf5e1250ee96fde8'
+          paths = ['src/indexer/background_refresh.rs', 'src/indexer/mod.rs',
+                   'src/lib.rs', 'tests/gh494_publish_resume.rs']
+
+          def api(path, payload=None):
+              # Only immutable Git objects are written. No ref, issue, PR,
+              # branch, workflow-dispatch, settings or deletion endpoints.
+              assert path.startswith(('/git/blobs', '/git/trees', '/git/commits'))
+              request = urllib.request.Request(
+                  prefix + path,
+                  data=None if payload is None else json.dumps(payload).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json',
+                           'Content-Type': 'application/json',
+                           'X-GitHub-Api-Version': '2022-11-28'},
+                  method='GET' if payload is None else 'POST')
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  return json.load(response)
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          assert not git('status', '--porcelain')
+          parent = git('rev-parse', 'HEAD')
+          parent_tree = git('rev-parse', 'HEAD^{tree}')
+          before = {path: git('rev-parse', 'HEAD:' + path) for path in paths}
+          blob = api('/git/blobs/' + patch_blob)
+          assert blob['encoding'] == 'base64' and blob['size'] == 10841
+          packed = base64.b64decode(blob['content'])
+          assert hashlib.sha1(b'blob ' + str(len(packed)).encode() + b'\0' + packed).hexdigest() == patch_blob
+          patch = gzip.decompress(packed)
+          assert len(patch) == 41632 and hashlib.sha256(patch).hexdigest() == patch_digest
+          patch_path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'reviewed-source-scan.patch'
+          patch_path.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--index', '--check', '--whitespace=error-all', str(patch_path)], check=True)
+          subprocess.run(['git', 'apply', '--index', '--whitespace=error-all', str(patch_path)], check=True)
+          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+          changed = git('diff', '--cached', '--name-only').splitlines()
+          assert sorted(changed) == sorted(paths), changed
+          assert not git('diff', '--name-only')
+          expected_unchanged_base_outputs = {
+              'src/indexer/background_refresh.rs': ('db74075dd002982724490f504424bc0d807f9e7e', '5dabb33fb981d3729f069722fa1e1f5daee1d884'),
+              'tests/gh494_publish_resume.rs': ('acc44624d9483684dc7aabdaa7291d04aa016794', '65eee4726808291652fb49fc102ca25c9505ded2'),
+          }
+          entries, after = [], {}
+          for path in paths:
+              content = pathlib.Path(path).read_bytes()
+              local_sha = git('hash-object', path)
+              if path in expected_unchanged_base_outputs:
+                  old, expected = expected_unchanged_base_outputs[path]
+                  if before[path] == old:
+                      assert local_sha == expected, (path, local_sha)
+              created = api('/git/blobs', {'content': base64.b64encode(content).decode(), 'encoding': 'base64'})
+              assert created['sha'] == local_sha, path
+              after[path] = local_sha
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': local_sha})
+          tree = api('/git/trees', {'base_tree': parent_tree, 'tree': entries})['sha']
+          message = ('feat(indexer): separate successful source-scan freshness from lexical publication '
+                     '(coding_agent_session_search-synme)\n\n'
+                     'Apply the previously reviewed, saved GH514 patch with strict context to current main. '
+                     'Preserve concurrent source edits. Archive-bound scan start/completion receipts, '
+                     'independent freshness and breaker recovery, typed robot fields, and thirteen regression '
+                     'definitions. Default polling interval remains 1800 seconds.\n\n'
+                     'Validation: exact patch SHA-256, four-file allowlist, strict git apply --index '
+                     '--check/application, git diff --cached --check, and uploaded blob identity. '
+                     'Native Rust tests, formatting, Clippy, goldens and UBS are NOT run by this object '
+                     'builder. This commit is unreferenced pending explicit main publication; no PR.')
+          commit = api('/git/commits', {'message': message, 'tree': tree, 'parents': [parent]})['sha']
+          receipt = {'parent': parent, 'parent_tree': parent_tree, 'tree': tree, 'commit': commit,
+                     'patch_sha256': patch_digest, 'before': before, 'after': after,
+                     'native_tests_executed': False, 'branch_updated': False}
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source-scan-receipt/receipt.json'
+          output.write_text(json.dumps(receipt, indent=2) + '\n')
+          print('SOURCE_SCAN_CANDIDATE=' + json.dumps(receipt, sort_keys=True))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Created unreferenced candidate `' + commit + '` from `' + parent + '`. No branch updated.\n')
+          PY
+      - name: Preserve the object receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-scan-publication-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/source-scan-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 3
