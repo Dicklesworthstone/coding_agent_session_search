@@ -26,9 +26,11 @@ jobs:
         include:
           - os: ubuntu-24.04
             architecture: x86_64
+            cache_key: gh515-native-ubuntu-24.04-complete-v1
             rustflags: -Z threads=1 -C link-arg=-fuse-ld=lld
           - os: macos-15
             architecture: arm64
+            cache_key: gh515-native-macos-15
             rustflags: -Z threads=1
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -36,8 +38,8 @@ jobs:
       run:
         shell: bash
     env:
-      CASS_VALIDATION_SOURCE_SHA: 'e99bdcd4d65654faf21f82bc063f7a774def8264'
-      CASS_BASELINE_SOURCE_SHA: '929181f237113e024b3e63db489e6c904a578e8a'
+      CASS_VALIDATION_SOURCE_SHA: 'eec2d29fc29a8019c999ac9c4fb4da6f10cd7863'
+      CASS_BASELINE_SOURCE_SHA: 'cdfcc8164894553e215d38aebae16eeb36cc7df4'
       CARGO_BUILD_JOBS: '1'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -57,7 +59,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
         with:
-          key: gh515-native-${{ matrix.os }}
+          key: ${{ matrix.cache_key }}
           cache-on-failure: true
       - name: Record exact source and native architecture
         env:
@@ -70,13 +72,13 @@ jobs:
           rustc --version
           sqlite3 --version
           mkdir -p "$RUNNER_TEMP/gh515-logs"
-          git hash-object src/daemon/core.rs src/daemon/worker.rs src/daemon/worker/work_queue.rs src/franken_sync.rs src/indexer/mod.rs src/storage/sqlite.rs tests/daemon_client_integration.rs Cargo.toml Cargo.lock
+          git hash-object src/daemon/core.rs src/daemon/worker.rs src/daemon/worker/work_queue.rs src/daemon/worker/existing_index/main_coverage/tests.rs src/daemon/worker/existing_index/tests.rs src/franken_sync.rs src/indexer/mod.rs src/storage/sqlite.rs tests/daemon_client_integration.rs tests/e2e_index_resume.rs Cargo.toml Cargo.lock
           # Restored compiler artifacts must not outrank the checked-out
           # sources by mtime. This changes no source bytes.
           git ls-files -z -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo | xargs -0 touch -c
       - name: Check lifecycle source formatting
         run: |
-          rustfmt --edition 2024 --check --config skip_children=true src/daemon/core.rs src/daemon/worker.rs src/daemon/worker/work_queue.rs src/daemon/worker/existing_index/main_coverage/tests.rs src/daemon/worker/existing_index/tests.rs src/franken_sync.rs src/indexer/mod.rs src/storage/sqlite.rs tests/daemon_client_integration.rs
+          rustfmt --edition 2024 --check --config skip_children=true src/daemon/core.rs src/daemon/worker.rs src/daemon/worker/work_queue.rs src/daemon/worker/existing_index/main_coverage/tests.rs src/daemon/worker/existing_index/tests.rs src/franken_sync.rs src/indexer/mod.rs src/storage/sqlite.rs tests/daemon_client_integration.rs tests/e2e_index_resume.rs
       - name: Migration, preparation and writer-admission regressions
         if: ${{ !cancelled() }}
         run: |
@@ -111,12 +113,28 @@ jobs:
             cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --lib "$test_filter" -- --test-threads=1 --nocapture 2>&1 | tee "$log_file"
             bash scripts/gate.sh --verify-test-log "$log_file"
           done
+      - name: Upload library and ownership diagnostic snapshot
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh515-lifecycle-library-ownership-${{ matrix.os }}-${{ env.CASS_VALIDATION_SOURCE_SHA }}
+          path: ${{ runner.temp }}/gh515-logs
+          if-no-files-found: error
+          retention-days: 7
       - name: Resident daemon and separate indexing processes
         if: ${{ !cancelled() }}
         run: |
           cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration gh515 -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
           bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
-          awk '/^test result: ok\./ { passed += $4 } END { exit !(passed >= 6) }' "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
+          awk '/^test result: ok\./ { passed += $4 } END { exit !(passed >= 7) }' "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
+      - name: Upload daemon process diagnostic snapshot
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh515-lifecycle-daemon-processes-${{ matrix.os }}-${{ env.CASS_VALIDATION_SOURCE_SHA }}
+          path: ${{ runner.temp }}/gh515-logs
+          if-no-files-found: error
+          retention-days: 7
       - name: Existing daemon, indexing, storage and migration safety suites
         if: ${{ !cancelled() }}
         run: |
@@ -150,16 +168,16 @@ jobs:
           bash scripts/gate.sh --local \
             --lib-filter 'gh515 franken_sync::tests daemon::worker:: indexer::tests::heartbeat search::asset_state::tests::lexical_state_reports_stalled_when_progress_is_stale_despite_fresh_heartbeat' \
             --integration daemon_client_integration,cli_index,e2e_index_resume,storage,storage_migration_safety \
-            --ubs-files src/daemon/core.rs,src/daemon/worker.rs,src/daemon/worker/work_queue.rs,src/daemon/worker/existing_index/main_coverage/tests.rs,src/daemon/worker/existing_index/tests.rs,src/franken_sync.rs,src/indexer/mod.rs,src/storage/sqlite.rs,tests/daemon_client_integration.rs \
+            --ubs-files src/daemon/core.rs,src/daemon/worker.rs,src/daemon/worker/work_queue.rs,src/daemon/worker/existing_index/main_coverage/tests.rs,src/daemon/worker/existing_index/tests.rs,src/franken_sync.rs,src/indexer/mod.rs,src/storage/sqlite.rs,tests/daemon_client_integration.rs,tests/e2e_index_resume.rs \
             2>&1 | tee "$RUNNER_TEMP/gh515-logs/full-gate-console.log"
-      - name: Checkout immutable test-only baseline control
+      - name: Checkout immutable baseline with identical test rendezvous
         if: ${{ !cancelled() }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ env.CASS_BASELINE_SOURCE_SHA }}
           path: gh515-baseline
           persist-credentials: false
-      - name: Unchanged-main coexistence and periodic ownership controls
+      - name: Baseline with identical test rendezvous for coexistence and periodic ownership
         if: ${{ !cancelled() }}
         working-directory: gh515-baseline
         run: |
@@ -172,6 +190,23 @@ jobs:
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration "indexer_process_coexistence::$test_name" -- --exact --test-threads=1 --nocapture 2>&1 | tee "$log_file"
             bash scripts/gate.sh --verify-test-log "$log_file"
           done
+      - name: Baseline control must reproduce missing daemon writer admission
+        if: ${{ !cancelled() }}
+        working-directory: gh515-baseline
+        run: |
+          test "$(git rev-parse HEAD)" = "$CASS_BASELINE_SOURCE_SHA"
+          git rev-parse HEAD
+          git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock
+          log_file="$RUNNER_TEMP/gh515-logs/baseline-daemon-writer-admission.log"
+          set +e
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration indexer_process_coexistence::gh515_active_daemon_embedding_serializes_index_and_cancels_without_losing_retry -- --exact --test-threads=1 --nocapture 2>&1 | tee "$log_file"
+          test_exit=${PIPESTATUS[0]}
+          set -e
+          test "$test_exit" -eq 101
+          # Only successful indexing during active embedding proves missing admission.
+          # Compiler errors, timeouts and unrelated assertions keep this control red.
+          awk '/expected index-busy for while-embedding/ { missing_admission = 1 } /^[[:space:]]*left: Some\(0\)$/ { wrong_success = 1 } /^[[:space:]]*right: Some\(7\)$/ { expected_busy = 1 } /^test result: FAILED\. 0 passed; 1 failed;/ { one_failure = 1 } END { exit !(missing_admission && wrong_success && expected_busy && one_failure) }' "$log_file"
+          git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock
       - name: Baseline control must reproduce missing SQL cancellation
         if: ${{ !cancelled() }}
         working-directory: gh515-baseline
@@ -180,9 +215,10 @@ jobs:
           git rev-parse HEAD
           git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock
           log_file="$RUNNER_TEMP/gh515-logs/baseline-migration-cancellation.log"
-          # Reuse only normal Cargo artifacts. This checkout changes only the
-          # test file relative to 31a9dc28; it contains none of the candidate
-          # ownership or cancellation implementation.
+          # Reuse only normal Cargo artifacts. Relative to 31a9dc28, this
+          # baseline has identical debug-only storage and daemon snapshot
+          # rendezvous plus the test overlay, without candidate writer admission
+          # or cancellation.
           set +e
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration indexer_process_coexistence::gh515_sigterm_cancels_contended_migration_before_native_busy_timeout -- --exact --test-threads=1 --nocapture 2>&1 | tee "$log_file"
           test_exit=${PIPESTATUS[0]}
