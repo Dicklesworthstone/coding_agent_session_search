@@ -95,6 +95,16 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   those rules in the Claude Code, Codex and Pi readers, which therefore no
   longer read such files at all.
 
+- **A Codebuff chat's workspace follows its `run-state.json`.** Re-indexing a
+  chat whose project root changed (a full or incremental run, or
+  `cass index --watch-once` on the sidecar or the chat directory) re-read
+  the new root but kept the workspace from the chat's first import, in the
+  archive and in search. The archive now takes the new workspace, moves the
+  chat's analytics with it and rebuilds the lexical index, as it already
+  did for Cursor agent sessions. A chat whose `run-state.json` is missing or
+  unreadable keeps the workspace it had, and so does a chat seen again
+  through another store's path.
+
 - **Codex sessions compressed to `.jsonl.zst` are indexed (#513).** Codex's
   `local_thread_store_compression` replaces a finished session's
   `rollout-*.jsonl` with `rollout-*.jsonl.zst`. cass found only `.jsonl` and

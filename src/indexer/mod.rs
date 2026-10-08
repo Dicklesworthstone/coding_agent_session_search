@@ -35704,7 +35704,11 @@ pub mod persist {
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
-        prepare_codebuff_message_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
+        prepare_codebuff_canonical_repair(
+            storage,
+            Some(t_index.path()),
+            std::slice::from_ref(conv),
+        )?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
@@ -35767,7 +35771,11 @@ pub mod persist {
         let total_started = Instant::now();
         let db_started = Instant::now();
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
-        prepare_codebuff_message_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
+        prepare_codebuff_canonical_repair(
+            storage,
+            Some(t_index.path()),
+            std::slice::from_ref(conv),
+        )?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
@@ -35921,10 +35929,11 @@ pub mod persist {
                 continue;
             }
             let (source_id, _) = extract_provenance(&conv.metadata);
-            if !storage.cursor_workspace_repair_needed(
+            if !storage.provider_workspace_repair_needed(
                 &conv.agent_slug,
                 &source_id,
                 conv.external_id.as_deref(),
+                &conv.source_path,
                 conv.workspace.as_deref(),
                 &conv.metadata,
             )? {
@@ -35949,22 +35958,34 @@ pub mod persist {
         Ok(())
     }
 
-    fn prepare_codebuff_message_repair(
+    fn prepare_codebuff_canonical_repair(
         storage: &FrankenStorage,
         index_path: Option<&Path>,
         convs: &[NormalizedConversation],
     ) -> Result<()> {
         for conv in convs.iter().filter(|conv| conv.agent_slug == "codebuff") {
-            if !storage.codebuff_message_revisions_needed(&map_to_internal(conv))? {
+            let (source_id, _) = extract_provenance(&conv.metadata);
+            if !storage.codebuff_message_revisions_needed(&map_to_internal(conv))?
+                && !storage.provider_workspace_repair_needed(
+                    &conv.agent_slug,
+                    &source_id,
+                    conv.external_id.as_deref(),
+                    &conv.source_path,
+                    conv.workspace.as_deref(),
+                    &conv.metadata,
+                )?
+            {
                 continue;
             }
-            let index_path = index_path
-                .context("Codebuff message revision requires the canonical index directory")?;
+            let index_path = index_path.context(
+                "Codebuff message revision or workspace change requires the canonical index directory",
+            )?;
             let db_path = storage.database_path()?;
-            // An in-place revision leaves COUNT/MAX unchanged. Revoke lexical
-            // authority before committing canonical rows, so a failed publish
-            // followed by an unchanged source replay still rebuilds from SQLite.
-            // This repair mode needs no archive-wide count for admission.
+            // An in-place revision or a run-state workspace change leaves
+            // COUNT/MAX unchanged. Revoke lexical authority before committing
+            // canonical rows, so a failed publish followed by an unchanged
+            // source replay still rebuilds from SQLite. This repair mode needs
+            // no archive-wide count for admission.
             let mut state = super::LexicalRebuildState::new(
                 super::deferred_lexical_rebuild_db_state(&db_path, 0),
                 super::LEXICAL_REBUILD_PAGE_SIZE,
@@ -36327,7 +36348,7 @@ pub mod persist {
             let canonical_index_path = raw_mirror_data_dir
                 .map(crate::search::tantivy::index_dir)
                 .transpose()?;
-            prepare_codebuff_message_repair(
+            prepare_codebuff_canonical_repair(
                 storage,
                 canonical_index_path
                     .as_deref()

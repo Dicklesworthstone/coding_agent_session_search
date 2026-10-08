@@ -7923,22 +7923,44 @@ pub struct SourceIngestLedgerEntry {
     pub observation: String,
 }
 
-fn cursor_workspace_attribution_is_authoritative(
+/// Whether a replayed conversation's workspace is the provider's current
+/// attribution, so it replaces the canonical one. Cursor agent sessions say so
+/// explicitly, including an explicit "unresolved". Codebuff re-emits a whole
+/// chat with the workspace read from its run-state sidecar, so a present
+/// workspace is current; an absent one (sidecar removed or unreadable) never
+/// erases a known association.
+fn provider_workspace_is_authoritative(
     agent_slug: &str,
     workspace: Option<&Path>,
     metadata: &serde_json::Value,
 ) -> bool {
-    agent_slug == "cursor"
-        && metadata["cursor_format"] == "agent"
-        && match metadata["cursor_workspace_attribution"].as_str() {
-            Some("workspace_trusted") => workspace.is_some_and(|path| !path.as_os_str().is_empty()),
-            Some("unresolved") => workspace.is_none(),
-            _ => false,
+    let present = workspace.is_some_and(|path| !path.as_os_str().is_empty());
+    match agent_slug {
+        "cursor" => {
+            metadata["cursor_format"] == "agent"
+                && match metadata["cursor_workspace_attribution"].as_str() {
+                    Some("workspace_trusted") => present,
+                    Some("unresolved") => workspace.is_none(),
+                    _ => false,
+                }
         }
+        "codebuff" => present,
+        _ => false,
+    }
 }
 
-/// Reconcile only the provider-owned attribution fields. A missing workspace
-/// in an ordinary partial packet must never erase a known association.
+/// A Codebuff chat can also be reached through another store's path (an
+/// alias source sharing its lineage). Only a replay of the canonical row's
+/// own source carries that chat's run-state; an alias keeps the canonical
+/// source's attribution.
+fn replay_owns_provider_workspace(
+    agent_slug: &str,
+    canonical_source: Option<&str>,
+    source_path: &Path,
+) -> bool {
+    agent_slug != "codebuff" || canonical_source == Some(path_to_string(source_path).as_str())
+}
+
 /// Canonical rows were deleted (forget, dedup, agent purge). Their vectors
 /// stay in the semantic artifact and SQLite reuses the freed top message ids,
 /// so a watermark that covers them lets `cass index --semantic` take the #394
@@ -7951,7 +7973,9 @@ fn clear_semantic_embed_watermark_after_deletion(tx: &FrankenTransaction<'_>) ->
     Ok(())
 }
 
-fn franken_reconcile_cursor_workspace(
+/// Reconcile only the provider-owned attribution fields. A missing workspace
+/// in an ordinary partial packet must never erase a known association.
+fn franken_reconcile_provider_workspace(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
     conversation_id: i64,
@@ -7968,7 +7992,7 @@ fn franken_reconcile_cursor_workspace(
         );
     }
     if conv.external_id.is_none()
-        || !cursor_workspace_attribution_is_authoritative(
+        || !provider_workspace_is_authoritative(
             &conv.agent_slug,
             conv.workspace.as_deref(),
             &conv.metadata_json,
@@ -7976,16 +8000,33 @@ fn franken_reconcile_cursor_workspace(
     {
         return Ok(false);
     }
-    let (previous_workspace, mut metadata): (Option<i64>, serde_json::Value) = tx.query_row_map(
-        "SELECT workspace_id, metadata_json, metadata_bin FROM conversations WHERE id = ?1",
+    let (previous_workspace, previous_source, mut metadata): (
+        Option<i64>,
+        Option<String>,
+        serde_json::Value,
+    ) = tx.query_row_map(
+        "SELECT workspace_id, source_path, metadata_json, metadata_bin FROM conversations WHERE id = ?1",
         fparams![conversation_id],
-        |row| Ok((row.get_typed(0)?, franken_read_metadata_compat(row, 1, 2))),
+        |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                franken_read_metadata_compat(row, 2, 3),
+            ))
+        },
     )?;
+    if !replay_owns_provider_workspace(
+        &conv.agent_slug,
+        previous_source.as_deref(),
+        &conv.source_path,
+    ) {
+        return Ok(false);
+    }
     let mut changed = previous_workspace != workspace_id;
     if !metadata.is_object() {
         // Preserve non-object legacy metadata rather than replacing it blindly.
         anyhow::bail!(
-            "cannot reconcile Cursor workspace for conversation {conversation_id}: canonical metadata is not an object"
+            "cannot reconcile the provider workspace for conversation {conversation_id}: canonical metadata is not an object"
         );
     }
     for field in ["cursor_workspace_attribution", "cursor_project_dir"] {
@@ -9843,33 +9884,37 @@ impl FrankenStorage {
     }
 
     /// Read-only admission for the indexer's durable pre-mutation checkpoint.
-    /// Cursor Agent external IDs are stable across workspace attribution changes.
-    pub(crate) fn cursor_workspace_repair_needed(
+    /// Cursor Agent and Codebuff external IDs are stable across workspace
+    /// attribution changes.
+    pub(crate) fn provider_workspace_repair_needed(
         &self,
         agent_slug: &str,
         source_id: &str,
         external_id: Option<&str>,
+        source_path: &Path,
         workspace: Option<&Path>,
         metadata: &serde_json::Value,
     ) -> Result<bool> {
-        if !cursor_workspace_attribution_is_authoritative(agent_slug, workspace, metadata) {
+        if !provider_workspace_is_authoritative(agent_slug, workspace, metadata) {
             return Ok(false);
         }
         let Some(external_id) = external_id else {
             return Ok(false);
         };
-        let existing: Option<Option<String>> = self
+        let existing: Option<(Option<String>, Option<String>)> = self
             .conn
             .query_row_map(
-                "SELECT (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id)
+                "SELECT (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id), c.source_path
              FROM conversations c WHERE c.source_id = ?1 AND c.external_id = ?2
-             AND c.agent_id = (SELECT id FROM agents WHERE slug = 'cursor')",
-                fparams![source_id, external_id],
-                |row| row.get_typed(0),
+             AND c.agent_id = (SELECT id FROM agents WHERE slug = ?3)",
+                fparams![source_id, external_id, agent_slug],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .optional()?;
-        Ok(existing
-            .is_some_and(|current| current.as_deref() != workspace.map(path_to_string).as_deref()))
+        Ok(existing.is_some_and(|(current, canonical_source)| {
+            replay_owns_provider_workspace(agent_slug, canonical_source.as_deref(), source_path)
+                && current.as_deref() != workspace.map(path_to_string).as_deref()
+        }))
     }
 
     /// Ensure an agent exists in the database, returning its ID.
@@ -13618,9 +13663,14 @@ impl FrankenStorage {
                 defer_lexical_updates,
                 defer_analytics_updates,
             )?;
-            outcome.workspace_changed =
-                franken_reconcile_cursor_workspace(&tx, agent_id, existing.id, workspace_id, conv)?;
-            franken_reassociate_cursor_analytics_workspace(&tx, existing.id, conv)?;
+            outcome.workspace_changed = franken_reconcile_provider_workspace(
+                &tx,
+                agent_id,
+                existing.id,
+                workspace_id,
+                conv,
+            )?;
+            franken_reassociate_provider_analytics_workspace(&tx, existing.id, conv)?;
             tx.commit()?;
             return Ok(outcome);
         }
@@ -13736,14 +13786,14 @@ impl FrankenStorage {
                     )?;
                 }
 
-                let workspace_changed = franken_reconcile_cursor_workspace(
+                let workspace_changed = franken_reconcile_provider_workspace(
                     &tx,
                     agent_id,
                     existing_id,
                     workspace_id,
                     conv,
                 )?;
-                franken_reassociate_cursor_analytics_workspace(&tx, existing_id, conv)?;
+                franken_reassociate_provider_analytics_workspace(&tx, existing_id, conv)?;
                 tx.commit()?;
                 return Ok(InsertOutcome {
                     conversation_id: existing_id,
@@ -17056,7 +17106,10 @@ impl FrankenStorage {
                 }
             };
 
-            let workspace_id = if conv.agent_slug == "codebuff" {
+            // Codebuff analytics start on the canonical row's workspace. A
+            // changed run-state workspace is reconciled below, and the
+            // reassociation pass after the flush relocates these rows.
+            let analytics_workspace_id = if conv.agent_slug == "codebuff" {
                 tx.query_row_map(
                     "SELECT workspace_id FROM conversations WHERE id = ?1",
                     fparams![conv_id],
@@ -17186,7 +17239,7 @@ impl FrankenStorage {
                         message_id,
                         conversation_id: conv_id,
                         agent_id,
-                        workspace_id,
+                        workspace_id: analytics_workspace_id,
                         source_id: conv.source_id.clone(),
                         timestamp_ms: msg_ts,
                         day_id: msg_day_id,
@@ -17215,7 +17268,7 @@ impl FrankenStorage {
                         hour_id: msg_hour_id,
                         day_id: msg_day_id,
                         agent_slug: conv.agent_slug.clone(),
-                        workspace_id: workspace_id.unwrap_or(0),
+                        workspace_id: analytics_workspace_id.unwrap_or(0),
                         source_id: conv.source_id.clone(),
                         role: role_s.to_string(),
                         content_chars,
@@ -17258,12 +17311,16 @@ impl FrankenStorage {
                 conversation_inserted: session_count_delta > 0,
                 inserted_indices,
                 updated_indices,
-                workspace_changed: franken_reconcile_cursor_workspace(
+                // The packet as received, not `conv`: for an existing Codebuff
+                // chat that carries the canonical source path, title and
+                // workspace so its FTS rows stay canonical, which would hide
+                // both a changed run-state and an alias source.
+                workspace_changed: franken_reconcile_provider_workspace(
                     &tx,
                     agent_id,
                     conv_id,
                     workspace_id,
-                    conv,
+                    normalized_conv.as_ref(),
                 )?,
             });
         }
@@ -17403,14 +17460,18 @@ impl FrankenStorage {
         for ((_, _, conv), outcome) in conversations.iter().zip(&outcomes) {
             if conv.external_id.is_some()
                 && (shelley_metadata_is_authoritative(conv)
-                    || cursor_workspace_attribution_is_authoritative(
+                    || provider_workspace_is_authoritative(
                         &conv.agent_slug,
                         conv.workspace.as_deref(),
                         &conv.metadata_json,
                     ))
                 && reassociated.insert(outcome.conversation_id)
             {
-                franken_reassociate_cursor_analytics_workspace(&tx, outcome.conversation_id, conv)?;
+                franken_reassociate_provider_analytics_workspace(
+                    &tx,
+                    outcome.conversation_id,
+                    conv,
+                )?;
             }
         }
 
@@ -20124,14 +20185,14 @@ fn franken_flush_analytics_rollups_in_tx(
 /// Relocate existing analytics without re-estimating tokens or creating missing
 /// metrics. This also repairs authoritative replays whose canonical workspace
 /// was corrected earlier, while their analytics still use the former workspace.
-fn franken_reassociate_cursor_analytics_workspace(
+fn franken_reassociate_provider_analytics_workspace(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     conv: &Conversation,
 ) -> Result<()> {
     if conv.external_id.is_none()
         || !(shelley_metadata_is_authoritative(conv)
-            || cursor_workspace_attribution_is_authoritative(
+            || provider_workspace_is_authoritative(
                 &conv.agent_slug,
                 conv.workspace.as_deref(),
                 &conv.metadata_json,
@@ -36483,7 +36544,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             conv.agent_slug = "codex".into();
             conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted"});
             let mut tx = storage.conn.transaction().unwrap();
-            franken_reassociate_cursor_analytics_workspace(&tx, id, &conv).unwrap();
+            franken_reassociate_provider_analytics_workspace(&tx, id, &conv).unwrap();
             tx.commit().unwrap();
             assert_eq!(snapshot(), original);
         }
@@ -37124,6 +37185,151 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             matches.is_empty(),
             "buffered intermediate FTS must not survive"
         );
+    }
+
+    /// mt90z: a Codebuff replay carries the workspace from its run-state
+    /// sidecar. A changed one replaces the canonical workspace and moves the
+    /// chat's analytics with it; a replay without one keeps what is known.
+    #[test]
+    #[serial]
+    fn codebuff_run_state_workspace_replaces_the_canonical_workspace_on_replay() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let before = PathBuf::from("/synthetic/probe");
+        let after = PathBuf::from("/metadata/watch-updated");
+        let probe = serde_json::json!({});
+        assert!(provider_workspace_is_authoritative(
+            "codebuff",
+            Some(&after),
+            &probe
+        ));
+        assert!(!provider_workspace_is_authoritative(
+            "codebuff", None, &probe
+        ));
+        assert!(!provider_workspace_is_authoritative(
+            "codebuff",
+            Some(Path::new("")),
+            &probe
+        ));
+        assert!(!provider_workspace_is_authoritative(
+            "claude_code",
+            Some(&after),
+            &probe
+        ));
+        for batched in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("codebuff-workspace.db")).unwrap();
+            let agent = gh423_agent(&storage);
+            let before_id = storage.ensure_workspace(&before, None).unwrap();
+            let after_id = storage.ensure_workspace(&after, None).unwrap();
+            let persist = |conv: &Conversation, workspace_id: Option<i64>| {
+                if batched {
+                    storage
+                        .insert_conversations_batched_with_analytics(
+                            &[(agent, workspace_id, conv)],
+                            false,
+                        )
+                        .unwrap()
+                        .pop()
+                        .unwrap()
+                } else {
+                    storage
+                        .insert_conversation_tree_with_analytics(agent, workspace_id, conv, false)
+                        .unwrap()
+                }
+            };
+            let attribution = || {
+                let rows = storage.list_conversations(10, 0).unwrap();
+                assert_eq!(rows.len(), 1);
+                let analytics: Vec<i64> = storage
+                    .raw()
+                    .query_map_collect(
+                        "SELECT workspace_id FROM message_metrics
+                         UNION SELECT IFNULL(workspace_id, 0) FROM token_usage",
+                        fparams![],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap();
+                (rows[0].workspace.clone(), analytics)
+            };
+            let mut conv = gh423_storage_snapshot();
+            conv.workspace = Some(before.clone());
+            let original = persist(&conv, Some(before_id));
+            let messages =
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap();
+            assert_eq!(attribution(), (Some(before.clone()), vec![before_id]));
+            let (external_id, metadata) = (conv.external_id.clone(), conv.metadata_json.clone());
+            let own = conv.source_path.clone();
+            // The same chat reached through another store shares its lineage.
+            let alias = PathBuf::from(
+                "/profile/.config/freebuff/projects/project/chats/native-chat/chat-messages.json",
+            );
+            let repair_needed = |source_path: &Path, workspace: Option<&Path>| {
+                storage
+                    .provider_workspace_repair_needed(
+                        "codebuff",
+                        "local",
+                        external_id.as_deref(),
+                        source_path,
+                        workspace,
+                        &metadata,
+                    )
+                    .unwrap()
+            };
+            assert!(
+                !repair_needed(&own, Some(&before)),
+                "an unchanged replay needs no repair"
+            );
+            assert!(repair_needed(&own, Some(&after)));
+            assert!(
+                !repair_needed(&own, None),
+                "an absent workspace is not a change"
+            );
+            assert!(
+                !repair_needed(&alias, Some(&after)),
+                "an alias source does not own the workspace"
+            );
+            assert!(!persist(&conv, Some(before_id)).workspace_changed);
+            let mut aliased = conv.clone();
+            aliased.source_path = alias.clone();
+            aliased.workspace = Some(after.clone());
+            let alias_replay = persist(&aliased, Some(after_id));
+            assert_eq!(alias_replay.conversation_id, original.conversation_id);
+            assert!(!alias_replay.workspace_changed);
+            assert_eq!(attribution(), (Some(before.clone()), vec![before_id]));
+            let generation_before = storage
+                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                .unwrap();
+
+            conv.workspace = Some(after.clone());
+            let changed = persist(&conv, Some(after_id));
+            assert_eq!(changed.conversation_id, original.conversation_id);
+            assert!(changed.workspace_changed);
+            assert!(!changed.conversation_inserted);
+            assert!(changed.inserted_indices.is_empty());
+            assert!(changed.updated_indices.is_empty());
+            assert_eq!(attribution(), (Some(after.clone()), vec![after_id]));
+            let generation_after = storage
+                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                .unwrap();
+            assert!(generation_after.is_some());
+            assert_ne!(
+                generation_after, generation_before,
+                "vector doc IDs embed the workspace"
+            );
+            assert!(!repair_needed(&own, Some(&after)));
+
+            conv.workspace = None;
+            let absent = persist(&conv, None);
+            assert_eq!(absent.conversation_id, original.conversation_id);
+            assert!(!absent.workspace_changed);
+            assert_eq!(attribution(), (Some(after.clone()), vec![after_id]));
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap(),
+                messages
+            );
+        }
     }
 
     #[test]
@@ -38405,7 +38611,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 );
             }
             conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"unresolved"});
-            assert!(!cursor_workspace_attribution_is_authoritative(
+            assert!(!provider_workspace_is_authoritative(
                 "codex",
                 None,
                 &conv.metadata_json
@@ -38440,7 +38646,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             {
                 let mut tx = storage.conn.transaction().unwrap();
                 assert!(
-                    franken_reconcile_cursor_workspace(
+                    franken_reconcile_provider_workspace(
                         &tx,
                         agent,
                         original.conversation_id,
