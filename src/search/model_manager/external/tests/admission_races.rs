@@ -4,7 +4,7 @@
 use super::*;
 use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use crate::search::semantic_manifest::BuildCheckpoint;
-use anyhow::Result as AnyResult;
+use anyhow::{Context as _, Result as AnyResult};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -75,7 +75,10 @@ impl Endpoint {
 
     fn arm(&self, action: impl FnOnce() -> AnyResult<()> + Send + 'static) {
         let mut mutation = self.mutation.lock().unwrap();
-        assert!(mutation.is_none(), "one mutation per first preflight request");
+        assert!(
+            mutation.is_none(),
+            "one mutation per first preflight request"
+        );
         *mutation = Some(Box::new(action));
     }
 
@@ -353,7 +356,10 @@ fn unchanged_preflight_retains_the_reader_without_extra_http() -> AnyResult<()> 
         assert_eq!(seen.len(), 3, "two preflights then the authorized query");
         assert_eq!(seen[2], vec![PRIVATE_QUERY.to_owned()]);
         assert_eq!(fs::read(&path)?, vectors);
-        assert_eq!(fs::read(SemanticManifest::path(fixture.dir.path()))?, manifest);
+        assert_eq!(
+            fs::read(SemanticManifest::path(fixture.dir.path()))?,
+            manifest
+        );
     }
     Ok(())
 }
@@ -435,7 +441,10 @@ fn canonical_append_during_preflight_is_seen_on_a_fresh_connection() -> AnyResul
         crate::indexer::lexical_storage_fingerprint_for_storage(&current)?,
         fixture.record.db_fingerprint
     );
-    assert_eq!(fs::read(SemanticManifest::path(fixture.dir.path()))?, before);
+    assert_eq!(
+        fs::read(SemanticManifest::path(fixture.dir.path()))?,
+        before
+    );
     Ok(())
 }
 
@@ -497,7 +506,10 @@ fn selected_generation_during_preflight_still_requires_its_owner() -> AnyResult<
         other => panic!("unexpected failure: {other:?}"),
     }
     fixture.endpoint.assert_only_public_preflight();
-    assert_eq!(fs::read(pointer)?, b"requires the immutable-generation reader");
+    assert_eq!(
+        fs::read(pointer)?,
+        b"requires the immutable-generation reader"
+    );
     Ok(())
 }
 
