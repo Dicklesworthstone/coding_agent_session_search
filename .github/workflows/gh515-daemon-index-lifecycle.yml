@@ -38,8 +38,8 @@ jobs:
       run:
         shell: bash
     env:
-      CASS_VALIDATION_SOURCE_SHA: '4d7a0a92234d352821d6e47a1eb88086dc8fece4'
-      CASS_BASELINE_SOURCE_SHA: 'cdfcc8164894553e215d38aebae16eeb36cc7df4'
+      CASS_VALIDATION_SOURCE_SHA: '0cddeb6aedb014b009618221046d5afac4f6d6d1'
+      CASS_BASELINE_SOURCE_SHA: 'e31cf9673ec6758673ca31d92d9f433f070a34b6'
       CARGO_BUILD_JOBS: '1'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -215,7 +215,7 @@ jobs:
           git rev-parse HEAD
           git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock
           log_file="$RUNNER_TEMP/gh515-logs/baseline-migration-cancellation.log"
-          # Reuse only normal Cargo artifacts. Relative to 31a9dc28, this
+          # Reuse only normal Cargo artifacts. Relative to 2a88e6fa, this
           # baseline has identical debug-only storage and daemon snapshot
           # rendezvous plus the test overlay, without candidate writer admission
           # or cancellation.
