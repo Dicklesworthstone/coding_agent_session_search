@@ -105884,12 +105884,18 @@ fn index_worker_thread_builder() -> std::thread::Builder {
         .stack_size(INDEX_WORKER_STACK_SIZE_BYTES)
 }
 
+/// Maximum time for an indexing worker to reach a safe boundary after a signal.
+const INDEX_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Poll cancel-safe Asupersync signal streams from the existing CLI progress
-/// loop. Signal delivery only requests a stop; the index worker owns draining
-/// the current batch, durable completion records and its indexing lock.
+/// loop. The first signal lets the index worker drain its current batch; a
+/// repeated signal or an expired grace period ends a worker that cannot reach
+/// a cancellation checkpoint (GH #515).
 struct IndexShutdownSignals {
     streams: Vec<(asupersync::signal::Signal, i32)>,
     received: Option<i32>,
+    received_at: Option<Instant>,
+    repeated: bool,
 }
 
 impl IndexShutdownSignals {
@@ -105906,6 +105912,8 @@ impl IndexShutdownSignals {
         Ok(Self {
             streams,
             received: None,
+            received_at: None,
+            repeated: false,
         })
     }
 
@@ -105916,16 +105924,71 @@ impl IndexShutdownSignals {
         for (signal, code) in &mut self.streams {
             let mut receive = std::pin::pin!(signal.recv());
             if matches!(receive.as_mut().poll(&mut context), Poll::Ready(Some(()))) {
-                self.received.get_or_insert(*code);
+                if self.received.is_some() {
+                    self.repeated = true;
+                } else {
+                    self.received = Some(*code);
+                    self.received_at = Some(Instant::now());
+                }
             }
         }
         self.received
     }
 
     fn poll(&mut self, progress: &indexer::IndexingProgress) {
-        if self.poll_exit_code().is_some() {
+        let already_received = self.received.is_some();
+        if let Some(code) = self.poll_exit_code() {
             progress.request_stop();
+            if !already_received {
+                tracing::info!(
+                    exit_code = code,
+                    grace_secs = INDEX_SHUTDOWN_GRACE.as_secs(),
+                    "index shutdown requested; draining current work before exit"
+                );
+            }
         }
+    }
+
+    /// Only call while the worker is still running. A worker that drained in
+    /// time follows the ordinary joined-result path, which also preserves the
+    /// signal's exit code when its last batch happened to finish successfully.
+    fn abort_if_needed(&self, elapsed_ms: u128) {
+        let (Some(code), Some(received_at)) = (self.received, self.received_at) else {
+            return;
+        };
+        let reason = if self.repeated {
+            "a second shutdown signal was received".to_string()
+        } else if received_at.elapsed() >= INDEX_SHUTDOWN_GRACE {
+            format!(
+                "the index worker did not stop within {} seconds",
+                INDEX_SHUTDOWN_GRACE.as_secs()
+            )
+        } else {
+            return;
+        };
+        let error = CliError {
+            code,
+            kind: CliErrorKind::Index.kind_str(),
+            message: format!("index interrupted: {reason}; exiting without waiting for the worker"),
+            hint: Some(
+                "Committed work and the database WAL are retained. Rerun the same index command to resume from committed source observations."
+                    .to_string(),
+            ),
+            retryable: true,
+        };
+        // A closed stderr must not panic and divert forced cancellation into
+        // unwinding before the process exit releases the worker's locks.
+        {
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "{}", cli_error_json_payload(&error, elapsed_ms));
+            let _ = stderr.flush();
+        }
+        // The worker may be blocked inside a storage operation. Opening a new
+        // connection or waiting for destructors here can block on that same
+        // operation and swallow SIGTERM again. Exit releases its OS locks;
+        // committed WAL frames remain available to the next indexing run.
+        std::process::exit(code);
     }
 }
 
@@ -108792,6 +108855,7 @@ fn run_index_with_data(
             if index_handle.is_finished() {
                 break;
             }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
 
             let phase = index_progress.phase.load(Ordering::Relaxed);
             let total = index_progress.total.load(Ordering::Relaxed);
@@ -108927,6 +108991,7 @@ fn run_index_with_data(
             if index_handle.is_finished() {
                 break;
             }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
 
             let phase = index_progress.phase.load(Ordering::Relaxed);
             let total = index_progress.total.load(Ordering::Relaxed);
@@ -109039,6 +109104,7 @@ fn run_index_with_data(
             if index_handle.is_finished() {
                 break;
             }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
 
             let phase_code = index_progress.phase.load(Ordering::Relaxed);
             let elapsed_ms = start.elapsed().as_millis();
@@ -109087,6 +109153,10 @@ fn run_index_with_data(
                 .semantic_aware(semantic);
         while !index_handle.is_finished() {
             shutdown_signals.poll(&index_progress);
+            if index_handle.is_finished() {
+                break;
+            }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
             {

@@ -10809,6 +10809,9 @@ fn expected_live_lexical_doc_count_resumable_with(
     save_interval: Duration,
     mut on_conversation: impl FnMut(i64) -> Result<()>,
 ) -> Result<usize> {
+    if let Some(progress) = progress {
+        progress.check_stop()?;
+    }
     let saved = partial_path
         .and_then(|path| fs::read(path).ok())
         .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsPartial>(&raw).ok())
@@ -10857,8 +10860,10 @@ fn expected_live_lexical_doc_count_resumable_with(
                 // The stall watchdog reads activity, not phase counters.
                 progress.tick_activity();
             }
+            let observed = on_conversation(conversation_id);
+            let stop = progress.map_or(Ok(()), IndexingProgress::check_stop);
             if let Some(path) = partial_path
-                && last_save.elapsed() >= save_interval
+                && (stop.is_err() || last_save.elapsed() >= save_interval)
             {
                 write_expected_lexical_docs_sidecar(
                     path,
@@ -10878,7 +10883,8 @@ fn expected_live_lexical_doc_count_resumable_with(
                 );
                 last_save = Instant::now();
             }
-            on_conversation(conversation_id)
+            observed?;
+            stop
         },
     )?;
     if let Some(path) = partial_path {
@@ -16887,6 +16893,9 @@ fn run_index_inner(
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.check_stop()?;
+    }
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS")
         .ok()
@@ -17026,6 +17035,9 @@ fn run_index_inner(
     });
     macro_rules! preflight_phase {
         ($phase:expr) => {{
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.check_stop()?;
+            }
             let phase_visible = preflight_breadcrumb_visible(initial_lock_mode, $phase);
             let timeout_enforced = initial_lock_mode == SearchMaintenanceMode::WatchStartup;
             if timeout_enforced {
@@ -17060,6 +17072,9 @@ fn run_index_inner(
         () => {{
             preflight_state.exit();
             bump_index_run_lock_progress_atomic(&progress_bump);
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.check_stop()?;
+            }
         }};
     }
     // The long stages after preflight (the scan, the authoritative lexical
@@ -17069,6 +17084,9 @@ fn run_index_inner(
     // These are not watch-startup steps, so the preflight watchdog ignores them.
     macro_rules! work_phase {
         ($phase:expr) => {{
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.check_stop()?;
+            }
             if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
                 tracing::debug!(
                     phase = $phase,
@@ -51033,6 +51051,38 @@ mod tests {
     }
 
     #[test]
+    fn gh515_stop_before_preflight_never_opens_archive() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("not-started");
+        let progress = Arc::new(IndexingProgress::default());
+        progress.request_stop();
+        let error = run_index_with_local_connector_roots(
+            IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path: data_dir.join("agent_search.db"),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "hash".to_string(),
+                progress: Some(progress),
+                watch_interval_secs: 30,
+            },
+            HashMap::new(),
+            None,
+        )
+        .expect_err("an already-cancelled run must stop before preflight");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert!(
+            !data_dir.exists(),
+            "cancellation must not create an archive or acquire the indexing lock"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_json_includes_rebuild_pipeline_runtime_metrics() {
         let progress = IndexingProgress::default();
         progress.phase.store(2, Ordering::Relaxed);
@@ -56998,6 +57048,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(finishing_scan(), (full(), vec![first, second]));
+    }
+
+    #[test]
+    fn gh515_stop_during_expected_docs_scan_saves_cursor_before_returning() -> Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("stop-count.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        seed_lexical_rebuild_fixture(&storage);
+        let db = db_path.to_string_lossy().into_owned();
+        let partial_path = dir.path().join(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+        let identity =
+            expected_lexical_docs_identity(&storage, count_total_messages_exact(&storage)?)?;
+        let full_count = expected_live_lexical_doc_count(&storage)?;
+        let ids: Vec<i64> = storage.raw().query_map_collect(
+            "SELECT id FROM conversations ORDER BY id",
+            &[] as &[ParamValue],
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
+        )?;
+        assert_eq!(ids.len(), 2);
+        let progress = IndexingProgress::default();
+        let mut visited = Vec::new();
+        let error = expected_live_lexical_doc_count_resumable_with(
+            &storage,
+            Some(&partial_path),
+            &db,
+            &identity,
+            Some(&progress),
+            Duration::MAX,
+            |conversation_id| {
+                visited.push(conversation_id);
+                progress.request_stop();
+                Ok(())
+            },
+        )
+        .expect_err("stop must interrupt the preflight scan at its next conversation boundary");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert_eq!(visited, vec![ids[0]], "no next conversation may be read");
+        let partial: ExpectedLexicalDocsPartial =
+            serde_json::from_slice(&fs::read(&partial_path)?)?;
+        assert_eq!(partial.last_conversation_id, ids[0]);
+        assert!(partial.expected_docs > 0);
+
+        let mut resumed = Vec::new();
+        let count = expected_live_lexical_doc_count_resumable_with(
+            &storage,
+            Some(&partial_path),
+            &db,
+            &identity,
+            None,
+            Duration::MAX,
+            |conversation_id| {
+                resumed.push(conversation_id);
+                Ok(())
+            },
+        )?;
+        assert_eq!(resumed, vec![ids[1]]);
+        assert_eq!(
+            count, full_count,
+            "resumption must agree with the full count"
+        );
+        assert!(!partial_path.exists());
+        Ok(())
     }
 
     /// GH #381: the expected-docs memo describes the canonical database, so a

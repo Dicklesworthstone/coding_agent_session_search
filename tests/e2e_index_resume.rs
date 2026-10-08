@@ -390,6 +390,150 @@ fn gh426_sigterm_and_sigint_stop_at_commit_boundary_and_resume() {
     }
 }
 
+/// GH #515: a worker blocked before its next cancellation checkpoint must
+/// release the real indexing lock after a signal. Park the existing final-WAL
+/// checkpoint after real source commits and lexical publication; a resumed
+/// invocation must still recover every message without waiting for that park.
+#[cfg(unix)]
+#[test]
+fn gh515_signals_bound_stuck_worker_and_release_index_lock() {
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn wait_for_trace(child: &mut Child, trace: &Path, stderr: &Path, message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if fs::read_to_string(trace)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|event| event["fields"]["message"] == message)
+            {
+                return;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "index exited before {message}: {}",
+                fs::read_to_string(stderr).unwrap()
+            );
+            assert!(Instant::now() < deadline, "no trace for {message}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    for (signal, repeat, exit, reason) in [
+        ("-TERM", false, 143, "did not stop within 5 seconds"),
+        ("-INT", true, 130, "second shutdown signal"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        seed(home.path(), 2);
+        let stdout = home.path().join("stuck-stdout");
+        let stderr = home.path().join("stuck-stderr");
+        let trace = home.path().join("stuck-trace.jsonl");
+        let mut command = index_command(home.path(), "1", &trace);
+        command
+            .env(
+                "CASS_TRACE_FILTER",
+                "warn,coding_agent_search=info,coding_agent_search::indexer=debug",
+            )
+            .env("CASS_TEST_WAL_CHECKPOINT_PARK_MS", "120000")
+            .env("CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS", "120")
+            .env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "0")
+            // Cancellation must not depend on the independent stall watchdog.
+            .env("CASS_INDEX_STALL_DETECT_SECS", "0")
+            .env("CASS_INDEX_STALL_ABORT_SECS", "0")
+            .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr).unwrap()));
+        if !repeat {
+            command.arg("--no-progress-events");
+        }
+        let mut child = Guard(command.spawn().unwrap());
+        wait_for_trace(
+            &mut child.0,
+            &trace,
+            &stderr,
+            "restored checkpoint policy before final index close",
+        );
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(home.path().join("data/index-run.lock"))
+            .unwrap();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&lock).is_err(),
+            "the parked process must hold the real index lock before the signal"
+        );
+        let send_signal = |child: &Child| {
+            assert!(
+                Command::new("kill")
+                    .args([signal, &child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        send_signal(&child.0);
+        wait_for_trace(
+            &mut child.0,
+            &trace,
+            &stderr,
+            "index shutdown requested; draining current work before exit",
+        );
+        if repeat {
+            // Observe the first request before sending the same signal again:
+            // POSIX may coalesce two signals that arrive before the first poll.
+            send_signal(&child.0);
+        }
+        let deadline = Instant::now() + Duration::from_secs(if repeat { 3 } else { 8 });
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shutdown still waiting on the parked worker: {}",
+                fs::read_to_string(&stderr).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(exit));
+        let log = fs::read_to_string(&stderr).unwrap();
+        let error = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["success"] == false && event["code"] == exit)
+            .unwrap_or_else(|| panic!("missing interrupted error envelope: {log}"));
+        assert_eq!(error["kind"], "index");
+        assert_eq!(error["retryable"], true);
+        assert!(error["error"].as_str().unwrap().contains(reason), "{error}");
+        assert!(error["hint"].as_str().unwrap().contains("WAL"));
+        assert!(
+            fs::read_to_string(&stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .all(|event| event["success"] != true),
+            "an interrupted invocation must not report success"
+        );
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .expect("bounded shutdown must release the real index lock");
+        fs2::FileExt::unlock(&lock).unwrap();
+        drop(lock);
+
+        let resumed_trace = home.path().join("stuck-resumed-trace.jsonl");
+        assert_cmd::Command::from_std(index_command(home.path(), "1", &resumed_trace))
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        verify_archive(home.path(), 2);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn gh426_batch_fallback_sigterm_and_sigint_preserve_committed_prefix() {
