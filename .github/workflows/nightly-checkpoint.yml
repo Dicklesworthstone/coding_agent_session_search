@@ -34,7 +34,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import base64, hashlib, json, os, urllib.request
-          sha = '10941d471f4dbdae549e417b1f733fdeea387a11'
+          sha = '4864736006bc2b2e38c613328cce4194c89e4a28'
           url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
           request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
           with urllib.request.urlopen(request, timeout=60) as response:
