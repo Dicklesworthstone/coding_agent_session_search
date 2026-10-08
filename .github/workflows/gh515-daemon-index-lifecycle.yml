@@ -29,7 +29,7 @@ permissions:
 
 concurrency:
   group: gh515-daemon-index-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   native:
