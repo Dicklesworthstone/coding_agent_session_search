@@ -13,7 +13,7 @@ permissions:
 jobs:
   source:
     name: Prepare exact reviewed workspace repair
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     permissions:
       contents: write
@@ -49,7 +49,7 @@ jobs:
           # or move refs; direct-main publication remains an expected-head action.
           python3 - <<'PY'
           import base64, hashlib, json, os, urllib.request
-          sha = '6574664373d3fe775b0ed366f42ae8bd103ec3e9'
+          sha = '22a07fbe5661b3c648f659830d70dba55b2d4d33'
           request = urllib.request.Request(
               'https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/git/blobs/' + sha,
               headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
