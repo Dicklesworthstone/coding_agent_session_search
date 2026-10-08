@@ -27612,6 +27612,12 @@ if sys.argv[2] == 'writer':
                 let _ = self.0.wait();
             }
         }
+        // How long to wait for the stock-SQLite fixture process to report
+        // `ready` / `released`: interpreter start plus fsync'd WAL setup in
+        // another process, not a cass latency bound (those are the strict
+        // refusal and open bounds below). Its setup takes ~50 ms on an idle
+        // host but has exceeded 10 s on a loaded build worker (bead gtafk).
+        const FIXTURE_WAIT: Duration = Duration::from_secs(120);
 
         let dir = TempDir::new().unwrap();
         for opener in ["raw", "storage", "owner"] {
@@ -27642,10 +27648,7 @@ if sys.argv[2] == 'writer':
                             }
                         }
                     });
-                    assert_eq!(
-                        output.recv_timeout(Duration::from_secs(10)).unwrap(),
-                        "ready"
-                    );
+                    assert_eq!(output.recv_timeout(FIXTURE_WAIT).unwrap(), "ready");
                     if writer {
                         // Witness the stock writer's real WAL_WRITE_LOCK from
                         // another process before trusting the negative control.
@@ -27749,10 +27752,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                         assert_eq!(fingerprint(""), main_before);
                         assert_eq!(fingerprint("-wal"), wal_before);
                         writeln!(fixture.0.stdin.as_mut().unwrap(), "release").unwrap();
-                        assert_eq!(
-                            output.recv_timeout(Duration::from_secs(10)).unwrap(),
-                            "released"
-                        );
+                        assert_eq!(output.recv_timeout(FIXTURE_WAIT).unwrap(), "released");
                         open_and_read().expect("same stale fixture recovers after writer release");
                     } else {
                         result.expect("ordinary read opener repairs stale SHM");
