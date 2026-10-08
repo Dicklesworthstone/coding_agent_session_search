@@ -7952,13 +7952,30 @@ fn provider_workspace_is_authoritative(
 /// A Codebuff chat can also be reached through another store's path (an
 /// alias source sharing its lineage). Only a replay of the canonical row's
 /// own source carries that chat's run-state; an alias keeps the canonical
-/// source's attribution.
+/// source's attribution. A targeted `--watch-once` scans the canonicalized
+/// path, so a replay can name the canonical file in another spelling (macOS
+/// `/private/var`, a symlinked home, a Windows short name or mixed
+/// separators): the paths are compared as paths and, when both exist, as
+/// files.
 fn replay_owns_provider_workspace(
     agent_slug: &str,
     canonical_source: Option<&str>,
     source_path: &Path,
 ) -> bool {
-    agent_slug != "codebuff" || canonical_source == Some(path_to_string(source_path).as_str())
+    if agent_slug != "codebuff" {
+        return true;
+    }
+    let Some(canonical_source) = canonical_source.map(Path::new) else {
+        return false;
+    };
+    canonical_source == source_path
+        || matches!(
+            (
+                std::fs::canonicalize(canonical_source),
+                std::fs::canonicalize(source_path),
+            ),
+            (Ok(canonical), Ok(replayed)) if canonical == replayed
+        )
 }
 
 /// Canonical rows were deleted (forget, dedup, agent purge). Their vectors
@@ -37330,6 +37347,51 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 messages
             );
         }
+    }
+
+    /// `--watch-once` scans the canonical path, so a chat first indexed
+    /// through a symlinked home (macOS `/var`) is replayed under another
+    /// spelling of the same file. That replay still owns the workspace; a
+    /// different file with the same layout does not.
+    #[cfg(unix)]
+    #[test]
+    fn codebuff_replay_owns_the_workspace_through_another_spelling_of_its_file() {
+        let dir = TempDir::new().unwrap();
+        let chat = |root: &Path| {
+            root.join("projects")
+                .join("project")
+                .join("chats")
+                .join("native-chat")
+                .join("chat-messages.json")
+        };
+        let real = dir.path().join("real");
+        let other = dir.path().join("other");
+        for root in [&real, &other] {
+            std::fs::create_dir_all(chat(root).parent().unwrap()).unwrap();
+            std::fs::write(chat(root), b"[]").unwrap();
+        }
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = path_to_string(chat(&link));
+        let owns = |path: &Path| replay_owns_provider_workspace("codebuff", Some(&canonical), path);
+
+        assert!(owns(&chat(&link)));
+        assert!(owns(&chat(&real)), "the same file through its real path");
+        assert!(!owns(&chat(&other)), "another store's file is an alias");
+        assert!(
+            !owns(&chat(&dir.path().join("absent"))),
+            "a path that does not exist compares by spelling only"
+        );
+        assert!(!replay_owns_provider_workspace(
+            "codebuff",
+            None,
+            &chat(&real)
+        ));
+        assert!(replay_owns_provider_workspace(
+            "cursor",
+            Some(&canonical),
+            &chat(&other)
+        ));
     }
 
     #[test]
