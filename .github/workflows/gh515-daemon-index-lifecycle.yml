@@ -36,8 +36,8 @@ jobs:
       run:
         shell: bash
     env:
-      CASS_VALIDATION_SOURCE_SHA: 'cc16f6663049947e9dd8c47b3b7257fb0b56c06c'
-      CASS_BASELINE_SOURCE_SHA: 'a3c4ff01e257935896ee1db45ff93dc8204c3339'
+      CASS_VALIDATION_SOURCE_SHA: '11aaed4ff21e8c1f8734ebfa9b448f4f186cfc2b'
+      CASS_BASELINE_SOURCE_SHA: 'd921803e5eb4c210f1882f014323049256b0277e'
       CARGO_BUILD_JOBS: '1'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -116,7 +116,7 @@ jobs:
         run: |
           cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration gh515 -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
           bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
-          awk '/^test result: ok\./ { passed += $4 } END { exit !(passed >= 5) }' "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
+          awk '/^test result: ok\./ { passed += $4 } END { exit !(passed >= 6) }' "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
       - name: Existing daemon, indexing, storage and migration safety suites
         if: ${{ !cancelled() }}
         run: |
@@ -159,14 +159,19 @@ jobs:
           ref: ${{ env.CASS_BASELINE_SOURCE_SHA }}
           path: gh515-baseline
           persist-credentials: false
-      - name: Unchanged-main resident-daemon coexistence control
+      - name: Unchanged-main coexistence and periodic ownership controls
         if: ${{ !cancelled() }}
         working-directory: gh515-baseline
         run: |
           test "$(git rev-parse HEAD)" = "$CASS_BASELINE_SOURCE_SHA"
-          log_file="$RUNNER_TEMP/gh515-logs/baseline-coexistence.log"
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration indexer_process_coexistence::gh515_resident_daemon_allows_fresh_schema_upgrade_and_repeated_indexing -- --exact --test-threads=1 --nocapture 2>&1 | tee "$log_file"
-          bash scripts/gate.sh --verify-test-log "$log_file"
+          for test_name in \
+            gh515_resident_daemon_allows_fresh_schema_upgrade_and_repeated_indexing \
+            gh515_periodic_daemon_handoff_after_killed_foreground_index
+          do
+            log_file="$RUNNER_TEMP/gh515-logs/baseline-${test_name}.log"
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration "indexer_process_coexistence::$test_name" -- --exact --test-threads=1 --nocapture 2>&1 | tee "$log_file"
+            bash scripts/gate.sh --verify-test-log "$log_file"
+          done
       - name: Baseline control must reproduce missing SQL cancellation
         if: ${{ !cancelled() }}
         working-directory: gh515-baseline
