@@ -158,10 +158,12 @@ fn gh511_codebuff_chat(
     project: &str,
     records: &serde_json::Value,
 ) -> std::path::PathBuf {
-    let chat = home
-        .join(".config/manicode/projects")
+    // One component per join: a "/" inside a joined fragment survives on
+    // Windows, so the path would not match the one the connector reports.
+    let chat = gh511_codebuff_projects(home)
         .join(project)
-        .join("chats/2026-03-21T17-14-03.768Z");
+        .join("chats")
+        .join("2026-03-21T17-14-03.768Z");
     std::fs::create_dir_all(&chat).unwrap();
     let transcript = chat.join("chat-messages.json");
     std::fs::write(&transcript, serde_json::to_vec(records).unwrap()).unwrap();
@@ -200,12 +202,14 @@ fn gh511_cass(home: &Path, data: &Path) -> assert_cmd::Command {
         command.env("SystemRoot", system_root);
     }
     if cfg!(windows) {
-        command.env(
-            "CASS_CODEBUFF_DATA_ROOT",
-            home.join(".config/manicode/projects"),
-        );
+        command.env("CASS_CODEBUFF_DATA_ROOT", gh511_codebuff_projects(home));
     }
     command
+}
+
+/// Codebuff's default projects root under `home`.
+fn gh511_codebuff_projects(home: &Path) -> std::path::PathBuf {
+    home.join(".config").join("manicode").join("projects")
 }
 
 /// The one Codebuff hit for the message whose content is `content`, from a
@@ -3016,7 +3020,7 @@ fn gh511_watch_once_retains_good_chats_and_retries_failed_sources() {
                 (path, bytes)
             })
             .collect();
-        let projects = home.join(".config/manicode/projects");
+        let projects = gh511_codebuff_projects(&home);
         let output = gh511_cass(&home, &data)
             .args(["index", "--watch", "--watch-once"])
             .arg(&projects)
