@@ -38,7 +38,7 @@ jobs:
       run:
         shell: bash
     env:
-      CASS_VALIDATION_SOURCE_SHA: 'eec2d29fc29a8019c999ac9c4fb4da6f10cd7863'
+      CASS_VALIDATION_SOURCE_SHA: '4d7a0a92234d352821d6e47a1eb88086dc8fece4'
       CASS_BASELINE_SOURCE_SHA: 'cdfcc8164894553e215d38aebae16eeb36cc7df4'
       CARGO_BUILD_JOBS: '1'
       CARGO_INCREMENTAL: '0'
