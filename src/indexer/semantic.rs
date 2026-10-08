@@ -61,12 +61,16 @@ impl ScheduledProviderAdmission {
                     &checkpoint.embedder_id,
                 )?;
                 crate::search::external_embedder::ExternalEmbeddingConfig::from_env()?
-                    .context("external_disabled: consent is required to resume the external checkpoint")?
+                    .context(
+                        "external_disabled: consent is required to resume the external checkpoint",
+                    )?
                     .identity()
             } else {
                 crate::search::embedder_registry::EmbedderRegistry::new(data_dir)
                     .get(selected)
-                    .context("semantic_checkpoint_owned: selected provider has no registered identity")?
+                    .context(
+                        "semantic_checkpoint_owned: selected provider has no registered identity",
+                    )?
                     .id
                     .to_owned()
             };
@@ -110,6 +114,43 @@ fn ensure_scheduled_checkpoint_owner(
         "semantic_checkpoint_owned: another tier or embedding space has unfinished work; resume its configured provider before switching; the scheduled worker did not replace its checkpoint"
     );
     Ok(())
+}
+
+/// Admit a scheduled command under its canonical maintenance lock, before
+/// loading weights, connecting an endpoint, or opening writable storage. Keep
+/// this exact ledger snapshot through the later artifact-lease validation.
+/// Stored identities only constrain an explicitly selected provider; they
+/// never select a provider or authorize network traffic.
+pub(crate) fn load_scheduled_checkpoint(
+    data_dir: &Path,
+    tier: TierKind,
+    selected: &str,
+    retained_identity: Option<&str>,
+) -> Result<SemanticManifest> {
+    let manifest = SemanticManifest::load(data_dir)
+        .context("semantic_checkpoint_unreadable: scheduled backfill retained the ledger")?
+        .unwrap_or_default();
+    if let Some(checkpoint) = &manifest.checkpoint {
+        // Reject a foreign tier before even resolving external configuration.
+        ensure_scheduled_checkpoint_owner(&manifest, tier, &checkpoint.embedder_id)?;
+        let identity = if let Some(id) = retained_identity {
+            id.to_owned()
+        } else if crate::search::embedder_registry::selects_external(Some(selected)) {
+            crate::search::external_embedder::ExternalEmbeddingConfig::from_env()?
+                .context(
+                    "external_disabled: consent is required to resume the external checkpoint",
+                )?
+                .identity()
+        } else {
+            crate::search::embedder_registry::EmbedderRegistry::new(data_dir)
+                .get(selected)
+                .context("semantic_checkpoint_owned: selected provider has no registered identity")?
+                .id
+                .to_owned()
+        };
+        ensure_scheduled_checkpoint_owner(&manifest, tier, &identity)?;
+    }
+    Ok(manifest)
 }
 
 /// Semantic indexer with lock-scoped ownership of backfill scratch artifacts.
@@ -202,12 +243,10 @@ impl SemanticIndexer {
             inner,
             startup_admission,
         } = self;
-        inner
-            .with_batch_size(batch_size)
-            .map(|inner| Self {
-                inner,
-                startup_admission,
-            })
+        inner.with_batch_size(batch_size).map(|inner| Self {
+            inner,
+            startup_admission,
+        })
     }
 
     fn admit_scheduled_checkpoint(
@@ -392,6 +431,75 @@ fn external_diagnostic_result<T>(external: bool, result: Result<T>) -> Result<T>
 mod external_diagnostic_tests {
     use super::*;
 
+    #[test]
+    fn scheduled_admission_uses_retained_identity_and_keeps_the_admitted_snapshot() {
+        use crate::search::semantic_manifest::BuildCheckpoint;
+        let dir = tempfile::tempdir().unwrap();
+        // Without a checkpoint, normal provider initialization owns admission.
+        // Even an unrecognized provider is not resolved by this read-only step.
+        assert!(
+            load_scheduled_checkpoint(dir.path(), TierKind::Fast, "not-a-provider", None)
+                .unwrap()
+                .checkpoint
+                .is_none()
+        );
+        let mut manifest = SemanticManifest::default();
+        manifest.checkpoint = Some(BuildCheckpoint {
+            tier: TierKind::Quality,
+            embedder_id: "retained-provider".into(),
+            last_offset: 1,
+            docs_embedded: 1,
+            conversations_processed: 1,
+            total_conversations: 3,
+            db_fingerprint: "old-archive-fingerprint".into(),
+            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+            saved_at_ms: 1,
+            last_message_id: Some(1),
+            cursor_exhausted: false,
+        });
+        manifest.save(dir.path()).unwrap();
+        let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+        // Use the already initialized provider; don't re-resolve an endpoint
+        // from ambient configuration in the middle of a multi-batch command.
+        let admitted = load_scheduled_checkpoint(
+            dir.path(),
+            TierKind::Quality,
+            "external",
+            Some("retained-provider"),
+        )
+        .unwrap();
+        assert_eq!(admitted.checkpoint, manifest.checkpoint);
+        assert_eq!(
+            std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+            before
+        );
+        assert!(
+            load_scheduled_checkpoint(
+                dir.path(),
+                TierKind::Quality,
+                "external",
+                Some("different-retained-provider"),
+            )
+            .is_err()
+        );
+
+        // A writer after planning/admission must cause a lease refusal rather
+        // than have its checkpoint silently loaded and treated as permission.
+        manifest.checkpoint.as_mut().unwrap().embedder_id = "concurrent-provider".into();
+        manifest.save(dir.path()).unwrap();
+        let current = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+        let error = match artifacts::BackfillArtifacts::begin(dir.path(), &admitted) {
+            Ok(_) => panic!("stale scheduled admission must not enter reclamation"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<BackfillManifestChanged>().is_some());
+        assert_eq!(
+            std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+            current
+        );
+    }
+
     fn failure() -> anyhow::Error {
         anyhow::Error::new(std::io::Error::other(
             "external_dimension_mismatch: expected 384 dimensions",
@@ -537,7 +645,9 @@ mod external_diagnostic_tests {
             let reloaded = SemanticManifest::load(dir.path())?.unwrap();
             for mut input in [reloaded, original] {
                 let result = worker.with_backfill_artifacts(dir.path(), &mut input, |_, _| {
-                    panic!("neither a reloaded nor a stale input may enter embedding or publication")
+                    panic!(
+                        "neither a reloaded nor a stale input may enter embedding or publication"
+                    )
                 });
                 let error = result.unwrap_err();
                 assert!(error.downcast_ref::<BackfillManifestChanged>().is_some());

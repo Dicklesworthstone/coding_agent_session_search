@@ -123903,6 +123903,37 @@ fn run_models_backfill_batch(
             }
         })?;
 
+    // Direct --scheduled commands must preserve ownership too, not just workers
+    // launched by the nightly parent. Read strictly under the maintenance lock
+    // before provider preflight or a storage open can have side effects. Reuse
+    // the admitted snapshot below so a concurrent change cannot become a newly
+    // authorized checkpoint after preflight; the artifact lease revalidates it.
+    let scheduled_manifest = if scheduled
+        || matches!(
+            std::env::var(crate::indexer::semantic::SCHEDULE_PRESERVE_CHECKPOINT).as_deref(),
+            Ok("1")
+        ) {
+        Some(
+            crate::indexer::semantic::load_scheduled_checkpoint(
+                &data_dir,
+                tier,
+                &embedder_type,
+                retained.indexer.as_ref().map(|indexer| indexer.embedder_id()),
+            )
+            .map_err(|error| CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: format!("Scheduled semantic checkpoint admission failed: {error:#}"),
+                hint: Some(
+                    "Resume the checkpoint's original tier/provider, or explicitly rebuild in the foreground; scheduled work never replaces a foreign checkpoint".into(),
+                ),
+                retryable: false,
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Refuse unavailable models before opening the archive: even a current-
     // schema storage open can change its shared-memory sidecar. Keep model
     // admission inside the maintenance lock so index-busy retains precedence.
@@ -123957,7 +123988,9 @@ fn run_models_backfill_batch(
         retryable: true,
     })?;
     // A corrupt external ledger is not permission to discard durable progress.
-    let mut manifest = if external {
+    let mut manifest = if let Some(manifest) = scheduled_manifest {
+        Ok(manifest)
+    } else if external {
         SemanticManifest::load(&data_dir).map(Option::unwrap_or_default)
     } else {
         SemanticManifest::load_or_default(&data_dir)

@@ -14,44 +14,9 @@ on:
 permissions:
   contents: read
 jobs:
-  source-export:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Export the identical reviewed admission patch without ref writes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, urllib.request
-          sha = '4864736006bc2b2e38c613328cce4194c89e4a28'
-          url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha
-          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-          with urllib.request.urlopen(request, timeout=60) as response:
-              value = json.load(response)
-          assert value['encoding'] == 'base64'
-          source = base64.b64decode(value['content'])
-          assert hashlib.sha1(b'blob ' + str(len(source)).encode() + b'\0' + source).hexdigest() == sha
-          exec(compile(source, 'reviewed-scheduled-admission-export', 'exec'))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: scheduled-admission-source-${{ github.sha }}
-          path: scheduled-admission-source.tar.gz
-          if-no-files-found: error
-          retention-days: 7
   native:
-    needs: source-export
+    # The direct-command candidate is committed. Test only the checked-out
+    # source; no source-export dependency or uncommitted overlay remains.
     strategy:
       fail-fast: false
       matrix:
@@ -71,96 +36,24 @@ jobs:
           persist-credentials: false
       - name: Verify the committed source revision
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: scheduled-admission-source-${{ github.sha }}
-      - name: Verify and install reviewed admission candidate
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os, tarfile
-          from pathlib import Path
-          def digest(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          with tarfile.open('scheduled-admission-source.tar.gz', 'r:gz') as archive:
-              receipt = json.load(archive.extractfile('scheduled-admission-source-receipt.json'))
-              assert receipt['source_commit'] == os.environ['GITHUB_SHA']
-              assert set(receipt['bases']) == set(receipt['blobs']) == {'src/indexer/semantic.rs', 'src/lib.rs', 'tests/external_backfill_runtime/cli.rs'}
-              for name, expected in receipt['blobs'].items():
-                  path = Path(name)
-                  assert not any(p.is_symlink() for p in [path, *path.parents])
-                  assert digest(path.read_bytes()) == receipt['bases'][name]
-                  member = archive.getmember(name)
-                  assert member.isfile()
-                  data = archive.extractfile(member).read()
-                  assert digest(data) == expected
-                  path.write_bytes(data)
-          Path('scheduled-admission-source-receipt.json').write_text(json.dumps(receipt))
-          PY
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Scheduler checkpoint order and failure regressions
-        run: cargo test --locked --lib schedule::tests -- --nocapture
-      - name: Semantic engine and artifact ownership regressions
-        run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
-      - name: Real nightly, checkpoint, external transport and CLI regressions
-        run: cargo test --locked --test external_backfill_runtime -- --nocapture
-      - name: Check checkpoint-owner source formatting
-        if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/lib.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
-      - name: Verify the candidate bytes tested and preserve unrelated checkout files
-        if: always()
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, subprocess
-          from pathlib import Path
-          receipt = json.loads(Path('scheduled-admission-source-receipt.json').read_text())
-          for name, expected in receipt['blobs'].items():
-              data = Path(name).read_bytes()
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only', 'HEAD'], text=True).splitlines())
-          assert changed == set(receipt['blobs']), changed
-          PY
-  committed-worker:
-    # Test the shipped worker boundary independently of the still-unlanded
-    # direct-CLI candidate above. Never apply an overlay to this checkout.
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Verify committed worker source
-        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
           toolchain: nightly-2026-08-31
           components: rustfmt, clippy
-      - name: Committed scheduler ownership and budget regressions
+      - name: Scheduler checkpoint order and failure regressions
         run: cargo test --locked --lib schedule::tests -- --nocapture
-      - name: Committed startup admission and all semantic ownership regressions
+      - name: Semantic engine and artifact ownership regressions
+        if: ${{ !cancelled() }}
         run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
-      - name: Committed real nightly and external backfill CLI regressions
+      - name: Real nightly, checkpoint, external transport and CLI regressions
+        if: ${{ !cancelled() }}
         run: cargo test --locked --test external_backfill_runtime -- --nocapture
       - name: Committed library Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --locked --lib -- -D warnings
-      - name: Check worker source formatting
+      - name: Check checkpoint-owner source formatting
         if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs tests/external_backfill_runtime/cli.rs
-      - name: Verify tests did not alter committed sources
+        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/lib.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
+      - name: Verify validation did not alter committed sources
         if: always()
         run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo

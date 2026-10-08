@@ -484,6 +484,160 @@ fn scheduled_fast(server: &Server, dir: &Path, db: &Path, batches: u32) -> Comma
 }
 
 #[test]
+fn external_cli_direct_scheduled_calls_refuse_foreign_owners_before_preflight() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = seed(dir.path())?;
+    let server = Server::start(384)?;
+    let other = Server::start(384)?;
+    let mut first = backfill(&server, dir.path(), &db, 1);
+    first.args(["--embedder", "external"]);
+    let report = success(run(first)?)?;
+    let staging = PathBuf::from(report["index_path"].as_str().context("staging path")?);
+    let manifest_path = SemanticManifest::path(dir.path());
+    let before = fs::read(&manifest_path)?;
+    let vectors_before = fs::read(&staging)?;
+    let wal = frankensearch::index::wal_path_for(&staging);
+    let wal_before = fs::read(&wal).ok();
+    server.take_inputs();
+
+    // No internal parent flag: the public --scheduled option is sufficient.
+    let mut fast = scheduled_fast(&server, dir.path(), &db, 1);
+    fast.env_remove("CASS_SCHEDULE_PRESERVE_CHECKPOINT");
+    let output = run(fast)?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("semantic_checkpoint_owned"));
+    assert!(server.take_inputs().is_empty());
+    assert_eq!(fs::read(&manifest_path)?, before);
+    assert_eq!(fs::read(&staging)?, vectors_before);
+    assert_eq!(fs::read(&wal).ok(), wal_before);
+    assert!(!vector_index_path(dir.path(), "fnv1a-384").exists());
+
+    for (key, value, diagnostic) in [
+        (
+            "CASS_EXTERNAL_EMBEDDING_MODEL",
+            "different-model",
+            "semantic_checkpoint_owned",
+        ),
+        (
+            "CASS_EXTERNAL_EMBEDDING_DIMENSION",
+            "128",
+            "semantic_checkpoint_owned",
+        ),
+        (
+            "CASS_EXTERNAL_EMBEDDING_REVISION",
+            "different-revision",
+            "semantic_checkpoint_owned",
+        ),
+        (
+            "CASS_EXTERNAL_EMBEDDING_URL",
+            other.url.as_str(),
+            "semantic_checkpoint_owned",
+        ),
+        ("CASS_EXTERNAL_EMBEDDINGS", "0", "external_disabled"),
+    ] {
+        let mut command = backfill(&server, dir.path(), &db, 1);
+        command
+            .args(["--embedder", "external", "--scheduled"])
+            .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+            .env_remove("CASS_SCHEDULE_PRESERVE_CHECKPOINT")
+            .env(key, value);
+        let output = run(command)?;
+        assert!(!output.status.success(), "{key}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{key}"
+        );
+        assert!(
+            server.take_inputs().is_empty(),
+            "{key}: no original-endpoint preflight"
+        );
+        assert!(
+            other.take_inputs().is_empty(),
+            "{key}: no alternate-endpoint preflight"
+        );
+        assert_eq!(fs::read(&manifest_path)?, before, "{key}");
+        assert_eq!(fs::read(&staging)?, vectors_before, "{key}");
+        assert_eq!(fs::read(&wal).ok(), wal_before, "{key}");
+    }
+
+    let mut resume = backfill(&server, dir.path(), &db, 10);
+    resume
+        .args(["--embedder", "external", "--scheduled"])
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env_remove("CASS_SCHEDULE_PRESERVE_CHECKPOINT");
+    let completed = success(run(resume)?)?;
+    assert_eq!(completed["published"], true);
+    assert_eq!(completed["model_initializations"], 1);
+    let sent = corpus(&server);
+    assert_eq!(sent.len(), 4);
+    assert!(sent.iter().all(|text| !text.contains("conversation 1")));
+    let fresh = tempfile::tempdir()?;
+    let fresh_db = seed(fresh.path())?;
+    let mut independent = backfill(&server, fresh.path(), &fresh_db, 10);
+    independent.args(["--embedder", "external"]);
+    let expected = success(run(independent)?)?;
+    assert_eq!(
+        signature(Path::new(completed["index_path"].as_str().unwrap()))?,
+        signature(Path::new(expected["index_path"].as_str().unwrap()))?
+    );
+    Ok(())
+}
+
+#[test]
+fn external_cli_direct_scheduled_corrupt_ledger_fails_before_storage_or_http() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = seed(dir.path())?;
+    let server = Server::start(384)?;
+    let manifest = SemanticManifest::path(dir.path());
+    fs::create_dir_all(manifest.parent().context("manifest parent")?)?;
+    fs::write(&manifest, b"{incomplete checkpoint")?;
+    let before = fs::read(&db)?;
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    let shm = PathBuf::from(format!("{}-shm", db.display()));
+    let wal_before = fs::read(&wal).ok();
+    let shm_before = fs::read(&shm).ok();
+    for selected in ["external", "hash"] {
+        let mut command = backfill(&server, dir.path(), &db, 1);
+        command
+            .args(["--embedder", selected, "--scheduled"])
+            .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+            .env_remove("CASS_SCHEDULE_PRESERVE_CHECKPOINT");
+        let output = run(command)?;
+        assert!(!output.status.success(), "{selected}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("semantic_checkpoint_unreadable"));
+        assert!(server.take_inputs().is_empty(), "{selected}");
+        assert_eq!(fs::read(&manifest)?, b"{incomplete checkpoint");
+        assert_eq!(fs::read(&db)?, before);
+        assert_eq!(fs::read(&wal).ok(), wal_before);
+        assert_eq!(fs::read(&shm).ok(), shm_before);
+        assert!(!vector_index_path(dir.path(), "fnv1a-384").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn external_cli_direct_scheduled_pause_precedes_checkpoint_admission() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = seed(dir.path())?;
+    let server = Server::start(384)?;
+    let manifest = SemanticManifest::path(dir.path());
+    fs::create_dir_all(manifest.parent().context("manifest parent")?)?;
+    fs::write(&manifest, b"{paused corrupt checkpoint")?;
+    let mut command = backfill(&server, dir.path(), &db, 1);
+    command
+        .args(["--embedder", "external", "--scheduled"])
+        .env_remove("CASS_SCHEDULE_PRESERVE_CHECKPOINT")
+        .env("CASS_EXTERNAL_EMBEDDINGS", "0")
+        .env("CASS_SEMANTIC_BACKFILL_FOREGROUND_ACTIVE", "1");
+    let report = success(run(command)?)?;
+    assert_eq!(report["status"], "paused");
+    assert_eq!(report["model_initializations"], 0);
+    assert!(server.take_inputs().is_empty());
+    assert_eq!(fs::read(manifest)?, b"{paused corrupt checkpoint");
+    Ok(())
+}
+
+#[test]
 fn external_cli_stale_scheduled_worker_cannot_erase_another_checkpoint() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = seed(dir.path())?;
@@ -721,7 +875,11 @@ fn external_cli_protected_worker_refuses_ledger_and_consent_before_storage_or_ht
     let mut first = backfill(&server, dir.path(), &db, 1);
     first.args(["--embedder", "external"]);
     let first_report = success(run(first)?)?;
-    let staging = PathBuf::from(first_report["index_path"].as_str().context("staging path")?);
+    let staging = PathBuf::from(
+        first_report["index_path"]
+            .as_str()
+            .context("staging path")?,
+    );
     let ledger = SemanticManifest::path(dir.path());
     let ledger_before = fs::read(&ledger)?;
     let vectors_before = fs::read(&staging)?;
