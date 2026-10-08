@@ -177,6 +177,12 @@ fn gh511_codebuff_chat(
 /// `env_clear` leaves XDG_CONFIG_HOME, XDG_DATA_HOME and
 /// CASS_CODEBUFF_DATA_ROOT unset, matching the reporter's macOS default-path
 /// invocation. The Codebuff binary need not be installed to find its history.
+///
+/// Windows is the exception (bead mt90z): FAD's default Codebuff root is
+/// `dirs::home_dir()`, which there comes from the Known Folder API and ignores
+/// USERPROFILE, so an isolated home cannot redirect it and the fixture was
+/// never found. There the root is named explicitly; Unix and macOS keep
+/// exercising default-path discovery.
 fn gh511_cass(home: &Path, data: &Path) -> assert_cmd::Command {
     let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     command
@@ -192,6 +198,12 @@ fn gh511_cass(home: &Path, data: &Path) -> assert_cmd::Command {
         .timeout(std::time::Duration::from_secs(180));
     if let Ok(system_root) = dotenvy::var("SystemRoot") {
         command.env("SystemRoot", system_root);
+    }
+    if cfg!(windows) {
+        command.env(
+            "CASS_CODEBUFF_DATA_ROOT",
+            home.join(".config/manicode/projects"),
+        );
     }
     command
 }
