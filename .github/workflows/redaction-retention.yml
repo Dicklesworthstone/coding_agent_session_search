@@ -1,0 +1,103 @@
+name: Redaction retention regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/indexer/memoization.rs'
+      - 'src/indexer/redact_secrets.rs'
+      - 'src/indexer/responsiveness/**'
+      - 'src/indexer/responsiveness.rs'
+      - 'tests/redaction_retention_policy.rs'
+      - 'tests/indexer_memoization_policy.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/redaction-retention.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redaction-retention-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  retained-values:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Record exact source and toolchain selection
+        id: toolchain
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/redaction-retention"
+          git rev-parse HEAD > "$RUNNER_TEMP/redaction-retention/source.txt"
+          git hash-object src/indexer/memoization.rs src/indexer/redact_secrets.rs src/indexer/responsiveness/resident.rs src/indexer/responsiveness/resident/policy.rs tests/redaction_retention_policy.rs >> "$RUNNER_TEMP/redaction-retention/source.txt"
+          python3 - <<'PY'
+          import os, pathlib, tomllib
+          channel = tomllib.loads(pathlib.Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'channel={channel}', file=output)
+          PY
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        id: rust
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Require the cache, redactor, and actual policy regressions
+        id: inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test redaction_retention_policy -- --list 2>&1 | tee "$RUNNER_TEMP/redaction-retention/test-list.log"
+          for name in \
+            retained_bytes_limit_values_before_the_entry_count_limit \
+            retained_bytes_count_allocated_capacity_and_preserve_hot_lru_values \
+            shared_retention_does_not_multiply_with_cache_owners_and_drop_releases_it \
+            retained_bytes_replacement_invalidation_and_quarantine_release_exactly_once \
+            retained_bytes_oversized_replacement_never_leaves_the_old_value_or_evicts_peers \
+            retained_bytes_pressure_shrink_and_recovery_do_not_resurrect_evicted_values \
+            retained_bytes_counter_refuses_overflow_and_zero_budget_without_allocating \
+            shared_retention_reservations_are_bounded_under_concurrent_cache_churn \
+            redaction_workers_share_retention_without_changing_parallel_output \
+            redaction_retention_pressure_releases_values_on_clean_input_and_recovers \
+            redaction_retention_bypass_never_bypasses_secret_redaction \
+            redaction_retention_pressure_preserves_quarantine_and_nested_json \
+            resident_policy_reclaims_live_redaction_values_and_holds_unknown_recovery \
+            production_redaction_paths_match_frozen_reference \
+            golden_redaction_corpus_is_byte_stable_across_paths
+          do
+            grep -F "$name: test" "$RUNNER_TEMP/redaction-retention/test-list.log"
+          done
+      - name: Execute exact-source policy, concurrent retention, and redaction equivalence
+        if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --test redaction_retention_policy -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/redaction-retention/regressions.log"
+          cargo test --locked --test indexer_memoization_policy -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/redaction-retention/lru-compatibility.log"
+      - name: Check production wiring with Clippy
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/redaction-retention/clippy.log"
+      - name: Preserve results including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: redaction-retention-${{ github.sha }}
+          path: ${{ runner.temp }}/redaction-retention/
+          if-no-files-found: warn
+          retention-days: 14
