@@ -53,7 +53,7 @@ jobs:
         run: cargo clippy --locked --lib -- -D warnings
       - name: Check checkpoint-owner source formatting
         if: always()
-        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/lib.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
+        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/indexer/semantic/artifacts.rs src/indexer/semantic/artifacts/lease_tests.rs src/lib.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
       - name: Verify validation did not alter committed sources
         if: always()
         run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo

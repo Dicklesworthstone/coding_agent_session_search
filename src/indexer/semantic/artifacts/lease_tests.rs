@@ -301,3 +301,128 @@ fn v1_checkpoint_input_is_accepted_without_migrating_or_rewriting_it() -> Result
     assert_eq!(snapshot(data)?, before);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn lease_release_is_explicit_even_when_an_inherited_descriptor_survives() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path();
+    let path = data.join(ARTIFACT_LOCK);
+    fs::write(&path, b"existing owner metadata")?;
+
+    // Live control: this is the previous close-only behavior, with a duplicate
+    // standing in for the same open file description inherited across fork.
+    let close_only = lock_file(&path)?;
+    let inherited = close_only.try_clone()?;
+    drop(close_only);
+    assert!(lock_file(&path).is_err());
+    fs2::FileExt::unlock(&inherited)?;
+    drop(inherited);
+
+    let manifest = SemanticManifest::default();
+    let owner = BackfillArtifacts::begin(data, &manifest)?;
+    let inherited = owner._lock.try_clone()?;
+    assert!(BackfillArtifacts::begin(data, &manifest).is_err());
+    drop(owner);
+    // This must work BEFORE inherited closes, without retries or sleeps.
+    let successor = BackfillArtifacts::begin(data, &manifest)?;
+    assert!(inherited.metadata()?.is_file());
+    assert_eq!(fs::read(&path)?, b"existing owner metadata");
+    drop(inherited);
+    // Closing the old description cannot unlock a separately admitted owner.
+    assert!(BackfillArtifacts::begin(data, &manifest).is_err());
+    drop(successor);
+    drop(BackfillArtifacts::begin(data, &manifest)?);
+    assert_eq!(fs::read(&path)?, b"existing owner metadata");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_or_unwound_lease_releases_duplicates_without_reclaiming_scratch() -> Result<()> {
+    for unwind in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path();
+        let mut manifest = SemanticManifest::default();
+        publish(data, &mut manifest)?;
+        let mut inherited = None;
+        let mut before_release = None;
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            let owner = BackfillArtifacts::begin(data, &manifest)?;
+            inherited = Some(owner._lock.try_clone()?);
+            scratch(data)?;
+            before_release = Some(snapshot(data)?);
+            if unwind {
+                panic!("intentional interrupted semantic artifact owner");
+            }
+            bail!("intentional failed semantic artifact owner")
+        }));
+        if unwind {
+            assert!(stopped.is_err());
+        } else {
+            assert!(stopped.expect("error return must not unwind").is_err());
+        }
+        let inherited = inherited.context("the interrupted owner duplicated its descriptor")?;
+        let before = before_release.context("the owner recorded state before releasing its lease")?;
+        assert_eq!(snapshot(data)?, before, "Drop must not publish or reclaim");
+        let successor = lock_file(&data.join(ARTIFACT_LOCK))?;
+        assert!(inherited.metadata()?.is_file());
+        assert!(
+            data.join(VECTOR_INDEX_DIR)
+                .join(".backfill-reuse-Abandoned123")
+                .is_dir()
+        );
+        assert_eq!(snapshot(data)?, before, "unlock must not publish or reclaim");
+        drop(inherited);
+        assert!(lock_file(&data.join(ARTIFACT_LOCK)).is_err());
+        drop(successor);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_prior_lease_does_not_interrupt_checkpoint_resume_and_publication() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path();
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let mut manifest = SemanticManifest::default();
+    let checkpoint = indexer.run_backfill_batch(
+        &rows(1..2),
+        data,
+        &mut manifest,
+        plan("resume", 1, 1, false),
+    )?;
+    let owner = BackfillArtifacts::begin(data, &manifest)?;
+    let inherited = owner._lock.try_clone()?;
+    let before = snapshot(data)?;
+    assert!(
+        indexer
+            .run_backfill_batch(&rows(2..4), data, &mut manifest, plan("resume", 3, 2, true))
+            .is_err(),
+        "live ownership must still prevent publication"
+    );
+    assert_eq!(snapshot(data)?, before);
+    drop(owner);
+
+    let complete =
+        indexer.run_backfill_batch(&rows(2..4), data, &mut manifest, plan("resume", 3, 2, true))?;
+    assert!(complete.published);
+    assert!(inherited.metadata()?.is_file(), "the duplicate is still open");
+    assert!(!checkpoint.index_path.exists());
+    assert!(SemanticManifest::load(data)?.unwrap().checkpoint.is_none());
+    let actual = VectorIndex::open_read_only(&complete.index_path)?;
+    assert_eq!(actual.record_count(), 3);
+    let reference = tempfile::tempdir()?;
+    let mut reference_manifest = SemanticManifest::default();
+    let expected_path = publish(reference.path(), &mut reference_manifest)?;
+    let expected = VectorIndex::open_read_only(&expected_path)?;
+    for position in 0..3 {
+        assert_eq!(actual.doc_id_at(position)?, expected.doc_id_at(position)?);
+        assert_eq!(
+            actual.vector_at_f32(position)?,
+            expected.vector_at_f32(position)?
+        );
+    }
+    Ok(())
+}

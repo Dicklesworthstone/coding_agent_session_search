@@ -71,23 +71,38 @@ pub(super) struct BackfillArtifacts {
     _lock: File,
 }
 
+impl Drop for BackfillArtifacts {
+    fn drop(&mut self) {
+        // Closing this descriptor alone does not release a Unix flock while a
+        // duplicate (for example in a concurrent fork before exec) survives.
+        // End ownership when the critical section ends, not when that unrelated
+        // descriptor is eventually closed. Never publish or reclaim from Drop.
+        if let Err(error) = fs2::FileExt::unlock(&self._lock) {
+            tracing::warn!(%error, "failed to explicitly release semantic artifact lease");
+        }
+    }
+}
+
 impl BackfillArtifacts {
     fn lock(data_dir: &Path) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
         let data_dir = data_dir.canonicalize()?;
         let lock = lock_file(&data_dir.join(ARTIFACT_LOCK))
             .context("another semantic backfill owns its staging artifacts")?;
-        let root = data_dir.join(VECTOR_INDEX_DIR);
+        // Own the lock before any fallible directory work, so those error
+        // paths release it explicitly as well as closing the descriptor.
+        let artifacts = Self {
+            data_dir,
+            _lock: lock,
+        };
+        let root = artifacts.data_dir.join(VECTOR_INDEX_DIR);
         fs::create_dir_all(&root)?;
         ensure!(
             fs::symlink_metadata(&root)?.is_dir()
                 && !is_link_or_reparse(&fs::symlink_metadata(&root)?),
             "refusing to reclaim through a symlinked vector_index directory"
         );
-        Ok(Self {
-            data_dir,
-            _lock: lock,
-        })
+        Ok(artifacts)
     }
 
     pub(super) fn begin(data_dir: &Path, input: &SemanticManifest) -> Result<Self> {
