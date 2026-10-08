@@ -5,6 +5,8 @@
 //! gap, a rollback, or an unrelated publication therefore causes a safe replay,
 //! never a skipped range whose publication we cannot establish. Reading and
 //! hashing the canonical prefix is intentional: only writes are skipped.
+//! The skipped documents must also exist with their native content witnesses;
+//! a cursor can name a publication without proving what it contains.
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -14,6 +16,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::ProjectionFingerprint;
+use super::super::canary::exact::PublishedSnapshot;
 use super::super::{CanonicalProjection, LexicalReconcileCheckpoint};
 use crate::search::tantivy::TantivyIndex;
 
@@ -284,6 +287,14 @@ pub(in crate::indexer::lexical_reconcile) struct Outcome {
     pub first_pass_live_docs: u64,
 }
 
+/// Only a proven content mismatch may discard the optimization and replay.
+/// Codec/I/O errors and malformed canonical bindings must remain failures.
+#[derive(Debug, thiserror::Error)]
+#[error("published repair prefix has no matching content witness for message {message_idx}")]
+struct PublishedPrefixMismatch {
+    message_idx: u64,
+}
+
 /// Finish both publication passes. The caller still owns the canonical read
 /// snapshot, run lock, endpoint checks, and the final checkpoint-clear decision.
 pub(in crate::indexer::lexical_reconcile) fn publish(
@@ -295,22 +306,48 @@ pub(in crate::indexer::lexical_reconcile) fn publish(
 ) -> Result<Outcome> {
     let path = progress_path(checkpoint_path);
     let mut progress = resume(&path, index_path, index, binding)?;
+    match publish_from_progress(projection, index, &mut progress, index_path, &path) {
+        Err(error) if error.downcast_ref::<PublishedPrefixMismatch>().is_some() => {
+            // The prefix check runs before any new batch mutation. Keep the
+            // canonical checkpoint and old receipt until a real commit earns
+            // fresh progress. A crash here merely repeats this check. Retry
+            // once, not indefinitely; ordinary engine/write errors propagate.
+            tracing::warn!(
+                conversation_id = binding.conversation_id,
+                %error,
+                "repair cursor skipped unverified documents; restarting both publication passes"
+            );
+            let mut fresh = Progress::fresh(binding);
+            publish_from_progress(projection, index, &mut fresh, index_path, &path)
+        }
+        outcome => outcome,
+    }
+}
+
+fn publish_from_progress(
+    projection: &CanonicalProjection<'_>,
+    index: &mut TantivyIndex,
+    progress: &mut Progress,
+    index_path: &Path,
+    path: &Path,
+) -> Result<Outcome> {
     let mut upserted_docs = 0;
     if progress.pass == Pass::Publish {
         upserted_docs = publish_pass(
             projection,
             index,
-            &mut progress,
+            progress,
             index_path,
-            &path,
+            path,
             &mut || Ok(()),
         )?;
         progress.pass = Pass::Replay;
         progress.completed_docs = 0;
-        progress.prefix_blake3 = prefix_digest(&ProjectionFingerprint::new(binding.expected_docs));
+        progress.prefix_blake3 =
+            prefix_digest(&ProjectionFingerprint::new(progress.binding.expected_docs));
         progress.first_pass_live_docs = Some(index.doc_count()?);
         progress.publication = Some(Publication::read(index_path, index)?);
-        progress.save(&path)?;
+        progress.save(path)?;
     }
     let first_pass_live_docs = progress
         .first_pass_live_docs
@@ -318,9 +355,9 @@ pub(in crate::indexer::lexical_reconcile) fn publish(
     publish_pass(
         projection,
         index,
-        &mut progress,
+        progress,
         index_path,
-        &path,
+        path,
         &mut || Ok(()),
     )?;
     Ok(Outcome {
@@ -339,6 +376,14 @@ fn publish_pass(
 ) -> Result<usize> {
     let resume_docs = progress.completed_docs;
     let resume_digest = progress.prefix_blake3.clone();
+    // One native view for the skipped prefix only, released before publishing
+    // any suffix. Do not retain a prior generation through all later commits.
+    let mut published_prefix = if resume_docs == 0 {
+        None
+    } else {
+        Some(PublishedSnapshot::open(index_path)?)
+    };
+    let mut first_mismatch = None;
     let mut fingerprint = ProjectionFingerprint::new(progress.binding.expected_docs);
     let mut checked_prefix = false;
     let mut upserted_docs = 0usize;
@@ -347,12 +392,26 @@ fn publish_pass(
             .saturating_sub(fingerprint.observed_docs)
             .min(docs.len());
         fingerprint.update(&docs[..skip])?;
+        if let Some(published) = published_prefix.as_ref() {
+            for document in &docs[..skip] {
+                if !published.verify_content(document)? && first_mismatch.is_none() {
+                    first_mismatch = Some(document.msg_idx);
+                }
+            }
+        }
         if !checked_prefix && fingerprint.observed_docs == resume_docs {
             ensure!(
                 prefix_digest(&fingerprint) == resume_digest,
                 "canonical repair prefix differs from the saved cursor; recovery retained"
             );
+            // Establish the canonical prefix first. An invalid digest plus a
+            // stale document must not turn malformed evidence into permission
+            // to overwrite either the index or its recovery receipt.
+            if let Some(message_idx) = first_mismatch {
+                return Err(PublishedPrefixMismatch { message_idx }.into());
+            }
             checked_prefix = true;
+            published_prefix = None;
         }
         let remaining = &docs[skip..];
         if remaining.is_empty() {
@@ -510,6 +569,185 @@ mod tests {
         fn index_path(&self) -> PathBuf {
             self.temp.path().join("index")
         }
+    }
+
+    /// Deliberately claim a canonical prefix for a separately constructed
+    /// real index. This models a semantically stale receipt, not a mock engine.
+    fn claimed_cursor(
+        binding: &LexicalReconcileCheckpoint,
+        docs: &[CassDocument],
+        index: &TantivyIndex,
+        index_path: &Path,
+        path: &Path,
+        pass: Pass,
+        completed_docs: usize,
+    ) -> Result<Progress> {
+        let mut fingerprint = ProjectionFingerprint::new(binding.expected_docs);
+        fingerprint.update(&docs[..completed_docs])?;
+        let progress = Progress {
+            version: VERSION,
+            binding: binding.clone(),
+            pass,
+            completed_docs,
+            prefix_blake3: prefix_digest(&fingerprint),
+            first_pass_live_docs: (pass == Pass::Replay).then_some(index.doc_count()?),
+            publication: Some(Publication::read(index_path, index)?),
+        };
+        progress.save(path)?;
+        Ok(progress)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stale_published_prefix_restarts_both_passes_without_losing_other_documents() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (binding, docs) = fixture.binding()?;
+        for missing in [false, true] {
+            for pass in [Pass::Publish, Pass::Replay] {
+                for completed in [2, docs.len()] {
+                    let index_path = fixture.temp.path().join(format!(
+                        "stale-{missing}-{pass:?}-{completed}"
+                    ));
+                    let checkpoint_path = index_path.join(".lexical-reconcile-1.json");
+                    let path = progress_path(&checkpoint_path);
+                    let mut actual = docs.clone();
+                    if missing {
+                        // Preserve count while removing the expected identity.
+                        actual[1].conversation_id = Some(binding.conversation_id + 100);
+                    } else {
+                        actual[1].content = "meridian stale interior content".into();
+                    }
+                    let mut index = TantivyIndex::open_or_create(&index_path)?;
+                    index.add_prebuilt_documents_slice(&actual)?;
+                    index.commit()?;
+                    let before = PublishedSnapshot::open(&index_path)?;
+                    assert!(before.verify_content(&docs[0])?);
+                    assert!(before.verify_content(&docs[6])?);
+                    assert!(!before.verify_content(&docs[1])?);
+                    drop(before);
+                    crate::indexer::write_json_pretty_atomically(&checkpoint_path, &binding)?;
+                    let recovery = std::fs::read(&checkpoint_path)?;
+                    claimed_cursor(
+                        &binding, &docs, &index, &index_path, &path, pass, completed,
+                    )?;
+                    // Establish that all OLD resume guards accept this receipt.
+                    // Only the native content witness can reject its skip.
+                    assert_eq!(
+                        resume(&path, &index_path, &index, &binding)?.completed_docs,
+                        completed
+                    );
+                    let outcome = publish(
+                        &fixture.projection(3),
+                        &mut index,
+                        &binding,
+                        &index_path,
+                        &checkpoint_path,
+                    )?;
+                    assert_eq!(outcome.upserted_docs, docs.len());
+                    let expected_total = docs.len() as u64 + u64::from(missing);
+                    assert_eq!(outcome.first_pass_live_docs, expected_total);
+                    assert_eq!(index.doc_count()?, expected_total);
+                    let after = PublishedSnapshot::open(&index_path)?;
+                    assert_eq!(
+                        fixture.projection(2).verify_published(&after, &binding)?,
+                        docs.len()
+                    );
+                    if missing {
+                        assert!(after.verify_content(&actual[1])?, "foreign row survives");
+                    }
+                    drop(after);
+                    assert_eq!(std::fs::read(&checkpoint_path)?, recovery);
+                    let final_progress = load(&path)?.context("completed replacement replay")?;
+                    assert_eq!(final_progress.pass, Pass::Replay);
+                    assert_eq!(final_progress.completed_docs, docs.len());
+                    // Once the actual source is repaired, another retry is a
+                    // write-free verification, not a permanent restart loop.
+                    let publication = Publication::read(&index_path, &index)?;
+                    let receipt = std::fs::read(&path)?;
+                    let retry = publish(
+                        &fixture.projection(1),
+                        &mut index,
+                        &binding,
+                        &index_path,
+                        &checkpoint_path,
+                    )?;
+                    assert_eq!(retry.upserted_docs, 0);
+                    assert_eq!(Publication::read(&index_path, &index)?, publication);
+                    assert_eq!(std::fs::read(&path)?, receipt);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalid_canonical_prefix_cannot_authorize_a_stale_document_restart() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (binding, docs) = fixture.binding()?;
+        let index_path = fixture.index_path();
+        let checkpoint_path = index_path.join(".lexical-reconcile-1.json");
+        let path = progress_path(&checkpoint_path);
+        let mut actual = docs.clone();
+        actual[1].content = "meridian wrong published content".into();
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(&actual)?;
+        index.commit()?;
+        let mut progress = claimed_cursor(
+            &binding, &docs, &index, &index_path, &path, Pass::Replay, docs.len(),
+        )?;
+        progress.prefix_blake3 = "0".repeat(64);
+        progress.save(&path)?;
+        let receipt = std::fs::read(&path)?;
+        let publication = Publication::read(&index_path, &index)?;
+        let error = publish(
+            &fixture.projection(2),
+            &mut index,
+            &binding,
+            &index_path,
+            &checkpoint_path,
+        )
+        .err()
+        .context("malformed canonical evidence must be refused")?;
+        assert!(error.to_string().contains("prefix differs"));
+        assert!(error.downcast_ref::<PublishedPrefixMismatch>().is_none());
+        assert_eq!(Publication::read(&index_path, &index)?, publication);
+        assert_eq!(std::fs::read(&path)?, receipt);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_native_publication_never_triggers_the_content_restart() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (binding, docs) = fixture.binding()?;
+        let index_path = fixture.index_path();
+        let checkpoint_path = index_path.join(".lexical-reconcile-1.json");
+        let path = progress_path(&checkpoint_path);
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(&docs)?;
+        index.commit()?;
+        claimed_cursor(
+            &binding, &docs, &index, &index_path, &path, Pass::Replay, docs.len(),
+        )?;
+        let receipt = std::fs::read(&path)?;
+        let corrupt = b"invalid native manifest";
+        std::fs::write(index_path.join("MANIFEST"), corrupt)?;
+        std::fs::write(index_path.join("MANIFEST.prev"), corrupt)?;
+        let error = publish(
+            &fixture.projection(2),
+            &mut index,
+            &binding,
+            &index_path,
+            &checkpoint_path,
+        )
+        .err()
+        .context("native admission must refuse corrupt manifests")?;
+        assert!(error.downcast_ref::<PublishedPrefixMismatch>().is_none());
+        assert_eq!(std::fs::read(index_path.join("MANIFEST"))?, corrupt);
+        assert_eq!(std::fs::read(index_path.join("MANIFEST.prev"))?, corrupt);
+        assert_eq!(std::fs::read(&path)?, receipt);
+        Ok(())
     }
 
     #[test]
