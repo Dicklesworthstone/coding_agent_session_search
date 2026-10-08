@@ -1,0 +1,156 @@
+# Temporary exact-candidate validation; application changes are not yet on main.
+name: GH515 daemon and index ownership
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh515-daemon-index-lifecycle.yml
+      - src/daemon/**
+      - src/franken_sync.rs
+      - src/lib.rs
+      - src/indexer/**
+      - src/storage/**
+      - src/search/asset_state.rs
+      - tests/daemon_client_integration.rs
+      - tests/e2e_index_resume.rs
+      - tests/cli_index.rs
+      - tests/storage.rs
+      - tests/storage_migration_safety.rs
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - rust-toolchain.toml
+      - .cargo/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh515-daemon-index-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            architecture: x86_64
+            rustflags: -Z threads=1 -C link-arg=-fuse-ld=lld
+          - os: macos-15
+            architecture: arm64
+            rustflags: -Z threads=1
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CASS_VALIDATION_SOURCE_SHA: '3b5ca7927ffb19411af531b40c8d7a03bfd0b228'
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+      RUST_BACKTRACE: '1'
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.CASS_VALIDATION_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+        with:
+          key: gh515-native-${{ matrix.os }}
+          cache-on-failure: true
+      - name: Record exact source and native architecture
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$CASS_VALIDATION_SOURCE_SHA"
+          test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
+          git rev-parse HEAD
+          uname -a
+          rustc --version
+          sqlite3 --version
+          mkdir -p "$RUNNER_TEMP/gh515-logs"
+          git hash-object src/daemon/core.rs src/daemon/worker.rs src/daemon/worker/work_queue.rs src/franken_sync.rs src/indexer/mod.rs src/storage/sqlite.rs tests/daemon_client_integration.rs Cargo.toml Cargo.lock
+          # Restored compiler artifacts must not outrank the checked-out
+          # sources by mtime. This changes no source bytes.
+          git ls-files -z -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo | xargs -0 touch -c
+      - name: Check lifecycle source formatting
+        run: |
+          rustfmt --edition 2024 --check --config skip_children=true src/daemon/core.rs src/daemon/worker.rs src/daemon/worker/work_queue.rs src/daemon/worker/existing_index/main_coverage/tests.rs src/daemon/worker/existing_index/tests.rs src/franken_sync.rs src/indexer/mod.rs src/storage/sqlite.rs tests/daemon_client_integration.rs
+      - name: Migration, preparation and writer-admission regressions
+        if: ${{ !cancelled() }}
+        run: |
+          # As in the existing native Codebuff gate, reduce the pinned
+          # runtime's compiler memory without changing features or assertions.
+          # These functional tests do not qualify release optimization.
+          cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --lib gh515 -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/preparation.log"
+          bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/preparation.log"
+      - name: SQL cancellation and structured cleanup regressions
+        if: ${{ !cancelled() }}
+        run: |
+          cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --lib franken_sync::tests -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/sql-cancellation.log"
+          bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/sql-cancellation.log"
+      - name: Daemon worker, retry generation and cancellation regressions
+        if: ${{ !cancelled() }}
+        run: |
+          cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --lib daemon::worker:: -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/worker.log"
+          bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/worker.log"
+      - name: Lock ownership, heartbeat and stalled-progress contracts
+        if: ${{ !cancelled() }}
+        run: |
+          for test_filter in \
+            indexer::tests::heartbeat \
+            indexer::tests::acquire_index_run_lock_writes_last_progress_at_ms_field \
+            indexer::tests::std_lock_probes_see_an_fs2_holder_as_busy \
+            indexer::tests::gh424_analytics_maintenance_lock_reports_kind_and_excludes_other_writers \
+            search::asset_state::tests::gh422_stale_lock_metadata_is_ignored_without_mutating_it_on_read \
+            search::asset_state::tests::live_owner_metadata_is_preserved_when_flock_is_held \
+            search::asset_state::tests::lexical_state_reports_stalled_when_progress_is_stale_despite_fresh_heartbeat
+          do
+            log_file="$RUNNER_TEMP/gh515-logs/ownership-${test_filter##*::}.log"
+            cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --lib "$test_filter" -- --test-threads=1 --nocapture 2>&1 | tee "$log_file"
+            bash scripts/gate.sh --verify-test-log "$log_file"
+          done
+      - name: Resident daemon and separate indexing processes
+        if: ${{ !cancelled() }}
+        run: |
+          cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration gh515 -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
+          bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
+          awk '/^test result: ok\./ { passed += $4 } END { exit !(passed >= 5) }' "$RUNNER_TEMP/gh515-logs/daemon-processes.log"
+      - name: Existing daemon, indexing, storage and migration safety suites
+        if: ${{ !cancelled() }}
+        run: |
+          cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test daemon_client_integration --test cli_index --test e2e_index_resume --test storage --test storage_migration_safety -- --test-threads=1 --skip gh515 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/index-storage.log"
+          bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/index-storage.log"
+      - name: Signal shutdown fallback and committed-work recovery
+        if: ${{ !cancelled() }}
+        run: |
+          cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' test --locked --test e2e_index_resume gh515 -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh515-logs/signal-recovery.log"
+          bash scripts/gate.sh --verify-test-log "$RUNNER_TEMP/gh515-logs/signal-recovery.log"
+      - name: Library and relevant integration Clippy
+        if: ${{ !cancelled() }}
+        run: |
+          cargo --config 'profile.dev.package.asupersync.opt-level=0' --config 'profile.dev.package.asupersync.codegen-units=256' clippy --locked --lib --test daemon_client_integration --test cli_index --test e2e_index_resume --test storage --test storage_migration_safety -- -D warnings 2>&1 | tee "$RUNNER_TEMP/gh515-logs/clippy.log"
+      - name: Verify validation preserved committed sources
+        if: always()
+        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: gh515-lifecycle-${{ matrix.os }}-${{ env.CASS_VALIDATION_SOURCE_SHA }}
+          path: ${{ runner.temp }}/gh515-logs
+          if-no-files-found: error
+          retention-days: 7
