@@ -111,7 +111,7 @@ const OS_TELEMETRY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Largest stdout/stderr accepted from one telemetry probe. `ioreg -c
 /// IOHIDSystem` is the largest at a few hundred KiB.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 const OS_TELEMETRY_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Outcome of one bounded telemetry probe.
@@ -119,6 +119,8 @@ const OS_TELEMETRY_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Debug)]
 enum TelemetryProbe {
     /// The command exited within the deadline (any status).
+    // Only the Unix probe runner constructs it; Windows test builds lack it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Completed(std::process::Output),
     /// The deadline passed; the command and its process group were killed.
     TimedOut,
@@ -129,7 +131,7 @@ enum TelemetryProbe {
 /// Run a telemetry command with no stdin, captured output, its own process
 /// group, and a hard wall-clock deadline. Never blocks past `timeout` on the
 /// child itself: a hung command is killed (SIGKILL to its group) and reaped.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn run_bounded_telemetry_probe(
     mut command: std::process::Command,
     timeout: Duration,

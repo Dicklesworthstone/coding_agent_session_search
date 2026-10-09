@@ -111957,7 +111957,7 @@ mod export_html_password_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod clipboard_helper_tests {
     use super::copy_to_system_clipboard;
 
@@ -111966,7 +111966,6 @@ mod clipboard_helper_tests {
     /// previous failure mode was a silent success that dropped the
     /// export on the floor.
     #[test]
-    #[cfg(not(windows))]
     fn returns_err_when_no_tool_is_available() {
         // Save and clear PATH so spawn() can't find pbcopy/wl-copy/xclip
         // /xsel/clip. Restore on exit even if the assertion panics.

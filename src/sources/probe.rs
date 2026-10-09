@@ -1233,6 +1233,7 @@ CASS_VERSION=0.4.2
     // =========================================================================
 
     /// Execute a probe script on the local system via bash, returning stdout.
+    #[cfg(not(windows))]
     fn run_probe_script_with_home(script: &str, home: Option<&std::path::Path>) -> String {
         use std::io::Write;
         let mut cmd = Command::new("bash");
@@ -1266,6 +1267,7 @@ CASS_VERSION=0.4.2
     }
 
     /// Execute PROBE_SCRIPT on the local system via bash, returning stdout.
+    #[cfg(not(windows))]
     fn run_probe_script_locally() -> String {
         run_probe_script_with_home(&build_probe_script(), None)
     }

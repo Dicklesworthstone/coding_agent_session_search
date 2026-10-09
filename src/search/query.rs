@@ -21403,8 +21403,7 @@ mod tests {
         for strict_read_only in [false, true] {
             let original_error =
                 open_search_hydration_sqlite(&db_path, Duration::from_secs(1), strict_read_only)
-                    .err()
-                    .expect("a non-SQLite file must fail the actual archive opener");
+                    .expect_err("a non-SQLite file must fail the actual archive opener");
             let original_message = original_error.to_string();
             let original_cause = original_error.root_cause().to_string();
             let client = SearchClient::open_with_options(
@@ -23652,12 +23651,12 @@ mod tests {
 
     #[test]
     fn exact_artifact_contract_invalid_optional_ann_falls_back_exact_read_only() -> Result<()> {
-        let mut modes = vec![
+        let modes = [
             SemanticAnnFixtureMode::CorruptMetadata,
             SemanticAnnFixtureMode::CrossRoleAlias,
+            #[cfg(unix)]
+            SemanticAnnFixtureMode::FinalComponentSymlink,
         ];
-        #[cfg(unix)]
-        modes.push(SemanticAnnFixtureMode::FinalComponentSymlink);
 
         for mode in modes {
             let fixture = build_semantic_test_fixture_with_ann(mode)?;

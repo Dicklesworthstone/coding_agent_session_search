@@ -30349,7 +30349,9 @@ pub(crate) fn acquire_semantic_backfill_lock(
 
 /// Try to admit a daemon embedding job through the same writer ownership as
 /// standalone indexing. A busy archive leaves the queued job intact; all
-/// other failures retain their original error and context.
+/// other failures retain their original error and context. The daemon is
+/// Unix-only.
+#[cfg(any(unix, test))]
 pub(crate) fn try_acquire_semantic_backfill_lock(
     data_dir: &Path,
     db_path: &Path,
