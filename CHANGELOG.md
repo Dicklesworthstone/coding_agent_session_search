@@ -105,6 +105,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   unreadable keeps the workspace it had, and so does a chat seen again
   through another store's path.
 
+- **On macOS, `cass index --watch` picks up new Devin and Shelley messages
+  while the app is running.** FSEvents reports a write to a file that stays
+  open only when the file is closed, and SQLite keeps its write-ahead log
+  open for as long as the app runs, so a commit that touched only the
+  `-wal` file was never noticed. The live watch now also checks each
+  database and its `-wal`/`-shm` files once per watch interval.
+
 - **Codex sessions compressed to `.jsonl.zst` are indexed (#513).** Codex's
   `local_thread_store_compression` replaces a finished session's
   `rollout-*.jsonl` with `rollout-*.jsonl.zst`. cass found only `.jsonl` and

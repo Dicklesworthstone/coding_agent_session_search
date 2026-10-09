@@ -30781,6 +30781,65 @@ fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
         && root.path.is_file()
 }
 
+/// FSEvents (macOS) reports a write through a file descriptor that stays open
+/// only when that descriptor closes, and SQLite keeps a provider's `-wal` open
+/// for the life of its connection, so a running Devin or Shelley's WAL-only
+/// commits never arrive as events there (s1nqh). Poll each database root's
+/// directory at the watch interval as well, queueing only the database and its
+/// sidecars. The native watcher stays authoritative: a poll error is logged,
+/// never escalated to a full-root rescan.
+fn database_root_poller(
+    roots: &[(ConnectorKind, ScanRoot)],
+    interval: Duration,
+    backlog: Arc<Mutex<WatchEventBacklog>>,
+    rescan: Arc<AtomicBool>,
+    wake: Sender<()>,
+) -> Option<notify::PollWatcher> {
+    let databases: Vec<&Path> = roots
+        .iter()
+        .filter(|(kind, root)| is_database_watch_root(*kind, root))
+        .map(|(_, root)| root.path.as_path())
+        .collect();
+    if databases.is_empty() {
+        return None;
+    }
+    let files: HashSet<PathBuf> = databases
+        .iter()
+        .flat_map(|database| {
+            let [wal, shm] = database_sidecar_paths(database);
+            [database.to_path_buf(), wal, shm]
+        })
+        .collect();
+    let directories: BTreeSet<&Path> = databases
+        .iter()
+        .map(|database| database.parent().unwrap_or(database))
+        .collect();
+    let mut poller = match notify::PollWatcher::new(
+        move |result: notify::Result<notify::Event>| match result {
+            Ok(mut event) => {
+                event.paths.retain(|path| files.contains(path));
+                enqueue_watch_notification(Ok(event), &backlog, &rescan, &wake);
+            }
+            Err(error) => tracing::debug!(%error, "database root poll failed"),
+        },
+        notify::Config::default().with_poll_interval(interval),
+    ) {
+        Ok(poller) => poller,
+        Err(error) => {
+            tracing::warn!(%error, "failed to start polling database roots");
+            return None;
+        }
+    };
+    for directory in directories {
+        if let Err(error) = poller.watch(directory, RecursiveMode::NonRecursive) {
+            tracing::warn!("failed to poll {}: {}", directory.display(), error);
+        } else {
+            tracing::info!("polling {} for database commits", directory.display());
+        }
+    }
+    Some(poller)
+}
+
 fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
     if matches!(kind, ConnectorKind::Devin | ConnectorKind::Shelley) {
         // Database providers filter by activity time, which can precede
@@ -30821,6 +30880,13 @@ where
     let notification_rescan = Arc::new(AtomicBool::new(false));
     let backlog_for_watcher = Arc::clone(&notification_backlog);
     let rescan_for_watcher = Arc::clone(&notification_rescan);
+    let _database_poller = database_root_poller(
+        &roots,
+        Duration::from_secs(watch_interval_secs.max(1)),
+        Arc::clone(&notification_backlog),
+        Arc::clone(&notification_rescan),
+        wake.clone(),
+    );
 
     let mut watcher = recommended_watcher(move |result| {
         enqueue_watch_notification(result, &backlog_for_watcher, &rescan_for_watcher, &wake);
@@ -61656,6 +61722,70 @@ mod tests {
         let outside = tmp.path().join("elsewhere.jsonl");
         std::fs::write(&outside, b"{}\n").unwrap();
         assert!(classify_paths(vec![outside], &roots, false).is_empty());
+    }
+
+    /// s1nqh: FSEvents reports nothing for a provider's WAL commits while the
+    /// provider keeps the `-wal` open, so the database root is also polled.
+    #[test]
+    fn database_root_poller_queues_held_open_wal_writes_and_ignores_neighbours() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let database = tmp.path().join("sessions.db");
+        std::fs::write(&database, b"database").unwrap();
+        let neighbour = tmp.path().join("notes.txt");
+        std::fs::write(&neighbour, b"before").unwrap();
+        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, woken) = bounded(1);
+
+        let directory_root = vec![(
+            ConnectorKind::Codex,
+            ScanRoot::local(tmp.path().to_path_buf()),
+        )];
+        assert!(
+            database_root_poller(
+                &directory_root,
+                Duration::from_millis(50),
+                Arc::clone(&backlog),
+                Arc::clone(&rescan),
+                wake.clone(),
+            )
+            .is_none(),
+            "only database roots are polled"
+        );
+
+        let roots = vec![(ConnectorKind::Devin, ScanRoot::local(database.clone()))];
+        let _poller = database_root_poller(
+            &roots,
+            Duration::from_millis(50),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake,
+        )
+        .expect("a database root is polled");
+        std::thread::sleep(Duration::from_millis(300));
+
+        std::fs::write(&neighbour, b"after, and longer").unwrap();
+        let [wal, _shm] = database_sidecar_paths(&database);
+        let mut provider = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal)
+            .unwrap();
+        provider.write_all(b"commit frame").unwrap();
+        provider.sync_all().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !backlog.lock().unwrap().paths.contains(&wal) {
+            assert!(Instant::now() < deadline, "the WAL commit was never queued");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(woken.try_recv().is_ok(), "the watch loop is woken");
+        let queued = backlog.lock().unwrap().paths.clone();
+        assert!(!queued.contains(&neighbour), "{queued:?}");
+        assert!(!rescan.load(Ordering::Acquire));
+        drop(provider);
     }
 
     #[test]
