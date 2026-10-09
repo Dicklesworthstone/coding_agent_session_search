@@ -21565,16 +21565,32 @@ fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
 }
 
 fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
-    let mut conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+    let mut conn = match crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
         db_path,
         Duration::from_secs(10),
-    )
-    .with_context(|| {
-        format!(
-            "opening canonical archive read-only before index: {}",
-            db_path.display()
-        )
-    })?;
+    ) {
+        Ok(conn) => conn,
+        // Duplicate `fts_messages` schema rows are derived-FTS debris, not
+        // archive damage: the storage open that follows deduplicates them
+        // (FrankenStorage::open) and checks the schema version itself.
+        Err(err)
+            if err.chain().any(|cause| {
+                let cause = cause.to_string();
+                cause.contains("conflicting virtual-table entries")
+                    && cause.contains("fts_messages")
+            }) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "opening canonical archive read-only before index: {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
 
     let result = match conn.query("SELECT value FROM meta WHERE key = 'schema_version';") {
         Ok(rows) => Ok(rows

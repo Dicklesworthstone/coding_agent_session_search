@@ -21013,6 +21013,15 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
         Err(err) if !crate::storage::sqlite::retryable_franken_anyhow(&err) => {
             let message = format!("{err:#}");
             let lower = message.to_ascii_lowercase();
+            // Duplicate `fts_messages` rows in sqlite_master make the strict
+            // open report a malformed image, but they describe the derived
+            // FTS catalog, not the archive's data. The writable open that
+            // follows deduplicates them (dedupe_conflicting_fts_schema_rows_
+            // via_sqlite3), so refusing here would block the repair.
+            if lower.contains("conflicting virtual-table entries") && lower.contains("fts_messages")
+            {
+                return None;
+            }
             (lower.contains("malformed")
                 || lower.contains("disk image")
                 || lower.contains("not a database"))

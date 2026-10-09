@@ -80,6 +80,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`cass index` repairs duplicate `fts_messages` schema rows again instead
+  of refusing the archive.** Two pre-index checks counted the duplicate row
+  as archive damage, so `cass index` exited with "refusing to index: the
+  canonical archive ... is malformed" (exit 9) or "index refused to modify
+  an unhealthy canonical archive" (exit 5). The duplicate rows come from the
+  search FTS table, which cass rebuilds from the archive, and the regular
+  open already removes them. Both checks now let that open repair them; any
+  other malformed archive is still refused.
 - **`CASS_EXCLUDE_PATHS` now keeps excluded sessions out of the index for
   every connector.** Only the Claude Code, Codex, Codebuff and Pi readers
   consulted the variable. For Gemini, Cursor, OpenCode, Aider and the other
