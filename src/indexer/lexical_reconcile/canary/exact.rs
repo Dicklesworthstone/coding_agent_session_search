@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use frankensearch::quill::cass::{
-    CassConversationKey, CassDerivedColumns, CassDocument, CassFieldValues,
-    cass_document_identity, field,
+    CassConversationKey, CassDerivedColumns, CassDocument, CassFieldValues, cass_document_identity,
+    field,
 };
 use frankensearch::quill::quiver::NumericValue;
 use frankensearch::quill::{
@@ -110,8 +110,7 @@ impl PublishedSnapshot {
         };
         let id = resolved.global_docid;
         let derived = CassDerivedColumns::derive(document.as_ref());
-        if full_content
-            && content_witness(&identity, document, &derived)? != resolved.content_hash
+        if full_content && content_witness(&identity, document, &derived)? != resolved.content_hash
         {
             return Ok(false);
         }
@@ -120,7 +119,10 @@ impl PublishedSnapshot {
             (field::SOURCE_ID, Some(document.source_id.as_str())),
             (field::SOURCE_PATH, Some(document.source_path.as_str())),
             (field::WORKSPACE, document.workspace.as_deref()),
-            (field::WORKSPACE_ORIGINAL, document.workspace_original.as_deref()),
+            (
+                field::WORKSPACE_ORIGINAL,
+                document.workspace_original.as_deref(),
+            ),
             (field::ORIGIN_KIND, Some(document.origin_kind.as_str())),
             (field::ORIGIN_HOST, document.origin_host.as_deref()),
             (field::TITLE, document.title.as_deref()),
@@ -130,12 +132,12 @@ impl PublishedSnapshot {
                 return Ok(false);
             }
         }
-        Ok(self.number(field::CONVERSATION_ID, id)?.map(i64::from_le_bytes)
+        Ok(self
+            .number(field::CONVERSATION_ID, id)?
+            .map(i64::from_le_bytes)
             == document.conversation_id
-            && self.number(field::MSG_IDX, id)?.map(u64::from_le_bytes)
-                == Some(document.msg_idx)
-            && self.number(field::CREATED_AT, id)?.map(i64::from_le_bytes)
-                == document.created_at)
+            && self.number(field::MSG_IDX, id)?.map(u64::from_le_bytes) == Some(document.msg_idx)
+            && self.number(field::CREATED_AT, id)?.map(i64::from_le_bytes) == document.created_at)
     }
 
     fn text(&self, field: u16, id: u32) -> Result<Option<String>> {
@@ -318,8 +320,8 @@ mod tests {
         let old = index.reader()?;
         // Exercise the incumbent in the SAME invocation: this is a real
         // ranked-candidate failure, not merely a synthetic cursor model.
-        let error = super::super::verify_with_budget(&old, &target, Some("common"), 4096)
-            .unwrap_err();
+        let error =
+            super::super::verify_with_budget(&old, &target, Some("common"), 4096).unwrap_err();
         assert!(error.to_string().contains("candidate budget"));
         drop(old);
         let exact = PublishedSnapshot::open(&path)?;

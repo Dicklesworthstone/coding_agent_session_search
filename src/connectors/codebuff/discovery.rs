@@ -257,7 +257,10 @@ mod tests {
         let known = discover_for_inventory(&ctx, &mut discover).unwrap();
         assert_eq!(known.len(), 2);
         assert_eq!(known[0].source_path, primary);
-        assert_eq!(known[1].source_path, primary.with_file_name("run-state.json"));
+        assert_eq!(
+            known[1].source_path,
+            primary.with_file_name("run-state.json")
+        );
         let mut failures = ScanFailures::default();
         let scanned = discover_for_scan(&ctx, &mut failures, &mut discover).unwrap();
         assert_eq!(known, scanned);

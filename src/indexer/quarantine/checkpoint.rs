@@ -147,7 +147,9 @@ mod tests {
             let result = Pending::prepare(&path, |writer| {
                 writer.write_all(&vec![b'x'; bytes])?;
                 assert_eq!(fs::read(&path)?, old);
-                Err(io::Error::other("injected write failure before publication"))
+                Err(io::Error::other(
+                    "injected write failure before publication",
+                ))
             });
             assert!(result.is_err());
             assert_eq!(fs::read(&path)?, old);
@@ -204,7 +206,9 @@ mod tests {
     #[test]
     fn both_real_ledgers_replace_stale_temp_files_without_touching_them() -> io::Result<()> {
         let dir = tempfile::tempdir()?;
-        let stale = dir.path().join(format!("{}.tmp", QuarantineState::FILENAME));
+        let stale = dir
+            .path()
+            .join(format!("{}.tmp", QuarantineState::FILENAME));
         fs::write(&stale, b"retained session-checkpoint evidence")?;
         let first = state("first");
         first.save(dir.path())?;
@@ -268,7 +272,10 @@ mod tests {
                     symlink(&source, link)
                 }
             };
-            alias(&dir.path().join(format!("{}.tmp", QuarantineState::FILENAME)))?;
+            alias(
+                &dir.path()
+                    .join(format!("{}.tmp", QuarantineState::FILENAME)),
+            )?;
             state("healthy").save(dir.path())?;
             let quarantine = dir.path().join("quarantine");
             fs::create_dir(&quarantine)?;

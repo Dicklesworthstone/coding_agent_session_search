@@ -482,11 +482,12 @@ impl MemoizingRedactor {
 
     fn with_retention_budget(capacity: usize, retention: Arc<MemoRetentionBudget>) -> Self {
         Self {
-            text_cache: crate::indexer::memoization::ContentAddressedMemoCache::with_retention_budget(
-                capacity,
-                Arc::clone(&retention),
-                String::capacity,
-            ),
+            text_cache:
+                crate::indexer::memoization::ContentAddressedMemoCache::with_retention_budget(
+                    capacity,
+                    Arc::clone(&retention),
+                    String::capacity,
+                ),
             algorithm_fingerprint: redaction_algorithm_fingerprint(),
             last_retention_limit: retention.limit(),
             retention,
@@ -494,7 +495,10 @@ impl MemoizingRedactor {
     }
 
     pub(crate) fn new() -> Self {
-        Self::with_retention_budget(Self::configured_capacity(), Arc::clone(&REDACTION_RETENTION))
+        Self::with_retention_budget(
+            Self::configured_capacity(),
+            Arc::clone(&REDACTION_RETENTION),
+        )
     }
 
     /// Resolve the per-owner entry ceiling, honoring the optional
@@ -1845,10 +1849,8 @@ mod tests {
             for worker in 0..8 {
                 let budget = Arc::clone(&budget);
                 scope.spawn(move || {
-                    let mut redactor = MemoizingRedactor::with_retention_budget(
-                        4096,
-                        Arc::clone(&budget),
-                    );
+                    let mut redactor =
+                        MemoizingRedactor::with_retention_budget(4096, Arc::clone(&budget));
                     for round in 0..16 {
                         let input = format!(
                             "worker {worker} message {round} {} password=hunter2hunter2",

@@ -63,7 +63,10 @@ fn resident_policy_reclaims_live_redaction_values_and_holds_unknown_recovery() {
         for (worker, redactor) in [(0, &mut first), (1, &mut second)] {
             let input = payload(worker, message);
             assert!(input.len() < MemoizingRedactor::MAX_MEMOIZED_INPUT_BYTES);
-            assert_eq!(redactor.redact_text(&input), redact_secrets::redact_text(&input));
+            assert_eq!(
+                redactor.redact_text(&input),
+                redact_secrets::redact_text(&input)
+            );
         }
     }
     assert_eq!(first.stats().live_entries, 64);
@@ -98,7 +101,10 @@ fn resident_policy_reclaims_live_redaction_values_and_holds_unknown_recovery() {
 
     let input = payload(0, 0);
     let misses = first.stats().misses;
-    assert_eq!(first.redact_text(&input), redact_secrets::redact_text(&input));
+    assert_eq!(
+        first.redact_text(&input),
+        redact_secrets::redact_text(&input)
+    );
     assert_eq!(first.stats().misses, misses + 1);
     assert_eq!(first.stats().hits, 0, "an evicted value must be recomputed");
 

@@ -420,8 +420,12 @@ mod path_encoding_tests {
         use std::os::unix::ffi::OsStringExt;
 
         let temp = TempDir::new().unwrap();
-        let first = temp.path().join(OsString::from_vec(b"source-\xff".to_vec()));
-        let second = temp.path().join(OsString::from_vec(b"source-\xfe".to_vec()));
+        let first = temp
+            .path()
+            .join(OsString::from_vec(b"source-\xff".to_vec()));
+        let second = temp
+            .path()
+            .join(OsString::from_vec(b"source-\xfe".to_vec()));
         fs::write(&first, b"first source").unwrap();
         // Lossy encoding would conflate a present source with an absent one.
         assert_ne!(first, second);
@@ -457,10 +461,14 @@ mod path_encoding_tests {
         let temp = TempDir::new().unwrap();
         let first = temp.path().join("first.jsonl");
         let last = temp.path().join("last.jsonl");
-        let bad_parent = temp.path().join(OsString::from_vec(b"project-\xff".to_vec()));
+        let bad_parent = temp
+            .path()
+            .join(OsString::from_vec(b"project-\xff".to_vec()));
         fs::create_dir(&bad_parent).unwrap();
         let bad_child = bad_parent.join("chat-messages.json");
-        let bad_file = temp.path().join(OsString::from_vec(b"source-\xff.jsonl".to_vec()));
+        let bad_file = temp
+            .path()
+            .join(OsString::from_vec(b"source-\xff.jsonl".to_vec()));
         for path in [&first, &bad_child, &bad_file, &last] {
             fs::write(path, b"preserved input").unwrap();
         }

@@ -80,12 +80,10 @@ impl MemoRetentionBudget {
             if limit == 0 || next > limit {
                 return None;
             }
-            match self.used.compare_exchange_weak(
-                used,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     let lease = MemoRetentionLease {
                         budget: Arc::clone(self),
@@ -192,11 +190,15 @@ pub(crate) enum MemoCacheEvent {
     Hit,
     Miss,
     Insert,
-    Evict { reason: MemoEvictReason },
+    Evict {
+        reason: MemoEvictReason,
+    },
     /// The computed result was not retained because its shared byte allowance
     /// could not admit it. This is not a redaction/derivation failure.
     BudgetBypass,
-    Quarantine { reason: String },
+    Quarantine {
+        reason: String,
+    },
     Invalidate,
 }
 
@@ -339,9 +341,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             return 0;
         };
         let mut evicted = 0;
-        while (retention.limit() == 0 || retention.used() > retention.limit())
-            && self.evict_lru()
-        {
+        while (retention.limit() == 0 || retention.used() > retention.limit()) && self.evict_lru() {
             evicted += 1;
         }
         if evicted > 0 {
@@ -1389,9 +1389,18 @@ mod tests {
         assert_eq!(bounded.stats().live_entries, 2);
         assert_eq!(bounded.retained_bytes(), 8);
         assert_eq!(budget.used(), 8);
-        assert!(matches!(bounded.get(&key(b"a", "lex", "v1")), MemoLookup::Miss));
-        assert!(matches!(bounded.get(&key(b"b", "lex", "v1")), MemoLookup::Hit { .. }));
-        assert!(matches!(bounded.get(&key(b"c", "lex", "v1")), MemoLookup::Hit { .. }));
+        assert!(matches!(
+            bounded.get(&key(b"a", "lex", "v1")),
+            MemoLookup::Miss
+        ));
+        assert!(matches!(
+            bounded.get(&key(b"b", "lex", "v1")),
+            MemoLookup::Hit { .. }
+        ));
+        assert!(matches!(
+            bounded.get(&key(b"c", "lex", "v1")),
+            MemoLookup::Hit { .. }
+        ));
     }
 
     #[test]
@@ -1410,9 +1419,20 @@ mod tests {
         assert_eq!(budget.used(), 64, "short text can own a much larger buffer");
         cache.get(&key(b"a", "lex", "v1"));
         let event = cache.insert(key(b"c", "lex", "v1"), "c".repeat(32));
-        assert_eq!(event, MemoCacheEvent::Evict { reason: MemoEvictReason::ValueByteBudget });
-        assert!(matches!(cache.get(&key(b"b", "lex", "v1")), MemoLookup::Miss));
-        assert!(matches!(cache.get(&key(b"a", "lex", "v1")), MemoLookup::Hit { .. }));
+        assert_eq!(
+            event,
+            MemoCacheEvent::Evict {
+                reason: MemoEvictReason::ValueByteBudget
+            }
+        );
+        assert!(matches!(
+            cache.get(&key(b"b", "lex", "v1")),
+            MemoLookup::Miss
+        ));
+        assert!(matches!(
+            cache.get(&key(b"a", "lex", "v1")),
+            MemoLookup::Hit { .. }
+        ));
         assert_eq!(budget.used(), 64);
     }
 
@@ -1420,19 +1440,32 @@ mod tests {
     fn shared_retention_does_not_multiply_with_cache_owners_and_drop_releases_it() {
         let budget = MemoRetentionBudget::new(12);
         let mut first = ContentAddressedMemoCache::with_retention_budget(
-            16, Arc::clone(&budget), String::capacity,
+            16,
+            Arc::clone(&budget),
+            String::capacity,
         );
         let mut second = ContentAddressedMemoCache::with_retention_budget(
-            16, Arc::clone(&budget), String::capacity,
+            16,
+            Arc::clone(&budget),
+            String::capacity,
         );
         first.insert(key(b"a", "lex", "v1"), "12345678".to_owned());
-        assert_eq!(second.insert(key(b"b", "lex", "v1"), "12345678".to_owned()), MemoCacheEvent::BudgetBypass);
+        assert_eq!(
+            second.insert(key(b"b", "lex", "v1"), "12345678".to_owned()),
+            MemoCacheEvent::BudgetBypass
+        );
         assert_eq!(budget.used(), 8);
         assert_eq!(second.stats().inserts, 0);
-        assert!(matches!(first.get(&key(b"a", "lex", "v1")), MemoLookup::Hit { .. }));
+        assert!(matches!(
+            first.get(&key(b"a", "lex", "v1")),
+            MemoLookup::Hit { .. }
+        ));
         drop(first);
         assert_eq!(budget.used(), 0);
-        assert_eq!(second.insert(key(b"b", "lex", "v1"), "12345678".to_owned()), MemoCacheEvent::Insert);
+        assert_eq!(
+            second.insert(key(b"b", "lex", "v1"), "12345678".to_owned()),
+            MemoCacheEvent::Insert
+        );
         assert_eq!(budget.used(), 8);
         drop(second);
         assert_eq!(budget.used(), 0);
@@ -1442,7 +1475,9 @@ mod tests {
     fn retained_bytes_replacement_invalidation_and_quarantine_release_exactly_once() {
         let budget = MemoRetentionBudget::new(16);
         let mut cache = ContentAddressedMemoCache::with_retention_budget(
-            2, Arc::clone(&budget), String::capacity,
+            2,
+            Arc::clone(&budget),
+            String::capacity,
         );
         let a = key(b"a", "lex", "v1");
         let b = key(b"b", "lex", "v1");
@@ -1456,11 +1491,17 @@ mod tests {
         assert_eq!(budget.used(), 0);
         assert!(!cache.invalidate(&a));
         assert_eq!(budget.used(), 0);
-        assert!(matches!(cache.insert(b.clone(), "new".into()), MemoCacheEvent::Quarantine { .. }));
+        assert!(matches!(
+            cache.insert(b.clone(), "new".into()),
+            MemoCacheEvent::Quarantine { .. }
+        ));
         budget.set_limit(0);
         cache.trim_to_budget();
         assert!(matches!(cache.get(&b), MemoLookup::Quarantined { .. }));
-        assert_eq!(cache.quarantine_inspection_items()[0].reason, "retain this reason");
+        assert_eq!(
+            cache.quarantine_inspection_items()[0].reason,
+            "retain this reason"
+        );
         drop(cache);
         assert_eq!(budget.used(), 0);
     }
@@ -1469,7 +1510,9 @@ mod tests {
     fn retained_bytes_oversized_replacement_never_leaves_the_old_value_or_evicts_peers() {
         let budget = MemoRetentionBudget::new(8);
         let mut cache = ContentAddressedMemoCache::with_retention_budget(
-            16, Arc::clone(&budget), String::capacity,
+            16,
+            Arc::clone(&budget),
+            String::capacity,
         );
         let a = key(b"a", "lex", "v1");
         let b = key(b"b", "lex", "v1");
@@ -1491,7 +1534,9 @@ mod tests {
     fn retained_bytes_pressure_shrink_and_recovery_do_not_resurrect_evicted_values() {
         let budget = MemoRetentionBudget::new(16);
         let mut cache = ContentAddressedMemoCache::with_retention_budget(
-            16, Arc::clone(&budget), String::capacity,
+            16,
+            Arc::clone(&budget),
+            String::capacity,
         );
         for label in [b"a", b"b", b"c", b"d"] {
             cache.insert(key(label, "lex", "v1"), "1234".into());
@@ -1499,21 +1544,39 @@ mod tests {
         budget.set_limit(4);
         assert_eq!(cache.trim_to_budget(), 3);
         assert_eq!(budget.used(), 4);
-        assert!(matches!(cache.get(&key(b"d", "lex", "v1")), MemoLookup::Hit { .. }));
+        assert!(matches!(
+            cache.get(&key(b"d", "lex", "v1")),
+            MemoLookup::Hit { .. }
+        ));
         budget.set_limit(0);
         assert_eq!(cache.trim_to_budget(), 1);
         assert_eq!(budget.used(), 0);
-        assert_eq!(cache.insert(key(b"e", "lex", "v1"), String::new()), MemoCacheEvent::BudgetBypass);
+        assert_eq!(
+            cache.insert(key(b"e", "lex", "v1"), String::new()),
+            MemoCacheEvent::BudgetBypass
+        );
         budget.set_limit(16);
-        assert_eq!(budget.used(), 0, "raising an allowance cannot allocate or resurrect values");
-        assert!(matches!(cache.get(&key(b"d", "lex", "v1")), MemoLookup::Miss));
-        assert_eq!(cache.insert(key(b"e", "lex", "v1"), "1234".into()), MemoCacheEvent::Insert);
+        assert_eq!(
+            budget.used(),
+            0,
+            "raising an allowance cannot allocate or resurrect values"
+        );
+        assert!(matches!(
+            cache.get(&key(b"d", "lex", "v1")),
+            MemoLookup::Miss
+        ));
+        assert_eq!(
+            cache.insert(key(b"e", "lex", "v1"), "1234".into()),
+            MemoCacheEvent::Insert
+        );
     }
 
     #[test]
     fn retained_bytes_counter_refuses_overflow_and_zero_budget_without_allocating() {
         let budget = MemoRetentionBudget::new(usize::MAX);
-        let lease = budget.reserve(usize::MAX).expect("the entire numeric allowance fits");
+        let lease = budget
+            .reserve(usize::MAX)
+            .expect("the entire numeric allowance fits");
         assert!(budget.reserve(1).is_none());
         assert_eq!(budget.used(), usize::MAX);
         drop(lease);
@@ -1521,9 +1584,12 @@ mod tests {
         budget.set_limit(0);
         assert!(budget.reserve(0).is_none());
         assert!(budget.reserve(1).is_none());
-        let cache: ContentAddressedMemoCache<String> = ContentAddressedMemoCache::with_retention_budget(
-            usize::MAX, Arc::clone(&budget), String::capacity,
-        );
+        let cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_retention_budget(
+                usize::MAX,
+                Arc::clone(&budget),
+                String::capacity,
+            );
         assert_eq!(cache.entries.capacity(), 0);
         assert_eq!(cache.lru_seq.capacity(), 0);
     }
@@ -1536,7 +1602,9 @@ mod tests {
                 let budget = Arc::clone(&budget);
                 scope.spawn(move || {
                     let mut cache = ContentAddressedMemoCache::with_retention_budget(
-                        8, Arc::clone(&budget), String::capacity,
+                        8,
+                        Arc::clone(&budget),
+                        String::capacity,
                     );
                     for round in 0..128 {
                         let k = key(format!("{worker}:{round}").as_bytes(), "lex", "v1");
@@ -1550,6 +1618,10 @@ mod tests {
                 });
             }
         });
-        assert_eq!(budget.used(), 0, "every worker's Drop releases its retained values");
+        assert_eq!(
+            budget.used(),
+            0,
+            "every worker's Drop releases its retained values"
+        );
     }
 }
