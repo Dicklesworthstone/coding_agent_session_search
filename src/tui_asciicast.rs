@@ -388,19 +388,17 @@ where
 }
 
 fn is_pty_eof_error(err: &io::Error) -> bool {
-    if matches!(
+    let eof_kind = matches!(
         err.kind(),
         io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
-    ) {
-        return true;
-    }
+    );
     #[cfg(unix)]
     {
-        err.raw_os_error() == Some(posix::EIO)
+        eof_kind || err.raw_os_error() == Some(posix::EIO)
     }
     #[cfg(not(unix))]
     {
-        false
+        eof_kind
     }
 }
 

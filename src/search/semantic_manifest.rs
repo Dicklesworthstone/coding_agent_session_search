@@ -4686,11 +4686,11 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
     #[cfg(windows)]
     {
         windows_move_file_write_through(temp_path, final_path, true)?;
-        return OpenOptions::new()
+        OpenOptions::new()
             .read(true)
             .write(true)
             .open(final_path)?
-            .sync_all();
+            .sync_all()
     }
     #[cfg(not(windows))]
     {
@@ -4784,7 +4784,7 @@ fn windows_move_file_write_through(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(all(unix, test))]
 fn replacement_path_entry_exists(path: &Path) -> std::io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),

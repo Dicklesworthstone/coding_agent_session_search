@@ -206,19 +206,18 @@ const MAX_PROOF_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PROOF_MANIFEST_ROWS: usize = 128;
 
 fn same_proof_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    if left.len() != right.len() || left.modified().ok() != right.modified().ok() {
-        return false;
-    }
+    let same_contents = left.len() == right.len() && left.modified().ok() == right.modified().ok();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
-            != (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
-        {
-            return false;
-        }
+        same_contents
+            && (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
+                == (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
     }
-    true
+    #[cfg(not(unix))]
+    {
+        same_contents
+    }
 }
 
 /// Read only the canonical manifest. Never follow artifact/log references or

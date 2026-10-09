@@ -27654,6 +27654,7 @@ const fn semantic_daemon_policy(daemon: bool, no_daemon: bool) -> SemanticDaemon
     }
 }
 
+#[cfg(any(unix, test))]
 fn compose_verified_daemon_embedder_or_local(
     daemon: Arc<dyn crate::search::daemon_client::DaemonClient>,
     embedder: Arc<dyn crate::search::embedder::Embedder>,
@@ -32542,6 +32543,8 @@ fn run_cli_search(
             }
             #[cfg(not(unix))]
             {
+                // Only the Unix daemon reranks with the search's embedder.
+                let _ = daemon_embedder_id_for_rerank;
                 local_reranker
             }
         } else {
