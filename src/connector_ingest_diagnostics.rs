@@ -638,9 +638,13 @@ impl ConnectorIngestRun {
     /// [`Self::finish`] does not re-read them.
     pub fn observe_reused_sources(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
-            if let Some(source) = self.sources.get_mut(&path)
-                && source.disposition == SourceIngestDisposition::Discovered
-            {
+            // Self-contained connectors skip the redundant discovery
+            // inventory, so a reused source may not be listed yet.
+            let source = self.sources.entry(path).or_insert(ObservedSource {
+                disposition: SourceIngestDisposition::Discovered,
+                malformed: false,
+            });
+            if source.disposition == SourceIngestDisposition::Discovered {
                 source.disposition = SourceIngestDisposition::Indexed;
             }
         }
@@ -1913,6 +1917,22 @@ mod tests {
         let report = run.finish();
         verify!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
         verify_eq!(report.summary.indexed, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reused_source_missing_from_the_discovery_inventory_counts_as_indexed() -> TestResult {
+        // Self-contained connectors (Claude Code, Codex) reuse ledger rows
+        // without listing the unchanged sources first.
+        let temp = tempdir()?;
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), Vec::new(), None);
+        let mut run = ConnectorIngestRun::begin("claude", temp.path(), &ctx, &[]);
+        let reused = temp.path().join("projects/p/session-0.jsonl");
+        run.observe_reused_sources([reused.clone(), reused]);
+        let report = run.finish();
+        verify!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        verify_eq!(report.summary.indexed, 1);
+        verify_eq!(report.summary.discovered, 0);
         Ok(())
     }
 

@@ -88,6 +88,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   search FTS table, which cass rebuilds from the archive, and the regular
   open already removes them. Both checks now let that open repair them; any
   other malformed archive is still refused.
+- **`cass index --json` counts reused Claude Code and Codex sessions as
+  indexed again.** `connector_summary.<provider>.indexed` counts unchanged
+  sessions reused from the source ledger. For Claude Code and Codex, which
+  no longer list unchanged sessions before reusing them, the count covered
+  only the sessions parsed in that run.
 - **`CASS_EXCLUDE_PATHS` now keeps excluded sessions out of the index for
   every connector.** Only the Claude Code, Codex, Codebuff and Pi readers
   consulted the variable. For Gemini, Cursor, OpenCode, Aider and the other
