@@ -39,10 +39,15 @@ impl DependencyObservations {
 }
 
 pub(crate) fn file_observation(path: &Path) -> Option<Value> {
+    // The ledger stores paths as JSON strings. Path's serializer rejects
+    // non-Unicode names, and json! would panic on that error. Such an input
+    // cannot carry reusable evidence; do not lose unrelated observations or
+    // collapse distinct native names through a lossy replacement string.
+    let encoded_path = path.to_str()?;
     match std::fs::metadata(path) {
         Ok(metadata) => {
             let observation = serde_json::json!({
-                "path": path, "size": metadata.len(),
+                "path": encoded_path, "size": metadata.len(),
                 "mtime_ns": metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH)
                     .ok()?.as_nanos().to_string(),
             });
@@ -58,7 +63,7 @@ pub(crate) fn file_observation(path: &Path) -> Option<Value> {
             Some(observation)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Some(serde_json::json!({"path": path, "absent": true}))
+            Some(serde_json::json!({"path": encoded_path, "absent": true}))
         }
         Err(_) => None,
     }
@@ -394,5 +399,121 @@ mod tests {
                 "scope": "production filesystem matcher; excludes discovery, registry, storage and parsing",
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod path_encoding_tests {
+    //! An unencodable path is missing evidence, not permission to panic or invent
+    //! a lossy source identity. Exercise the actual filesystem observer and matcher.
+
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const CONTRACT: &str = "path-encoding-test";
+
+    #[cfg(unix)]
+    #[test]
+    fn unencodable_existing_and_missing_paths_never_receive_a_ledger_certificate() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join(OsString::from_vec(b"source-\xff".to_vec()));
+        let second = temp.path().join(OsString::from_vec(b"source-\xfe".to_vec()));
+        fs::write(&first, b"first source").unwrap();
+        // Lossy encoding would conflate a present source with an absent one.
+        assert_ne!(first, second);
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert!(serde_json::to_value(&first).is_err());
+        assert!(serde_json::to_value(&second).is_err());
+        assert!(fs::metadata(&first).unwrap().is_file());
+        assert_eq!(
+            fs::metadata(&second).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let malformed = serde_json::json!({
+            "producer_contract": CONTRACT, "primary": null, "dependencies": []
+        })
+        .to_string();
+        for path in [&first, &second] {
+            assert!(file_observation(path).is_none());
+            for observes_parent in [false, true] {
+                assert!(!ledger_matches(&malformed, path, observes_parent, CONTRACT));
+            }
+        }
+        assert_eq!(fs::read(&first).unwrap(), b"first source");
+        assert!(!second.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_dependency_capture_preserves_healthy_inputs_around_unencodable_sources() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first.jsonl");
+        let last = temp.path().join("last.jsonl");
+        let bad_parent = temp.path().join(OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&bad_parent).unwrap();
+        let bad_child = bad_parent.join("chat-messages.json");
+        let bad_file = temp.path().join(OsString::from_vec(b"source-\xff.jsonl".to_vec()));
+        for path in [&first, &bad_child, &bad_file, &last] {
+            fs::write(path, b"preserved input").unwrap();
+        }
+        let parent_before = file_observation(temp.path()).unwrap();
+        let first_before = file_observation(&first).unwrap();
+        let last_before = file_observation(&last).unwrap();
+        let snapshot = DependencyObservations::capture([
+            first.clone(),
+            bad_child.clone(),
+            bad_file.clone(),
+            last.clone(),
+        ]);
+        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(snapshot.files[&first], first_before);
+        assert_eq!(snapshot.files[&last], last_before);
+        assert_eq!(snapshot.parent_for(&first), Some(&parent_before));
+        assert_eq!(snapshot.parent_for(&last), Some(&parent_before));
+        assert!(snapshot.parent_for(&bad_child).is_none());
+        assert!(!snapshot.files.contains_key(&bad_child));
+        assert!(!snapshot.files.contains_key(&bad_file));
+        for path in [&first, &bad_child, &bad_file, &last] {
+            assert_eq!(fs::read(path).unwrap(), b"preserved input");
+        }
+    }
+
+    #[test]
+    fn unicode_paths_keep_the_existing_wire_shape_and_reuse_contract() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("ordinary 雪 source.jsonl");
+        let missing = temp.path().join("absent 雪 sidecar.json");
+        fs::write(&path, b"unchanged source").unwrap();
+        let observed = file_observation(&path).unwrap();
+        assert_eq!(observed["path"], serde_json::to_value(&path).unwrap());
+        assert_eq!(
+            file_observation(&missing),
+            Some(serde_json::json!({"path": missing, "absent": true}))
+        );
+        let saved = serde_json::json!({
+            "producer_contract": CONTRACT,
+            "primary": observed,
+            "dependencies": [
+                file_observation(temp.path()).unwrap(),
+                file_observation(&missing).unwrap()
+            ]
+        })
+        .to_string();
+        for observes_parent in [false, true] {
+            assert!(ledger_matches(&saved, &path, observes_parent, CONTRACT));
+        }
+        fs::write(&missing, b"new metadata").unwrap();
+        for observes_parent in [false, true] {
+            assert!(!ledger_matches(&saved, &path, observes_parent, CONTRACT));
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"unchanged source");
     }
 }
