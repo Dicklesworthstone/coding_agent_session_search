@@ -907,6 +907,7 @@ dependencies = [
  "shell-words",
  "sigpipe",
  "smallvec",
+ "socket2",
  "ssh2",
  "strsim",
  "sysinfo",

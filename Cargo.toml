@@ -196,6 +196,10 @@ unicode-width = "0.2.2"
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
+# SO_NOSIGPIPE on the clipboard socket pair: macOS has no MSG_NOSIGNAL, so a
+# write after the clipboard tool exits would raise SIGPIPE. Already built (with
+# "all") for asupersync, so this adds no crate.
+socket2 = { version = "0.6.5", features = ["all"] }
 
 # Statically link OpenSSL into Unix release binaries so they do not require a
 # matching system libssl. Windows builds use platform TLS/crypto stacks through

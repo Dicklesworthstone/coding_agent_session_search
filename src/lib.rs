@@ -111809,11 +111809,15 @@ fn write_clipboard_command(
     use std::io::Write;
     use std::process::Stdio;
 
-    // Unlike a ChildStdin pipe, UnixStream::write suppresses SIGPIPE even
-    // when main has restored SIG_DFL for stdout. The unnamed pair keeps
-    // clipboard bytes off disk and delivers ordinary readable stdin.
+    // Unlike a ChildStdin pipe, a socket write can be kept from raising
+    // SIGPIPE even when main has restored SIG_DFL for stdout: std sends with
+    // MSG_NOSIGNAL on Linux, and macOS, which lacks that flag, needs
+    // SO_NOSIGPIPE on our end. The unnamed pair keeps clipboard bytes off
+    // disk and delivers ordinary readable stdin.
     #[cfg(unix)]
     let (mut stdin, child_stdin) = std::os::unix::net::UnixStream::pair()?;
+    #[cfg(target_os = "macos")]
+    socket2::SockRef::from(&stdin).set_nosigpipe(true)?;
     #[cfg(unix)]
     command.stdin(Stdio::from(std::os::fd::OwnedFd::from(child_stdin)));
     #[cfg(not(unix))]
