@@ -243,7 +243,15 @@ fn gh511_multiple_failures_recover_independently_across_indexing_modes() {
     fn archive(data: &Path) -> BTreeMap<String, (i64, i64)> {
         let storage = SqliteStorage::open_readonly(&data.join("agent_search.db")).unwrap();
         let mut messages = BTreeMap::new();
-        for conversation in storage.list_conversations(20, 0).unwrap() {
+        // On Windows the other connectors find the real profile
+        // (FOLDERID_Profile ignores USERPROFILE), so a host with agent history
+        // adds conversations this test does not own.
+        for conversation in storage
+            .list_conversations(i64::MAX, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|conversation| conversation.agent_slug == "codebuff")
+        {
             let conversation_id = conversation.id.unwrap();
             for message in storage.fetch_messages(conversation_id).unwrap() {
                 assert!(
