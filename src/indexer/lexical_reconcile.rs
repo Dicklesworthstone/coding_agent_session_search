@@ -348,7 +348,14 @@ pub(crate) fn run_lexical_conversation_reconcile(
         conversation_id > 0,
         "reconcile conversation id must be positive"
     );
-    let _run_lock = super::acquire_index_run_lock(data_dir, db_path, SearchMaintenanceMode::Index)?;
+    // Writable admission: the archive is opened through a recovery-capable
+    // read-only open, which may repair it.
+    let _run_lock = super::acquire_index_run_lock_with_job_kind(
+        data_dir,
+        db_path,
+        SearchMaintenanceMode::Index,
+        super::maintenance_job_kind_for_mode(SearchMaintenanceMode::Index),
+    )?;
 
     let storage = FrankenStorage::open_readonly(db_path)
         .with_context(|| format!("opening canonical archive {} read-only", db_path.display()))?;
@@ -741,7 +748,10 @@ mod tests {
         index.upsert_prebuilt_documents_slice(&[changed])?;
         index.commit()?;
         let after = canary::exact::PublishedSnapshot::open(&path)?;
-        assert_eq!(projection.verify_published(&before, &checkpoint)?, docs.len());
+        assert_eq!(
+            projection.verify_published(&before, &checkpoint)?,
+            docs.len()
+        );
         assert!(projection.verify_published(&after, &checkpoint).is_err());
         for case in 0..4 {
             let mut wrong = checkpoint.clone();

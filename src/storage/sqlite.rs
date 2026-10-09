@@ -44261,6 +44261,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
     #[test]
     fn gh515_first_v22_migration_then_preparation_preserves_live_reader() -> Result<()> {
+        use crate::franken_sync::FrankenError;
+
         const TEST_NAME: &str = "storage::sqlite::tests::gh515_first_v22_migration_then_preparation_preserves_live_reader";
         const DIRECTORY_ENV: &str = "CASS_TEST_GH515_MIGRATION_DIRECTORY";
         const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
