@@ -9790,8 +9790,16 @@ fn run_quarantine_clear(
     use crate::indexer::quarantine::{QuarantineKey, QuarantineState};
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    // Clearing quarantine changes only the ledgers under the data directory;
+    // unlike retrying a quarantined source, it never writes the archive.
     let _mutation_guard = apply
-        .then(|| crate::indexer::acquire_quarantine_mutation_lock(&data_dir))
+        .then(|| {
+            crate::indexer::acquire_search_asset_mutation_lock(
+                &data_dir,
+                &data_dir.join("agent_search.db"),
+                crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+            )
+        })
         .transpose()
         .map_err(|err| quarantine_apply_cli_error("clear", err))?;
     let mut state = QuarantineState::load_for_operator(&data_dir)
@@ -20980,15 +20988,21 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
         return None;
     }
 
-    match open_franken_cli_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT) {
-        Ok(conn) => {
+    // This observation also runs before a read-only force rebuild has archive
+    // writer admission. It must never repair WAL or schema state on open.
+    match crate::storage::sqlite::FrankenStorage::open_strict_readonly_with_timeout(
+        db_path,
+        STATE_DB_OPEN_TIMEOUT,
+    ) {
+        Ok(storage) => {
+            let conn = storage.into_raw();
             let (integrity, detail) = probe_state_db_integrity(|sql| {
                 use crate::franken_sync::compat::RowExt;
                 franken_query_row_map_retry(&conn, sql, &[], |row| {
                     row.get_typed::<i64>(0).map(|_| ())
                 })
             });
-            let _ = close_franken_cli_read_db(conn, db_path, reason);
+            let _ = close_franken_cli_read_db_without_checkpoint(conn, db_path, reason);
             match integrity {
                 Some(StateDbIntegrity::Corrupt) => {
                     Some(detail.unwrap_or_else(|| "corruption-class read failure".to_owned()))
@@ -20996,12 +21010,13 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
                 _ => None,
             }
         }
-        Err(err) if !err.retryable => {
-            let lower = err.message.to_ascii_lowercase();
+        Err(err) if !crate::storage::sqlite::retryable_franken_anyhow(&err) => {
+            let message = format!("{err:#}");
+            let lower = message.to_ascii_lowercase();
             (lower.contains("malformed")
                 || lower.contains("disk image")
                 || lower.contains("not a database"))
-            .then_some(err.message)
+            .then_some(message)
         }
         Err(_) => None,
     }
@@ -21798,6 +21813,149 @@ fn index_unsupported_quill_writer_admission_cli_error(chain: &str) -> CliError {
 #[cfg(test)]
 mod index_error_mapping_tests {
     use super::*;
+
+    fn idempotency_test_bundle_bytes(db_path: &Path) -> Vec<Option<Vec<u8>>> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let mut path = db_path.as_os_str().to_owned();
+                path.push(suffix);
+                match std::fs::read(Path::new(&path)) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("reading cache fixture {path:?}: {error}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gh515_idempotency_lookup_never_creates_or_expires_archive_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path().join("data");
+        let db_path = temp.path().join("archive-parent/archive.db");
+        assert_eq!(read_index_idempotency_cache(&db_path, "missing", 0), None);
+        assert!(!db_path.parent().unwrap().exists());
+
+        std::fs::create_dir_all(db_path.parent().unwrap())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy())?;
+        conn.execute("CREATE TABLE archive_identity (content TEXT)")?;
+        conn.execute("INSERT INTO archive_identity VALUES ('keep this archive')")?;
+        conn.close()?;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        assert_eq!(read_index_idempotency_cache(&db_path, "missing", 0), None);
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        assert!(!data_dir.exists());
+        assert!(!db_path.parent().unwrap().join("doctor").exists());
+
+        let payload = serde_json::json!({"success": true, "messages": 1});
+        store_index_idempotency_result(&data_dir, &db_path, "expired", 7, &payload, 0)?;
+        store_index_idempotency_result(&data_dir, &db_path, "live", 7, &payload, 100)?;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        let now_ms = 24 * 60 * 60 * 1000;
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "expired", now_ms),
+            None
+        );
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "unknown", now_ms),
+            None
+        );
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "live", now_ms),
+            Some(("7".to_string(), payload.to_string()))
+        );
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        let storage = crate::storage::sqlite::FrankenStorage::open_strict_readonly(&db_path)?;
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT COUNT(*) FROM idempotency_keys")?
+                .get_typed::<i64>(0)?,
+            2,
+            "TTL lookup must leave expired rows for an admitted cache writer"
+        );
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT content FROM archive_identity")?
+                .get_typed::<String>(0)?,
+            "keep this archive"
+        );
+        storage.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_idempotency_persistence_obeys_archive_owner_and_recovers() -> Result<()> {
+        use crate::search::asset_state::SearchMaintenanceJobKind;
+
+        let temp = tempfile::tempdir()?;
+        let owner_data = temp.path().join("owner-data");
+        let cache_data = temp.path().join("cache-data");
+        let db_path = temp.path().join("archive.db");
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy())?;
+        conn.execute("CREATE TABLE archive_identity (content TEXT)")?;
+        conn.execute("INSERT INTO archive_identity VALUES ('keep this archive')")?;
+        conn.close()?;
+        let payload = serde_json::json!({"success": true, "messages": 1});
+        let owner = crate::indexer::acquire_search_maintenance_mutation_lock(
+            &owner_data,
+            &db_path,
+            SearchMaintenanceJobKind::SemanticRebuild,
+        )?;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        assert!(
+            store_index_idempotency_result(&cache_data, &db_path, "expired", 7, &payload, 0)
+                .is_err()
+        );
+        assert_eq!(read_index_idempotency_cache(&db_path, "expired", 0), None);
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        assert!(std::fs::read(cache_data.join("index-run.lock"))?.is_empty());
+        drop(owner);
+
+        store_index_idempotency_result(&cache_data, &db_path, "expired", 7, &payload, 0)?;
+        store_index_idempotency_result(&cache_data, &db_path, "live", 7, &payload, 100)?;
+        let owner = crate::indexer::acquire_search_maintenance_mutation_lock(
+            &owner_data,
+            &db_path,
+            SearchMaintenanceJobKind::SemanticRebuild,
+        )?;
+        let now_ms = 24 * 60 * 60 * 1000;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        assert!(
+            store_index_idempotency_result(&cache_data, &db_path, "retry", 7, &payload, now_ms)
+                .is_err()
+        );
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        drop(owner);
+
+        store_index_idempotency_result(&cache_data, &db_path, "retry", 7, &payload, now_ms)?;
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "retry", now_ms),
+            Some(("7".to_string(), payload.to_string()))
+        );
+        assert!(std::fs::read(cache_data.join("index-run.lock"))?.is_empty());
+        let storage = crate::storage::sqlite::FrankenStorage::open_strict_readonly(&db_path)?;
+        let keys = storage.raw().query_map_collect(
+            "SELECT key FROM idempotency_keys ORDER BY key",
+            &[],
+            |row| row.get_typed::<String>(0),
+        )?;
+        assert_eq!(keys, ["live", "retry"]);
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT content FROM archive_identity")?
+                .get_typed::<String>(0)?,
+            "keep this archive"
+        );
+        for row in storage.raw().query("PRAGMA integrity_check")? {
+            assert_eq!(row.get_typed::<String>(0)?, "ok");
+        }
+        storage.close_without_checkpoint()?;
+        Ok(())
+    }
 
     #[test]
     fn index_idempotency_cache_rejects_non_objects_and_preserves_valid_results() {
@@ -108488,6 +108646,81 @@ fn cached_index_payload(result_json: &str, key: &str) -> Option<serde_json::Valu
     Some(serde_json::Value::Object(payload))
 }
 
+fn read_index_idempotency_cache(
+    db_path: &Path,
+    key: &str,
+    now_ms: i64,
+) -> Option<(String, String)> {
+    // Lookup precedes index admission. A missing or unavailable cache is a
+    // miss: never create its table, expire rows, repair storage, or wait for
+    // another archive owner before the indexer can report typed contention.
+    let storage = crate::storage::sqlite::FrankenStorage::open_strict_readonly_with_timeout(
+        db_path,
+        Duration::ZERO,
+    )
+    .ok()?;
+    let conn = storage.into_raw();
+    let cached = conn
+        .execute("PRAGMA busy_timeout = 0;")
+        .and_then(|_| conn.query_row_map(
+            "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
+            crate::franken_sync::params![key, now_ms],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        ))
+        .ok();
+    let _ = close_franken_cli_read_db_without_checkpoint(
+        conn,
+        db_path,
+        "checking index idempotency cache",
+    );
+    cached
+}
+
+fn store_index_idempotency_result(
+    data_dir: &Path,
+    db_path: &Path,
+    key: &str,
+    params_hash: u64,
+    payload: &serde_json::Value,
+    now_ms: i64,
+) -> Result<()> {
+    use crate::franken_sync::compat::TransactionExt;
+
+    let result_json = serde_json::to_string(payload)?;
+    let hash_str = params_hash.to_string();
+    let expires_ms = now_ms + 24 * 60 * 60 * 1000;
+    // The indexing worker has already joined and released its ownership.
+    // Reacquire both asset and archive admission for this short cache write;
+    // a newly admitted daemon/indexer must keep its ownership undisturbed.
+    let _mutation_guard = crate::indexer::acquire_search_maintenance_mutation_lock(
+        data_dir,
+        db_path,
+        crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+    )?;
+    with_frankensqlite_connection(db_path, "storing index idempotency result", |conn| {
+        let mut transaction = conn.transaction()?;
+        transaction.execute(
+            "CREATE TABLE IF NOT EXISTS idempotency_keys (
+                key TEXT PRIMARY KEY,
+                params_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+        )?;
+        transaction.execute_compat(
+            "DELETE FROM idempotency_keys WHERE expires_at <= ?1",
+            crate::franken_sync::params![now_ms],
+        )?;
+        transaction.execute_compat(
+            "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            crate::franken_sync::params![key, hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+        )?;
+        transaction.commit()
+    })?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -108510,7 +108743,6 @@ fn run_index_with_data(
     mut captured_result: Option<&mut Option<serde_json::Value>>,
     mirror_source_ids: Option<Vec<String>>,
 ) -> CliResult<()> {
-    use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
     if background {
@@ -108593,42 +108825,10 @@ fn run_index_with_data(
 
     // Check for cached idempotency result
     if let Some(key) = &idempotency_key {
-        let cached = with_frankensqlite_connection(
-            &db_path,
-            "checking index idempotency cache",
-            |conn| {
-                if let Err(e) = conn.execute(
-                    "CREATE TABLE IF NOT EXISTS idempotency_keys (
-                        key TEXT PRIMARY KEY,
-                        params_hash TEXT NOT NULL,
-                        result_json TEXT NOT NULL,
-                        created_at INTEGER NOT NULL,
-                        expires_at INTEGER NOT NULL
-                    )",
-                ) {
-                    tracing::warn!("Failed to create idempotency_keys table: {e}");
-                }
+        let cached =
+            read_index_idempotency_cache(&db_path, key, chrono::Utc::now().timestamp_millis());
 
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                if let Err(e) = conn.execute_compat(
-                    "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-                    crate::franken_sync::params![now_ms],
-                ) {
-                    tracing::warn!("Failed to clean expired idempotency keys: {e}");
-                }
-
-                let cached: Option<(String, String)> = conn
-                    .query_row_map(
-                        "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                        crate::franken_sync::params![key.as_str(), now_ms],
-                        |r: &crate::franken_sync::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
-                    )
-                    .ok();
-                Ok(cached)
-            },
-        );
-
-        if let Ok(Some((stored_hash, result_json))) = cached {
+        if let Some((stored_hash, result_json)) = cached {
             if stored_hash == params_hash.to_string() {
                 // A syntactically valid scalar or array is not an index result.
                 // Treat damaged cache entries as misses in every output mode.
@@ -109393,34 +109593,17 @@ fn run_index_with_data(
             payload["idempotency_key"] = serde_json::json!(key);
             payload["cached"] = serde_json::json!(false);
 
-            if let Err(e) = with_frankensqlite_connection(
+            if let Err(e) = store_index_idempotency_result(
+                &data_dir,
                 &db_path,
-                "storing index idempotency result",
-                |conn| {
-                    // On a first run the data directory may not exist when
-                    // cache lookup runs. Indexing creates it, so initialize
-                    // the cache here as well before persisting the result.
-                    conn.execute(
-                        "CREATE TABLE IF NOT EXISTS idempotency_keys (
-                            key TEXT PRIMARY KEY,
-                            params_hash TEXT NOT NULL,
-                            result_json TEXT NOT NULL,
-                            created_at INTEGER NOT NULL,
-                            expires_at INTEGER NOT NULL
-                        )",
-                    )?;
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
-                    let result_json = serde_json::to_string(&payload).unwrap_or_default();
-                    let hash_str = params_hash.to_string();
-                    conn.execute_compat(
-                        "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        crate::franken_sync::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
-                    )?;
-                    Ok(())
-                },
+                key,
+                params_hash,
+                &payload,
+                chrono::Utc::now().timestamp_millis(),
             ) {
-                tracing::warn!("Failed to store idempotency key: {e}");
+                // Persistence is best-effort, including typed index-busy when
+                // a new writer starts after the completed indexing worker.
+                tracing::warn!("Failed to store idempotency key: {e:#}");
             }
         }
 
@@ -123335,23 +123518,26 @@ fn run_models_build_hnsw(
     } else {
         let db_path = data_dir.join("agent_search.db");
         Some(
-            crate::indexer::acquire_semantic_backfill_lock(&data_dir, &db_path).map_err(
-                |error| {
-                    let rendered = format!("{error:#}");
-                    if error_chain_indicates_active_cass_index(&rendered) {
-                        return active_index_run_details(&data_dir, &db_path)
-                            .map(|details| details.to_cli_error())
-                            .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
-                    }
-                    CliError {
-                        code: 5,
-                        kind: CliErrorKind::Storage.kind_str(),
-                        message: format!("Failed to acquire HNSW maintenance lock: {rendered}"),
-                        hint: Some("Check permissions under the cass data directory".into()),
-                        retryable: true,
-                    }
-                },
-            )?,
+            crate::indexer::acquire_search_asset_mutation_lock(
+                &data_dir,
+                &db_path,
+                crate::search::asset_state::SearchMaintenanceJobKind::SemanticRebuild,
+            )
+            .map_err(|error| {
+                let rendered = format!("{error:#}");
+                if error_chain_indicates_active_cass_index(&rendered) {
+                    return active_index_run_details(&data_dir, &db_path)
+                        .map(|details| details.to_cli_error())
+                        .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
+                }
+                CliError {
+                    code: 5,
+                    kind: CliErrorKind::Storage.kind_str(),
+                    message: format!("Failed to acquire HNSW maintenance lock: {rendered}"),
+                    hint: Some("Check permissions under the cass data directory".into()),
+                    retryable: true,
+                }
+            })?,
         )
     };
     let mut manifest = SemanticManifest::load(&data_dir)

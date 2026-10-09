@@ -8250,16 +8250,12 @@ fn doctor_reports_oversized_wal_sidecar_without_touching_it() {
     );
 }
 
-/// GH #382 / g3zyo: `doctor --fix` must not hang forever on an archive whose
-/// writable open loops (the owner's 10 GB archive with a 200 MB WAL did
-/// exactly that). Positive observable: with the checkpoint parked past a
-/// 1 s deadline the `archive_wal` check comes back `fail` naming the deadline,
-/// GH #382 and the stock-sqlite remedy, `fix_applied` stays false, the
-/// sidecar is untouched, and the whole command returns in seconds. Planted
-/// negative: the same fixture with the park removed is covered by the
-/// read-only test above (a sparse WAL is not valid content, so the real
-/// checkpoint path is not exercised here). No-claim: this proves the bound,
-/// not that frankensqlite's open no longer loops.
+/// GH #382 / #515: doctor cannot return a checkpoint failure report while
+/// its timed-out writer keeps running after the repair guard is released.
+/// A non-cancellable checkpoint now ends the owning process with exit 70 at
+/// the same deadline. The explicit stderr receipt replaces the old partial
+/// stdout report; a separate unparked repair must recover and checkpoint the
+/// preserved archive successfully.
 #[test]
 fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -8267,16 +8263,53 @@ fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
     let data_dir = test_home.join("cass-data");
     seed_healthy_empty_index(test_home, &data_dir);
 
+    let db_path = data_dir.join("agent_search.db");
     let wal_path = data_dir.join("agent_search.db-wal");
-    let oversized: u64 = 65 * 1024 * 1024;
-    let wal = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&wal_path)
-        .expect("open wal sidecar");
-    wal.set_len(oversized).expect("grow wal sidecar");
-    drop(wal);
+    // Produce real committed WAL frames, not sparse padding: the unparked
+    // retry below must recover and checkpoint this exact database. Rewriting
+    // one small scratch row grows the WAL without populating the canonical
+    // corpus or making the main database large.
+    let fixture = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+        .expect("open checkpoint fixture");
+    fixture
+        .execute("PRAGMA wal_autocheckpoint = 0")
+        .expect("retain every committed fixture frame");
+    fixture
+        .execute(
+            "CREATE TABLE wal_checkpoint_probe(
+                id INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            )",
+        )
+        .expect("create checkpoint probe");
+    fixture
+        .execute("INSERT INTO wal_checkpoint_probe VALUES (1, -1, '')")
+        .expect("seed checkpoint probe");
+    let mut expected_generation = -1_i64;
+    let mut expected_payload = String::new();
+    for generation in 0_i64..512 {
+        let payload = if generation % 2 == 0 { "a" } else { "b" }.repeat(256 * 1024);
+        fixture
+            .execute_compat(
+                "UPDATE wal_checkpoint_probe SET generation = ?1, payload = ?2 WHERE id = 1",
+                coding_agent_search::franken_sync::params![generation, payload.as_str()],
+            )
+            .expect("commit another generation of real WAL frames");
+        expected_generation = generation;
+        expected_payload = payload;
+        if fs::metadata(&wal_path).expect("fixture WAL metadata").len() >= 65 * 1024 * 1024 {
+            break;
+        }
+    }
+    fixture
+        .close_without_checkpoint()
+        .expect("close fixture while preserving its committed WAL");
+    let oversized = fs::metadata(&wal_path).expect("fixture WAL metadata").len();
+    assert!(
+        oversized >= 65 * 1024 * 1024,
+        "bounded fixture writes must cross the real 64 MiB doctor threshold: {oversized} bytes"
+    );
 
     let started = std::time::Instant::now();
     let out = cass_cmd(test_home)
@@ -8292,29 +8325,31 @@ fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
         .output()
         .expect("run cass doctor --fix --json");
     let elapsed = started.elapsed();
-    let payload: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
-        panic!(
-            "doctor json: {err}\nstdout={}\nstderr={}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        )
-    });
-    let check = payload["checks"]
-        .as_array()
-        .expect("checks")
-        .iter()
-        .find(|check| check["name"].as_str() == Some("archive_wal"))
-        .cloned()
-        .expect("archive_wal check present");
-
-    assert_eq!(check["status"].as_str(), Some("fail"), "{check}");
-    assert_eq!(check["fix_applied"].as_bool(), Some(false), "{check}");
-    let message = check["message"].as_str().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(70),
+        "doctor must terminate its checkpoint owner at the deadline; stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let timeout = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|value| value["kind"] == "wal-checkpoint-timeout")
+        .unwrap_or_else(|| panic!("no checkpoint-timeout envelope on stderr:\n{stderr}"));
+    assert_eq!(timeout["success"], false, "{timeout}");
+    assert_eq!(timeout["code"], 70, "{timeout}");
+    assert_eq!(timeout["retryable"], true, "{timeout}");
+    assert_eq!(timeout["context"], "doctor --fix", "{timeout}");
+    assert_eq!(timeout["deadline_ms"], 1_000, "{timeout}");
     assert!(
-        message.contains("did not complete within 1 s")
-            && message.contains("GH #382")
-            && message.contains("wal_checkpoint(TRUNCATE)"),
-        "the failure must name the deadline, the issue and the remedy: {message}"
+        test_paths_equivalent(timeout["db_path"].as_str().unwrap(), &db_path),
+        "{timeout}"
+    );
+    let message = timeout["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.is_empty(),
+        "the failure must explain why its owning process terminated: {timeout}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(15),
@@ -8326,6 +8361,71 @@ fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
         oversized,
         "a timed-out checkpoint must leave the sidecar as it found it"
     );
+
+    let recovered = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--fix",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("retry doctor without the parked checkpoint");
+    let payload: Value = serde_json::from_slice(&recovered.stdout).unwrap_or_else(|error| {
+        panic!(
+            "doctor recovery json: {error}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&recovered.stdout),
+            String::from_utf8_lossy(&recovered.stderr)
+        )
+    });
+    let check = payload["checks"]
+        .as_array()
+        .expect("recovery checks")
+        .iter()
+        .find(|check| check["name"] == "archive_wal")
+        .expect("archive_wal recovery check");
+    assert_eq!(check["status"], "pass", "{check}");
+    assert_eq!(check["fix_applied"], true, "{check}");
+    assert!(
+        fs::metadata(&wal_path).map_or(0, |metadata| metadata.len()) <= 32,
+        "the admitted retry must checkpoint the preserved WAL"
+    );
+    use coding_agent_search::franken_sync::compat::{OpenFlags, open_with_flags};
+    let connection = open_with_flags(&db_path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("read the recovered canonical archive strictly read-only");
+    for row in connection.query("PRAGMA integrity_check").unwrap() {
+        assert_eq!(row.get_typed::<String>(0).unwrap(), "ok");
+    }
+    assert!(
+        connection
+            .query("PRAGMA foreign_key_check")
+            .unwrap()
+            .is_empty()
+    );
+    for table in ["conversations", "messages"] {
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"))
+                .unwrap()
+                .get_typed::<i64>(0)
+                .unwrap(),
+            0,
+            "checkpoint recovery must preserve the seeded empty archive"
+        );
+    }
+    let rows = connection
+        .query("SELECT id, generation, payload FROM wal_checkpoint_probe")
+        .expect("read the committed checkpoint sentinel after recovery");
+    assert_eq!(
+        rows.len(),
+        1,
+        "recovery must retain exactly one scratch row"
+    );
+    assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 1);
+    assert_eq!(rows[0].get_typed::<i64>(1).unwrap(), expected_generation);
+    assert_eq!(rows[0].get_typed::<String>(2).unwrap(), expected_payload);
+    connection.close_without_checkpoint().unwrap();
 }
 
 /// GH #497: a deferred deep page-integrity probe cannot certify health.

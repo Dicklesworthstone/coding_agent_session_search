@@ -4122,16 +4122,13 @@ fn gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats() {
     );
 }
 
-/// GH #382 / g3zyo: the index run's final `wal_checkpoint(TRUNCATE)` is bounded.
-/// On an archive whose frankensqlite writable path loops, that checkpoint never
-/// returned and every run hung after a successful publish. Positive observable:
-/// with the checkpoint parked past a 1 s budget the run still exits 0 within
-/// seconds and leaves the WAL sidecar in place (non-empty) for the next opener;
-/// a plain `cass index` afterwards, unparked, truncates it. Planted negative:
-/// the unparked run truncating the sidecar is what proves the parked run really
-/// skipped the checkpoint rather than never issuing one. No-claim: this proves
-/// the bound, not that the engine no longer loops (that is frankensqlite
-/// 8d012706a, consumed with its release).
+/// GH #382 / #515: final checkpoint timeout must end the process that still
+/// owns the writable operation. Returning success used to detach its thread
+/// and release maintenance admission while that writer could continue. The
+/// same 1 s budget now exits 70 with a checkpoint-timeout diagnostic; durable
+/// messages remain intact and a separate unparked index can recover immediately.
+/// This deliberately changes the old timeout-success contract. A successful
+/// checkpoint still exits 0 and truncates the WAL as before.
 #[test]
 fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let tmp = TempDir::new().unwrap();
@@ -4139,6 +4136,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     seed_fts_liveness_sessions(home);
+    let db_path = data_dir.join("agent_search.db");
     let wal_path = data_dir.join("agent_search.db-wal");
 
     let started = std::time::Instant::now();
@@ -4153,6 +4151,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
         ])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Discrimination by wall clock: a full run of this fixture takes up
         // to ~30 s on a loaded debug-build fleet worker, so the park is 60 s
         // against a 1 s budget — a run that waited for the parked checkpoint
@@ -4165,12 +4164,62 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let elapsed = started.elapsed();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "a final checkpoint that outlives its budget must not fail the run (GH #382); \
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "a timed-out checkpoint must terminate its writer before releasing admission; \
          status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
+    let timeout = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|value| value["kind"] == "wal-checkpoint-timeout")
+        .unwrap_or_else(|| panic!("no checkpoint-timeout envelope on stderr:\n{stderr}"));
+    assert_eq!(timeout["success"], false, "{timeout}");
+    assert_eq!(timeout["code"], 70, "{timeout}");
+    assert_eq!(timeout["retryable"], true, "{timeout}");
+    assert_eq!(timeout["context"], "index run", "{timeout}");
+    assert_eq!(timeout["deadline_ms"], 1_000, "{timeout}");
+    assert!(
+        !coding_agent_search::search::asset_state::read_search_maintenance_snapshot(&data_dir)
+            .active,
+        "a reaped checkpoint owner must not retain active indexing admission"
+    );
+    let archive_contents = || {
+        use coding_agent_search::franken_sync::compat::{
+            ConnectionExt, OpenFlags, RowExt, open_with_flags,
+        };
+
+        let connection =
+            open_with_flags(&db_path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("strictly read the durable archive after checkpoint process exit");
+        let messages = connection
+            .query_map_collect(
+                "SELECT content FROM messages ORDER BY content",
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .expect("canonical messages");
+        for row in connection.query("PRAGMA integrity_check").unwrap() {
+            assert_eq!(row.get_typed::<String>(0).unwrap(), "ok");
+        }
+        assert!(
+            connection
+                .query("PRAGMA foreign_key_check")
+                .unwrap()
+                .is_empty()
+        );
+        connection.close_without_checkpoint().unwrap();
+        messages
+    };
+    let expected_messages = [
+        "fts liveness alpha",
+        "fts liveness alpha_response",
+        "fts liveness beta",
+        "fts liveness beta_response",
+    ];
+    assert_eq!(archive_contents(), expected_messages);
     let parked_elapsed = elapsed;
     // A WAL that still carries frames is larger than its 32-byte header; a
     // truncated one (frankensqlite keeps the header on TRUNCATE) is exactly 32.
@@ -4178,7 +4227,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let wal_bytes_after_parked_run = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
     assert!(
         wal_bytes_after_parked_run > WAL_HEADER_BYTES,
-        "the skipped checkpoint must leave the WAL frames for the next opener; \
+        "the interrupted checkpoint must leave the WAL frames for the next opener; \
          wal_bytes={wal_bytes_after_parked_run}\nstderr={stderr}"
     );
 
@@ -4188,6 +4237,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
         .args(["index", "--json", "--no-progress-events", "--data-dir"])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .output()
         .expect("run a plain cass index without the park");
     let plain_elapsed = started.elapsed();
@@ -4195,6 +4245,12 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
         output.status.success(),
         "the next plain run must succeed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(archive_contents(), expected_messages);
+    assert!(
+        fs::read(data_dir.join("index-run.lock"))
+            .unwrap()
+            .is_empty()
     );
     // The bound, measured against the same worker's load: a run that waited
     // for the 60 s park would take at least the plain run plus 60 s; a

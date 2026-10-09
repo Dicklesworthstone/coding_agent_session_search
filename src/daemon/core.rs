@@ -517,7 +517,10 @@ impl ModelDaemon {
         if current.is_some() || self.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        let (worker, handle) = EmbeddingWorker::new();
+        let (mut worker, handle) = EmbeddingWorker::new();
+        if let Some(data_dir) = &self.config.data_dir {
+            worker.set_data_dir(data_dir.clone());
+        }
         match std::thread::Builder::new()
             .name("embedding-worker".into())
             .spawn(move || worker.run())

@@ -365,8 +365,8 @@ fn real_daemon_repairs_stored_zero_signal_instead_of_reporting_unchanged() -> an
 }
 
 #[test]
-fn real_daemon_unchanged_pass_keeps_the_original_generation_with_a_live_reader() -> anyhow::Result<()>
-{
+fn real_daemon_unchanged_pass_keeps_the_original_generation_with_a_live_reader()
+-> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let db = temp.path().join("archive.db");
     let directory = temp.path().join("semantic");

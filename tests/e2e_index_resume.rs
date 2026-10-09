@@ -86,7 +86,7 @@ fn source_observations(log: &str) -> Vec<bool> {
         .collect()
 }
 
-fn verify_completed_summary(output: &[u8], conversations: usize) {
+fn verify_completed_summary(output: &[u8], conversations: usize, sources: usize) {
     let summary: Value = serde_json::from_slice(output).expect("completed index JSON");
     assert_eq!(summary["success"], true, "{summary}");
     assert_eq!(summary["conversations"], conversations, "{summary}");
@@ -100,8 +100,10 @@ fn verify_completed_summary(output: &[u8], conversations: usize) {
         conversations * 32,
         "{summary}"
     );
+    // Source outcomes include unchanged ledger-reused sources, while the
+    // conversation and message counters above describe this scan's delta.
     assert_eq!(
-        summary["indexing_stats"]["connector_summary"]["claude"]["indexed"], conversations,
+        summary["indexing_stats"]["connector_summary"]["claude"]["indexed"], sources,
         "{summary}"
     );
 }
@@ -196,7 +198,7 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
                 .get_output()
                 .stdout
                 .clone();
-        verify_completed_summary(&resumed, if reusable { 6 } else { 8 });
+        verify_completed_summary(&resumed, if reusable { 6 } else { 8 }, 8);
         let log = fs::read_to_string(&resumed_trace).unwrap();
         let observations = source_observations(&log);
         assert_eq!(
@@ -267,7 +269,7 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
                 .get_output()
                 .stdout
                 .clone();
-        verify_completed_summary(&upgraded, if reusable { 2 } else { 8 });
+        verify_completed_summary(&upgraded, if reusable { 2 } else { 8 }, 8);
         let log = fs::read_to_string(&upgraded_trace).unwrap();
         let observations = source_observations(&log);
         for (skipped, expected) in [
@@ -304,7 +306,7 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
                 .get_output()
                 .stdout
                 .clone();
-        verify_completed_summary(&replay, if reusable { 1 } else { 8 });
+        verify_completed_summary(&replay, if reusable { 1 } else { 8 }, 8);
         let log = fs::read_to_string(&replay_trace).unwrap();
         let observations = source_observations(&log);
         assert_eq!(

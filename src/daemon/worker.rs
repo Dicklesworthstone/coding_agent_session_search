@@ -8,15 +8,17 @@ mod existing_index;
 mod work_queue;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
 use self::embedding_source::{EmbeddingMessageSource, SqliteEmbeddingSource};
 use self::existing_index::ExistingIndexState;
 use self::work_queue::{JobControl, Receiver, Sender};
+use crate::franken_sync::CancellationHandle;
 use crate::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
     saturating_u32_from_i64, semantic_doc_id_for_input,
@@ -32,6 +34,13 @@ const DEFAULT_SEMANTIC_MODEL: &str = "minilm";
 
 /// Maximum passages retained for one embedding/progress checkpoint.
 const EMBED_PROGRESS_CHUNK_SIZE: usize = 128;
+const MAINTENANCE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerOperationOutcome {
+    Completed,
+    Deferred,
+}
 
 /// How an embedding pass ended: normally, or via a user cancel (which must be
 /// recorded as cancelled, not failed).
@@ -110,6 +119,7 @@ pub struct EmbeddingWorkerHandle {
     sender: Sender,
     cancel_flag: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    shutdown_cancellation: CancellationHandle,
 }
 
 impl EmbeddingWorkerHandle {
@@ -131,11 +141,12 @@ impl EmbeddingWorkerHandle {
     }
 
     /// Request cooperative shutdown immediately, not after queued jobs finish.
-    /// An in-flight engine operation or embedding batch finishes before its
-    /// next cancellation checkpoint; this does not forcibly kill the thread.
+    /// Engine operations drain through cancellation and embedding batches finish
+    /// before their next checkpoint; this does not forcibly kill the thread.
     pub fn shutdown(&self) -> Result<(), String> {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.cancel_flag.store(true, Ordering::SeqCst);
+        self.shutdown_cancellation.cancel();
         self.sender.send(WorkerMessage::Shutdown)
     }
 }
@@ -145,8 +156,10 @@ pub struct EmbeddingWorker {
     receiver: Receiver,
     cancel_flag: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    shutdown_cancellation: CancellationHandle,
     running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
     active_control: Mutex<Option<JobControl>>,
+    maintenance_data_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,20 +235,50 @@ impl EmbeddingWorker {
         let (sender, receiver) = work_queue::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_cancellation = CancellationHandle::default();
         let running_pass = Arc::new(Mutex::new(None));
         let handle = EmbeddingWorkerHandle {
             sender,
             cancel_flag: Arc::clone(&cancel_flag),
             shutdown_requested: Arc::clone(&shutdown_requested),
+            shutdown_cancellation: shutdown_cancellation.clone(),
         };
         let worker = Self {
             receiver,
             cancel_flag,
             shutdown_requested,
+            shutdown_cancellation,
             running_pass,
             active_control: Mutex::new(None),
+            maintenance_data_dir: None,
         };
         (worker, handle)
+    }
+
+    /// The daemon endpoint belongs to this data directory, including when
+    /// its archive is supplied through a custom --db path outside it.
+    pub(crate) fn set_data_dir(&mut self, data_dir: PathBuf) {
+        self.maintenance_data_dir = Some(data_dir);
+    }
+
+    fn try_acquire_archive_mutation(
+        &self,
+        db_path: &Path,
+    ) -> anyhow::Result<Option<crate::indexer::SearchMaintenanceMutationGuard>> {
+        match std::fs::metadata(db_path) {
+            Ok(metadata) if !metadata.is_file() => {
+                anyhow::bail!("embedding archive target is not a regular file");
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
+        // Match the CLI's explicit data-dir / custom --db resolution exactly,
+        // including relative archive paths used by standalone worker callers.
+        let data_dir =
+            crate::resolve_data_dir(&self.maintenance_data_dir, Some(&db_path.to_path_buf()));
+        crate::indexer::try_acquire_semantic_backfill_lock(&data_dir, db_path)
     }
 
     fn is_stopping(&self) -> bool {
@@ -258,6 +301,30 @@ impl EmbeddingWorker {
             .lock()
             .map(|control| control.as_ref().is_some_and(JobControl::all_cancelled))
             .unwrap_or(true)
+    }
+
+    fn preparation_cancellation(&self) -> anyhow::Result<CancellationHandle> {
+        let control = self
+            .active_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("embedding worker state lock poisoned"))?;
+        Ok(control
+            .as_ref()
+            .map(JobControl::preparation_cancellation)
+            .unwrap_or_else(|| self.shutdown_cancellation.clone()))
+    }
+
+    fn model_cancellation(&self, model: &str) -> anyhow::Result<CancellationHandle> {
+        let control = self
+            .active_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("embedding worker state lock poisoned"))?;
+        match control.as_ref() {
+            Some(control) => control.model_cancellation(model).ok_or_else(|| {
+                anyhow::anyhow!("embedding pass has no matching cancellation owner")
+            }),
+            None => Ok(self.shutdown_cancellation.clone()),
+        }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -288,39 +355,70 @@ impl EmbeddingWorker {
     /// Run the worker loop (blocking). Call from a spawned thread.
     pub fn run(self) {
         info!("Embedding worker started");
-        while let Ok((msg, permit)) = self.receiver.recv() {
+        while let Ok((msg, mut permit)) = self.receiver.recv() {
             if self.shutdown_requested.load(Ordering::SeqCst) {
                 break;
             }
             match msg {
                 WorkerMessage::Submit(config) => {
-                    let Some(permit) = permit.as_ref() else {
+                    let Some(job_permit) = permit.as_ref() else {
                         error!("embedding submission has no job ownership permit");
                         break;
                     };
                     match self.active_control.lock() {
-                        Ok(mut control) => *control = Some(permit.control()),
+                        Ok(mut control) => *control = Some(job_permit.control()),
                         Err(_) => {
                             error!("embedding worker state lock poisoned");
                             break;
                         }
                     }
                     self.cancel_flag.store(false, Ordering::SeqCst);
-                    info!(db_path = %config.db_path, two_tier = config.two_tier, "Processing embedding job");
-                    if let Err(e) = self.process_job(&config) {
-                        error!(db_path = %config.db_path, error = %e, "Embedding job failed");
-                    }
+                    let result = self.process_job(&config);
                     match self.active_control.lock() {
                         Ok(mut control) => *control = None,
                         Err(_) => break,
+                    }
+                    match result {
+                        Ok(WorkerOperationOutcome::Completed) => {}
+                        Ok(WorkerOperationOutcome::Deferred) => {
+                            debug!(db_path = %config.db_path, "Deferring embedding job behind active archive maintenance");
+                            let Some(permit) = permit.take() else {
+                                error!("deferred embedding job has no ownership permit");
+                                break;
+                            };
+                            if let Err(error) = self.receiver.defer_job(
+                                config,
+                                permit,
+                                MAINTENANCE_LOCK_RETRY_DELAY,
+                            ) {
+                                error!(%error, "Failed to retain deferred embedding job");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!(db_path = %config.db_path, error = %e, "Embedding job failed");
+                        }
                     }
                 }
                 WorkerMessage::Cancel { db_path, model_id } => {
                     // The queue already cancelled in-memory ownership. Process
                     // durable cleanup before any newer submission can start.
-                    info!(%db_path, ?model_id, "Processing embedding cancellation cleanup");
-                    if let Err(e) = Self::cancel_in_db(&db_path, model_id.as_deref()) {
-                        warn!(%db_path, error = %e, "Failed to cancel jobs in database");
+                    match self.cancel_in_db(&db_path, model_id.as_deref()) {
+                        Ok(WorkerOperationOutcome::Completed) => {}
+                        Ok(WorkerOperationOutcome::Deferred) => {
+                            debug!(%db_path, "Deferring embedding cancellation behind active archive maintenance");
+                            if let Err(error) = self.receiver.defer_cancel(
+                                db_path,
+                                model_id,
+                                MAINTENANCE_LOCK_RETRY_DELAY,
+                            ) {
+                                error!(%error, "Failed to retain deferred embedding cancellation");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%db_path, error = %e, "Failed to cancel jobs in database");
+                        }
                     }
                 }
                 WorkerMessage::Shutdown => {
@@ -333,23 +431,47 @@ impl EmbeddingWorker {
     }
 
     /// Cancel persisted jobs without creating an archive for an absent target.
-    fn cancel_in_db(db_path: &str, model_id: Option<&str>) -> anyhow::Result<()> {
+    fn cancel_in_db(
+        &self,
+        db_path: &str,
+        model_id: Option<&str>,
+    ) -> anyhow::Result<WorkerOperationOutcome> {
         match std::fs::metadata(db_path) {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => anyhow::bail!("embedding cancellation target is not a regular file"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WorkerOperationOutcome::Completed);
+            }
             Err(error) => return Err(error.into()),
         }
-        let storage = FrankenStorage::open(Path::new(db_path))?;
+        let Some(maintenance) = self.try_acquire_archive_mutation(Path::new(db_path))? else {
+            return Ok(WorkerOperationOutcome::Deferred);
+        };
+        info!(%db_path, ?model_id, "Processing embedding cancellation cleanup");
+        let opened = {
+            let _scope = self.shutdown_cancellation.enter();
+            FrankenStorage::open(Path::new(db_path))
+        };
+        let storage = match opened {
+            Ok(storage) => storage,
+            Err(error) if self.is_stopping() => {
+                debug!(%error, "Embedding cleanup preparation stopped after storage drained");
+                return Ok(WorkerOperationOutcome::Completed);
+            }
+            Err(error) => return Err(error),
+        };
+        // Durable terminal status is cleanup. Its write must not inherit the
+        // cancelled operation context that just drained preparation.
         storage.cancel_embedding_jobs(db_path, model_id)?;
-        Ok(())
+        maintenance.mark_progress();
+        Ok(WorkerOperationOutcome::Completed)
     }
 
     /// Process a single embedding job. A model-specific cancellation skips only
     /// that pass, including a future tier of a currently active two-tier job.
-    fn process_job(&self, config: &EmbeddingJobConfig) -> anyhow::Result<()> {
+    fn process_job(&self, config: &EmbeddingJobConfig) -> anyhow::Result<WorkerOperationOutcome> {
         if self.is_stopping() || self.all_passes_cancelled() {
-            return Ok(());
+            return Ok(WorkerOperationOutcome::Completed);
         }
         let db_path = Path::new(&config.db_path);
         let index_path = Path::new(&config.index_path);
@@ -358,18 +480,44 @@ impl EmbeddingWorker {
             .iter()
             .find(|(model, _)| !self.pass_was_cancelled(model))
         else {
-            return Ok(());
+            return Ok(WorkerOperationOutcome::Completed);
         };
         self.set_running_pass(&config.db_path, first_model)?;
         let _running_reset = RunningPassReset(&self.running_pass);
         if self.is_stopping() || self.all_passes_cancelled() {
-            return Ok(());
+            return Ok(WorkerOperationOutcome::Completed);
         }
-        let storage = FrankenStorage::open(db_path)?;
-        if self.is_stopping() || self.all_passes_cancelled() {
-            return Ok(());
-        }
-        let messages = SqliteEmbeddingSource::open(db_path)?;
+        // Own the same operation-scoped lock as cass index/doctor BEFORE
+        // migrations, the pinned read snapshot, job writes or vector reads.
+        // The snapshot and writer are declared afterwards so both close before
+        // this guard stops its heartbeat and releases the authoritative lock.
+        let Some(maintenance) = self.try_acquire_archive_mutation(db_path)? else {
+            return Ok(WorkerOperationOutcome::Deferred);
+        };
+        info!(db_path = %config.db_path, two_tier = config.two_tier, "Processing embedding job");
+        let preparation_cancellation = self.preparation_cancellation()?;
+        let prepared = {
+            let _scope = preparation_cancellation.enter();
+            (|| -> anyhow::Result<_> {
+                let storage = FrankenStorage::open(db_path)?;
+                maintenance.mark_progress();
+                if self.is_stopping() || self.all_passes_cancelled() {
+                    return Ok(None);
+                }
+                let messages = SqliteEmbeddingSource::open(db_path)?;
+                maintenance.mark_progress();
+                Ok(Some((storage, messages)))
+            })()
+        };
+        let (storage, messages) = match prepared {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(WorkerOperationOutcome::Completed),
+            Err(error) if self.is_stopping() || self.all_passes_cancelled() => {
+                debug!(%error, "Embedding preparation cancelled after storage drained");
+                return Ok(WorkerOperationOutcome::Completed);
+            }
+            Err(error) => return Err(error),
+        };
         let total_docs = saturating_i64_from_usize(messages.total_docs());
         info!(
             db_path = %config.db_path,
@@ -380,25 +528,60 @@ impl EmbeddingWorker {
 
         for (model_name, use_semantic) in &passes {
             if self.is_stopping() {
-                return Ok(());
+                return Ok(WorkerOperationOutcome::Completed);
             }
             self.set_running_pass(&config.db_path, model_name)?;
             if self.pass_was_cancelled(model_name) {
                 info!(model = model_name, "Skipping cancelled embedding pass");
                 continue;
             }
-            let job_id = storage.upsert_embedding_job(&config.db_path, model_name, total_docs)?;
-            storage.start_embedding_job(job_id)?;
-            let pass_result = self.generate_embeddings_from_source(
-                &storage,
-                &messages,
-                model_name,
-                *use_semantic,
-                job_id,
-                index_path,
-                db_path,
-                &mut |_| {},
-            );
+            let cancellation = self.model_cancellation(model_name)?;
+            let started = {
+                let _scope = cancellation.enter();
+                (|| -> anyhow::Result<_> {
+                    let job_id =
+                        storage.upsert_embedding_job(&config.db_path, model_name, total_docs)?;
+                    storage.start_embedding_job(job_id)?;
+                    Ok(job_id)
+                })()
+            };
+            let job_id = match started {
+                Ok(job_id) => job_id,
+                Err(error) if self.is_cancelled() => {
+                    debug!(model = model_name, %error, "Embedding pass start cancelled after storage drained");
+                    storage.cancel_embedding_jobs(&config.db_path, Some(model_name))?;
+                    maintenance.mark_progress();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            maintenance.mark_progress();
+            let pass_result = {
+                let _scope = cancellation.enter();
+                (|| {
+                    #[cfg(debug_assertions)]
+                    self.pause_open_snapshot_for_test(db_path, job_id)?;
+                    self.generate_embeddings_from_source(
+                        &storage,
+                        &messages,
+                        model_name,
+                        *use_semantic,
+                        job_id,
+                        index_path,
+                        db_path,
+                        &mut |_| maintenance.mark_progress(),
+                    )
+                })()
+            };
+            // The engine operation has fully drained and its cancellation
+            // scope has ended before any durable terminal-status update.
+            let pass_result = match pass_result {
+                Err(error) if self.is_cancelled() => {
+                    debug!(model = model_name, %error, "Embedding pass cancelled after storage drained");
+                    Ok(EmbeddingPassOutcome::Cancelled)
+                }
+                result => result,
+            };
             match pass_result {
                 Ok(EmbeddingPassOutcome::Completed) => {
                     storage.complete_embedding_job(job_id)?;
@@ -416,6 +599,36 @@ impl EmbeddingWorker {
                     warn!(model = model_name, error = %e, "Embedding pass failed");
                 }
             }
+            maintenance.mark_progress();
+        }
+        Ok(WorkerOperationOutcome::Completed)
+    }
+
+    /// Process-regression rendezvous AFTER a real snapshot and job write. The
+    /// controller can now test exclusion/cancellation without a race against a
+    /// small fixture finishing. Release builds have no hook or wait path.
+    #[cfg(debug_assertions)]
+    fn pause_open_snapshot_for_test(&self, db_path: &Path, job_id: i64) -> anyhow::Result<()> {
+        let Ok(ready_path) = dotenvy::var("CASS_TEST_EMBEDDING_SNAPSHOT_READY") else {
+            return Ok(());
+        };
+        let release_path = dotenvy::var("CASS_TEST_EMBEDDING_SNAPSHOT_RELEASE").map_err(|_| {
+            anyhow::anyhow!("embedding snapshot rendezvous requires a release path")
+        })?;
+        std::fs::write(
+            ready_path,
+            serde_json::to_vec(&serde_json::json!({
+                "pid": std::process::id(),
+                "db_path": db_path,
+                "job_id": job_id,
+            }))?,
+        )?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !Path::new(&release_path).exists() && !self.is_cancelled() {
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("embedding snapshot rendezvous was not released within 60 seconds");
+            }
+            std::thread::park_timeout(Duration::from_millis(10));
         }
         Ok(())
     }
@@ -491,7 +704,8 @@ impl EmbeddingWorker {
             return Ok(EmbeddingPassOutcome::Cancelled);
         }
         let embedder_kind = resolve_embedder_kind(model_name, use_semantic)?;
-        let Some(existing_state) = ExistingIndexState::open(index_path, &embedder_kind, &cancelled)?
+        let Some(existing_state) =
+            ExistingIndexState::open(index_path, &embedder_kind, &cancelled)?
         else {
             return Ok(EmbeddingPassOutcome::Cancelled);
         };

@@ -1,4 +1,6 @@
+mod archive_lease;
 pub mod background_refresh;
+mod checkpoint_deadline;
 pub(crate) mod lexical_generation;
 mod lexical_publish;
 pub mod lexical_reconcile;
@@ -1193,6 +1195,10 @@ pub(crate) const INDEX_PHASE_ANALYTICS_REBUILD: usize = 10;
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
     pub stop_requested: AtomicBool,
+    /// Cancellation of an admitted preparation query is relayed to the
+    /// engine's operation context. Its owner still drains the query and
+    /// rollback before releasing storage or the index-run lock.
+    storage_cancellation: crate::franken_sync::CancellationHandle,
     pub total: AtomicUsize,
     pub current: AtomicUsize,
     /// #332: monotonic work-liveness tick. Producer threads bump it once per
@@ -1348,6 +1354,7 @@ pub(crate) struct ConnectorScanFailure(#[source] anyhow::Error);
 impl IndexingProgress {
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
+        self.storage_cancellation.cancel();
     }
 
     pub fn stop_requested(&self) -> bool {
@@ -3035,15 +3042,79 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && opts.db_path.exists()
 }
 
+enum ReadonlyRebuildBoundary {
+    Rebuild,
+    ArchiveWrite,
+}
+
+/// Only these typed failures identify derived state that the ordinary reader
+/// is allowed to repair. In particular, a malformed archive must still fail a
+/// search-triggered probe before it creates maintenance artifacts (GH #436).
+fn readonly_rebuild_needs_archive_recovery(db_path: &Path, error: &anyhow::Error) -> bool {
+    use crate::franken_sync::FrankenError;
+
+    let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<FrankenError>())
+    else {
+        return false;
+    };
+    match error {
+        FrankenError::BusyRecovery => true,
+        FrankenError::DatabaseCorrupt { detail } => {
+            detail.contains("conflicting virtual-table entries") && detail.contains("fts_messages")
+        }
+        FrankenError::CannotOpen { .. } => {
+            let Ok(canonical_db_path) = archive_lease::canonical_database_path(db_path) else {
+                return false;
+            };
+            if !canonical_db_path.is_file() {
+                return false;
+            }
+            let mut wal_path = canonical_db_path.into_os_string();
+            wal_path.push("-wal");
+            fs::symlink_metadata(Path::new(&wal_path))
+                .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 32)
+        }
+        _ => false,
+    }
+}
+
+fn open_readonly_rebuild_storage(
+    db_path: &Path,
+    before_recovery: impl FnOnce() -> Result<()>,
+) -> Result<FrankenStorage> {
+    // This first attempt is an observation, not another 30-second recovery
+    // wait. A recovery-capable open can proceed only after writer admission.
+    match FrankenStorage::open_strict_readonly_with_timeout(db_path, Duration::ZERO) {
+        Ok(storage) => Ok(storage),
+        Err(error) if readonly_rebuild_needs_archive_recovery(db_path, &error) => {
+            before_recovery()?;
+            let canonical_db_path = archive_lease::canonical_database_path(db_path)?;
+            FrankenStorage::open_readonly(&canonical_db_path).with_context(|| {
+                format!(
+                    "opening canonical rebuild reader after admitted recovery for {} (strict read: {error:#})",
+                    db_path.display()
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn try_readonly_canonical_force_rebuild(
     opts: &IndexOptions,
     progress_bump: &Arc<AtomicI64>,
+    mut before_boundary: impl FnMut(ReadonlyRebuildBoundary) -> Result<()>,
 ) -> Result<bool> {
     if !should_try_readonly_canonical_force_rebuild(opts) {
         return Ok(false);
     }
 
-    let storage = FrankenStorage::open_readonly(&opts.db_path).with_context(|| {
+    let storage = open_readonly_rebuild_storage(&opts.db_path, || {
+        before_boundary(ReadonlyRebuildBoundary::ArchiveWrite)
+    })
+    .with_context(|| {
         format!(
             "opening canonical database read-only for force rebuild: {}",
             opts.db_path.display()
@@ -3085,6 +3156,7 @@ fn try_readonly_canonical_force_rebuild(
     );
 
     ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    before_boundary(ReadonlyRebuildBoundary::Rebuild)?;
     let rebuild_start = Instant::now();
     let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
         &opts.db_path,
@@ -3116,7 +3188,12 @@ fn try_readonly_canonical_force_rebuild(
     // `cass health` report stale forever even though the lexical index is
     // freshly rebuilt. performed_scan=false so last_scan_ts is preserved.
     let now_ms = FrankenStorage::now_millis();
-    match FrankenStorage::open_writer(&opts.db_path) {
+    // The rebuild above is read-only and remains useful with an unwritable
+    // archive directory. Its optional watermark write needs the same archive
+    // lease as every other writer, including when another data dir owns it.
+    match before_boundary(ReadonlyRebuildBoundary::ArchiveWrite)
+        .and_then(|()| FrankenStorage::open_writer(&opts.db_path))
+    {
         Ok(writer) => {
             let write_result = writer.set_last_indexed_at(now_ms);
             match writer.close() {
@@ -3388,6 +3465,10 @@ fn lexical_rebuild_db_state_matches_legacy(
 struct IndexRunLockGuard {
     // Keep the file handle alive for the lifetime of the lock.
     file: File,
+    // The data-dir lock protects derived assets; this separate pathname lease
+    // excludes writers using the same archive with another --data-dir. It is
+    // declared last among lock handles so data-dir metadata is cleared first.
+    archive_write_lease: Option<archive_lease::ArchiveWriteLease>,
     _path: PathBuf,
     started_at_ms: i64,
     updated_at_ms: i64,
@@ -3416,6 +3497,9 @@ struct IndexRunLockGuard {
     /// in that case.
     last_progress_at_ms_atomic: Arc<AtomicI64>,
     db_path: PathBuf,
+    // Keep the original filesystem spelling for delayed writer admission.
+    // Lexically normalizing `..` before resolving symlinks changes identity.
+    archive_path: PathBuf,
     job_id: String,
     job_kind: SearchMaintenanceJobKind,
     metadata_write_lock: Arc<Mutex<()>>,
@@ -3432,6 +3516,13 @@ impl Drop for IndexRunLockGuard {
 }
 
 impl IndexRunLockGuard {
+    fn acquire_archive_write_lease(&mut self) -> Result<()> {
+        if self.archive_write_lease.is_none() {
+            self.archive_write_lease = Some(acquire_archive_write_lease(&self.archive_path)?);
+        }
+        Ok(())
+    }
+
     fn write_metadata(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
         self.write_metadata_with_phase(mode, mode.as_lock_value())
     }
@@ -7003,6 +7094,36 @@ impl LexicalRebuildState {
     }
 }
 
+/// Contention on the canonical maintenance lock is an admission outcome, not
+/// an embedding or storage failure. Keep it typed so the daemon can retain an
+/// accepted job for retry without interpreting an arbitrary error message.
+#[derive(Debug, thiserror::Error)]
+#[error("another cass index process already holds {}", lock_path.display())]
+struct IndexRunBusy {
+    lock_path: PathBuf,
+}
+
+fn acquire_archive_write_lease(db_path: &Path) -> Result<archive_lease::ArchiveWriteLease> {
+    match archive_lease::ArchiveWriteLease::try_acquire(db_path).with_context(|| {
+        format!(
+            "acquiring canonical archive writer lease for {}",
+            db_path.display()
+        )
+    })? {
+        archive_lease::ArchiveLeaseAttempt::Acquired(lease) => Ok(lease),
+        archive_lease::ArchiveLeaseAttempt::Busy(lock_path) => {
+            Err(IndexRunBusy { lock_path }.into())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveAdmission {
+    Writable,
+    DataDirOnly,
+}
+
+#[cfg(test)]
 fn acquire_index_run_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -7021,6 +7142,22 @@ fn acquire_index_run_lock_with_job_kind(
     db_path: &Path,
     mode: SearchMaintenanceMode,
     job_kind: SearchMaintenanceJobKind,
+) -> Result<IndexRunLockGuard> {
+    acquire_index_run_lock_with_archive_admission(
+        data_dir,
+        db_path,
+        mode,
+        job_kind,
+        ArchiveAdmission::Writable,
+    )
+}
+
+fn acquire_index_run_lock_with_archive_admission(
+    data_dir: &Path,
+    db_path: &Path,
+    mode: SearchMaintenanceMode,
+    job_kind: SearchMaintenanceJobKind,
+    archive_admission: ArchiveAdmission,
 ) -> Result<IndexRunLockGuard> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
@@ -7041,10 +7178,7 @@ fn acquire_index_run_lock_with_job_kind(
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            anyhow::bail!(
-                "another cass index process already holds {}",
-                lock_path.display()
-            );
+            return Err(IndexRunBusy { lock_path }.into());
         }
         Err(std::fs::TryLockError::Error(err)) => {
             return Err(err)
@@ -7052,9 +7186,31 @@ fn acquire_index_run_lock_with_job_kind(
         }
     }
 
+    let archive_path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving the archive writer path")?
+            .join(db_path)
+    };
+    // Do not publish this attempt as an active owner until both leases are
+    // held. If archive admission fails, dropping `file` releases the data-dir
+    // lock without changing either owner's metadata or opening the database.
+    let archive_write_lease = match archive_admission {
+        ArchiveAdmission::Writable => Some(acquire_archive_write_lease(&archive_path)?),
+        ArchiveAdmission::DataDirOnly => None,
+    };
+    let db_path = archive_write_lease.as_ref().map_or_else(
+        || {
+            archive_lease::canonical_database_path(&archive_path)
+                .unwrap_or_else(|_| archive_path.clone())
+        },
+        |lease| lease.database_path().to_path_buf(),
+    );
     let now_ms = FrankenStorage::now_millis();
     let mut guard = IndexRunLockGuard {
         file,
+        archive_write_lease,
         _path: lock_path,
         started_at_ms: now_ms,
         updated_at_ms: now_ms,
@@ -7067,7 +7223,8 @@ fn acquire_index_run_lock_with_job_kind(
         // payload. Seed with `now_ms` so a stall-detector that fires
         // before the first bump cannot false-positive on `0`.
         last_progress_at_ms_atomic: Arc::new(AtomicI64::new(now_ms)),
-        db_path: crate::normalize_path_identity(db_path),
+        db_path,
+        archive_path,
         job_id: String::new(),
         job_kind,
         metadata_write_lock: Arc::new(Mutex::new(())),
@@ -16893,9 +17050,45 @@ fn run_index_inner(
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
+    let progress = opts.progress.clone();
+    let result = run_index_with_storage_ownership(
+        opts,
+        event_channel,
+        local_connector_roots,
+        mirror_source_ids,
+    );
+    // Some archive diagnostics intentionally turn engine errors into reason
+    // strings. Once the owner has drained, a requested stop must not escape
+    // as a spurious corruption or migration failure merely because an Abort
+    // lost its concrete type while passing through those diagnostics.
+    if progress
+        .as_ref()
+        .is_some_and(|progress| progress.stop_requested())
+    {
+        if let Err(error) = &result {
+            tracing::debug!(error = %error, "index owner drained after cancellation");
+        }
+        return Err(IndexInterrupted.into());
+    }
+    result
+}
+
+fn run_index_with_storage_ownership(
+    opts: IndexOptions,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+    local_connector_roots: LocalConnectorRootsOverride,
+    mirror_source_ids: Option<Vec<String>>,
+) -> Result<()> {
     if let Some(progress) = opts.progress.as_ref() {
         progress.check_stop()?;
     }
+    // Preparation includes SQL between the named breadcrumbs as well as
+    // inside them. Keep one scope until actual scan/rebuild work is admitted;
+    // that work retains the existing finish-current-batch stop contract.
+    let mut storage_cancellation_scope = opts
+        .progress
+        .as_ref()
+        .map(|progress| progress.storage_cancellation.enter());
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS")
         .ok()
@@ -16926,6 +17119,29 @@ fn run_index_inner(
     } else {
         maintenance_job_kind_for_mode(initial_lock_mode)
     };
+    // Ordinary writers must own both the data dir and canonical archive
+    // before even an integrity probe can pin a snapshot. The narrow readonly
+    // force-rebuild path can consume an unwritable archive; it acquires the
+    // archive lease before any recovery write, its optional watermark write,
+    // or a writable preparation fallback for an empty archive.
+    let archive_admission = if should_try_readonly_canonical_force_rebuild(&opts) {
+        ArchiveAdmission::DataDirOnly
+    } else {
+        ArchiveAdmission::Writable
+    };
+    let mut index_run_lock = acquire_index_run_lock_with_archive_admission(
+        &opts.data_dir,
+        &opts.db_path,
+        initial_lock_mode,
+        job_kind,
+        archive_admission,
+    )?;
+    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
+        opts.data_dir.clone(),
+        index_run_lock_heartbeat_interval(),
+        Arc::clone(&index_run_lock.metadata_write_lock),
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
+    );
     // i6upe: refuse to rebuild ON TOP of a malformed canonical archive.
     // Every index mode reads the canonical DB (`--force-rebuild` performs a
     // READONLY authoritative rebuild from it), so indexing a corrupt archive
@@ -16948,18 +17164,6 @@ fn run_index_inner(
             opts.db_path.display()
         ));
     }
-    let mut index_run_lock = acquire_index_run_lock_with_job_kind(
-        &opts.data_dir,
-        &opts.db_path,
-        initial_lock_mode,
-        job_kind,
-    )?;
-    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
-        opts.data_dir.clone(),
-        index_run_lock_heartbeat_interval(),
-        Arc::clone(&index_run_lock.metadata_write_lock),
-        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
-    );
     // GH#324: reclaim staging debris stranded by previous hard-crashed runs
     // now that we hold the exclusive index-run lock, and BEFORE the
     // disk-headroom preflight below — otherwise a crash/restart loop's own
@@ -17037,6 +17241,9 @@ fn run_index_inner(
         ($phase:expr) => {{
             if let Some(progress) = opts.progress.as_ref() {
                 progress.check_stop()?;
+                if storage_cancellation_scope.is_none() {
+                    storage_cancellation_scope = Some(progress.storage_cancellation.enter());
+                }
             }
             let phase_visible = preflight_breadcrumb_visible(initial_lock_mode, $phase);
             let timeout_enforced = initial_lock_mode == SearchMaintenanceMode::WatchStartup;
@@ -17071,10 +17278,10 @@ fn run_index_inner(
     macro_rules! complete_preflight_phase {
         () => {{
             preflight_state.exit();
-            bump_index_run_lock_progress_atomic(&progress_bump);
             if let Some(progress) = opts.progress.as_ref() {
                 progress.check_stop()?;
             }
+            bump_index_run_lock_progress_atomic(&progress_bump);
         }};
     }
     // The long stages after preflight (the scan, the authoritative lexical
@@ -17084,6 +17291,7 @@ fn run_index_inner(
     // These are not watch-startup steps, so the preflight watchdog ignores them.
     macro_rules! work_phase {
         ($phase:expr) => {{
+            drop(storage_cancellation_scope.take());
             if let Some(progress) = opts.progress.as_ref() {
                 progress.check_stop()?;
             }
@@ -17148,6 +17356,7 @@ fn run_index_inner(
                 preflight_phase!("watch_startup:fts_shadow_viability");
                 preflight_fts_shadow_before_lexical_readers(&opts.db_path)?;
                 complete_preflight_phase!();
+                work_phase!("lexical:rebuild");
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
@@ -17180,10 +17389,24 @@ fn run_index_inner(
             }
         }
     }
-    if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+    if try_readonly_canonical_force_rebuild(&opts, &progress_bump, |boundary| {
+        match boundary {
+            ReadonlyRebuildBoundary::Rebuild => work_phase!("lexical:rebuild"),
+            ReadonlyRebuildBoundary::ArchiveWrite => {
+                if let Some(progress) = opts.progress.as_ref() {
+                    progress.check_stop()?;
+                }
+                index_run_lock.acquire_archive_write_lease()?;
+            }
+        }
+        Ok(())
+    })? {
         return Ok(());
     }
 
+    // An empty canonical archive makes the readonly force-rebuild probe
+    // decline. Its writable fallback must not bypass cross-data-dir admission.
+    index_run_lock.acquire_archive_write_lease()?;
     preflight_phase!("watch_startup:open_storage");
     // GH #374: a full rebuild must classify an existing canonical archive on
     // a strictly read-only connection before `open_storage_for_index`. That
@@ -19660,6 +19883,19 @@ fn run_index_inner(
         // Clone detector for the callback
         let detector_clone = stale_detector.clone();
 
+        if watch_once_mode {
+            if opts.watch {
+                // Explicit paths still run once when combined with --watch.
+                // Preserve the already-published Watch mode while admitting
+                // the callback under its finish-current-batch contract.
+                drop(storage_cancellation_scope.take());
+                if let Some(progress) = opts.progress.as_ref() {
+                    progress.check_stop()?;
+                }
+            } else {
+                work_phase!("index:scan");
+            }
+        }
         let watch_result = watch_sources(
             opts.watch_once_paths.clone(),
             watch_roots.clone(),
@@ -19935,37 +20171,24 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
     // GH #382 / g3zyo: bounded. On an archive whose frankensqlite writable path
     // loops (the disowned-page reclaim sweep rescans the WAL per ledger page)
     // this checkpoint never returned, so every index run hung *after* a
-    // successful publish and every stale-on-read refresh died here. The publish
-    // is durable before this point and an un-truncated WAL costs the next
-    // opener a replay, never data — so a checkpoint that outlives its budget is
-    // reported and skipped rather than waited on forever.
+    // successful publish. The publish is durable before this point, but a
+    // still-running checkpoint cannot be left behind when writer ownership
+    // is released. The existing deadline now ends the process with exit 70;
+    // the next owner recovers the committed WAL normally.
     let timeout = final_wal_checkpoint_timeout();
-    let worker_context = context.to_string();
-    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), timeout, move |path| {
-        run_final_wal_checkpoint(path, &worker_context)
+    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), timeout, context, |path| {
+        run_final_wal_checkpoint(path, context)
     }) {
         AbortWalCheckpointAttempt::Finished(Ok(_outcome)) => Ok(()),
         AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!(
             "final WAL checkpoint after {context} failed: {error}"
         )),
-        AbortWalCheckpointAttempt::TimedOut => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                context,
-                timeout_secs = timeout.as_secs(),
-                "final WAL checkpoint exceeded its budget and was left for the next opener; \
-                 if this repeats on a large archive the writable open is looping on the WAL \
-                 (GH #382): back up the archive and its sidecars, then checkpoint it with \
-                 stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)"
-            );
-            Ok(())
-        }
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+        AbortWalCheckpointAttempt::DeadlineUnavailable(error) => {
             tracing::warn!(
                 db_path = %db_path.display(),
                 context,
                 %error,
-                "final WAL checkpoint worker was unavailable; the WAL is left for the next opener"
+                "final WAL checkpoint deadline timer was unavailable; the WAL is left for the next opener"
             );
             Ok(())
         }
@@ -19975,8 +20198,8 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
 /// Wall-clock budget for the index run's final `wal_checkpoint(TRUNCATE)`
 /// (GH #382 / g3zyo). `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS` overrides
 /// the 900 s default, which stays below the finalize stall abort (1800 s) so
-/// a looping checkpoint is skipped truthfully instead of turning into an
-/// exit-70 abort; `0` falls back to the default rather than disabling the bound.
+/// the checkpoint's own exit-70 deadline fires before the broader finalize
+/// watchdog; `0` falls back to the default rather than disabling the bound.
 fn final_wal_checkpoint_timeout() -> Duration {
     const DEFAULT_SECS: u64 = 900;
     let secs = dotenvy::var("CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS")
@@ -20023,49 +20246,46 @@ enum FinalWalCheckpointOutcome {
     },
 }
 
-/// Outcome of the separately supervised checkpoint attempted immediately
-/// before a watchdog-forced process exit.
+/// Outcome of a checkpoint with an owned terminal deadline. A timeout cannot
+/// return: doing so would release ownership with a database operation alive.
 #[derive(Debug)]
 enum AbortWalCheckpointAttempt {
     Finished(Result<FinalWalCheckpointOutcome, String>),
-    TimedOut,
-    WorkerUnavailable(String),
+    DeadlineUnavailable(String),
 }
 
 const ABORT_WAL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run the pre-abort checkpoint on a disposable worker and wait only for the
-/// supplied deadline. The watchdog is supervising a process whose indexer
-/// thread is already proven wedged; running another database open/checkpoint
-/// synchronously on the watchdog thread can block behind that same owner and
-/// defeat the promised bounded exit.
+/// Keep checkpoint open, SQL and close on the caller thread. An owned timer
+/// preserves the existing deadline, including for a constructor that does not
+/// expose operation cancellation. Timeout is terminal for this process; the
+/// helper never returns while a detached writer could outlive its caller's
+/// leases. This also protects nonterminal streaming-cancellation callers.
 fn run_bounded_abort_wal_checkpoint<F>(
     db_path: PathBuf,
     timeout: Duration,
+    context: &str,
     checkpoint: F,
 ) -> AbortWalCheckpointAttempt
 where
-    F: FnOnce(&Path) -> Result<FinalWalCheckpointOutcome> + Send + 'static,
+    F: FnOnce(&Path) -> Result<FinalWalCheckpointOutcome>,
 {
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let _worker = match std::thread::Builder::new()
-        .name("cass-abort-wal-checkpoint".to_string())
-        .spawn(move || {
-            let result = checkpoint(&db_path).map_err(|err| format!("{err:#}"));
-            let _ = result_tx.send(result);
-        }) {
-        Ok(worker) => worker,
-        Err(err) => return AbortWalCheckpointAttempt::WorkerUnavailable(err.to_string()),
-    };
-
-    match result_rx.recv_timeout(timeout) {
+    let diagnostic = serde_json::json!({
+        "success": false,
+        "code": 70,
+        "kind": "wal-checkpoint-timeout",
+        "retryable": true,
+        "db_path": db_path,
+        "context": context,
+        "deadline_ms": timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+        "message": "WAL checkpoint exceeded its deadline; terminating the process before releasing archive ownership. Committed rows remain in the database/WAL for the next run to recover.",
+    })
+    .to_string();
+    match checkpoint_deadline::run(timeout, diagnostic, || {
+        checkpoint(&db_path).map_err(|error| format!("{error:#}"))
+    }) {
         Ok(result) => AbortWalCheckpointAttempt::Finished(result),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => AbortWalCheckpointAttempt::TimedOut,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            AbortWalCheckpointAttempt::WorkerUnavailable(
-                "checkpoint worker exited without reporting an outcome".to_string(),
-            )
-        }
+        Err(error) => AbortWalCheckpointAttempt::DeadlineUnavailable(error.to_string()),
     }
 }
 
@@ -20100,14 +20320,14 @@ fn classify_final_wal_checkpoint(
 /// skips destructors — so the canonical WAL is never checkpointed and a killed
 /// run leaves a multi-GB orphaned `*.db-wal` behind a tiny `*.db` (the #296
 /// symptom). This opens a *fresh, independent* frankensqlite connection to the
-/// canonical DB file (the wedged storage handle's workers are parked, but the
-/// file itself is checkpointable through a new connection) and runs
+/// canonical DB file and runs
 /// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
-/// SQLite. The fresh checkpoint itself is supervised from a disposable thread
-/// and gets only [`ABORT_WAL_CHECKPOINT_TIMEOUT`]: the still-live wedged writer
+/// SQLite. The fresh checkpoint stays on this calling thread and gets only
+/// [`ABORT_WAL_CHECKPOINT_TIMEOUT`]: the still-live wedged writer
 /// can otherwise block the fresh open/checkpoint indefinitely and turn the
-/// watchdog's promised exit into another hang. Everything is best-effort; a
-/// failure or timeout is logged and swallowed so the abort still proceeds.
+/// watchdog's promised exit into another hang. Ordinary errors remain
+/// best-effort; timeout terminates the whole process rather than returning
+/// with an independent archive writer still alive.
 /// Stale index-run locks are already reaped on the next startup by
 /// `read_search_maintenance_snapshot` (flock-based), so this focuses on the
 /// WAL.
@@ -20130,6 +20350,7 @@ fn best_effort_abort_wal_checkpoint_for_db(db_path: &Path) {
     match run_bounded_abort_wal_checkpoint(
         db_path.to_path_buf(),
         ABORT_WAL_CHECKPOINT_TIMEOUT,
+        "stall abort",
         |path| run_final_wal_checkpoint(path, "stall abort"),
     ) {
         AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed)) => {
@@ -20161,18 +20382,11 @@ fn best_effort_abort_wal_checkpoint_for_db(db_path: &Path) {
                 "best-effort WAL checkpoint before stall abort failed; the WAL may remain uncheckpointed until the next clean run"
             );
         }
-        AbortWalCheckpointAttempt::TimedOut => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                timeout_ms = ABORT_WAL_CHECKPOINT_TIMEOUT.as_millis(),
-                "best-effort WAL checkpoint before stall abort exceeded its deadline; proceeding with the bounded exit and preserving the WAL for recovery"
-            );
-        }
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+        AbortWalCheckpointAttempt::DeadlineUnavailable(error) => {
             tracing::warn!(
                 db_path = %db_path.display(),
                 %error,
-                "best-effort WAL checkpoint worker was unavailable before stall abort; proceeding with the bounded exit"
+                "best-effort WAL checkpoint deadline timer was unavailable; leaving the WAL for the next opener"
             );
         }
     }
@@ -20193,33 +20407,29 @@ pub(crate) const CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV: &str = "CASS_TEST_WAL_CHE
 /// [`checkpoint_wal_truncate`] with a wall-clock deadline (GH #382, bead
 /// g3zyo). On the owner-scale archive with a 200 MB WAL, frankensqlite's
 /// writable open never returns, which turned `cass doctor --fix` into an
-/// infinite hang. The checkpoint runs on the same disposable worker as the
-/// stall-abort checkpoint; if it has not finished by `deadline`, the caller
-/// gets an error that names the shape and the out-of-band remedy instead of
-/// waiting forever. The worker is left to finish or die with the process — it
-/// cannot be cancelled, and the callers are short-lived CLI commands.
+/// infinite hang. The checkpoint stays on the caller thread, under its own
+/// canonical archive lease. If it exceeds `deadline`, exit 70 preserves the
+/// ownership boundary; returning a report while a detached writer remained
+/// alive would let another maintenance command enter the same archive.
 pub(crate) fn checkpoint_wal_truncate_with_deadline(
     db_path: &Path,
     context: &str,
     deadline: Duration,
 ) -> Result<bool> {
-    let worker_context = context.to_string();
-    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), deadline, move |path| {
-        run_final_wal_checkpoint(path, &worker_context)
+    // The doctor caller owns its separate repair lock, but that does not
+    // serialize against a writer using another data directory. Admission must
+    // be nonblocking here: an index owner may itself be awaiting that doctor
+    // lock, so waiting for its archive lease would invert the lock order.
+    let _archive_write_lease = acquire_archive_write_lease(db_path)?;
+    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), deadline, context, |path| {
+        run_final_wal_checkpoint(path, context)
     }) {
         AbortWalCheckpointAttempt::Finished(Ok(outcome)) => {
             Ok(matches!(outcome, FinalWalCheckpointOutcome::Completed))
         }
         AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!("{error}")),
-        AbortWalCheckpointAttempt::TimedOut => Err(anyhow::anyhow!(
-            "WAL checkpoint did not complete within {} s; on a large archive this means the \
-             writable open is looping on the WAL (GH #382): back up {} and its -wal/-shm \
-             sidecars, then checkpoint with stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)",
-            deadline.as_secs(),
-            db_path.display()
-        )),
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => Err(anyhow::anyhow!(
-            "WAL checkpoint worker was unavailable after {context}: {error}"
+        AbortWalCheckpointAttempt::DeadlineUnavailable(error) => Err(anyhow::anyhow!(
+            "WAL checkpoint deadline timer was unavailable after {context}: {error}"
         )),
     }
 }
@@ -22550,23 +22760,36 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     // while another process locks a freshly created file at the same path,
     // yielding two concurrent exclusive "holders". Keeping the file
     // immortal once created is what makes the flock sound; instead we avoid
-    // creating it when the repair cannot possibly proceed. Opening the DB
-    // read-only without the lock is already done by every observation path
-    // (search itself, `read_search_maintenance_snapshot`, status/health).
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    // creating it when the repair cannot possibly proceed. The initial probe
+    // is strictly read-only; a recognized recovery-required state must acquire
+    // and retain both writer leases before using a recovery-capable reader.
+    let mut recovery_guard = None;
+    let probed_storage = open_readonly_rebuild_storage(db_path, || {
+        recovery_guard = Some(acquire_search_maintenance_mutation_lock(
+            data_dir,
+            db_path,
+            SearchMaintenanceJobKind::LexicalRefresh,
+        )?);
+        Ok(())
+    })
+    .with_context(|| {
         format!(
             "opening database to repair lexical index for search: {}",
             db_path.display()
         )
     })?;
 
-    let index_run_lock = acquire_index_run_lock(data_dir, db_path, SearchMaintenanceMode::Index)?;
-    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
-        data_dir.to_path_buf(),
-        index_run_lock_heartbeat_interval(),
-        Arc::clone(&index_run_lock.metadata_write_lock),
-        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
-    );
+    let index_run_lock = match recovery_guard {
+        Some(guard) => guard,
+        None => acquire_search_asset_mutation_lock(
+            data_dir,
+            db_path,
+            SearchMaintenanceJobKind::LexicalRefresh,
+        )?,
+    };
+    // Declare the reader after the combined guard so every error path closes
+    // storage before joining the heartbeat and releasing either lease.
+    let storage = probed_storage;
     // GH#324: this repair path also stages under the index root; sweep
     // debris from previous crashed runs while we hold the exclusive lock.
     staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
@@ -22620,7 +22843,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         data_dir,
         total_conversations,
         progress,
-        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
+        index_run_lock.progress_atomic(),
     )?;
     Ok(SearchLexicalRepairOutcome {
         indexed_docs: rebuild.indexed_docs,
@@ -23376,7 +23599,9 @@ fn spawn_lexical_rebuild_packet_producer(
                 let _ = tx.send(LexicalRebuildPipelineMessage::Error(format!("{error:#}")));
             };
 
-            let mut storage = match FrankenStorage::open_readonly(&db_path) {
+            // Preparation owns any recovery writes. Worker readers cannot
+            // acquire an independent recovery writer during a readonly build.
+            let mut storage = match FrankenStorage::open_strict_readonly(&db_path) {
                 Ok(storage) => storage,
                 Err(err) => {
                     send_error(err.context(format!(
@@ -24118,7 +24343,8 @@ fn lexical_post_run_maintenance_skipped_for_test() -> bool {
 /// (`CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS`, default 1), write a
 /// sentinel describing the authority/checkpoint gap the commit just opened
 /// and park so the test can SIGKILL the run inside that window. Unset in
-/// production: an absent sentinel path returns immediately.
+/// production: an absent sentinel path returns immediately. A release path
+/// lets process tests resume the real commit without a timing-dependent sleep.
 fn maybe_pause_lexical_rebuild_after_commit_for_kill(
     state_path: &Path,
     checkpoint_indexed_docs: usize,
@@ -24159,7 +24385,24 @@ fn maybe_pause_lexical_rebuild_after_commit_for_kill(
             sentinel_path.display()
         )
     })?;
-    thread::sleep(Duration::from_millis(sleep_ms));
+    if let Some(release_path) = dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_RELEASE")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+    {
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_millis(sleep_ms);
+        while !release_path.exists() {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                anyhow::bail!(
+                    "lexical rebuild commit rendezvous was not released within {sleep_ms} ms"
+                );
+            };
+            thread::park_timeout(remaining.min(Duration::from_millis(10)));
+        }
+    } else {
+        thread::sleep(Duration::from_millis(sleep_ms));
+    }
     Ok(())
 }
 
@@ -26242,7 +26485,7 @@ fn rebuild_tantivy_from_db_once(
         *step_started = Instant::now();
     };
 
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
         format!(
             "opening database for Tantivy rebuild: {}",
             db_path.display()
@@ -30059,7 +30302,20 @@ pub(crate) struct SearchMaintenanceMutationGuard {
 }
 
 impl SearchMaintenanceMutationGuard {
-    fn mark_progress(&self) {
+    fn new(data_dir: &Path, lock: IndexRunLockGuard) -> Self {
+        let heartbeat = IndexRunLockHeartbeat::start(
+            data_dir.to_path_buf(),
+            index_run_lock_heartbeat_interval(),
+            Arc::clone(&lock.metadata_write_lock),
+            Arc::clone(&lock.last_progress_at_ms_atomic),
+        );
+        Self {
+            _heartbeat: heartbeat,
+            lock,
+        }
+    }
+
+    pub(crate) fn mark_progress(&self) {
         bump_index_run_lock_progress_atomic(&self.lock.last_progress_at_ms_atomic);
     }
 
@@ -30091,6 +30347,20 @@ pub(crate) fn acquire_semantic_backfill_lock(
     )
 }
 
+/// Try to admit a daemon embedding job through the same writer ownership as
+/// standalone indexing. A busy archive leaves the queued job intact; all
+/// other failures retain their original error and context.
+pub(crate) fn try_acquire_semantic_backfill_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<Option<SearchMaintenanceMutationGuard>> {
+    match acquire_semantic_backfill_lock(data_dir, db_path) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(error) if error.downcast_ref::<IndexRunBusy>().is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn acquire_search_maintenance_mutation_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -30102,16 +30372,26 @@ pub(crate) fn acquire_search_maintenance_mutation_lock(
         SearchMaintenanceMode::Index,
         job_kind,
     )?;
-    let heartbeat = IndexRunLockHeartbeat::start(
-        data_dir.to_path_buf(),
-        index_run_lock_heartbeat_interval(),
-        Arc::clone(&lock.metadata_write_lock),
-        Arc::clone(&lock.last_progress_at_ms_atomic),
-    );
-    Ok(SearchMaintenanceMutationGuard {
-        _heartbeat: heartbeat,
-        lock,
-    })
+    Ok(SearchMaintenanceMutationGuard::new(data_dir, lock))
+}
+
+/// Admit maintenance that only changes data-dir assets, such as HNSW output
+/// or quarantine metadata. Callers must not open canonical storage through a
+/// recovery-capable reader or a writer while holding only this guard. Keeping
+/// this narrow path allows derived-asset work with an unwritable archive.
+pub(crate) fn acquire_search_asset_mutation_lock(
+    data_dir: &Path,
+    db_path: &Path,
+    job_kind: SearchMaintenanceJobKind,
+) -> Result<SearchMaintenanceMutationGuard> {
+    let lock = acquire_index_run_lock_with_archive_admission(
+        data_dir,
+        db_path,
+        SearchMaintenanceMode::Index,
+        job_kind,
+        ArchiveAdmission::DataDirOnly,
+    )?;
+    Ok(SearchMaintenanceMutationGuard::new(data_dir, lock))
 }
 
 /// Operator-facing bounded quarantine retry (#292 ask #3, `cass quarantine
@@ -42759,6 +43039,361 @@ mod tests {
     }
 
     #[test]
+    fn gh515_semantic_admission_preserves_owner_and_releases_heartbeat() -> Result<()> {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        let lexical = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        let original = read_search_maintenance_snapshot(tmp.path());
+        assert!(original.active);
+        assert!(try_acquire_semantic_backfill_lock(tmp.path(), &db_path)?.is_none());
+        let contended = read_search_maintenance_snapshot(tmp.path());
+        assert_eq!(contended.job_id, original.job_id);
+        assert_eq!(contended.last_progress_at_ms, original.last_progress_at_ms);
+        drop(lexical);
+
+        let semantic = try_acquire_semantic_backfill_lock(tmp.path(), &db_path)?
+            .context("semantic job must be admitted after the lexical owner drains")?;
+        assert!(
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index).is_err()
+        );
+        let active = read_search_maintenance_snapshot(tmp.path());
+        assert!(active.active);
+        assert_eq!(
+            active.job_kind,
+            Some(SearchMaintenanceJobKind::SemanticRebuild)
+        );
+        drop(semantic);
+
+        let after = read_search_maintenance_snapshot(tmp.path());
+        assert!(!after.active);
+        assert!(after.job_id.is_none());
+        assert!(
+            read_index_run_lock_metadata_for_test(&tmp.path().join("index-run.lock"))?.is_empty()
+        );
+        let _next = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+
+        // Permission/path errors must not be mistaken for a busy owner and
+        // silently put accepted daemon work into an endless retry queue.
+        let not_a_directory = tmp.path().join("not-a-directory");
+        fs::write(&not_a_directory, b"preserve")?;
+        assert!(try_acquire_semantic_backfill_lock(&not_a_directory, &db_path).is_err());
+        assert_eq!(fs::read(&not_a_directory)?, b"preserve");
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_archive_admission_serializes_different_data_directories() -> Result<()> {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+
+        for archive_exists in [false, true] {
+            let tmp = TempDir::new()?;
+            let db_path = tmp.path().join("archive.db");
+            if archive_exists {
+                fs::write(&db_path, b"canonical bytes")?;
+            }
+            let first_data = tmp.path().join("first");
+            let second_data = tmp.path().join("second");
+            let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            let original = read_search_maintenance_snapshot(&first_data);
+            let lease_path = archive_lease::ArchiveWriteLease::path(&db_path)?;
+            assert_eq!(db_path.exists(), archive_exists);
+            assert_eq!(fs::metadata(&lease_path)?.len(), 0);
+
+            let error =
+                acquire_index_run_lock(&second_data, &db_path, SearchMaintenanceMode::Index)
+                    .expect_err("a different data directory must not admit the same archive");
+            assert_eq!(
+                error.downcast_ref::<IndexRunBusy>().unwrap().lock_path,
+                lease_path,
+            );
+            assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+            assert!(
+                read_index_run_lock_metadata_for_test(&second_data.join("index-run.lock"))?
+                    .is_empty()
+            );
+            assert!(!read_search_maintenance_snapshot(&second_data).active);
+            assert_eq!(
+                read_search_maintenance_snapshot(&first_data).job_id,
+                original.job_id
+            );
+
+            // Creating the database while its first owner is admitted must not
+            // switch the lease key from the missing-leaf path to a new inode.
+            if !archive_exists {
+                fs::write(&db_path, b"canonical bytes")?;
+                assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+            }
+            drop(owner);
+            let successor = try_acquire_semantic_backfill_lock(&second_data, &db_path)?
+                .context("the next data directory must acquire the released archive")?;
+            assert!(read_search_maintenance_snapshot(&second_data).active);
+            assert!(!read_search_maintenance_snapshot(&first_data).active);
+            assert_eq!(fs::metadata(&lease_path)?.len(), 0);
+            assert_eq!(fs::read(&db_path)?, b"canonical bytes");
+            drop(successor);
+            assert!(!read_search_maintenance_snapshot(&second_data).active);
+            assert!(
+                read_index_run_lock_metadata_for_test(&second_data.join("index-run.lock"))?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_archive_admission_releases_partial_admission_and_keeps_archives_independent()
+    -> Result<()> {
+        let tmp = TempDir::new()?;
+        let first_data = tmp.path().join("first");
+        let second_data = tmp.path().join("second");
+        let first_db = tmp.path().join("first.db");
+        let second_db = tmp.path().join("second.db");
+        let first = acquire_semantic_backfill_lock(&first_data, &first_db)?;
+        assert!(try_acquire_semantic_backfill_lock(&second_data, &first_db)?.is_none());
+
+        // The failed archive attempt must release its preliminary data-dir
+        // lock; an unrelated archive can then use that data dir immediately.
+        let second = acquire_semantic_backfill_lock(&second_data, &second_db)?;
+        assert!(try_acquire_semantic_backfill_lock(&first_data, &second_db)?.is_none());
+        drop(second);
+        drop(first);
+
+        let blocked_parent = tmp.path().join("not-a-directory");
+        fs::write(&blocked_parent, b"preserve")?;
+        let error =
+            try_acquire_semantic_backfill_lock(&second_data, &blocked_parent.join("archive.db"))
+                .err()
+                .context("an archive path error must remain an error, not deferred work")?;
+        assert!(!error.is::<IndexRunBusy>());
+        assert_eq!(fs::read(blocked_parent)?, b"preserve");
+        let _retry = acquire_semantic_backfill_lock(&second_data, &second_db)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_archive_admission_unifies_symlink_spellings_before_and_after_creation() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        for archive_exists in [false, true] {
+            let tmp = TempDir::new()?;
+            let archive_dir = tmp.path().join("archives");
+            fs::create_dir(&archive_dir)?;
+            let alias_dir = tmp.path().join("alias");
+            symlink(&archive_dir, &alias_dir)?;
+            let db_path = archive_dir.join("archive.db");
+            if archive_exists {
+                fs::write(&db_path, b"preserve")?;
+            }
+            let first_data = tmp.path().join("first");
+            let second_data = tmp.path().join("second");
+            let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            let lease_path = archive_lease::ArchiveWriteLease::path(&db_path)?;
+            let before = fs::metadata(&lease_path)?;
+            assert!(
+                try_acquire_semantic_backfill_lock(&second_data, &alias_dir.join("archive.db"))?
+                    .is_none()
+            );
+            if archive_exists {
+                let alias_file = tmp.path().join("archive-link.db");
+                symlink(&db_path, &alias_file)?;
+                assert!(try_acquire_semantic_backfill_lock(&second_data, &alias_file)?.is_none());
+            }
+            drop(owner);
+            let retry =
+                acquire_semantic_backfill_lock(&second_data, &alias_dir.join("archive.db"))?;
+            let after = fs::metadata(&lease_path)?;
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(after.len(), 0);
+            drop(retry);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_archive_admission_resolves_symlinks_before_parent_components() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        for archive_exists in [false, true] {
+            let tmp = TempDir::new()?;
+            let lexical_parent = tmp.path().join("lexical-parent");
+            let archive_parent = tmp.path().join("actual-parent");
+            fs::create_dir(&lexical_parent)?;
+            fs::create_dir_all(archive_parent.join("child"))?;
+            symlink(archive_parent.join("child"), lexical_parent.join("link"))?;
+            let db_path = archive_parent.join("archive.db");
+            let spelling = lexical_parent.join("link/../archive.db");
+            if archive_exists {
+                fs::write(&db_path, b"canonical bytes")?;
+            }
+            let first_data = tmp.path().join("first");
+            let second_data = tmp.path().join("second");
+            let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            assert!(try_acquire_semantic_backfill_lock(&second_data, &spelling)?.is_none());
+
+            // Delayed writer admission from a readonly rebuild must preserve
+            // exactly the same OS path semantics as immediate admission.
+            let mut readonly = acquire_index_run_lock_with_archive_admission(
+                &second_data,
+                &spelling,
+                SearchMaintenanceMode::Index,
+                SearchMaintenanceJobKind::LexicalRefresh,
+                ArchiveAdmission::DataDirOnly,
+            )?;
+            assert!(
+                readonly
+                    .acquire_archive_write_lease()
+                    .expect_err("the readonly upgrade must respect the canonical owner")
+                    .is::<IndexRunBusy>()
+            );
+            if !archive_exists {
+                fs::write(&spelling, b"canonical bytes")?;
+            }
+            assert_eq!(fs::canonicalize(&spelling)?, fs::canonicalize(&db_path)?);
+            drop(owner);
+            readonly.acquire_archive_write_lease()?;
+            assert!(try_acquire_semantic_backfill_lock(&first_data, &db_path)?.is_none());
+            assert!(
+                !lexical_parent
+                    .join("archive.db.cass-index-run.lock")
+                    .exists()
+            );
+            drop(readonly);
+            let _retry = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            assert_eq!(fs::read(&db_path)?, b"canonical bytes");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_archive_admission_unifies_dangling_leaf_targets_and_creates_missing_parents()
+    -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("new/nested/archive.db");
+        let spelling = tmp.path().join("archive-link.db");
+        symlink("new/nested/archive.db", &spelling)?;
+        let first_data = tmp.path().join("first");
+        let second_data = tmp.path().join("second");
+        let owner = acquire_semantic_backfill_lock(&first_data, &spelling)?;
+        assert!(db_path.parent().unwrap().is_dir());
+        assert!(!db_path.exists(), "admission must not create the archive");
+        assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+        fs::write(&spelling, b"created through the original dangling link")?;
+        assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+        assert_eq!(
+            archive_lease::ArchiveWriteLease::path(&spelling)?,
+            archive_lease::ArchiveWriteLease::path(&db_path)?,
+        );
+        drop(owner);
+        let successor = acquire_semantic_backfill_lock(&second_data, &db_path)?;
+        assert!(try_acquire_semantic_backfill_lock(&first_data, &spelling)?.is_none());
+        drop(successor);
+
+        let cycle_a = tmp.path().join("cycle-a.db");
+        let cycle_b = tmp.path().join("cycle-b.db");
+        symlink(&cycle_b, &cycle_a)?;
+        symlink(&cycle_a, &cycle_b)?;
+        let error = try_acquire_semantic_backfill_lock(&first_data, &cycle_a)
+            .err()
+            .context("unresolvable symlinks must fail without claiming a different archive")?;
+        assert!(!error.is::<IndexRunBusy>());
+        assert!(
+            read_index_run_lock_metadata_for_test(&first_data.join("index-run.lock"))?.is_empty()
+        );
+        let _retry = acquire_semantic_backfill_lock(&first_data, &spelling)?;
+        assert_eq!(
+            fs::read(&db_path)?,
+            b"created through the original dangling link"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_writer_admission_precedes_archive_preparation() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        let original = b"an archive being initialized by its existing owner";
+        fs::write(&db_path, original)?;
+        let _owner = acquire_semantic_backfill_lock(tmp.path(), &db_path)?;
+        let snapshot = crate::search::asset_state::read_search_maintenance_snapshot(tmp.path());
+        let result = run_index_with_local_connector_roots(
+            IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path: db_path.clone(),
+                data_dir: tmp.path().to_path_buf(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "hash".to_string(),
+                progress: Some(Arc::new(IndexingProgress::default())),
+                watch_interval_secs: 30,
+            },
+            HashMap::new(),
+            None,
+        );
+        assert!(
+            result
+                .expect_err("a contender must not inspect another owner's archive")
+                .is::<IndexRunBusy>()
+        );
+        assert_eq!(fs::read(&db_path)?, original);
+        assert!(!tmp.path().join("index").exists());
+        assert_eq!(
+            crate::search::asset_state::read_search_maintenance_snapshot(tmp.path()).job_id,
+            snapshot.job_id,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_stop_before_preparation_preserves_archive_and_does_not_claim_writer() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir)?;
+        let db_path = data_dir.join("agent_search.db");
+        // An already-cancelled invocation must not even probe or migrate its
+        // archive. A sentinel makes an accidental open fail unmistakably.
+        let original = b"archive not to be opened by a cancelled invocation";
+        fs::write(&db_path, original)?;
+        let progress = Arc::new(IndexingProgress::default());
+        progress.request_stop();
+        let result = run_index_with_local_connector_roots(
+            IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "hash".to_string(),
+                progress: Some(progress),
+                watch_interval_secs: 30,
+            },
+            HashMap::new(),
+            None,
+        );
+        assert!(
+            result
+                .expect_err("cancelled index must stop")
+                .is::<IndexInterrupted>()
+        );
+        assert_eq!(fs::read(db_path)?, original);
+        assert!(!data_dir.join("index-run.lock").exists());
+        assert!(!data_dir.join("index").exists());
+        Ok(())
+    }
+
+    #[test]
     fn issue_342_semantic_index_lock_identifies_rebuild_job_and_phase() -> Result<()> {
         use crate::search::asset_state::read_search_maintenance_snapshot;
 
@@ -52394,27 +53029,169 @@ mod tests {
         Ok(())
     }
 
-    /// #422: a watchdog-confirmed wedge must still terminate even when the
-    /// fresh checkpoint attempt blocks behind the wedged writer. Before the
-    /// checkpoint was separately supervised, this pre-exit cleanup could
-    /// itself hang forever and nullify the watchdog's abort guarantee.
+    /// Checkpoint SQL stays under its caller's ownership. Every timeout
+    /// process is owned and reaped by this test; no delayed worker can escape.
     #[test]
-    fn abort_wal_checkpoint_wait_is_bounded_when_the_worker_blocks() {
-        let started = Instant::now();
-        let attempt = run_bounded_abort_wal_checkpoint(
-            PathBuf::from("unused-by-planted-blocking-checkpoint"),
-            Duration::from_millis(5),
-            |_| {
-                std::thread::sleep(Duration::from_secs(1));
-                Ok(FinalWalCheckpointOutcome::Completed)
-            },
-        );
+    fn gh515_checkpoint_deadline_preserves_ownership_through_return_unwind_and_timeout()
+    -> Result<()> {
+        const CHILD: &str = "CASS_TEST_GH515_CHECKPOINT_CHILD";
+        const ROOT: &str = "CASS_TEST_GH515_CHECKPOINT_ROOT";
+        const TEST: &str = "indexer::tests::gh515_checkpoint_deadline_preserves_ownership_through_return_unwind_and_timeout";
+        if let Ok(mode) = dotenvy::var(CHILD) {
+            let root = PathBuf::from(dotenvy::var(ROOT)?);
+            let db_path = root.join("archive.db");
+            let _owner = acquire_semantic_backfill_lock(&root.join("owner"), &db_path)?;
+            fs::write(root.join("ready"), b"owned")?;
+            let ready_deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("go").exists() {
+                anyhow::ensure!(
+                    Instant::now() < ready_deadline,
+                    "supervisor did not release child"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let caller = std::thread::current().id();
+            let local = std::rc::Rc::new(std::cell::Cell::new(0));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_bounded_abort_wal_checkpoint(
+                    db_path,
+                    Duration::from_millis(50),
+                    "unit deadline",
+                    |_| {
+                        assert_eq!(std::thread::current().id(), caller);
+                        local.set(1);
+                        match mode.as_str() {
+                            "timeout" => std::thread::sleep(Duration::from_secs(3)),
+                            "panic" => panic!("planted checkpoint panic"),
+                            "error" => anyhow::bail!("planted checkpoint error"),
+                            "complete" => {}
+                            _ => anyhow::bail!("unknown checkpoint child mode"),
+                        }
+                        Ok(FinalWalCheckpointOutcome::Completed)
+                    },
+                )
+            }));
+            match mode.as_str() {
+                "complete" => assert!(matches!(
+                    result,
+                    Ok(AbortWalCheckpointAttempt::Finished(Ok(_)))
+                )),
+                "error" => assert!(matches!(
+                    result,
+                    Ok(AbortWalCheckpointAttempt::Finished(Err(_)))
+                )),
+                "panic" => assert!(result.is_err()),
+                _ => anyhow::bail!("a timed-out checkpoint returned to its owner"),
+            }
+            assert_eq!(
+                local.get(),
+                1,
+                "the real caller-thread closure must execute"
+            );
+            fs::write(root.join("returned"), b"timer joined")?;
+            // A forgotten timer must not kill an already-returned owner later.
+            std::thread::sleep(Duration::from_millis(150));
+            return Ok(());
+        }
 
-        assert!(matches!(attempt, AbortWalCheckpointAttempt::TimedOut));
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "checkpoint supervision must return at its own deadline, not wait for the blocked worker"
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for mode in ["complete", "error", "panic", "timeout"] {
+            let tmp = TempDir::new()?;
+            let root = tmp.path();
+            let db_path = root.join("archive.db");
+            fs::write(&db_path, b"canonical bytes")?;
+            let stderr_path = root.join("stderr");
+            let mut child = Child(
+                std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, mode)
+                    .env(ROOT, root)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::from(File::create(&stderr_path)?))
+                    .spawn()?,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("ready").exists() {
+                anyhow::ensure!(
+                    child.0.try_wait()?.is_none(),
+                    "checkpoint child exited before admission"
+                );
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "checkpoint child did not acquire ownership"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                try_acquire_semantic_backfill_lock(&root.join("contender"), &db_path)?.is_none()
+            );
+            fs::write(root.join("go"), b"run")?;
+            let status = loop {
+                if let Some(status) = child.0.try_wait()? {
+                    break status;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "checkpoint child did not stop");
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            if mode == "timeout" {
+                assert_eq!(
+                    status.code(),
+                    Some(70),
+                    "{}",
+                    fs::read_to_string(&stderr_path)?
+                );
+                assert!(!root.join("returned").exists());
+                let stderr = fs::read_to_string(&stderr_path)?;
+                let event = stderr
+                    .lines()
+                    .find_map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .filter(|value| value["kind"] == "wal-checkpoint-timeout")
+                    })
+                    .context("checkpoint timeout must emit the structured failure")?;
+                assert_eq!(event["success"], false);
+                assert_eq!(event["code"], 70);
+                assert_eq!(event["retryable"], true);
+                assert_eq!(event["deadline_ms"], 50);
+                assert_eq!(event["context"], "unit deadline");
+            } else {
+                assert!(status.success(), "{}", fs::read_to_string(&stderr_path)?);
+                assert!(root.join("returned").exists());
+            }
+            let _retry = acquire_semantic_backfill_lock(&root.join("contender"), &db_path)?;
+            assert_eq!(fs::read(&db_path)?, b"canonical bytes");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_doctor_checkpoint_refuses_busy_archive_before_timer_or_open() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        fs::write(&db_path, b"archive must not be opened")?;
+        let owner_data = tmp.path().join("owner");
+        let owner = acquire_semantic_backfill_lock(&owner_data, &db_path)?;
+        let before = crate::search::asset_state::read_search_maintenance_snapshot(&owner_data);
+        let error =
+            checkpoint_wal_truncate_with_deadline(&db_path, "doctor --fix", Duration::from_secs(5))
+                .expect_err("doctor checkpoint must respect another archive writer");
+        assert!(error.is::<IndexRunBusy>(), "{error:#}");
+        assert_eq!(fs::read(&db_path)?, b"archive must not be opened");
+        assert_eq!(
+            crate::search::asset_state::read_search_maintenance_snapshot(&owner_data).job_id,
+            before.job_id,
         );
+        drop(owner);
+        let _retry = acquire_semantic_backfill_lock(&tmp.path().join("next"), &db_path)?;
+        Ok(())
     }
 
     /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked
@@ -56575,6 +57352,268 @@ mod tests {
             !should_try_readonly_canonical_force_rebuild(&opts),
             "targeted watch-once force rebuild should not ignore explicit paths"
         );
+    }
+
+    #[test]
+    fn gh515_readonly_recovery_classification_rejects_unrelated_open_failures() -> Result<()> {
+        use crate::franken_sync::FrankenError;
+
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        fs::write(&db_path, b"canonical bytes")?;
+        let cannot_open: anyhow::Error = FrankenError::CannotOpen {
+            path: db_path.clone(),
+        }
+        .into();
+        assert!(!readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &cannot_open
+        ));
+        let wal_path = tmp.path().join("archive.db-wal");
+        fs::write(&wal_path, [0; 32])?;
+        assert!(!readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &cannot_open
+        ));
+        fs::write(&wal_path, [0; 33])?;
+        assert!(readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &cannot_open
+        ));
+        for error in [
+            FrankenError::Busy,
+            FrankenError::DatabaseCorrupt {
+                detail: "malformed canonical B-tree".into(),
+            },
+            FrankenError::DatabaseCorrupt {
+                detail: "conflicting virtual-table entries for another_table".into(),
+            },
+            FrankenError::NotADatabase {
+                path: db_path.clone(),
+            },
+        ] {
+            assert!(!readonly_rebuild_needs_archive_recovery(
+                &db_path,
+                &error.into()
+            ));
+        }
+        assert!(readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &FrankenError::DatabaseCorrupt {
+                detail: "conflicting virtual-table entries for fts_messages".into(),
+            }
+            .into(),
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh515_readonly_rebuilds_survive_unavailable_archive_write_admission() -> Result<()> {
+        let _ignore_sources = ignore_sources_config();
+        for busy_owner in [false, true] {
+            let tmp = TempDir::new()?;
+            let data_dir = tmp.path().join("rebuilt");
+            let db_path = tmp.path().join("archive.db");
+            let storage = FrankenStorage::open(&db_path)?;
+            seed_lexical_rebuild_fixture(&storage);
+            storage.set_last_indexed_at(123)?;
+            storage.close()?;
+            let lease_path = archive_lease::ArchiveWriteLease::path(&db_path)?;
+            let owner = if busy_owner {
+                Some(acquire_semantic_backfill_lock(
+                    &tmp.path().join("writer"),
+                    &db_path,
+                )?)
+            } else {
+                // A directory makes lease creation fail even when the test
+                // runs as root. No archive write lease can be acquired here.
+                fs::create_dir(&lease_path)?;
+                None
+            };
+            let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+            opts.force_rebuild = true;
+            opts.db_path = db_path.clone();
+            opts.progress = Some(Arc::new(IndexingProgress::default()));
+            run_index_with_local_connector_roots(opts, HashMap::new(), None)?;
+            assert_eq!(live_tantivy_doc_count(&index_dir(&data_dir)?)?, Some(4));
+            let search_data_dir = tmp.path().join("search-repair");
+            let repair = repair_lexical_index_from_canonical_db_for_search(
+                &db_path,
+                &search_data_dir,
+                None,
+            )?;
+            assert_eq!(repair.indexed_docs, 4);
+            assert_eq!(
+                live_tantivy_doc_count(&index_dir(&search_data_dir)?)?,
+                Some(4)
+            );
+            let storage = FrankenStorage::open_strict_readonly(&db_path)?;
+            assert_eq!(count_total_messages_exact(&storage)?, 4);
+            assert_eq!(storage.get_last_indexed_at()?, Some(123));
+            assert_eq!(
+                storage.raw().query_row_map(
+                    "PRAGMA integrity_check",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed::<String>(0)
+                )?,
+                "ok"
+            );
+            assert!(storage.raw().query("PRAGMA foreign_key_check")?.is_empty());
+            storage.close_without_checkpoint()?;
+            assert!(
+                !crate::search::asset_state::read_search_maintenance_snapshot(&data_dir).active
+            );
+            assert_eq!(lease_path.is_file(), busy_owner);
+            drop(owner);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_readonly_recovery_requires_archive_admission_and_retries_after_release() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        // Generate two real SQLite WAL generations, then retain the old SHM
+        // beside the new WAL. The fixture process exits; recovery ownership
+        // below belongs entirely to the real CASS admission and storage code.
+        let script = r#"
+import pathlib, shutil, sqlite3, sys
+p = pathlib.Path(sys.argv[1])
+seed = str(p) + '.seed'
+c = sqlite3.connect(seed)
+c.executescript('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(n INTEGER); INSERT INTO t VALUES(10);')
+old = pathlib.Path(seed + '-shm').read_bytes()
+c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+c.execute('INSERT INTO t VALUES(20)')
+c.commit()
+current = pathlib.Path(seed + '-shm').read_bytes()
+assert old[32:40] != current[32:40]
+for suffix in ['', '-wal']:
+    shutil.copyfile(seed + suffix, str(p) + suffix)
+pathlib.Path(str(p) + '-shm').write_bytes(old)
+c.close()
+"#;
+        let fixture = std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(&db_path)
+            .output()
+            .context("Python sqlite3 is required for the real stale-WAL-index fixture")?;
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let fingerprint = |suffix: &str| -> Result<(Vec<u8>, SystemTime)> {
+            let mut path = db_path.as_os_str().to_os_string();
+            path.push(suffix);
+            Ok((fs::read(&path)?, fs::metadata(&path)?.modified()?))
+        };
+        let main_before = fingerprint("")?;
+        let wal_before = fingerprint("-wal")?;
+        let shm_before = fingerprint("-shm")?;
+        let first_data = tmp.path().join("first");
+        let second_data = tmp.path().join("second");
+        let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+        let mut recovery_guard = None;
+        let started = Instant::now();
+        let error = open_readonly_rebuild_storage(&db_path, || {
+            recovery_guard = Some(acquire_search_maintenance_mutation_lock(
+                &second_data,
+                &db_path,
+                SearchMaintenanceJobKind::LexicalRefresh,
+            )?);
+            Ok(())
+        })
+        .err()
+        .context("a stale WAL index must not recover outside archive ownership")?;
+        assert!(error.is::<IndexRunBusy>(), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(recovery_guard.is_none());
+        assert_eq!(fingerprint("")?, main_before);
+        assert_eq!(fingerprint("-wal")?, wal_before);
+        assert_eq!(fingerprint("-shm")?, shm_before);
+        assert!(
+            read_index_run_lock_metadata_for_test(&second_data.join("index-run.lock"))?.is_empty()
+        );
+        drop(owner);
+
+        let started = Instant::now();
+        let storage = open_readonly_rebuild_storage(&db_path, || {
+            recovery_guard = Some(acquire_search_maintenance_mutation_lock(
+                &second_data,
+                &db_path,
+                SearchMaintenanceJobKind::LexicalRefresh,
+            )?);
+            Ok(())
+        })?;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(recovery_guard.is_some());
+        assert!(try_acquire_semantic_backfill_lock(&first_data, &db_path)?.is_none());
+        assert_eq!(
+            storage
+                .raw()
+                .query_row_map("SELECT sum(n) FROM t", &[] as &[ParamValue], |row| {
+                    row.get_typed::<i64>(0)
+                })?,
+            30
+        );
+        storage.close_without_checkpoint()?;
+        assert_eq!(fingerprint("")?, main_before);
+        assert_eq!(fingerprint("-wal")?, wal_before);
+        drop(recovery_guard);
+        FrankenStorage::open_strict_readonly(&db_path)?.close_without_checkpoint()?;
+        let _retry = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh515_empty_readonly_force_rebuild_acquires_archive_before_writable_fallback() -> Result<()>
+    {
+        let _ignore_sources = ignore_sources_config();
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        storage.set_last_indexed_at(123)?;
+        storage.close()?;
+        let owner = acquire_semantic_backfill_lock(&tmp.path().join("writer"), &db_path)?;
+        let data_dir = tmp.path().join("contender");
+        let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+        opts.force_rebuild = true;
+        opts.db_path = db_path.clone();
+        opts.progress = Some(Arc::new(IndexingProgress::default()));
+        let error = run_index_with_local_connector_roots(opts.clone(), HashMap::new(), None)
+            .expect_err("empty readonly probe must not bypass the existing archive writer");
+        assert!(error.is::<IndexRunBusy>());
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        assert_eq!(count_total_messages_exact(&storage)?, 0);
+        assert_eq!(storage.get_last_indexed_at()?, Some(123));
+        storage.close_without_checkpoint()?;
+        assert!(!crate::search::asset_state::read_search_maintenance_snapshot(&data_dir).active);
+        drop(owner);
+        run_index_with_local_connector_roots(opts, HashMap::new(), None)?;
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        assert_eq!(count_total_messages_exact(&storage)?, 0);
+        assert!(
+            storage
+                .get_last_indexed_at()?
+                .is_some_and(|timestamp| timestamp > 123)
+        );
+        assert_eq!(
+            storage
+                .raw()
+                .query_row_map("PRAGMA integrity_check", &[] as &[ParamValue], |row| row
+                    .get_typed::<String>(
+                    0
+                ))?,
+            "ok"
+        );
+        assert!(storage.raw().query("PRAGMA foreign_key_check")?.is_empty());
+        storage.close_without_checkpoint()?;
+        Ok(())
     }
 
     #[test]
@@ -62388,6 +63427,133 @@ mod tests {
             .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(message_count, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn gh515_targeted_watch_once_finishes_admitted_batch_after_stop() -> Result<()> {
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        struct StopOnWatchScan {
+            progress: Arc<IndexingProgress>,
+            observed: Arc<AtomicBool>,
+        }
+
+        #[derive(Default)]
+        struct WatchScanVisitor(bool);
+
+        impl Visit for WatchScanVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" && value == "watch_once_scan" {
+                    self.0 = true;
+                }
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, format!("{value:?}").trim_matches('"'));
+            }
+        }
+
+        impl<S: Subscriber> Layer<S> for StopOnWatchScan {
+            fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+                let mut visitor = WatchScanVisitor::default();
+                event.record(&mut visitor);
+                if visitor.0 && !self.observed.swap(true, Ordering::SeqCst) {
+                    // This event follows the real connector scan. Stop is
+                    // requested after work admission, before that selected
+                    // batch's canonical and lexical writes finish.
+                    self.progress.request_stop();
+                }
+            }
+        }
+
+        for watch in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let data_dir = tmp.path().join("cass-data");
+            let session = tmp
+                .path()
+                .join(".codex/sessions/rollout-gh515-watch-stop.jsonl");
+            write_semantic_watch_once_codex_session(&session, "gh515-watch-stop", "initial")?;
+            let mut opts = semantic_watch_once_opts(
+                &data_dir,
+                &session,
+                Arc::new(IndexingProgress::default()),
+            );
+            opts.semantic = false;
+            opts.watch = watch;
+            run_index(opts.clone(), None)?;
+
+            let marker = "gh515admittedtargetedbatch";
+            write_semantic_watch_once_codex_session(&session, "gh515-watch-stop", marker)?;
+            // Make this a changed source without depending on filesystem
+            // timestamp resolution or a scheduling delay between runs.
+            fs::File::options().write(true).open(&session)?.set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(2)),
+            )?;
+            let progress = Arc::new(IndexingProgress::default());
+            opts.progress = Some(Arc::clone(&progress));
+            let observed = Arc::new(AtomicBool::new(false));
+            let subscriber = Registry::default().with(StopOnWatchScan {
+                progress,
+                observed: Arc::clone(&observed),
+            });
+            let result =
+                tracing::subscriber::with_default(subscriber, || run_index(opts.clone(), None));
+            assert!(
+                observed.load(Ordering::SeqCst),
+                "targeted scan was not admitted"
+            );
+            let error = result.expect_err("the admitted stop must remain an interrupted result");
+            assert!(
+                error.downcast_ref::<IndexInterrupted>().is_some(),
+                "{error:#}"
+            );
+
+            let storage = FrankenStorage::open(&opts.db_path)?;
+            let committed = watch_lexical_canonical_rows(&storage);
+            assert_eq!(committed.len(), 2);
+            assert!(committed.iter().all(|row| row.3.contains(marker)));
+            assert_eq!(
+                storage.raw().query_row_map(
+                    "SELECT COUNT(*) FROM meta WHERE key LIKE 'watch_lexical_replay_v1:%'",
+                    &[],
+                    |row| row.get_typed::<i64>(0),
+                )?,
+                0,
+                "the admitted batch must finish lexical publication and clear its recovery debt"
+            );
+            storage.close()?;
+            let index_path = index_dir(&data_dir)?;
+            let published = watch_lexical_search_ids(&index_path, marker);
+            assert_eq!(published.len(), 2);
+            assert!(fs::read(data_dir.join("index-run.lock"))?.is_empty());
+
+            opts.progress = Some(Arc::new(IndexingProgress::default()));
+            run_index(opts.clone(), None)?;
+            let recovered = FrankenStorage::open(&opts.db_path)?;
+            assert_eq!(watch_lexical_canonical_rows(&recovered), committed);
+            assert_eq!(
+                recovered
+                    .raw()
+                    .query_row_map("PRAGMA integrity_check", &[], |row| {
+                        row.get_typed::<String>(0)
+                    })?,
+                "ok"
+            );
+            assert!(
+                recovered
+                    .raw()
+                    .query("PRAGMA foreign_key_check")?
+                    .is_empty()
+            );
+            recovered.close()?;
+            assert_eq!(watch_lexical_search_ids(&index_path, marker), published);
+            assert!(fs::read(data_dir.join("index-run.lock"))?.is_empty());
+        }
+        Ok(())
     }
 
     fn write_semantic_watch_once_codex_session(path: &Path, id: &str, marker: &str) -> Result<()> {
@@ -68758,6 +69924,12 @@ mod tests {
         assert!(
             !sidecar_path.exists(),
             "GH #436: a failed read-path repair must not leave index-run.lock.meta behind"
+        );
+        assert!(
+            !archive_lease::ArchiveWriteLease::path(&db_path)
+                .unwrap()
+                .exists(),
+            "an unopenable archive must not create an archive writer lease"
         );
     }
 

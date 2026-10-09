@@ -5303,6 +5303,35 @@ pub(crate) fn error_message_indicates_populated_fts_shadow_without_rowid_reload(
     mentions_populated_without_rowid_shadow && lower.contains("not yet supported")
 }
 
+/// Test-only rendezvous separating uncancellable engine bootstrap from SQL
+/// issued on an admitted connection. Baseline and candidate use the same hook.
+#[cfg(debug_assertions)]
+fn index_storage_open_rendezvous_for_test(path: &Path) -> Result<()> {
+    let (Some(ready), Some(release)) = (
+        dotenvy::var("CASS_TEST_INDEX_STORAGE_OPEN_READY").ok(),
+        dotenvy::var("CASS_TEST_INDEX_STORAGE_OPEN_RELEASE").ok(),
+    ) else {
+        return Ok(());
+    };
+    let ready = PathBuf::from(ready);
+    let release = PathBuf::from(release);
+    let receipt = serde_json::to_vec(&serde_json::json!({
+        "pid": std::process::id(),
+        "db_path": path,
+    }))?;
+    let temporary = ready.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temporary, receipt).context("writing storage-open test rendezvous")?;
+    fs::rename(&temporary, &ready).context("publishing storage-open test rendezvous")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.exists() {
+        if Instant::now() >= deadline {
+            bail!("storage-open test rendezvous was not released within 30 seconds");
+        }
+        std::thread::park_timeout(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 impl FrankenStorage {
     fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
         Self::new_with_shared_caches(
@@ -5423,6 +5452,8 @@ impl FrankenStorage {
             FrankenConnection::open(&path_str)
                 .with_context(|| format!("creating frankensqlite db at {}", path.display()))?
         };
+        #[cfg(debug_assertions)]
+        index_storage_open_rendezvous_for_test(path)?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
         retry_transient_storage_op("run_migrations", || storage.run_migrations())?;
@@ -44133,6 +44164,521 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .get_typed(0)
             .unwrap();
         assert_eq!(current, CURRENT_SCHEMA_VERSION);
+    }
+
+    fn gh515_v21_preparation_fixture(path: &Path) -> Result<FrankenStorage> {
+        let conn = FrankenConnection::open(path.to_string_lossy().into_owned())?;
+        run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS)?;
+        apply_conversation_tail_state_cache_migration(&conn)?;
+        let historic_steps: Vec<_> = POST_TAIL_CACHE_MIGRATION_STEPS
+            .iter()
+            .copied()
+            .filter(|(version, _, _)| *version <= 21)
+            .collect();
+        run_attributed_migration_steps(&conn, &historic_steps)?;
+        let fixture = FrankenStorage::new(conn, path.to_path_buf());
+        fixture.apply_config()?;
+        fixture.sync_meta_schema_version(21)?;
+        seed_atomic_fts_rebuild_fixture(&fixture);
+        assert_eq!(fixture.schema_version()?, 21);
+        assert!(
+            fixture
+                .raw()
+                .query("SELECT name FROM sqlite_master WHERE name = 'forgotten_sources'")?
+                .is_empty(),
+            "the fixture must genuinely predate the v22 table"
+        );
+        Ok(fixture)
+    }
+
+    fn gh515_stock_sqlite_v21_preparation_fixture(path: &Path) -> Result<()> {
+        assert!(
+            !path.exists(),
+            "the stock-SQLite fixture must use a fresh path"
+        );
+        // A FrankenSQLite-created fixture is stamped at birth and cannot prove
+        // first-engine-open validation. Build this historical archive entirely
+        // through the existing stock-SQLite interop layer, retaining its meta
+        // version tracking for the normal CASS migration-ledger transition.
+        let conn = rusqlite_test_fixture_conn(path);
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        for &(_, _, sql) in BASE_MIGRATION_STEPS {
+            conn.execute_batch(sql)?;
+        }
+        // The combined V13 schema already includes the V15 tail-state columns.
+        conn.execute_batch(MIGRATION_V15_TAIL_STATE_TABLE)?;
+        for &(version, _, sql) in POST_TAIL_CACHE_MIGRATION_STEPS {
+            if version <= 21 {
+                conn.execute_batch(sql)?;
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO meta(key, value) VALUES('schema_version', '21');
+             INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+             VALUES(1, 'codex', 'Codex', 'cli', 1700000000000, 1700000000000);
+             INSERT INTO workspaces(id, path) VALUES(1, '/tmp/gh515-stock-sqlite');
+             INSERT INTO conversations(id, agent_id, workspace_id, source_path, started_at)
+             VALUES(1, 1, 1, '/tmp/gh515-stock-sqlite/session.jsonl', 1700000000000);
+             INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
+             VALUES(1, 1, 0, 'user', 'first engine migration retains canonical text', 1700000000001);",
+        )?;
+        conn.execute_batch(FTS5_REGISTER_SQL)?;
+        conn.execute_batch(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(1, 'first engine migration retains canonical text', '', 'codex',
+                    '/tmp/gh515-stock-sqlite', '/tmp/gh515-stock-sqlite/session.jsonl', 1700000000001);",
+        )?;
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?,
+            "ok",
+            "the first engine open must receive a valid stock-SQLite archive"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "21"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'forgotten_sources'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0,
+            "the stock-SQLite fixture must genuinely predate the v22 table"
+        );
+        conn.close().map_err(|(_, error)| error)?;
+        assert!(!database_sidecar_path(path, ".fsqlite-migration-state").exists());
+        assert!(
+            !database_sidecar_path(path, "-wal").exists(),
+            "closing the sole stock-SQLite owner must leave WAL initialization pending"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_first_v22_migration_then_preparation_preserves_live_reader() -> Result<()> {
+        const TEST_NAME: &str = "storage::sqlite::tests::gh515_first_v22_migration_then_preparation_preserves_live_reader";
+        const DIRECTORY_ENV: &str = "CASS_TEST_GH515_MIGRATION_DIRECTORY";
+        const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+        let Some(test_root) = std::env::var_os(DIRECTORY_ENV) else {
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+
+            // The parent owns all fixture files and reaps the SQL owner before
+            // deleting them, including when a stuck migration exceeds its bound.
+            let directory = TempDir::new()?;
+            let log_path = directory.path().join("same-thread-migration.log");
+            let log = fs::File::create(&log_path)?;
+            let mut child = Child(
+                Command::new(std::env::current_exe()?)
+                    .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
+                    .env(DIRECTORY_ENV, directory.path())
+                    .env("CASS_DEFER_LEXICAL_UPDATES", "0")
+                    .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1000")
+                    .stdout(log.try_clone()?)
+                    .stderr(log)
+                    .spawn()?,
+            );
+            let deadline = Instant::now() + CHILD_TIMEOUT;
+            loop {
+                if let Some(status) = child.0.try_wait()? {
+                    let output = fs::read_to_string(&log_path)?;
+                    anyhow::ensure!(
+                        status.success() && output.contains("1 passed"),
+                        "GH515 same-thread migration child failed ({status}):\n{output}"
+                    );
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "GH515 same-thread migration child exceeded {CHILD_TIMEOUT:?}:\n{}",
+                        fs::read_to_string(&log_path)?
+                    );
+                }
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+        };
+        let test_root = PathBuf::from(test_root);
+        for (stock_sqlite_fixture, retain_reader) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let directory = TempDir::new_in(&test_root)?;
+            let path = directory.path().join("v21-preparation.db");
+            eprintln!(
+                "GH515 migration: stock_sqlite_fixture={stock_sqlite_fixture}, retain_reader={retain_reader}"
+            );
+            if stock_sqlite_fixture {
+                gh515_stock_sqlite_v21_preparation_fixture(&path)?;
+                assert!(
+                    !database_sidecar_path(&path, ".fsqlite-migration-state").exists(),
+                    "the stock-SQLite archive must have no marker before its first engine open"
+                );
+            } else {
+                let fixture = gh515_v21_preparation_fixture(&path)?;
+                fixture.close_without_checkpoint()?;
+            }
+
+            // Keep the same owner thread across open, migration and the two
+            // reported preparation queries. A peer on an initialized WAL can
+            // retain its snapshot through DDL and subsequent writer activity.
+            // A stock archive's first reader instead pins the main image while
+            // WAL initialization is still pending; that maintenance must wait
+            // until the reader releases its snapshot.
+            let mut reader = if retain_reader {
+                let reader = FrankenConnection::open_schema_only_with_wal_index_recovery(
+                    path.to_string_lossy().into_owned(),
+                )?;
+                reader.execute("BEGIN DEFERRED")?;
+                assert_eq!(
+                    reader
+                        .query_row("SELECT COUNT(*) FROM messages")?
+                        .get_typed::<i64>(0)?,
+                    1
+                );
+                Some(reader)
+            } else {
+                None
+            };
+            if stock_sqlite_fixture && retain_reader {
+                // fsqlite 0.4.9 install_wal_backend_with_vfs routes a missing
+                // WAL through with_wal_initialization. Its exclusive pager
+                // maintenance upgrade refuses an active peer transaction with
+                // BusyRecovery before initializing the WAL or running repair.
+                let original = fs::read(&path)?;
+                let started = Instant::now();
+                let error = match open_current_schema_storage_with_timeout(
+                    &path,
+                    Duration::from_secs(10),
+                ) {
+                    Err(error) => error,
+                    Ok(_) => bail!("first WAL initialization must respect the live reader"),
+                };
+                assert!(
+                    matches!(
+                        error.downcast_ref::<FrankenError>(),
+                        Some(FrankenError::BusyRecovery)
+                    ),
+                    "first-open contention must retain its retryable type: {error:#}"
+                );
+                assert!(
+                    started.elapsed() < CHILD_TIMEOUT,
+                    "contended bootstrap must settle within the existing child bound"
+                );
+                assert!(
+                    !database_sidecar_path(&path, ".fsqlite-migration-state").exists(),
+                    "a refused bootstrap must not claim that engine migration completed"
+                );
+                assert_eq!(
+                    fs::read(&path)?,
+                    original,
+                    "a refused bootstrap must preserve the canonical database image"
+                );
+                let peer = reader.take().context("retained stock-archive reader")?;
+                assert_eq!(
+                    peer.query_row("SELECT value FROM meta WHERE key = 'schema_version'")?
+                        .get_typed::<String>(0)?,
+                    "21"
+                );
+                assert_eq!(
+                    peer.query_row("SELECT COUNT(*) FROM messages")?
+                        .get_typed::<i64>(0)?,
+                    1
+                );
+                assert_eq!(
+                    peer.query_row("SELECT content FROM messages WHERE id = 1")?
+                        .get_typed::<String>(0)?,
+                    "first engine migration retains canonical text"
+                );
+                peer.execute("ROLLBACK")?;
+                peer.close_without_checkpoint()?;
+            }
+            let cancellation = crate::franken_sync::CancellationHandle::default();
+            let migrated = {
+                let _scope = cancellation.enter();
+                if stock_sqlite_fixture {
+                    assert!(
+                        !database_sidecar_path(&path, ".fsqlite-migration-state").exists(),
+                        "the optional schema-only reader must leave engine migration pending"
+                    );
+                    // Follow index admission: the ordinary constructor must
+                    // run pending engine validation even with a schema-only
+                    // peer, then v21 falls back to normal CASS migration.
+                    assert!(
+                        open_current_schema_storage_with_timeout(&path, Duration::from_secs(10))?
+                            .is_none(),
+                        "the historical v21 schema must still require CASS migration"
+                    );
+                    assert!(
+                        index_engine_migration_is_complete(&path),
+                        "first-engine-open validation must complete before v22 migration"
+                    );
+                }
+                let migrated = FrankenStorage::open(&path)?;
+                assert_eq!(migrated.schema_version()?, CURRENT_SCHEMA_VERSION);
+                assert_eq!(
+                    migrated
+                        .raw()
+                        .query_row("SELECT COUNT(*) FROM messages")?
+                        .get_typed::<i64>(0)?,
+                    1,
+                    "the exact message count must finish on the migration handle"
+                );
+                assert_eq!(
+                    migrated.fts_shadow_viability_with_bound(None)?,
+                    FtsShadowViability::Viable { corpus_messages: 1 }
+                );
+                migrated.raw().execute(
+                    "INSERT INTO forgotten_sources(source_path, forgotten_at_ms) \
+                     VALUES('/tmp/v22-recovery.jsonl', 1700000000000)",
+                )?;
+                migrated
+            };
+            if let Some(reader) = reader {
+                assert_eq!(
+                    reader
+                        .query_row("SELECT COUNT(*) FROM messages")?
+                        .get_typed::<i64>(0)?,
+                    1,
+                    "migration must preserve the live reader's canonical snapshot"
+                );
+                reader.execute("ROLLBACK")?;
+                reader.close_without_checkpoint()?;
+            }
+            let integrity = migrated.raw().query("PRAGMA integrity_check")?;
+            assert!(
+                !integrity.is_empty(),
+                "integrity proof must return a result"
+            );
+            for row in integrity {
+                assert_eq!(row.get_typed::<String>(0)?, "ok");
+            }
+            migrated.close()?;
+            let reopened = FrankenStorage::open(&path)?;
+            assert_eq!(reopened.schema_version()?, CURRENT_SCHEMA_VERSION);
+            assert_eq!(
+                reopened
+                    .raw()
+                    .query_row("SELECT COUNT(*) FROM messages")?
+                    .get_typed::<i64>(0)?,
+                1
+            );
+            assert_eq!(
+                reopened.fts_shadow_viability_with_bound(None)?,
+                FtsShadowViability::Viable { corpus_messages: 1 }
+            );
+            assert_eq!(
+                reopened
+                    .raw()
+                    .query_row("SELECT COUNT(*) FROM forgotten_sources")?
+                    .get_typed::<i64>(0)?,
+                1,
+                "the first post-migration write must survive reopening"
+            );
+            reopened.close()?;
+        }
+        Ok(())
+    }
+
+    /// Every potentially blocking engine operation runs in an owned child,
+    /// including fixture creation and recovery. The supervisor can therefore
+    /// fail a preparation stall and reap both peers without abandoning a
+    /// thread-affine connection or leaving an orphaned test process behind.
+    #[test]
+    fn gh515_cross_process_migration_and_preparation_are_bounded() -> Result<()> {
+        const TEST_NAME: &str =
+            "storage::sqlite::tests::gh515_cross_process_migration_and_preparation_are_bounded";
+        const ROLE_ENV: &str = "CASS_TEST_GH515_STORAGE_ROLE";
+        const DIRECTORY_ENV: &str = "CASS_TEST_GH515_STORAGE_DIRECTORY";
+        const BASE_MESSAGES: i64 = 128;
+        const INDEX_ATTEMPTS: i64 = 7;
+        const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+        if let Ok(role) = dotenvy::var(ROLE_ENV) {
+            let directory = PathBuf::from(dotenvy::var(DIRECTORY_ENV)?);
+            let path = directory.join("archive.db");
+            let count = |conn: &FrankenConnection| -> Result<i64> {
+                Ok(conn
+                    .query_row("SELECT COUNT(*) FROM messages")?
+                    .get_typed(0)?)
+            };
+            match role.as_str() {
+                "fixture" => {
+                    eprintln!("GH515 fixture: create genuine v21 archive");
+                    let storage = gh515_v21_preparation_fixture(&path)?;
+                    let conversation_id = storage
+                        .raw()
+                        .query_row("SELECT id FROM conversations LIMIT 1")?
+                        .get_typed::<i64>(0)?;
+                    let mut transaction = storage.raw().transaction()?;
+                    let body = "multipage canonical snapshot ".repeat(64);
+                    for idx in 1..BASE_MESSAGES {
+                        transaction.execute_compat(
+                            "INSERT INTO messages(conversation_id, idx, role, content) \
+                             VALUES(?1, ?2, 'user', ?3)",
+                            fparams![conversation_id, idx, body.as_str()],
+                        )?;
+                    }
+                    transaction.commit()?;
+                    drop(transaction);
+                    storage.rebuild_fts()?;
+                    assert_eq!(count(storage.raw())?, BASE_MESSAGES);
+                    storage.close_without_checkpoint()?;
+                }
+                "reader" => {
+                    eprintln!("GH515 reader: establish v21 WAL snapshot");
+                    let reader = open_franken_with_flags(
+                        path.to_string_lossy().as_ref(),
+                        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )?;
+                    reader.execute("BEGIN DEFERRED TRANSACTION")?;
+                    assert_eq!(count(&reader)?, BASE_MESSAGES);
+                    fs::write(directory.join("reader-ready"), b"pinned")?;
+                    let deadline = Instant::now() + CHILD_TIMEOUT + CHILD_TIMEOUT;
+                    while !directory.join("reader-release").exists() {
+                        if Instant::now() >= deadline {
+                            bail!("GH515 retained reader was not released");
+                        }
+                        std::thread::park_timeout(Duration::from_millis(10));
+                    }
+                    assert_eq!(
+                        count(&reader)?,
+                        BASE_MESSAGES,
+                        "the peer must retain its original snapshot through migration and writes"
+                    );
+                    reader.execute("ROLLBACK")?;
+                    reader.close_without_checkpoint()?;
+                }
+                "writer" => {
+                    let cancellation = crate::franken_sync::CancellationHandle::default();
+                    let _scope = cancellation.enter();
+                    for attempt in 0..INDEX_ATTEMPTS {
+                        eprintln!("GH515 writer {attempt}: open/migrate");
+                        let storage = FrankenStorage::open(&path)?;
+                        assert_eq!(storage.schema_version()?, CURRENT_SCHEMA_VERSION);
+                        eprintln!("GH515 writer {attempt}: exact count");
+                        assert_eq!(count(storage.raw())?, BASE_MESSAGES + attempt);
+                        eprintln!("GH515 writer {attempt}: FTS viability");
+                        assert_eq!(
+                            storage.fts_shadow_viability_with_bound(None)?,
+                            FtsShadowViability::Viable {
+                                corpus_messages: u64::try_from(BASE_MESSAGES + attempt)?
+                            }
+                        );
+                        eprintln!("GH515 writer {attempt}: append/close");
+                        storage.raw().execute_compat(
+                            "INSERT INTO messages(conversation_id, idx, role, content) \
+                             SELECT id, ?1, 'user', 'post-migration message' \
+                             FROM conversations LIMIT 1",
+                            fparams![BASE_MESSAGES + attempt],
+                        )?;
+                        storage.raw().execute_compat(
+                            "INSERT INTO forgotten_sources(source_path, forgotten_at_ms) \
+                             VALUES(?1, 1700000000000)",
+                            fparams![format!("/tmp/gh515-{attempt}.jsonl")],
+                        )?;
+                        storage.close_without_checkpoint()?;
+                    }
+                }
+                "recovery" => {
+                    eprintln!("GH515 recovery: reopen and verify committed archive");
+                    let storage = FrankenStorage::open(&path)?;
+                    assert_eq!(count(storage.raw())?, BASE_MESSAGES + INDEX_ATTEMPTS);
+                    assert_eq!(
+                        storage
+                            .raw()
+                            .query_row("SELECT COUNT(*) FROM forgotten_sources")?
+                            .get_typed::<i64>(0)?,
+                        INDEX_ATTEMPTS
+                    );
+                    let integrity = storage.raw().query("PRAGMA quick_check")?;
+                    assert!(!integrity.is_empty());
+                    for row in integrity {
+                        assert_eq!(row.get_typed::<String>(0)?, "ok");
+                    }
+                    storage.close()?;
+                }
+                _ => bail!("unknown GH515 storage child role: {role}"),
+            }
+            return Ok(());
+        }
+
+        struct Child {
+            process: std::process::Child,
+            log_path: PathBuf,
+        }
+        impl Child {
+            fn spawn(directory: &Path, role: &str) -> Result<Self> {
+                let log_path = directory.join(format!("{role}.log"));
+                let log = fs::File::create(&log_path)?;
+                let process = Command::new(std::env::current_exe()?)
+                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .env(ROLE_ENV, role)
+                    .env(DIRECTORY_ENV, directory)
+                    .env("CASS_DEFER_LEXICAL_UPDATES", "0")
+                    .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1000")
+                    .stdout(log.try_clone()?)
+                    .stderr(log)
+                    .spawn()?;
+                Ok(Self { process, log_path })
+            }
+
+            fn wait(&mut self, ready: Option<&Path>) -> Result<()> {
+                let deadline = Instant::now() + CHILD_TIMEOUT;
+                loop {
+                    if let Some(status) = self.process.try_wait()? {
+                        let output = fs::read_to_string(&self.log_path)?;
+                        if ready.is_some() || !status.success() || !output.contains("1 passed") {
+                            bail!("GH515 storage child exited {status}:\n{output}");
+                        }
+                        return Ok(());
+                    }
+                    if ready.is_some_and(Path::exists) {
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        let output = fs::read_to_string(&self.log_path)?;
+                        bail!("GH515 storage child exceeded {CHILD_TIMEOUT:?}:\n{output}");
+                    }
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+            }
+        }
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.process.kill();
+                let _ = self.process.wait();
+            }
+        }
+
+        for retain_reader in [false, true] {
+            let directory = TempDir::new()?;
+            Child::spawn(directory.path(), "fixture")?.wait(None)?;
+            let mut reader = if retain_reader {
+                let mut reader = Child::spawn(directory.path(), "reader")?;
+                reader.wait(Some(&directory.path().join("reader-ready")))?;
+                Some(reader)
+            } else {
+                None
+            };
+            Child::spawn(directory.path(), "writer")?.wait(None)?;
+            if let Some(reader) = reader.as_mut() {
+                assert!(reader.process.try_wait()?.is_none());
+                fs::write(directory.path().join("reader-release"), b"release")?;
+                reader.wait(None)?;
+            }
+            Child::spawn(directory.path(), "recovery")?.wait(None)?;
+        }
+        Ok(())
     }
 
     #[test]

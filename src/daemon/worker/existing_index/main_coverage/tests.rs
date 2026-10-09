@@ -7,7 +7,8 @@ fn write_index(
     rows: &[(String, Vec<f32>)],
     quantization: Quantization,
 ) -> anyhow::Result<()> {
-    let mut writer = VectorIndex::create_with_revision(path, "coverage-test", "v1", 4, quantization)?;
+    let mut writer =
+        VectorIndex::create_with_revision(path, "coverage-test", "v1", 4, quantization)?;
     for (id, vector) in rows {
         writer.write_record(id, vector)?;
     }
@@ -55,11 +56,7 @@ fn on_demand_counts_match_exhaustive_f16_and_f32_census() -> anyhow::Result<()> 
         }
         write_index(&path, &rows, quantization)?;
         let mut writer = VectorIndex::open_writer(&path)?;
-        let deleted: Vec<_> = rows
-            .iter()
-            .step_by(11)
-            .map(|(id, _)| id.as_str())
-            .collect();
+        let deleted: Vec<_> = rows.iter().step_by(11).map(|(id, _)| id.as_str()).collect();
         writer.soft_delete_batch(&deleted)?;
         drop(writer);
         let source = VectorIndex::open_read_only(&path)?;
