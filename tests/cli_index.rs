@@ -4181,10 +4181,24 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     assert_eq!(timeout["retryable"], true, "{timeout}");
     assert_eq!(timeout["context"], "index run", "{timeout}");
     assert_eq!(timeout["deadline_ms"], 1_000, "{timeout}");
-    assert!(
-        !coding_agent_search::search::asset_state::read_search_maintenance_snapshot(&data_dir)
-            .active,
-        "a reaped checkpoint owner must not retain active indexing admission"
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass status after the reaped checkpoint");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap_or_else(|err| {
+        panic!(
+            "status --json must print JSON ({err}); stdout={} stderr={}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )
+    });
+    assert_eq!(
+        status["rebuild"]["active"], false,
+        "a reaped checkpoint owner must not retain active indexing admission: {status}"
     );
     let archive_contents = || {
         use coding_agent_search::franken_sync::compat::{

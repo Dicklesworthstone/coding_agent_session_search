@@ -4,6 +4,8 @@
 
 #[path = "../src/indexer/memoization.rs"]
 pub(crate) mod memoization;
+// This target uses part of the redactor; the library target lints the rest.
+#[allow(dead_code)]
 #[path = "../src/indexer/redact_secrets.rs"]
 mod redact_secrets;
 #[path = "../src/indexer/responsiveness/resident/policy.rs"]
