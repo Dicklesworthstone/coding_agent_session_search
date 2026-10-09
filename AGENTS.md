@@ -323,7 +323,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **Current state:** the general workflows (`CI`, Release, Coverage, Benchmarks, Browser Tests, Fuzzing, Install Test, Fresh Clone Build) are `disabled_manually`; only narrow issue-specific regression workflows run on push, and none of them is a merge gate. Until CI is re-enabled this gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
+Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **GitHub Actions is permanently off** (owner, 2026-10-09: "NO GH ACTIONS, PERIOD!!! EVER!!! we ONLY ever use /dsr"). Nothing under `.github/workflows/` runs: do not add or edit a workflow as a verification lane, and never make a bead's closure wait on a workflow run. Windows and macOS proof comes from the dsr build hosts (`dsr health all`), releases from `dsr build` / `dsr release` / `dsr fallback`. This gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
 
 **Local pre-flight before pushing:**
 
@@ -339,7 +339,7 @@ ubs $(git diff --name-only --cached)
 
 If a known-acceptable warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
 
-The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file when the workflow is enabled. Local installs should match.
+The pinned UBS version lives in `.github/workflows/ubs-version.txt`. Local installs should match.
 
 ---
 
@@ -414,19 +414,14 @@ Use `FrankenConnectionManager` for concurrent access:
 
 ## E2E Browser Tests
 
-**IMPORTANT:** E2E browser tests (Playwright) should only be run on GitHub Actions CI, NOT locally.
+**IMPORTANT:** Do not run the E2E browser tests (Playwright) on the shared development machine.
 
-Running browser tests locally:
+Running browser tests there:
 - Consumes significant system resources (spawns browser instances)
 - Can freeze or slow down the development machine
-- May have different results than CI due to environment differences
+- May have different results than a clean host due to environment differences
 
-**Push to a branch and let GitHub Actions run the tests.** The CI workflow in `.github/workflows/browser-tests.yml` handles:
-- Installing browsers
-- Running tests in parallel across Chromium, Firefox, and WebKit
-- Uploading test artifacts and reports
-
-If you need to debug a specific test, use `test.only()` and run a single spec file, but prefer CI for full test runs.
+GitHub Actions is permanently off, so `.github/workflows/browser-tests.yml` never runs: pushing a branch does not run them. Run browser specs on a dsr build host, one spec file at a time while debugging (`test.only()`), and name the host in the receipt.
 
 ---
 
