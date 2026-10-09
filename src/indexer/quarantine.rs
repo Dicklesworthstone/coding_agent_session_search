@@ -19,6 +19,8 @@
 //! make a previously-poison session indexable again produces a fresh
 //! quarantine record rather than coalescing with the stale one.
 
+mod checkpoint;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -184,16 +186,12 @@ impl QuarantineState {
         })
     }
 
-    /// Atomically write the quarantine state to disk via temp file + rename,
-    /// so partial writes can never produce a corrupt quarantine_state.json.
+    /// Stream, flush and atomically replace the recovery checkpoint. A failed
+    /// preparation leaves the previous file intact; see the publication and
+    /// directory-sync qualifications in `checkpoint::save`.
     pub fn save(&self, data_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
-        let final_path = Self::path(data_dir);
-        let tmp_path = data_dir.join(format!("{}.tmp", Self::FILENAME));
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp_path, json)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+        checkpoint::save(&Self::path(data_dir), self)
     }
 
     /// Record an attempt that failed irreducibly on `key`. If the key
@@ -339,10 +337,7 @@ pub fn record_connector_line(
             last_observed_at: now,
             attempt_count: 1,
         });
-    let temp_path = quarantine_dir.join("connector_ingest_lines.json.tmp");
-    let json = serde_json::to_vec_pretty(&state).map_err(std::io::Error::other)?;
-    std::fs::write(&temp_path, json)?;
-    std::fs::rename(temp_path, path)
+    checkpoint::save(&path, &state)
 }
 
 #[cfg(test)]
