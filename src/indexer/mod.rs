@@ -63434,6 +63434,7 @@ c.close()
     #[test]
     #[serial]
     fn gh515_targeted_watch_once_finishes_admitted_batch_after_stop() -> Result<()> {
+        use std::io::Write;
         use tracing::field::{Field, Visit};
         use tracing::{Event, Subscriber};
         use tracing_subscriber::Registry;
@@ -63489,7 +63490,17 @@ c.close()
             run_index(opts.clone(), None)?;
 
             let marker = "gh515admittedtargetedbatch";
-            write_semantic_watch_once_codex_session(&session, "gh515-watch-stop", marker)?;
+            // The admitted batch is a new turn appended to the session, as a
+            // live rollout grows. Rewriting the existing turns would not do:
+            // ingest keeps a message already stored at its index.
+            fs::OpenOptions::new().append(true).open(&session)?.write_all(
+                format!(
+                    r#"{{"timestamp":"2026-05-28T09:00:03.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{marker} user semantic"}}]}}}}
+{{"timestamp":"2026-05-28T09:00:04.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{marker} assistant semantic"}}]}}}}
+"#
+                )
+                .as_bytes(),
+            )?;
             // Make this a changed source without depending on filesystem
             // timestamp resolution or a scheduling delay between runs.
             fs::File::options().write(true).open(&session)?.set_times(
@@ -63516,8 +63527,16 @@ c.close()
 
             let storage = FrankenStorage::open(&opts.db_path)?;
             let committed = watch_lexical_canonical_rows(&storage);
-            assert_eq!(committed.len(), 2);
-            assert!(committed.iter().all(|row| row.3.contains(marker)));
+            assert_eq!(committed.len(), 4, "{committed:?}");
+            assert_eq!(
+                committed
+                    .iter()
+                    .filter(|row| row.3.contains(marker))
+                    .map(|row| row.2)
+                    .collect::<Vec<_>>(),
+                [2, 3],
+                "the admitted turn must be committed whole: {committed:?}"
+            );
             assert_eq!(
                 storage.raw().query_row_map(
                     "SELECT COUNT(*) FROM meta WHERE key LIKE 'watch_lexical_replay_v1:%'",
