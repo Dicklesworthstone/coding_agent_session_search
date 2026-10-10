@@ -80,6 +80,16 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`cass index` verifies the lexical index one time fewer per run.** Each
+  Quill open hashes every live segment, and the startup check opened the
+  index twice: once for its document count and once for the contract check.
+  One open now supplies both. A writer's document count also comes from the
+  snapshot the writer already verified instead of a fresh reader. On a
+  471,594-message test archive with a 678 MB index, a run with nothing to
+  index now reads 4.1 GB through the page cache instead of 4.8 GB (disk reads
+  unchanged at 703 MB). Most of the remaining work is the Quill writer open,
+  which verifies the index four times; frankensearch's main branch reduces
+  that to once, and cass needs a frankensearch release to pick it up.
 - **`cass index` repairs duplicate `fts_messages` schema rows again instead
   of refusing the archive.** Two pre-index checks counted the duplicate row
   as archive damage, so `cass index` exited with "refusing to index: the

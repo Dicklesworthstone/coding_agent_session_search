@@ -1199,6 +1199,8 @@ impl QuillCassIndex {
     ///
     /// Returns an error when the published snapshot cannot be opened.
     pub fn reader(&self) -> Result<QuillSearchIndex> {
+        #[cfg(test)]
+        READER_OPEN_COUNT.with(|count| count.set(count.get() + 1));
         drive(|cx| {
             let directory = self.directory.clone();
             async move {
@@ -1221,7 +1223,21 @@ impl QuillCassIndex {
     /// Returns an error when publication authority cannot prove the snapshot
     /// readable.
     pub fn doc_count(&self) -> Result<u64> {
-        Ok(self.reader()?.doc_count()?)
+        // The writer verified its published snapshot when it opened or
+        // committed it. A new reader would hash every segment again, which
+        // is a full read of the lexical index per call. Reopen only when the
+        // engine says publication may have moved past this writer's view.
+        match self.index.doc_count() {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    path = %self.directory.display(),
+                    "writer snapshot cannot vouch for the published count; reopening a reader"
+                );
+                Ok(self.reader()?.doc_count()?)
+            }
+        }
     }
 
     /// Durable directory backing this index.
@@ -2559,6 +2575,37 @@ mod tests {
             .expect("index documents");
         index.commit().expect("commit");
         assert_eq!(index.doc_count().expect("doc count"), 2);
+    }
+
+    /// Counting documents on a writer reads its verified snapshot. A reader
+    /// open re-hashes every segment, so a no-op `cass index` that asked for
+    /// the count several times read the whole lexical index each time.
+    #[test]
+    fn writer_doc_count_tracks_commits_without_opening_a_reader() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        index
+            .add_cass_documents(&[sample("alpha", 0, "first published document")])
+            .expect("index one document");
+        index.commit().expect("commit");
+        let opens = reader_open_count();
+        assert_eq!(index.doc_count().expect("doc count"), 1);
+        index
+            .add_cass_documents(&[sample("beta", 1, "second published document")])
+            .expect("index another document");
+        assert_eq!(
+            index.doc_count().expect("doc count before commit"),
+            1,
+            "an uncommitted document is not published"
+        );
+        index.commit().expect("commit");
+        assert_eq!(index.doc_count().expect("doc count"), 2);
+        assert_eq!(reader_open_count(), opens, "doc_count opened a reader");
+        // A fresh reader agrees with the writer's count.
+        assert_eq!(
+            index.reader().expect("reader").doc_count().expect("count"),
+            2
+        );
     }
 
     /// A reentrant bridge call must not re-enter `block_on` on one runtime.

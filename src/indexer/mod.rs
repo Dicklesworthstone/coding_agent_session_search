@@ -17937,29 +17937,17 @@ fn run_index_with_storage_ownership(
         // rebuild so we do a full scan and reindex messages into the new index
         // (SQLite is incremental-only by default).
         if !tantivy_requires_rebuild {
-            match crate::search::tantivy::searchable_index_summary(&index_path) {
-                Ok(Some(summary)) => {
-                    if let Err(e) =
-                        crate::search::tantivy::validate_searchable_index_contract(&index_path)
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            path = %index_path.display(),
-                            "tantivy contract preflight failed; forcing rebuild"
-                        );
-                        tantivy_requires_rebuild = true;
-                    } else {
-                        observed_tantivy_docs = Some(summary.docs);
-                    }
-                }
-                Ok(None) => {
-                    tantivy_requires_rebuild = true;
+            // One validated open supplies both the contract check and the
+            // live doc count; each Quill open hashes every live segment.
+            match crate::search::tantivy::validated_searchable_index_summary(&index_path) {
+                Ok(summary) => {
+                    observed_tantivy_docs = Some(summary.docs);
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         path = %index_path.display(),
-                        "tantivy open preflight failed; forcing rebuild"
+                        "tantivy open/contract preflight failed; forcing rebuild"
                     );
                     tantivy_requires_rebuild = true;
                 }
