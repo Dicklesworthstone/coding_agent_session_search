@@ -1,12 +1,20 @@
 //! Stale-on-read index catch-up: spawn a detached, low-priority incremental
 //! `cass index` when a read path (search, pack, TUI launch, daemon tick)
-//! notices the index is behind the session files on disk.
+//! notices the index is behind, or its last successful source scan is overdue.
 //!
 //! Design constraints:
 //!
 //! * **Never block the read.** The caller serves its current (possibly stale)
 //!   results immediately; the catch-up runs in a separate process that
-//!   outlives the caller. The *next* read is fresh.
+//!   outlives the caller. Later reads see new sessions after it publishes.
+//! * **Source freshness is separate from index health.** A healthy generation
+//!   does not prove that new provider files have been scanned (GH #514). After
+//!   five minutes since `last_indexed_at`, the next eligible read requests an
+//!   incremental scan even when `stale` is false and no pending count is known.
+//!   This is not a timer or a promise to finish indexing within five minutes.
+//!   No provider directory is walked by the read path. Override the interval
+//!   with `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS`; zero disables only this cadence,
+//!   leaving stale/partial/pending catch-up and the global opt-out unchanged.
 //! * **At most one catch-up at a time, machine-wide per data dir.** The
 //!   spawned child takes the normal `index-run.lock`, so it cannot race a
 //!   foreground `cass index`; this module additionally checks that lock
@@ -45,6 +53,11 @@ use tracing::{debug, info, warn};
 
 /// Default minimum spacing between two auto-spawned catch-up runs.
 pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
+
+/// Successful-scan age after which reads request another incremental pass.
+/// Unlike the spawn cooldown, a successful foreground or scheduled run resets
+/// this clock too. It does not change the health surface's stale threshold.
+pub const DEFAULT_SOURCE_SCAN_SECS: u64 = 300;
 
 /// Spacing after an auto-spawned catch-up ended without advancing the index,
 /// indexed by `consecutive_failures - 1`, measured from the moment the failure
@@ -282,6 +295,34 @@ pub fn judge_previous_spawn(
 /// `cass search --robot-meta` and `cass status` emit) warrants a catch-up.
 /// Returns the reason string that will be recorded, or `None`.
 pub fn catch_up_reason(index_freshness: &serde_json::Value) -> Option<&'static str> {
+    catch_up_reason_at(index_freshness, now_ms(), source_scan_interval_from_env())
+}
+
+fn parse_source_scan_interval(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn source_scan_interval_from_env() -> Duration {
+    let default = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+    let Ok(value) = dotenvy::var("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS") else {
+        return default;
+    };
+    parse_source_scan_interval(&value).unwrap_or_else(|| {
+        warn!(
+            default_secs = DEFAULT_SOURCE_SCAN_SECS,
+            "invalid CASS_AUTO_REFRESH_SOURCE_SCAN_SECS; expected nonnegative integer seconds, using default"
+        );
+        default
+    })
+}
+
+/// Pure policy: no source traversal, metadata writes, sleeps, or child startup.
+/// The ordinary spawn path still enforces opt-out, locks, cooldown and breaker.
+fn catch_up_reason_at(
+    index_freshness: &serde_json::Value,
+    now: i64,
+    source_scan_interval: Duration,
+) -> Option<&'static str> {
     let flag = |key: &str| {
         index_freshness
             .get(key)
@@ -309,7 +350,18 @@ pub fn catch_up_reason(index_freshness: &serde_json::Value) -> Option<&'static s
     if pending > 0 {
         return Some("pending-sessions");
     }
-    None
+    if source_scan_interval.is_zero() {
+        return None;
+    }
+    // Missing, malformed, sentinel and future watermarks cannot prove age.
+    // Do not replace them with epoch zero and launch on every otherwise
+    // healthy read. Explicit unhealthy flags above keep their existing policy.
+    let last_scan = last_indexed_at_ms_from_freshness(index_freshness)?;
+    if last_scan <= 0 {
+        return None;
+    }
+    let elapsed_ms = u64::try_from(now.checked_sub(last_scan)?).ok()?;
+    (Duration::from_millis(elapsed_ms) >= source_scan_interval).then_some("source-scan-overdue")
 }
 
 /// Cooldown check factored out for tests.
@@ -975,6 +1027,217 @@ mod tests {
         assert_eq!(catch_up_reason(&missing), None);
         let rebuilding = serde_json::json!({"exists": true, "rebuilding": true, "stale": true});
         assert_eq!(catch_up_reason(&rebuilding), None);
+    }
+
+    #[test]
+    fn gh514_healthy_generation_requests_an_overdue_source_scan() {
+        let last_scan = 1_800_000_000_000_i64;
+        let freshness = serde_json::json!({
+            "exists": true, "rebuilding": false, "partial": false,
+            "stale": false, "pending_sessions": 0, "last_indexed_at": last_scan,
+        });
+        let before = freshness.clone();
+        let interval = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+        for (age, expected) in [
+            (0, None),
+            (299_999, None),
+            (300_000, Some("source-scan-overdue")),
+            (29 * 60_000, Some("source-scan-overdue")),
+        ] {
+            assert_eq!(
+                catch_up_reason_at(&freshness, last_scan + age, interval),
+                expected
+            );
+        }
+        // Source-scan admission is not a claim that the indexed generation
+        // became unhealthy, nor a guess that any source has actually changed.
+        assert_eq!(freshness, before);
+    }
+
+    #[test]
+    fn gh514_successful_scan_resets_age_even_without_known_pending_sessions() {
+        let now = 1_800_000_000_000_i64;
+        let interval = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+        let mut freshness = serde_json::json!({
+            "exists": true, "stale": false, "last_indexed_at": now - 300_000,
+        });
+        assert_eq!(
+            catch_up_reason_at(&freshness, now, interval),
+            Some("source-scan-overdue")
+        );
+        // Foreground, scheduled and no-op successful scans all publish the
+        // same watermark; there is no separate auto-refresh-only age clock.
+        freshness["last_indexed_at"] = serde_json::json!(now);
+        assert_eq!(catch_up_reason_at(&freshness, now + 299_999, interval), None);
+        assert_eq!(
+            catch_up_reason_at(&freshness, now + 300_000, interval),
+            Some("source-scan-overdue")
+        );
+    }
+
+    #[test]
+    fn gh514_scan_age_accepts_real_receipt_timestamps_and_millisecond_boundaries() {
+        let stamp = "2026-10-10T00:00:00.125Z";
+        let last_scan = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap()
+            .timestamp_millis();
+        let interval = Duration::from_secs(60);
+        for value in [serde_json::json!(stamp), serde_json::json!(last_scan)] {
+            let freshness = serde_json::json!({"exists": true, "last_indexed_at": value});
+            assert_eq!(
+                catch_up_reason_at(&freshness, last_scan + 59_999, interval),
+                None
+            );
+            assert_eq!(
+                catch_up_reason_at(&freshness, last_scan + 60_000, interval),
+                Some("source-scan-overdue")
+            );
+        }
+    }
+
+    #[test]
+    fn gh514_scan_cadence_never_overrides_rebuild_or_existing_repair_reasons() {
+        let now = 1_800_000_000_000_i64;
+        let interval = Duration::from_secs(1);
+        for (flags, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"exists": false}), None),
+            (
+                serde_json::json!({"exists": true, "rebuilding": true}),
+                None,
+            ),
+            (
+                serde_json::json!({"exists": true, "partial": true, "stale": true}),
+                Some("index-partial"),
+            ),
+            (
+                serde_json::json!({"exists": true, "stale": true, "pending_sessions": 1}),
+                Some("index-stale"),
+            ),
+            (
+                serde_json::json!({"exists": true, "pending_sessions": 1}),
+                Some("pending-sessions"),
+            ),
+        ] {
+            let mut freshness = flags;
+            freshness["last_indexed_at"] = serde_json::json!(now - 300_000);
+            assert_eq!(catch_up_reason_at(&freshness, now, interval), expected);
+            // Zero disables age-based scans, not stale/partial/pending repair.
+            assert_eq!(catch_up_reason_at(&freshness, now, Duration::ZERO), expected);
+        }
+        let healthy = serde_json::json!({"exists": true, "last_indexed_at": 1});
+        assert_eq!(catch_up_reason_at(&healthy, now, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn gh514_unknown_or_future_scan_times_do_not_become_epoch_zero() {
+        let now = 1_800_000_000_000_i64;
+        let interval = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("not-a-timestamp"),
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(i64::MIN),
+            serde_json::json!(i64::MAX),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(now + 1),
+            serde_json::json!(false),
+        ] {
+            let freshness = serde_json::json!({"exists": true, "last_indexed_at": value});
+            assert_eq!(
+                catch_up_reason_at(&freshness, now, interval),
+                None,
+                "{freshness}"
+            );
+        }
+        let freshness = serde_json::json!({"exists": true, "last_indexed_at": 1});
+        assert_eq!(catch_up_reason_at(&freshness, i64::MIN, interval), None);
+        assert_eq!(
+            catch_up_reason_at(&freshness, i64::MAX, Duration::from_secs(u64::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn gh514_source_scan_interval_is_separate_from_spawn_cooldown() {
+        assert_eq!(
+            parse_source_scan_interval(" 60 "),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(parse_source_scan_interval("0"), Some(Duration::ZERO));
+        assert_eq!(
+            parse_source_scan_interval(&u64::MAX.to_string()),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        for invalid in ["", "-1", "1.5", "false", "18446744073709551616"] {
+            assert_eq!(parse_source_scan_interval(invalid), None);
+        }
+        let now = 1_800_000_000_000_i64;
+        let freshness = serde_json::json!({"exists": true, "last_indexed_at": now - 60_000});
+        assert_eq!(
+            catch_up_reason_at(&freshness, now, Duration::from_secs(60)),
+            Some("source-scan-overdue")
+        );
+        let recent_spawn = AutoRefreshState {
+            last_spawn_ms: now - 1000,
+            ..AutoRefreshState::default()
+        };
+        assert_eq!(
+            cooldown_remaining(
+                Some(&recent_spawn),
+                AutoRefreshPolicy::default().cooldown,
+                now
+            ),
+            Some(299)
+        );
+    }
+
+    #[test]
+    fn gh514_overdue_source_scan_keeps_global_opt_out_and_failed_run_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("disabled");
+        let now = now_ms();
+        let freshness = serde_json::json!({"exists": true, "last_indexed_at": now - 600_000});
+        let reason = catch_up_reason_at(&freshness, now, Duration::from_secs(300)).unwrap();
+        let disabled = maybe_spawn_with_policy(
+            &missing,
+            &missing.join("agent_search.db"),
+            reason,
+            false,
+            last_indexed_at_ms_from_freshness(&freshness),
+            AutoRefreshPolicy {
+                enabled: false,
+                ..AutoRefreshPolicy::default()
+            },
+        );
+        assert_eq!(disabled, AutoRefreshOutcome::Disabled);
+        assert!(!missing.exists());
+
+        let prior = AutoRefreshState {
+            last_spawn_ms: now - 3_600_000,
+            last_pid: 4242,
+            last_reason: reason.into(),
+            ..AutoRefreshState::default()
+        };
+        save_state(dir.path(), &prior).unwrap();
+        let blocked = maybe_spawn_with_policy(
+            dir.path(),
+            &dir.path().join("agent_search.db"),
+            reason,
+            false,
+            Some(prior.last_spawn_ms - 1),
+            AutoRefreshPolicy::default(),
+        );
+        assert!(matches!(
+            blocked,
+            AutoRefreshOutcome::BackedOff {
+                consecutive_failures: 1,
+                ..
+            }
+        ));
+        assert_eq!(load_state(dir.path()).unwrap().last_pid, 4242);
+        assert!(!log_path(dir.path()).exists(), "no child was started");
     }
 
     #[test]
