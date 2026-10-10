@@ -10,16 +10,78 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{MAX_RECORD_BYTES, MAX_ROW_BYTES, Record, read_record_bytes};
+use super::{ContinuedRow, MAX_RECORD_BYTES, MAX_ROW_BYTES, Record, read_record_bytes};
 
 const CHUNK_BYTES: usize = 1024 * 1024;
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Serialize)]
+#[serde(tag = "type", deny_unknown_fields)]
 enum Frame {
-    RowStart { bytes: usize },
-    RowChunk { sequence: usize, data: String },
-    RowEnd { sha256: String },
+    #[serde(rename = "row_start")]
+    Start { bytes: usize },
+    #[serde(rename = "row_chunk")]
+    Chunk { sequence: usize, data: String },
+    #[serde(rename = "row_end")]
+    End { sha256: String },
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier)]
+enum FrameKind {
+    #[serde(rename = "row_start")]
+    Start,
+    #[serde(rename = "row_chunk")]
+    Chunk,
+    #[serde(rename = "row_end")]
+    End,
+}
+
+fn present_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+impl<'de> Deserialize<'de> for Frame {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(rename = "type")]
+            kind: FrameKind,
+            #[serde(default, deserialize_with = "present_field")]
+            bytes: Option<usize>,
+            #[serde(default, deserialize_with = "present_field")]
+            sequence: Option<usize>,
+            #[serde(default, deserialize_with = "present_field")]
+            data: Option<String>,
+            #[serde(default, deserialize_with = "present_field")]
+            sha256: Option<String>,
+        }
+
+        // This parser also handles the ordinary-record fallback. Never buffer
+        // arbitrary JSON before discovering an unknown field or wrong scalar
+        // type; absence and explicit null must remain distinct for each field.
+        let fields = Fields::deserialize(deserializer)?;
+        match (
+            fields.kind,
+            fields.bytes,
+            fields.sequence,
+            fields.data,
+            fields.sha256,
+        ) {
+            (FrameKind::Start, Some(bytes), None, None, None) => Ok(Self::Start { bytes }),
+            (FrameKind::Chunk, None, Some(sequence), Some(data), None) => {
+                Ok(Self::Chunk { sequence, data })
+            }
+            (FrameKind::End, None, None, None, Some(sha256)) => Ok(Self::End { sha256 }),
+            _ => Err(serde::de::Error::custom(
+                "continuation type and payload disagree",
+            )),
+        }
+    }
 }
 
 fn invalid(line: u64, message: impl std::fmt::Display) -> anyhow::Error {
@@ -56,10 +118,10 @@ pub(super) fn write(bytes: &[u8], output: &mut impl Write) -> io::Result<()> {
             "invalid continued row size",
         ));
     }
-    write_frame(&Frame::RowStart { bytes: bytes.len() }, output)?;
+    write_frame(&Frame::Start { bytes: bytes.len() }, output)?;
     for (sequence, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
         write_frame(
-            &Frame::RowChunk {
+            &Frame::Chunk {
                 sequence,
                 data: STANDARD.encode(chunk),
             },
@@ -67,7 +129,7 @@ pub(super) fn write(bytes: &[u8], output: &mut impl Write) -> io::Result<()> {
         )?;
     }
     write_frame(
-        &Frame::RowEnd {
+        &Frame::End {
             sha256: hex::encode(Sha256::digest(bytes)),
         },
         output,
@@ -96,7 +158,7 @@ impl<R: BufRead> Chunks<'_, R> {
             .ok_or_else(|| invalid(self.line, "incomplete continued row"))?;
         let next = frame(&bytes, self.line)?;
         if self.remaining == 0 {
-            let Frame::RowEnd { sha256 } = next else {
+            let Frame::End { sha256 } = next else {
                 return Err(invalid(
                     self.line,
                     "expected row_end after the declared row bytes",
@@ -110,7 +172,7 @@ impl<R: BufRead> Chunks<'_, R> {
             self.position = 0;
             return Ok(());
         }
-        let Frame::RowChunk { sequence, data } = next else {
+        let Frame::Chunk { sequence, data } = next else {
             return Err(invalid(self.line, "expected the next row_chunk"));
         };
         if sequence != self.sequence {
@@ -182,7 +244,7 @@ impl Write for Size {
 }
 
 pub(super) fn read(reader: &mut impl BufRead, start: &[u8], line: u64) -> Result<Record> {
-    let Frame::RowStart { bytes } = frame(start, line)? else {
+    let Frame::Start { bytes } = frame(start, line)? else {
         return Err(invalid(line, "continuation without row_start"));
     };
     if bytes <= MAX_RECORD_BYTES || bytes > MAX_ROW_BYTES {
@@ -202,12 +264,14 @@ pub(super) fn read(reader: &mut impl BufRead, start: &[u8], line: u64) -> Result
         finished: false,
         failure: None,
     };
-    let decoded =
-        serde_json::from_reader::<_, Record>(BufReader::with_capacity(64 * 1024, &mut chunks));
+    let decoded = serde_json::from_reader::<_, ContinuedRow>(BufReader::with_capacity(
+        64 * 1024,
+        &mut chunks,
+    ));
     if let Some(error) = chunks.failure.take() {
         return Err(error);
     }
-    let record = decoded.map_err(|error| {
+    let ContinuedRow(record) = decoded.map_err(|error| {
         invalid(
             line,
             format!("malformed continued row, column {}", error.column()),

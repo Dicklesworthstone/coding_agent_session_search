@@ -6,6 +6,7 @@ use std::io::{BufRead, Write};
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -143,7 +144,7 @@ pub fn identifier(value: &str) -> bool {
 
 /// REAL is an exact, lowercase IEEE-754 binary64 bit string; JSON's number
 /// rounding cannot change a restored value. Integers remain signed 64-bit.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(
     tag = "kind",
     content = "value",
@@ -156,6 +157,80 @@ pub enum Cell {
     Real(String),
     Text(String),
     Blob(String),
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum CellKind {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+enum Scalar {
+    Integer(i64),
+    Text(String),
+}
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ScalarVisitor;
+
+        impl Visitor<'_> for ScalarVisitor {
+            type Value = Scalar;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a signed 64-bit integer or a string")
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Scalar, E> {
+                Ok(Scalar::Integer(value))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Scalar, E> {
+                i64::try_from(value)
+                    .map(Scalar::Integer)
+                    .map_err(|_| E::custom("logical integer is outside the signed 64-bit range"))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Scalar, E> {
+                Ok(Scalar::Text(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Scalar, E> {
+                Ok(Scalar::Text(value))
+            }
+        }
+
+        // Reject arrays, objects, booleans and floating-point numbers at their
+        // first token, including when the value precedes its kind tag.
+        deserializer.deserialize_any(ScalarVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for Cell {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            kind: CellKind,
+            value: Option<Scalar>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        match (fields.kind, fields.value) {
+            (CellKind::Null, None) => Ok(Self::Null),
+            (CellKind::Integer, Some(Scalar::Integer(value))) => Ok(Self::Integer(value)),
+            (CellKind::Real, Some(Scalar::Text(value))) => Ok(Self::Real(value)),
+            (CellKind::Text, Some(Scalar::Text(value))) => Ok(Self::Text(value)),
+            (CellKind::Blob, Some(Scalar::Text(value))) => Ok(Self::Blob(value)),
+            _ => Err(de::Error::custom(
+                "logical cell kind and scalar value disagree",
+            )),
+        }
+    }
 }
 
 impl Cell {
@@ -208,13 +283,178 @@ pub struct Completion {
     pub content_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Record {
     Header { header: Header },
     Table { table: Table },
     Row { values: Vec<Cell> },
     Completion { completion: Completion },
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum RecordKind {
+    Header,
+    Table,
+    Row,
+    Completion,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum RecordField {
+    Type,
+    Header,
+    Table,
+    Values,
+    Completion,
+}
+
+struct RowValues;
+
+impl<'de> DeserializeSeed<'de> for RowValues {
+    type Value = Vec<Cell>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for RowValues {
+    type Value = Vec<Cell>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("at most 256 logical cells")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        struct NextCell {
+            admitted: bool,
+        }
+
+        impl<'de> DeserializeSeed<'de> for NextCell {
+            type Value = Cell;
+
+            fn deserialize<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Cell, D::Error> {
+                if !self.admitted {
+                    return Err(de::Error::custom("logical row exceeds 256 columns"));
+                }
+                Cell::deserialize(deserializer)
+            }
+        }
+
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_COLUMNS));
+        while let Some(cell) = sequence.next_element_seed(NextCell {
+            admitted: values.len() < MAX_COLUMNS,
+        })? {
+            values.push(cell);
+        }
+        Ok(values)
+    }
+}
+
+struct RecordVisitor {
+    row_only: bool,
+}
+
+impl<'de> Visitor<'de> for RecordVisitor {
+    type Value = Record;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a logical record object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Record, A::Error> {
+        let mut kind = None;
+        let mut payload = None;
+        while let Some(field) = map.next_key::<RecordField>()? {
+            if !matches!(field, RecordField::Type) && payload.is_some() {
+                return Err(de::Error::custom(
+                    "duplicate or conflicting logical record payload",
+                ));
+            }
+            if self.row_only && !matches!(field, RecordField::Type | RecordField::Values) {
+                return Err(de::Error::custom("only logical rows may use continuations"));
+            }
+            let (payload_kind, record) = match field {
+                RecordField::Type => {
+                    if kind.is_some() {
+                        return Err(de::Error::duplicate_field("type"));
+                    }
+                    let next = map.next_value::<RecordKind>()?;
+                    if self.row_only && next != RecordKind::Row {
+                        return Err(de::Error::custom("only logical rows may use continuations"));
+                    }
+                    kind = Some(next);
+                    continue;
+                }
+                RecordField::Header => (
+                    RecordKind::Header,
+                    Record::Header {
+                        header: map.next_value()?,
+                    },
+                ),
+                RecordField::Table => (
+                    RecordKind::Table,
+                    Record::Table {
+                        table: map.next_value()?,
+                    },
+                ),
+                RecordField::Values => (
+                    RecordKind::Row,
+                    Record::Row {
+                        values: map.next_value_seed(RowValues)?,
+                    },
+                ),
+                RecordField::Completion => (
+                    RecordKind::Completion,
+                    Record::Completion {
+                        completion: map.next_value()?,
+                    },
+                ),
+            };
+            if kind.is_some_and(|kind| kind != payload_kind) {
+                return Err(de::Error::custom(
+                    "logical record type and payload disagree",
+                ));
+            }
+            payload = Some((payload_kind, record));
+        }
+        let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
+        match payload {
+            Some((payload_kind, record)) if kind == payload_kind => Ok(record),
+            Some(_) => Err(de::Error::custom(
+                "logical record type and payload disagree",
+            )),
+            None => Err(de::Error::custom("logical record payload is missing")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Record {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Internally tagged enum derivation first buffers an untyped JSON tree.
+        // Typed fields keep rows bounded before validating the table shape and
+        // still allow the type discriminator to follow its payload.
+        deserializer.deserialize_map(RecordVisitor { row_only: false })
+    }
+}
+
+pub(super) struct ContinuedRow(pub Record);
+
+impl<'de> Deserialize<'de> for ContinuedRow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_map(RecordVisitor { row_only: true })
+            .map(Self)
+    }
 }
 
 struct LimitedBuffer(Vec<u8>, usize);
@@ -483,9 +723,7 @@ impl Validator {
     }
 
     fn record_limit(&self, record: &Record) -> usize {
-        if self.header.schema_version == CHUNKED_VERSION
-            && matches!(record, Record::Row { .. })
-        {
+        if self.header.schema_version == CHUNKED_VERSION && matches!(record, Record::Row { .. }) {
             MAX_ROW_BYTES
         } else {
             MAX_RECORD_BYTES

@@ -40,7 +40,7 @@ pub(super) fn verify_existing(
     let mut line = 2u64;
     while let Some(record) = codec::read_record(input, line)? {
         validator
-            .push(&record)
+            .validate(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         line = line
             .checked_add(1)

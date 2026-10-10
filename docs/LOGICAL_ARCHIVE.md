@@ -16,14 +16,17 @@ identity, acknowledgement of private content, and a **new** output path. Reuse
 that identity for subsequent exports of the same archive. Do not use a pathname
 as identity. Receipts are JSON on stdout; failures are JSON on stderr.
 
-Current exports use **wire format version 2**. This binary also reads, verifies
+Current exports default to **wire format version 2**. This binary also reads, verifies
 and restores version 1 backups with their original limits. Version 2 supports a
 complete encoded logical row up to 256 MiB by splitting large rows into physical
 JSONL frames of at most 8 MiB each. An older binary that supports only version 1
 refuses version 2 backups, including those containing only small rows; use a
 version 2 reader for new exports. The receipt's `schema_version` reports the
 version of the archive actually exported or read. The header's separate
-`storage_schema_version` identifies the canonical database schema.
+`storage_schema_version` identifies the canonical database schema. Use
+`--format-version 1` when an older reader is required and every encoded row fits
+within 8 MiB; an oversized row is refused without publishing a partial archive.
+`--format-version 2` explicitly selects the default large-row transport.
 
 Export opens FrankenSQLite read-only and holds one transaction across schema
 inspection and all table scans. It does not migrate, repair, checkpoint, acquire
@@ -194,6 +197,16 @@ framing overhead. A continuation group counts as one logical record. Batch
 commits are never exposed as a valid partial restore: the complete stream,
 footer, counts, digest, canonical schema metadata, foreign keys and database
 integrity must all pass first.
+
+Restore failures retain their database cause and report the failed operation,
+including batch boundaries and verification probes. An insertion failure also
+identifies the logical record, table, one-based table row and single integer
+primary key when available. These diagnostics exclude text/BLOB keys, message
+bodies, constraint payloads and arbitrary engine messages. Database I/O and busy
+failures retain their retryable classes. A failed integrity-query read supplies
+no integrity verdict; it is reported as a failed probe rather than as proof of
+broken relationships. The same policy applies to reviewed migrations and
+existing-destination comparisons.
 
 Replay retains the canonical WAL writer policy. A journal-mode change or clean
 close does not by itself prove a self-contained database. After all private
@@ -401,7 +414,7 @@ Archive failures are JSON on stderr with a kebab-case `kind`:
 
 ## Version 2 wire contract
 
-New exports have `schema_version: 2` and declare these `record_types`, in order:
+Version 2 exports have `schema_version: 2` and declare these `record_types`, in order:
 `table`, `row`, `row_start`, `row_chunk`, `row_end`, `completion`. The header,
 table descriptors, typed cells, primary-key order, and completion have the same
 logical meanings as version 1. A row whose complete canonical JSON and newline
@@ -427,12 +440,23 @@ fail verification. Only logical rows may use continuations. Padding a small row
 with whitespace does not permit it to use a continuation group or bypass the
 version 1 row limit.
 
+Typed parsing enforces the 256-column limit before collecting additional cells.
+Cell values are restricted to their scalar wire types during parsing, including
+when the value precedes its kind tag. Arrays or objects cannot cause an untyped
+JSON tree to be materialized as a malformed cell or continuation frame. Unknown,
+duplicate and mismatched fields are rejected, and a continued record must be a
+row before other record payloads are read. Valid field order remains flexible.
+
 The encoder holds one bounded canonical row and emits chunks successively.
 The decoder retains one decoded 1 MiB chunk while constructing the typed row;
-it does not concatenate a second complete encoded input row. Parsing, canonical
-validation, BLOB conversion and database binding still require memory
-proportional to that row, in addition to fixed frame buffers. The limits are not
-a promise of a 256 MiB whole-process memory ceiling.
+it does not concatenate a second complete encoded input row. Archive input
+validation counts and hashes canonical bytes through an 8 KiB buffer instead of
+allocating another encoded row. BLOB validation uses a fixed 3 KiB decode buffer
+and retains strict base64 padding and tail-bit checks. Verification, restore and
+migration input, and search/view scans share this validation path. Parsing,
+export encoding, BLOB conversion for restore and database binding still require
+memory proportional to that row, in addition to fixed frame buffers. The limits
+are not a promise of a 256 MiB whole-process memory ceiling.
 
 A continuation group contributes **one logical row** to table and archive
 counts. The completion digest covers canonical reconstructed rows, not the

@@ -214,7 +214,12 @@ fn oversized_message_export_verify_restore_search_and_reimport_are_lossless() {
     assert_eq!(refused.status.code(), Some(9));
     assert!(refused.stdout.is_empty());
     let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
-    assert!(error["error"]["message"].as_str().unwrap().contains("8 MiB"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("8 MiB")
+    );
     assert!(
         !legacy_output.exists(),
         "v1 must not silently drop the large row"
@@ -282,11 +287,7 @@ fn oversized_message_export_verify_restore_search_and_reimport_are_lossless() {
         command(root.path())
             .args(["archive", "view"])
             .arg(&backup)
-            .args([
-                "--message-id",
-                &small_id.to_string(),
-                "--content-sha256",
-            ])
+            .args(["--message-id", &small_id.to_string(), "--content-sha256"])
             .arg(exported["content_sha256"].as_str().unwrap())
             .args(["-C", "0", "--include-private"])
             .output()

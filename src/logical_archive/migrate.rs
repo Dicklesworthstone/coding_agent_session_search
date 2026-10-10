@@ -143,7 +143,7 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
             tables.push(table.clone());
         }
         validator
-            .push(&record)
+            .validate(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         line = line
             .checked_add(1)
@@ -398,7 +398,7 @@ fn restore_reviewed<R: BufRead>(
             batch_bytes = 0;
         }
         validator
-            .push(&record)
+            .validate(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         match record {
             Record::Table { table } => {

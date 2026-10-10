@@ -81,6 +81,45 @@ fn assert_integrity(bytes: &[u8]) {
 }
 
 #[test]
+fn continuation_frames_keep_the_v2_wire_names() {
+    let fixtures = [
+        (
+            Frame::Start { bytes: 8_388_609 },
+            b"{\"type\":\"row_start\",\"bytes\":8388609}\n".as_slice(),
+        ),
+        (
+            Frame::Chunk {
+                sequence: 0,
+                data: "AA==".to_owned(),
+            },
+            b"{\"type\":\"row_chunk\",\"sequence\":0,\"data\":\"AA==\"}\n".as_slice(),
+        ),
+        (
+            Frame::End {
+                sha256: "0".repeat(64),
+            },
+            b"{\"type\":\"row_end\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}\n".as_slice(),
+        ),
+    ];
+    for (record, expected) in fixtures {
+        let mut encoded = Vec::new();
+        write_frame(&record, &mut encoded).unwrap();
+        assert_eq!(encoded, expected);
+        let decoded = frame(expected, 1).unwrap();
+        let mut roundtrip = Vec::new();
+        write_frame(&decoded, &mut roundtrip).unwrap();
+        assert_eq!(roundtrip, expected);
+        // The independent object ordering places bytes/data/sha256 before type.
+        let reordered =
+            serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(expected).unwrap())
+                .unwrap();
+        let mut reordered_roundtrip = Vec::new();
+        write_frame(&frame(&reordered, 1).unwrap(), &mut reordered_roundtrip).unwrap();
+        assert_eq!(reordered_roundtrip, expected);
+    }
+}
+
+#[test]
 fn chunked_unicode_and_blob_are_byte_exact_and_each_frame_is_bounded() {
     let bytes = wire();
     let frames: Vec<_> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
@@ -168,8 +207,138 @@ fn unsupported_versions_and_inconsistent_record_type_lists_are_refused() {
 fn declared_row_limit_is_checked_before_reading_chunks() {
     for bytes in [0, MAX_RECORD_BYTES, MAX_ROW_BYTES + 1, usize::MAX] {
         let mut input = Vec::new();
-        write_frame(&Frame::RowStart { bytes }, &mut input).unwrap();
+        write_frame(&Frame::Start { bytes }, &mut input).unwrap();
         assert_integrity(&input);
+    }
+}
+
+struct ForbiddenTail<'a>(&'a std::cell::Cell<bool>);
+
+impl Read for ForbiddenTail<'_> {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        self.0.set(true);
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "PRIVATE_UNREAD_TAIL",
+        ))
+    }
+}
+
+fn assert_group_rejected_before_next_chunk(prefix: &str) {
+    // The stream claims 256 MiB, but the malformed shape is decisive in the
+    // first chunk. A parser buffering arbitrary JSON would request the tail
+    // and report I/O instead; no huge fixture or process-memory guess is needed.
+    let mut chunk = prefix.as_bytes().to_vec();
+    assert!(chunk.len() < CHUNK_BYTES);
+    chunk.resize(CHUNK_BYTES, b' ');
+    let mut wire = Vec::new();
+    write_frame(
+        &Frame::Start {
+            bytes: MAX_ROW_BYTES,
+        },
+        &mut wire,
+    )
+    .unwrap();
+    write_frame(
+        &Frame::Chunk {
+            sequence: 0,
+            data: STANDARD.encode(chunk),
+        },
+        &mut wire,
+    )
+    .unwrap();
+    let tail_read = std::cell::Cell::new(false);
+    let stream = Cursor::new(wire).chain(ForbiddenTail(&tail_read));
+    let error = codec::read_record(&mut BufReader::with_capacity(37, stream), 41).unwrap_err();
+    assert_eq!(
+        super::super::super::classify_failure(&error),
+        (5, "logical-archive-integrity", false)
+    );
+    assert!(!tail_read.get());
+    assert!(!error.to_string().contains("PRIVATE_"));
+    assert!(error.to_string().contains("41"));
+}
+
+#[test]
+fn frames_reject_untyped_values_and_unknown_fields_before_reading_the_tail() {
+    for prefix in [
+        r#"{"data":["#,
+        r#"{"bytes":{"#,
+        r#"{"sequence":["#,
+        r#"{"sha256":["#,
+        r#"{"PRIVATE_FIELD":["#,
+        r#"{"values":["#,
+    ] {
+        let tail_read = std::cell::Cell::new(false);
+        let input = Cursor::new(prefix).chain(ForbiddenTail(&tail_read));
+        let error = serde_json::from_reader::<_, Frame>(input).err().unwrap();
+        assert!(!error.is_io());
+        assert!(!tail_read.get());
+    }
+}
+
+#[test]
+fn frames_reject_null_duplicate_and_cross_kind_fields() {
+    for wire in [
+        r#"{"type":"row_start","bytes":8388609,"data":null}"#,
+        r#"{"type":"row_start","bytes":null}"#,
+        r#"{"type":"row_start","bytes":8388609,"bytes":8388609}"#,
+        r#"{"type":"row_start","bytes":8388609,"type":"row_start"}"#,
+        r#"{"type":"row_chunk","sequence":0,"data":"AA==","sha256":"PRIVATE_HASH"}"#,
+        r#"{"type":"row_chunk","data":"AA=="}"#,
+        r#"{"type":"row_chunk","sequence":0,"data":null}"#,
+        r#"{"type":"row_chunk","sequence":-1,"data":"AA=="}"#,
+        r#"{"type":"row_chunk","sequence":0.0,"data":"AA=="}"#,
+        r#"{"type":"row_end","sha256":"PRIVATE_HASH","sequence":0}"#,
+        r#"{"type":"row_end","sha256":null}"#,
+        r#"{"type":{"row_start":null},"bytes":8388609}"#,
+        r#"{"bytes":8388609,"type":["row_start"]}"#,
+        r#"{"type":0,"bytes":8388609}"#,
+        r#"{"type":null,"bytes":8388609}"#,
+    ] {
+        let error = frame(wire.as_bytes(), 47).err().unwrap();
+        assert_eq!(
+            super::super::super::classify_failure(&error),
+            (5, "logical-archive-integrity", false)
+        );
+        assert!(!error.to_string().contains("PRIVATE_"));
+        assert!(error.to_string().contains("47"));
+    }
+}
+
+#[test]
+fn continued_rows_reject_excess_cells_before_reading_the_rest_of_the_group() {
+    for start in [r#"{"type":"row","values":["#, r#"{"values":["#] {
+        let prefix = format!(
+            "{start}{}{{\"kind\":\"text\",\"value\":\"PRIVATE_CELL",
+            r#"{"kind":"null"},"#.repeat(codec::MAX_COLUMNS)
+        );
+        assert_group_rejected_before_next_chunk(&prefix);
+    }
+}
+
+#[test]
+fn continued_cells_refuse_untyped_nested_payloads_before_buffering_them() {
+    for prefix in [
+        r#"{"type":"row","values":[{"value":["#,
+        r#"{"values":[{"value":{"PRIVATE_KEY":"#,
+        r#"{"type":"row","values":[{"kind":"text","value":["#,
+    ] {
+        assert_group_rejected_before_next_chunk(prefix);
+    }
+}
+
+#[test]
+fn continued_rows_refuse_non_row_and_duplicate_payloads_before_reading_them() {
+    for prefix in [
+        r#"{"type":"header","header":{"record_types":["#,
+        r#"{"header":{"record_types":["#,
+        r#"{"table":{"columns":["#,
+        r#"{"completion":{"tables":{"#,
+        r#"{"type":"row","values":[],"values":["#,
+        r#"{"values":[],"PRIVATE_FIELD":["#,
+    ] {
+        assert_group_rejected_before_next_chunk(prefix);
     }
 }
 
@@ -214,19 +383,19 @@ fn checksum_tampering_and_invalid_base64_are_rejected_without_echoing_payloads()
     let last = frames.len() - 1;
     frames[last].clear();
     write_frame(
-        &Frame::RowEnd {
+        &Frame::End {
             sha256: "0".repeat(64),
         },
         &mut frames[last],
     )
     .unwrap();
     assert_integrity(&frames.concat());
-    let Frame::RowChunk { sequence, mut data } = frame(&frames[1], 1).unwrap() else {
+    let Frame::Chunk { sequence, mut data } = frame(&frames[1], 1).unwrap() else {
         panic!("first continuation must be a chunk");
     };
     data.replace_range(..1, "%");
     frames[1].clear();
-    write_frame(&Frame::RowChunk { sequence, data }, &mut frames[1]).unwrap();
+    write_frame(&Frame::Chunk { sequence, data }, &mut frames[1]).unwrap();
     assert_integrity(&frames.concat());
 }
 
@@ -240,7 +409,7 @@ fn empty_short_and_extra_chunks_are_rejected() {
     for data in [String::new(), STANDARD.encode(b"short")] {
         let mut frames = original.clone();
         frames[1].clear();
-        write_frame(&Frame::RowChunk { sequence: 0, data }, &mut frames[1]).unwrap();
+        write_frame(&Frame::Chunk { sequence: 0, data }, &mut frames[1]).unwrap();
         assert_integrity(&frames.concat());
     }
     let mut frames = original;

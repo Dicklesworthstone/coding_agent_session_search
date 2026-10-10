@@ -330,7 +330,7 @@ fn restore<R: BufRead>(
         }
         // Archive-side checks are integrity verdicts; SQLite failures below are not.
         validator
-            .push(&record)
+            .validate(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         match record {
             Record::Table { table } => {

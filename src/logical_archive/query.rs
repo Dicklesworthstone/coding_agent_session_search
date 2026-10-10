@@ -167,7 +167,7 @@ fn scan(
     let mut line = 2_u64;
     while let Some(record) = codec::read_record(input, line)? {
         validator
-            .push(&record)
+            .validate(&record)
             .with_context(|| format!("logical evidence record {line}"))
             .map_err(super::integrity_unless_io)?;
         match &record {

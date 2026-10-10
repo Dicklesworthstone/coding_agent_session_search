@@ -312,6 +312,162 @@ fn numeric_and_blob_encodings_are_lossless_and_strict() {
 }
 
 #[test]
+fn typed_cells_preserve_scalar_values_and_allow_the_kind_after_the_value() {
+    let fixtures = [
+        (r#"{"kind":"null"}"#, Cell::Null),
+        (r#"{"kind":"null","value":null}"#, Cell::Null),
+        (r#"{"value":null,"kind":"null"}"#, Cell::Null),
+        (
+            r#"{"value":-9223372036854775808,"kind":"integer"}"#,
+            Cell::Integer(i64::MIN),
+        ),
+        (
+            r#"{"kind":"integer","value":9223372036854775807}"#,
+            Cell::Integer(i64::MAX),
+        ),
+        (r#"{"value":0,"kind":"integer"}"#, Cell::Integer(0)),
+        (
+            r#"{"value":"8000000000000000","kind":"real"}"#,
+            Cell::Real("8000000000000000".to_owned()),
+        ),
+        (
+            r#"{"value":"雪\u0000\"","kind":"text"}"#,
+            Cell::Text("雪\0\"".to_owned()),
+        ),
+        (
+            r#"{"value":"AP+A","kind":"blob"}"#,
+            Cell::Blob("AP+A".to_owned()),
+        ),
+    ];
+    for (wire, expected) in fixtures {
+        assert_eq!(serde_json::from_str::<Cell>(wire).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_reader::<_, Cell>(Cursor::new(wire)).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn typed_cells_reject_nested_values_overflow_floats_and_duplicate_fields() {
+    for wire in [
+        r#"{"kind":"integer","value":9223372036854775808}"#,
+        r#"{"value":-9223372036854775809,"kind":"integer"}"#,
+        r#"{"kind":"integer","value":18446744073709551616}"#,
+        r#"{"value":1.0,"kind":"integer"}"#,
+        r#"{"value":1e0,"kind":"integer"}"#,
+        r#"{"value":"7","kind":"integer"}"#,
+        r#"{"value":7,"kind":"text"}"#,
+        r#"{"value":true,"kind":"integer"}"#,
+        r#"{"value":[],"kind":"text"}"#,
+        r#"{"value":{},"kind":"blob"}"#,
+        r#"{"value":null,"kind":"text"}"#,
+        r#"{"value":0,"kind":"null"}"#,
+        r#"{"kind":"text"}"#,
+        r#"{"value":"PRIVATE_VALUE"}"#,
+        r#"{"kind":"null","kind":"null"}"#,
+        r#"{"kind":"null","value":null,"value":null}"#,
+        r#"{"kind":"null","PRIVATE_FIELD":null}"#,
+        r#"{"kind":{"null":null}}"#,
+        r#"{"kind":["null"]}"#,
+        r#"{"kind":0}"#,
+        r#"{"kind":null}"#,
+    ] {
+        assert!(serde_json::from_str::<Cell>(wire).is_err());
+        let record = format!("{{\"type\":\"row\",\"values\":[{wire}]}}\n");
+        let error = read_record(&mut Cursor::new(record), 23).unwrap_err();
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (5, "logical-archive-integrity", false)
+        );
+        assert!(error.to_string().contains("23"));
+        assert!(!error.to_string().contains("PRIVATE_"));
+    }
+}
+
+#[test]
+fn typed_records_accept_payload_before_type_for_every_record_kind() {
+    let records = [
+        ("header", "header", Record::Header { header: header() }),
+        ("table", "table", Record::Table { table: table() }),
+        (
+            "row",
+            "values",
+            Record::Row {
+                values: vec![Cell::Integer(7), Cell::Text("雪\0".to_owned())],
+            },
+        ),
+        (
+            "completion",
+            "completion",
+            Record::Completion {
+                completion: Completion {
+                    records: 0,
+                    tables: BTreeMap::new(),
+                    content_sha256: "0".repeat(64),
+                },
+            },
+        ),
+    ];
+    for (kind, field, expected) in records {
+        let encoded = serde_json::to_value(&expected).unwrap();
+        let payload = &encoded[field];
+        let reordered = format!("{{\"{field}\":{payload},\"type\":\"{kind}\"}}\n");
+        assert_eq!(
+            read_record(&mut Cursor::new(reordered), 1).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            read_record(&mut Cursor::new(encode(&expected).unwrap()), 1).unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn typed_records_reject_unknown_duplicate_missing_and_conflicting_fields() {
+    for wire in [
+        r#"{"type":"row","values":[],"values":[]}"#,
+        r#"{"type":"row","type":"row","values":[]}"#,
+        r#"{"values":[],"type":"row","type":"row"}"#,
+        r#"{"type":"row","values":[],"header":null}"#,
+        r#"{"type":"table","values":[]}"#,
+        r#"{"values":[],"type":"table"}"#,
+        r#"{"values":[]}"#,
+        r#"{"type":"row"}"#,
+        r#"{"type":"row","values":null}"#,
+        r#"{"type":"row","values":[],"PRIVATE_FIELD":[]}"#,
+        r#"{"type":{"row":null},"values":[]}"#,
+        r#"{"values":[],"type":["row"]}"#,
+        r#"{"type":2,"values":[]}"#,
+        r#"{"type":null,"values":[]}"#,
+    ] {
+        assert!(serde_json::from_str::<Record>(wire).is_err());
+        let error = read_record(&mut Cursor::new(format!("{wire}\n")), 31).unwrap_err();
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (5, "logical-archive-integrity", false)
+        );
+        assert!(!error.to_string().contains("PRIVATE_"));
+    }
+}
+
+#[test]
+fn row_cell_limit_is_enforced_during_decoding_at_the_exact_boundary() {
+    let at_limit = Record::Row {
+        values: vec![Cell::Null; MAX_COLUMNS],
+    };
+    assert_eq!(
+        read_record(&mut Cursor::new(encode(&at_limit).unwrap()), 1).unwrap(),
+        Some(at_limit)
+    );
+    let oversized = Record::Row {
+        values: vec![Cell::Null; MAX_COLUMNS + 1],
+    };
+    assert!(read_record(&mut Cursor::new(encode(&oversized).unwrap()), 1).is_err());
+}
+
+#[test]
 fn invalid_descriptors_and_row_shapes_fail_closed() {
     let mut descriptor = table();
     descriptor.name = "messages; DROP TABLE meta".to_owned();
