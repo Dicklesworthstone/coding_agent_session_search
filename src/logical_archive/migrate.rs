@@ -762,27 +762,7 @@ fn compare_table_rows<R: BufRead>(
     table: &Table,
     cursor: &mut ProjectionCursor<R>,
 ) -> Result<()> {
-    let columns = table
-        .columns
-        .iter()
-        .map(|name| export::quoted(name))
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
-    let order = table
-        .primary_key
-        .iter()
-        .map(|&offset| {
-            Ok(format!(
-                "{} COLLATE BINARY ASC",
-                export::quoted(&table.columns[offset])?
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
-    let sql = format!(
-        "SELECT {columns} FROM {} ORDER BY {order}",
-        export::quoted(&table.name)?
-    );
+    let sql = export::ordered_scan_sql(connection, table)?;
 
     let mut failure = None;
     let mut rows_compared = 0_u64;
