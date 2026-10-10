@@ -1,16 +1,21 @@
 //! Real-binary logical recovery: receipt parity, privacy, idempotence and conflicts.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::Output;
 use std::time::Duration;
 
 use assert_cmd::Command;
-use coding_agent_search::franken_sync::Connection;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::{Connection, SqliteValue};
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn command(home: &Path) -> Command {
     // Bind this test to Cargo's freshly built executable, not a PATH installation
@@ -74,6 +79,324 @@ fn import(home: &Path, input: &Path, output: &Path, identical: bool) -> Output {
         cmd.arg("--if-identical");
     }
     cmd.output().unwrap()
+}
+
+const COLLECTION_ROWS: i64 = 1025;
+const RECORD_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const PRIVATE_COLLECTION_MARKER: &str = "GH517-PRIVATE-MESSAGE";
+const PRIVATE_COLLECTION_BLOB: &[u8] = b"GH517-PRIVATE-BLOB\0\x01\xff";
+
+fn collection_body(position: i64) -> String {
+    format!(
+        "{PRIVATE_COLLECTION_MARKER} {position}: \"quote\" \\backslash \0 δ 日本語\n{}",
+        "x".repeat(8 * 1024)
+    )
+}
+
+fn collection_extra(position: i64) -> String {
+    serde_json::json!({"usage": {"input_tokens": position}, "request_id": format!("request-{position}")})
+        .to_string()
+}
+
+/// Initialize the real canonical schema, then bind one row at a time in small
+/// transactions. Fixture setup must not collect a conversation or whole archive
+/// in memory, or run unrelated lexical indexing over oversized message bodies.
+fn collection_fixture(source: &Path) {
+    let connection = SqliteStorage::open(source).unwrap().into_raw();
+    connection
+        .execute_batch(
+            "INSERT INTO agents (id, slug, name, kind, created_at, updated_at)
+             VALUES (1, 'archive_fixture', 'Archive fixture', 'cli', 1733000000000, 1733000000000);
+             INSERT INTO conversations
+                 (id, agent_id, source_id, external_id, source_path, estimated_cost_usd)
+             VALUES (7, 1, 'local', 'gh517-collection', '/absent/provider/large.jsonl', 0.125);",
+        )
+        .unwrap();
+    {
+        let insert = connection
+            .prepare(
+                "INSERT INTO messages
+                 (id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+                 VALUES (?1, 7, ?2, 'assistant', ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        for start in (0..COLLECTION_ROWS).step_by(32) {
+            connection.execute("BEGIN IMMEDIATE").unwrap();
+            for position in start..(start + 32).min(COLLECTION_ROWS) {
+                insert
+                    .execute_with_params(&[
+                        SqliteValue::Integer(10_000 + 3 * position),
+                        SqliteValue::Integer(2 * position),
+                        if position % 2 == 0 {
+                            SqliteValue::Null
+                        } else {
+                            SqliteValue::Text("archive_fixture".into())
+                        },
+                        SqliteValue::Integer(1_733_000_000_000 + position),
+                        SqliteValue::Text(collection_body(position).into()),
+                        SqliteValue::Text(collection_extra(position).into()),
+                        SqliteValue::Blob(PRIVATE_COLLECTION_BLOB.into()),
+                    ])
+                    .unwrap();
+            }
+            connection.execute("COMMIT").unwrap();
+        }
+    }
+    connection.close().unwrap();
+}
+
+/// Hash source files incrementally so preservation assertions do not turn a
+/// streaming regression into a whole-database memory allocation.
+fn source_file_digests(directory: &Path) -> BTreeMap<std::ffi::OsString, [u8; 32]> {
+    let mut digests = BTreeMap::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    for entry in fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file());
+        let mut file = fs::File::open(entry.path()).unwrap();
+        let mut digest = Sha256::new();
+        loop {
+            let read = file.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        digests.insert(entry.file_name(), digest.finalize().into());
+    }
+    assert!(!digests.is_empty());
+    digests
+}
+
+#[test]
+fn real_binary_large_collection_exports_all_typed_rows_and_verifies_the_backup() {
+    let root = tempfile::tempdir().unwrap();
+    let source_directory = root.path().join("source");
+    fs::create_dir(&source_directory).unwrap();
+    let source = source_directory.join("agent_search.db");
+    collection_fixture(&source);
+    let before = source_file_digests(&source_directory);
+    let input = root.path().join("large-collection.jsonl");
+    let exported = export(root.path(), &source, &input);
+    assert_eq!(exported["tables"]["messages"], COLLECTION_ROWS);
+    assert_eq!(exported["integrity_verified"], true);
+    assert_eq!(exported["contains_private_data"], true);
+    assert!(fs::metadata(&input).unwrap().len() > RECORD_LIMIT_BYTES as u64);
+    let verified = receipt(
+        command(root.path())
+            .args(["archive", "verify"])
+            .arg(&input)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(verified["operation"], "verify");
+    for field in ["content_sha256", "records", "tables"] {
+        assert_eq!(verified[field], exported[field], "{field}");
+    }
+
+    // Inspect actual typed cells, including escaped text, NULLs, integer IDs,
+    // metadata and BLOBs. Matching receipts alone could miss the same omitted
+    // rows in both export and verification. Retain only one wire record.
+    let mut reader = BufReader::new(fs::File::open(&input).unwrap());
+    let mut line = String::new();
+    let mut table = String::new();
+    let mut columns = Vec::new();
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut message_position = 0_i64;
+    let mut saw_real = false;
+    let mut saw_completion = false;
+    while reader.read_line(&mut line).unwrap() != 0 {
+        assert!(line.len() <= RECORD_LIMIT_BYTES);
+        let record: Value = serde_json::from_str(&line).unwrap();
+        match record["type"].as_str().unwrap() {
+            "header" => {
+                assert_eq!(record["header"]["schema_version"], 1);
+                assert_eq!(record["header"]["contains_private_data"], true);
+            }
+            "table" => {
+                table = record["table"]["name"].as_str().unwrap().to_owned();
+                columns = record["table"]["columns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|column| column.as_str().unwrap().to_owned())
+                    .collect();
+                assert!(counts.insert(table.clone(), 0).is_none());
+            }
+            "row" => {
+                *counts.get_mut(&table).unwrap() += 1;
+                let values = record["values"].as_array().unwrap();
+                let cell =
+                    |name: &str| &values[columns.iter().position(|column| column == name).unwrap()];
+                if table == "messages" {
+                    let position = message_position;
+                    assert_eq!(
+                        cell("id"),
+                        &serde_json::json!({"kind": "integer", "value": 10_000 + 3 * position})
+                    );
+                    assert_eq!(
+                        cell("conversation_id"),
+                        &serde_json::json!({"kind": "integer", "value": 7})
+                    );
+                    assert_eq!(
+                        cell("idx"),
+                        &serde_json::json!({"kind": "integer", "value": 2 * position})
+                    );
+                    assert_eq!(
+                        cell("role"),
+                        &serde_json::json!({"kind": "text", "value": "assistant"})
+                    );
+                    let author = if position % 2 == 0 {
+                        serde_json::json!({"kind": "null"})
+                    } else {
+                        serde_json::json!({"kind": "text", "value": "archive_fixture"})
+                    };
+                    assert_eq!(cell("author"), &author);
+                    assert_eq!(
+                        cell("created_at"),
+                        &serde_json::json!({"kind": "integer", "value": 1_733_000_000_000_i64 + position})
+                    );
+                    assert_eq!(
+                        cell("content"),
+                        &serde_json::json!({"kind": "text", "value": collection_body(position)})
+                    );
+                    assert_eq!(
+                        cell("extra_json"),
+                        &serde_json::json!({"kind": "text", "value": collection_extra(position)})
+                    );
+                    assert_eq!(
+                        cell("extra_bin"),
+                        &serde_json::json!({"kind": "blob", "value": STANDARD.encode(PRIVATE_COLLECTION_BLOB)})
+                    );
+                    message_position += 1;
+                } else if table == "conversations" {
+                    assert_eq!(
+                        cell("estimated_cost_usd"),
+                        &serde_json::json!({"kind": "real", "value": "3fc0000000000000"})
+                    );
+                    saw_real = true;
+                }
+            }
+            "completion" => {
+                assert!(!saw_completion);
+                assert_eq!(
+                    record["completion"]["content_sha256"],
+                    exported["content_sha256"]
+                );
+                saw_completion = true;
+            }
+            // ubs:ignore -- intentional unit-test contract assertion.
+            other => panic!("unexpected wire record type {other}"),
+        }
+        line.clear();
+    }
+    assert_eq!(message_position, COLLECTION_ROWS);
+    assert!(saw_real && saw_completion);
+    assert_eq!(exported["tables"], serde_json::to_value(&counts).unwrap());
+    assert_eq!(exported["records"], counts.values().sum::<u64>());
+    let repeated = export(root.path(), &source, &root.path().join("repeat.jsonl"));
+    assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
+    assert_eq!(source_file_digests(&source_directory), before);
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn real_binary_late_oversized_rows_report_location_and_reason_without_publishing() {
+    let root = tempfile::tempdir().unwrap();
+    let source_directory = root.path().join("source");
+    let destination = root.path().join("exports");
+    fs::create_dir(&source_directory).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let source = source_directory.join("agent_search.db");
+    collection_fixture(&source);
+    let mut expected_locks = Vec::new();
+    for case in ["raw-payload", "json-escaping"] {
+        let content = if case == "raw-payload" {
+            format!(
+                "{PRIVATE_COLLECTION_MARKER}{}",
+                "x".repeat(RECORD_LIMIT_BYTES)
+            )
+        } else {
+            // A body below the raw limit still exceeds the encoded contract:
+            // each NUL becomes six JSON bytes (\\u0000).
+            let content = format!(
+                "{PRIVATE_COLLECTION_MARKER}{}",
+                "\0".repeat(RECORD_LIMIT_BYTES / 6 + 1)
+            );
+            assert!(content.len() < RECORD_LIMIT_BYTES);
+            content
+        };
+        let connection = Connection::open(source.to_str().unwrap()).unwrap();
+        assert_eq!(
+            connection
+                .execute_with_params(
+                    "UPDATE messages SET content = ?1 WHERE id = ?2",
+                    &[
+                        SqliteValue::Text(content.into()),
+                        SqliteValue::Integer(10_000 + 3 * (COLLECTION_ROWS - 1)),
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        connection.close().unwrap();
+        let before = source_file_digests(&source_directory);
+        let output = destination.join(format!("{case}.jsonl"));
+        let failed = command(root.path())
+            .args(["archive", "export", "--db"])
+            .arg(&source)
+            .args([
+                "--archive-id",
+                "cli-archive",
+                "--include-private",
+                "--output",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert_eq!(failed.status.code(), Some(9), "{case}");
+        assert!(
+            failed.stdout.is_empty(),
+            "failed export must emit no success receipt"
+        );
+        let payload: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+        assert_eq!(payload["error"]["code"], 9);
+        assert_eq!(payload["error"]["kind"], "logical-archive-error");
+        assert_eq!(payload["error"]["retryable"], false);
+        let message = payload["error"]["message"].as_str().unwrap();
+        assert!(message.contains("logical table messages"), "{message}");
+        assert!(
+            message.contains(&format!("row {COLLECTION_ROWS}")),
+            "{message}"
+        );
+        assert!(message.contains("8 MiB"), "{message}");
+        assert!(failed.stderr.len() < 4096, "diagnostics must stay bounded");
+        let diagnostic = String::from_utf8_lossy(&failed.stderr);
+        for private in [
+            PRIVATE_COLLECTION_MARKER.to_owned(),
+            "GH517-PRIVATE-BLOB".to_owned(),
+            STANDARD.encode(PRIVATE_COLLECTION_BLOB),
+        ] {
+            assert!(
+                !diagnostic.contains(&private),
+                "private cell leaked in diagnostic"
+            );
+        }
+        assert!(!output.exists(), "a valid prefix is not a complete backup");
+        assert_eq!(source_file_digests(&source_directory), before);
+        expected_locks.push(format!(".{case}.jsonl.logical-archive.lock"));
+        expected_locks.sort();
+        let mut remaining: Vec<_> = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining, expected_locks,
+            "temporary export files must be cleaned up"
+        );
+    }
+    assert!(!root.path().join("unused-default").exists());
 }
 
 #[test]

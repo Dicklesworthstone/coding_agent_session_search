@@ -34,6 +34,40 @@ lock files prevent competing processes from locking different inodes. These
 controls do not impose a wall-clock deadline on database opening or scanning.
 Offline verification rejects special files and symlinks before reading JSONL.
 
+### Diagnosing an export failure
+
+Export errors identify the operation that failed. A row conversion, validation
+or output-write failure identifies the logical table and its **one-based row
+position in primary-key order**. When the table has a single integer primary key,
+the diagnostic also includes that column and value, for example
+`logical table messages, row 1025 (id=5128)`. A row position is not a message ID.
+Text and BLOB keys, message bodies and metadata values are never included.
+
+The reason appears in the JSON error's `message`, without requiring debug logs.
+Database-read errors include the FrankenSQLite error class and numeric code,
+plus the number of complete rows already written for that table. I/O errors
+report the error kind and OS code when available. Database page numbers and
+short-read byte counts may also be reported; arbitrary engine and I/O message
+payloads are withheld because they can contain private data. The original typed
+causes remain available to the exit-code classifier, so a busy database or a
+failed read is not mislabeled as an unsupported logical record.
+
+The 8 MiB limit applies to **one complete encoded row**, including all its cells,
+JSON framing, escaping, base64 expansion and the final newline. A collection can
+be much larger than 8 MiB; a raw text field smaller than 8 MiB can still exceed
+the encoded limit. The early payload check is only a lower bound; the bounded
+encoder decides whether a record actually fits. An oversized record fails
+explicitly with its table, row and limit. Export never skips or shortens it.
+Version 1 also refuses SQLite TEXT containing invalid UTF-8 instead of silently
+substituting replacement characters in a purportedly lossless backup.
+
+An error after substantial streaming can therefore identify a single
+unsupported row. It does not make the already written prefix a valid backup.
+Failures before publication discard the private stage and leave no new final
+archive; the persistent destination lock file is expected. Verification must
+succeed and the completion receipt must be emitted before treating an export
+as successful.
+
 ## Search and read a backup without restoring it
 
 When only a logical backup is available, `archive search` searches complete
