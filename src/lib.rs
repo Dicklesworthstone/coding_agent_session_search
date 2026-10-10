@@ -24526,17 +24526,20 @@ mod watch_once_resolution_tests {
         assert!(resolved.is_none());
     }
 
+    // Absolute on every platform: on Windows `/tmp/x` has no drive, so the
+    // resolver correctly absolutizes it to `C:/tmp/x` and an equality check on
+    // the input would fail for the wrong reason.
     #[test]
     fn unit_test_watch_mode_can_consume_test_watch_once_env_paths() {
-        let env_paths = Some(vec![PathBuf::from("/tmp/watch-path.jsonl")]);
+        let env_paths = Some(vec![std::env::temp_dir().join("watch-path.jsonl")]);
         let resolved = resolve_watch_once_paths_from_sources(true, None, env_paths.clone());
         assert_eq!(resolved, env_paths);
     }
 
     #[test]
     fn explicit_watch_once_paths_win_even_without_watch_flag() {
-        let explicit = Some(vec![PathBuf::from("/tmp/session.jsonl")]);
-        let env_paths = Some(vec![PathBuf::from("/tmp/leaked-watch-path.jsonl")]);
+        let explicit = Some(vec![std::env::temp_dir().join("session.jsonl")]);
+        let env_paths = Some(vec![std::env::temp_dir().join("leaked-watch-path.jsonl")]);
         let resolved = resolve_watch_once_paths_from_sources(false, explicit.clone(), env_paths);
         assert_eq!(resolved, explicit);
     }
