@@ -80,6 +80,27 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **On Windows, `cass index --watch-once` records plain `C:\...` source
+  paths.** It canonicalized each requested path with
+  `std::fs::canonicalize`, which on Windows returns the verbatim spelling
+  `\\?\C:\...`. A session first indexed through `--watch-once` kept that
+  spelling as its source path, so search results showed `\\?\C:\...`.
+  The watch-once paths, the scan roots matched against
+  them and the source-ledger key now drop the `\\?\` prefix whenever the
+  plain spelling names the same file, using `dunce`. Long paths and other
+  names that need the prefix keep it. A watch-once run and a scan of the
+  same session never created a second conversation, because both merge on
+  the session's id. Three more places compared the two spellings on
+  Windows:
+  - `cass sessions --workspace` and `--current` dropped sessions whose
+    stored workspace no longer exists.
+  - The swarm status asked Agent Mail for a `\\?\C:\...` project key that
+    no agent registers.
+  - The guard that keeps stale-on-read refresh and the TUI's first-run index
+    out of scratch data dirs missed a temp data dir that did not exist yet.
+    That last guard missed the same case on macOS, where the temp dir
+    resolves to `/private/var/folders/...`.
+  Linux is unchanged.
 - **On Windows, a stalled `cass index` exits 70 again instead of crashing.**
   After printing the `index-stalled` envelope, the stall abort called
   `std::process::exit(70)`. On Windows that ends the other threads and then

@@ -450,14 +450,23 @@ fn live_command(
     Ok(output.stdout)
 }
 
+/// The Agent Mail project key for `repo`: its canonical working directory in
+/// the plain spelling agents register, never Windows' verbatim `\\?\C:\...`
+/// (9v9xi).
+fn mail_project_key(repo: &Path) -> Result<String, &'static str> {
+    let project = dunce::canonicalize(repo).map_err(|_| "cannot identify Mail project")?;
+    project
+        .to_str()
+        .map(str::to_owned)
+        .ok_or("Mail project is not UTF-8")
+}
+
 fn collect_live_mail(repo: &Path, started: Instant) -> Result<Value, String> {
     let endpoint = dotenvy::var("CASS_SWARM_AGENT_MAIL_URL")
         .map_err(|_| "CASS_SWARM_AGENT_MAIL_URL is not configured")?;
     let token = dotenvy::var("CASS_SWARM_AGENT_MAIL_TOKEN").ok();
-    let project = repo
-        .canonicalize()
-        .map_err(|_| "cannot identify Mail project")?;
-    let project = project.to_str().ok_or("Mail project is not UTF-8")?;
+    let project = mail_project_key(repo)?;
+    let project = project.as_str();
     let encoded: String = project.bytes().map(|byte| format!("%{byte:02X}")).collect();
     crate::ensure_rustls_crypto_provider();
     let client = reqwest::blocking::Client::builder()
@@ -1542,6 +1551,21 @@ mod tests {
         let mut bad = roster;
         bad["agents"][0]["last_active_ts"] = json!("invalid");
         assert!(project_mail_observations(&bad, &json!([]), "/project", now).is_err());
+    }
+
+    #[test]
+    fn mail_project_key_is_the_plain_canonical_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let key = mail_project_key(root.path()).unwrap();
+        assert!(
+            !key.starts_with(r"\\?\"),
+            "verbatim Mail project key: {key}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&key).unwrap(),
+            std::fs::canonicalize(root.path()).unwrap()
+        );
+        assert!(mail_project_key(&root.path().join("missing")).is_err());
     }
 
     #[test]

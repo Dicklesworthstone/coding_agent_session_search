@@ -14427,8 +14427,10 @@ fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_n
 }
 
 fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String {
+    // dunce: on Windows the plain spelling (C:\...) a scan records, not the
+    // verbatim \\?\C:\... std::fs::canonicalize returns (9v9xi).
     let canonical =
-        std::fs::canonicalize(&source.source_path).unwrap_or_else(|_| source.source_path.clone());
+        dunce::canonicalize(&source.source_path).unwrap_or_else(|_| source.source_path.clone());
     let mappings = ctx
         .scan_roots
         .iter()
@@ -32936,7 +32938,7 @@ fn explicit_watch_once_scan_path(
     } else {
         path.to_path_buf()
     };
-    std::fs::canonicalize(&scan_path).unwrap_or(scan_path)
+    dunce::canonicalize(&scan_path).unwrap_or(scan_path)
 }
 
 /// GH #478: existing explicit `--watch-once` paths that no connector claims.
@@ -32991,7 +32993,7 @@ fn classify_paths(
         .iter()
         .map(|(_, root)| {
             if prefer_explicit_paths {
-                std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone())
+                dunce::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone())
             } else {
                 root.path.clone()
             }
@@ -33006,7 +33008,7 @@ fn classify_paths(
         .iter()
         .map(|(_, root)| {
             (!prefer_explicit_paths)
-                .then(|| std::fs::canonicalize(&root.path).ok())
+                .then(|| dunce::canonicalize(&root.path).ok())
                 .flatten()
                 .filter(|canonical| canonical != &root.path)
         })
@@ -33016,8 +33018,11 @@ fn classify_paths(
         let hinted_kind = prefer_explicit_paths
             .then(|| explicit_watch_once_connector_hint(&requested))
             .flatten();
+        // dunce keeps Windows paths in the plain spelling a scan records, so
+        // a session indexed by --watch-once and by a scan has one identity
+        // (9v9xi). Elsewhere it is std::fs::canonicalize.
         let canonical = prefer_explicit_paths.then(|| {
-            std::fs::canonicalize(&requested).unwrap_or_else(|error| {
+            dunce::canonicalize(&requested).unwrap_or_else(|error| {
                 tracing::warn!(
                     path = %requested.display(),
                     %error,
@@ -63005,10 +63010,9 @@ c.close()
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Claude);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        // The plain spelling a scan records, not Windows' verbatim `\\?\`
+        // (9v9xi); std::fs::canonicalize everywhere else.
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
     }
 
     #[test]
@@ -63029,10 +63033,7 @@ c.close()
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
     }
 
     #[test]
@@ -63054,10 +63055,7 @@ c.close()
         let classified = classify_paths(vec![session.clone()], &roots, true);
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::PrimeAgent);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
         for path in [
             ".prime-other/agent/sessions/x.jsonl",
             ".pi/agent/sessions/x.jsonl",
@@ -63086,10 +63084,7 @@ c.close()
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
     }
@@ -63235,7 +63230,7 @@ c.close()
         assert_eq!(classified[0].0, ConnectorKind::Omp);
         assert_eq!(
             classified[0].1.path,
-            std::fs::canonicalize(sessions_root).unwrap()
+            dunce::canonicalize(sessions_root).unwrap()
         );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
@@ -63262,7 +63257,7 @@ c.close()
         assert_eq!(classified[0].0, ConnectorKind::Omp);
         assert_eq!(
             classified[0].1.path,
-            std::fs::canonicalize(sessions_root).unwrap()
+            dunce::canonicalize(sessions_root).unwrap()
         );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());

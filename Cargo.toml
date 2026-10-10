@@ -121,6 +121,9 @@ ftui-runtime = { version = "=0.5.0", features = ["native-backend", "crossterm-co
 ftui-tty = { version = "=0.5.0" }
 ftui-extras = { version = "=0.5.0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "7.0.0"
+# Canonical paths without Windows' verbatim `\\?\` prefix where the plain
+# spelling names the same file (source identities, 9v9xi).
+dunce = "1.0.5"
 walkdir = "2.5.0"
 glob = "0.3.3"
 base64 = ">=0.21"

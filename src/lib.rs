@@ -23252,9 +23252,11 @@ fn maybe_auto_refresh_index_after_read(
 /// explicitly points at one). Auto-refresh never fires there, and neither
 /// does the TUI's first-run index.
 pub(crate) fn auto_refresh_is_scratch_data_dir(data_dir: &Path) -> bool {
-    let temp = std::env::temp_dir();
-    let canon_temp = std::fs::canonicalize(&temp).unwrap_or(temp);
-    let canon_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    // Both sides resolve through their nearest existing ancestor, so a data
+    // dir that does not exist yet shares the temp dir's canonical spelling
+    // (`\\?\C:\...` on Windows, `/private/var/folders/...` on macOS).
+    let canon_temp = normalize_path_identity(&std::env::temp_dir());
+    let canon_dir = normalize_path_identity(data_dir);
     // `/tmp` is a symlink to `/private/tmp` on macOS, so a canonicalized
     // Linux-style `/tmp/...` data dir lands under `/private/tmp` there.
     canon_dir.starts_with(&canon_temp)
@@ -94811,12 +94813,14 @@ fn normalize_session_filter_path(path: &Path) -> CliResult<PathBuf> {
             .map_err(|e| CliError::unknown(format!("current directory: {e}")))?
             .join(path)
     };
-    Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
+    // dunce: the plain `C:\...` spelling stored workspaces use, so a stored
+    // workspace that no longer exists still matches on Windows (9v9xi).
+    Ok(dunce::canonicalize(&absolute).unwrap_or(absolute))
 }
 
 fn workspace_match_distance(candidate: Option<&Path>, target: &Path) -> Option<usize> {
     let candidate = candidate?;
-    let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    let candidate = dunce::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
 
     if candidate == target {
         return Some(0);
@@ -94831,6 +94835,48 @@ fn workspace_match_distance(candidate: Option<&Path>, target: &Path) -> Option<u
         Some(target_depth.saturating_sub(candidate_depth))
     } else {
         None
+    }
+}
+
+/// 9v9xi: a path that does not exist cannot be canonicalized, so it must still
+/// compare with an existing one in the same spelling (Windows `\\?\` prefix,
+/// macOS `/var` -> `/private/var`).
+#[cfg(test)]
+mod path_spelling_tests {
+    use super::*;
+
+    #[test]
+    fn session_workspace_filter_matches_a_stored_workspace_that_no_longer_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Resolve the temp dir's own symlinks first, so only the spelling the
+        // filter produces can differ.
+        let base = dunce::canonicalize(temp.path()).expect("resolve temp dir");
+        let target = normalize_session_filter_path(&base).expect("filter target");
+        let deleted = base.join("deleted-project");
+        assert!(!deleted.exists());
+        assert_eq!(workspace_match_distance(Some(&base), &target), Some(0));
+        assert_eq!(workspace_match_distance(Some(&deleted), &target), Some(1));
+        let sibling = PathBuf::from(format!("{}-sibling", base.display()));
+        assert_eq!(workspace_match_distance(Some(&sibling), &target), None);
+    }
+
+    #[test]
+    fn scratch_data_dir_is_recognized_before_it_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("not-created-yet").join("cass-data");
+        assert!(!data_dir.exists());
+        assert!(auto_refresh_is_scratch_data_dir(&data_dir));
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        assert!(auto_refresh_is_scratch_data_dir(&data_dir));
+        // The root of the temp dir's filesystem is not scratch space.
+        let root = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("temp dir root")
+            .to_path_buf();
+        let outside = root.join(format!("cass-not-scratch-{}", std::process::id()));
+        assert!(!outside.exists());
+        assert!(!auto_refresh_is_scratch_data_dir(&outside));
     }
 }
 

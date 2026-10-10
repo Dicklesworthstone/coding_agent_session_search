@@ -853,6 +853,7 @@ dependencies = [
  "directories",
  "dirs 7.0.0",
  "dotenvy",
+ "dunce",
  "flate2",
  "franken-agent-detection",
  "frankensearch",
