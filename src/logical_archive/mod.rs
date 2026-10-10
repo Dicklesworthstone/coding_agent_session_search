@@ -54,6 +54,10 @@ enum Operation {
         /// Acknowledge that full session bodies and metadata are exported.
         #[arg(long)]
         include_private: bool,
+        /// Wire version: 2 supports large rows; 1 targets older backup readers.
+        /// Version 1 refuses rows beyond 8 MiB instead of truncating them.
+        #[arg(long, default_value_t = codec::CHUNKED_VERSION, value_parser = clap::value_parser!(u32).range(1..=2))]
+        format_version: u32,
     },
     /// Verify framing, identities, counts and digest without opening a database.
     Verify { input: PathBuf },
@@ -255,6 +259,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             output,
             archive_id,
             include_private,
+            format_version,
         } => {
             require_private_acknowledgement(
                 include_private,
@@ -271,7 +276,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
                         "export requires an explicit --db or --data-dir (or CASS_DATA_DIR)".into(),
                     )
                 })?;
-            let (header, completion) = export::export_file(&source, &output, archive_id)?;
+            let (header, completion) = if format_version == codec::CHUNKED_VERSION {
+                export::export_file(&source, &output, archive_id)?
+            } else {
+                export::export_file_for_version(&source, &output, archive_id, format_version)?
+            };
             ("export", header, completion)
         }
         Operation::Verify { input } => {

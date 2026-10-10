@@ -252,7 +252,20 @@ pub fn tables(connection: &Connection) -> Result<Vec<Table>> {
     Ok(output)
 }
 
+fn row_limit(format_version: u32) -> Result<usize> {
+    match format_version {
+        codec::VERSION => Ok(codec::MAX_RECORD_BYTES),
+        codec::CHUNKED_VERSION => Ok(codec::MAX_ROW_BYTES),
+        _ => Err(super::ArchiveUsageError("--format-version must be 1 or 2".into()).into()),
+    }
+}
+
 pub fn cells(values: &[SqliteValue]) -> Result<Vec<Cell>> {
+    cells_for_version(values, codec::CHUNKED_VERSION)
+}
+
+fn cells_for_version(values: &[SqliteValue], format_version: u32) -> Result<Vec<Cell>> {
+    let limit = row_limit(format_version)?;
     // Check payload lower bounds before cloning text or base64-expanding blobs.
     let mut bytes = 0usize;
     for value in values {
@@ -279,9 +292,13 @@ pub fn cells(values: &[SqliteValue]) -> Result<Vec<Cell>> {
         bytes = bytes
             .checked_add(size)
             .ok_or_else(|| anyhow!("oversized logical row"))?;
-        // v2 splits a large logical row into bounded physical frames. Admit
-        // that row here; the validator still enforces its exact encoded size.
-        ensure!(bytes < codec::MAX_ROW_BYTES, "logical row exceeds 256 MiB");
+        // The selected transport determines admission. Neither version
+        // truncates a row or changes the shared physical-frame bound.
+        ensure!(
+            bytes < limit,
+            "logical row exceeds {} MiB",
+            limit / (1024 * 1024)
+        );
     }
     values
         .iter()
@@ -381,14 +398,24 @@ pub fn snapshot(
     archive_id: String,
     output: &mut impl Write,
 ) -> Result<(Header, Completion)> {
+    snapshot_for_version(connection, archive_id, codec::CHUNKED_VERSION, output)
+}
+
+fn snapshot_for_version(
+    connection: &Connection,
+    archive_id: String,
+    format_version: u32,
+    output: &mut impl Write,
+) -> Result<(Header, Completion)> {
+    row_limit(format_version)?;
     let tables = tables(connection)?;
     let header = Header {
         format: codec::FORMAT.to_owned(),
-        schema_version: codec::CHUNKED_VERSION,
+        schema_version: format_version,
         archive_id,
         exported_at_ms: chrono::Utc::now().timestamp_millis(),
         storage_schema_version: schema_version(connection)?,
-        record_types: codec::record_types(codec::CHUNKED_VERSION),
+        record_types: codec::record_types(format_version),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
     };
@@ -439,8 +466,13 @@ pub fn snapshot(
                 let row_number = rows_written
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("logical table row position overflow"))?;
+                let converted = if format_version == codec::CHUNKED_VERSION {
+                    cells(row.values())
+                } else {
+                    cells_for_version(row.values(), format_version)
+                };
                 let record = Record::Row {
-                    values: cells(row.values()).map_err(|error| {
+                    values: converted.map_err(|error| {
                         row_failure(
                             row_location(&table, row_number, row.values()),
                             "cell conversion",
@@ -500,12 +532,25 @@ fn buffered_snapshot(
     archive_id: String,
     output: &mut impl Write,
 ) -> Result<(Header, Completion)> {
+    buffered_snapshot_for_version(connection, archive_id, codec::CHUNKED_VERSION, output)
+}
+
+fn buffered_snapshot_for_version(
+    connection: &Connection,
+    archive_id: String,
+    format_version: u32,
+    output: &mut impl Write,
+) -> Result<(Header, Completion)> {
     let mut buffered = BufWriter::with_capacity(EXPORT_IO_BUFFER_BYTES, output);
     // snapshot explicitly flushes before returning success. On any error,
     // discard buffered bytes rather than letting Drop silently retry a failed
     // write or flush an abandoned prefix. Publication remains export_file's
     // responsibility, after sync and read-back verification.
-    let result = snapshot(connection, archive_id, &mut buffered);
+    let result = if format_version == codec::CHUNKED_VERSION {
+        snapshot(connection, archive_id, &mut buffered)
+    } else {
+        snapshot_for_version(connection, archive_id, format_version, &mut buffered)
+    };
     let _ = buffered.into_parts();
     result
 }
@@ -515,6 +560,16 @@ pub fn export_file(
     destination: &Path,
     archive_id: String,
 ) -> Result<(Header, Completion)> {
+    export_file_for_version(source, destination, archive_id, codec::CHUNKED_VERSION)
+}
+
+pub(super) fn export_file_for_version(
+    source: &Path,
+    destination: &Path,
+    archive_id: String,
+    format_version: u32,
+) -> Result<(Header, Completion)> {
+    row_limit(format_version)?; // Refuse unsupported selections before filesystem mutation.
     let _lock = DestinationLock::acquire(destination)?;
     ensure!(
         fs::symlink_metadata(destination)
@@ -524,7 +579,11 @@ pub fn export_file(
     let connection = open_source(source)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent(destination)?)
         .map_err(|error| io_failure("cannot create staged logical archive", error))?;
-    let result = buffered_snapshot(&connection, archive_id, &mut temporary)?;
+    let result = if format_version == codec::CHUNKED_VERSION {
+        buffered_snapshot(&connection, archive_id, &mut temporary)?
+    } else {
+        buffered_snapshot_for_version(&connection, archive_id, format_version, &mut temporary)?
+    };
     connection
         .execute("ROLLBACK") // Release the consistent read snapshot.
         .map_err(|error| source_failure("cannot release source snapshot", error))?;
@@ -588,3 +647,7 @@ pub fn verify_file(path: &Path) -> Result<(Header, Completion)> {
 #[cfg(test)]
 #[path = "export_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "v2_export_tests.rs"]
+mod v2_tests;
