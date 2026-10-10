@@ -14,11 +14,12 @@ mod migrate;
 mod query;
 mod reimport;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coding_agent_search::franken_sync::FrankenError;
+use coding_agent_search::indexer::IndexRunBusy;
 use coding_agent_search::search::archive_rebuild::ArchiveIndexPlan;
 
 #[derive(Parser)]
@@ -212,8 +213,8 @@ fn require_private_acknowledgement(include_private: bool, message: &str) -> Resu
 /// Engine payloads can contain SQL, filesystem paths or private cell values.
 /// Report only structural error codes and numeric I/O coordinates, retaining
 /// the typed cause so automation can still distinguish busy and I/O failures.
-fn database_failure(context: impl std::fmt::Display, error: FrankenError) -> anyhow::Error {
-    let detail = match &error {
+fn database_failure_message(context: impl std::fmt::Display, error: &FrankenError) -> String {
+    let detail = match error {
         FrankenError::Io(error) => match error.raw_os_error() {
             Some(code) => format!("; I/O {:?} (OS error {code})", error.kind()),
             None => format!("; I/O {:?}", error.kind()),
@@ -244,11 +245,15 @@ fn database_failure(context: impl std::fmt::Display, error: FrankenError) -> any
         FrankenError::WalCorrupt { .. } => "; corrupt WAL".to_owned(),
         _ => String::new(),
     };
-    let message = format!(
+    format!(
         "{context}: FrankenSQLite {:?} (code {}){detail}",
         error.error_code(),
         error.extended_error_code(),
-    );
+    )
+}
+
+fn database_failure(context: impl std::fmt::Display, error: FrankenError) -> anyhow::Error {
+    let message = database_failure_message(context, &error);
     anyhow::Error::new(error).context(message)
 }
 
@@ -267,6 +272,7 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
     }
     if has(|cause| {
         cause.is::<ArchiveBusyError>()
+            || cause.is::<IndexRunBusy>()
             || cause.downcast_ref::<FrankenError>().is_some_and(|error| {
                 matches!(
                     error,
@@ -302,6 +308,46 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
         return (5, "logical-archive-integrity", false);
     }
     (9, "logical-archive-error", false)
+}
+
+/// Keep the canonical-restore receipt and retry instructions in the visible
+/// message without flattening the indexing cause. Index workers and engine
+/// errors may contain private text, so summarize only recognized typed causes.
+fn index_rebuild_failure(
+    error: anyhow::Error,
+    database: &Path,
+    created: bool,
+    retry_flags: &str,
+) -> anyhow::Error {
+    let detail = if error
+        .chain()
+        .any(|cause| cause.is::<IndexRunBusy>() || cause.is::<ArchiveBusyError>())
+    {
+        "lexical rebuild failed: maintenance or database lock contention".to_owned()
+    } else if let Some(cause) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<FrankenError>())
+    {
+        database_failure_message("lexical rebuild failed", cause)
+    } else if let Some(cause) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        match cause.raw_os_error() {
+            Some(code) => format!(
+                "lexical rebuild failed: I/O {:?} (OS error {code})",
+                cause.kind()
+            ),
+            None => format!("lexical rebuild failed: I/O {:?}", cause.kind()),
+        }
+    } else {
+        "lexical rebuild failed during index recovery admission or publication".to_owned()
+    };
+    error.context(format!(
+        "canonical archive was {} and is retained at {}; {detail}; retry the same import with {retry_flags}",
+        if created { "created" } else { "verified unchanged" },
+        database.display(),
+    ))
 }
 
 /// The `archive` subcommand tree, for the main CLI's help and command
@@ -480,12 +526,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
                     "--if-identical --rebuild-index"
                 };
                 lexical_rebuild = Some(plan.rebuild().map_err(|error| {
-                    anyhow!(
-                        "canonical archive was {} and is retained at {}; lexical rebuild failed: {}; retry the same import with {retry_flags}",
-                        if created { "created" } else { "verified unchanged" },
-                        plan.database().display(),
-                        error,
-                    )
+                    index_rebuild_failure(error, plan.database(), created, retry_flags)
                 })?);
             }
             ("import", header, completion)
@@ -520,6 +561,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     fn classified(error: FrankenError) -> (i32, &'static str, bool) {
         classify_failure(
@@ -575,6 +617,85 @@ mod tests {
             },
         ] {
             assert_eq!(classified(error), io);
+        }
+    }
+
+    #[test]
+    fn failed_index_rebuild_keeps_typed_causes_and_private_retry_diagnostics() {
+        for (cause, class, detail) in [
+            (
+                anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "PRIVATE-WORKER-CONTENT",
+                )),
+                (14, "logical-archive-io", true),
+                "I/O StorageFull",
+            ),
+            (
+                anyhow::Error::new(FrankenError::IoRead { page: 42 }),
+                (14, "logical-archive-io", true),
+                "cannot read database page 42",
+            ),
+            (
+                anyhow::Error::new(FrankenError::CheckpointFailed {
+                    detail: "PRIVATE-WORKER-CONTENT".into(),
+                }),
+                (14, "logical-archive-io", true),
+                "database checkpoint failed",
+            ),
+            (
+                anyhow::Error::new(FrankenError::BusySnapshot {
+                    conflicting_pages: "PRIVATE-WORKER-CONTENT".into(),
+                }),
+                (7, "logical-archive-busy", true),
+                "FrankenSQLite",
+            ),
+            (
+                anyhow::Error::new(FrankenError::SnapshotTooOld { txn_id: 88 }),
+                (7, "logical-archive-busy", true),
+                "retry the archive command for a fresh snapshot",
+            ),
+            (
+                anyhow::Error::new(FrankenError::WriteConflict {
+                    page: 44,
+                    holder: 88,
+                }),
+                (7, "logical-archive-busy", true),
+                "database write conflict on page 44",
+            ),
+            (
+                anyhow::Error::new(FrankenError::DatabaseCorrupt {
+                    detail: "PRIVATE-WORKER-CONTENT".into(),
+                }),
+                (9, "logical-archive-error", false),
+                "FrankenSQLite",
+            ),
+            (
+                anyhow!("busy permission denied PRIVATE-WORKER-CONTENT"),
+                (9, "logical-archive-error", false),
+                "index recovery admission or publication",
+            ),
+        ] {
+            let has_engine_cause = cause.downcast_ref::<FrankenError>().is_some();
+            let has_io_cause = cause.downcast_ref::<std::io::Error>().is_some();
+            let error = index_rebuild_failure(
+                cause.context("PRIVATE-WORKER-CONTENT in a producer context"),
+                Path::new("recovered/agent_search.db"),
+                false,
+                "--if-identical --allow-compatible-schema --rebuild-index",
+            );
+            assert_eq!(classify_failure(&error), class);
+            assert_eq!(
+                error.downcast_ref::<FrankenError>().is_some(),
+                has_engine_cause
+            );
+            assert_eq!(error.downcast_ref::<std::io::Error>().is_some(), has_io_cause);
+            let message = error.to_string();
+            assert!(message.contains("verified unchanged and is retained at"));
+            assert!(message.contains("recovered/agent_search.db"));
+            assert!(message.contains(detail), "{message}");
+            assert!(message.contains("--if-identical --allow-compatible-schema --rebuild-index"));
+            assert!(!message.contains("PRIVATE-WORKER-CONTENT"), "{message}");
         }
     }
 

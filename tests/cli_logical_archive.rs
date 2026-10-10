@@ -1511,11 +1511,14 @@ fn failed_index_rebuild_retains_the_complete_restore_and_identical_retry_can_fin
     fs::create_dir(&obstruction).unwrap();
     let target = data.join("agent_search.db");
     let failed = import_with_lexical_rebuild(root.path(), &input, &target, false);
-    assert!(!failed.status.success());
+    assert_eq!(failed.status.code(), Some(14));
     assert!(failed.stdout.is_empty());
     let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert_eq!(error["error"]["kind"], "logical-archive-io");
+    assert_eq!(error["error"]["retryable"], true);
     assert!(error.to_string().contains("is retained"), "{error}");
     assert!(error.to_string().contains("--if-identical --rebuild-index"));
+    assert!(!error.to_string().contains("PORTABLENEEDLE"));
     assert!(target.is_file());
     assert_eq!(
         export(
@@ -1542,6 +1545,135 @@ fn failed_index_rebuild_retains_the_complete_restore_and_identical_retry_can_fin
             .unwrap()
             .len(),
         4
+    );
+}
+
+#[test]
+fn busy_index_rebuild_retains_a_verified_database_and_identical_retry_finishes() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let input_before = fs::read(&input).unwrap();
+    let data = root.path().join("busy-recovered-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    let lock = fs::File::create(data.join("index-run.lock")).unwrap();
+    lock.lock().unwrap();
+
+    // This is genuine contention with another process, after canonical
+    // publication. The CLI must retain both the restored DB and the busy type.
+    let failed = import_with_lexical_rebuild(root.path(), &input, &target, false);
+    assert_eq!(failed.status.code(), Some(7));
+    assert!(failed.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert_eq!(error["error"]["kind"], "logical-archive-busy");
+    assert_eq!(error["error"]["retryable"], true);
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("created and is retained at"));
+    assert!(message.contains("lock contention"));
+    assert!(message.contains("--if-identical --rebuild-index"));
+    assert!(!message.contains("PORTABLENEEDLE"));
+    assert!(target.is_file());
+    assert!(!data.join("index").exists());
+    assert_eq!(fs::read(&input).unwrap(), input_before);
+    let database_before = fs::read(&target).unwrap();
+    assert_eq!(
+        export(root.path(), &target, &root.path().join("busy-retained.jsonl"))["content_sha256"],
+        exported["content_sha256"]
+    );
+
+    drop(lock);
+    let retried = receipt(import_with_lexical_rebuild(
+        root.path(),
+        &input,
+        &target,
+        true,
+    ));
+    assert_eq!(retried["destination_status"], "unchanged");
+    assert_eq!(retried["lexical_rebuild"]["indexed_documents"], 4);
+    assert_eq!(fs::read(&target).unwrap(), database_before);
+    assert_eq!(fs::read(&input).unwrap(), input_before);
+    assert_eq!(
+        search_recovered(root.path(), &data, "PORTABLENEEDLE")["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+fn assert_indexed_import_preserves_aliased_input(link: impl Fn(&Path, &Path)) {
+    let root = tempfile::tempdir().unwrap();
+    let (input, _, _) = portable_search_fixture(root.path());
+    let input_before = fs::read(&input).unwrap();
+    for case in 0..5 {
+        let data = root.path().join(format!("aliased-profile-{case}"));
+        fs::create_dir(&data).unwrap();
+        let index = coding_agent_search::search::tantivy::expected_index_dir(&data);
+        let alias = match case {
+            0 => data.join("index-run.lock"),
+            1 => data.join("index-run.lock.meta"),
+            2 => data.join(".maintenance-events.jsonl"),
+            3 => index.join(".archive-fingerprint-cache.json.1.tmp"),
+            _ => data.join("index/.rebuild-staging/retained-segment"),
+        };
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        link(&input, &alias);
+        let target = data.join("agent_search.db");
+        let failed = import_with_lexical_rebuild(root.path(), &input, &target, false);
+        assert!(!failed.status.success(), "maintenance alias case {case}");
+        assert!(failed.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+        assert!(!error.to_string().contains("PORTABLENEEDLE"));
+        // Refuse before import acquires a destination lock or publishes a DB.
+        // In particular, index-run metadata must never truncate the JSONL.
+        assert!(!target.exists(), "maintenance alias case {case}");
+        assert!(!data.join(".agent_search.db.logical-archive.lock").exists());
+        assert_eq!(fs::read(&input).unwrap(), input_before);
+        assert_eq!(fs::read(&alias).unwrap(), input_before);
+    }
+}
+
+#[test]
+fn indexed_import_preserves_input_aliased_by_maintenance_hard_links() {
+    assert_indexed_import_preserves_aliased_input(|input, alias| {
+        fs::hard_link(input, alias).unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn indexed_import_preserves_input_aliased_by_maintenance_symlinks() {
+    assert_indexed_import_preserves_aliased_input(|input, alias| {
+        std::os::unix::fs::symlink(input, alias).unwrap();
+    });
+}
+
+#[test]
+fn indexed_retry_preserves_database_aliased_by_a_maintenance_file() {
+    let root = tempfile::tempdir().unwrap();
+    let (input, exported, _) = portable_search_fixture(root.path());
+    let input_before = fs::read(&input).unwrap();
+    let data = root.path().join("aliased-database-profile");
+    fs::create_dir(&data).unwrap();
+    let target = data.join("agent_search.db");
+    receipt(import(root.path(), &input, &target, false));
+    let before = fs::read(&target).unwrap();
+    let alias = data.join("index-run.lock.meta");
+    fs::hard_link(&target, &alias).unwrap();
+
+    let failed = import_with_lexical_rebuild(root.path(), &input, &target, true);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&failed.stderr).expect("one JSON failure");
+    assert!(!error.to_string().contains("PORTABLENEEDLE"));
+    assert!(!data.join("index-run.lock").exists());
+    assert!(!data.join("index").exists());
+    assert_eq!(fs::read(&target).unwrap(), before);
+    assert_eq!(fs::read(&alias).unwrap(), before);
+    assert_eq!(fs::read(&input).unwrap(), input_before);
+    assert_eq!(
+        export(root.path(), &target, &root.path().join("alias-retained.jsonl"))["content_sha256"],
+        exported["content_sha256"]
     );
 }
 

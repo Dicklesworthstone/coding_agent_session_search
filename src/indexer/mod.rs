@@ -7099,7 +7099,7 @@ impl LexicalRebuildState {
 /// accepted job for retry without interpreting an arbitrary error message.
 #[derive(Debug, thiserror::Error)]
 #[error("another cass index process already holds {}", lock_path.display())]
-struct IndexRunBusy {
+pub struct IndexRunBusy {
     lock_path: PathBuf,
 }
 
@@ -22944,15 +22944,32 @@ enum LexicalRebuildPagePrepResult {
     Part(LexicalRebuildSequencedPreparedPage),
     Error {
         sequence: u64,
-        error: String,
+        error: anyhow::Error,
     },
 }
 
 #[derive(Debug)]
 enum LexicalRebuildPipelineMessage {
     Batch(LexicalRebuildPreparedPage),
-    Error(String),
+    Error(anyhow::Error),
     Done,
+}
+
+fn lexical_rebuild_page_prep_error(sequence: u64, error: anyhow::Error) -> anyhow::Error {
+    error.context(format!(
+        "lexical rebuild page-prep worker failed at sequence {sequence}"
+    ))
+}
+
+/// Error chains are Send + Sync; carrying them through the existing channel
+/// preserves database/I/O classification without printing private cause text.
+fn send_lexical_rebuild_pipeline_error(
+    sender: &Sender<LexicalRebuildPipelineMessage>,
+    error: anyhow::Error,
+) {
+    let _ = sender.send(LexicalRebuildPipelineMessage::Error(
+        error.context("lexical rebuild packet producer failed"),
+    ));
 }
 
 fn lexical_rebuild_prepared_page_reserved_bytes(page: &LexicalRebuildPreparedPage) -> usize {
@@ -23456,14 +23473,9 @@ fn spawn_lexical_rebuild_page_prep_workers(
                             Err(err) => {
                                 let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                     sequence: 0,
-                                    error: format!(
-                                        "{:#}",
-                                        err.context(format!(
-                                            "opening readonly storage for lexical rebuild page-prep worker {}: {}",
-                                            worker_idx,
-                                            worker_db_path.display()
-                                        ))
-                                    ),
+                                    error: err.context(format!(
+                                        "opening readonly storage for lexical rebuild page-prep worker {worker_idx}"
+                                    )),
                                 });
                                 return;
                             }
@@ -23526,7 +23538,9 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                     worker_reservation_order.close();
                                     let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                         sequence,
-                                        error: format!("{err:#}"),
+                                        error: err.context(format!(
+                                            "lexical rebuild page-prep worker {worker_idx} could not prepare page sequence {sequence}"
+                                        )),
                                     });
                                     break;
                                 }
@@ -23534,10 +23548,10 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                     worker_reservation_order.close();
                                     let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                         sequence,
-                                        error: format!(
-                                            "lexical rebuild page-prep worker {worker_idx} panicked while preparing page sequence {sequence}: {}",
-                                            panic_payload_message(payload)
-                                        ),
+                                        error: anyhow::anyhow!(panic_payload_message(payload))
+                                            .context(format!(
+                                                "lexical rebuild page-prep worker {worker_idx} panicked while preparing page sequence {sequence}"
+                                            )),
                                     });
                                     break;
                                 }
@@ -23600,7 +23614,7 @@ fn spawn_lexical_rebuild_packet_producer(
                 *step_started = Instant::now();
             };
             let send_error = |error: anyhow::Error| {
-                let _ = tx.send(LexicalRebuildPipelineMessage::Error(format!("{error:#}")));
+                send_lexical_rebuild_pipeline_error(&tx, error);
             };
 
             // Preparation owns any recovery writes. Worker readers cannot
@@ -24178,11 +24192,7 @@ fn spawn_lexical_rebuild_packet_producer(
                                 &mut completed_pages,
                                 flow_limiter.as_ref(),
                             );
-                            return Err(anyhow::anyhow!(
-                                "lexical rebuild page-prep worker failed at sequence {}: {}",
-                                sequence,
-                                error
-                            ));
+                            return Err(lexical_rebuild_page_prep_error(sequence, error));
                         }
                         Err(_) => {
                             reservation_order.close();
@@ -25937,7 +25947,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                             )?;
                         }
                         Ok(LexicalRebuildPipelineMessage::Error(error)) => {
-                            return Err(anyhow::anyhow!(error));
+                            return Err(error);
                         }
                         Ok(LexicalRebuildPipelineMessage::Done) => {
                             producer_finished = true;
@@ -27515,7 +27525,7 @@ fn rebuild_tantivy_from_db_once(
                         }
                     }
                     Ok(LexicalRebuildPipelineMessage::Error(error)) => {
-                        return Err(anyhow::anyhow!(error));
+                        return Err(error);
                     }
                     Ok(LexicalRebuildPipelineMessage::Done) => break,
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -51403,6 +51413,116 @@ mod tests {
     }
 
     #[test]
+    fn lexical_rebuild_failure_channels_preserve_database_and_io_causes() -> Result<()> {
+        use crate::franken_sync::FrankenError;
+
+        let causes = [
+            anyhow::Error::new(FrankenError::IoRead { page: 42 }),
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "PRIVATE-LEXICAL-FAILURE-PATH",
+            )),
+            anyhow::Error::new(FrankenError::CheckpointFailed {
+                detail: "PRIVATE-LEXICAL-FAILURE-CHECKPOINT".to_owned(),
+            }),
+        ];
+        for (case, cause) in causes.into_iter().enumerate() {
+            let (worker_tx, worker_rx) = bounded(1);
+            let worker = thread::spawn(move || {
+                worker_tx.send(LexicalRebuildPagePrepResult::Error {
+                    sequence: 37,
+                    error: cause.context("PRIVATE-LEXICAL-FAILURE-WORKER-CONTEXT"),
+                })
+            });
+            let response = worker_rx.recv_timeout(Duration::from_secs(10))?;
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("failure fixture worker panicked"))?
+                .map_err(|_| anyhow::anyhow!("failure fixture channel disconnected"))?;
+            let LexicalRebuildPagePrepResult::Error { sequence, error } = response else {
+                anyhow::bail!("failure fixture did not reach the page-prep dispatcher");
+            };
+            assert_eq!(sequence, 37);
+            let error = lexical_rebuild_page_prep_error(sequence, error);
+            assert!(!error.to_string().contains("PRIVATE-LEXICAL-FAILURE"));
+
+            let (producer_tx, producer_rx) = bounded(1);
+            send_lexical_rebuild_pipeline_error(&producer_tx, error);
+            let LexicalRebuildPipelineMessage::Error(error) =
+                producer_rx.recv_timeout(Duration::from_secs(10))?
+            else {
+                anyhow::bail!("failure fixture did not reach the rebuild sink");
+            };
+            assert_eq!(error.to_string(), "lexical rebuild packet producer failed");
+            assert!(error.chain().any(|cause| {
+                cause.to_string() == "lexical rebuild page-prep worker failed at sequence 37"
+            }));
+            match case {
+                0 => assert!(matches!(
+                    error.downcast_ref::<FrankenError>(),
+                    Some(FrankenError::IoRead { page: 42 })
+                )),
+                1 => assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .context("filesystem failure lost its typed cause")?
+                        .kind(),
+                    std::io::ErrorKind::PermissionDenied
+                ),
+                2 => assert!(matches!(
+                    error.downcast_ref::<FrankenError>(),
+                    Some(FrankenError::CheckpointFailed { .. })
+                )),
+                _ => anyhow::bail!("unexpected failure fixture case"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_rebuild_page_prep_open_failure_retains_its_engine_cause() -> Result<()> {
+        let root = TempDir::new()?;
+        let db_path = root.path().join("PRIVATE-WORKER-ARCHIVE-PATH.db");
+        let (work_tx, work_rx) = bounded(1);
+        let (result_tx, result_rx) = bounded(1);
+        let workers = spawn_lexical_rebuild_page_prep_workers(
+            1,
+            db_path.clone(),
+            Arc::new(HashMap::new()),
+            work_rx,
+            result_tx,
+            Arc::new(StreamingByteLimiter::new(1024)),
+            Arc::new(LexicalRebuildReservationOrder::new()),
+            Arc::new(LexicalRebuildProducerTelemetry::default()),
+            None,
+        )?;
+        let response = result_rx.recv_timeout(Duration::from_secs(30))?;
+        drop(work_tx);
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("archive admission worker panicked"))?;
+        }
+        let LexicalRebuildPagePrepResult::Error { sequence, error } = response else {
+            anyhow::bail!("missing archive did not fail page-prep admission");
+        };
+        assert_eq!(sequence, 0);
+        assert!(
+            error
+                .downcast_ref::<crate::franken_sync::FrankenError>()
+                .is_some(),
+            "page-prep admission must retain the engine error type"
+        );
+        assert!(error.to_string().contains("page-prep worker 0"));
+        assert!(!error.to_string().contains("PRIVATE-WORKER-ARCHIVE-PATH"));
+        assert!(
+            !db_path.exists(),
+            "read-only admission cannot create an archive"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[serial]
     fn page_prep_worker_panic_surfaces_as_error_result_instead_of_parking_producer() {
         let tmp = TempDir::new().unwrap();
@@ -51453,12 +51573,21 @@ mod tests {
             LexicalRebuildPagePrepResult::Error { sequence, error } => {
                 assert_eq!(sequence, 0);
                 assert!(
-                    error.contains("panicked"),
+                    error.to_string().contains("panicked"),
                     "error must identify the panic: {error}"
                 );
                 assert!(
-                    error.contains("injected lexical rebuild page-prep panic"),
+                    error
+                        .root_cause()
+                        .to_string()
+                        .contains("injected lexical rebuild page-prep panic"),
                     "error must preserve the panic payload text: {error}"
+                );
+                assert!(
+                    !error
+                        .to_string()
+                        .contains("injected lexical rebuild page-prep panic"),
+                    "the public worker context must omit private panic payloads"
                 );
             }
             other => panic!("expected a page-prep Error result, got {other:?}"),

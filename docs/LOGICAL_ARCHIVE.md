@@ -271,6 +271,16 @@ input outside the destination directory because index, lock and checkpoint
 names there belong to maintenance, not interchange storage. The output path,
 not an ambient `CASS_DATA_DIR` or export-source `--db`, selects this profile.
 
+Indexed recovery also checks file identity before canonical restoration and
+again before rebuilding. Direct profile files and the entire lexical index
+tree, including staging and retained generations, must not contain symlinks,
+reparse points, special files, or hard links to the input backup or canonical
+database. This prevents lock metadata, maintenance logs and checkpoint writes
+from modifying either protected file through another pathname. The check keeps
+an open input handle and visits one directory entry at a time, with a maximum
+maintenance-tree depth of 64; it does not read file bodies or retain a list of
+index files. Independent regular maintenance files remain admissible.
+
 This path reads only the restored canonical database. It does not run normal
 provider discovery, rescan local histories, salvage historical source bundles,
 create a semantic index, or acquire a model. It reuses the existing exclusive
@@ -322,6 +332,14 @@ cass archive import /private/backups/history.jsonl \
   --output /private/recovered-cass/agent_search.db \
   --if-identical --rebuild-index
 ```
+
+Index-run contention retains exit 7 (`logical-archive-busy`, retryable); typed
+filesystem and database I/O failures retain exit 14 (`logical-archive-io`,
+retryable). Page-preparation and packet-producer worker channels preserve these
+causes. The error message reports safe I/O kinds, database codes or page numbers,
+the retained database and retry flags without echoing worker payloads or private
+session text. Unclassified failures remain exit 9 and are not inferred from
+words such as "busy" in an arbitrary error message.
 
 `--if-identical` must verify the whole existing database before granting rebuild
 authority. A different archive is a conflict even when its caller-assigned
