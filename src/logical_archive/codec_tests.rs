@@ -204,6 +204,7 @@ fn an_unterminated_oversized_stream_is_stopped_before_unbounded_reading() {
 
 #[test]
 fn malformed_errors_do_not_echo_private_bodies() {
+    // ubs:ignore[rust.security.hardcoded-secrets] -- Synthetic payload verifies diagnostic redaction.
     let secret = "PRIVATE_SESSION_SECRET";
     let bytes = format!("{{\"type\":\"{secret}\"}}\n");
     let error = read_record(&mut Cursor::new(bytes), 12)
@@ -213,6 +214,81 @@ fn malformed_errors_do_not_echo_private_bodies() {
     assert!(!error.contains(secret));
     assert!(read_record(&mut Cursor::new(b"\xff\n"), 1).is_err());
     assert!(read_record(&mut Cursor::new(b"\n"), 1).is_err());
+}
+
+#[test]
+fn failed_read_after_valid_records_reports_io_and_position_without_private_details() {
+    struct FailedRead {
+        prefix: Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailedRead {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.prefix.read(bytes)?;
+            if count == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "PRIVATE_READ_ERROR_DETAIL",
+                ))
+            } else {
+                Ok(count)
+            }
+        }
+    }
+
+    // Header, table and one complete private row have already verified when
+    // the underlying reader fails before the completion. This is not evidence
+    // of an invalid archive, and the reader's arbitrary message is not public.
+    let prefix = valid()
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(3)
+        .flatten()
+        .copied()
+        .collect();
+    let mut input = BufReader::with_capacity(
+        64,
+        FailedRead {
+            prefix: Cursor::new(prefix),
+        },
+    );
+    let error = verify(&mut input).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("record 4"), "{message}");
+    assert!(message.contains("UnexpectedEof"), "{message}");
+    assert!(!message.contains("PRIVATE_READ_ERROR_DETAIL"));
+    assert!(!message.contains("private"));
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.downcast_ref::<std::io::Error>().is_some());
+}
+
+#[test]
+fn interrupted_reads_resume_and_verify_the_complete_archive() {
+    struct InterruptedOnce {
+        bytes: Cursor<Vec<u8>>,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            // Exercise records spanning many read buffers as well as EINTR.
+            let take = bytes.len().min(7);
+            self.bytes.read(&mut bytes[..take])
+        }
+    }
+
+    let expected = verify(&mut Cursor::new(valid())).unwrap();
+    let input = InterruptedOnce {
+        bytes: Cursor::new(valid()),
+        interrupted: false,
+    };
+    assert_eq!(verify(&mut BufReader::new(input)).unwrap(), expected);
 }
 
 #[test]

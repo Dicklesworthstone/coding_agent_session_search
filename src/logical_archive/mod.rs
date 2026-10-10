@@ -190,7 +190,18 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
     }) {
         return (7, "logical-archive-busy", true);
     }
-    if has(|cause| cause.is::<std::io::Error>()) {
+    if has(|cause| {
+        cause.is::<std::io::Error>()
+            || cause.downcast_ref::<FrankenError>().is_some_and(|error| {
+                matches!(
+                    error,
+                    FrankenError::Io(_)
+                        | FrankenError::IoRead { .. }
+                        | FrankenError::IoWrite { .. }
+                        | FrankenError::ShortRead { .. }
+                )
+            })
+    }) {
         return (14, "logical-archive-io", true);
     }
     if has(|cause| cause.is::<ArchiveIntegrityError>()) {
@@ -414,5 +425,21 @@ mod tests {
             classified(FrankenError::DatatypeMismatch),
             (9, "logical-archive-error", false)
         );
+    }
+
+    #[test]
+    fn database_io_variants_remain_retryable_through_context() {
+        let io = (14, "logical-archive-io", true);
+        for error in [
+            FrankenError::Io(std::io::ErrorKind::PermissionDenied.into()),
+            FrankenError::IoRead { page: 42 },
+            FrankenError::IoWrite { page: 43 },
+            FrankenError::ShortRead {
+                expected: 4096,
+                actual: 2048,
+            },
+        ] {
+            assert_eq!(classified(error), io);
+        }
     }
 }

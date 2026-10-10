@@ -2,7 +2,7 @@
 //! authority and are omitted; unfamiliar unkeyed tables fail rather than vanish.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -260,6 +260,17 @@ pub fn cells(values: &[SqliteValue]) -> Result<Vec<Cell>> {
 fn row_failure(table: &str, row: u64, stage: &str, error: anyhow::Error) -> anyhow::Error {
     let message = format!("logical table {table}, row {row}, {stage}: {error}");
     error.context(message)
+}
+
+/// I/O error messages may contain a pathname or caller-supplied private data.
+/// Keep the typed cause for classification, but expose only its kind and OS
+/// code in the outer message consumed by the JSON CLI.
+pub(super) fn io_failure(context: impl std::fmt::Display, error: io::Error) -> anyhow::Error {
+    let message = match error.raw_os_error() {
+        Some(code) => format!("{context}: I/O {:?} (OS error {code})", error.kind()),
+        None => format!("{context}: I/O {:?}", error.kind()),
+    };
+    anyhow::Error::new(error).context(message)
 }
 
 fn output_failure(location: &str, error: std::io::Error) -> anyhow::Error {

@@ -266,8 +266,10 @@ fn read_record_bytes(reader: &mut impl BufRead, line: u64) -> Result<Option<Vec<
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             // Keep the I/O cause: a failed read is not a verdict on the archive.
             Err(error) => {
-                return Err(anyhow::Error::new(error)
-                    .context(format!("cannot read logical archive at record {line}")));
+                return Err(super::export::io_failure(
+                    format!("cannot read logical archive at record {line}"),
+                    error,
+                ));
             }
         };
         if available.is_empty() {
