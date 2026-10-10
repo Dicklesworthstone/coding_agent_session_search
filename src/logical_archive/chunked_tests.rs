@@ -1,5 +1,5 @@
-use super::*;
 use super::super::{self as codec, Cell, Completion, Header, Table, Validator};
+use super::*;
 use std::io::Cursor;
 use std::sync::OnceLock;
 
@@ -11,7 +11,10 @@ fn row_bytes() -> &'static [u8] {
         let row = Record::Row {
             values: vec![
                 Cell::Integer(7),
-                Cell::Text(format!("PRIVATE-ROW{}", "雪\0".repeat(MAX_RECORD_BYTES / 9 + 1))),
+                Cell::Text(format!(
+                    "PRIVATE-ROW{}",
+                    "雪\0".repeat(MAX_RECORD_BYTES / 9 + 1)
+                )),
                 Cell::Blob(STANDARD.encode([0_u8, 255, 128].repeat(1024))),
             ],
         };
@@ -48,13 +51,22 @@ fn table() -> Table {
 
 fn archive(version: u32, row: &Record) -> (Vec<u8>, Completion) {
     let header = header(version);
-    let mut output = codec::encode(&Record::Header { header: header.clone() }).unwrap();
+    let mut output = codec::encode(&Record::Header {
+        header: header.clone(),
+    })
+    .unwrap();
     let mut validator = Validator::new(header).unwrap();
     for record in [Record::Table { table: table() }, row.clone()] {
         codec::write_encoded(&validator.push(&record).unwrap(), &mut output).unwrap();
     }
     let completion = validator.completion();
-    output.extend(validator.push(&Record::Completion { completion: completion.clone() }).unwrap());
+    output.extend(
+        validator
+            .push(&Record::Completion {
+                completion: completion.clone(),
+            })
+            .unwrap(),
+    );
     (output, completion)
 }
 
@@ -104,13 +116,23 @@ fn continuation_group_is_one_logical_row_and_leaves_the_next_record_unread() {
 #[test]
 fn v1_and_v2_preserve_the_same_small_row_content_digest() {
     let row = Record::Row {
-        values: vec![Cell::Integer(7), Cell::Text("legacy 雪".to_owned()), Cell::Null],
+        values: vec![
+            Cell::Integer(7),
+            Cell::Text("legacy 雪".to_owned()),
+            Cell::Null,
+        ],
     };
     let (old, old_completion) = archive(codec::VERSION, &row);
     let (new, new_completion) = archive(codec::CHUNKED_VERSION, &row);
     assert_eq!(old_completion, new_completion);
-    assert_eq!(codec::verify(&mut Cursor::new(old)).unwrap().1, old_completion);
-    assert_eq!(codec::verify(&mut Cursor::new(new)).unwrap().1, new_completion);
+    assert_eq!(
+        codec::verify(&mut Cursor::new(old)).unwrap().1,
+        old_completion
+    );
+    assert_eq!(
+        codec::verify(&mut Cursor::new(new)).unwrap().1,
+        new_completion
+    );
 }
 
 #[test]
@@ -118,7 +140,10 @@ fn v1_header_cannot_authorize_a_continued_row() {
     let row: Record = serde_json::from_slice(row_bytes()).unwrap();
     let (bytes, _) = archive(codec::CHUNKED_VERSION, &row);
     let header_end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
-    let mut downgraded = codec::encode(&Record::Header { header: header(codec::VERSION) }).unwrap();
+    let mut downgraded = codec::encode(&Record::Header {
+        header: header(codec::VERSION),
+    })
+    .unwrap();
     downgraded.extend_from_slice(&bytes[header_end..]);
     let error = codec::verify(&mut Cursor::new(downgraded)).unwrap_err();
     assert_eq!(
@@ -151,8 +176,10 @@ fn declared_row_limit_is_checked_before_reading_chunks() {
 #[test]
 fn omitted_reordered_and_duplicate_chunks_are_rejected() {
     let bytes = wire();
-    let original: Vec<Vec<u8>> = bytes.split_inclusive(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec).collect();
+    let original: Vec<Vec<u8>> = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
     let mut omitted = original.clone();
     omitted.remove(2);
     assert_integrity(&omitted.concat());
@@ -180,11 +207,19 @@ fn every_frame_boundary_truncation_and_missing_final_newline_are_rejected() {
 #[test]
 fn checksum_tampering_and_invalid_base64_are_rejected_without_echoing_payloads() {
     let bytes = wire();
-    let mut frames: Vec<Vec<u8>> = bytes.split_inclusive(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec).collect();
+    let mut frames: Vec<Vec<u8>> = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
     let last = frames.len() - 1;
     frames[last].clear();
-    write_frame(&Frame::RowEnd { sha256: "0".repeat(64) }, &mut frames[last]).unwrap();
+    write_frame(
+        &Frame::RowEnd {
+            sha256: "0".repeat(64),
+        },
+        &mut frames[last],
+    )
+    .unwrap();
     assert_integrity(&frames.concat());
     let Frame::RowChunk { sequence, mut data } = frame(&frames[1], 1).unwrap() else {
         panic!("first continuation must be a chunk");
@@ -198,8 +233,10 @@ fn checksum_tampering_and_invalid_base64_are_rejected_without_echoing_payloads()
 #[test]
 fn empty_short_and_extra_chunks_are_rejected() {
     let bytes = wire();
-    let original: Vec<Vec<u8>> = bytes.split_inclusive(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec).collect();
+    let original: Vec<Vec<u8>> = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
     for data in [String::new(), STANDARD.encode(b"short")] {
         let mut frames = original.clone();
         frames[1].clear();
@@ -213,7 +250,10 @@ fn empty_short_and_extra_chunks_are_rejected() {
 
 #[test]
 fn whitespace_padding_cannot_smuggle_a_small_row_through_v1() {
-    let mut padded = codec::encode(&Record::Row { values: vec![Cell::Integer(7)] }).unwrap();
+    let mut padded = codec::encode(&Record::Row {
+        values: vec![Cell::Integer(7)],
+    })
+    .unwrap();
     padded.resize(MAX_RECORD_BYTES + 1, b' ');
     let mut input = Vec::new();
     write(&padded, &mut input).unwrap();
@@ -224,11 +264,15 @@ fn whitespace_padding_cannot_smuggle_a_small_row_through_v1() {
 fn a_valid_group_checksum_does_not_replace_the_archive_completion_digest() {
     let row: Record = serde_json::from_slice(row_bytes()).unwrap();
     let (bytes, _) = archive(codec::CHUNKED_VERSION, &row);
-    let mut frames: Vec<Vec<u8>> = bytes.split_inclusive(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec).collect();
+    let mut frames: Vec<Vec<u8>> = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
     let mut changed = row_bytes().to_vec();
-    let at = changed.windows(b"PRIVATE-ROW".len())
-        .position(|window| window == b"PRIVATE-ROW").unwrap();
+    let at = changed
+        .windows(b"PRIVATE-ROW".len())
+        .position(|window| window == b"PRIVATE-ROW")
+        .unwrap();
     changed[at] = b'X';
     let mut group = Vec::new();
     write(&changed, &mut group).unwrap(); // Its per-row checksum is correct.
@@ -245,7 +289,10 @@ fn continued_input_io_failure_keeps_its_retryable_class() {
     struct Fails;
     impl Read for Fails {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "PRIVATE-READ-DETAIL"))
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "PRIVATE-READ-DETAIL",
+            ))
         }
     }
     let bytes = wire();
@@ -261,7 +308,9 @@ fn continued_input_io_failure_keeps_its_retryable_class() {
 
 #[test]
 fn a_failed_frame_write_stops_before_row_end() {
-    struct FailsAfterStart { calls: usize }
+    struct FailsAfterStart {
+        calls: usize,
+    }
     impl Write for FailsAfterStart {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.calls += 1;
@@ -271,7 +320,9 @@ fn a_failed_frame_write_stops_before_row_end() {
                 Ok(bytes.len())
             }
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     let mut output = FailsAfterStart { calls: 0 };
     let error = write(row_bytes(), &mut output).unwrap_err();

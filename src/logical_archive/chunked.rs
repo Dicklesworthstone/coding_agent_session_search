@@ -28,14 +28,20 @@ fn invalid(line: u64, message: impl std::fmt::Display) -> anyhow::Error {
 
 fn frame(bytes: &[u8], line: u64) -> Result<Frame> {
     serde_json::from_slice(bytes).map_err(|error| {
-        invalid(line, format!("malformed continuation frame, column {}", error.column()))
+        invalid(
+            line,
+            format!("malformed continuation frame, column {}", error.column()),
+        )
     })
 }
 
 fn write_frame(frame: &Frame, output: &mut impl Write) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(frame).map_err(io::Error::other)?;
     if bytes.len() >= MAX_RECORD_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "oversized continuation frame"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "oversized continuation frame",
+        ));
     }
     bytes.push(b'\n');
     output.write_all(&bytes)
@@ -45,17 +51,25 @@ fn write_frame(frame: &Frame, output: &mut impl Write) -> io::Result<()> {
 /// streamed: never build a second, base64-expanded copy of the complete row.
 pub(super) fn write(bytes: &[u8], output: &mut impl Write) -> io::Result<()> {
     if bytes.len() <= MAX_RECORD_BYTES || bytes.len() > MAX_ROW_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid continued row size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid continued row size",
+        ));
     }
     write_frame(&Frame::RowStart { bytes: bytes.len() }, output)?;
     for (sequence, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
         write_frame(
-            &Frame::RowChunk { sequence, data: STANDARD.encode(chunk) },
+            &Frame::RowChunk {
+                sequence,
+                data: STANDARD.encode(chunk),
+            },
             output,
         )?;
     }
     write_frame(
-        &Frame::RowEnd { sha256: hex::encode(Sha256::digest(bytes)) },
+        &Frame::RowEnd {
+            sha256: hex::encode(Sha256::digest(bytes)),
+        },
         output,
     )
 }
@@ -83,7 +97,10 @@ impl<R: BufRead> Chunks<'_, R> {
         let next = frame(&bytes, self.line)?;
         if self.remaining == 0 {
             let Frame::RowEnd { sha256 } = next else {
-                return Err(invalid(self.line, "expected row_end after the declared row bytes"));
+                return Err(invalid(
+                    self.line,
+                    "expected row_end after the declared row bytes",
+                ));
             };
             if sha256 != hex::encode(self.digest.clone().finalize()) {
                 return Err(invalid(self.line, "continued row checksum mismatch"));
@@ -97,7 +114,10 @@ impl<R: BufRead> Chunks<'_, R> {
             return Err(invalid(self.line, "expected the next row_chunk"));
         };
         if sequence != self.sequence {
-            return Err(invalid(self.line, "missing, duplicate or unordered row_chunk"));
+            return Err(invalid(
+                self.line,
+                "missing, duplicate or unordered row_chunk",
+            ));
         }
         // Canonical chunk sizes bound both allocation and frame count (at
         // most 256), including hostile streams made of tiny or empty chunks.
@@ -106,7 +126,8 @@ impl<R: BufRead> Chunks<'_, R> {
         if data.len() != encoded {
             return Err(invalid(self.line, "row_chunk has the wrong encoded length"));
         }
-        let decoded = STANDARD.decode(data)
+        let decoded = STANDARD
+            .decode(data)
             .map_err(|_| invalid(self.line, "invalid row_chunk base64"))?;
         if decoded.len() != expected {
             return Err(invalid(self.line, "row_chunk has the wrong decoded length"));
@@ -160,16 +181,15 @@ impl Write for Size {
     }
 }
 
-pub(super) fn read(
-    reader: &mut impl BufRead,
-    start: &[u8],
-    line: u64,
-) -> Result<Record> {
+pub(super) fn read(reader: &mut impl BufRead, start: &[u8], line: u64) -> Result<Record> {
     let Frame::RowStart { bytes } = frame(start, line)? else {
         return Err(invalid(line, "continuation without row_start"));
     };
     if bytes <= MAX_RECORD_BYTES || bytes > MAX_ROW_BYTES {
-        return Err(invalid(line, "continued row must exceed 8 MiB and fit within 256 MiB"));
+        return Err(invalid(
+            line,
+            "continued row must exceed 8 MiB and fit within 256 MiB",
+        ));
     }
     let mut chunks = Chunks {
         reader,
@@ -188,7 +208,10 @@ pub(super) fn read(
         return Err(error);
     }
     let record = decoded.map_err(|error| {
-        invalid(line, format!("malformed continued row, column {}", error.column()))
+        invalid(
+            line,
+            format!("malformed continued row, column {}", error.column()),
+        )
     })?;
     if !chunks.finished || chunks.remaining != 0 {
         return Err(invalid(line, "continued row was not completed"));
@@ -203,7 +226,10 @@ pub(super) fn read(
         // This also prevents accepting continuation frames under a v1 header:
         // every reconstructed row must exceed v1's unchanged Validator bound.
         // Whitespace-padding a small row cannot bypass that version admission.
-        return Err(invalid(line, "a single-record row must not use continuations"));
+        return Err(invalid(
+            line,
+            "a single-record row must not use continuations",
+        ));
     }
     Ok(record)
 }

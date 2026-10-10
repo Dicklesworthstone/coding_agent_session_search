@@ -337,7 +337,7 @@ fn scan_failure_keeps_the_cause_but_redacts_its_message() {
 }
 
 #[test]
-fn exact_limit_null_heavy_row_is_published_and_verified() -> Result<()> {
+fn exact_physical_limit_row_stays_an_ordinary_verified_record() -> Result<()> {
     let root = tempfile::tempdir()?;
     let database = root.path().join("source.db");
     let output = root.path().join("archive.jsonl");
@@ -358,8 +358,8 @@ fn exact_limit_null_heavy_row_is_published_and_verified() -> Result<()> {
     values.extend(std::iter::repeat_n(Cell::Null, 62));
     let framing = serde_json::to_vec(&Record::Row { values })?.len() + 1;
     let body_length = codec::MAX_RECORD_BYTES - framing;
-    // The former 32-byte scalar estimate rejected this supported row.
-    assert!(body_length + 63 * 32 >= codec::MAX_RECORD_BYTES);
+    // An exactly full physical record must remain an ordinary row in v2,
+    // including all NULL cells; continuations begin only above this boundary.
     connection.execute_with_params(
         "INSERT INTO messages (id, body) VALUES (17, ?1)",
         &[SqliteValue::Text("s".repeat(body_length).into())],
@@ -368,6 +368,7 @@ fn exact_limit_null_heavy_row_is_published_and_verified() -> Result<()> {
     connection.close()?;
 
     let receipt = export_file(&database, &output, "boundary-archive".to_owned())?;
+    assert_eq!(receipt.0.schema_version, codec::CHUNKED_VERSION);
     assert_eq!(receipt, verify_file(&output)?);
     assert_eq!(receipt.1.records, 3);
     assert_eq!(receipt.1.tables["messages"], 2);
@@ -438,9 +439,80 @@ fn invalid_utf8_text_is_refused_without_lossy_backup_or_private_diagnostic() -> 
 }
 
 #[test]
-fn oversized_cells_report_the_bound_without_echoing_the_value() {
-    let private = "PRIVATE-OVERSIZED-CELL".repeat(codec::MAX_RECORD_BYTES / 20 + 1);
-    let cause = cells(&[SqliteValue::Text(private.into())]).unwrap_err();
+fn cells_preserve_large_text_blob_and_nulls_within_the_v2_bound() -> Result<()> {
+    let length = 9 * 1024 * 1024;
+    let blob: std::sync::Arc<[u8]> = vec![0xff; length].into();
+    let values = [
+        SqliteValue::Integer(17),
+        SqliteValue::Text("x".repeat(length).into()),
+        SqliteValue::Blob(blob.clone()),
+        SqliteValue::Null,
+    ];
+    let actual = cells(&values)?;
+    assert_eq!(actual.len(), values.len());
+    assert_eq!(actual[0], Cell::Integer(17));
+    assert!(matches!(
+        (&actual[1], &values[1]),
+        (Cell::Text(text), SqliteValue::Text(original))
+            if text.as_bytes() == original.as_bytes_direct()
+    ));
+    let Cell::Blob(encoded) = &actual[2] else {
+        return Err(anyhow!("large BLOB changed its storage class"));
+    };
+    assert!(STANDARD.decode(encoded)?.as_slice() == blob.as_ref());
+    assert_eq!(actual[3], Cell::Null);
+    Ok(())
+}
+
+#[test]
+fn cells_refuse_invalid_utf8_without_private_diagnostic() {
+    let text = fsqlite_types::SmallText::from_bytes(b"PRIVATE-INVALID-UTF8\x80\xff");
+    assert!(!text.is_valid_utf8());
+    let error = cells(&[SqliteValue::Text(text)])
+        .expect_err("invalid UTF-8 must not become replacement characters");
+    let message = error.to_string();
+    assert!(message.contains("invalid UTF-8"));
+    assert!(!message.contains("PRIVATE-INVALID-UTF8"));
+}
+
+#[test]
+fn cells_preserve_an_exact_v1_boundary_row_with_many_nulls() -> Result<()> {
+    let mut empty = vec![Cell::Integer(17), Cell::Text(String::new())];
+    empty.extend(std::iter::repeat_n(Cell::Null, 62));
+    let framing = serde_json::to_vec(&Record::Row { values: empty })?.len() + 1;
+    let length = codec::MAX_RECORD_BYTES - framing;
+    let mut values = vec![
+        SqliteValue::Integer(17),
+        SqliteValue::Text("s".repeat(length).into()),
+    ];
+    values.extend(std::iter::repeat_n(SqliteValue::Null, 62));
+    let actual = cells(&values)?;
+    assert_eq!(actual.len(), 64);
+    assert!(actual[2..].iter().all(|value| *value == Cell::Null));
+    assert_eq!(
+        codec::encode(&Record::Row { values: actual })?.len(),
+        codec::MAX_RECORD_BYTES
+    );
+    Ok(())
+}
+
+#[test]
+fn shared_blob_cells_reject_the_256_mib_bound_without_expansion_or_private_diagnostic() {
+    // Cloning SqliteValue::Blob shares its Arc: this fixture retains one
+    // 3 MiB payload, while 64 base64 payloads alone would occupy 256 MiB.
+    // Required JSON framing means the row cannot fit. Refuse it in preflight,
+    // before allocating any of those 64 encoded copies.
+    let private = b"PRIVATE-OVERSIZED-CELL";
+    let mut bytes = vec![0_u8; 3 * 1024 * 1024];
+    bytes[..private.len()].copy_from_slice(private);
+    let blob: std::sync::Arc<[u8]> = bytes.into();
+    let mut values = vec![SqliteValue::Integer(19)];
+    values.extend(std::iter::repeat_n(SqliteValue::Blob(blob.clone()), 64));
+    assert_eq!(
+        (values.len() - 1) * blob.len().div_ceil(3) * 4,
+        codec::MAX_ROW_BYTES
+    );
+    let cause = cells(&values).unwrap_err();
     let error = row_failure(
         "logical table messages, row 19".to_owned(),
         "cell conversion",
@@ -448,18 +520,19 @@ fn oversized_cells_report_the_bound_without_echoing_the_value() {
     );
     let public_message = error.to_string();
     assert!(public_message.contains("messages, row 19, cell conversion"));
-    assert!(public_message.contains("8 MiB"));
+    assert!(public_message.contains("256 MiB"));
     assert!(!public_message.contains("PRIVATE-OVERSIZED-CELL"));
+    assert!(!public_message.contains(&STANDARD.encode(private)));
 }
 
 #[test]
-fn json_expansion_failure_names_the_row_and_never_publishes() -> Result<()> {
+fn json_expansion_beyond_one_frame_is_published_and_verified() -> Result<()> {
     let source = tempfile::tempdir()?;
     let destination = tempfile::tempdir()?;
     let database = source.path().join("agent_search.db");
     fixture(&database);
-    // Raw text fits the cell bound, but JSON's six-byte NUL escapes exceed
-    // the encoded-record limit. This is distinct from an oversized raw cell.
+    // The raw body fits one physical frame, but JSON's six-byte NUL escapes
+    // require v2 continuations. Export must retain it rather than refuse it.
     let body = format!(
         "PRIVATE-ENCODED-ROW{}",
         "\0".repeat(codec::MAX_RECORD_BYTES / 6 + 1)
@@ -468,31 +541,33 @@ fn json_expansion_failure_names_the_row_and_never_publishes() -> Result<()> {
     let connection = Connection::open(path_text(&database)?)?;
     connection.execute_with_params(
         "UPDATE messages SET body = ?1 WHERE id = 7",
-        &[SqliteValue::Text(body.into())],
+        &[SqliteValue::Text(body.clone().into())],
     )?;
     connection.close()?;
     let before = contents(source.path());
     let output = destination.path().join("archive.jsonl");
-    let error = export_file(&database, &output, "encoding-failure".to_owned())
-        .expect_err("oversized JSON must refuse, never truncate or skip the row");
-    let public_message = error.to_string();
-    assert!(
-        public_message.contains("messages, row 2"),
-        "{public_message}"
-    );
-    assert!(public_message.contains("id=7"), "{public_message}");
-    assert!(
-        public_message.contains("record validation/encoding"),
-        "{public_message}"
-    );
-    assert!(public_message.contains("8 MiB"), "{public_message}");
-    assert!(!public_message.contains("PRIVATE-ENCODED-ROW"));
-    assert!(!output.exists());
+    let receipt = export_file(&database, &output, "encoding-continuation".to_owned())?;
+    assert_eq!(receipt.0.schema_version, codec::CHUNKED_VERSION);
+    assert_eq!(receipt.1.tables["messages"], 2);
+    assert_eq!(receipt, verify_file(&output)?);
+    let mut input = BufReader::new(File::open(&output)?);
+    let mut line = 1;
+    let mut found = false;
+    while let Some(record) = codec::read_record(&mut input, line)? {
+        if let Record::Row { values } = record
+            && values[0] == Cell::Integer(7)
+        {
+            assert!(matches!(&values[1], Cell::Text(actual) if actual == &body));
+            found = true;
+        }
+        line += 1;
+    }
+    assert!(found, "the continued message must survive byte for byte");
     assert_eq!(before, contents(source.path()));
     assert_eq!(
         fs::read_dir(destination.path())?.count(),
-        1,
-        "only the persistent destination lock may remain, not a partial backup"
+        2,
+        "only the published archive and persistent destination lock may remain"
     );
     Ok(())
 }

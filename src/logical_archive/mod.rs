@@ -362,7 +362,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let mut receipt = serde_json::json!({
         "operation": operation,
         "format": codec::FORMAT,
-        "schema_version": codec::VERSION,
+        "schema_version": header.schema_version,
         "archive_id": header.archive_id,
         "records": completion.records,
         "tables": completion.tables,

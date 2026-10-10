@@ -279,7 +279,9 @@ pub fn cells(values: &[SqliteValue]) -> Result<Vec<Cell>> {
         bytes = bytes
             .checked_add(size)
             .ok_or_else(|| anyhow!("oversized logical row"))?;
-        ensure!(bytes < codec::MAX_RECORD_BYTES, "logical row exceeds 8 MiB");
+        // v2 splits a large logical row into bounded physical frames. Admit
+        // that row here; the validator still enforces its exact encoded size.
+        ensure!(bytes < codec::MAX_ROW_BYTES, "logical row exceeds 256 MiB");
     }
     values
         .iter()
@@ -382,14 +384,11 @@ pub fn snapshot(
     let tables = tables(connection)?;
     let header = Header {
         format: codec::FORMAT.to_owned(),
-        schema_version: codec::VERSION,
+        schema_version: codec::CHUNKED_VERSION,
         archive_id,
         exported_at_ms: chrono::Utc::now().timestamp_millis(),
         storage_schema_version: schema_version(connection)?,
-        record_types: ["table", "row", "completion"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+        record_types: codec::record_types(codec::CHUNKED_VERSION),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
     };

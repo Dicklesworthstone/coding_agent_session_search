@@ -26,7 +26,14 @@ const MAX_KEY_BYTES: usize = 64 * 1024;
 
 pub fn record_types(version: u32) -> Vec<String> {
     let names: &[&str] = if version == CHUNKED_VERSION {
-        &["table", "row", "row_start", "row_chunk", "row_end", "completion"]
+        &[
+            "table",
+            "row",
+            "row_start",
+            "row_chunk",
+            "row_end",
+            "completion",
+        ]
     } else {
         &["table", "row", "completion"]
     };

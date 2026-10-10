@@ -16,15 +16,24 @@ identity, acknowledgement of private content, and a **new** output path. Reuse
 that identity for subsequent exports of the same archive. Do not use a pathname
 as identity. Receipts are JSON on stdout; failures are JSON on stderr.
 
+Current exports use **wire format version 2**. This binary also reads, verifies
+and restores version 1 backups with their original limits. Version 2 supports a
+complete encoded logical row up to 256 MiB by splitting large rows into physical
+JSONL frames of at most 8 MiB each. An older binary that supports only version 1
+refuses version 2 backups, including those containing only small rows; use a
+version 2 reader for new exports. The receipt's `schema_version` reports the
+version of the archive actually exported or read. The header's separate
+`storage_schema_version` identifies the canonical database schema.
+
 Export opens FrankenSQLite read-only and holds one transaction across schema
 inspection and all table scans. It does not migrate, repair, checkpoint, acquire
 models, or update source export metadata. Physical logical tables are streamed
 one row at a time; the known derived `fts_messages` virtual table and its exact
 FTS5 shadow names, and SQLite internal tables, are omitted. Other prefix-sharing
 tables are not discarded. Unknown virtual tables and unkeyed tables are refused
-rather than silently losing data. Canonical schemas with unsupported identifiers,
-key types, or oversized rows require an explicit format extension; they are not
-truncated.
+rather than silently losing data. Unsupported identifiers, key types, and rows
+exceeding the 256 MiB encoded logical-row limit are refused explicitly. Export
+never truncates them or substitutes references to external provider files.
 
 The destination uses a separate adjacent lock, with a five-second lock
 acquisition deadline. An export is written to a private temporary file in the
@@ -52,14 +61,17 @@ payloads are withheld because they can contain private data. The original typed
 causes remain available to the exit-code classifier, so a busy database or a
 failed read is not mislabeled as an unsupported logical record.
 
-The 8 MiB limit applies to **one complete encoded row**, including all its cells,
-JSON framing, escaping, base64 expansion and the final newline. A collection can
-be much larger than 8 MiB; a raw text field smaller than 8 MiB can still exceed
-the encoded limit. The early payload check is only a lower bound; the bounded
-encoder decides whether a record actually fits. An oversized record fails
-explicitly with its table, row and limit. Export never skips or shortens it.
-Version 1 also refuses SQLite TEXT containing invalid UTF-8 instead of silently
-substituting replacement characters in a purportedly lossless backup.
+The current 256 MiB limit applies to **one complete encoded logical row**,
+including all its cells, JSON framing, escaping, base64 expansion and the final
+newline. Each physical frame remains bounded to 8 MiB. A collection can be much
+larger than either limit; a raw text field below 256 MiB can still exceed the
+logical-row limit when combined with the other cells and encoding overhead.
+The early payload check is only a lower bound; the bounded encoder decides
+whether the logical row actually fits. A row beyond that limit fails explicitly
+with its table, row and limit. Export never skips or shortens it. SQLite TEXT
+containing invalid UTF-8 is also refused instead of silently substituting
+replacement characters in a purportedly lossless backup. Version 1 inputs retain
+their original 8 MiB limit on a complete encoded row.
 
 An error after substantial streaming can therefore identify a single
 unsupported row. It does not make the already written prefix a valid backup.
@@ -139,9 +151,12 @@ fails. Selected orphan relationships or ambiguous view coordinates fail rather
 than falling back to a similarly named session on another machine.
 
 These are sequential scans, not indexed lookups: work grows with backup size
-and each page scans again. Retained application state is bounded by one 8 MiB
-wire record plus the page/context limits, with a 2 MiB encoded-response ceiling.
-This is not a measured whole-process RSS or wall-clock guarantee. No model,
+and each page scans again. Decoding and validation retain state proportional to
+one logical row, whose canonical encoding is at most 256 MiB in version 2, plus
+bounded frame, encoding and page/context buffers. Physical JSONL frames remain
+at most 8 MiB, and the encoded-response ceiling remains 2 MiB. The 64 KiB complete
+view window is unchanged even when an unselected row is larger. These are not
+measured whole-process RSS or wall-clock guarantees. No model,
 database, profile, index or provider file is created or opened by these commands.
 They report `content_source: "logical_archive"`, not canonical-database access.
 `integrity_verified` means the complete wire checksum/count/order contract
@@ -169,11 +184,16 @@ Rows are individually bound as typed SQL parameters using one prepared INSERT
 per table. No exported path is used as a write destination and no URL or provider
 source is fetched. Initializer seeds are removed only from the new private
 replay database. Trusted initializer triggers are suspended during replay and
-reinstated afterward, avoiding duplicate derived writes. Input batches are
-limited to 128 records or 16 MiB of consumed JSONL, including whitespace,
-whichever comes first. Batch commits are never exposed as a valid partial
-restore: the complete stream, footer, counts, digest, canonical schema metadata,
-foreign keys and database integrity must all pass first.
+reinstated afterward, avoiding duplicate derived writes. A batch rolls over
+before the next logical record would exceed 128 records or 16 MiB of consumed
+JSONL, including whitespace and continuation framing. One logical row cannot be
+split across database inserts: an admitted row larger than the byte budget is
+processed in its own batch and may exceed 16 MiB. Its canonical encoding still
+must fit the 256 MiB logical-row limit; continuation transport adds base64 and
+framing overhead. A continuation group counts as one logical record. Batch
+commits are never exposed as a valid partial restore: the complete stream,
+footer, counts, digest, canonical schema metadata, foreign keys and database
+integrity must all pass first.
 
 Replay retains the canonical WAL writer policy. A journal-mode change or clean
 close does not by itself prove a self-contained database. After all private
@@ -379,6 +399,51 @@ Archive failures are JSON on stderr with a kebab-case `kind`:
 | 14 | `logical-archive-io` | yes | Reading or writing a file failed |
 | 9 | `logical-archive-error` | no | Anything else, including an occupied destination |
 
+## Version 2 wire contract
+
+New exports have `schema_version: 2` and declare these `record_types`, in order:
+`table`, `row`, `row_start`, `row_chunk`, `row_end`, `completion`. The header,
+table descriptors, typed cells, primary-key order, and completion have the same
+logical meanings as version 1. A row whose complete canonical JSON and newline
+fit within 8 MiB is written as one ordinary `row` record with the same bytes as
+version 1. The limit for an entire canonical logical row is 256 MiB.
+
+A larger row is written as one contiguous continuation group:
+
+* `row_start` declares `bytes`, the byte count of the complete encoded logical
+  row including its final newline. It must exceed 8 MiB and fit within 256 MiB.
+* `row_chunk` carries a zero-based `sequence` and standard padded base64 `data`.
+  Each chunk decodes to 1 MiB of the row's canonical JSON bytes, except the last,
+  which contains exactly the remaining bytes. Chunk boundaries can fall inside
+  UTF-8 characters or JSON escapes; decoding reconstructs the original bytes.
+* `row_end` carries the lowercase hexadecimal `sha256` of those complete row
+  bytes. The count and checksum must both match before the reader returns a row.
+
+Every physical frame is UTF-8 JSONL, ends in a newline, and fits within the same
+8 MiB frame bound. Declared row size, chunk size and sequence are checked while
+reading, with at most 256 chunks per row. Missing, duplicate, reordered, empty
+or extra chunks, malformed base64, checksum mismatches and incomplete groups
+fail verification. Only logical rows may use continuations. Padding a small row
+with whitespace does not permit it to use a continuation group or bypass the
+version 1 row limit.
+
+The encoder holds one bounded canonical row and emits chunks successively.
+The decoder retains one decoded 1 MiB chunk while constructing the typed row;
+it does not concatenate a second complete encoded input row. Parsing, canonical
+validation, BLOB conversion and database binding still require memory
+proportional to that row, in addition to fixed frame buffers. The limits are not
+a promise of a 256 MiB whole-process memory ceiling.
+
+A continuation group contributes **one logical row** to table and archive
+counts. The completion digest covers canonical reconstructed rows, not the
+continuation envelopes. For hashing, both versions use the version 1 domain and
+normalize the header's wire version and record-type list to version 1, with its
+timestamp set to zero. Equal logical content under the same archive identity
+therefore retains the same digest across versions. Each group's checksum is an
+additional consistency check; it does not replace the final archive completion
+or provide a signature. Restore, repeated-import comparison, search and view
+consume the reconstructed row through the same validation path.
+
 ## Version 1 wire contract
 
 Each UTF-8 JSONL record ends in a newline and is at most 8 MiB, **including** that
@@ -414,9 +479,10 @@ material. Descriptors are bounded to 256 tables, 256 columns per table, and
 
 The digest starts with `cass.logical_archive.v1\0`, followed by compact canonical
 JSON records with their newlines. The header timestamp is normalized to zero
-when hashing. All table and row records are hashed; the completion is not.
+when hashing; version 2 also normalizes its wire version and record-type list
+as described above. All table and row records are hashed; the completion is not.
 Serialization follows the Rust format structs' declared field order, not input
-object key order. The digest binds archive identity, schema, descriptors, cell
+object key order. The digest binds archive identity, storage schema, descriptors, cell
 values and omissions, but not export time or incidental JSON whitespace. This
 is an integrity checksum, **not** a signature or proof of source authenticity.
 
