@@ -372,6 +372,61 @@ fn scan_failure(table: &str, next_row: u64, error: FrankenError) -> anyhow::Erro
     )
 }
 
+/// Let the engine walk primary-key indexes when the persisted schema proves
+/// every column uses the default BINARY collation. Explicit COLLATE wrappers
+/// prevent the pinned engine from recognizing text/composite index ordering.
+/// A bounded DDL check is deliberately conservative: comments or string values
+/// containing COLLATE keep the explicit ordering, as do absent/large definitions.
+/// Never infer default collation from an index, whose key terms may override it.
+pub(super) fn ordered_scan_sql(connection: &Connection, table: &Table) -> Result<String> {
+    table.validate()?;
+    let metadata = connection
+        .query_with_params(
+            "SELECT CASE WHEN sql IS NOT NULL AND length(sql) <= 65536 \
+             THEN instr(upper(sql), 'COLLATE') = 0 ELSE 0 END \
+             FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 2",
+            &[SqliteValue::Text(table.name.clone().into())],
+        )
+        .map_err(|error| {
+            source_failure(
+                format!("cannot inspect ordering for logical table {}", table.name),
+                error,
+            )
+        })?;
+    ensure!(
+        metadata.len() <= 1,
+        "logical table ordering metadata is ambiguous"
+    );
+    let default_binary = metadata
+        .first()
+        .map(|row| row.get_typed::<i64>(0))
+        .transpose()
+        .map_err(|error| {
+            source_failure(
+                format!("cannot decode ordering for logical table {}", table.name),
+                error,
+            )
+        })?
+        == Some(1);
+    let columns = table
+        .columns
+        .iter()
+        .map(|name| quoted(name))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let collation = if default_binary { "" } else { " COLLATE BINARY" };
+    let order = table
+        .primary_key
+        .iter()
+        .map(|&offset| Ok(format!("{}{collation} ASC", quoted(&table.columns[offset])?)))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(format!(
+        "SELECT {columns} FROM {} ORDER BY {order}",
+        quoted(&table.name)?
+    ))
+}
+
 pub fn snapshot(
     connection: &Connection,
     archive_id: String,
@@ -415,27 +470,7 @@ fn snapshot_for_version(
                     error,
                 )
             })?;
-        let columns = table
-            .columns
-            .iter()
-            .map(|name| quoted(name))
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        let order = table
-            .primary_key
-            .iter()
-            .map(|&offset| {
-                Ok(format!(
-                    "{} COLLATE BINARY ASC",
-                    quoted(&table.columns[offset])?
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        let sql = format!(
-            "SELECT {columns} FROM {} ORDER BY {order}",
-            quoted(&table.name)?
-        );
+        let sql = ordered_scan_sql(connection, &table)?;
         let mut failure = None;
         let mut rows_written = 0u64;
         let streamed = connection.query_with_params_for_each(&sql, &[], |row| {
@@ -630,3 +665,337 @@ mod tests;
 #[cfg(test)]
 #[path = "v2_export_tests.rs"]
 mod v2_tests;
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    fn opcodes(connection: &Connection, sql: &str) -> Result<Vec<String>> {
+        connection
+            .query(&format!("EXPLAIN {sql}"))?
+            .iter()
+            .map(|row| row.get_typed::<String>(1).map_err(anyhow::Error::from))
+            .collect()
+    }
+
+    #[test]
+    fn implicit_binary_primary_key_scans_avoid_sorters_and_verify() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let destination = tempfile::tempdir()?;
+        let database = source.path().join("source.db");
+        let connection = Connection::open(path_text(&database)?)?;
+        connection.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', '9');
+             CREATE TABLE binary_keys (k BLOB PRIMARY KEY, body TEXT);
+             INSERT INTO binary_keys VALUES
+               ('a', 'private body'), (7, 'private body'), (X'FF', 'private body'),
+               ('Z', 'private body'), (-2, 'private body'), (X'0001', 'private body'),
+               (X'00', 'private body'), ('007', 'private body');
+             CREATE TABLE composite_keys (
+               tenant TEXT, sequence INTEGER, body TEXT,
+               PRIMARY KEY (tenant, sequence));
+             INSERT INTO composite_keys VALUES
+               ('a', 2, 'private body'), ('Z', 1, 'private body'),
+               ('A', 4, 'private body'), ('a', -3, 'private body'),
+               ('A', -2, 'private body');
+             CREATE TABLE large_keys (k TEXT PRIMARY KEY, body TEXT);",
+        )?;
+        for key in ["\0", "a\0z", "é"] {
+            connection.execute_with_params(
+                "INSERT INTO binary_keys VALUES (?1, 'private body')",
+                &[SqliteValue::Text(key.to_owned().into())],
+            )?;
+        }
+        connection.execute("BEGIN")?;
+        for index in (0..512).rev() {
+            connection.execute_with_params(
+                "INSERT INTO large_keys VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Text(format!("key-{index:06}").into()),
+                    SqliteValue::Text("private collection body ".repeat(16).into()),
+                ],
+            )?;
+        }
+        connection.execute("COMMIT")?;
+        connection.close()?;
+        let connection = open_source(&database)?;
+        let descriptors = tables(&connection)?;
+        for name in ["binary_keys", "composite_keys", "large_keys"] {
+            let table = descriptors.iter().find(|table| table.name == name).unwrap();
+            let sql = ordered_scan_sql(&connection, table)?;
+            let plan = opcodes(&connection, &sql)?;
+            assert!(
+                plan.iter().any(|opcode| opcode == "OpenRead"),
+                "{name}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|opcode| opcode.starts_with("Sorter")),
+                "{name}: {plan:?}"
+            );
+            let columns = table
+                .columns
+                .iter()
+                .map(|name| quoted(name))
+                .collect::<Result<Vec<_>>>()?
+                .join(", ");
+            let order = table
+                .primary_key
+                .iter()
+                .map(|&offset| {
+                    Ok(format!(
+                        "{} COLLATE BINARY ASC",
+                        quoted(&table.columns[offset])?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join(", ");
+            let original = format!(
+                "SELECT {columns} FROM {} ORDER BY {order}",
+                quoted(&table.name)?
+            );
+            assert!(
+                opcodes(&connection, &original)?
+                    .iter()
+                    .any(|opcode| opcode == "SorterOpen"),
+                "positive control did not exercise the old sorter for {name}"
+            );
+            if name == "large_keys" {
+                let mut count = 0;
+                connection.query_with_params_for_each(&sql, &[], |row| {
+                    assert_eq!(row.get_typed::<String>(0)?, format!("key-{count:06}"));
+                    count += 1;
+                    Ok(())
+                })?;
+                assert_eq!(count, 512);
+            }
+        }
+        let table = descriptors
+            .iter()
+            .find(|table| table.name == "binary_keys")
+            .unwrap();
+        let actual = connection
+            .query(&ordered_scan_sql(&connection, table)?)?
+            .iter()
+            .map(|row| cells(row.values()).map(|values| values[0].clone()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            actual,
+            vec![
+                Cell::Integer(-2),
+                Cell::Integer(7),
+                Cell::Text("\0".into()),
+                Cell::Text("007".into()),
+                Cell::Text("Z".into()),
+                Cell::Text("a".into()),
+                Cell::Text("a\0z".into()),
+                Cell::Text("é".into()),
+                Cell::Blob("AA==".into()),
+                Cell::Blob("AAE=".into()),
+                Cell::Blob("/w==".into()),
+            ]
+        );
+        let table = descriptors
+            .iter()
+            .find(|table| table.name == "composite_keys")
+            .unwrap();
+        let actual = connection
+            .query(&ordered_scan_sql(&connection, table)?)?
+            .iter()
+            .map(|row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            actual,
+            vec![
+                ("A".into(), -2),
+                ("A".into(), 4),
+                ("Z".into(), 1),
+                ("a".into(), -3),
+                ("a".into(), 2),
+            ]
+        );
+        connection.execute("ROLLBACK")?;
+        connection.close_without_checkpoint()?;
+        let output = destination.path().join("archive.jsonl");
+        let receipt = export_file(&database, &output, "binary-index-scan".into())?;
+        assert_eq!(receipt, verify_file(&output)?);
+        assert_eq!(receipt.1.tables["large_keys"], 512);
+        assert_eq!(receipt.1.tables["binary_keys"], 11);
+        assert_eq!(receipt.1.tables["composite_keys"], 5);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_or_unattested_collations_keep_binary_order_and_verify() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let destination = tempfile::tempdir()?;
+        let database = source.path().join("source.db");
+        let connection = Connection::open(path_text(&database)?)?;
+        connection.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', '9');
+             CREATE TABLE declared_nocase (k TEXT COLLATE NOCASE PRIMARY KEY, body TEXT);
+             CREATE TABLE pk_nocase (k TEXT, body TEXT, PRIMARY KEY(k COLLATE NOCASE));
+             CREATE TABLE overridden_binary (
+               k TEXT COLLATE NOCASE, body TEXT, PRIMARY KEY(k COLLATE BINARY));
+             CREATE TABLE explicit_binary (k TEXT COLLATE BINARY PRIMARY KEY, body TEXT);
+             CREATE TABLE literal_keyword (
+               k TEXT PRIMARY KEY, body TEXT DEFAULT 'PRIVATE-COLLATE-DEFAULT');",
+        )?;
+        let large_default = "x".repeat(65_537);
+        connection.execute(&format!(
+            "CREATE TABLE oversized_definition (
+               k TEXT PRIMARY KEY, body TEXT DEFAULT 'PRIVATE-LONG-DEFAULT-{large_default}')"
+        ))?;
+        let names = [
+            "declared_nocase",
+            "pk_nocase",
+            "overridden_binary",
+            "explicit_binary",
+            "literal_keyword",
+            "oversized_definition",
+        ];
+        for name in names {
+            connection.execute(&format!(
+                "INSERT INTO {} VALUES ('a', 'private body'), ('Z', 'private body')",
+                quoted(name)?
+            ))?;
+        }
+        connection.close()?;
+        let connection = open_source(&database)?;
+        let descriptors = tables(&connection)?;
+        for name in names {
+            let table = descriptors.iter().find(|table| table.name == name).unwrap();
+            let sql = ordered_scan_sql(&connection, table)?;
+            assert!(
+                sql.contains("\"k\" COLLATE BINARY ASC"),
+                "fallback was lost for {name}"
+            );
+            assert!(!sql.contains("PRIVATE-"), "DDL contents entered the scan SQL");
+            let actual = connection
+                .query(&sql)?
+                .iter()
+                .map(|row| row.get_typed::<String>(0).map_err(anyhow::Error::from))
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(
+                actual,
+                vec!["Z".to_owned(), "a".to_owned()],
+                "BINARY order changed for {name}"
+            );
+        }
+        connection.execute("ROLLBACK")?;
+        connection.close_without_checkpoint()?;
+        for version in [codec::VERSION, codec::CHUNKED_VERSION] {
+            let output = destination.path().join(format!("archive-v{version}.jsonl"));
+            let receipt =
+                export_file_for_version(&database, &output, "collation-fallback".into(), version)?;
+            assert_eq!(receipt, verify_file(&output)?);
+            for name in names {
+                assert_eq!(receipt.1.tables[name], 2);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absent_ordering_metadata_preserves_the_database_read_error() -> Result<()> {
+        let connection = Connection::open(":memory:")?;
+        let table = Table {
+            name: "absent_table".into(),
+            columns: vec!["k".into(), "body".into()],
+            primary_key: vec![0],
+        };
+        let sql = ordered_scan_sql(&connection, &table)?;
+        assert!(sql.contains("\"k\" COLLATE BINARY ASC"));
+        let error = connection
+            .query_with_params_for_each(&sql, &[], |_| Ok(()))
+            .expect_err("a missing catalog entry must still reach the original table read");
+        assert!(matches!(error, FrankenError::NoSuchTable { .. }));
+        let error = scan_failure(&table.name, 1, error);
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (9, "logical-archive-error", false)
+        );
+        assert!(error.to_string().contains("absent_table before row 1"));
+        assert!(matches!(
+            error.downcast_ref::<FrankenError>(),
+            Some(FrankenError::NoSuchTable { .. })
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_and_collated_text_key_write_failures_remain_private() -> Result<()> {
+        struct LimitedWriter {
+            remaining: usize,
+        }
+
+        impl Write for LimitedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "PRIVATE-WRITER-DETAIL",
+                    ));
+                }
+                let count = bytes.len().min(self.remaining);
+                self.remaining -= count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("an incomplete snapshot must not be flushed");
+            }
+        }
+
+        for collation in ["", " COLLATE NOCASE"] {
+            let source = tempfile::tempdir()?;
+            let database = source.path().join("source.db");
+            let connection = Connection::open(path_text(&database)?)?;
+            connection.execute_batch(&format!(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', '9');
+                 CREATE TABLE a_private (
+                   k TEXT{collation} PRIMARY KEY, body TEXT DEFAULT 'PRIVATE-DDL-CONTENT');
+                 INSERT INTO a_private VALUES ('PRIVATE-KEY-ONE', 'PRIVATE-MESSAGE-ONE');
+                 INSERT INTO a_private VALUES ('PRIVATE-KEY-TWO', 'PRIVATE-MESSAGE-TWO');"
+            ))?;
+            connection.close()?;
+            let connection = open_source(&database)?;
+            let mut complete = Vec::new();
+            snapshot(&connection, "private-key-failure".into(), &mut complete)?;
+            let mut offset = 0;
+            let mut failure_offset = None;
+            for line in complete.split_inclusive(|byte| *byte == b'\n') {
+                if let Record::Row { values } = serde_json::from_slice(line)?
+                    && values[0] == Cell::Text("PRIVATE-KEY-TWO".into())
+                {
+                    failure_offset = Some(offset + line.len() / 2);
+                    break;
+                }
+                offset += line.len();
+            }
+            let mut writer = LimitedWriter {
+                remaining: failure_offset.expect("fixture has a second private row"),
+            };
+            let error = snapshot(&connection, "private-key-failure".into(), &mut writer)
+                .expect_err("a partial row must abort either ordering path");
+            let message = error.to_string();
+            assert!(
+                message.contains("logical table a_private, row 2"),
+                "{message}"
+            );
+            assert!(message.contains("WriteZero"), "{message}");
+            assert!(!message.contains("PRIVATE-"), "{message}");
+            assert_eq!(
+                super::super::classify_failure(&error),
+                (14, "logical-archive-io", true)
+            );
+            assert_eq!(writer.remaining, 0);
+            connection.execute("ROLLBACK")?;
+            connection.close_without_checkpoint()?;
+        }
+        Ok(())
+    }
+}
