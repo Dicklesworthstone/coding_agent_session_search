@@ -490,3 +490,145 @@ fn final_flush_failure_is_not_a_successful_snapshot() -> Result<()> {
     connection.close_without_checkpoint()?;
     Ok(())
 }
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: Vec<u8>,
+    writes: usize,
+    flushes: usize,
+    largest_write: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        self.largest_write = self.largest_write.max(bytes.len());
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn buffered_snapshot_coalesces_rows_without_changing_the_verified_digest() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    let body = SqliteValue::Text("buffered transcript ".repeat(80).into());
+    connection.execute("BEGIN")?;
+    for id in 100..612 {
+        connection.execute_with_params(
+            "INSERT INTO messages(id, body) VALUES (?1, ?2)",
+            &[SqliteValue::Integer(id), body.clone()],
+        )?;
+    }
+    connection.execute("COMMIT")?;
+    connection.close()?;
+    let connection = open_source(&database)?;
+    let mut direct = CountingWriter::default();
+    let direct_receipt = snapshot(&connection, "buffer-proof".to_owned(), &mut direct)?;
+    let mut buffered = CountingWriter::default();
+    let buffered_receipt =
+        buffered_snapshot(&connection, "buffer-proof".to_owned(), &mut buffered)?;
+    // The timestamp may differ, but canonical rows and their digest must not.
+    assert_eq!(direct_receipt.1, buffered_receipt.1);
+    assert_eq!(
+        codec::verify(&mut BufReader::new(buffered.bytes.as_slice()))?,
+        buffered_receipt
+    );
+    assert_eq!(buffered_receipt.1.tables["messages"], 514);
+    assert!(buffered.bytes.len() > 2 * EXPORT_IO_BUFFER_BYTES);
+    assert!(buffered.writes > 1, "exercise more than one buffer flush");
+    assert!(
+        buffered.writes * 16 < direct.writes,
+        "small records were not coalesced: direct={}, buffered={}",
+        direct.writes,
+        buffered.writes
+    );
+    assert!(buffered.largest_write <= EXPORT_IO_BUFFER_BYTES);
+    assert_eq!(buffered.flushes, 1);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn buffered_snapshot_preserves_records_larger_than_its_io_buffer() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute_with_params(
+        "UPDATE messages SET body = ?1 WHERE id = 7",
+        &[SqliteValue::Text("x".repeat(EXPORT_IO_BUFFER_BYTES * 2).into())],
+    )?;
+    connection.close()?;
+    let connection = open_source(&database)?;
+    let mut writer = CountingWriter::default();
+    let receipt = buffered_snapshot(&connection, "large-record".to_owned(), &mut writer)?;
+    assert!(writer.largest_write > EXPORT_IO_BUFFER_BYTES);
+    assert_eq!(
+        codec::verify(&mut BufReader::new(writer.bytes.as_slice()))?,
+        receipt
+    );
+    assert_eq!(receipt.1.tables["messages"], 2);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn buffered_snapshot_does_not_retry_failed_writes_on_drop() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    // This small fixture reaches the sink on the final explicit flush. A
+    // normal BufWriter drop would retry the still-buffered failed write.
+    let mut writer = FaultWriter {
+        fail_at: Some(0),
+        ..Default::default()
+    };
+    let error = buffered_snapshot(&connection, "failed-buffer".to_owned(), &mut writer)
+        .expect_err("a failed final write must not produce a receipt");
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.to_string().contains("logical archive flush"));
+    assert!(!error.to_string().contains("PRIVATE-WRITER-DETAIL"));
+    assert_eq!(writer.writes, 1, "an error must not trigger an implicit retry");
+    assert_eq!(writer.flushes, 0);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn buffered_snapshot_propagates_underlying_flush_errors() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    let mut writer = FaultWriter {
+        fail_flush: true,
+        ..Default::default()
+    };
+    let error = buffered_snapshot(&connection, "failed-flush".to_owned(), &mut writer).unwrap_err();
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.to_string().contains("logical archive flush"));
+    assert!(!error.to_string().contains("PRIVATE-FLUSH-DETAIL"));
+    assert_eq!(writer.writes, 1);
+    assert_eq!(writer.flushes, 1);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}

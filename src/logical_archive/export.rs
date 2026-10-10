@@ -2,7 +2,7 @@
 //! authority and are omitted; unfamiliar unkeyed tables fail rather than vanish.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,10 @@ use coding_agent_search::franken_sync::compat::{OpenFlags, RowExt, open_with_fla
 use coding_agent_search::franken_sync::{Connection, FrankenError, SqliteValue};
 
 use super::codec::{self, Cell, Completion, Header, Record, Table, Validator};
+
+// Bound extra I/O memory independently of archive size. The existing codec
+// still enforces its separate 8 MiB per-record limit.
+const EXPORT_IO_BUFFER_BYTES: usize = 256 * 1024;
 
 /// A separate destination lock, not the unrelated source-mirroring sync.lock.
 /// Lock files persist so contenders cannot accidentally lock different inodes.
@@ -379,6 +383,23 @@ pub fn snapshot(
     validator.finish()
 }
 
+/// Coalesce small records instead of issuing one file write per canonical
+/// row. Large records bypass BufWriter's fixed-size buffer without growing it.
+fn buffered_snapshot(
+    connection: &Connection,
+    archive_id: String,
+    output: &mut impl Write,
+) -> Result<(Header, Completion)> {
+    let mut buffered = BufWriter::with_capacity(EXPORT_IO_BUFFER_BYTES, output);
+    // snapshot explicitly flushes before returning success. On any error,
+    // discard buffered bytes rather than letting Drop silently retry a failed
+    // write or flush an abandoned prefix. Publication remains export_file's
+    // responsibility, after sync and read-back verification.
+    let result = snapshot(connection, archive_id, &mut buffered);
+    let _ = buffered.into_parts();
+    result
+}
+
 pub fn export_file(
     source: &Path,
     destination: &Path,
@@ -392,12 +413,15 @@ pub fn export_file(
     );
     let connection = open_source(source)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent(destination)?)?;
-    let result = snapshot(&connection, archive_id, &mut temporary)?;
+    let result = buffered_snapshot(&connection, archive_id, &mut temporary)?;
     connection.execute("ROLLBACK")?; // Release the consistent read snapshot.
     connection.close_without_checkpoint()?;
     temporary.as_file().sync_all()?;
     // Verify the actual bytes destined for publication, not just writer state.
-    let actual = codec::verify(&mut BufReader::new(File::open(temporary.path())?))?;
+    let actual = codec::verify(&mut BufReader::with_capacity(
+        EXPORT_IO_BUFFER_BYTES,
+        File::open(temporary.path())?,
+    ))?;
     ensure!(
         actual == result,
         "staged export failed read-back verification"
@@ -423,7 +447,7 @@ pub fn verify_file(path: &Path) -> Result<(Header, Completion)> {
     // Apply the same regular-file admission as import before any blocking read.
     // File::open alone can wait forever on a FIFO before framing limits apply.
     let input = super::import::open_input(path)?;
-    codec::verify(&mut BufReader::new(input))
+    codec::verify(&mut BufReader::with_capacity(EXPORT_IO_BUFFER_BYTES, input))
 }
 
 #[cfg(test)]
