@@ -4,6 +4,7 @@
 
 mod codec;
 mod export;
+mod extract;
 mod import;
 mod migrate;
 mod query;
@@ -93,6 +94,25 @@ enum Operation {
         #[arg(long, short = 'C', default_value_t = 2)]
         context: usize,
         /// Acknowledge that complete private session text will be displayed.
+        #[arg(long)]
+        include_private: bool,
+    },
+    /// Extract one complete message field to a NEW private file, without a DB restore.
+    Extract {
+        input: PathBuf,
+        /// Exact canonical message ID from archive search, not a physical line.
+        #[arg(long)]
+        message_id: i64,
+        /// Require the exact backup content digest returned by search or verify.
+        #[arg(long)]
+        content_sha256: String,
+        /// Stored field: text is exact UTF-8; extra-bin is decoded raw BLOB bytes.
+        #[arg(long, value_enum, default_value = "content")]
+        field: extract::Field,
+        /// New file only. Parent must exist; existing files are never replaced.
+        #[arg(long)]
+        output: PathBuf,
+        /// Acknowledge that the file contains complete private session content.
         #[arg(long)]
         include_private: bool,
     },
@@ -366,6 +386,23 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 "backup view emits private session text; pass --include-private to acknowledge this",
             )?;
             let result = query::view(&input, message_id, context, &content_sha256)?;
+            println!("{result}");
+            return Ok(());
+        }
+        Operation::Extract {
+            input,
+            message_id,
+            content_sha256,
+            field,
+            output,
+            include_private,
+        } => {
+            require_private_acknowledgement(
+                include_private,
+                "backup extraction writes complete private session data; pass --include-private to acknowledge this",
+            )?;
+            let result =
+                extract::extract_file(&input, &output, message_id, &content_sha256, field)?;
             println!("{result}");
             return Ok(());
         }
