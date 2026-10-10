@@ -374,14 +374,42 @@ pub fn cooldown_remaining(
     if last <= 0 {
         return None;
     }
-    let elapsed_ms = now_ms.saturating_sub(last);
-    let cooldown_ms = i64::try_from(cooldown.as_millis()).unwrap_or(i64::MAX);
+    if cooldown.is_zero() {
+        return None;
+    }
+    // A clock correction or an unusually large configured interval must not
+    // overflow while deciding whether launching another process is safe.
+    // Every Duration in milliseconds and every difference of i64 timestamps
+    // fits i128, including the addition used to round remaining seconds up.
+    let elapsed_ms = i128::from(now_ms) - i128::from(last);
+    let cooldown_ms = i128::from(cooldown.as_secs()) * 1000 + i128::from(cooldown.subsec_millis());
     if elapsed_ms >= cooldown_ms {
         None
     } else {
         let remaining_ms = cooldown_ms - elapsed_ms;
-        Some(((remaining_ms + 999) / 1000).max(1) as u64)
+        Some(u64::try_from((remaining_ms + 999) / 1000).unwrap_or(u64::MAX))
     }
+}
+
+/// The absence of index-run.lock immediately after spawn is not proof that
+/// the child exited: another read can arrive before it acquires that lock.
+/// Leave an unjudged spawn alone during its ordinary cooldown. Recognized
+/// failures still report their backoff immediately, and successful watermarks
+/// still reset the breaker during cooldown. Zero keeps its explicit no-wait
+/// meaning; this does not invent a separate liveness or PID-reuse heuristic.
+fn unjudged_spawn_cooldown(
+    state: Option<&AutoRefreshState>,
+    cooldown: Duration,
+    last_indexed_at_ms: Option<i64>,
+    now: i64,
+) -> Option<u64> {
+    let state = state?;
+    if state.failure_counted_for_spawn_ms == state.last_spawn_ms
+        || last_indexed_at_ms.is_some_and(|watermark| watermark >= state.last_spawn_ms)
+    {
+        return None;
+    }
+    cooldown_remaining(Some(state), cooldown, now)
 }
 
 /// The exact argv (after the binary) used for a detached catch-up child.
@@ -618,6 +646,17 @@ pub fn maybe_spawn_with_policy(
 
     let now = now_ms();
     let mut state = load_state(data_dir);
+    if let Some(remaining_secs) =
+        unjudged_spawn_cooldown(state.as_ref(), policy.cooldown, last_indexed_at_ms, now)
+    {
+        debug!(
+            reason,
+            remaining_secs,
+            "auto-refresh skipped: previous spawn is still in cooldown"
+        );
+        let _ = FileExt::unlock(&guard);
+        return AutoRefreshOutcome::Cooldown { remaining_secs };
+    }
     if let Some(current) = state.as_mut() {
         let before = current.clone();
         let verdict = judge_previous_spawn(current, last_indexed_at_ms, now, &log_path(data_dir));
@@ -1343,6 +1382,187 @@ mod tests {
             !log_path(data_dir).exists(),
             "no child must have been spawned"
         );
+    }
+
+    #[test]
+    fn launch_cooldown_expires_without_erasing_failure_or_success_evidence() {
+        let mut state = AutoRefreshState {
+            last_spawn_ms: 1_000_000,
+            last_pid: 42,
+            last_reason: "source-scan-overdue".into(),
+            ..AutoRefreshState::default()
+        };
+        let cooldown = Duration::from_secs(300);
+        for watermark in [None, Some(999_999)] {
+            assert_eq!(
+                unjudged_spawn_cooldown(Some(&state), cooldown, watermark, 1_000_000),
+                Some(300)
+            );
+            assert_eq!(
+                unjudged_spawn_cooldown(Some(&state), cooldown, watermark, 1_299_999),
+                Some(1)
+            );
+            assert_eq!(
+                unjudged_spawn_cooldown(Some(&state), cooldown, watermark, 1_300_000),
+                None
+            );
+        }
+        assert_eq!(
+            unjudged_spawn_cooldown(Some(&state), cooldown, Some(1_000_000), 1_000_000),
+            None,
+            "a completed catch-up must reset an earlier failure streak immediately"
+        );
+        assert_eq!(
+            unjudged_spawn_cooldown(Some(&state), Duration::ZERO, Some(1), 1_000_000),
+            None
+        );
+        state.failure_counted_for_spawn_ms = state.last_spawn_ms;
+        state.consecutive_failures = 1;
+        assert_eq!(
+            unjudged_spawn_cooldown(Some(&state), cooldown, Some(1), 1_000_000),
+            None,
+            "a known failure must not be hidden behind launch grace"
+        );
+    }
+
+    #[test]
+    fn recent_unjudged_spawn_is_not_failed_by_a_burst_of_reads_before_its_index_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AutoRefreshState {
+            last_spawn_ms: now_ms(),
+            last_pid: 4242,
+            last_reason: "source-scan-overdue".into(),
+            ..AutoRefreshState::default()
+        };
+        save_state(dir.path(), &state).unwrap();
+        let state_before = std::fs::read(state_path(dir.path())).unwrap();
+        std::fs::write(
+            log_path(dir.path()),
+            b"child has not acquired index-run.lock yet",
+        )
+        .unwrap();
+        let log_before = std::fs::read(log_path(dir.path())).unwrap();
+        // The decisive regression: a real freshness watermark is still older
+        // than this spawn. Older tests used None, which never judged a failure.
+        // File locks serialize parallel callers; none may inflate the streak,
+        // truncate the child's log, or start another process in this window.
+        std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                threads.push(scope.spawn(|| {
+                    maybe_spawn_with_policy(
+                        dir.path(),
+                        &dir.path().join("agent_search.db"),
+                        "source-scan-overdue",
+                        false,
+                        Some(state.last_spawn_ms - 300_000),
+                        AutoRefreshPolicy::default(),
+                    )
+                }));
+            }
+            for thread in threads {
+                let outcome = thread.join().unwrap();
+                assert!(
+                    matches!(
+                        outcome,
+                        AutoRefreshOutcome::Cooldown { .. } | AutoRefreshOutcome::GuardBusy
+                    ),
+                    "{outcome:?}"
+                );
+            }
+        });
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+        assert_eq!(std::fs::read(state_path(dir.path())).unwrap(), state_before);
+        assert_eq!(std::fs::read(log_path(dir.path())).unwrap(), log_before);
+    }
+
+    #[test]
+    fn successful_watermark_resets_a_prior_streak_even_inside_launch_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawn = now_ms();
+        save_state(
+            dir.path(),
+            &AutoRefreshState {
+                last_spawn_ms: spawn,
+                last_pid: 42,
+                last_reason: "source-scan-overdue".into(),
+                consecutive_failures: 2,
+                failure_counted_for_spawn_ms: spawn - 86_400_000,
+                last_failure_detected_ms: spawn - 86_000_000,
+                last_failure: Some("prior unsuccessful catch-up".into()),
+            },
+        )
+        .unwrap();
+        let outcome = maybe_spawn_with_policy(
+            dir.path(),
+            &dir.path().join("agent_search.db"),
+            "source-scan-overdue",
+            false,
+            Some(spawn),
+            AutoRefreshPolicy::default(),
+        );
+        assert!(matches!(outcome, AutoRefreshOutcome::Cooldown { .. }));
+        let state = load_state(dir.path()).unwrap();
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.last_failure_detected_ms, 0);
+        assert!(state.last_failure.is_none());
+        assert_eq!(state.last_pid, 42);
+        assert!(!log_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recognized_failures_keep_backoff_even_with_a_long_launch_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let state = AutoRefreshState {
+            last_spawn_ms: now - 1000,
+            last_pid: 42,
+            last_reason: "source-scan-overdue".into(),
+            consecutive_failures: 2,
+            failure_counted_for_spawn_ms: now - 1000,
+            last_failure_detected_ms: now,
+            last_failure: Some("recognized failure".into()),
+        };
+        save_state(dir.path(), &state).unwrap();
+        let outcome = maybe_spawn_with_policy(
+            dir.path(),
+            &dir.path().join("agent_search.db"),
+            "source-scan-overdue",
+            false,
+            Some(now - 2000),
+            AutoRefreshPolicy {
+                enabled: true,
+                cooldown: Duration::from_secs(86_400),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            AutoRefreshOutcome::BackedOff {
+                consecutive_failures: 2,
+                ..
+            }
+        ));
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+        assert!(!log_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn cooldown_handles_clock_rollback_and_extreme_intervals_without_overflow() {
+        let state = AutoRefreshState {
+            last_spawn_ms: 1,
+            ..AutoRefreshState::default()
+        };
+        let cooldown = Duration::from_secs(300);
+        assert_eq!(cooldown_remaining(Some(&state), cooldown, 0), Some(301));
+        assert_eq!(
+            cooldown_remaining(Some(&state), Duration::from_secs(u64::MAX), i64::MIN),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            cooldown_remaining(Some(&state), Duration::ZERO, i64::MIN),
+            None
+        );
+        assert_eq!(cooldown_remaining(Some(&state), cooldown, i64::MAX), None);
     }
 
     #[test]
