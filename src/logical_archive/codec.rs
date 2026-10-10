@@ -178,9 +178,21 @@ impl Cell {
             }
             Self::Blob(encoded) => {
                 ensure!(encoded.len() <= MAX_ROW_BYTES, "oversized BLOB encoding");
-                STANDARD
-                    .decode(encoded)
-                    .map_err(|_| anyhow!("invalid BLOB encoding"))?;
+                // Validation must not allocate a decoded copy of a potentially
+                // 192 MiB BLOB only to throw it away. Every nonfinal block ends
+                // on a base64 quartet and must not contain padding. The same
+                // STANDARD engine checks the final block's padding/tail bits.
+                let mut decoded = [0_u8; 3 * 1024];
+                let mut blocks = encoded.as_bytes().chunks(4 * 1024).peekable();
+                while let Some(block) = blocks.next() {
+                    ensure!(
+                        blocks.peek().is_none() || !block.contains(&b'='),
+                        "invalid BLOB encoding"
+                    );
+                    STANDARD
+                        .decode_slice(block, &mut decoded)
+                        .map_err(|_| anyhow!("invalid BLOB encoding"))?;
+                }
             }
             _ => {}
         }
@@ -236,6 +248,68 @@ fn encode_with_limit(record: &Record, limit: usize) -> Result<Vec<u8>> {
     })?;
     buffer.0.push(b'\n');
     Ok(buffer.0)
+}
+
+/// Canonical hashing with fixed scratch space, not a second full encoded row.
+/// Buffer small serializer writes so field punctuation does not require a
+/// separate SHA-256 update; large strings are hashed directly in whole blocks.
+struct CanonicalHash {
+    digest: Sha256,
+    bytes: usize,
+    limit: usize,
+    buffer: [u8; 8192],
+    buffered: usize,
+}
+
+impl CanonicalHash {
+    fn new(digest: Sha256, limit: usize) -> Self {
+        Self {
+            digest,
+            bytes: 0,
+            limit,
+            buffer: [0; 8192],
+            buffered: 0,
+        }
+    }
+
+    fn finish(mut self) -> (Sha256, usize) {
+        self.digest.update(&self.buffer[..self.buffered]);
+        (self.digest, self.bytes)
+    }
+}
+
+impl Write for CanonicalHash {
+    fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes.len();
+        if count > self.limit.saturating_sub(self.bytes) {
+            return Err(std::io::Error::other("logical encoding exceeds its bound"));
+        }
+        self.bytes += count;
+        if self.buffered != 0 {
+            let take = bytes.len().min(self.buffer.len() - self.buffered);
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&bytes[..take]);
+            self.buffered += take;
+            bytes = &bytes[take..];
+            if self.buffered == self.buffer.len() {
+                self.digest.update(&self.buffer);
+                self.buffered = 0;
+            }
+        }
+        if bytes.len() >= self.buffer.len() {
+            let take = bytes.len() / self.buffer.len() * self.buffer.len();
+            self.digest.update(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        self.buffer[self.buffered..self.buffered + bytes.len()].copy_from_slice(bytes);
+        self.buffered += bytes.len();
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.digest.update(&self.buffer[..self.buffered]);
+        self.buffered = 0;
+        Ok(())
+    }
 }
 
 /// Emit already validated canonical bytes, splitting an oversized v2 row into
@@ -381,18 +455,46 @@ impl Validator {
 
     pub fn push(&mut self, record: &Record) -> Result<Vec<u8>> {
         ensure!(!self.completed, "records follow the archive completion");
-        // Return canonical logical bytes, not continuation frames. Hashing
-        // reconstructed rows rather than their transport keeps the content
-        // digest independent of framing. Only v2 rows get the larger bound.
-        let limit = if self.header.schema_version == CHUNKED_VERSION
+        let bytes = encode_with_limit(record, self.record_limit(record))?;
+        let mut digest = self.digest.clone();
+        digest.update(&bytes);
+        self.accept(record, digest)?;
+        Ok(bytes)
+    }
+
+    /// Verify a record and advance canonical identity without allocating its
+    /// serialized bytes. Return its exact encoded size, including the newline.
+    /// All checks and hashing precede state mutation, just as in `push`.
+    pub fn validate(&mut self, record: &Record) -> Result<usize> {
+        ensure!(!self.completed, "records follow the archive completion");
+        let limit = self.record_limit(record);
+        let mut hash = CanonicalHash::new(self.digest.clone(), limit);
+        let encode_error = || {
+            anyhow!(
+                "logical record cannot be encoded within {} MiB",
+                limit / (1024 * 1024)
+            )
+        };
+        serde_json::to_writer(&mut hash, record).map_err(|_| encode_error())?;
+        hash.write_all(b"\n").map_err(|_| encode_error())?;
+        let (digest, bytes) = hash.finish();
+        self.accept(record, digest)?;
+        Ok(bytes)
+    }
+
+    fn record_limit(&self, record: &Record) -> usize {
+        if self.header.schema_version == CHUNKED_VERSION
             && matches!(record, Record::Row { .. })
         {
             MAX_ROW_BYTES
         } else {
             MAX_RECORD_BYTES
-        };
-        // Refuse oversize before advancing counters or the previous identity.
-        let bytes = encode_with_limit(record, limit)?;
+        }
+    }
+
+    /// The single invariant/state transition path for writers and readers.
+    /// A rejected record never advances the key, counts, or canonical digest.
+    fn accept(&mut self, record: &Record, digest: Sha256) -> Result<()> {
         match record {
             Record::Header { .. } => bail!("duplicate archive header"),
             Record::Table { table } => {
@@ -430,8 +532,7 @@ impl Validator {
                         .is_none_or(|previous| *previous < next_key),
                     "duplicate or unordered logical record identity"
                 );
-                self.last_key = Some(next_key);
-                self.rows = self
+                let rows = self
                     .rows
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("logical record count overflow"))?;
@@ -439,9 +540,12 @@ impl Validator {
                     .counts
                     .get_mut(&table.name)
                     .expect("current table has a counter");
-                *count = count
+                let next_count = count
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("logical table count overflow"))?;
+                *count = next_count;
+                self.rows = rows;
+                self.last_key = Some(next_key);
             }
             Record::Completion { completion } => {
                 ensure!(self.current.is_some(), "logical archive contains no tables");
@@ -450,11 +554,11 @@ impl Validator {
                     "logical archive completion count or digest mismatch"
                 );
                 self.completed = true;
-                return Ok(bytes);
+                return Ok(());
             }
         }
-        self.digest.update(&bytes);
-        Ok(bytes)
+        self.digest = digest;
+        Ok(())
     }
 
     pub fn completion(&self) -> Completion {
@@ -484,7 +588,7 @@ pub fn verify(reader: &mut impl BufRead) -> Result<(Header, Completion)> {
     let mut line = 2u64;
     while let Some(record) = read_record(reader, line)? {
         validator
-            .push(&record)
+            .validate(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         line = line
             .checked_add(1)
@@ -496,3 +600,7 @@ pub fn verify(reader: &mut impl BufRead) -> Result<(Header, Completion)> {
 #[cfg(test)]
 #[path = "codec_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "streaming_tests.rs"]
+mod streaming_tests;
