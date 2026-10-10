@@ -40,6 +40,10 @@ fn base_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     // Specific overrides if needed (some might fallback to other paths, but HOME usually covers it)
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // HOME does not isolate Claude Code on Windows (its home comes from the
+    // profile known folder) or under an inherited CLAUDE_CONFIG_DIR; either
+    // way the host's real sessions would be indexed into the test archive.
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
     cmd
 }
 
@@ -398,6 +402,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
+            // On Windows the default ~/.cursor/projects is the profile known
+            // folder, which ignores HOME and USERPROFILE.
+            .env("CASS_CURSOR_PROJECTS_ROOT", home.join(".cursor/projects"))
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("RUST_MIN_STACK", "134217728");
         cmd

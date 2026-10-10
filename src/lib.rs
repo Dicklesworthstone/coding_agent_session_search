@@ -29575,6 +29575,12 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows refuses to rename a directory while the admitted reader holds files in \
+                  it, so this replacement cannot happen there; a publish fails instead \
+                  (coding_agent_session_search-lndgg)"
+    )]
     fn gh452_admitted_reader_survives_replacement_before_client_construction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();

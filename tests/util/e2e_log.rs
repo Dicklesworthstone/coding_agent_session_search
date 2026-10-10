@@ -1466,6 +1466,10 @@ impl E2eCommandEnvironment {
         apply("CASS_TRACE_MAX_EVENTS", OsStr::new("4096"));
         if let Some(home) = &self.home {
             apply("HOME", home.as_os_str());
+            // HOME alone does not isolate Claude Code on Windows (profile
+            // known folder) or under an inherited CLAUDE_CONFIG_DIR.
+            // `with_var` still overrides this.
+            apply("CLAUDE_CONFIG_DIR", home.join(".claude").as_os_str());
         }
         if let Some(codex_home) = &self.codex_home {
             apply("CODEX_HOME", codex_home.as_os_str());
