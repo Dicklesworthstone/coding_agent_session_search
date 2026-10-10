@@ -60,6 +60,7 @@ pub(super) fn verify_existing(
         actual.1 == expected.1,
         "restore conflict: existing canonical data differs from the verified input; nothing was replaced"
     );
+    import::verify_schema_authority(&reader, &expected.0.storage_schema_version)?;
     import::verify_database(&reader)?;
     require_same_file(&reader, destination)?;
     reader.execute("ROLLBACK").map_err(|error| {

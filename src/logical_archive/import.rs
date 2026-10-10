@@ -215,6 +215,40 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
     Ok(statements)
 }
 
+/// Canonical row equality does not establish the schema authority that ordinary
+/// storage opens will use. Check both markers in the caller's existing snapshot.
+/// The admitted version may be historical during a read-only identical retry;
+/// new restores have already matched it to this binary's initializer.
+pub(super) fn verify_schema_authority(
+    connection: &Connection,
+    expected_storage_version: &str,
+) -> Result<()> {
+    let expected = expected_storage_version
+        .parse::<i64>()
+        .context("logical archive storage schema version is invalid")?;
+    let version = connection
+        .query_row("SELECT MAX(version) FROM _schema_migrations")
+        .map_err(|error| {
+            super::database_failure("cannot read the canonical schema-migration authority", error)
+        })?
+        .get_typed::<Option<i64>>(0)
+        .map_err(|error| {
+            super::database_failure(
+                "cannot decode the canonical schema-migration authority",
+                error,
+            )
+        })?;
+    ensure!(
+        version == Some(expected),
+        "canonical schema-migration authority disagrees with the archive storage schema"
+    );
+    ensure!(
+        export::schema_version(connection)? == expected_storage_version,
+        "canonical schema marker disagrees with the archive storage schema"
+    );
+    Ok(())
+}
+
 pub(super) fn verify_database(connection: &Connection) -> Result<()> {
     let mut violated = false;
     let check = connection.query_with_params_for_each("PRAGMA foreign_key_check", &[], |_| {
@@ -506,6 +540,7 @@ pub fn import_file_with_policy(
             super::database_failure("cannot require durable private restore writes", error)
         })?;
     let result = restore(&connection, &mut input, header)?;
+    verify_schema_authority(&connection, &result.0.storage_schema_version)?;
     // restore() has verified the complete input and committed every private
     // batch. VACUUM INTO includes committed WAL rows while leaving the replay
     // files in place. Never delete or ignore them to make publication pass.
@@ -521,6 +556,7 @@ pub fn import_file_with_policy(
     // metadata and relationships. Input verification alone cannot detect an
     // affinity conversion, initializer side effect, or storage write defect.
     let reader = export::open_source(&candidate)?;
+    verify_schema_authority(&reader, &result.0.storage_schema_version)?;
     verify_database(&reader)?;
     let actual = export::snapshot(&reader, result.0.archive_id.clone(), &mut io::sink())?;
     reader.execute("ROLLBACK").map_err(|error| {
@@ -814,5 +850,154 @@ mod publication_tests {
                 assert!(!candidate.exists());
             }
         }
+    }
+
+    fn schema_authority_database_files(
+        path: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::iter::once(path.to_path_buf())
+            .chain(sidecars(path))
+            .filter_map(|path| match fs::read(&path) {
+                Ok(bytes) => Some((path, bytes)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot inspect test database: {error}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contradictory_schema_authority_never_publishes_or_confirms_an_existing_database()
+    -> Result<()> {
+        use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+        for case in ["empty", "stale", "future"] {
+            let root = tempfile::tempdir()?;
+            let source = root.path().join("source.db");
+            drop(SqliteStorage::open(&source)?);
+            let writer = Connection::open(export::path_text(&source)?)?;
+            match case {
+                "empty" => {
+                    writer.execute("DELETE FROM _schema_migrations")?;
+                }
+                "stale" => {
+                    writer.execute_with_params(
+                        "DELETE FROM _schema_migrations WHERE version = ?1",
+                        &[SqliteValue::Integer(CURRENT_SCHEMA_VERSION)],
+                    )?;
+                }
+                "future" => {
+                    writer.execute_with_params(
+                        "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2)",
+                        &[
+                            SqliteValue::Integer(CURRENT_SCHEMA_VERSION + 1),
+                            SqliteValue::Text("PRIVATE-FUTURE-SCHEMA-AUTHORITY".into()),
+                        ],
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                export::schema_version(&writer)?,
+                CURRENT_SCHEMA_VERSION.to_string()
+            );
+            writer.close()?;
+
+            let input = root.path().join("history.jsonl");
+            let expected =
+                export::export_file(&source, &input, "schema-authority".to_owned())?;
+            assert_eq!(expected, export::verify_file(&input)?);
+            let source_before = schema_authority_database_files(&source);
+            let input_before = fs::read(&input)?;
+            let destination = root.path().join("restored.db");
+            let error = import_file(&input, &destination, "schema-authority")
+                .expect_err("matching rows cannot authorize a contradictory migration ledger");
+            assert!(error.to_string().contains("schema-migration authority"));
+            assert!(!error.to_string().contains("PRIVATE-FUTURE-SCHEMA-AUTHORITY"));
+            require_new_destination(&destination)?;
+
+            let error = import_file_with_policy(&input, &source, "schema-authority", true)
+                .expect_err("an identical retry must validate the existing migration authority");
+            assert!(error.to_string().contains("schema-migration authority"));
+            assert!(!error.to_string().contains("PRIVATE-FUTURE-SCHEMA-AUTHORITY"));
+            assert_eq!(source_before, schema_authority_database_files(&source));
+            assert_eq!(input_before, fs::read(&input)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_restore_schema_authority_survives_normal_reopen_and_read_only_retry() -> Result<()> {
+        use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source.db");
+        drop(SqliteStorage::open(&source)?);
+        let input = root.path().join("history.jsonl");
+        let expected =
+            export::export_file(&source, &input, "schema-authority".to_owned())?;
+        let destination = root.path().join("restored.db");
+        assert_eq!(
+            import_file(&input, &destination, "schema-authority")?,
+            expected
+        );
+        let reopened = SqliteStorage::open(&destination)?;
+        assert_eq!(reopened.schema_version()?, CURRENT_SCHEMA_VERSION);
+        drop(reopened);
+        let before = schema_authority_database_files(&destination);
+        let (header, completion, created) =
+            import_file_with_policy(&input, &destination, "schema-authority", true)?;
+        assert!(!created);
+        assert_eq!((header, completion), expected);
+        assert_eq!(before, schema_authority_database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_schema_authority_keeps_typed_private_engine_failures() -> Result<()> {
+        use fsqlite_types::cx::CancelReason;
+
+        let connection = Connection::open(":memory:")?;
+        connection.execute_batch(
+            "CREATE TABLE _schema_migrations (version TEXT PRIMARY KEY);
+             INSERT INTO _schema_migrations VALUES ('PRIVATE-UNREADABLE-SCHEMA-AUTHORITY');",
+        )?;
+        let error = verify_schema_authority(&connection, "22")
+            .expect_err("an undecodable ledger is not a supported schema authority");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot decode the canonical schema-migration authority")
+        );
+        assert!(!error.to_string().contains("PRIVATE-UNREADABLE-SCHEMA-AUTHORITY"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<FrankenError>().is_some())
+        );
+
+        let (operation, relay) = connection
+            .as_async()
+            .root_cx()
+            .create_child_with_local_cancel_relay();
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+        let error = {
+            let _binding = connection.as_async().bind_operation_cx(&operation);
+            verify_schema_authority(&connection, "22")
+                .expect_err("a cancelled authority probe cannot certify the database")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot read the canonical schema-migration authority")
+        );
+        assert!(!error.to_string().contains("PRIVATE-UNREADABLE-SCHEMA-AUTHORITY"));
+        assert!(error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<FrankenError>(),
+                Some(FrankenError::Abort)
+            )
+        }));
+        assert!(connection.as_async().root_cx().checkpoint().is_ok());
+        Ok(())
     }
 }
