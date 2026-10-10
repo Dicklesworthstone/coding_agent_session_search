@@ -408,9 +408,15 @@ Archive failures are JSON on stderr with a kebab-case `kind`:
 |---|---|---|---|
 | 2 | `logical-archive-usage` | no | Malformed or unacknowledged request |
 | 5 | `logical-archive-integrity` | no | Archive failed decoding, count or digest checks |
-| 7 | `logical-archive-busy` | yes | The destination lock stayed held for five seconds, or the source database stayed locked past its busy timeout |
-| 14 | `logical-archive-io` | yes | Reading or writing a file failed |
+| 7 | `logical-archive-busy` | yes | Destination/source locking, a transaction conflict, or an expired read snapshot prevented completion |
+| 14 | `logical-archive-io` | yes | File, database-page, or checkpoint I/O failed |
 | 9 | `logical-archive-error` | no | Anything else, including an occupied destination |
+
+Retry a busy failure by running the whole archive command again. An expired
+snapshot requires a new read transaction; an emitted prefix must never be
+continued using a different snapshot. Corruption, constraint violations,
+database capacity limits and ambiguous multi-process consistency failures stay
+nonretryable. Engine error strings do not determine the classification.
 
 ## Version 2 wire contract
 

@@ -187,7 +187,20 @@ fn database_failure(context: impl std::fmt::Display, error: FrankenError) -> any
         FrankenError::NoSuchColumn { .. } => "; missing column".to_owned(),
         FrankenError::QueryReturnedNoRows => "; required row missing".to_owned(),
         FrankenError::QueryReturnedMultipleRows => "; expected a single row".to_owned(),
-        FrankenError::SnapshotTooOld { .. } => "; source snapshot is too old".to_owned(),
+        FrankenError::SnapshotTooOld { .. } => {
+            "; source snapshot is too old; retry the archive command for a fresh snapshot".to_owned()
+        }
+        FrankenError::WriteConflict { page, .. } => {
+            format!("; database write conflict on page {page}")
+        }
+        FrankenError::SerializationFailure { page } => {
+            format!("; database page {page} changed after the transaction snapshot")
+        }
+        FrankenError::LockFailed { .. } => "; database lock operation failed".to_owned(),
+        FrankenError::CheckpointFailed { .. } => "; database checkpoint failed".to_owned(),
+        FrankenError::MultiProcessContractViolation { .. } => {
+            "; multi-process consistency could not be established; inspect the database before retrying".to_owned()
+        }
         FrankenError::WalCorrupt { .. } => "; corrupt WAL".to_owned(),
         _ => String::new(),
     };
@@ -203,8 +216,10 @@ fn database_failure(context: impl std::fmt::Display, error: FrankenError) -> any
 /// command: usage 2, integrity 5, busy 7, I/O 14 (retryable, like every other
 /// cass `io` kind), anything else 9. Classification is by error type, never by
 /// message text, so a path that happens to contain "usage" stays I/O. Busy
-/// covers both the destination lock and a source database that stayed locked
-/// past its busy timeout (an index run writing it, say); both clear on retry.
+/// covers destination/source locks and transaction conflicts. Retry the whole
+/// command to obtain a fresh consistent snapshot; never resume an emitted
+/// prefix with a different generation. An ambiguous multi-process contract
+/// refusal stays nonretryable because it can represent damaged shared state.
 pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
     let has = |matches: fn(&(dyn std::error::Error + 'static)) -> bool| error.chain().any(matches);
     if has(|cause| cause.is::<ArchiveUsageError>()) {
@@ -219,6 +234,10 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
                         | FrankenError::BusyRecovery
                         | FrankenError::BusySnapshot { .. }
                         | FrankenError::DatabaseLocked { .. }
+                        | FrankenError::SnapshotTooOld { .. }
+                        | FrankenError::WriteConflict { .. }
+                        | FrankenError::SerializationFailure { .. }
+                        | FrankenError::LockFailed { .. }
                 )
             })
     }) {
@@ -233,6 +252,7 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
                         | FrankenError::IoRead { .. }
                         | FrankenError::IoWrite { .. }
                         | FrankenError::ShortRead { .. }
+                        | FrankenError::CheckpointFailed { .. }
                 )
             })
     }) {
@@ -477,9 +497,80 @@ mod tests {
                 expected: 4096,
                 actual: 2048,
             },
+            FrankenError::CheckpointFailed {
+                detail: "PRIVATE-CHECKPOINT-PATH-AND-SQL".into(),
+            },
         ] {
             assert_eq!(classified(error), io);
         }
+    }
+
+    #[test]
+    fn snapshot_conflicts_and_lock_failures_keep_safe_retryable_causes() {
+        for (cause, detail) in [
+            (
+                FrankenError::SnapshotTooOld { txn_id: 88 },
+                "retry the archive command for a fresh snapshot",
+            ),
+            (
+                FrankenError::WriteConflict {
+                    page: 42,
+                    holder: 88,
+                },
+                "database write conflict on page 42",
+            ),
+            (
+                FrankenError::SerializationFailure { page: 43 },
+                "database page 43 changed after the transaction snapshot",
+            ),
+            (
+                FrankenError::LockFailed {
+                    detail: "PRIVATE-LOCK-PATH-AND-SQL".into(),
+                },
+                "database lock operation failed",
+            ),
+        ] {
+            let error = database_failure(
+                "cannot stream logical table messages before row 60001, after 60000 complete rows",
+                cause,
+            );
+            assert_eq!(classify_failure(&error), (7, "logical-archive-busy", true));
+            assert!(error.downcast_ref::<FrankenError>().is_some());
+            let message = error.to_string();
+            assert!(message.contains("before row 60001, after 60000 complete rows"));
+            assert!(message.contains(detail), "{message}");
+            assert!(!message.contains("PRIVATE-LOCK-PATH-AND-SQL"));
+        }
+    }
+
+    #[test]
+    fn contract_and_data_failures_do_not_become_retryable_from_message_text() {
+        for cause in [
+            // The engine also maps this to SQLITE_BUSY, but its detail can
+            // describe damaged freelist/shared state rather than contention.
+            FrankenError::MultiProcessContractViolation {
+                detail: "SQLITE_BUSY PRIVATE-SQL-AND-MESSAGE".into(),
+            },
+            FrankenError::DatabaseCorrupt {
+                detail: "I/O busy retry PRIVATE-SQL-AND-MESSAGE".into(),
+            },
+            FrankenError::UniqueViolation {
+                columns: "busy PRIVATE-SQL-AND-MESSAGE".into(),
+            },
+            FrankenError::DatabaseFull,
+        ] {
+            let error = database_failure("logical table messages, row 257", cause);
+            assert_eq!(
+                classify_failure(&error),
+                (9, "logical-archive-error", false)
+            );
+            assert!(error.downcast_ref::<FrankenError>().is_some());
+            assert!(!error.to_string().contains("PRIVATE-SQL-AND-MESSAGE"));
+        }
+        assert_eq!(
+            classify_failure(&anyhow!("database busy: retry the archive command")),
+            (9, "logical-archive-error", false)
+        );
     }
 
     #[test]
@@ -500,6 +591,12 @@ mod tests {
                 FrankenError::ShortRead {
                     expected: 4096,
                     actual: 2048,
+                },
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::CheckpointFailed {
+                    detail: "PRIVATE-SQL-AND-MESSAGE".into(),
                 },
                 (14, "logical-archive-io", true),
             ),
