@@ -935,10 +935,11 @@ pub fn import_compatible(
     let target = target_version()?;
 
     if source_version == target {
-        let (header, completion, created) = super::import::import_file_with_policy(
-            input_path,
+        let (header, completion, created) = super::import::import_inspected_file(
+            file,
             destination,
-            expected_archive_id,
+            &inspected.header,
+            &inspected.completion,
             if_identical,
         )?;
         return Ok(MigrationOutcome {

@@ -3,7 +3,7 @@
 //! Batches are private until the whole stream and the persisted rows are proved.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -518,7 +518,60 @@ pub fn import_file_with_policy(
     expected_archive_id: &str,
     if_identical: bool,
 ) -> Result<(Header, Completion, bool)> {
-    let mut input = Input::new(BufReader::new(open_input(input)?));
+    import_open_file(
+        open_input(input)?,
+        destination,
+        expected_archive_id,
+        if_identical,
+        None,
+    )
+}
+
+/// Continue a caller's completed inspection using the SAME admitted file.
+/// Reopening its pathname could silently restore a different, valid archive.
+/// A descriptor alone does not prevent in-place changes, so require the
+/// inspected header and completion again before publishing or reporting a match.
+pub(super) fn import_inspected_file(
+    mut input: File,
+    destination: &Path,
+    header: &Header,
+    completion: &Completion,
+    if_identical: bool,
+) -> Result<(Header, Completion, bool)> {
+    input
+        .rewind()
+        .map_err(|error| export::io_failure("cannot rewind inspected logical archive", error))?;
+    import_open_file(
+        input,
+        destination,
+        &header.archive_id,
+        if_identical,
+        Some((header, completion)),
+    )
+}
+
+fn require_inspected_receipt(
+    actual: &(Header, Completion),
+    inspected: Option<(&Header, &Completion)>,
+) -> Result<()> {
+    if let Some((header, completion)) = inspected
+        && (&actual.0 != header || &actual.1 != completion)
+    {
+        return Err(super::integrity(
+            "logical archive changed after inspection; no destination was published or replaced",
+        ));
+    }
+    Ok(())
+}
+
+fn import_open_file(
+    input: File,
+    destination: &Path,
+    expected_archive_id: &str,
+    if_identical: bool,
+    inspected: Option<(&Header, &Completion)>,
+) -> Result<(Header, Completion, bool)> {
+    let mut input = Input::new(BufReader::new(input));
     let Some(Record::Header { header }) = input.record(1)? else {
         return Err(super::integrity("logical archive must begin with a header"));
     };
@@ -527,11 +580,18 @@ pub fn import_file_with_policy(
         header.archive_id == expected_archive_id,
         "logical archive identity does not match --archive-id"
     );
+    if let Some((expected, _)) = inspected
+        && &header != expected
+    {
+        return Err(super::integrity(
+            "logical archive header changed after inspection; no destination was published or replaced",
+        ));
+    }
     let _lock = DestinationLock::acquire(destination)?;
     if if_identical && fs::symlink_metadata(destination).is_ok() {
-        let (header, completion) =
-            super::reimport::verify_existing(&mut input, header, destination)?;
-        return Ok((header, completion, false));
+        let result = super::reimport::verify_existing(&mut input, header, destination)?;
+        require_inspected_receipt(&result, inspected)?;
+        return Ok((result.0, result.1, false));
     }
     require_new_destination(destination)?;
 
@@ -572,6 +632,8 @@ pub fn import_file_with_policy(
             super::database_failure("cannot require durable private restore writes", error)
         })?;
     let result = restore(&connection, &mut input, header)?;
+    // Bind the replay to its inspection before materialization or publication.
+    require_inspected_receipt(&result, inspected)?;
     verify_schema_authority(&connection, &result.0.storage_schema_version)?;
     // restore() has verified the complete input and committed every private
     // batch. The engine backup checkpoints this private writer before copying
@@ -1188,3 +1250,7 @@ mod publication_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "pinned_import_tests.rs"]
+mod pinned_tests;
