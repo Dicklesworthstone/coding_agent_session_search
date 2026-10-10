@@ -425,7 +425,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     fs::create_dir_all(&transcript_dir).unwrap();
     let transcript = transcript_dir.join("gh459-session.jsonl");
     fs::write(&transcript, "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"gh459needle retained chat\"}]}}\n").unwrap();
-    fs::File::open(&transcript)
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -635,7 +637,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     assert_eq!(search_count(Some(&correct)), 0);
     let sidecar = project.join(".workspace-trusted");
     fs::write(&sidecar, json!({"workspacePath":correct}).to_string()).unwrap();
-    fs::File::open(&sidecar)
+    fs::File::options()
+        .write(true)
+        .open(&sidecar)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -723,7 +727,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         0
     );
     fs::write(&sidecar, "{malformed").unwrap();
-    fs::File::open(&sidecar)
+    fs::File::options()
+        .write(true)
+        .open(&sidecar)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -1592,7 +1598,9 @@ fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marke
         "unrequestedneighborneedle",
     );
     for source in [&regular, &real, &neighbor] {
-        fs::File::open(source)
+        fs::File::options()
+            .write(true)
+            .open(source)
             .unwrap()
             .set_times(
                 fs::FileTimes::new()
@@ -4481,8 +4489,13 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
     );
     // 7qirz: mid-rebuild, the lock names the rebuild, not the last preflight
     // step (which is what #483/#497 operators saw for a whole 42-minute pass).
+    // Windows refuses reads of a byte range another process holds locked
+    // (os error 33), so cass mirrors the lock's metadata into
+    // index-run.lock.meta and reads that on a lock conflict
+    // (asset_state::index_run_lock_metadata_sidecar_path). Do the same.
     let lock = fs::read_to_string(data_dir.join("index-run.lock"))
-        .expect("index-run.lock while the rebuild is parked");
+        .or_else(|_| fs::read_to_string(data_dir.join("index-run.lock.meta")))
+        .expect("index-run.lock (or its metadata sidecar) while the rebuild is parked");
     assert!(
         lock.lines().any(|line| line == "phase=lexical:rebuild"),
         "the lock must name the active rebuild: {lock}"
