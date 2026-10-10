@@ -9,12 +9,29 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "chunked.rs"]
+mod chunked;
+
 pub const FORMAT: &str = "cass.logical_archive";
+/// Version 1 remains readable, with its original per-row limit and digest.
 pub const VERSION: u32 = 1;
+pub const CHUNKED_VERSION: u32 = 2;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+/// Separate from the wire-frame bound. Reconstruction and SQLite parameter
+/// binding require one complete logical row; never assemble an unbounded row.
+pub const MAX_ROW_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_TABLES: usize = 256;
 pub const MAX_COLUMNS: usize = 256;
 const MAX_KEY_BYTES: usize = 64 * 1024;
+
+pub fn record_types(version: u32) -> Vec<String> {
+    let names: &[&str] = if version == CHUNKED_VERSION {
+        &["table", "row", "row_start", "row_chunk", "row_end", "completion"]
+    } else {
+        &["table", "row", "completion"]
+    };
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -33,7 +50,7 @@ impl Header {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.format == FORMAT, "unknown logical archive format");
         ensure!(
-            self.schema_version == VERSION,
+            matches!(self.schema_version, VERSION | CHUNKED_VERSION),
             "unsupported logical archive version"
         );
         ensure!(
@@ -55,7 +72,7 @@ impl Header {
             "invalid canonical storage schema version"
         );
         ensure!(
-            self.record_types == ["table", "row", "completion"],
+            self.record_types == record_types(self.schema_version),
             "unsupported record types"
         );
         ensure!(
@@ -153,7 +170,7 @@ impl Cell {
                 );
             }
             Self::Blob(encoded) => {
-                ensure!(encoded.len() <= MAX_RECORD_BYTES, "oversized BLOB encoding");
+                ensure!(encoded.len() <= MAX_ROW_BYTES, "oversized BLOB encoding");
                 STANDARD
                     .decode(encoded)
                     .map_err(|_| anyhow!("invalid BLOB encoding"))?;
@@ -181,14 +198,14 @@ pub enum Record {
     Completion { completion: Completion },
 }
 
-struct LimitedBuffer(Vec<u8>);
+struct LimitedBuffer(Vec<u8>, usize);
 
 impl Write for LimitedBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         // Leave room for the mandatory newline; never allocate an oversized
         // encoded message before discovering that it violates the contract.
-        if bytes.len() > (MAX_RECORD_BYTES - 1).saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other("logical record exceeds 8 MiB"));
+        if bytes.len() > (self.1 - 1).saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("logical encoding exceeds its bound"));
         }
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -199,17 +216,49 @@ impl Write for LimitedBuffer {
 }
 
 pub fn encode(record: &Record) -> Result<Vec<u8>> {
-    let mut buffer = LimitedBuffer(Vec::with_capacity(4096));
-    serde_json::to_writer(&mut buffer, record)
-        .map_err(|_| anyhow!("logical record cannot be encoded within 8 MiB"))?;
+    encode_with_limit(record, MAX_RECORD_BYTES)
+}
+
+fn encode_with_limit(record: &Record, limit: usize) -> Result<Vec<u8>> {
+    let mut buffer = LimitedBuffer(Vec::with_capacity(4096), limit);
+    serde_json::to_writer(&mut buffer, record).map_err(|_| {
+        anyhow!(
+            "logical record cannot be encoded within {} MiB",
+            limit / (1024 * 1024)
+        )
+    })?;
     buffer.0.push(b'\n');
     Ok(buffer.0)
+}
+
+/// Emit already validated canonical bytes, splitting an oversized v2 row into
+/// bounded frames. Small records retain the exact v1 representation. Callers
+/// must use Validator::push first; it enforces the header's version and limits.
+pub fn write_encoded(bytes: &[u8], output: &mut impl Write) -> std::io::Result<()> {
+    if bytes.len() <= MAX_RECORD_BYTES {
+        output.write_all(bytes)
+    } else {
+        chunked::write(bytes, output)
+    }
 }
 
 /// Enforce the encoded limit while reading, rather than after read_line has
 /// already allocated an attacker-controlled buffer. EOF is valid between, not
 /// within, newline-terminated records. Parsing errors never echo input bytes.
 pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record>> {
+    let Some(bytes) = read_record_bytes(reader, line)? else {
+        return Ok(None);
+    };
+    // The ordinary path still parses once. Continuations are decoded here, so
+    // import, migration, reimport, search and view all see one ordinary row.
+    let record = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(_) => chunked::read(reader, &bytes, line)?,
+    };
+    Ok(Some(record))
+}
+
+fn read_record_bytes(reader: &mut impl BufRead, line: u64) -> Result<Option<Vec<u8>>> {
     let mut bytes = Vec::with_capacity(4096);
     loop {
         let available = match reader.fill_buf() {
@@ -239,13 +288,7 @@ pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
         if newline.is_some() {
-            let record = serde_json::from_slice(&bytes).map_err(|error| {
-                super::integrity(format!(
-                    "malformed logical archive record {line}, column {}",
-                    error.column()
-                ))
-            })?;
-            return Ok(Some(record));
+            return Ok(Some(bytes));
         }
     }
 }
@@ -308,6 +351,11 @@ impl Validator {
         header.validate()?;
         let mut identity = header.clone();
         identity.exported_at_ms = 0;
+        // v2 changes transport, not canonical identity. Keeping the v1 digest
+        // domain also lets a v1 backup compare with a freshly exported v2
+        // snapshot during restore verification and read-only --if-identical.
+        identity.schema_version = VERSION;
+        identity.record_types = record_types(VERSION);
         let mut digest = Sha256::new();
         digest.update(b"cass.logical_archive.v1\0");
         digest.update(encode(&Record::Header { header: identity })?);
@@ -324,6 +372,18 @@ impl Validator {
 
     pub fn push(&mut self, record: &Record) -> Result<Vec<u8>> {
         ensure!(!self.completed, "records follow the archive completion");
+        // Return canonical logical bytes, not continuation frames. Hashing
+        // reconstructed rows rather than their transport keeps the content
+        // digest independent of framing. Only v2 rows get the larger bound.
+        let limit = if self.header.schema_version == CHUNKED_VERSION
+            && matches!(record, Record::Row { .. })
+        {
+            MAX_ROW_BYTES
+        } else {
+            MAX_RECORD_BYTES
+        };
+        // Refuse oversize before advancing counters or the previous identity.
+        let bytes = encode_with_limit(record, limit)?;
         match record {
             Record::Header { .. } => bail!("duplicate archive header"),
             Record::Table { table } => {
@@ -381,10 +441,9 @@ impl Validator {
                     "logical archive completion count or digest mismatch"
                 );
                 self.completed = true;
-                return encode(record);
+                return Ok(bytes);
             }
         }
-        let bytes = encode(record)?;
         self.digest.update(&bytes);
         Ok(bytes)
     }

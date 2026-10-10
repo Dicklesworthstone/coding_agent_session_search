@@ -348,7 +348,7 @@ pub fn snapshot(
                 let encoded = validator.push(&record).map_err(|error| {
                     row_failure(&table.name, row_number, "record validation/encoding", error)
                 })?;
-                output.write_all(&encoded).map_err(|error| {
+                codec::write_encoded(&encoded, output).map_err(|error| {
                     output_failure(
                         &format!("logical table {}, row {row_number}", table.name),
                         error,
