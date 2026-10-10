@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
@@ -167,27 +167,149 @@ fn collection_fixture(source: &Path) {
     connection.close().unwrap();
 }
 
-/// Hash source files incrementally so preservation assertions do not turn a
-/// streaming regression into a whole-database memory allocation.
-fn source_file_digests(directory: &Path) -> BTreeMap<std::ffi::OsString, [u8; 32]> {
+#[derive(Debug, PartialEq, Eq)]
+enum SourceEntryKind {
+    Directory,
+    File { bytes: u64, sha256: [u8; 32] },
+    Symlink(PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SourceEntry {
+    kind: SourceEntryKind,
+    readonly: bool,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+/// Hash files incrementally and retain directories and link targets as entries.
+/// The real initializer creates doctor/ alongside its database; silently
+/// skipping that subtree would miss changes to the source's recovery evidence.
+/// Links are recorded, never opened or traversed, including dangling links.
+fn source_file_digests(directory: &Path) -> BTreeMap<PathBuf, SourceEntry> {
+    let root = fs::symlink_metadata(directory).unwrap();
+    assert!(root.is_dir() && !root.file_type().is_symlink());
     let mut digests = BTreeMap::new();
     let mut buffer = [0_u8; 64 * 1024];
-    for entry in fs::read_dir(directory).unwrap() {
-        let entry = entry.unwrap();
-        assert!(entry.file_type().unwrap().is_file());
-        let mut file = fs::File::open(entry.path()).unwrap();
-        let mut digest = Sha256::new();
-        loop {
-            let read = file.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(parent) = pending.pop() {
+        for entry in fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let kind = if metadata.file_type().is_symlink() {
+                SourceEntryKind::Symlink(fs::read_link(&path).unwrap())
+            } else if metadata.is_dir() {
+                pending.push(path.clone());
+                SourceEntryKind::Directory
+            } else {
+                assert!(metadata.is_file(), "unsupported source entry: {path:?}");
+                let mut file = fs::File::open(&path).unwrap();
+                let mut digest = Sha256::new();
+                let mut bytes = 0_u64;
+                loop {
+                    let read = file.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..read]);
+                    bytes += read as u64;
+                }
+                assert_eq!(bytes, metadata.len(), "source changed while hashing");
+                SourceEntryKind::File {
+                    bytes,
+                    sha256: digest.finalize().into(),
+                }
+            };
+            #[cfg(unix)]
+            use std::os::unix::fs::PermissionsExt;
+            let state = SourceEntry {
+                kind,
+                readonly: metadata.permissions().readonly(),
+                #[cfg(unix)]
+                mode: metadata.permissions().mode(),
+            };
+            assert!(
+                digests
+                    .insert(path.strip_prefix(directory).unwrap().to_path_buf(), state)
+                    .is_none()
+            );
         }
-        digests.insert(entry.file_name(), digest.finalize().into());
     }
     assert!(!digests.is_empty());
     digests
+}
+
+#[test]
+fn source_preservation_manifest_tracks_nested_files_empty_directories_and_moves() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(source.join("doctor/receipts")).unwrap();
+    fs::write(source.join("agent_search.db"), b"database bytes").unwrap();
+    let evidence = source.join("doctor/evidence.json");
+    fs::write(&evidence, b"private recovery evidence").unwrap();
+    let before = source_file_digests(&source);
+    assert_eq!(before.len(), 4);
+    assert_eq!(
+        before[Path::new("doctor/receipts")].kind,
+        SourceEntryKind::Directory
+    );
+    assert_eq!(
+        before[Path::new("doctor/evidence.json")].kind,
+        SourceEntryKind::File {
+            bytes: 25,
+            sha256: Sha256::digest(b"private recovery evidence").into(),
+        }
+    );
+
+    fs::write(&evidence, b"changed recovery evidence").unwrap();
+    assert_ne!(source_file_digests(&source), before);
+    fs::write(&evidence, b"private recovery evidence").unwrap();
+    assert_eq!(source_file_digests(&source), before);
+
+    fs::rename(source.join("doctor/receipts"), source.join("doctor/moved")).unwrap();
+    assert_ne!(source_file_digests(&source), before);
+    fs::rename(source.join("doctor/moved"), source.join("doctor/receipts")).unwrap();
+    assert_eq!(source_file_digests(&source), before);
+    fs::create_dir(source.join("doctor/new-empty-directory")).unwrap();
+    assert_ne!(source_file_digests(&source), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn source_preservation_manifest_records_symlinks_without_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let external = root.path().join("external");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&external).unwrap();
+    fs::write(source.join("agent_search.db"), b"database bytes").unwrap();
+    fs::write(external.join("private.txt"), b"outside the source tree").unwrap();
+    symlink(&external, source.join("directory-link")).unwrap();
+    symlink(external.join("private.txt"), source.join("file-link")).unwrap();
+    symlink(&source, source.join("cycle")).unwrap();
+    symlink("missing-target", source.join("dangling")).unwrap();
+    let before = source_file_digests(&source);
+    assert_eq!(before.len(), 5);
+    assert_eq!(
+        before[Path::new("directory-link")].kind,
+        SourceEntryKind::Symlink(external.clone())
+    );
+    assert_eq!(
+        before[Path::new("dangling")].kind,
+        SourceEntryKind::Symlink(PathBuf::from("missing-target"))
+    );
+    assert!(!before.contains_key(Path::new("directory-link/private.txt")));
+
+    fs::write(
+        external.join("private.txt"),
+        b"external change is not followed",
+    )
+    .unwrap();
+    fs::create_dir(external.join("new-external-directory")).unwrap();
+    assert_eq!(source_file_digests(&source), before);
 }
 
 #[test]

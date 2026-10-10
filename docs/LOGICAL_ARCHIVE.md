@@ -400,6 +400,16 @@ The flag combines with `--if-identical` (a retry reports `unchanged` without
 modifying the database image) and with `--rebuild-index`, whose failure message
 names the retry flags to repeat.
 
+Each accepting pass requires the archived `meta.schema_version` to be text
+matching the header's source storage version. A missing or conflicting marker
+fails before a migration candidate is created. Persisted comparison validates
+the same records it compares, including the shape, primary-key order and digest
+of skipped migration-history rows. It must reach a valid completion matching
+the originally inspected archive before issuing a success receipt. Rewinding
+an already verified input is never treated as proof that its contents stayed
+unchanged. This applies to both version 1 and version 2 archives and to
+`--if-identical` retries.
+
 ## Exit codes
 
 Archive failures are JSON on stderr with a kebab-case `kind`:
