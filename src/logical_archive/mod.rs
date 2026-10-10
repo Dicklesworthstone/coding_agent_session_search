@@ -3,6 +3,10 @@
 //! or the reviewed v20/v21 -> v22 schema migration; export and verification never do so.
 
 mod codec;
+mod conversation_extract;
+#[cfg(test)]
+#[path = "conversation_extract_cli_tests.rs"]
+mod conversation_cli_tests;
 mod export;
 mod extract;
 mod import;
@@ -113,6 +117,22 @@ enum Operation {
         #[arg(long)]
         output: PathBuf,
         /// Acknowledge that the file contains complete private session content.
+        #[arg(long)]
+        include_private: bool,
+    },
+    /// Recover a complete conversation and all message fields without restoring a DB.
+    ExtractConversation {
+        input: PathBuf,
+        /// Positive conversation ID from archive search, scoped to the exact digest.
+        #[arg(long)]
+        conversation_id: i64,
+        /// Require the exact backup content digest returned by search or verify.
+        #[arg(long)]
+        content_sha256: String,
+        /// New private typed JSONL transcript; not a full archive import input.
+        #[arg(long)]
+        output: PathBuf,
+        /// Acknowledge that all private message bodies and metadata are copied.
         #[arg(long)]
         include_private: bool,
     },
@@ -403,6 +423,22 @@ pub fn run(args: Vec<String>) -> Result<()> {
             )?;
             let result =
                 extract::extract_file(&input, &output, message_id, &content_sha256, field)?;
+            println!("{result}");
+            return Ok(());
+        }
+        Operation::ExtractConversation {
+            input,
+            conversation_id,
+            content_sha256,
+            output,
+            include_private,
+        } => {
+            require_private_acknowledgement(
+                include_private,
+                "conversation extraction writes complete private session data; pass --include-private to acknowledge this",
+            )?;
+            let result =
+                conversation_extract::extract_file(&input, &output, conversation_id, &content_sha256)?;
             println!("{result}");
             return Ok(());
         }

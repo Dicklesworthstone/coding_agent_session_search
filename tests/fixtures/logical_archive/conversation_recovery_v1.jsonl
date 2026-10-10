@@ -1,0 +1,11 @@
+{"type":"header","header":{"format":"cass.logical_archive","schema_version":1,"archive_id":"conversation-recovery","exported_at_ms":1,"storage_schema_version":"22","record_types":["table","row","completion"],"contains_private_data":true,"omissions":["derived_search_assets"]}}
+{"type":"table","table":{"name":"agents","columns":["id","name"],"primary_key":[0]}}
+{"type":"row","values":[{"kind":"integer","value":1},{"kind":"text","value":"PRIVATE-UNRELATED-AGENT"}]}
+{"type":"table","table":{"name":"conversations","columns":["id","source_path","title","extra_json"],"primary_key":[0]}}
+{"type":"row","values":[{"kind":"integer","value":1},{"kind":"null"},{"kind":"text","value":"PRIVATE-UNRELATED-TITLE"},{"kind":"null"}]}
+{"type":"row","values":[{"kind":"integer","value":7},{"kind":"text","value":"/missing/provider/session.jsonl"},{"kind":"text","value":"PRIVATE-TARGET title 雪"},{"kind":"text","value":"{ \"nested\": [1, true, null] }"}]}
+{"type":"table","table":{"name":"messages","columns":["id","conversation_id","idx","role","content","extra_json","extra_bin","temperature","optional"],"primary_key":[0]}}
+{"type":"row","values":[{"kind":"integer","value":10},{"kind":"integer","value":7},{"kind":"integer","value":2},{"kind":"text","value":"assistant"},{"kind":"text","value":"PRIVATE-TARGET first\u0000 café\n"},{"kind":"text","value":"{ \"preserve_whitespace\" : true }"},{"kind":"blob","value":"AP+AAQ=="},{"kind":"real","value":"8000000000000000"},{"kind":"null"}]}
+{"type":"row","values":[{"kind":"integer","value":11},{"kind":"integer","value":1},{"kind":"integer","value":0},{"kind":"text","value":"assistant"},{"kind":"text","value":"PRIVATE-UNRELATED-MESSAGE"},{"kind":"text","value":"{ \"preserve_whitespace\" : true }"},{"kind":"blob","value":"CAk="},{"kind":"real","value":"8000000000000000"},{"kind":"null"}]}
+{"type":"row","values":[{"kind":"integer","value":18},{"kind":"integer","value":7},{"kind":"integer","value":8},{"kind":"text","value":"assistant"},{"kind":"text","value":"PRIVATE-TARGET late evidence"},{"kind":"text","value":"{ \"preserve_whitespace\" : true }"},{"kind":"blob","value":""},{"kind":"real","value":"8000000000000000"},{"kind":"null"}]}
+{"type":"completion","completion":{"records":6,"tables":{"agents":1,"conversations":2,"messages":3},"content_sha256":"bed004624c6ef745e883b5ce3924f0cff4d125b19ab68d53a826dbfb9aeff816"}}
