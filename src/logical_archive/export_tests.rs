@@ -300,3 +300,193 @@ fn verification_refuses_nonregular_inputs_before_decoding() -> Result<()> {
     assert_eq!(fs::read_link(&linked)?, target);
     Ok(())
 }
+
+#[test]
+fn scan_failure_keeps_busy_errors_retryable() {
+    for cause in [FrankenError::Busy, FrankenError::BusyRecovery] {
+        let error = scan_failure("messages", 468_001, cause);
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (7, "logical-archive-busy", true)
+        );
+        assert!(error.downcast_ref::<FrankenError>().is_some());
+        assert!(error.to_string().contains("before row 468001"));
+    }
+}
+
+#[test]
+fn scan_failure_keeps_the_cause_but_redacts_its_message() {
+    let error = scan_failure(
+        "messages",
+        42,
+        FrankenError::Internal("PRIVATE-DATABASE-CONTENT".to_owned()),
+    );
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (9, "logical-archive-error", false)
+    );
+    let public_message = error.to_string();
+    assert!(public_message.contains("messages before row 42"));
+    assert!(public_message.contains("source was not repaired"));
+    assert!(!public_message.contains("PRIVATE-DATABASE-CONTENT"));
+    assert!(matches!(
+        error.downcast_ref::<FrankenError>(),
+        Some(FrankenError::Internal(message)) if message == "PRIVATE-DATABASE-CONTENT"
+    ));
+}
+
+#[test]
+fn oversized_cells_report_the_bound_without_echoing_the_value() {
+    let private = "PRIVATE-OVERSIZED-CELL".repeat(codec::MAX_RECORD_BYTES / 20 + 1);
+    let cause = cells(&[SqliteValue::Text(private.into())]).unwrap_err();
+    let error = row_failure("messages", 19, "cell conversion", cause);
+    let public_message = error.to_string();
+    assert!(public_message.contains("messages, row 19, cell conversion"));
+    assert!(public_message.contains("8 MiB"));
+    assert!(!public_message.contains("PRIVATE-OVERSIZED-CELL"));
+}
+
+#[test]
+fn json_expansion_failure_names_the_row_and_never_publishes() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    // Raw text fits the cell bound, but JSON's six-byte NUL escapes exceed
+    // the encoded-record limit. This is distinct from an oversized raw cell.
+    let body = format!(
+        "PRIVATE-ENCODED-ROW{}",
+        "\0".repeat(codec::MAX_RECORD_BYTES / 6 + 1)
+    );
+    assert!(body.len() < codec::MAX_RECORD_BYTES);
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute_with_params(
+        "UPDATE messages SET body = ?1 WHERE id = 7",
+        &[SqliteValue::Text(body.into())],
+    )?;
+    connection.close()?;
+    let before = contents(source.path());
+    let output = destination.path().join("archive.jsonl");
+    let error = export_file(&database, &output, "encoding-failure".to_owned())
+        .expect_err("oversized JSON must refuse, never truncate or skip the row");
+    let public_message = error.to_string();
+    assert!(
+        public_message.contains("messages, row 2, record validation/encoding"),
+        "{public_message}"
+    );
+    assert!(public_message.contains("8 MiB"), "{public_message}");
+    assert!(!public_message.contains("PRIVATE-ENCODED-ROW"));
+    assert!(!output.exists());
+    assert_eq!(before, contents(source.path()));
+    assert_eq!(
+        fs::read_dir(destination.path())?.count(),
+        1,
+        "only the persistent destination lock may remain, not a partial backup"
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct FaultWriter {
+    writes: usize,
+    flushes: usize,
+    fail_at: Option<usize>,
+    fail_flush: bool,
+}
+
+impl Write for FaultWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let position = self.writes;
+        self.writes += 1;
+        if self.fail_at == Some(position) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "PRIVATE-WRITER-DETAIL",
+            ));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes += 1;
+        if self.fail_flush {
+            return Err(std::io::Error::other("PRIVATE-FLUSH-DETAIL"));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn row_write_failure_keeps_io_class_and_public_location() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    // Header, messages descriptor, first row, then fail on the second row.
+    let mut writer = FaultWriter {
+        fail_at: Some(3),
+        ..Default::default()
+    };
+    let error = snapshot(&connection, "write-failure".to_owned(), &mut writer).unwrap_err();
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    let public_message = error.to_string();
+    assert!(public_message.contains("messages, row 2"), "{public_message}");
+    assert!(public_message.contains("WriteZero"), "{public_message}");
+    assert!(!public_message.contains("PRIVATE-WRITER-DETAIL"));
+    assert_eq!(writer.writes, 4);
+    assert_eq!(writer.flushes, 0);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn header_and_completion_write_errors_do_not_echo_writer_details() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    for (fail_at, location) in [(0, "header"), (6, "completion")] {
+        let mut writer = FaultWriter {
+            fail_at: Some(fail_at),
+            ..Default::default()
+        };
+        let error = snapshot(&connection, "write-failure".to_owned(), &mut writer).unwrap_err();
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (14, "logical-archive-io", true)
+        );
+        let public_message = error.to_string();
+        assert!(public_message.contains(location), "{public_message}");
+        assert!(!public_message.contains("PRIVATE-WRITER-DETAIL"));
+    }
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn final_flush_failure_is_not_a_successful_snapshot() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    let mut writer = FaultWriter {
+        fail_flush: true,
+        ..Default::default()
+    };
+    let error = snapshot(&connection, "flush-failure".to_owned(), &mut writer).unwrap_err();
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.to_string().contains("logical archive flush"));
+    assert!(!error.to_string().contains("PRIVATE-FLUSH-DETAIL"));
+    assert_eq!(writer.flushes, 1);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}

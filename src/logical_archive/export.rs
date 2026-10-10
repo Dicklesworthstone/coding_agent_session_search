@@ -250,6 +250,29 @@ pub fn cells(values: &[SqliteValue]) -> Result<Vec<Cell>> {
         .collect()
 }
 
+/// Only local cell/codec errors may use this: those messages describe the
+/// violated contract without quoting values. A database or I/O error may
+/// contain private text and must use the redacted helpers below instead.
+fn row_failure(table: &str, row: u64, stage: &str, error: anyhow::Error) -> anyhow::Error {
+    let message = format!("logical table {table}, row {row}, {stage}: {error}");
+    error.context(message)
+}
+
+fn output_failure(location: &str, error: std::io::Error) -> anyhow::Error {
+    let message = format!("{location}: output I/O failed ({:?})", error.kind());
+    anyhow::Error::new(error).context(message)
+}
+
+/// Keep the database error in the chain so busy/locked errors stay retryable.
+/// Only its typed classification is public; engine messages can contain data.
+fn scan_failure(table: &str, next_row: u64, error: FrankenError) -> anyhow::Error {
+    let error = anyhow::Error::new(error);
+    let (_, kind, _) = super::classify_failure(&error);
+    error.context(format!(
+        "cannot stream logical table {table} before row {next_row} ({kind}); source was not repaired"
+    ))
+}
+
 pub fn snapshot(
     connection: &Connection,
     archive_id: String,
@@ -270,13 +293,19 @@ pub fn snapshot(
         omissions: vec!["derived_search_assets".to_owned()],
     };
     let mut validator = Validator::new(header.clone())?;
-    output.write_all(&codec::encode(&Record::Header {
-        header: header.clone(),
-    })?)?;
+    output
+        .write_all(&codec::encode(&Record::Header {
+            header: header.clone(),
+        })?)
+        .map_err(|error| output_failure("logical archive header", error))?;
     for table in tables {
-        output.write_all(&validator.push(&Record::Table {
-            table: table.clone(),
-        })?)?;
+        output
+            .write_all(&validator.push(&Record::Table {
+                table: table.clone(),
+            })?)
+            .map_err(|error| {
+                output_failure(&format!("logical table {} descriptor", table.name), error)
+            })?;
         let columns = table
             .columns
             .iter()
@@ -299,12 +328,29 @@ pub fn snapshot(
             quoted(&table.name)?
         );
         let mut failure = None;
+        let mut rows_written = 0u64;
         let streamed = connection.query_with_params_for_each(&sql, &[], |row| {
             let result = (|| -> Result<()> {
+                // This is a one-based position in the table's exported PK
+                // order, not a message ID or a private primary-key value.
+                let row_number = rows_written
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("logical table row position overflow"))?;
                 let record = Record::Row {
-                    values: cells(row.values())?,
+                    values: cells(row.values()).map_err(|error| {
+                        row_failure(&table.name, row_number, "cell conversion", error)
+                    })?,
                 };
-                output.write_all(&validator.push(&record)?)?;
+                let encoded = validator.push(&record).map_err(|error| {
+                    row_failure(&table.name, row_number, "record validation/encoding", error)
+                })?;
+                output.write_all(&encoded).map_err(|error| {
+                    output_failure(
+                        &format!("logical table {}, row {row_number}", table.name),
+                        error,
+                    )
+                })?;
+                rows_written = row_number;
                 Ok(())
             })();
             if let Err(error) = result {
@@ -316,18 +362,20 @@ pub fn snapshot(
             Ok(())
         });
         if let Some(error) = failure {
-            return Err(error).with_context(|| format!("logical table {}", table.name));
+            // Do not hide the actionable row/stage behind a table-only
+            // context, or return the engine's callback-aborted sentinel.
+            return Err(error);
         }
-        streamed.map_err(|_| {
-            anyhow!(
-                "cannot stream logical table {}; source was not repaired",
-                table.name
-            )
-        })?;
+        streamed
+            .map_err(|error| scan_failure(&table.name, rows_written.saturating_add(1), error))?;
     }
     let completion = validator.completion();
-    output.write_all(&validator.push(&Record::Completion { completion })?)?;
-    output.flush()?;
+    output
+        .write_all(&validator.push(&Record::Completion { completion })?)
+        .map_err(|error| output_failure("logical archive completion", error))?;
+    output
+        .flush()
+        .map_err(|error| output_failure("logical archive flush", error))?;
     validator.finish()
 }
 
