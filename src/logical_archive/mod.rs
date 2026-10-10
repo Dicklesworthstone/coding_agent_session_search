@@ -169,6 +169,36 @@ fn require_private_acknowledgement(include_private: bool, message: &str) -> Resu
     }
 }
 
+/// Engine payloads can contain SQL, filesystem paths or private cell values.
+/// Report only structural error codes and numeric I/O coordinates, retaining
+/// the typed cause so automation can still distinguish busy and I/O failures.
+fn database_failure(context: impl std::fmt::Display, error: FrankenError) -> anyhow::Error {
+    let detail = match &error {
+        FrankenError::Io(error) => match error.raw_os_error() {
+            Some(code) => format!("; I/O {:?} (OS error {code})", error.kind()),
+            None => format!("; I/O {:?}", error.kind()),
+        },
+        FrankenError::IoRead { page } => format!("; cannot read database page {page}"),
+        FrankenError::IoWrite { page } => format!("; cannot write database page {page}"),
+        FrankenError::ShortRead { expected, actual } => {
+            format!("; short read: expected {expected} bytes, received {actual}")
+        }
+        FrankenError::NoSuchTable { .. } => "; missing table".to_owned(),
+        FrankenError::NoSuchColumn { .. } => "; missing column".to_owned(),
+        FrankenError::QueryReturnedNoRows => "; required row missing".to_owned(),
+        FrankenError::QueryReturnedMultipleRows => "; expected a single row".to_owned(),
+        FrankenError::SnapshotTooOld { .. } => "; source snapshot is too old".to_owned(),
+        FrankenError::WalCorrupt { .. } => "; corrupt WAL".to_owned(),
+        _ => String::new(),
+    };
+    let message = format!(
+        "{context}: FrankenSQLite {:?} (code {}){detail}",
+        error.error_code(),
+        error.extended_error_code(),
+    );
+    anyhow::Error::new(error).context(message)
+}
+
 /// Exit code, kebab-case error kind and retryability for a failed archive
 /// command: usage 2, integrity 5, busy 7, I/O 14 (retryable, like every other
 /// cass `io` kind), anything else 9. Classification is by error type, never by
@@ -449,6 +479,60 @@ mod tests {
             },
         ] {
             assert_eq!(classified(error), io);
+        }
+    }
+
+    #[test]
+    fn safe_database_diagnostics_preserve_classes_without_private_payloads() {
+        let cases = [
+            (
+                FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "PRIVATE-SQL-AND-MESSAGE",
+                )),
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::IoWrite { page: 43 },
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::ShortRead {
+                    expected: 4096,
+                    actual: 2048,
+                },
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::BusySnapshot {
+                    conflicting_pages: "PRIVATE-SQL-AND-MESSAGE".into(),
+                },
+                (7, "logical-archive-busy", true),
+            ),
+            (
+                FrankenError::DatabaseLocked {
+                    path: PathBuf::from("PRIVATE-SQL-AND-MESSAGE"),
+                },
+                (7, "logical-archive-busy", true),
+            ),
+            (
+                FrankenError::DatabaseCorrupt {
+                    detail: "PRIVATE-SQL-AND-MESSAGE".into(),
+                },
+                (9, "logical-archive-error", false),
+            ),
+        ];
+        for (cause, expected) in cases {
+            let error = database_failure(
+                "record 260: logical table messages, row 257 (id=1799), insertion failed",
+                cause,
+            );
+            assert_eq!(classify_failure(&error), expected);
+            assert!(error.downcast_ref::<FrankenError>().is_some());
+            let message = error.to_string();
+            assert!(message.contains("logical table messages, row 257 (id=1799)"));
+            assert!(message.contains("FrankenSQLite"));
+            assert!(!message.contains("PRIVATE-SQL-AND-MESSAGE"));
         }
     }
 }

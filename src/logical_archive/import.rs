@@ -179,9 +179,11 @@ fn insert_sql(table: &Table) -> Result<String> {
 /// Suspending its triggers avoids replaying derived writes while importing the
 /// corresponding canonical ledger rows. Restore the same trusted definitions.
 fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
-    let rows = connection.query(
-        "SELECT name, substr(sql, 1, 65537) FROM sqlite_master WHERE type = 'trigger' ORDER BY name LIMIT 257",
-    )?;
+    let rows = connection
+        .query(
+            "SELECT name, substr(sql, 1, 65537) FROM sqlite_master WHERE type = 'trigger' ORDER BY name LIMIT 257",
+        )
+        .map_err(|error| super::database_failure("cannot read canonical restore triggers", error))?;
     ensure!(
         rows.len() <= 256,
         "canonical schema exceeds restore trigger limit"
@@ -189,14 +191,25 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
     let mut statements = Vec::new();
     let mut bytes = 0usize;
     for row in rows {
-        let name = row.get_typed::<String>(0)?;
-        let sql = row.get_typed::<String>(1)?;
+        let name = row.get_typed::<String>(0).map_err(|error| {
+            super::database_failure("cannot decode a canonical restore trigger name", error)
+        })?;
+        let sql = row.get_typed::<String>(1).map_err(|error| {
+            super::database_failure(
+                "cannot decode a canonical restore trigger definition",
+                error,
+            )
+        })?;
         bytes = bytes.saturating_add(sql.len());
         ensure!(
             sql.len() <= 65536 && bytes <= MAX_TRIGGER_BYTES,
             "canonical trigger definitions exceed restore budget"
         );
-        connection.execute(&format!("DROP TRIGGER {}", export::quoted(&name)?))?;
+        connection
+            .execute(&format!("DROP TRIGGER {}", export::quoted(&name)?))
+            .map_err(|error| {
+                super::database_failure("cannot suspend a canonical restore trigger", error)
+            })?;
         statements.push(sql);
     }
     Ok(statements)
@@ -214,19 +227,29 @@ pub(super) fn verify_database(connection: &Connection) -> Result<()> {
         !violated,
         "restored archive has broken canonical relationships"
     );
-    check.context("cannot check restored archive relationships")?;
+    check.map_err(|error| {
+        super::database_failure("cannot check restored archive relationships", error)
+    })?;
 
     let mut rows = 0usize;
+    let mut invalid = false;
     let check = connection.query_with_params_for_each("PRAGMA integrity_check", &[], |row| {
         rows = rows.saturating_add(1);
         if row.get_typed::<String>(0)? != "ok" {
+            invalid = true;
             return Err(FrankenError::Internal(
                 "restore integrity check failed".to_owned(),
             ));
         }
         Ok(())
     });
-    check.map_err(|_| anyhow!("restored database failed integrity verification"))?;
+    ensure!(!invalid, "restored database failed integrity verification");
+    // A failed read supplies no integrity verdict. Retain the engine cause so
+    // I/O and busy failures keep their retryable classes without exposing the
+    // engine's arbitrary diagnostic payload or a corrupt row's contents.
+    check.map_err(|error| {
+        super::database_failure("cannot read restored database integrity results", error)
+    })?;
     ensure!(rows > 0, "restored database supplied no integrity result");
     Ok(())
 }
@@ -244,22 +267,45 @@ fn restore<R: BufRead>(
         "logical archive storage schema differs from this binary; cross-schema migration is not supported"
     );
     let mut validator = Validator::new(header).map_err(super::integrity_unless_io)?;
-    connection.execute("PRAGMA foreign_keys = OFF")?;
+    connection
+        .execute("PRAGMA foreign_keys = OFF")
+        .map_err(|error| {
+            super::database_failure("cannot suspend restore foreign-key enforcement", error)
+        })?;
     ensure!(
         connection
-            .query_row("PRAGMA foreign_keys")?
-            .get_typed::<i64>(0)?
+            .query_row("PRAGMA foreign_keys")
+            .map_err(|error| {
+                super::database_failure("cannot read restore foreign-key enforcement", error)
+            })?
+            .get_typed::<i64>(0)
+            .map_err(|error| {
+                super::database_failure("cannot decode restore foreign-key enforcement", error)
+            })?
             == 0,
         "cannot suspend foreign-key enforcement for ordered restoration"
     );
-    connection.execute("BEGIN IMMEDIATE")?;
+    connection.execute("BEGIN IMMEDIATE").map_err(|error| {
+        super::database_failure("cannot begin the private restore transaction", error)
+    })?;
     let triggers = suspend_triggers(connection)?;
     for table in &expected {
         // Remove initializer seeds only in this unpublished, freshly made DB.
-        connection.execute(&format!("DELETE FROM {}", export::quoted(&table.name)?))?;
+        connection
+            .execute(&format!("DELETE FROM {}", export::quoted(&table.name)?))
+            .map_err(|error| {
+                super::database_failure(
+                    format!(
+                        "cannot clear initializer rows in logical table {}",
+                        table.name
+                    ),
+                    error,
+                )
+            })?;
     }
     let mut table_count = 0usize;
     let mut statement = None;
+    let mut table_row = 0u64;
     let mut batch_records = 0usize;
     let mut batch_bytes = 0usize;
     let mut line = 2u64;
@@ -267,8 +313,18 @@ fn restore<R: BufRead>(
         if batch_records == MAX_BATCH_RECORDS
             || input.record_bytes > MAX_BATCH_BYTES.saturating_sub(batch_bytes)
         {
-            connection.execute("COMMIT")?;
-            connection.execute("BEGIN IMMEDIATE")?;
+            connection.execute("COMMIT").map_err(|error| {
+                super::database_failure(
+                    format!("cannot commit the private restore batch before record {line}"),
+                    error,
+                )
+            })?;
+            connection.execute("BEGIN IMMEDIATE").map_err(|error| {
+                super::database_failure(
+                    format!("cannot begin the private restore batch for record {line}"),
+                    error,
+                )
+            })?;
             batch_records = 0;
             batch_bytes = 0;
         }
@@ -284,16 +340,36 @@ fn restore<R: BufRead>(
                 );
                 // One prepared INSERT per descriptor, not one SQL parse/compile
                 // per archive row. It remains idle across private batch commits.
-                statement = Some(connection.prepare(&insert_sql(&table)?)?);
+                let insert = connection.prepare(&insert_sql(&table)?).map_err(|error| {
+                    super::database_failure(
+                        format!(
+                            "record {line}: cannot prepare logical table {} insertion",
+                            table.name
+                        ),
+                        error,
+                    )
+                })?;
+                statement = Some((insert, table));
                 table_count += 1;
+                table_row = 0;
             }
             Record::Row { values: cells } => {
-                let insert = statement.as_ref().ok_or_else(|| {
+                let (insert, table) = statement.as_ref().ok_or_else(|| {
                     super::integrity(format!("record {line}: row precedes its table"))
                 })?;
+                table_row = table_row
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("logical table row position overflow"))?;
                 let row = values(cells).map_err(super::integrity_unless_io)?;
-                insert.execute_with_params(&row)
-                    .map_err(|_| anyhow!("record {line}: canonical row insertion failed; no destination was published"))?;
+                insert.execute_with_params(&row).map_err(|error| {
+                    super::database_failure(
+                        format!(
+                            "record {line}: {}, canonical row insertion failed; no destination was published",
+                            export::row_location(table, table_row, &row)
+                        ),
+                        error,
+                    )
+                })?;
             }
             Record::Completion { .. } => {}
             Record::Header { .. } => {
@@ -320,10 +396,14 @@ fn restore<R: BufRead>(
     // Release the final prepared program before restoring schema objects.
     drop(statement);
     for statement in triggers {
-        connection.execute_batch(&statement)?;
+        connection.execute_batch(&statement).map_err(|error| {
+            super::database_failure("cannot reinstate canonical restore triggers", error)
+        })?;
     }
     verify_database(connection)?;
-    connection.execute("COMMIT")?;
+    connection.execute("COMMIT").map_err(|error| {
+        super::database_failure("cannot commit the verified private restore database", error)
+    })?;
     Ok(result)
 }
 
@@ -347,7 +427,12 @@ fn materialize_candidate(connection: &Connection, candidate: &Path) -> Result<()
             "VACUUM INTO ?1",
             &[SqliteValue::Text(export::path_text(candidate)?.into())],
         )
-        .context("cannot materialize a self-contained restore publication image")?;
+        .map_err(|error| {
+            super::database_failure(
+                "cannot materialize a self-contained restore publication image",
+                error,
+            )
+        })?;
     require_candidate_without_sidecars(candidate)
 }
 
@@ -392,24 +477,45 @@ pub fn import_file_with_policy(
     let storage = SqliteStorage::open(&replay_path)
         .context("cannot initialize canonical restore candidate")?;
     drop(storage);
-    let connection = Connection::open(export::path_text(&replay_path)?)?;
-    connection.execute("PRAGMA busy_timeout = 5000")?;
+    let connection = Connection::open(export::path_text(&replay_path)?).map_err(|error| {
+        super::database_failure("cannot open the private restore database", error)
+    })?;
+    connection
+        .execute("PRAGMA busy_timeout = 5000")
+        .map_err(|error| {
+            super::database_failure("cannot set the private restore busy timeout", error)
+        })?;
     // Replay uses the canonical WAL writer contract. A separate engine snapshot
     // below, not changing journal mode, establishes a single-file publication.
     let mode = connection
-        .query_row("PRAGMA journal_mode = WAL")?
-        .get_typed::<String>(0)?;
+        .query_row("PRAGMA journal_mode = WAL")
+        .map_err(|error| {
+            super::database_failure("cannot enable WAL for private canonical replay", error)
+        })?
+        .get_typed::<String>(0)
+        .map_err(|error| {
+            super::database_failure("cannot decode the private replay journal mode", error)
+        })?;
     ensure!(
         mode.eq_ignore_ascii_case("wal"),
         "cannot enable WAL for private canonical replay"
     );
-    connection.execute("PRAGMA synchronous = FULL")?;
+    connection
+        .execute("PRAGMA synchronous = FULL")
+        .map_err(|error| {
+            super::database_failure("cannot require durable private restore writes", error)
+        })?;
     let result = restore(&connection, &mut input, header)?;
     // restore() has verified the complete input and committed every private
     // batch. VACUUM INTO includes committed WAL rows while leaving the replay
     // files in place. Never delete or ignore them to make publication pass.
     materialize_candidate(&connection, &candidate)?;
-    connection.close()?;
+    connection.close().map_err(|error| {
+        super::database_failure(
+            "cannot close the materialized private restore database",
+            error,
+        )
+    })?;
 
     // Reopen the persisted database and hash its actual typed rows, descriptors,
     // metadata and relationships. Input verification alone cannot detect an
@@ -417,8 +523,18 @@ pub fn import_file_with_policy(
     let reader = export::open_source(&candidate)?;
     verify_database(&reader)?;
     let actual = export::snapshot(&reader, result.0.archive_id.clone(), &mut io::sink())?;
-    reader.execute("ROLLBACK")?;
-    reader.close_without_checkpoint()?;
+    reader.execute("ROLLBACK").map_err(|error| {
+        super::database_failure(
+            "cannot release the restored database verification snapshot",
+            error,
+        )
+    })?;
+    reader.close_without_checkpoint().map_err(|error| {
+        super::database_failure(
+            "cannot close the restored database verification reader",
+            error,
+        )
+    })?;
     ensure!(
         actual.1 == result.1,
         "restored database does not reproduce the archive's canonical digest"

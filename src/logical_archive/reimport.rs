@@ -21,7 +21,9 @@ fn identity(path: &Path) -> Result<FileIdentity> {
 fn require_same_file(connection: &Connection, path: &Path) -> Result<()> {
     let actual = identity(path)?;
     ensure!(
-        connection.file_identity()? == Some(actual),
+        connection.file_identity().map_err(|error| {
+            super::database_failure("cannot recheck the existing destination identity", error)
+        })? == Some(actual),
         "restore destination changed during comparison; retry without replacing it"
     );
     Ok(())
@@ -48,7 +50,9 @@ pub(super) fn verify_existing(
     let admitted = identity(destination)?;
     let reader = export::open_source(destination)?;
     ensure!(
-        reader.file_identity()? == Some(admitted),
+        reader.file_identity().map_err(|error| {
+            super::database_failure("cannot read the existing destination identity", error)
+        })? == Some(admitted),
         "restore destination changed before comparison; nothing was replaced"
     );
     let actual = export::snapshot(&reader, expected.0.archive_id.clone(), &mut io::sink())?;
@@ -58,8 +62,18 @@ pub(super) fn verify_existing(
     );
     import::verify_database(&reader)?;
     require_same_file(&reader, destination)?;
-    reader.execute("ROLLBACK")?;
-    reader.close_without_checkpoint()?;
+    reader.execute("ROLLBACK").map_err(|error| {
+        super::database_failure(
+            "cannot release the existing destination comparison snapshot",
+            error,
+        )
+    })?;
+    reader.close_without_checkpoint().map_err(|error| {
+        super::database_failure(
+            "cannot close the existing destination comparison reader",
+            error,
+        )
+    })?;
     // Equality describes one pinned read snapshot, not a lease preventing other
     // writers after this check. No import receipt is written into the archive.
     Ok(expected)

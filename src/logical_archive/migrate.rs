@@ -179,7 +179,15 @@ fn require_reviewed_table_layout(
     for table in &added {
         let sql = format!("SELECT 1 FROM {} LIMIT 1", export::quoted(&table.name)?);
         ensure!(
-            connection.query(&sql)?.is_empty(),
+            connection
+                .query(&sql)
+                .map_err(|error| {
+                    super::database_failure(
+                        format!("cannot check newly added logical table {}", table.name),
+                        error,
+                    )
+                })?
+                .is_empty(),
             "table {} added since the archived schema must stay empty in a migrated archive",
             table.name
         );
@@ -238,9 +246,11 @@ fn meta_schema_version_row(table: &Table, cells: &[Cell]) -> bool {
 }
 
 fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
-    let rows = connection.query(
-        "SELECT name, substr(sql, 1, 65537) FROM sqlite_master WHERE type = 'trigger' ORDER BY name LIMIT 257",
-    )?;
+    let rows = connection
+        .query(
+            "SELECT name, substr(sql, 1, 65537) FROM sqlite_master WHERE type = 'trigger' ORDER BY name LIMIT 257",
+        )
+        .map_err(|error| super::database_failure("cannot read canonical migration triggers", error))?;
     ensure!(
         rows.len() <= 256,
         "canonical schema exceeds restore trigger limit"
@@ -248,14 +258,25 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
     let mut statements = Vec::new();
     let mut bytes = 0_usize;
     for row in rows {
-        let name = row.get_typed::<String>(0)?;
-        let sql = row.get_typed::<String>(1)?;
+        let name = row.get_typed::<String>(0).map_err(|error| {
+            super::database_failure("cannot decode a canonical migration trigger name", error)
+        })?;
+        let sql = row.get_typed::<String>(1).map_err(|error| {
+            super::database_failure(
+                "cannot decode a canonical migration trigger definition",
+                error,
+            )
+        })?;
         bytes = bytes.saturating_add(sql.len());
         ensure!(
             sql.len() <= 65_536 && bytes <= MAX_TRIGGER_BYTES,
             "canonical trigger definitions exceed restore budget"
         );
-        connection.execute(&format!("DROP TRIGGER {}", export::quoted(&name)?))?;
+        connection
+            .execute(&format!("DROP TRIGGER {}", export::quoted(&name)?))
+            .map_err(|error| {
+                super::database_failure("cannot suspend a canonical migration trigger", error)
+            })?;
         statements.push(sql);
     }
     Ok(statements)
@@ -264,8 +285,17 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
 fn verify_current_schema_authority(connection: &Connection) -> Result<()> {
     let expected = i64::from(target_version()?);
     let version = connection
-        .query_row("SELECT MAX(version) FROM _schema_migrations")?
-        .get_typed::<i64>(0)?;
+        .query_row("SELECT MAX(version) FROM _schema_migrations")
+        .map_err(|error| {
+            super::database_failure("cannot read the current schema-migration authority", error)
+        })?
+        .get_typed::<i64>(0)
+        .map_err(|error| {
+            super::database_failure(
+                "cannot decode the current schema-migration authority",
+                error,
+            )
+        })?;
     ensure!(
         version == expected,
         "migrated candidate does not retain the current schema-migration authority"
@@ -284,9 +314,26 @@ fn clear_archived_data(connection: &Connection, archived: &[Table]) -> Result<()
             continue;
         }
         if table.name == META_TABLE {
-            connection.execute("DELETE FROM \"meta\" WHERE \"key\" <> 'schema_version'")?;
+            connection
+                .execute("DELETE FROM \"meta\" WHERE \"key\" <> 'schema_version'")
+                .map_err(|error| {
+                    super::database_failure(
+                        "cannot clear initializer rows in logical table meta",
+                        error,
+                    )
+                })?;
         } else {
-            connection.execute(&format!("DELETE FROM {}", export::quoted(&table.name)?))?;
+            connection
+                .execute(&format!("DELETE FROM {}", export::quoted(&table.name)?))
+                .map_err(|error| {
+                    super::database_failure(
+                        format!(
+                            "cannot clear initializer rows in logical table {}",
+                            table.name
+                        ),
+                        error,
+                    )
+                })?;
         }
     }
     Ok(())
@@ -311,14 +358,21 @@ fn restore_reviewed<R: BufRead>(
         "logical archive changed between validation and replay"
     );
     let mut validator = Validator::new(header).map_err(super::integrity_unless_io)?;
-    connection.execute("PRAGMA foreign_keys = OFF")?;
-    connection.execute("BEGIN IMMEDIATE")?;
+    connection
+        .execute("PRAGMA foreign_keys = OFF")
+        .map_err(|error| {
+            super::database_failure("cannot suspend migration foreign-key enforcement", error)
+        })?;
+    connection.execute("BEGIN IMMEDIATE").map_err(|error| {
+        super::database_failure("cannot begin the private migration transaction", error)
+    })?;
     let triggers = suspend_triggers(connection)?;
     clear_archived_data(connection, &inspected.tables)?;
 
     let mut statement = None;
     let mut current_table: Option<Table> = None;
     let mut table_count = 0_usize;
+    let mut table_row = 0_u64;
     let mut saw_schema_marker = false;
     let mut batch_records = 0_usize;
     let mut batch_bytes = 0_usize;
@@ -328,8 +382,18 @@ fn restore_reviewed<R: BufRead>(
         if batch_records == MAX_BATCH_RECORDS
             || input.record_bytes > MAX_BATCH_BYTES.saturating_sub(batch_bytes)
         {
-            connection.execute("COMMIT")?;
-            connection.execute("BEGIN IMMEDIATE")?;
+            connection.execute("COMMIT").map_err(|error| {
+                super::database_failure(
+                    format!("cannot commit the private migration batch before record {line}"),
+                    error,
+                )
+            })?;
+            connection.execute("BEGIN IMMEDIATE").map_err(|error| {
+                super::database_failure(
+                    format!("cannot begin the private migration batch for record {line}"),
+                    error,
+                )
+            })?;
             batch_records = 0;
             batch_bytes = 0;
         }
@@ -345,27 +409,41 @@ fn restore_reviewed<R: BufRead>(
                 statement = if table.name == MIGRATIONS_TABLE {
                     None
                 } else {
-                    Some(connection.prepare(&insert_sql(&table)?)?)
+                    Some(connection.prepare(&insert_sql(&table)?).map_err(|error| {
+                        super::database_failure(
+                            format!("record {line}: cannot prepare logical table {} migration insertion", table.name),
+                            error,
+                        )
+                    })?)
                 };
                 current_table = Some(table);
                 table_count += 1;
+                table_row = 0;
             }
             Record::Row { values: cells } => {
                 let table = current_table
                     .as_ref()
                     .ok_or_else(|| anyhow!("record {line}: row precedes its table"))?;
+                table_row = table_row
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("logical table row position overflow"))?;
                 if table.name == MIGRATIONS_TABLE {
                     // Archived migration history is input evidence, never current authority.
                 } else if meta_schema_version_row(table, &cells) {
                     saw_schema_marker = true;
                 } else {
+                    let row = values(cells)?;
                     statement
                         .as_ref()
                         .ok_or_else(|| anyhow!("record {line}: no compatible insert target"))?
-                        .execute_with_params(&values(cells)?)
-                        .map_err(|_| {
-                            anyhow!(
-                                "record {line}: row does not satisfy the reviewed v{REVIEWED_TARGET_VERSION} schema; no destination was published"
+                        .execute_with_params(&row)
+                        .map_err(|error| {
+                            super::database_failure(
+                                format!(
+                                    "record {line}: {}, reviewed v{REVIEWED_TARGET_VERSION} row insertion failed; no destination was published",
+                                    export::row_location(table, table_row, &row)
+                                ),
+                                error,
                             )
                         })?;
                 }
@@ -396,11 +474,18 @@ fn restore_reviewed<R: BufRead>(
 
     drop(statement);
     for trigger in triggers {
-        connection.execute_batch(&trigger)?;
+        connection.execute_batch(&trigger).map_err(|error| {
+            super::database_failure("cannot reinstate canonical migration triggers", error)
+        })?;
     }
     verify_current_schema_authority(connection)?;
     super::import::verify_database(connection)?;
-    connection.execute("COMMIT")?;
+    connection.execute("COMMIT").map_err(|error| {
+        super::database_failure(
+            "cannot commit the verified private migrated database",
+            error,
+        )
+    })?;
     Ok(())
 }
 
@@ -444,7 +529,12 @@ fn materialize_candidate(connection: &Connection, candidate: &Path) -> Result<()
             "VACUUM INTO ?1",
             &[SqliteValue::Text(export::path_text(candidate)?.into())],
         )
-        .context("cannot materialize a self-contained migrated publication image")?;
+        .map_err(|error| {
+            super::database_failure(
+                "cannot materialize a self-contained migrated publication image",
+                error,
+            )
+        })?;
     require_candidate_without_sidecars(candidate)
 }
 
@@ -476,7 +566,12 @@ fn identity(path: &Path) -> Result<FileIdentity> {
 fn require_same_file(connection: &Connection, path: &Path) -> Result<()> {
     let actual = identity(path)?;
     ensure!(
-        connection.file_identity()? == Some(actual),
+        connection.file_identity().map_err(|error| {
+            super::database_failure(
+                "cannot recheck the reviewed migration destination identity",
+                error,
+            )
+        })? == Some(actual),
         "restore destination changed during reviewed migration comparison; retry without replacing it"
     );
     Ok(())
@@ -575,8 +670,12 @@ fn compare_table_rows<R: BufRead>(
     );
 
     let mut failure = None;
+    let mut rows_compared = 0_u64;
     let streamed = connection.query_with_params_for_each(&sql, &[], |row| {
         let result = (|| -> Result<()> {
+            let next_row = rows_compared
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("logical table row position overflow"))?;
             let Some(record) = cursor.next()? else {
                 bail!(
                     "persisted migrated table {} contains an extra row",
@@ -595,6 +694,7 @@ fn compare_table_rows<R: BufRead>(
                 "persisted migrated row differs from verified archive table {}",
                 table.name
             );
+            rows_compared = next_row;
             Ok(())
         })();
         if let Err(error) = result {
@@ -608,7 +708,16 @@ fn compare_table_rows<R: BufRead>(
     if let Some(error) = failure {
         return Err(error);
     }
-    streamed.map_err(|_| anyhow!("cannot compare persisted migrated table {}", table.name))?;
+    streamed.map_err(|error| {
+        super::database_failure(
+            format!(
+                "cannot compare persisted migrated logical table {} before row {}, after {rows_compared} complete rows",
+                table.name,
+                rows_compared.saturating_add(1)
+            ),
+            error,
+        )
+    })?;
 
     if let Some(record) = cursor.next()? {
         if matches!(record, Record::Row { .. }) {
@@ -643,7 +752,12 @@ fn verify_persisted_projection(
     let reader = export::open_source(candidate)?;
     if let Some(expected_identity) = expected_identity {
         ensure!(
-            reader.file_identity()? == Some(expected_identity),
+            reader.file_identity().map_err(|error| {
+                super::database_failure(
+                    "cannot read the reviewed migration destination identity",
+                    error,
+                )
+            })? == Some(expected_identity),
             "restore destination changed before reviewed migration comparison; nothing was replaced"
         );
     }
@@ -695,8 +809,18 @@ fn verify_persisted_projection(
     if expected_identity.is_some() {
         require_same_file(&reader, candidate)?;
     }
-    reader.execute("ROLLBACK")?;
-    reader.close_without_checkpoint()?;
+    reader.execute("ROLLBACK").map_err(|error| {
+        super::database_failure(
+            "cannot release the reviewed migration comparison snapshot",
+            error,
+        )
+    })?;
+    reader.close_without_checkpoint().map_err(|error| {
+        super::database_failure(
+            "cannot close the reviewed migration comparison reader",
+            error,
+        )
+    })?;
     if require_sidecar_free {
         require_candidate_without_sidecars(candidate)?;
     }
@@ -756,9 +880,12 @@ pub fn import_compatible(
             Some(admitted),
             false,
         )
-        .context(
-            "restore conflict: existing canonical data is not the verified reviewed migration; nothing was replaced",
-        )?;
+        .map_err(|error| {
+            let message = format!(
+                "cannot verify the existing destination as a reviewed migration; nothing was replaced: {error}"
+            );
+            error.context(message)
+        })?;
         return Ok(MigrationOutcome {
             header: inspected.header.clone(),
             completion: inspected.completion.clone(),
@@ -777,22 +904,46 @@ pub fn import_compatible(
     let storage = SqliteStorage::open(&replay_path)
         .context("cannot initialize reviewed migration candidate")?;
     drop(storage);
-    let connection = Connection::open(export::path_text(&replay_path)?)?;
-    connection.execute("PRAGMA busy_timeout = 5000")?;
+    let connection = Connection::open(export::path_text(&replay_path)?).map_err(|error| {
+        super::database_failure("cannot open the private migration database", error)
+    })?;
+    connection
+        .execute("PRAGMA busy_timeout = 5000")
+        .map_err(|error| {
+            super::database_failure("cannot set the private migration busy timeout", error)
+        })?;
     let mode = connection
-        .query_row("PRAGMA journal_mode = WAL")?
-        .get_typed::<String>(0)?;
+        .query_row("PRAGMA journal_mode = WAL")
+        .map_err(|error| {
+            super::database_failure(
+                "cannot enable WAL for private reviewed migration replay",
+                error,
+            )
+        })?
+        .get_typed::<String>(0)
+        .map_err(|error| {
+            super::database_failure("cannot decode the private migration journal mode", error)
+        })?;
     ensure!(
         mode.eq_ignore_ascii_case("wal"),
         "cannot enable WAL for private reviewed migration replay"
     );
-    connection.execute("PRAGMA synchronous = FULL")?;
+    connection
+        .execute("PRAGMA synchronous = FULL")
+        .map_err(|error| {
+            super::database_failure("cannot require durable private migration writes", error)
+        })?;
 
     file.seek(SeekFrom::Start(0))?;
     let mut bounded = Input::new(BufReader::new(&mut file));
     restore_reviewed(&connection, &mut bounded, &inspected)?;
     materialize_candidate(&connection, &candidate)?;
-    connection.close()?;
+    connection.close().map_err(|error| {
+        super::database_failure(
+            "cannot close the materialized private migration database",
+            error,
+        )
+    })?;
 
     verify_persisted_projection(&mut file, &candidate, &inspected, None, true)?;
     #[cfg(unix)]
@@ -822,6 +973,132 @@ mod tests {
     use coding_agent_search::storage::sqlite::SqliteStorage;
     use std::collections::BTreeMap;
     use std::io::Write;
+
+    #[test]
+    fn projection_database_read_failure_retains_its_safe_typed_cause() -> Result<()> {
+        let connection = Connection::open(":memory:")?;
+        let table = Table {
+            name: "messages".into(),
+            columns: vec!["id".into(), "content".into()],
+            primary_key: vec![0],
+        };
+        let mut cursor = ProjectionCursor::new(&b"PRIVATE-ARCHIVE-MUST-NOT-BE-READ"[..]);
+        let error = compare_table_rows(&connection, &table, &mut cursor)
+            .expect_err("a missing canonical table must fail database comparison");
+        let message = error.to_string();
+        assert!(message.contains("logical table messages before row 1, after 0 complete rows"));
+        assert!(message.contains("missing table"));
+        assert!(!message.contains("PRIVATE-ARCHIVE"));
+        assert!(matches!(
+            error.downcast_ref::<FrankenError>(),
+            Some(FrankenError::NoSuchTable { .. })
+        ));
+        assert_eq!(
+            cursor.line, 1,
+            "database errors must not consume archive rows"
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn projection_cancellation_reports_the_completed_prefix_and_preserves_database() -> Result<()> {
+        use fsqlite_types::cx::CancelReason;
+        use std::cell::Cell as Counter;
+
+        struct CancelOnFirstRecord<'a, F> {
+            remaining: &'a [u8],
+            records: &'a Counter<u64>,
+            cancel: Option<F>,
+        }
+
+        impl<F: FnOnce()> Read for CancelOnFirstRecord<'_, F> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let count = output.len().min(self.remaining.len());
+                output[..count].copy_from_slice(&self.remaining[..count]);
+                self.consume(count);
+                Ok(count)
+            }
+        }
+
+        impl<F: FnOnce()> BufRead for CancelOnFirstRecord<'_, F> {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                Ok(self.remaining)
+            }
+
+            fn consume(&mut self, count: usize) {
+                for byte in &self.remaining[..count] {
+                    if *byte == b'\n' {
+                        self.records.set(self.records.get() + 1);
+                        if let Some(cancel) = self.cancel.take() {
+                            cancel();
+                        }
+                    }
+                }
+                self.remaining = &self.remaining[count..];
+            }
+        }
+
+        let connection = Connection::open(":memory:")?;
+        connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, content TEXT)")?;
+        let table = Table {
+            name: "messages".into(),
+            columns: vec!["id".into(), "content".into()],
+            primary_key: vec![0],
+        };
+        let mut encoded = Vec::new();
+        connection.execute("BEGIN IMMEDIATE")?;
+        let statement = connection.prepare("INSERT INTO messages VALUES (?, ?)")?;
+        for id in 1..=2048 {
+            statement.execute_with_params(&[
+                SqliteValue::Integer(id),
+                SqliteValue::Text("PRIVATE-PROJECTION-CONTENT".into()),
+            ])?;
+            encoded.extend(codec::encode(&Record::Row {
+                values: vec![
+                    Cell::Integer(id),
+                    Cell::Text("PRIVATE-PROJECTION-CONTENT".into()),
+                ],
+            })?);
+        }
+        drop(statement);
+        connection.execute("COMMIT")?;
+        connection.execute("BEGIN")?;
+        let (operation, relay) = connection
+            .as_async()
+            .root_cx()
+            .create_child_with_local_cancel_relay();
+        let records = Counter::new(0);
+        let input = CancelOnFirstRecord {
+            remaining: &encoded,
+            records: &records,
+            cancel: Some(|| assert!(relay.cancel_local(CancelReason::UserInterrupt))),
+        };
+        let mut cursor = ProjectionCursor::new(input);
+        let error = {
+            let _binding = connection.as_async().bind_operation_cx(&operation);
+            compare_table_rows(&connection, &table, &mut cursor)
+                .expect_err("cancellation must stop a running database comparison")
+        };
+        assert!((1..2048).contains(&records.get()));
+        let message = error.to_string();
+        assert!(message.contains(&format!("after {} complete rows", records.get())));
+        assert!(message.contains("FrankenSQLite Abort (code 4)"));
+        assert!(!message.contains("PRIVATE-PROJECTION-CONTENT"));
+        assert!(matches!(
+            error.downcast_ref::<FrankenError>(),
+            Some(FrankenError::Abort)
+        ));
+        connection.execute("ROLLBACK")?;
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages")?
+                .get_typed::<i64>(0)?,
+            2048
+        );
+        connection.close()?;
+        Ok(())
+    }
 
     fn database_files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         ["", "-wal", "-shm", "-journal"]

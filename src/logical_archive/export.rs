@@ -321,7 +321,7 @@ fn cells_for_version(values: &[SqliteValue], format_version: u32) -> Result<Vec<
 /// can themselves contain private session data, so report their row position
 /// without printing the key. A single integer key makes a failed message easy
 /// to locate without confusing its ID with the one-based position in the scan.
-fn row_location(table: &Table, position: u64, values: &[SqliteValue]) -> String {
+pub(super) fn row_location(table: &Table, position: u64, values: &[SqliteValue]) -> String {
     let mut location = format!("logical table {}, row {position}", table.name);
     if let [key] = table.primary_key.as_slice()
         && let Some(SqliteValue::Integer(value)) = values.get(*key)
@@ -347,30 +347,9 @@ pub(super) fn io_failure(context: impl std::fmt::Display, error: io::Error) -> a
 /// Its fieldless error code and numeric I/O coordinates are safe to report.
 /// Retain the original typed error so busy and I/O failures remain retryable.
 fn source_failure(context: impl std::fmt::Display, error: FrankenError) -> anyhow::Error {
-    let detail = match &error {
-        FrankenError::Io(error) => match error.raw_os_error() {
-            Some(code) => format!("; I/O {:?} (OS error {code})", error.kind()),
-            None => format!("; I/O {:?}", error.kind()),
-        },
-        FrankenError::IoRead { page } => format!("; cannot read database page {page}"),
-        FrankenError::IoWrite { page } => format!("; cannot write database page {page}"),
-        FrankenError::ShortRead { expected, actual } => {
-            format!("; short read: expected {expected} bytes, received {actual}")
-        }
-        FrankenError::NoSuchTable { .. } => "; missing table".to_owned(),
-        FrankenError::NoSuchColumn { .. } => "; missing column".to_owned(),
-        FrankenError::QueryReturnedNoRows => "; required row missing".to_owned(),
-        FrankenError::QueryReturnedMultipleRows => "; expected a single row".to_owned(),
-        FrankenError::SnapshotTooOld { .. } => "; source snapshot is too old".to_owned(),
-        FrankenError::WalCorrupt { .. } => "; corrupt WAL".to_owned(),
-        _ => String::new(),
-    };
-    let message = format!(
-        "{context}: FrankenSQLite {:?} (code {}){detail}; source was not repaired",
-        error.error_code(),
-        error.extended_error_code(),
-    );
-    anyhow::Error::new(error).context(message)
+    let failure = super::database_failure(context, error);
+    let message = format!("{failure}; source was not repaired");
+    failure.context(message)
 }
 
 /// cells() and Validator emit content-free format diagnostics. Preserve those
