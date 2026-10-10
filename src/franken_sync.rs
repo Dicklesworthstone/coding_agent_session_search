@@ -36,6 +36,8 @@ use std::sync::{
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite_types::cx::{CancelReason, LocalCancelRelay};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use frankensqlite::BackupReport;
 pub use frankensqlite::{FileIdentity, FrankenError, Row, SqliteValue, fsqlite_vfs, params};
 
 // ---------------------------------------------------------------------------
@@ -278,6 +280,20 @@ impl Connection {
     /// Descriptor-bound identity, distinct from a possibly replaced pathname.
     pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
         self.drive_operation(self.inner.file_identity())
+    }
+
+    /// Copy a quiescent file-backed database into a new, verified image.
+    ///
+    /// The engine checkpoints committed WAL data before its bounded image copy
+    /// and compares the source and target receipts. This can modify the source
+    /// WAL state; callers requiring a read-only source snapshot must not use it.
+    /// Existing targets and active transactions are refused by the engine.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn backup_exact_to(
+        &self,
+        target: impl AsRef<std::path::Path>,
+    ) -> Result<BackupReport, FrankenError> {
+        self.drive_operation(self.inner.backup_exact_to(target))
     }
 
     /// Execute a single SQL statement, returning the affected row count.
@@ -755,6 +771,123 @@ mod tests {
     use super::compat::{RowExt, TransactionExt};
     use super::*;
     use asupersync::{Cx, cx::CapMask};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn backup_exact_to_includes_wal_rows_and_refuses_existing_or_active_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.db");
+        let destination = directory.path().join("copied.db");
+        let active_target = directory.path().join("uncommitted.db");
+        let conn = Connection::open(source.to_string_lossy())?;
+        conn.execute("PRAGMA journal_mode = WAL")?;
+        conn.execute("PRAGMA wal_autocheckpoint = 0")?;
+        conn.execute("CREATE TABLE backup_rows (id INTEGER PRIMARY KEY, body TEXT, extra BLOB)")?;
+        let body = "recovery-λ\0".repeat(8192);
+        let extra = vec![0xa5_u8; 80 * 1024];
+        conn.execute_with_params(
+            "INSERT INTO backup_rows VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Integer(7),
+                SqliteValue::Text(body.clone().into()),
+                SqliteValue::Blob(extra.clone().into()),
+            ],
+        )?;
+        assert!(std::fs::metadata(directory.path().join("source.db-wal"))?.len() > 32);
+
+        let report = conn.backup_exact_to(&destination)?;
+        assert!(report.byte_len > 64 * 1024, "exercise multiple copy chunks");
+        assert_eq!(report.byte_len, std::fs::metadata(&destination)?.len());
+        assert_eq!(
+            report.byte_len,
+            u64::from(report.page_count) * u64::from(report.page_size)
+        );
+        let published = std::fs::read(&destination)?;
+        assert_eq!(published, std::fs::read(&source)?);
+        assert!(matches!(
+            conn.backup_exact_to(&destination),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(std::fs::read(&destination)?, published);
+
+        conn.execute("BEGIN IMMEDIATE")?;
+        conn.execute("INSERT INTO backup_rows VALUES (8, 'not committed', NULL)")?;
+        assert!(matches!(
+            conn.backup_exact_to(&active_target),
+            Err(FrankenError::Busy)
+        ));
+        assert!(!active_target.exists());
+        assert!(conn.as_async().in_transaction());
+        conn.execute("ROLLBACK")?;
+        conn.close()?;
+
+        let reader = compat::open_with_flags(
+            destination.to_string_lossy().as_ref(),
+            compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let row = reader.query_row("SELECT id, body, extra FROM backup_rows")?;
+        assert_eq!(row.get_typed::<i64>(0)?, 7);
+        assert_eq!(row.get_typed::<String>(1)?, body);
+        assert_eq!(row.get_typed::<Vec<u8>>(2)?, extra);
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM backup_rows")?
+                .get_typed::<i64>(0)?,
+            1
+        );
+        reader.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn backup_exact_to_cancellation_preserves_uncheckpointed_source_and_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("cancelled-source.db");
+        let wal = directory.path().join("cancelled-source.db-wal");
+        let target = directory.path().join("not-admitted.db");
+        let conn = Connection::open(source.to_string_lossy())?;
+        conn.execute("PRAGMA journal_mode = WAL")?;
+        conn.execute("PRAGMA wal_autocheckpoint = 0")?;
+        conn.execute("CREATE TABLE backup_cancel (id INTEGER PRIMARY KEY)")?;
+        conn.execute("INSERT INTO backup_cancel VALUES (42)")?;
+        let source_before = std::fs::read(&source)?;
+        let wal_before = std::fs::read(&wal)?;
+        assert!(wal_before.len() > 32);
+
+        let handle = CancellationHandle::default();
+        handle.cancel();
+        {
+            let _scope = handle.enter();
+            assert!(matches!(
+                conn.backup_exact_to(&target),
+                Err(FrankenError::Abort)
+            ));
+        }
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&source)?, source_before);
+        assert_eq!(std::fs::read(&wal)?, wal_before);
+        assert!(handle.inner.active.lock().unwrap().is_empty());
+
+        // Local cancellation must not poison the connection or its runtime.
+        // An admitted retry can checkpoint and include the committed WAL row.
+        conn.backup_exact_to(&target)?;
+        conn.close()?;
+        let reader = compat::open_with_flags(
+            target.to_string_lossy().as_ref(),
+            compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        assert_eq!(
+            reader
+                .query_row("SELECT id FROM backup_cancel")?
+                .get_typed::<i64>(0)?,
+            42
+        );
+        reader.close_without_checkpoint()?;
+        Ok(())
+    }
 
     #[test]
     fn cancellation_before_open_preserves_files_and_runtime()

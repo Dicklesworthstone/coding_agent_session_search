@@ -440,6 +440,79 @@ fn real_binary_large_collection_exports_all_typed_rows_and_verifies_the_backup()
     assert!(saw_real && saw_completion);
     assert_eq!(exported["tables"], serde_json::to_value(&counts).unwrap());
     assert_eq!(exported["records"], counts.values().sum::<u64>());
+
+    // Exercise replay through its persisted publication image, across many
+    // batches. Compare every restored message independently of archive receipts
+    // while retaining only one row and its expected payload at a time.
+    let restored_directory = root.path().join("restored-collection");
+    fs::create_dir(&restored_directory).unwrap();
+    let target = restored_directory.join("agent_search.db");
+    let imported = receipt(import(root.path(), &input, &target, false));
+    assert_eq!(imported["destination_status"], "created");
+    assert_eq!(imported["integrity_verified"], true);
+    for field in ["content_sha256", "records", "tables"] {
+        assert_eq!(imported[field], exported[field], "{field}");
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(
+            !restored_directory
+                .join(format!("agent_search.db{suffix}"))
+                .exists()
+        );
+    }
+    let reader = coding_agent_search::franken_sync::compat::open_with_flags(
+        target.to_str().unwrap(),
+        coding_agent_search::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    reader.execute("BEGIN").unwrap();
+    let mut restored_rows = 0_i64;
+    reader
+        .query_with_params_for_each(
+            "SELECT id, conversation_id, idx, role, author, created_at,
+                    content, extra_json, extra_bin FROM messages ORDER BY id",
+            &[],
+            |row| {
+                let position = restored_rows;
+                assert_eq!(row.get_typed::<i64>(0)?, 10_000 + 3 * position);
+                assert_eq!(row.get_typed::<i64>(1)?, 7);
+                assert_eq!(row.get_typed::<i64>(2)?, 2 * position);
+                assert!(row.get_typed::<String>(3)? == "assistant");
+                assert!(
+                    row.get_typed::<Option<String>>(4)?
+                        == if position % 2 == 0 {
+                            None
+                        } else {
+                            Some("archive_fixture".to_owned())
+                        }
+                );
+                assert_eq!(row.get_typed::<i64>(5)?, 1_733_000_000_000 + position);
+                assert!(
+                    row.get_typed::<String>(6)? == collection_body(position),
+                    "restored message content changed"
+                );
+                assert!(
+                    row.get_typed::<String>(7)? == collection_extra(position),
+                    "restored message metadata changed"
+                );
+                assert!(
+                    row.get_typed::<Vec<u8>>(8)?.as_slice() == PRIVATE_COLLECTION_BLOB,
+                    "restored message BLOB changed"
+                );
+                restored_rows += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(restored_rows, COLLECTION_ROWS);
+    reader.execute("ROLLBACK").unwrap();
+    reader.close_without_checkpoint().unwrap();
+    let restored_before = source_file_digests(&restored_directory);
+    let retried = receipt(import(root.path(), &input, &target, true));
+    assert_eq!(retried["destination_status"], "unchanged");
+    assert_eq!(retried["content_sha256"], exported["content_sha256"]);
+    assert_eq!(source_file_digests(&restored_directory), restored_before);
+
     let repeated = export(root.path(), &source, &root.path().join("repeat.jsonl"));
     assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
     assert_eq!(source_file_digests(&source_directory), before);

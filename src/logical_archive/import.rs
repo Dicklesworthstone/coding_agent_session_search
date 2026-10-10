@@ -11,7 +11,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use coding_agent_search::franken_sync::compat::RowExt;
 use coding_agent_search::franken_sync::{Connection, FrankenError, SqliteValue};
-use coding_agent_search::storage::sqlite::SqliteStorage;
+use coding_agent_search::storage::sqlite::{SqliteStorage, active_schema_migration_versions};
 
 use super::codec::{self, Cell, Completion, Header, Record, Table, Validator};
 use super::export::{self, DestinationLock};
@@ -216,7 +216,9 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
 }
 
 /// Canonical row equality does not establish the schema authority that ordinary
-/// storage opens will use. Check both markers in the caller's existing snapshot.
+/// storage opens will use. Check both markers and every active migration through
+/// the admitted version in the caller's existing snapshot. The engine replays
+/// missing lower versions even when the maximum version is already current.
 /// The admitted version may be historical during a read-only identical retry;
 /// new restores have already matched it to this binary's initializer.
 pub(super) fn verify_schema_authority(
@@ -242,6 +244,38 @@ pub(super) fn verify_schema_authority(
         version == Some(expected),
         "canonical schema-migration authority disagrees with the archive storage schema"
     );
+    // Fresh databases start at the combined v13 migration. Legacy v1..v12
+    // entries are optional; names and timestamps are historical data, not a
+    // replacement for the initializer's actual set of executable steps.
+    // Indexed point probes keep this check bounded by the binary's step count,
+    // independently of the archive's size or the numeric header version.
+    for required in active_schema_migration_versions().filter(|&version| version <= expected) {
+        let rows = connection
+            .query_with_params(
+                "SELECT version FROM _schema_migrations WHERE version = ?1 LIMIT 1",
+                &[SqliteValue::Integer(required)],
+            )
+            .map_err(|error| {
+                super::database_failure(
+                    format!("cannot read canonical schema-migration authority for v{required}"),
+                    error,
+                )
+            })?;
+        let recorded = rows
+            .first()
+            .map(|row| row.get_typed::<i64>(0))
+            .transpose()
+            .map_err(|error| {
+                super::database_failure(
+                    format!("cannot decode canonical schema-migration authority for v{required}"),
+                    error,
+                )
+            })?;
+        ensure!(
+            recorded == Some(required),
+            "canonical schema-migration authority is missing required migration v{required}; normal storage opening would replay it"
+        );
+    }
     ensure!(
         export::schema_version(connection)? == expected_storage_version,
         "canonical schema marker disagrees with the archive storage schema"
@@ -451,16 +485,14 @@ pub fn import_file(
     Ok((header, completion))
 }
 
-/// Materialize committed replay state through the engine, not a main-file copy
-/// or a journal-mode switch. The replay DB may legitimately retain WAL/journal
-/// files after close; none of those names may be moved into the publication.
+/// Copy the private, committed replay state through the engine's verified page
+/// backup. VACUUM INTO hydrates every table in the pinned engine; this path
+/// checkpoints the sole replay writer and copies with a fixed-size buffer.
+/// The replay's WAL/journal names must never be moved into the publication.
 fn materialize_candidate(connection: &Connection, candidate: &Path) -> Result<()> {
     require_new_destination(candidate)?;
     connection
-        .execute_with_params(
-            "VACUUM INTO ?1",
-            &[SqliteValue::Text(export::path_text(candidate)?.into())],
-        )
+        .backup_exact_to(candidate)
         .map_err(|error| {
             super::database_failure(
                 "cannot materialize a self-contained restore publication image",
@@ -542,8 +574,8 @@ pub fn import_file_with_policy(
     let result = restore(&connection, &mut input, header)?;
     verify_schema_authority(&connection, &result.0.storage_schema_version)?;
     // restore() has verified the complete input and committed every private
-    // batch. VACUUM INTO includes committed WAL rows while leaving the replay
-    // files in place. Never delete or ignore them to make publication pass.
+    // batch. The engine backup checkpoints this private writer before copying
+    // its verified image; it must not run on the user's live source database.
     materialize_candidate(&connection, &candidate)?;
     connection.close().map_err(|error| {
         super::database_failure(
@@ -797,7 +829,7 @@ mod publication_tests {
             );
         }
 
-        // Parameter binding must handle both quotes and Unicode in the path.
+        // The path API must handle both quotes and Unicode without SQL quoting.
         let candidate = root.path().join("publication 'δ'.db");
         materialize_candidate(&writer, &candidate).unwrap();
         let reader = export::open_source(&candidate).unwrap();
@@ -866,6 +898,146 @@ mod publication_tests {
     }
 
     #[test]
+    fn schema_authority_checks_each_active_step_in_fresh_and_legacy_histories() -> Result<()> {
+        for expected in [20_i64, 21, 22] {
+            for legacy in [false, true] {
+                let connection = Connection::open(":memory:")?;
+                connection.execute_batch(
+                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE _schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+                )?;
+                connection.execute_with_params(
+                    "INSERT INTO meta VALUES ('schema_version', ?1)",
+                    &[SqliteValue::Text(expected.to_string().into())],
+                )?;
+                let first = if legacy { 1 } else { 13 };
+                for version in first..=expected {
+                    connection.execute_with_params(
+                        "INSERT INTO _schema_migrations VALUES (?1, ?2)",
+                        &[
+                            SqliteValue::Integer(version),
+                            SqliteValue::Text("PRIVATE-HISTORICAL-MIGRATION-NAME".into()),
+                        ],
+                    )?;
+                }
+                verify_schema_authority(&connection, &expected.to_string())?;
+                for missing in 13..expected {
+                    connection.execute_with_params(
+                        "DELETE FROM _schema_migrations WHERE version = ?1",
+                        &[SqliteValue::Integer(missing)],
+                    )?;
+                    assert_eq!(
+                        connection
+                            .query_row("SELECT MAX(version) FROM _schema_migrations")?
+                            .get_typed::<i64>(0)?,
+                        expected,
+                        "the declared maximum alone cannot detect this hole"
+                    );
+                    let error = verify_schema_authority(&connection, &expected.to_string())
+                        .expect_err("every executable historical migration must be recorded");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("missing required migration v{missing}"))
+                    );
+                    assert!(!error.to_string().contains("PRIVATE-HISTORICAL-MIGRATION-NAME"));
+                    connection.execute_with_params(
+                        "INSERT INTO _schema_migrations VALUES (?1, 'historical name')",
+                        &[SqliteValue::Integer(missing)],
+                    )?;
+                }
+                verify_schema_authority(&connection, &expected.to_string())?;
+                connection.close()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_history_refuses_restore_before_normal_open_can_replay_v18() -> Result<()> {
+        use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source.db");
+        drop(SqliteStorage::open(&source)?);
+        let writer = Connection::open(export::path_text(&source)?)?;
+        writer.execute_batch(
+            "INSERT INTO agents (id, slug, name, kind, created_at, updated_at)
+             VALUES (1, 'tail-fixture', 'Tail Fixture', 'cli', 0, 0);
+             INSERT INTO conversations
+                 (id, agent_id, source_path, ended_at, last_message_idx, last_message_created_at)
+             VALUES (1, 1, 'PRIVATE-SCHEMA-AUTHORITY-SOURCE', 100, 1, 100);
+             INSERT INTO conversation_tail_state
+                 (conversation_id, ended_at, last_message_idx, last_message_created_at)
+             VALUES (1, 999, 99, 999);
+             DELETE FROM _schema_migrations WHERE version = 18;",
+        )?;
+        for index in 0_i64..100 {
+            writer.execute_with_params(
+                "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
+                 VALUES (?1, 1, ?2, 'user', ?3, 'PRIVATE-SCHEMA-AUTHORITY-MESSAGE')",
+                &[
+                    SqliteValue::Integer(index + 1),
+                    SqliteValue::Integer(index),
+                    SqliteValue::Integer(index * 10 + 9),
+                ],
+            )?;
+        }
+        assert_eq!(
+            writer
+                .query_row("SELECT MAX(version) FROM _schema_migrations")?
+                .get_typed::<i64>(0)?,
+            CURRENT_SCHEMA_VERSION
+        );
+        verify_database(&writer)?;
+        writer.close()?;
+
+        let input = root.path().join("history.jsonl");
+        let expected = export::export_file(&source, &input, "sparse-history".to_owned())?;
+        assert_eq!(expected, export::verify_file(&input)?);
+        let source_before = schema_authority_database_files(&source);
+        let input_before = fs::read(&input)?;
+        let destination = root.path().join("restored.db");
+        let error = import_file(&input, &destination, "sparse-history")
+            .expect_err("a digest-valid sparse history must not be published");
+        assert!(error.to_string().contains("missing required migration v18"));
+        assert!(!error.to_string().contains("PRIVATE-SCHEMA-AUTHORITY"));
+        require_new_destination(&destination)?;
+        let error = import_file_with_policy(&input, &source, "sparse-history", true)
+            .expect_err("identical rows cannot authorize a migration replay on ordinary open");
+        assert!(error.to_string().contains("missing required migration v18"));
+        assert!(!error.to_string().contains("PRIVATE-SCHEMA-AUTHORITY"));
+        assert_eq!(source_before, schema_authority_database_files(&source));
+        assert_eq!(input_before, fs::read(&input)?);
+
+        let reader = export::open_source(&source)?;
+        assert_eq!(
+            reader
+                .query_row("SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = 1")?
+                .get_typed::<i64>(0)?,
+            99,
+            "both refused import paths must preserve the newer canonical tail"
+        );
+        reader.execute("ROLLBACK")?;
+        reader.close_without_checkpoint()?;
+
+        // Positive control on this disposable source fixture, after proving
+        // both archive paths leave it untouched. The actual storage opener
+        // replays a missing v18 even though MAX(version) remains current, and
+        // its INSERT OR REPLACE overwrites the newer hot tail with legacy data.
+        let reopened = SqliteStorage::open(&source)?;
+        assert_eq!(
+            reopened
+                .raw()
+                .query_row("SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = 1")?
+                .get_typed::<i64>(0)?,
+            1
+        );
+        assert_eq!(reopened.schema_version()?, CURRENT_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
     fn contradictory_schema_authority_never_publishes_or_confirms_an_existing_database()
     -> Result<()> {
         use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
@@ -929,26 +1101,41 @@ mod publication_tests {
     fn exact_restore_schema_authority_survives_normal_reopen_and_read_only_retry() -> Result<()> {
         use coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION;
 
-        let root = tempfile::tempdir()?;
-        let source = root.path().join("source.db");
-        drop(SqliteStorage::open(&source)?);
-        let input = root.path().join("history.jsonl");
-        let expected =
-            export::export_file(&source, &input, "schema-authority".to_owned())?;
-        let destination = root.path().join("restored.db");
-        assert_eq!(
-            import_file(&input, &destination, "schema-authority")?,
-            expected
-        );
-        let reopened = SqliteStorage::open(&destination)?;
-        assert_eq!(reopened.schema_version()?, CURRENT_SCHEMA_VERSION);
-        drop(reopened);
-        let before = schema_authority_database_files(&destination);
-        let (header, completion, created) =
-            import_file_with_policy(&input, &destination, "schema-authority", true)?;
-        assert!(!created);
-        assert_eq!((header, completion), expected);
-        assert_eq!(before, schema_authority_database_files(&destination));
+        for legacy in [false, true] {
+            let root = tempfile::tempdir()?;
+            let source = root.path().join("source.db");
+            drop(SqliteStorage::open(&source)?);
+            if legacy {
+                let writer = Connection::open(export::path_text(&source)?)?;
+                for version in 1_i64..13 {
+                    writer.execute_with_params(
+                        "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2)",
+                        &[
+                            SqliteValue::Integer(version),
+                            SqliteValue::Text("historical migration".into()),
+                        ],
+                    )?;
+                }
+                writer.close()?;
+            }
+            let input = root.path().join("history.jsonl");
+            let expected =
+                export::export_file(&source, &input, "schema-authority".to_owned())?;
+            let destination = root.path().join("restored.db");
+            assert_eq!(
+                import_file(&input, &destination, "schema-authority")?,
+                expected
+            );
+            let reopened = SqliteStorage::open(&destination)?;
+            assert_eq!(reopened.schema_version()?, CURRENT_SCHEMA_VERSION);
+            drop(reopened);
+            let before = schema_authority_database_files(&destination);
+            let (header, completion, created) =
+                import_file_with_policy(&input, &destination, "schema-authority", true)?;
+            assert!(!created);
+            assert_eq!((header, completion), expected);
+            assert_eq!(before, schema_authority_database_files(&destination));
+        }
         Ok(())
     }
 

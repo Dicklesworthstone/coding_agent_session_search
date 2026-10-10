@@ -6504,6 +6504,21 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (22, "forgotten_sources", MIGRATION_V22),
 ];
 
+/// Migration versions that ordinary storage open may apply when their ledger
+/// rows are absent. Restores must retain every admitted step, including V15's
+/// separately implemented migration; a matching maximum alone is insufficient.
+pub fn active_schema_migration_versions() -> impl Iterator<Item = i64> {
+    BASE_MIGRATION_STEPS
+        .iter()
+        .map(|&(version, _, _)| version)
+        .chain(std::iter::once(15))
+        .chain(
+            POST_TAIL_CACHE_MIGRATION_STEPS
+                .iter()
+                .map(|&(version, _, _)| version),
+        )
+}
+
 /// Run each pending migration through its own single-migration runner so an
 /// error names the exact failing step. Returns the applied versions plus the
 /// first step's `was_fresh` signal — the same value the combined-runner form

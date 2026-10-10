@@ -355,29 +355,7 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
 }
 
 fn verify_current_schema_authority(connection: &Connection) -> Result<()> {
-    let expected = i64::from(target_version()?);
-    let version = connection
-        .query_row("SELECT MAX(version) FROM _schema_migrations")
-        .map_err(|error| {
-            super::database_failure("cannot read the current schema-migration authority", error)
-        })?
-        .get_typed::<i64>(0)
-        .map_err(|error| {
-            super::database_failure(
-                "cannot decode the current schema-migration authority",
-                error,
-            )
-        })?;
-    ensure!(
-        version == expected,
-        "migrated candidate does not retain the current schema-migration authority"
-    );
-    let legacy = export::schema_version(connection)?;
-    ensure!(
-        legacy == expected.to_string(),
-        "migrated candidate legacy schema marker is not current"
-    );
-    Ok(())
+    super::import::verify_schema_authority(connection, &target_version()?.to_string())
 }
 
 fn clear_archived_data(connection: &Connection, archived: &[Table]) -> Result<()> {
@@ -597,11 +575,10 @@ fn require_candidate_without_sidecars(candidate: &Path) -> Result<()> {
 
 fn materialize_candidate(connection: &Connection, candidate: &Path) -> Result<()> {
     require_new_destination(candidate)?;
+    // Only the private, committed replay is checkpointed. The engine's page
+    // backup avoids VACUUM INTO's whole-database hydration in the pinned engine.
     connection
-        .execute_with_params(
-            "VACUUM INTO ?1",
-            &[SqliteValue::Text(export::path_text(candidate)?.into())],
-        )
+        .backup_exact_to(candidate)
         .map_err(|error| {
             super::database_failure(
                 "cannot materialize a self-contained migrated publication image",
@@ -1906,6 +1883,46 @@ mod tests {
         assert!(!repeated.created);
         assert!(repeated.migration.is_some());
         assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
+    fn reviewed_retry_rejects_sparse_current_history_even_when_projection_matches() -> Result<()> {
+        for source in [20, 21] {
+            let root = tempfile::tempdir()?;
+            let input = versioned_archive(root.path(), source, false, false)?;
+            let destination = root.path().join("restored.db");
+            import_compatible(&input, &destination, "reviewed-migration", false)?;
+            let writer = Connection::open(export::path_text(&destination)?)?;
+            writer.execute("DELETE FROM _schema_migrations WHERE version = 18")?;
+            assert_eq!(
+                writer
+                    .query_row("SELECT MAX(version) FROM _schema_migrations")?
+                    .get_typed::<i64>(0)?,
+                i64::from(REVIEWED_TARGET_VERSION)
+            );
+            writer.close()?;
+            let before = database_files(&destination);
+            let input_before = fs::read(&input)?;
+
+            // The authenticated projection intentionally ignores migration
+            // history differences. It still matches this sparse target, so
+            // the current-schema authority check must reject it separately.
+            let mut file = super::super::import::open_input(&input)?;
+            let inspected = inspect(&mut file, "reviewed-migration")?;
+            file.seek(SeekFrom::Start(0))?;
+            let reader = export::open_source(&destination)?;
+            verify_projection_rows(&reader, BufReader::new(file), &inspected)?;
+            reader.execute("ROLLBACK")?;
+            reader.close_without_checkpoint()?;
+
+            let error = import_compatible(&input, &destination, "reviewed-migration", true)
+                .err()
+                .context("a matching projection must not authorize lower-version migration replay")?;
+            assert!(error.to_string().contains("missing required migration v18"));
+            assert_eq!(before, database_files(&destination));
+            assert_eq!(input_before, fs::read(&input)?);
+        }
         Ok(())
     }
 

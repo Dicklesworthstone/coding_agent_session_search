@@ -198,6 +198,16 @@ commits are never exposed as a valid partial restore: the complete stream,
 footer, counts, digest, canonical schema metadata, foreign keys and database
 integrity must all pass first.
 
+Before publication or an identical-retry success, the migration ledger and
+`meta.schema_version` must agree with the admitted storage version. Every active
+initializer migration through that version must have a ledger entry: ordinary
+storage opening replays a missing intermediate migration even when the latest
+version is present. Such a replay can overwrite restored canonical state.
+Fresh histories beginning at v13 and legacy histories retaining v1 through v12
+are both accepted. Missing steps are reported by version without printing
+historical migration names or message contents, and are never repaired during
+backup restoration or comparison.
+
 Restore failures retain their database cause and report the failed operation,
 including batch boundaries and verification probes. An insertion failure also
 identifies the logical record, table, one-based table row and single integer
@@ -208,12 +218,15 @@ no integrity verdict; it is reported as a failed probe rather than as proof of
 broken relationships. The same policy applies to reviewed migrations and
 existing-destination comparisons.
 
-Replay retains the canonical WAL writer policy. A journal-mode change or clean
-close does not by itself prove a self-contained database. After all private
-batches commit and validate, parameterized `VACUUM INTO` materializes a separate
-publication image containing the committed logical database. The replay files
-are never relabelled as a complete image, and their sidecars are not discarded
-to manufacture a successful check. Allow disk space for both the replay database
+Replay retains the canonical WAL writer policy. After all private batches commit
+and validate, the engine's verified page-backup API checkpoints the private
+replay database and copies its committed image to a new publication candidate.
+The pinned engine copies with a fixed 64 KiB buffer and hashes images one page
+at a time. This avoids the whole-database hydration of its `VACUUM INTO` path.
+Only the private replay database is checkpointed; the input and the user's live
+source database are never passed to this API. The replay files are never
+relabelled as a complete image, and their sidecars are not discarded to
+manufacture a successful check. Allow disk space for both the replay database
 and its sidecars and the separate publication image during restoration.
 
 Import rejects content-bearing sidecars beside the image, closes the writer,
