@@ -80,6 +80,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **On Windows, a stalled `cass index` exits 70 again instead of crashing.**
+  After printing the `index-stalled` envelope, the stall abort called
+  `std::process::exit(70)`. On Windows that ends the other threads and then
+  runs the exiting thread's thread-local destructors. One of them joined a
+  worker thread the exit had already killed, panicked, and the process
+  aborted with 0xC0000409 ("thread local panicked on drop") instead of the
+  documented exit 70. The exit now happens on a fresh thread that holds no
+  such state. Linux and macOS are unchanged.
 - **`cass index` verifies the lexical index one time fewer per run.** Each
   Quill open hashes every live segment, and the startup check opened the
   index twice: once for its document count and once for the contract check.

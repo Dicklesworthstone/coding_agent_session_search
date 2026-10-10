@@ -107188,8 +107188,28 @@ fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &
         // DB instead of a multi-GB orphaned WAL. Stale locks are reaped by the
         // next startup's flock-based recovery.
         crate::indexer::best_effort_abort_wal_checkpoint(data_dir);
-        std::process::exit(70);
+        exit_without_this_threads_tls_destructors(70);
     }
+}
+
+/// Exit with `code` without running the calling thread's thread-local
+/// destructors. On Windows, `std::process::exit` terminates every other thread
+/// and then runs the calling thread's TLS destructors; one that joins a worker
+/// thread the exit already killed panics ("threads should not terminate
+/// unexpectedly"), and a panic in a TLS destructor aborts the process with
+/// 0xC0000409 instead of `code`. A fresh thread owns no such state, so exiting
+/// from it keeps the documented code. Elsewhere this is `std::process::exit`.
+fn exit_without_this_threads_tls_destructors(code: i32) -> ! {
+    #[cfg(windows)]
+    {
+        // The spawned thread ends the process; join only returns if the spawn
+        // itself failed, and then the direct exit below still runs.
+        let _ = std::thread::Builder::new()
+            .name("cass-exit".to_string())
+            .spawn(move || std::process::exit(code))
+            .map(std::thread::JoinHandle::join);
+    }
+    std::process::exit(code)
 }
 
 #[cfg(test)]
