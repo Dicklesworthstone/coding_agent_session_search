@@ -498,3 +498,40 @@ fn a_failed_frame_write_stops_before_row_end() {
     assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     assert_eq!(output.calls, 2);
 }
+
+#[test]
+fn streaming_encoder_has_fixed_chunk_storage_and_matches_existing_frames() {
+    let mut output = Vec::new();
+    let mut encoder = Encoder {
+        output: &mut output,
+        remaining: row_bytes().len(),
+        sequence: 0,
+        buffer: Vec::with_capacity(CHUNK_BYTES),
+        digest: Sha256::new(),
+    };
+    let capacity = encoder.buffer.capacity();
+    for bytes in row_bytes().chunks(7919) {
+        encoder.write_all(bytes).unwrap();
+        assert!(encoder.buffer.len() < CHUNK_BYTES);
+        assert_eq!(encoder.buffer.capacity(), capacity);
+    }
+    encoder.finish().unwrap();
+    let expected = wire();
+    let after_start = expected.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    assert_eq!(output, expected[after_start..]);
+}
+
+#[test]
+fn streaming_size_mismatch_never_emits_a_valid_row_end() {
+    let record: Record = serde_json::from_slice(row_bytes()).unwrap();
+    for size in [row_bytes().len() - 1, row_bytes().len() + 1] {
+        let mut output = Vec::new();
+        assert!(write_record(&record, size, &mut output).is_err());
+        assert!(
+            !output
+                .windows(b"\"row_end\"".len())
+                .any(|window| window == b"\"row_end\"")
+        );
+        assert_integrity(&output);
+    }
+}

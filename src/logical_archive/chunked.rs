@@ -136,6 +136,105 @@ pub(super) fn write(bytes: &[u8], output: &mut impl Write) -> io::Result<()> {
     )
 }
 
+/// Serialize an admitted row without a row-sized canonical JSON allocation.
+/// Size/digest admission is already complete; this pass needs only one raw
+/// chunk plus its bounded base64/frame encoding. Drop never publishes an end.
+pub(super) fn write_record(
+    record: &Record,
+    bytes: usize,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    if !matches!(record, Record::Row { .. })
+        || bytes <= MAX_RECORD_BYTES
+        || bytes > MAX_ROW_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid continued row size or type",
+        ));
+    }
+    write_frame(&Frame::Start { bytes }, output)?;
+    let mut encoder = Encoder {
+        output,
+        remaining: bytes,
+        sequence: 0,
+        buffer: Vec::with_capacity(CHUNK_BYTES),
+        digest: Sha256::new(),
+    };
+    super::serialize_record(record, bytes, &mut encoder)?;
+    encoder.finish()
+}
+
+struct Encoder<'a, W> {
+    output: &'a mut W,
+    remaining: usize,
+    sequence: usize,
+    buffer: Vec<u8>,
+    digest: Sha256,
+}
+
+impl<W: Write> Encoder<'_, W> {
+    fn emit_chunk(&mut self) -> io::Result<()> {
+        write_frame(
+            &Frame::Chunk {
+                sequence: self.sequence,
+                data: STANDARD.encode(&self.buffer),
+            },
+            self.output,
+        )?;
+        self.digest.update(&self.buffer);
+        self.sequence += 1;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if self.remaining != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "continued row did not reach its validated size",
+            ));
+        }
+        if !self.buffer.is_empty() {
+            self.emit_chunk()?;
+        }
+        write_frame(
+            &Frame::End {
+                sha256: hex::encode(self.digest.finalize()),
+            },
+            self.output,
+        )
+    }
+}
+
+impl<W: Write> Write for Encoder<'_, W> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let count = bytes.len();
+        if count > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "continued row exceeded its validated size",
+            ));
+        }
+        while !bytes.is_empty() {
+            let take = bytes.len().min(CHUNK_BYTES - self.buffer.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buffer.len() == CHUNK_BYTES {
+                self.emit_chunk()?;
+            }
+        }
+        self.remaining -= count;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // A short final chunk is legal only after all declared bytes arrive.
+        // Only finish() seals it; serde serialization does not call flush().
+        self.output.flush()
+    }
+}
+
 /// A bounded decoder for one group. Only one decoded 1 MiB chunk is retained;
 /// serde constructs the logical row directly, rather than first retaining a
 /// second complete copy of its encoded JSON. Binding that row into SQLite and

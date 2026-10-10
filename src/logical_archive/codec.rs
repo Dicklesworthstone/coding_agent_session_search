@@ -1,7 +1,7 @@
 //! Versioned, bounded JSONL framing. No SQL or filesystem paths are executable data.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine as _;
@@ -531,7 +531,7 @@ impl Write for CanonicalHash {
             self.buffered += take;
             bytes = &bytes[take..];
             if self.buffered == self.buffer.len() {
-                self.digest.update(&self.buffer);
+                self.digest.update(self.buffer.as_slice());
                 self.buffered = 0;
             }
         }
@@ -550,6 +550,98 @@ impl Write for CanonicalHash {
         self.buffered = 0;
         Ok(())
     }
+}
+
+/// An admitted immutable record. Ordinary small rows keep the one-pass
+/// buffered path; larger rows are serialized directly to bounded transport
+/// frames after their exact size and canonical digest have been checked.
+pub struct PreparedRecord<'a> {
+    record: &'a Record,
+    encoded: Option<Vec<u8>>,
+    bytes: usize,
+}
+
+impl PreparedRecord<'_> {
+    pub fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
+        if let Some(bytes) = &self.encoded {
+            write_encoded(bytes, output)
+        } else if self.bytes <= MAX_RECORD_BYTES {
+            serialize_record(self.record, self.bytes, output)
+        } else {
+            chunked::write_record(self.record, self.bytes, output)
+        }
+    }
+}
+
+/// serde_json wraps I/O failures. Retain the original typed cause, including
+/// the OS code, rather than degrading disk-full/permission errors to Other.
+/// This adapter never flushes on drop or retries a non-interrupted failure.
+struct CheckedOutput<'a, W> {
+    output: &'a mut W,
+    remaining: usize,
+    failure: Option<io::Error>,
+}
+
+impl<W: Write> CheckedOutput<'_, W> {
+    fn fail(&mut self, error: io::Error) -> io::Result<usize> {
+        self.failure = Some(error);
+        Err(io::Error::other("logical output write failed"))
+    }
+}
+
+impl<W: Write> Write for CheckedOutput<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(io::Error::other("logical output write failed"));
+        }
+        if bytes.len() > self.remaining {
+            return self.fail(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "logical record exceeded its validated size",
+            ));
+        }
+        let written = loop {
+            match self.output.write(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return self.fail(error),
+                Ok(0) if !bytes.is_empty() => {
+                    return self.fail(io::ErrorKind::WriteZero.into());
+                }
+                Ok(written) if written > bytes.len() => {
+                    return self.fail(io::ErrorKind::InvalidData.into());
+                }
+                Ok(written) => break written,
+            }
+        };
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn serialize_record(record: &Record, bytes: usize, output: &mut impl Write) -> io::Result<()> {
+    let mut checked = CheckedOutput {
+        output,
+        remaining: bytes,
+        failure: None,
+    };
+    let result = serde_json::to_writer(&mut checked, record)
+        .map_err(io::Error::other)
+        .and_then(|()| checked.write_all(b"\n"));
+    if let Some(error) = checked.failure.take() {
+        return Err(error);
+    }
+    result?;
+    if checked.remaining != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "logical record did not reach its validated size",
+        ));
+    }
+    Ok(())
 }
 
 /// Emit already validated canonical bytes, splitting an oversized v2 row into
@@ -700,6 +792,34 @@ impl Validator {
         digest.update(&bytes);
         self.accept(record, digest)?;
         Ok(bytes)
+    }
+
+    /// Admit an output row without ever allocating a full large encoding.
+    /// Most session messages fit the 64 KiB fast path and serialize only once.
+    /// Oversize/escaping failures in the small buffer fall through to the
+    /// unchanged version-specific limits, not to truncation or omission.
+    pub fn prepare<'a>(&mut self, record: &'a Record) -> Result<PreparedRecord<'a>> {
+        ensure!(!self.completed, "records follow the archive completion");
+        match encode_with_limit(record, self.record_limit(record).min(64 * 1024)) {
+            Ok(encoded) => {
+                let mut digest = self.digest.clone();
+                digest.update(&encoded);
+                self.accept(record, digest)?;
+                Ok(PreparedRecord {
+                    record,
+                    bytes: encoded.len(),
+                    encoded: Some(encoded),
+                })
+            }
+            Err(_) => {
+                let bytes = self.validate(record)?;
+                Ok(PreparedRecord {
+                    record,
+                    encoded: None,
+                    bytes,
+                })
+            }
+        }
     }
 
     /// Verify a record and advance canonical identity without allocating its

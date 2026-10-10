@@ -459,14 +459,14 @@ fn snapshot_for_version(
                         )
                     })?,
                 };
-                let encoded = validator.push(&record).map_err(|error| {
+                let prepared = validator.prepare(&record).map_err(|error| {
                     row_failure(
                         row_location(&table, row_number, row.values()),
                         "record validation/encoding",
                         error,
                     )
                 })?;
-                codec::write_encoded(&encoded, output).map_err(|error| {
+                prepared.write_to(output).map_err(|error| {
                     io_failure(
                         format!(
                             "cannot write {}",

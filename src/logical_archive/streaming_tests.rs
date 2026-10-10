@@ -219,3 +219,143 @@ fn bounded_blob_validation_agrees_with_the_full_standard_decoder() {
         check(invalid.to_owned());
     }
 }
+
+#[test]
+fn prepared_output_matches_existing_wire_bytes_across_all_buffer_boundaries() {
+    for body in [
+        Cell::Text("ordinary message".to_owned()),
+        Cell::Text("x".repeat(64 * 1024)),
+        Cell::Text("雪\0😀".repeat(64 * 1024)),
+        Cell::Text("x".repeat(MAX_RECORD_BYTES)),
+        Cell::Blob(STANDARD.encode(vec![0xa5; MAX_RECORD_BYTES])),
+    ] {
+        let record = row(7, body);
+        let mut buffered = Validator::new(header(CHUNKED_VERSION)).unwrap();
+        let mut streaming = Validator::new(header(CHUNKED_VERSION)).unwrap();
+        buffered.validate(&table()).unwrap();
+        streaming.validate(&table()).unwrap();
+        let encoded = buffered.push(&record).unwrap();
+        let mut expected = Vec::new();
+        write_encoded(&encoded, &mut expected).unwrap();
+        let prepared = streaming.prepare(&record).unwrap();
+        assert_eq!(prepared.bytes, encoded.len());
+        assert_eq!(prepared.encoded.is_some(), encoded.len() <= 64 * 1024);
+        let mut actual = Vec::new();
+        prepared.write_to(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(streaming.completion(), buffered.completion());
+        assert_eq!(
+            read_record(&mut Cursor::new(&actual), 3).unwrap(),
+            Some(record)
+        );
+        assert!(
+            actual
+                .split_inclusive(|byte| *byte == b'\n')
+                .all(|frame| frame.len() <= MAX_RECORD_BYTES)
+        );
+    }
+}
+
+#[test]
+fn prepared_v1_large_row_refusal_does_not_consume_its_identity() {
+    let mut validator = Validator::new(header(VERSION)).unwrap();
+    validator.validate(&table()).unwrap();
+    let oversized = row(7, Cell::Text("x".repeat(MAX_RECORD_BYTES)));
+    assert!(validator.prepare(&oversized).is_err());
+    assert_eq!(validator.completion().records, 0);
+    let record = row(7, Cell::Null);
+    let prepared = validator.prepare(&record).unwrap();
+    let mut output = Vec::new();
+    prepared.write_to(&mut output).unwrap();
+    assert_eq!(output, encode(&record).unwrap());
+}
+
+#[test]
+fn streaming_output_preserves_os_errors_and_does_not_retry_or_flush_on_drop() {
+    struct Failing {
+        calls: usize,
+        flushes: usize,
+    }
+    impl Write for Failing {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls >= 2 {
+                Err(io::Error::from_raw_os_error(28))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+    // Both direct serialization and the continuation serializer must retain
+    // the original OS error through serde_json's intermediate error wrapper.
+    for length in [65_536, MAX_RECORD_BYTES] {
+        let record = row(7, Cell::Text("x".repeat(length)));
+        let mut validator = Validator::new(header(CHUNKED_VERSION)).unwrap();
+        validator.validate(&table()).unwrap();
+        let prepared = validator.prepare(&record).unwrap();
+        let mut output = Failing {
+            calls: 0,
+            flushes: 0,
+        };
+        let error = prepared.write_to(&mut output).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(28));
+        assert_eq!(output.calls, 2);
+        assert_eq!(output.flushes, 0);
+    }
+}
+
+#[test]
+fn streaming_serialization_retries_interruptions_and_finishes_partial_writes() {
+    struct Partial {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+    impl Write for Partial {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if matches!(self.calls, 3 | 5) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let count = bytes.len().min(13);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let record = row(7, Cell::Text("雪\0".repeat(20_000)));
+    let expected = encode(&record).unwrap();
+    let mut output = Partial {
+        bytes: Vec::new(),
+        calls: 0,
+    };
+    serialize_record(&record, expected.len(), &mut output).unwrap();
+    assert_eq!(output.bytes, expected);
+    assert!(output.calls > 5);
+}
+
+#[test]
+fn streaming_serialization_preserves_write_zero_and_checks_its_exact_size() {
+    struct Zero;
+    impl Write for Zero {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let record = row(7, Cell::Text("message".to_owned()));
+    let size = encode(&record).unwrap().len();
+    let error = serialize_record(&record, size, &mut Zero).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    for wrong_size in [size - 1, size + 1] {
+        let error = serialize_record(&record, wrong_size, &mut io::sink()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
