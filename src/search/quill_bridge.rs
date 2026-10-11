@@ -3165,6 +3165,69 @@ mod tests {
         assert_eq!(index.doc_count().expect("doc count"), sessions * 2 + 1);
     }
 
+    /// GH #518 (frankensearch#41): a two-word query's dictionary work grows
+    /// with the segment count, not its square. Quill 0.3.4 (cass 0.10.0)
+    /// re-charged one dictionary unit per segment for every cached term
+    /// statistic, so each segment of each of the query's eight term streams
+    /// (two words x title, content and both prefix fields) paid for every
+    /// segment: about 8 x 120 x 120 = 115,200 units here, and the whole
+    /// 10,000,000 in the report. The budget below sits far under that and far
+    /// over a linear charge.
+    #[test]
+    fn gh518_two_word_query_fuel_is_linear_in_segment_count() {
+        const SEGMENTS: usize = 120;
+        const BUDGET: u64 = 40_000;
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let config = QuillConfig {
+            deterministic_ingest: true,
+            ..cass_quill_config()
+        };
+        let mut index =
+            QuillCassIndex::open_or_create_with_config(directory.path(), &config).expect("open");
+        for session in 0..SEGMENTS {
+            index
+                .add_cass_documents(&[sample(&format!("gh518-{session}"), 0, "git fixture setup")])
+                .expect("index document");
+            index.commit().expect("commit");
+        }
+        assert_eq!(published_segment_count(&index), SEGMENTS);
+
+        let open_with_budget = |query_fuel_budget: u64| {
+            let path = directory.path().to_path_buf();
+            drive(|cx| async move {
+                QuillSearchIndex::open_with_schema(
+                    &cx,
+                    path,
+                    CASS_SEMANTIC_SCHEMA,
+                    QuillConfig {
+                        query_fuel_budget,
+                        ..cass_quill_config()
+                    },
+                )
+                .await
+            })
+            .expect("open reader")
+        };
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        let query = parser
+            .parse(
+                "git fixture",
+                &frankensearch::quill::query::CassQueryFilters::default(),
+            )
+            .query;
+
+        let page = search_paginated(&open_with_budget(BUDGET), &query, 4, 0, false)
+            .expect("a two-word query over 120 segments fits a linear budget");
+        assert_eq!(page.hits.len(), 4);
+
+        // Control: this reader meters the query, so the pass above is the
+        // budget holding rather than metering being off.
+        let error = search_paginated(&open_with_budget(10), &query, 4, 0, false)
+            .expect_err("ten units cannot cover 120 segments");
+        assert!(is_query_fuel_exhausted(&error), "{error:#}");
+    }
+
     /// Fuel exhaustion is recognised by the engine's own error text, anywhere
     /// in the cause chain, and only that text (GH #441 degrade path).
     #[test]

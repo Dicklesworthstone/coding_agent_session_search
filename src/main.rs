@@ -172,8 +172,17 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
         });
         eprintln!("{payload}");
     } else {
-        // Human-readable output stays on stderr per Unix convention.
+        // Human-readable output stays on stderr per Unix convention. The
+        // remedy goes on its own line: a person needs it as much as a robot
+        // envelope does, and without it a missing index or an exhausted query
+        // budget (GH #518) never named the command that fixes it.
         eprintln!("{}", err.message);
+        if let Some(hint) = err.hint.as_deref().map(str::trim)
+            && !hint.is_empty()
+            && !err.message.contains(hint)
+        {
+            eprintln!("Hint: {hint}");
+        }
     }
     std::process::exit(err.code);
 }

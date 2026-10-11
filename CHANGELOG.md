@@ -80,6 +80,22 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **A two-word search no longer runs out of query fuel on a fragmented
+  index (#518).** In cass 0.10.0, Quill 0.3.4 charged the dictionary
+  lookups behind each term statistic again for every segment it searched,
+  so a query's cost grew with the square of the segment count. On an index
+  with thousands of segments, `cass search "git fixture"` spent its whole
+  10,000,000-unit budget on dictionary blocks and failed. Quill 0.4.0 (see
+  Changed) computes each statistic once per search. A test now runs a
+  two-word query over 120 one-document segments under a 40,000-unit budget;
+  it fails on v0.10.0.
+- **Errors print their remedy in human mode too.** The hint (for example
+  "Run 'cass index --full' once…" for a missing index, or the fuel-budget
+  remedies) reached only `--robot`/`--json` error envelopes. A human-mode
+  error now prints it on a `Hint:` line after the message. That includes
+  a mistyped command: `cass export --format json` printed only "Could not
+  parse arguments", and now also says which argument is missing and shows
+  examples.
 - **On Windows, `cass index --watch-once` records plain `C:\...` source
   paths.** It canonicalized each requested path with
   `std::fs::canonicalize`, which on Windows returns the verbatim spelling
