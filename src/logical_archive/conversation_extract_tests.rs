@@ -45,7 +45,7 @@ fn fixture(version: u32, large: bool, empty: bool) -> (Vec<u8>, String, Vec<Reco
         10, 7, 2,
         if large { "雪\0".repeat(codec::MAX_RECORD_BYTES / 9 + 1) }
         else { "PRIVATE-TARGET message\0 café\n".into() },
-        vec![0_u8, 255, 128, 1].repeat(17_000),
+        [0_u8, 255, 128, 1].repeat(17_000),
     );
     let last = message(18, 7, 8, "PRIVATE-TARGET last message".into(), vec![]);
     let mut records = vec![
