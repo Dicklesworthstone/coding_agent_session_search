@@ -96,6 +96,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   a mistyped command: `cass export --format json` printed only "Could not
   parse arguments", and now also says which argument is missing and shows
   examples.
+- **On Windows, `cass index` no longer fails with "Access is denied" while
+  replacing a semantic index.** A semantic rebuild or reconciliation over an
+  existing vector index kept its own handles to that file open while it
+  renamed the new generation over it, and Windows refuses such a rename:
+  `cass index --full` exited 9 with "install complete semantic rebuild |
+  Access is denied". The handles now close first. On Windows, another
+  process that has the index open (a search, the TUI) can still block the
+  replacement.
 - **On Windows, `cass index --watch-once` records plain `C:\...` source
   paths.** It canonicalized each requested path with
   `std::fs::canonicalize`, which on Windows returns the verbatim spelling

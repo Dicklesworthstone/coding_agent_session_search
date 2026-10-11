@@ -226,6 +226,11 @@ fn run_with_limit(
         return Ok(0);
     }
     drop(source);
+    // The observations hold the main file and WAL open. Compaction below may
+    // rename over the main file, which Windows refuses while any handle to it
+    // is open (if17v).
+    drop(before);
+    drop(wal_before);
 
     // Keep one authoritative persistence implementation. Its native writer
     // validates the contract again and writes one atomic WAL batch, then runs

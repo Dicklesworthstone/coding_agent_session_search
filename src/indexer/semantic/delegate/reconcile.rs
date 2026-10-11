@@ -214,6 +214,13 @@ pub(super) fn run(
             && ObservedSemanticFile::capture(&wal_path)? == wal_before,
         "semantic source changed during canonical reconciliation; retry under the maintenance lock"
     );
+    // Close the source reader and both observations before the rename: each
+    // holds the destination or its WAL open, and Windows refuses to rename
+    // over a file while any handle to it is open ("Access is denied", if17v).
+    let retained_wal_rows = source.as_ref().map_or(0, VectorIndex::wal_record_count);
+    drop(source);
+    drop(previous);
+    drop(wal_before);
     check_cancelled()?;
     let published = VectorIndex::install_replacement(&destination, &candidate_path)
         .context("install complete canonical semantic generation")?;
@@ -221,7 +228,7 @@ pub(super) fn run(
         tier = tier.as_str(),
         published_docs = published.record_count(),
         replaced_docs = replacements.len(),
-        retained_wal_rows = source.as_ref().map_or(0, VectorIndex::wal_record_count),
+        retained_wal_rows,
         "published canonical semantic reconciliation"
     );
     Ok(published)

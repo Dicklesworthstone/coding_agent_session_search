@@ -94,6 +94,11 @@ where
         RebuildDestination::capture(&destination)? == previous,
         "semantic destination changed during full rebuild; retry under the maintenance lock"
     );
+    // The observation holds the destination open, which only the comparison
+    // above needs. Windows refuses to rename over a file while any handle to
+    // it is open, so holding it made every rebuild over an existing
+    // generation fail with "Access is denied" (if17v).
+    drop(previous);
     check_cancelled()?;
     VectorIndex::install_replacement(&destination, &candidate_path)
         .context("install complete semantic rebuild")
