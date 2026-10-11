@@ -130,6 +130,21 @@ fn setup_should_index_host(
         || RemoteIndexer::needs_indexing(host)
 }
 
+/// How an unfinished setup obtained its candidate hosts.
+///
+/// Automatic discovery must be refreshed before probing; only an explicit
+/// user-supplied host list can be replayed without provider metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupDiscoveryMode {
+    /// Discover aliases from the current SSH configuration only.
+    Ssh,
+    /// Discover SSH aliases and eligible peers from current Tailscale status.
+    Tailscale,
+    /// Use the explicit host list supplied with --hosts.
+    Explicit,
+}
+
 /// Persistent state for resumable setup.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SetupState {
@@ -139,6 +154,10 @@ pub struct SetupState {
     pub discovered_hosts: usize,
     /// Names of discovered hosts.
     pub discovered_host_names: Vec<String>,
+    /// Discovery provenance. Older state files omit this and must not have
+    /// their unverified candidate addresses replayed into automatic probes.
+    #[serde(default)]
+    pub discovery_mode: Option<SetupDiscoveryMode>,
     /// Whether probing phase is complete.
     pub probing_complete: bool,
     /// Probe results for each host.
@@ -517,12 +536,20 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // =========================================================================
     // Phase 1: Discovery
     // =========================================================================
-    // An unfinished probe phase can resume discovery saved by an older version
-    // that included provider exit nodes. Saved names have no peer metadata, so
-    // refresh automatic Tailscale discovery rather than replaying that list.
-    // Explicit --hosts and already-completed probing keep their resume behavior.
+    // GH505: --resume must not replay automatic candidates just because the
+    // user omitted --tailscale this time. Remember the provider choice, not
+    // the eligibility of its old addresses. Current explicit hosts take
+    // precedence while probing is unfinished; completed phases stay intact.
+    let discovery_mode = if opts.hosts.is_some() {
+        SetupDiscoveryMode::Explicit
+    } else if opts.tailscale {
+        SetupDiscoveryMode::Tailscale
+    } else {
+        state.discovery_mode.unwrap_or(SetupDiscoveryMode::Ssh)
+    };
     let discovered_hosts = if !state.discovery_complete
-        || (opts.tailscale && opts.hosts.is_none() && !state.probing_complete)
+        || (!state.probing_complete
+            && (discovery_mode != SetupDiscoveryMode::Explicit || opts.hosts.is_some()))
     {
         check_interrupted()?;
 
@@ -543,7 +570,16 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 })
                 .collect()
         } else {
-            let (hosts, warning) = discover_fleet_hosts(opts.tailscale);
+            if state.discovery_complete && state.discovery_mode.is_none() && !opts.tailscale {
+                // Legacy state cannot distinguish automatic peers from an
+                // explicit host list. Do not guess or enable a new provider.
+                eprintln!(
+                    "Saved setup discovery has no provider metadata; rediscovering SSH aliases. \
+                     Repeat --tailscale or --hosts to include other intended hosts."
+                );
+            }
+            let (hosts, warning) =
+                discover_fleet_hosts(discovery_mode == SetupDiscoveryMode::Tailscale);
             if let Some(warning) = warning {
                 eprintln!("{warning}");
             }
@@ -553,6 +589,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         state.discovered_hosts = hosts.len();
         state.discovered_host_names = hosts.iter().map(|h| h.name.clone()).collect();
         state.discovery_complete = true;
+        state.discovery_mode = Some(discovery_mode);
         state.save()?;
 
         if !opts.json {
@@ -568,7 +605,8 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
 
         hosts
     } else {
-        // Reconstruct from saved state
+        // Only explicit candidates or already-completed probing may use
+        // saved names. Automatic unfinished discovery always refreshes above.
         state
             .discovered_host_names
             .iter()
@@ -1297,6 +1335,7 @@ mod tests {
         assert!(!state.discovery_complete);
         assert_eq!(state.discovered_hosts, 0);
         assert!(state.discovered_host_names.is_empty());
+        assert!(state.discovery_mode.is_none());
         assert!(!state.probing_complete);
         assert!(state.probed_hosts.is_empty());
         assert!(!state.selection_complete);
@@ -1393,6 +1432,38 @@ mod tests {
         );
         assert_eq!(deserialized.selected_host_names, state.selected_host_names);
         assert_eq!(deserialized.started_at, state.started_at);
+    }
+
+    #[test]
+    fn test_setup_tailscale_discovery_mode_serde_roundtrip() {
+        for mode in [
+            SetupDiscoveryMode::Ssh,
+            SetupDiscoveryMode::Tailscale,
+            SetupDiscoveryMode::Explicit,
+        ] {
+            let state = SetupState {
+                discovery_complete: true,
+                discovery_mode: Some(mode),
+                ..Default::default()
+            };
+            let json = serde_json::to_vec(&state).unwrap();
+            let loaded: SetupState = serde_json::from_slice(&json).unwrap();
+            assert_eq!(loaded.discovery_mode, Some(mode));
+        }
+    }
+
+    #[test]
+    fn test_setup_tailscale_legacy_discovery_mode_is_unknown() {
+        let mut json = serde_json::to_value(SetupState::default()).unwrap();
+        json.as_object_mut().unwrap().remove("discovery_mode");
+        let loaded: SetupState = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(loaded.discovery_mode, None);
+        json["discovery_mode"] = serde_json::Value::Null;
+        let loaded: SetupState = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(loaded.discovery_mode, None);
+        // An unrecognized new mode must fail closed, never become Explicit.
+        json["discovery_mode"] = serde_json::json!("unrecognized_provider");
+        assert!(serde_json::from_value::<SetupState>(json).is_err());
     }
 
     #[test]
