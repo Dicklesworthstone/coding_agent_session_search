@@ -459,3 +459,70 @@ fn gh505_real_saved_provider_mode_survives_resume_without_flags() {
         "status --json\nstatus --json\n"
     );
 }
+
+const PROVIDER_ALIASES: &str = "Host provider-by-tag\n HostName 100.90.0.1\n\
+    Host provider-by-dns\n HostName se-sto-wg-001.mullvad.ts.net\n\
+    Host 100.90.0.2\n\
+    Host workstation.example.ts.net\n HostName 100.90.0.1\n";
+
+#[test]
+fn gh505_configured_provider_aliases_never_reach_setup_transport() {
+    // A provider-looking alias label can still be a legitimate SSH machine.
+    let aliases = format!(
+        "{ALIAS}{PROVIDER_ALIASES}Host se-sto-wg-001.mullvad.ts.net\n HostName 100.64.0.8\n"
+    );
+    let fixture = FleetFixture::new(mixed_peers(), &aliases);
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(discovery["hosts"].as_array().unwrap().len(), 3, "{discovery}");
+    assert!(fixture.attempted_transports().is_empty());
+
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from([
+            "100.64.0.1".into(),
+            "100.64.0.2".into(),
+            "100.64.0.8".into(),
+        ])
+    );
+}
+
+#[test]
+fn gh505_only_provider_aliases_do_not_start_transport_even_when_offline() {
+    let mut peers = mullvad_peers();
+    peers["tag-only"]["Online"] = json!(false);
+    peers["dns-only"]["ShareeNode"] = json!(true);
+    let fixture = FleetFixture::new(peers, PROVIDER_ALIASES);
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(discovery["status"], "no_hosts", "{discovery}");
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    assert!(fixture.attempted_transports().is_empty());
+}
+
+#[test]
+fn gh505_bare_resume_filters_provider_aliases_before_peer_deduplication() {
+    let fixture = FleetFixture::new(mixed_peers(), PROVIDER_ALIASES);
+    fixture.save_discovery(
+        Some(SetupDiscoveryMode::Tailscale),
+        &["provider-by-tag", "100.90.0.2"],
+    );
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    // The alias named workstation.example.ts.net points at a provider. It must
+    // be removed before considering the real workstation's DNS name, even
+    // though that real peer sorts ahead of the provider in the status map.
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.status_calls).unwrap(),
+        "status --json\n"
+    );
+}

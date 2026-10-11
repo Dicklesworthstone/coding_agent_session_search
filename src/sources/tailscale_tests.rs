@@ -126,3 +126,89 @@ fn gh505_tailscale_large_mullvad_inventory_only_adds_real_machines() {
         ]
     );
 }
+
+#[test]
+fn gh505_tailscale_removes_configured_provider_destinations_before_liveness_checks() {
+    for flags in [
+        json!({"Online": true}),
+        json!({"Online": false}),
+        json!({"Online": true, "ShareeNode": true}),
+    ] {
+        let mut tagged = flags.clone();
+        tagged["Tags"] = json!(["tag:mullvad-exit-node"]);
+        tagged["TailscaleIPs"] = json!(["fd7a:115c:a1e0::1", "100.90.0.1"]);
+        let mut dns_only = flags;
+        dns_only["DNSName"] = json!("SE-STO-WG-001.MULLVAD.TS.NET.");
+        // DNS evidence must work even when no usable IPv4 address is reported.
+        dns_only["TailscaleIPs"] = json!(null);
+        let bytes = serde_json::to_vec(&json!({
+            "BackendState": "Running",
+            "Peer": {"tagged": tagged, "dns-only": dns_only}
+        }))
+        .unwrap();
+        let mut hosts = parse_ssh_config(
+            "Host by-ip\n HostName 100.90.0.1\n\
+             Host by-ipv6\n HostName fd7a:115c:a1e0:0:0:0:0:1\n\
+             Host by-dns\n HostName se-sto-wg-001.mullvad.ts.net\n\
+             Host 100.90.0.1 SE-STO-WG-001.MULLVAD.TS.NET.\n\
+             Host workstation\n HostName 100.64.0.1\n User developer\n Port 2222\n IdentityFile ~/.ssh/work\n",
+        );
+        for _ in 0..2 {
+            merge_tailscale_hosts(&mut hosts, &bytes).unwrap();
+            assert_eq!(hosts.len(), 1, "provider aliases survived: {hosts:?}");
+            assert_eq!(hosts[0].connection_string(), "developer@workstation");
+            assert_eq!(hosts[0].hostname.as_deref(), Some("100.64.0.1"));
+            assert_eq!(hosts[0].port, Some(2222));
+            assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/work"));
+        }
+    }
+}
+
+#[test]
+fn gh505_tailscale_provider_names_do_not_override_alias_destinations() {
+    let mut hosts = parse_ssh_config(
+        "Host se-sto-wg-001.mullvad.ts.net\n HostName 192.0.2.1\n User developer\n\
+         Host 100.90.0.1\n HostName 192.0.2.2\n Port 2222\n\
+         Host workstation\n HostName work.notmullvad.ts.net\n IdentityFile ~/.ssh/work\n\
+         Host lookalike\n HostName se-sto-wg-001.mullvad.ts.net.example.ts.net\n",
+    );
+    let bytes = serde_json::to_vec(&json!({
+        "BackendState": "Running",
+        "Peer": {
+            "provider": {
+                "Online": true,
+                "Tags": ["tag:mullvad-exit-node"],
+                "DNSName": "se-sto-wg-001.mullvad.ts.net.",
+                "TailscaleIPs": ["100.90.0.1"],
+                "HostName": "workstation"
+            }
+        }
+    }))
+    .unwrap();
+    merge_tailscale_hosts(&mut hosts, &bytes).unwrap();
+    assert_eq!(hosts.len(), 4);
+    assert_eq!(hosts[0].hostname.as_deref(), Some("192.0.2.1"));
+    assert_eq!(hosts[0].user.as_deref(), Some("developer"));
+    assert_eq!(hosts[1].hostname.as_deref(), Some("192.0.2.2"));
+    assert_eq!(hosts[1].port, Some(2222));
+    assert_eq!(hosts[2].name, "workstation");
+    assert_eq!(hosts[2].identity_file.as_deref(), Some("~/.ssh/work"));
+    assert_eq!(hosts[3].name, "lookalike");
+}
+
+#[test]
+fn gh505_tailscale_invalid_status_never_partially_removes_aliases() {
+    let mut hosts = parse_ssh_config(
+        "Host provider\n HostName 100.90.0.1\n\
+         Host workstation\n HostName 100.64.0.1\n",
+    );
+    for bytes in [
+        br#"{"BackendState":"NeedsLogin","Peer":{"a":{"Tags":["tag:mullvad-exit-node"],"TailscaleIPs":["100.90.0.1"]}}}"#.as_slice(),
+        br#"{"BackendState":"Running","Peer":{"a":{"Tags":["tag:mullvad-exit-node"],"TailscaleIPs":["100.90.0.1"]},"z":{"TailscaleIPs":["invalid address"]}}}"#,
+    ] {
+        assert!(merge_tailscale_hosts(&mut hosts, bytes).is_err());
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].name, "provider");
+        assert_eq!(hosts[1].name, "workstation");
+    }
+}
