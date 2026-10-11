@@ -1,7 +1,9 @@
 //! A caller-owned, persistent lexical search session over standard I/O.
 //!
 //! The reader is loaded lazily and retained until explicit reload, shutdown, or
-//! EOF. Search is index-only. Canonical follow-up requires an explicit --db
+//! EOF. Search is index-only unless --lexical-fallback is explicitly enabled.
+//! That recovery lane admits only small archives after a Quill fuel refusal.
+//! Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
 //! Separate opt-in semantic retrieval retains local models and vector assets.
 //! No lane starts writers, automatic refresh, downloads, or detached children.
@@ -15,6 +17,8 @@ mod admission;
 mod canonical;
 #[path = "search_service/deadline.rs"]
 mod deadline;
+#[path = "search_service/lexical_fallback.rs"]
+mod lexical_fallback;
 #[path = "search_service/mcp.rs"]
 mod mcp;
 #[path = "search_service/memory.rs"]
@@ -80,9 +84,14 @@ enum ServiceCommand {
         #[arg(long, requires = "stdio")]
         mcp: bool,
         /// Opt in to canonical view requests against this fixed read-only archive.
-        /// Search, status and startup still never open the database.
+        /// Search stays index-only unless --lexical-fallback is also supplied.
         #[arg(long, value_name = "PATH")]
         db: Option<PathBuf>,
+        /// Recover Quill fuel refusals using this explicit archive's SQLite lane.
+        /// Admits at most 64 MiB of database plus WAL; shares the request deadline.
+        /// Results identify the changed backend and are not Quill-score equivalent.
+        #[arg(long, requires = "db")]
+        lexical_fallback: bool,
         /// Opt in to candidate-only refinement with this installed local reranker.
         /// Never downloads files; ordinary search, startup and status stay model-free.
         #[arg(long, value_name = "PATH")]
@@ -148,6 +157,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         stdio: _,
         mcp,
         db,
+        lexical_fallback,
         reranker_model,
         semantic_embedder,
         request_timeout_ms,
@@ -177,6 +187,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         std::env::current_dir().map_err(cli_io_error)?.join(index)
     };
     let mut session = Session::new(index);
+    session.lexical_recovery.enabled = lexical_fallback;
     session.request_timeout = Duration::from_millis(request_timeout_ms);
     session.archive = db
         .map(|path| {
@@ -268,6 +279,7 @@ struct Session {
     memory_observation: Option<std::sync::Arc<memory::Observation>>,
     refiner: refinement::Refiner,
     semantic: semantic::Semantic,
+    lexical_recovery: lexical_fallback::Recovery,
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
@@ -288,6 +300,7 @@ impl Session {
             memory_observation: None,
             refiner: refinement::Refiner::default(),
             semantic: semantic::Semantic::default(),
+            lexical_recovery: lexical_fallback::Recovery::default(),
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
@@ -364,12 +377,15 @@ impl Session {
             "snapshot_policy": "pinned_until_reload",
             "freshness": "not_checked",
             "canonical_view_enabled": self.archive.is_some(),
-            "canonical_database_accessed": self.canonical_read_attempts != 0 || self.semantic.archive_access_attempted(),
+            "canonical_database_accessed": self.canonical_read_attempts != 0
+                || self.semantic.archive_access_attempted()
+                || self.lexical_recovery.archive_access_attempted(),
             "canonical_read_attempts": self.canonical_read_attempts,
             "canonical_reads_completed": self.canonical_reads_completed,
             "models_loaded": self.refiner.loaded() || self.semantic.model_loaded(),
             "refinement": self.refiner.status(),
             "semantic": self.semantic.status(),
+            "lexical_fallback": self.lexical_recovery.status(),
             "maintenance_performed": false,
             "memory_supervision": memory.unwrap_or_else(|| json!({"enabled": false})),
             "reader_admission": {
@@ -430,13 +446,34 @@ impl Session {
         // No payload hydration and no query-prefix response cache: every call
         // uses the production lexical parser, scorer and result reducer against
         // the SAME admitted reader, without opening a canonical archive.
-        let mut hits = client.search(
+        let primary = client.search(
             query,
-            filters,
+            filters.clone(),
             limit + 1,
             offset,
             FieldMask::new(false, true, true, false),
-        )?;
+        );
+        // A valid empty primary result remains authoritative. Only a work-
+        // budget refusal enters the explicit fallback, including a refusal in
+        // SearchClient's internal overfetch or federated search. Never restart
+        // the request deadline or increase the engine's fuel allowance here.
+        let (mut hits, fallback) = match primary {
+            Ok(hits) => (hits, None),
+            Err(error) => {
+                let page = self.lexical_recovery.recover(
+                    self.archive.as_deref(),
+                    error,
+                    lexical_fallback::Search {
+                        query,
+                        filters,
+                        limit: limit + 1,
+                        offset,
+                    },
+                )?;
+                (page.hits, Some(page.metadata))
+            }
+        };
+        let degraded = fallback.is_some();
         ensure!(
             hits.len() <= limit + 1,
             "search backend exceeded the requested page"
@@ -463,7 +500,11 @@ impl Session {
             "next_offset": next_offset,
             "page_window_exhausted": has_next && next_offset.is_none(),
             "preview_only": true,
-            "reader_reused": reused,
+            "backend": if degraded { "frankensqlite" } else { "quill" },
+            "degraded": degraded,
+            "fallback": fallback,
+            "reader_reused": reused && !degraded,
+            "result_reader_epoch": if degraded { None } else { Some(self.successful_opens) },
             "setup_ms": setup_ms,
             "search_ms": started.elapsed().as_millis(),
             "snapshot": self.status(),
