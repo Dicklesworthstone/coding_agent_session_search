@@ -6,6 +6,16 @@ Issue: [#518](https://github.com/Dicklesworthstone/coding_agent_session_search/i
 The driver tests described below do not build fragmented Quill indexes, execute
 CASS, or establish a latency improvement. Keep #518 open until those checks pass.
 
+**Update 2026-10-11 (cass bead 7hvlg):** the reporter's engine version is
+settled. cass 0.10.0 ships frankensearch-quill 0.3.4, which still charged a
+cached term statistic again for every segment it searched (Frankensearch #41),
+so the charge grew with the square of the segment count. The test
+`search::quill_bridge::tests::gh518_two_word_query_fuel_is_linear_in_segment_count`
+builds 120 one-document segments and runs `git fixture` under a 40,000-unit
+budget. On v0.10.0 it fails with `fuel exhausted after 40000/40000 units
+(segments=42, dictionary_blocks=39794, posting_blocks=164)`. On main, which
+pins Quill 0.4.0, it passes. The fix reaches users with the next cass release.
+
 ## What the inspected code establishes
 
 The initial CASS revision examined was
