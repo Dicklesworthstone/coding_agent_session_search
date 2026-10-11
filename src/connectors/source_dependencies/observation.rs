@@ -5,6 +5,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+mod windows;
+
 /// Evidence captured before the connector starts its own discovery and parsing.
 /// Optional sidecars may be selected before `should_scan_source` is called, so
 /// a parent observed only in that hook cannot cover the whole reconstruction.
@@ -44,6 +47,11 @@ pub(crate) fn file_observation(path: &Path) -> Option<Value> {
     // cannot carry reusable evidence; do not lose unrelated observations or
     // collapse distinct native names through a lossy replacement string.
     let encoded_path = path.to_str()?;
+    #[cfg(windows)]
+    {
+        windows::file_observation(path, encoded_path)
+    }
+    #[cfg(not(windows))]
     match std::fs::metadata(path) {
         Ok(metadata) => {
             let observation = serde_json::json!({
