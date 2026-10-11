@@ -93,7 +93,12 @@ pub mod workflow_macros;
 pub fn shutdown_thread_local_bridge_runtimes() -> bool {
     let fsqlite_shutdown = franken_sync::shutdown_driver();
     let quill_shutdown = search::quill_bridge::shutdown_driver();
-    fsqlite_shutdown && quill_shutdown
+    // SQLite connectors cache a separate runtime inside FAD. Drop it before
+    // Windows process teardown terminates its worker threads (GH #519).
+    // Evaluate every shutdown before combining results: a timeout in one
+    // bridge must not leave another runtime cached until process exit.
+    let fad_shutdown = franken_agent_detection::connectors::sqlite_sync::shutdown_driver();
+    fsqlite_shutdown && quill_shutdown && fad_shutdown
 }
 
 use crate::franken_sync::compat::{
@@ -110615,13 +110620,17 @@ fn load_opencode_sqlite_session_for_export(
     );
     let convs = connector.scan(&scan_ctx)?;
 
-    // Find the conversation matching the session id
+    // The connector also discovers default stores and skips unreadable ones.
+    // An export must not substitute a same-ID session from another database.
     let conv = convs
         .into_iter()
-        .find(|c| c.external_id.as_deref() == Some(session_id.as_ref()))
+        .find(|conversation| {
+            conversation.external_id.as_deref() == Some(session_id.as_ref())
+                && conversation.source_path.parent() == Some(db_path)
+        })
         .with_context(|| {
             format!(
-                "session '{}' not found in OpenCode database at {}",
+                "session '{}' not found or unreadable in OpenCode database at {}",
                 session_id,
                 db_path.display()
             )

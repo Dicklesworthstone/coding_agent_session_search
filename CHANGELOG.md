@@ -80,6 +80,22 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **OpenCode SQLite exports shut down the connector runtime before Windows
+  process teardown (#519).** The connector keeps a separate thread-local
+  Asupersync runtime. Dropping it after Windows terminated its worker
+  threads could panic with `threads should not terminate unexpectedly`
+  and exit `0xC0000409`, despite a complete export. FAD `=0.3.10` exposes
+  early shutdown; CASS now calls it alongside both of its own bridges on
+  success and error paths. Cleanup continues through all three bridges even
+  if one times out. Export matching also requires the requested database,
+  so an unreadable store cannot be replaced by a same-ID session from another default
+  OpenCode store. The preceding WAL salt warning remains a separate
+  diagnostic; FAD now logs the full chain for actual database-read errors.
+  The maintainer reports native Windows reproduction and verification of
+  the shutdown API in issue #519. The additional lifecycle and concurrency
+  regressions remain unexecuted here because dependency compilation exceeded
+  the available memory; this exact integration still needs runtime and native
+  Windows qualification.
 - **A two-word search no longer runs out of query fuel on a fragmented
   index (#518).** In cass 0.10.0, Quill 0.3.4 charged the dictionary
   lookups behind each term statistic again for every segment it searched,

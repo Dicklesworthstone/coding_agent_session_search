@@ -181,10 +181,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // pi-durable) and pi_agent_rust SQLite sessions (pi-sqlite). 0.3.8
         // resolves `..`, relative and symlink-alias CASS_EXCLUDE_PATHS
         // entries for the Claude, Pi and Codex readers (cass 0f1k0).
+        // 0.3.10 exposes SQLite connector runtime shutdown before Windows
+        // process teardown (cass#519) and preserves the full read-error chain.
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.8",
+        expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[

@@ -1626,6 +1626,568 @@ fn export_help_shows_formats() {
         .stdout(contains("markdown").or(contains("Markdown")));
 }
 
+// GH #519: a complete file is not sufficient proof of a successful export.
+// Exercise the real process through normal return, including its thread-local
+// database/runtime teardown, and check both the transcript and the exit status.
+fn gh519_opencode_database(db_path: &Path, session_id: &str) -> PathBuf {
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref()).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE session (
+             id TEXT PRIMARY KEY, project_id TEXT, slug TEXT, directory TEXT,
+             title TEXT, version TEXT, time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE message (
+             id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+             time_updated INTEGER, data TEXT
+         );
+         CREATE TABLE part (
+             id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+             time_created INTEGER, time_updated INTEGER, data TEXT
+         );
+         CREATE TABLE export_wal_activity (id INTEGER PRIMARY KEY, generation INTEGER);
+         INSERT INTO export_wal_activity VALUES (1, 0);
+         BEGIN IMMEDIATE;",
+    )
+    .unwrap();
+    conn.execute_compat(
+        "INSERT INTO session VALUES (?1, 'project', 'export', '/work/export',
+         'GH519 complete conversation', '1.14.46', 1700000000000, 1700000000008)",
+        fparams![session_id],
+    )
+    .unwrap();
+    for index in 0..9_i64 {
+        let message_id = format!("msg_{index}");
+        let role = if index % 2 == 0 { "user" } else { "assistant" };
+        conn.execute_compat(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
+            fparams![
+                message_id.as_str(),
+                session_id,
+                1_700_000_000_000_i64 + index,
+                json!({"role": role}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            fparams![
+                format!("part_{index}"),
+                message_id,
+                session_id,
+                1_700_000_000_000_i64 + index,
+                json!({"type": "text", "text": format!("GH519 message {index}: complete 🪟")})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.close().unwrap();
+    db_path.join(session_id)
+}
+
+fn gh519_export_cmd(home: &Path, session: &Path) -> Command {
+    let mut cmd = base_cmd(home);
+    cmd.current_dir(home)
+        .env("USERPROFILE", home)
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("OPENCODE_SQLITE_DB", session.parent().unwrap())
+        .env("OPENCODE_STORAGE_ROOT", home.join("empty-opencode-storage"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_OUTPUT_FORMAT", "json")
+        .env("RUST_BACKTRACE", "full")
+        .arg("export")
+        .arg(session)
+        .args(["--format", "json", "--include-tools"])
+        .timeout(Duration::from_secs(60));
+    cmd
+}
+
+fn gh519_assert_messages(bytes: &[u8]) {
+    let payload: Value = serde_json::from_slice(bytes).expect("complete, valid exported JSON");
+    let messages = payload.as_array().expect("export is a message array");
+    assert_eq!(messages.len(), 9, "every expected message must survive");
+    for (index, message) in messages.iter().enumerate() {
+        assert_eq!(
+            message["content"],
+            format!("GH519 message {index}: complete 🪟")
+        );
+        assert_eq!(
+            message["role"],
+            if index % 2 == 0 { "user" } else { "assistant" }
+        );
+    }
+}
+
+fn gh519_assert_success(output: &std::process::Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a complete export must also exit successfully; status={}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+    assert!(
+        !stderr.contains("threads should not terminate unexpectedly"),
+        "{stderr}"
+    );
+}
+
+fn gh519_assert_error(output: &std::process::Output, expected_kind: &str) {
+    assert_eq!(output.status.code(), Some(9), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "no export success on failure: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+    let envelope = stderr
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .expect("typed error envelope must survive database/runtime shutdown");
+    assert_eq!(envelope["error"]["code"], 9, "{stderr}");
+    assert_eq!(envelope["error"]["kind"], expected_kind, "{stderr}");
+    assert!(envelope["error"]["retryable"].is_boolean(), "{stderr}");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Gh519WalActivity {
+    Commits,
+    Truncate,
+}
+
+/// The writer lives in this test process; every reader is a separate real cass
+/// process. The selected nine messages stay fixed while unrelated transactions
+/// repeatedly commit to the same WAL, optionally resetting it after each commit.
+fn gh519_exports_with_wal_writer(
+    db_path: &Path,
+    commands: Vec<Command>,
+    activity: Gh519WalActivity,
+) -> Vec<std::process::Output> {
+    use std::io::Read;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let commits = Arc::new(AtomicUsize::new(0));
+    let salt_changes = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let writer_stop = Arc::clone(&stop);
+    let writer_commits = Arc::clone(&commits);
+    let writer_salt_changes = Arc::clone(&salt_changes);
+    let db_path = db_path.to_path_buf();
+    let writer = std::thread::Builder::new()
+        .name("gh519-live-wal-writer".into())
+        .stack_size(128 * 1024 * 1024)
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref())?;
+                conn.execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     PRAGMA wal_autocheckpoint = 0;
+                     PRAGMA busy_timeout = 1000;",
+                )?;
+                let wal_path = db_path.with_file_name(format!(
+                    "{}-wal",
+                    db_path.file_name().unwrap().to_string_lossy()
+                ));
+                let mut ready_tx = Some(ready_tx);
+                let mut previous_salt = None;
+                while !writer_stop.load(Ordering::Acquire) {
+                    conn.execute(
+                        "UPDATE export_wal_activity SET generation = generation + 1 WHERE id = 1",
+                    )?;
+                    // Inspect actual WAL headers to distinguish ordinary live
+                    // commits from the separately tested reset contention.
+                    let mut header = [0_u8; 24];
+                    fs::File::open(&wal_path)?.read_exact(&mut header)?;
+                    let salt: [u8; 8] = header[16..24].try_into().unwrap();
+                    if previous_salt.is_some_and(|previous| previous != salt) {
+                        writer_salt_changes.fetch_add(1, Ordering::Release);
+                    }
+                    previous_salt = Some(salt);
+                    if matches!(activity, Gh519WalActivity::Truncate) {
+                        conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                    }
+                    writer_commits.fetch_add(1, Ordering::Release);
+                    if let Some(ready_tx) = ready_tx.take() {
+                        ready_tx.send(())?;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                conn.close()?;
+                Ok(())
+            })();
+            let drained = coding_agent_search::shutdown_thread_local_bridge_runtimes();
+            assert!(drained, "writer runtime must finish before thread exit");
+            result
+        })
+        .expect("spawn live WAL writer");
+
+    let ready = ready_rx.recv_timeout(Duration::from_secs(30));
+    let before = commits.load(Ordering::Acquire);
+    let salts_before = salt_changes.load(Ordering::Acquire);
+    // Save fallible subprocess results until after stopping and joining the
+    // writer, so a failed export cannot leave the test's writer running.
+    let outputs: Vec<_> = if ready.is_ok() {
+        commands.into_iter().map(|mut cmd| cmd.output()).collect()
+    } else {
+        Vec::new()
+    };
+    stop.store(true, Ordering::Release);
+    writer
+        .join()
+        .expect("WAL writer panicked")
+        .expect("WAL writer failed");
+    ready.expect("WAL writer became ready");
+    let concurrent_commits = commits.load(Ordering::Acquire) - before;
+    let concurrent_resets = salt_changes.load(Ordering::Acquire) - salts_before;
+    assert!(concurrent_commits > 0, "no concurrent writes occurred");
+    match activity {
+        Gh519WalActivity::Commits => assert_eq!(
+            concurrent_resets, 0,
+            "steady writer must not reset the WAL during exports"
+        ),
+        Gh519WalActivity::Truncate => assert!(
+            concurrent_resets > 0,
+            "no WAL generation changed while cass exports ran"
+        ),
+    }
+    eprintln!(
+        "GH519 WAL {activity:?}: {concurrent_commits} concurrent commits, \
+         {concurrent_resets} salt changes during {} exports",
+        outputs.len()
+    );
+    outputs
+        .into_iter()
+        .map(|output| output.expect("run cass export"))
+        .collect()
+}
+
+#[test]
+fn gh519_export_opencode_sqlite_stdout_exits_successfully() {
+    let tmp = TempDir::new().unwrap();
+    let session = gh519_opencode_database(&tmp.path().join("opencode.db"), "ses_gh519");
+    let output = gh519_export_cmd(tmp.path(), &session).output().unwrap();
+    gh519_assert_success(&output);
+    gh519_assert_messages(&output.stdout);
+}
+
+#[test]
+fn gh519_export_opencode_sqlite_live_wal_exits_successfully_repeatedly() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    let session = gh519_opencode_database(&db_path, "ses_gh519");
+    let paths: Vec<_> = (0..3)
+        .map(|run| tmp.path().join(format!("out-{run}.json")))
+        .collect();
+    let commands = paths
+        .iter()
+        .map(|path| {
+            let mut cmd = gh519_export_cmd(tmp.path(), &session);
+            cmd.args(["--source", "local"]).arg("-o").arg(path);
+            cmd
+        })
+        .collect();
+    let outputs = gh519_exports_with_wal_writer(&db_path, commands, Gh519WalActivity::Commits);
+    for (path, output) in paths.iter().zip(outputs) {
+        gh519_assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Exported to:"));
+        gh519_assert_messages(&fs::read(path).expect("published export"));
+    }
+}
+
+#[test]
+fn gh519_export_indexed_source_live_wal_exits_successfully_repeatedly() {
+    use coding_agent_search::sources::provenance::{Source, SourceKind};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    storage
+        .upsert_source(&Source {
+            id: "work-laptop".into(),
+            kind: SourceKind::Ssh,
+            host_label: Some("work-laptop".into()),
+            machine_id: None,
+            platform: None,
+            config_json: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .unwrap();
+    let agent_id = storage
+        .ensure_agent(&sample_agent("opencode", "OpenCode"))
+        .unwrap();
+    // Deliberately absent: --source must read the archive, not a local store.
+    let session = tmp.path().join("remote/opencode.db/ses_gh519");
+    let messages = (0..9)
+        .map(|index| {
+            sample_message(
+                index,
+                if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                1_700_000_000_000 + index,
+                &format!("GH519 message {index}: complete 🪟"),
+            )
+        })
+        .collect();
+    let mut conversation = sample_conversation(
+        "opencode",
+        tmp.path(),
+        &session,
+        "ses_gh519",
+        "GH519 complete conversation",
+        1_700_000_000_000,
+        messages,
+    );
+    conversation.source_id = "work-laptop".into();
+    conversation.origin_host = Some("work-laptop".into());
+    storage
+        .insert_conversation_tree(agent_id, None, &conversation)
+        .unwrap();
+    storage
+        .raw()
+        .execute_batch(
+            "CREATE TABLE export_wal_activity (id INTEGER PRIMARY KEY, generation INTEGER);
+         INSERT INTO export_wal_activity VALUES (1, 0);",
+        )
+        .unwrap();
+    drop(storage);
+
+    let paths: Vec<_> = (0..3)
+        .map(|run| tmp.path().join(format!("archive-{run}.json")))
+        .collect();
+    let commands = paths
+        .iter()
+        .map(|path| {
+            let mut cmd = gh519_export_cmd(tmp.path(), &session);
+            cmd.args(["--source", "work-laptop"])
+                .arg("--db")
+                .arg(&db_path)
+                .arg("-o")
+                .arg(path);
+            cmd
+        })
+        .collect();
+    let outputs = gh519_exports_with_wal_writer(&db_path, commands, Gh519WalActivity::Commits);
+    for (path, output) in paths.iter().zip(outputs) {
+        gh519_assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Exported to:"));
+        gh519_assert_messages(&fs::read(path).expect("published archive export"));
+    }
+}
+
+#[test]
+fn gh519_export_opencode_sqlite_wal_resets_complete_or_fail_cleanly() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    let session = gh519_opencode_database(&db_path, "ses_gh519");
+    let paths: Vec<_> = (0..6)
+        .map(|run| tmp.path().join(format!("reset-{run}.json")))
+        .collect();
+    let commands = paths
+        .iter()
+        .map(|path| {
+            let mut cmd = gh519_export_cmd(tmp.path(), &session);
+            cmd.args(["--source", "local"]).arg("-o").arg(path);
+            cmd
+        })
+        .collect();
+    let outputs = gh519_exports_with_wal_writer(&db_path, commands, Gh519WalActivity::Truncate);
+    let mut completed = 0;
+    let mut refused = 0;
+    // Upstream independently reproduced a read refusal when TRUNCATE leaves
+    // the WAL header briefly empty. That is separate from GH519's panic after
+    // writing a complete file. Check every attempt; never retry or discard a
+    // nonzero exit, and never accept published output paired with an error.
+    for (path, output) in paths.iter().zip(outputs) {
+        if output.status.code() == Some(0) {
+            gh519_assert_success(&output);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Exported to:"));
+            gh519_assert_messages(&fs::read(path).expect("complete reset-contention export"));
+            completed += 1;
+        } else {
+            gh519_assert_error(&output, "opencode-sqlite-parse");
+            assert!(
+                !path.exists(),
+                "a refused read must not publish an incomplete or misleading export"
+            );
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        completed + refused,
+        6,
+        "every subprocess outcome is checked"
+    );
+    eprintln!("GH519 WAL reset outcomes: {completed} complete, {refused} clean read refusals");
+
+    // The helper has stopped and joined the writer. Always demand complete
+    // success now, so permanent unreadability cannot satisfy the refusal arm.
+    let destination = tmp.path().join("after-resets.json");
+    let output = gh519_export_cmd(tmp.path(), &session)
+        .args(["--source", "local"])
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    gh519_assert_success(&output);
+    gh519_assert_messages(&fs::read(destination).expect("complete export after WAL writer stops"));
+}
+
+#[test]
+fn gh519_export_corrupt_opencode_database_fails_without_publishing() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    fs::write(&db_path, b"not a SQLite database").unwrap();
+    let session = db_path.join("ses_gh519");
+    let destination = tmp.path().join("out.json");
+    for previous in [None, Some(b"previous complete export".as_slice())] {
+        if let Some(previous) = previous {
+            fs::write(&destination, previous).unwrap();
+        }
+        let output = gh519_export_cmd(tmp.path(), &session)
+            .arg("-o")
+            .arg(&destination)
+            .output()
+            .unwrap();
+        gh519_assert_error(&output, "opencode-sqlite-parse");
+        if let Some(previous) = previous {
+            assert_eq!(fs::read(&destination).unwrap(), previous);
+        } else {
+            assert!(
+                !destination.exists(),
+                "failed read must not publish an export"
+            );
+        }
+    }
+}
+
+#[test]
+fn gh519_export_unreadable_committed_wal_fails_without_publishing() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("opencode.db");
+    let session = gh519_opencode_database(&db_path, "ses_gh519");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref()).unwrap();
+    conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+    let main_before = fs::read(&db_path).unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute_compat(
+        "INSERT INTO message VALUES ('msg_9', 'ses_gh519', 1700000000009,
+         1700000000009, ?1)",
+        fparams![json!({"role": "assistant"}).to_string()],
+    )
+    .unwrap();
+    conn.execute_compat(
+        "INSERT INTO part VALUES ('part_9', 'msg_9', 'ses_gh519', 1700000000009,
+         1700000000009, ?1)",
+        fparams![json!({"type": "text", "text": "GH519 committed WAL-only message"}).to_string()],
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.close_without_checkpoint().unwrap();
+    let wal_path = tmp.path().join("opencode.db-wal");
+    assert!(fs::metadata(&wal_path).unwrap().len() > 32);
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        main_before,
+        "the tenth committed message must require the WAL"
+    );
+
+    let complete = gh519_export_cmd(tmp.path(), &session).output().unwrap();
+    gh519_assert_success(&complete);
+    let messages: Vec<Value> = serde_json::from_slice(&complete.stdout).unwrap();
+    assert_eq!(messages.len(), 10);
+    assert_eq!(messages[9]["content"], "GH519 committed WAL-only message");
+    assert_eq!(fs::read(&db_path).unwrap(), main_before);
+
+    // A directory gives a portable WAL I/O failure, unlike an obsolete salt
+    // or invalid header the engine may legitimately treat as an empty WAL.
+    // Retain the original committed bytes for diagnosis instead of deleting.
+    let retained_wal = tmp.path().join("retained-committed.wal");
+    fs::rename(&wal_path, &retained_wal).unwrap();
+    fs::create_dir(&wal_path).unwrap();
+    let destination = tmp.path().join("out.json");
+    for previous in [None, Some(complete.stdout.as_slice())] {
+        if let Some(previous) = previous {
+            fs::write(&destination, previous).unwrap();
+        }
+        let output = gh519_export_cmd(tmp.path(), &session)
+            .arg("-o")
+            .arg(&destination)
+            .output()
+            .unwrap();
+        gh519_assert_error(&output, "opencode-sqlite-parse");
+        if let Some(previous) = previous {
+            assert_eq!(fs::read(&destination).unwrap(), previous);
+        } else {
+            assert!(!destination.exists(), "an incomplete read must not publish");
+        }
+    }
+    assert!(wal_path.is_dir());
+    assert!(retained_wal.is_file());
+    assert_eq!(fs::read(&db_path).unwrap(), main_before);
+}
+
+#[test]
+fn gh519_export_output_failure_exits_cleanly_after_opencode_read() {
+    let tmp = TempDir::new().unwrap();
+    let session = gh519_opencode_database(&tmp.path().join("opencode.db"), "ses_gh519");
+    let destination = tmp.path().join("missing-directory/out.json");
+    let output = gh519_export_cmd(tmp.path(), &session)
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    gh519_assert_error(&output, "file-create");
+    assert!(!destination.exists());
+
+    #[cfg(target_os = "linux")]
+    {
+        // Unlike a missing parent directory, /dev/full opens successfully and
+        // rejects write_all with ENOSPC after the connector has returned data.
+        let output = gh519_export_cmd(tmp.path(), &session)
+            .args(["-o", "/dev/full"])
+            .output()
+            .unwrap();
+        gh519_assert_error(&output, "file-write");
+    }
+}
+
+#[test]
+fn gh519_export_missing_session_does_not_use_another_opencode_store() {
+    let tmp = TempDir::new().unwrap();
+    let requested_db = tmp.path().join("requested/opencode.db");
+    gh519_opencode_database(&requested_db, "different_session");
+    let default_db = tmp.path().join("default/opencode.db");
+    gh519_opencode_database(&default_db, "ses_gh519");
+    let destination = tmp.path().join("out.json");
+    let output = gh519_export_cmd(tmp.path(), &requested_db.join("ses_gh519"))
+        .env("OPENCODE_SQLITE_DB", &default_db)
+        .arg("-o")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    gh519_assert_error(&output, "opencode-sqlite-parse");
+    assert!(
+        !destination.exists(),
+        "another database's session must not be substituted"
+    );
+}
+
 // =============================================================================
 // Export-HTML command tests
 // =============================================================================
