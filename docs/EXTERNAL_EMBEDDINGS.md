@@ -133,3 +133,59 @@ The newer immutable-generation and progressive/two-tier serving paths still
 require their existing ownership/identity admission and remain fail-closed;
 this feature does not bypass those gates. No GPU throughput or quality gain
 is guaranteed; those depend on the chosen server and model.
+
+## Persistent JSON and MCP search
+
+After completing external quality backfill, start a caller-owned service with
+that same archive and endpoint/model/dimension/revision configuration:
+
+```sh
+cass serve --stdio --data-dir /path/to/cass \
+  --db /path/to/cass/agent_search.db --semantic-embedder external
+```
+
+Both startup `--semantic-embedder external` and endpoint consent are required.
+Setting `CASS_SEMANTIC_EMBEDDER=external`, a URL, or a key alone never changes
+ordinary service search into external work. Startup, status, catalog discovery,
+invalid requests, and ordinary `search` requests perform no endpoint requests.
+Use newline-delimited requests on the retained connection:
+
+```json
+{"op":"semantic_search","id":1,"query":"transaction checkpoint","mode":"semantic","limit":5}
+{"op":"semantic_search","id":2,"query":"incremental recovery","mode":"hybrid","limit":5}
+{"op":"unload","id":3}
+```
+
+The first semantic request admits the completed external artifact and current
+canonical archive through the same strict loader as one-shot search. Only then
+does it send fixed public probes, recheck admission, and embed the query. The
+HTTP provider, exact vector readers and filter maps remain in this process for
+subsequent queries; it does not re-embed canonical message bodies at query time.
+`unload` releases those owners. The next semantic request must admit them and
+run preflight again. A changed archive or guarded publication refuses reuse
+before the next query is sent; unload/reload is not permission to accept stale
+vectors. Complete the corresponding backfill before querying changed history.
+
+Status reports `external_provider_selected`, the admitted safe `embedder_id`,
+and `local_model_loaded: false`. `neural` is null for an arbitrary external
+service, not a claim about its implementation. Status never resolves a URL or
+API key. Restart the service with a new environment to change endpoint
+configuration or credentials. Keep the server's model/preprocessing frozen;
+reuse and public probes do not attest its weights or detect all server drift.
+
+Add `--mcp` to use the same provider through `cass_semantic_search`. The MCP
+handshake and tool description disclose query transmission and potential
+remote processing/billing. Only that external tool sets `openWorldHint: true`
+and declines `readOnlyHint`: the canonical archive is read-only, but CASS
+cannot certify the remote service's effects. Other local tools keep their
+existing annotations. Neither discovery nor tool arguments grant endpoint
+consent, select a URL, or override startup archive coordinates.
+
+Exact semantic mode fails explicitly on unavailable providers or assets. Hybrid
+mode may fall back to lexical with `semantic_fallback_reason`; it never silently
+substitutes local MiniLM or hash vectors into the external space. Native ANN is
+still disabled in this persistent service, including for `approximate: true`.
+Whole-request deadlines, sampled resident-memory supervision and optional
+cross-process reader admission remain in force. Terminating the worker bounds
+local work, not remote execution already accepted or resulting charges. Reader
+reuse is implemented; no GPU throughput, latency or peak-RSS gain is asserted.

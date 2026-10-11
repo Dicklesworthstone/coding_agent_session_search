@@ -283,6 +283,13 @@ impl Semantic {
         self.config.is_some()
     }
 
+    /// Startup selection only, not a consent/configuration probe or HTTP call.
+    pub(super) fn external_selected(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| matches!(config.embedder, EmbedderChoice::External))
+    }
+
     pub(super) fn model_loaded(&self) -> bool {
         self.client.is_some()
             && self
@@ -312,7 +319,7 @@ impl Semantic {
                 EmbedderChoice::External => None,
                 local => Some(local.local_model()),
             }),
-            "external_provider_selected": self.config.as_ref().is_some_and(|config| matches!(config.embedder, EmbedderChoice::External)),
+            "external_provider_selected": self.external_selected(),
             "local_model_loaded": self.model_loaded(),
             "context_epoch": self.client.as_ref().map(|_| self.successful_loads),
             "load_attempts": self.load_attempts, "successful_loads": self.successful_loads,
