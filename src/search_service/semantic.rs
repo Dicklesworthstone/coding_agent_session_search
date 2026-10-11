@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, Metadata};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use coding_agent_search::search::embedder::Embedder;
@@ -37,6 +37,36 @@ use super::protocol::{self, Filters};
 const MAX_GUARDED_FILES: usize = 4096;
 const MAX_SHARD_MANIFEST_BYTES: u64 = 1024 * 1024;
 const NATIVE_ANN_UNAVAILABLE: &str = "persistent_native_ann_requires_reclaimable_owners";
+const MAX_ADMISSION_BACKOFF_SECS: u64 = 30;
+
+/// Bound repeated cold admission after missing/corrupt assets or failed public
+/// endpoint preflight. This is a per-worker retry gate, not a result cache or a
+/// background retry task. It retains no query, credentials or reader owners.
+#[derive(Default)]
+struct AdmissionRetry {
+    failures: u32,
+    failed_at: Option<Instant>,
+}
+
+impl AdmissionRetry {
+    fn failed(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.failed_at = Some(now);
+    }
+
+    fn retry_after_ms(&self, now: Instant) -> u64 {
+        let Some(failed_at) = self.failed_at else {
+            return 0;
+        };
+        let seconds = (1_u64 << self.failures.saturating_sub(1).min(5))
+            .min(MAX_ADMISSION_BACKOFF_SECS);
+        let remaining = Duration::from_secs(seconds)
+            .saturating_sub(now.saturating_duration_since(failed_at));
+        // Round up: a sub-millisecond remainder must not look ready. The
+        // duration is at most 30 seconds, even for a saturated failure counter.
+        u64::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+    }
+}
 
 fn ann_metadata(requested: bool) -> Value {
     json!({
@@ -104,6 +134,13 @@ enum Refusal {
         "semantic assets or archive changed; call reload or unload before retrying semantic retrieval"
     )]
     Changed,
+    #[error(
+        "semantic_admission_backoff: retry in {retry_after_ms} ms or unload/reload after resolving the failure; no semantic work was started; last failure: {reason}"
+    )]
+    AdmissionBackoff {
+        retry_after_ms: u64,
+        reason: String,
+    },
     #[error("semantic retrieval is unavailable: {0}")]
     Unavailable(String),
 }
@@ -111,7 +148,7 @@ enum Refusal {
 pub(super) fn error_kind(error: &anyhow::Error) -> &'static str {
     match error.downcast_ref::<Refusal>() {
         Some(Refusal::Changed) => "semantic_reload_required",
-        Some(Refusal::Unavailable(_)) => "semantic_unavailable",
+        Some(Refusal::Unavailable(_) | Refusal::AdmissionBackoff { .. }) => "semantic_unavailable",
         None => "semantic_search_failed",
     }
 }
@@ -269,6 +306,7 @@ pub(super) struct Semantic {
     calls_completed: u64,
     queries_attempted: u64,
     last_failure: Option<String>,
+    admission_retry: AdmissionRetry,
 }
 
 impl Semantic {
@@ -308,6 +346,7 @@ impl Semantic {
         self.guard = AssetGuard::default();
         self.requires_reload = false;
         self.last_failure = None;
+        self.admission_retry = AdmissionRetry::default();
     }
 
     pub(super) fn status(&self) -> Value {
@@ -325,6 +364,12 @@ impl Semantic {
             "load_attempts": self.load_attempts, "successful_loads": self.successful_loads,
             "calls_completed": self.calls_completed, "requires_reload": self.requires_reload,
             "queries_attempted": self.queries_attempted,
+            "admission_retry": {
+                "consecutive_failures": self.admission_retry.failures,
+                "retry_after_ms": self.admission_retry.retry_after_ms(Instant::now()),
+                "max_delay_ms": MAX_ADMISSION_BACKOFF_SECS * 1000,
+                "automatic_retries": false,
+            },
             "last_failure": self.last_failure, "change_detection": "file_identity_size_mtime_and_unix_ctime",
             "snapshot_policy": "retained_assets_with_archive_change_checks", "immutable_generation_certified": false,
             "canonical_database_access_enabled": self.enabled(), "maintenance_performed": false,
@@ -332,13 +377,45 @@ impl Semantic {
         })
     }
 
-    fn ensure_loaded(&mut self, db: &Path) -> Result<()> {
+    /// Passive request admission precedes the shared reader pool. Known-unready
+    /// semantic work must neither reserve capacity nor mask lexical fallback.
+    fn admit_request(&self, now: Instant) -> Result<()> {
         if self.requires_reload {
             return Err(Refusal::Changed.into());
         }
+        if self.client.is_none() {
+            let retry_after_ms = self.admission_retry.retry_after_ms(now);
+            if retry_after_ms != 0 {
+                return Err(Refusal::AdmissionBackoff {
+                    retry_after_ms,
+                    reason: self
+                        .last_failure
+                        .clone()
+                        .unwrap_or_else(|| "semantic admission failed".into()),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_loaded(&mut self, db: &Path) -> Result<()> {
+        self.admit_request(Instant::now())?;
         if self.client.is_some() {
             return self.check();
         }
+        let result = self.load(db);
+        if result.is_ok() {
+            self.admission_retry = AdmissionRetry::default();
+        } else {
+            // Backoff starts after teardown of the unsuccessful load, not at
+            // its start: a slow preflight must not consume its own retry delay.
+            self.admission_retry.failed(Instant::now());
+        }
+        result
+    }
+
+    fn load(&mut self, db: &Path) -> Result<()> {
         let config = self
             .config
             .as_ref()
@@ -466,22 +543,25 @@ impl Session {
         let started = Instant::now();
         let fallback_filters = filters.clone();
         let reused = self.semantic.client.is_some();
-        let lease = if self.reader_lease.is_none() {
-            self.acquire_reader_lease()?
-        } else {
-            None
-        };
-        let archive = self
-            .archive
-            .as_deref()
-            .context("semantic search requires an explicit --db")?;
-        let setup = self.semantic.ensure_loaded(archive);
+        let setup = self.semantic.admit_request(Instant::now()).and_then(|()| {
+            let lease = if self.reader_lease.is_none() {
+                self.acquire_reader_lease()?
+            } else {
+                None
+            };
+            let archive = self
+                .archive
+                .as_deref()
+                .context("semantic search requires an explicit --db")?;
+            let setup = self.semantic.ensure_loaded(archive);
+            if setup.is_ok() && lease.is_some() {
+                self.reader_lease = lease;
+            } else {
+                drop(lease);
+            }
+            setup
+        });
         let setup_ms = started.elapsed().as_millis();
-        if setup.is_ok() && lease.is_some() {
-            self.reader_lease = lease;
-        } else {
-            drop(lease);
-        }
         let started = Instant::now();
         // Independent retrieval introduces semantic candidates absent from the
         // lexical shortlist. Both legs use a bounded page candidate window.
@@ -556,7 +636,14 @@ impl Session {
             Ok((hits, ann)) => (hits, "semantic", ann, None),
             Err(error) => {
                 let reason = format!("{error:#}");
-                self.semantic.last_failure = Some(reason.clone());
+                // Keep the original failure actionable during backoff rather
+                // than replacing it with the retry gate's synthetic refusal.
+                if !matches!(
+                    error.downcast_ref::<Refusal>(),
+                    Some(Refusal::AdmissionBackoff { .. })
+                ) {
+                    self.semantic.last_failure = Some(reason.clone());
+                }
                 if mode == Mode::Semantic {
                     return Err(error);
                 }

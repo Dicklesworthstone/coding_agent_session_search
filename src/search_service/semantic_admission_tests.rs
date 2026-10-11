@@ -158,6 +158,12 @@ fn invalidated_semantic_only_worker_hands_capacity_to_a_peer_without_unload() ->
     assert!(recovered.ok, "{recovered:?}");
     assert_eq!(recovered.result.unwrap()["count"], 1);
     assert!(matches!(pool.acquire(), Err(PoolRefusal::Busy)));
+    // The invalidated worker already knows it cannot load. It should report
+    // that fact without competing with the peer for its newly acquired slot.
+    let repeated = semantic_query(&mut session, "semantic");
+    assert_eq!(repeated.error.unwrap().kind, "semantic_reload_required");
+    assert_eq!(session.semantic.queries_attempted, 1);
+    assert_eq!(session.semantic.admission_retry.failures, 0);
     peer.unload();
     drop(pool.acquire()?);
     Ok(())
@@ -233,5 +239,130 @@ fn cold_semantic_admission_failure_leaves_no_reader_slot_reserved() -> Result<()
     assert!(session.reader_lease.is_none());
     drop(pool.acquire()?);
     assert!(!session.archive.as_ref().unwrap().exists());
+    Ok(())
+}
+
+#[test]
+fn admission_retry_has_exact_boundaries_and_a_saturating_bounded_delay() {
+    let now = Instant::now();
+    let mut retry = AdmissionRetry::default();
+    assert_eq!(retry.retry_after_ms(now), 0);
+    for seconds in [1, 2, 4, 8, 16, 30, 30] {
+        retry.failed(now);
+        assert_eq!(retry.retry_after_ms(now), seconds * 1000);
+        let expires = now + Duration::from_secs(seconds);
+        assert_eq!(retry.retry_after_ms(expires - Duration::from_nanos(1)), 1);
+        assert_eq!(retry.retry_after_ms(expires), 0);
+        assert_eq!(retry.retry_after_ms(expires + Duration::from_secs(1)), 0);
+    }
+    retry.failures = u32::MAX;
+    retry.failed(now);
+    assert_eq!(retry.failures, u32::MAX);
+    assert_eq!(retry.retry_after_ms(now), 30_000);
+    // Even an earlier observation cannot create an unbounded duration.
+    retry.failed_at = Some(now + Duration::from_secs(1));
+    assert_eq!(retry.retry_after_ms(now), 30_000);
+}
+
+#[test]
+fn failed_cold_admission_backs_off_before_pool_access_and_unload_clears_it() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let pool = Pool::new(root.path().join("reader-pool"), 1)?;
+    let mut session = Session::new(root.path().join("missing-index"));
+    session.archive = Some(root.path().join("missing.db"));
+    session.semantic = Semantic::new(root.path().to_path_buf(), EmbedderChoice::Hash);
+    session.admission_pool = Some(pool.clone());
+    let failed = semantic_query(&mut session, "semantic");
+    assert!(!failed.ok);
+    let original = session.semantic.last_failure.clone().unwrap();
+    assert_eq!(session.semantic.admission_retry.failures, 1);
+    // Inject the clock, not a storage result; no sleeps or slow-host boundary
+    // races are needed to keep the following public requests inside backoff.
+    session.semantic.admission_retry.failed_at = Some(Instant::now() + Duration::from_secs(60));
+    let peer = pool.acquire()?;
+    for _ in 0..3 {
+        let blocked = semantic_query(&mut session, "semantic");
+        assert!(!blocked.ok);
+        let error = blocked.error.unwrap();
+        assert_eq!(error.kind, "semantic_unavailable");
+        assert!(error.message.contains("semantic_admission_backoff"));
+        assert!(error.message.contains(&original));
+        assert_eq!(session.semantic.load_attempts, 1);
+        assert_eq!(session.semantic.admission_retry.failures, 1);
+        assert_eq!(session.semantic.last_failure.as_ref(), Some(&original));
+        assert!(session.reader_lease.is_none());
+    }
+    let status = session.status();
+    assert_eq!(status["semantic"]["admission_retry"]["retry_after_ms"], 1000);
+    assert_eq!(status["semantic"]["admission_retry"]["automatic_retries"], false);
+    drop(peer);
+    assert!(session.handle(protocol::Request::Unload { id: 3 }).0.ok);
+    assert_eq!(session.semantic.admission_retry.failures, 0);
+    assert_eq!(session.semantic.admission_retry.retry_after_ms(Instant::now()), 0);
+    assert!(!semantic_query(&mut session, "semantic").ok);
+    assert_eq!(session.semantic.load_attempts, 2);
+    assert_eq!(session.semantic.admission_retry.failures, 1);
+    drop(pool.acquire()?);
+    assert!(!session.archive.as_ref().unwrap().exists());
+    Ok(())
+}
+
+#[test]
+fn expired_admission_retry_loads_repaired_vectors_and_clears_the_failure() -> Result<()> {
+    let (root, mut session, pool) = fixture()?;
+    let vector = vector_index_path(root.path(), HashEmbedder::default().id());
+    let retained = root.path().join("temporarily-unavailable.fsvi");
+    std::fs::rename(&vector, &retained)?;
+    assert!(!semantic_query(&mut session, "semantic").ok);
+    assert_eq!(session.semantic.admission_retry.failures, 1);
+    assert_eq!(session.semantic.load_attempts, 1);
+    drop(pool.acquire()?);
+    std::fs::rename(&retained, &vector)?;
+    session.semantic.admission_retry.failed_at = Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(31))
+            .context("test clock cannot represent elapsed backoff")?,
+    );
+    let repaired = semantic_query(&mut session, "semantic");
+    assert!(repaired.ok, "{repaired:?}");
+    assert_eq!(repaired.result.unwrap()["count"], 1);
+    assert_eq!(session.semantic.load_attempts, 2);
+    assert_eq!(session.semantic.successful_loads, 1);
+    assert_eq!(session.semantic.admission_retry.failures, 0);
+    assert!(session.semantic.last_failure.is_none());
+    assert!(matches!(pool.acquire(), Err(PoolRefusal::Busy)));
+    session.unload();
+    drop(pool.acquire()?);
+    Ok(())
+}
+
+#[test]
+fn hybrid_uses_retained_lexical_results_during_semantic_admission_backoff() -> Result<()> {
+    let (root, mut session, pool) = fixture()?;
+    let vector = vector_index_path(root.path(), HashEmbedder::default().id());
+    std::fs::rename(&vector, root.path().join("retained-vectors.fsvi"))?;
+    let first = semantic_query(&mut session, "hybrid");
+    assert!(first.ok, "{first:?}");
+    assert_eq!(first.result.unwrap()["realized_mode"], "lexical");
+    let original = session.semantic.last_failure.clone().unwrap();
+    session.semantic.admission_retry.failed_at = Some(Instant::now() + Duration::from_secs(60));
+    let second = semantic_query(&mut session, "hybrid");
+    assert!(second.ok, "{second:?}");
+    let result = second.result.unwrap();
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["realized_mode"], "lexical");
+    assert_eq!(result["reader_reused"], true);
+    assert!(
+        result["semantic_fallback_reason"]
+            .as_str()
+            .unwrap()
+            .contains("semantic_admission_backoff")
+    );
+    assert_eq!(session.semantic.load_attempts, 1);
+    assert_eq!(session.successful_opens, 1);
+    assert_eq!(session.semantic.last_failure.as_ref(), Some(&original));
+    assert!(matches!(pool.acquire(), Err(PoolRefusal::Busy)));
+    session.unload();
+    drop(pool.acquire()?);
     Ok(())
 }

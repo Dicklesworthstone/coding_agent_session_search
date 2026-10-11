@@ -189,3 +189,34 @@ Whole-request deadlines, sampled resident-memory supervision and optional
 cross-process reader admission remain in force. Terminating the worker bounds
 local work, not remote execution already accepted or resulting charges. Reader
 reuse is implemented; no GPU throughput, latency or peak-RSS gain is asserted.
+
+### Failed admission and reader capacity
+
+The persistent service backs off **cold semantic loading** after missing or
+corrupt assets, invalid configuration, or unsuccessful endpoint preflight.
+Successive failed loads wait 1, 2, 4, 8, 16, then at most 30 seconds before a
+new request may try again. The monotonic delay starts after the failed load
+has returned and released its temporary owners. No timer, background probe,
+or automatic request is started; an arriving request is still required.
+
+During the delay, semantic mode reports `semantic_unavailable` with a
+`semantic_admission_backoff` message and the original failure. Hybrid mode
+can use lexical search immediately, reporting the same explicit fallback
+reason. Status exposes `semantic.admission_retry.consecutive_failures`,
+`retry_after_ms` (rounded up), `max_delay_ms`, and `automatic_retries: false`.
+`last_failure` retains the underlying diagnosis rather than being overwritten
+by each skipped attempt. These status reads perform no filesystem or HTTP work.
+
+Successful loading, `unload`, or `reload` clears the admission backoff. Existing
+identity, consent, readiness, and preflight checks still apply to the next load.
+Pool contention and failures of a query against an already loaded provider do
+not increase this cold-load counter. The separate opt-in HTTP retry policy
+above is unchanged. The same admission policy also applies to local providers;
+ordinary lexical requests and one-shot `cass search` are unaffected.
+
+A semantic reader invalidated by an archive/publication change releases its
+shared admission slot when no lexical reader or reranker remains. This includes
+a failed hybrid fallback. A surviving lexical reader keeps the slot, so capacity
+is not handed to another process before the last retained owner is released.
+Known reload refusals and admission backoff do not acquire a semantic slot;
+lexical fallback must still obtain or reuse its own admission normally.
