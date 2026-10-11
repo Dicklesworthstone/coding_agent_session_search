@@ -440,6 +440,29 @@ impl Session {
         limit: usize,
         offset: usize,
     ) -> Result<Value> {
+        let result =
+            self.semantic_search_with_readers(query, mode, approximate, filters, limit, offset);
+        // Invalidation destroys the semantic owners, not the Session. An idle
+        // failed worker must not keep the pool full until an explicit unload.
+        // Wait for the entire attempt (including lexical fallback and local
+        // temporary owners) to finish before releasing the shared slot. A
+        // surviving lexical reader, reranker or semantic provider still owns it.
+        if self.semantic.client.is_none() && self.client.is_none() && !self.refiner.loaded() {
+            drop(self.reader_lease.take());
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn semantic_search_with_readers(
+        &mut self,
+        query: &str,
+        mode: Mode,
+        approximate: bool,
+        filters: Filters,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Value> {
         let started = Instant::now();
         let fallback_filters = filters.clone();
         let reused = self.semantic.client.is_some();
@@ -591,6 +614,10 @@ impl Session {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "semantic_admission_tests.rs"]
+mod admission_tests;
 
 #[cfg(test)]
 mod external_selection_tests {
