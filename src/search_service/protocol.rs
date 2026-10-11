@@ -57,6 +57,16 @@ impl ViewSelection {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
+    Transcript {
+        id: u64,
+        source_path: String,
+        source_id: String,
+        conversation_id: i64,
+        #[serde(default)]
+        cursor: Option<super::canonical::transcript::Cursor>,
+        #[serde(default = "super::canonical::transcript::default_limit")]
+        limit: usize,
+    },
     SemanticSearch {
         id: u64,
         query: String,

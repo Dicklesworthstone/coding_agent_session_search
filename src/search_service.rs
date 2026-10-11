@@ -406,6 +406,8 @@ impl Session {
                 "canonical_batch_views": canonical::MAX_BATCH_VIEWS,
                 "canonical_batch_messages": canonical::MAX_BATCH_MESSAGES,
                 "canonical_batch_content_bytes": canonical::MAX_CONTENT_BYTES,
+                "transcript_messages": canonical::transcript::MAX_MESSAGES,
+                "transcript_content_bytes": canonical::transcript::MAX_PAGE_BYTES,
                 "request_timeout_ms": self.request_timeout.as_millis(),
                 "timeout_exit_code": deadline::TIMEOUT_EXIT_CODE,
                 "timeout_scope": "first_frame_byte_through_response_flush",
@@ -513,6 +515,68 @@ impl Session {
 
     fn handle(&mut self, request: Request) -> (Reply, bool) {
         match request {
+            Request::Transcript {
+                id,
+                source_path,
+                source_id,
+                conversation_id,
+                cursor,
+                limit,
+            } => {
+                let page = canonical::transcript::Page {
+                    source_path: &source_path,
+                    source_id: &source_id,
+                    conversation_id,
+                    cursor: cursor.as_ref(),
+                    limit,
+                };
+                if let Err(message) = page.validate() {
+                    return (Reply::failure(Some(id), "invalid_request", message), false);
+                }
+                let Some(db) = &self.archive else {
+                    return (
+                        Reply::failure(
+                            Some(id),
+                            "canonical_access_disabled",
+                            "transcript requires an explicit --db at service startup",
+                        ),
+                        false,
+                    );
+                };
+                // Hold admission through this page's reader teardown, but never
+                // pin an archive transaction while waiting for another request.
+                let _lease = if self.reader_lease.is_none() {
+                    match self.acquire_reader_lease() {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            return (
+                                Reply::failure(
+                                    Some(id),
+                                    admission_error_kind(&error, "admission_unavailable"),
+                                    format!("{error:#}"),
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.canonical_read_attempts = self.canonical_read_attempts.saturating_add(1);
+                let reply = match canonical::transcript::read(db, &page) {
+                    Ok(result) => {
+                        self.canonical_reads_completed =
+                            self.canonical_reads_completed.saturating_add(1);
+                        Reply::success(id, result)
+                    }
+                    Err(error) => Reply::failure(
+                        Some(id),
+                        canonical::transcript::error_kind(&error),
+                        format!("{error:#}"),
+                    ),
+                };
+                (reply, false)
+            }
             Request::ViewBatch { id, views } => {
                 if views.is_empty() || views.len() > canonical::MAX_BATCH_VIEWS {
                     return (
