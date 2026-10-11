@@ -19,6 +19,8 @@ pub mod daemon_runtime_state;
 pub mod dependency_drift;
 pub mod dependency_pin_correlation;
 pub mod doctor;
+#[cfg(test)]
+mod doctor_candidate_wal_tests;
 pub(crate) mod doctor_chokepoint;
 pub mod doctor_recover;
 pub(crate) mod doctor_robot_docs;
@@ -55538,6 +55540,9 @@ fn doctor_backup_kind_label(manifest: &serde_json::Value) -> &'static str {
 }
 const DOCTOR_BACKUP_RESTORE_PLAN_PREFIX: &str = "doctor-backup-restore-plan-v1";
 
+#[cfg(test)]
+mod doctor_backup_restore_tests;
+
 #[derive(Debug, Clone)]
 struct DoctorBackupManifestRecord {
     backup_id: String,
@@ -55566,6 +55571,7 @@ struct DoctorBackupVerification {
     status: String,
     checksum_status_counts: BTreeMap<String, usize>,
     restore_rehearsal_allowed: bool,
+    storage_probe_status: &'static str,
     sidecar_bundle_status: String,
     prior_live_db_path: Option<PathBuf>,
     prior_live_wal_path: Option<PathBuf>,
@@ -55748,6 +55754,7 @@ fn doctor_backup_verification_value(
         "status": verification.status,
         "checksum_status_counts": verification.checksum_status_counts,
         "restore_rehearsal_allowed": verification.restore_rehearsal_allowed,
+        "storage_probe_status": verification.storage_probe_status,
         "sidecar_bundle_status": verification.sidecar_bundle_status,
         "artifact_count": verification.artifact_count,
         "total_size_bytes": verification.total_size_bytes,
@@ -55764,6 +55771,61 @@ fn doctor_backup_verification_value(
         "warnings": verification.warnings,
         "blocked_reasons": verification.blocked_reasons,
     })
+}
+
+/// The engine must inspect the same bundle that restore will copy. An adjacent
+/// WAL can contain committed rows even when the main database file is unchanged;
+/// it cannot be silently omitted from the manifest or replaced by a WAL with a
+/// different basename. SHM is optional, but an existing SHM must also be recorded
+/// before a read-only probe may consume it.
+fn doctor_backup_source_bundle_is_complete(
+    verification: &DoctorBackupVerification,
+) -> Result<(), String> {
+    let db_path = verification
+        .prior_live_db_path
+        .as_ref()
+        .ok_or_else(|| "restore verification has no matched prior-live DB path".to_string())?;
+    for (suffix, recorded_path) in [
+        ("-wal", verification.prior_live_wal_path.as_ref()),
+        ("-shm", verification.prior_live_shm_path.as_ref()),
+        // A hot rollback journal can also surface as BusyRecovery. This
+        // backup format has no journal component, so it cannot be omitted
+        // before deferring admission to a private WAL-index recovery.
+        ("-journal", None),
+    ] {
+        let adjacent_path = doctor_sqlite_sidecar_path(db_path, suffix)
+            .ok_or_else(|| "prior-live backup DB has no file name".to_string())?;
+        if let Some(recorded_path) = recorded_path {
+            if *recorded_path != adjacent_path {
+                return Err(format!(
+                    "prior-live {suffix} backup does not belong to the recorded database basename"
+                ));
+            }
+            let metadata = std::fs::symlink_metadata(recorded_path).map_err(|_| {
+                format!("required prior-live {suffix} backup is missing or unreadable")
+            })?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "required prior-live {suffix} backup is not a regular non-symlink file"
+                ));
+            }
+        } else {
+            match std::fs::symlink_metadata(&adjacent_path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "prior-live database has an unrecorded {suffix} sidecar; backup bundle verification refused"
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(format!(
+                        "cannot determine whether the prior-live {suffix} sidecar is present"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn verify_doctor_backup_record(
@@ -55790,6 +55852,7 @@ fn verify_doctor_backup_record(
         status: "failed".to_string(),
         checksum_status_counts: BTreeMap::new(),
         restore_rehearsal_allowed: false,
+        storage_probe_status: "not_attempted",
         sidecar_bundle_status: "not-evaluated".to_string(),
         prior_live_db_path: None,
         prior_live_wal_path: None,
@@ -55830,12 +55893,25 @@ fn verify_doctor_backup_record(
             .push("backup manifest has no artifacts array".to_string());
         return verification;
     };
+    let mut restore_roles = BTreeSet::new();
     for artifact in artifacts {
         let artifact_kind = artifact
             .get("artifact_kind")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let restore_component = matches!(
+            artifact_kind.as_str(),
+            "prior_live_archive_db_backup"
+                | "prior_live_archive_wal_backup"
+                | "prior_live_archive_shm_backup"
+        );
+        let duplicate_role = restore_component && !restore_roles.insert(artifact_kind.clone());
+        if duplicate_role {
+            verification.blocked_reasons.push(format!(
+                "backup manifest repeats restore component {artifact_kind}"
+            ));
+        }
         let expected_blake3 = artifact
             .get("checksum_blake3")
             .and_then(serde_json::Value::as_str)
@@ -55856,6 +55932,9 @@ fn verify_doctor_backup_record(
         let Some(path) = backup_path else {
             artifact_verification.status = "missing-path".to_string();
             artifact_verification.error = Some("artifact has no backup_path".to_string());
+            verification.blocked_reasons.push(format!(
+                "backup artifact {artifact_kind} failed verification: missing-path"
+            ));
             *verification
                 .checksum_status_counts
                 .entry(artifact_verification.status.clone())
@@ -55906,20 +55985,32 @@ fn verify_doctor_backup_record(
                 }
             }
         }
-        match artifact_kind.as_str() {
-            "prior_live_archive_db_backup" => {
-                verification.prior_live_db_path = Some(path.clone());
-                verification.prior_live_db_blake3 = artifact_verification.actual_blake3.clone();
+        if artifact_verification.status != "matched" {
+            verification.blocked_reasons.push(format!(
+                "backup artifact {artifact_kind} failed verification: {}",
+                artifact_verification.status
+            ));
+        } else if !duplicate_role {
+            // Restore remains bound to the manifest's expected bytes. Merely
+            // observing a hash must never authorize a changed WAL for copying.
+            match artifact_kind.as_str() {
+                "prior_live_archive_db_backup" => {
+                    verification.prior_live_db_path = Some(path.clone());
+                    verification.prior_live_db_blake3 =
+                        artifact_verification.expected_blake3.clone();
+                }
+                "prior_live_archive_wal_backup" => {
+                    verification.prior_live_wal_path = Some(path.clone());
+                    verification.prior_live_wal_blake3 =
+                        artifact_verification.expected_blake3.clone();
+                }
+                "prior_live_archive_shm_backup" => {
+                    verification.prior_live_shm_path = Some(path.clone());
+                    verification.prior_live_shm_blake3 =
+                        artifact_verification.expected_blake3.clone();
+                }
+                _ => {}
             }
-            "prior_live_archive_wal_backup" => {
-                verification.prior_live_wal_path = Some(path.clone());
-                verification.prior_live_wal_blake3 = artifact_verification.actual_blake3.clone();
-            }
-            "prior_live_archive_shm_backup" => {
-                verification.prior_live_shm_path = Some(path.clone());
-                verification.prior_live_shm_blake3 = artifact_verification.actual_blake3.clone();
-            }
-            _ => {}
         }
         *verification
             .checksum_status_counts
@@ -55939,6 +56030,10 @@ fn verify_doctor_backup_record(
     });
     verification.sidecar_bundle_status = if !prior_live_db_matched {
         "missing-required-db".to_string()
+    } else if restore_roles.contains("prior_live_archive_wal_backup") && !wal_matched {
+        "invalid-required-wal".to_string()
+    } else if restore_roles.contains("prior_live_archive_shm_backup") && !shm_matched {
+        "invalid-required-shm".to_string()
     } else if shm_matched && !wal_matched {
         verification
             .blocked_reasons
@@ -55952,28 +56047,59 @@ fn verify_doctor_backup_record(
         "single-file-db".to_string()
     };
     if prior_live_db_matched {
-        if let Some(db_path) = verification.prior_live_db_path.as_ref() {
-            match open_franken_with_flags(
-                &db_path.to_string_lossy(),
-                FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
-                Ok(connection) => {
-                    drop(connection);
-                    verification
-                        .warnings
-                        .push("frankensqlite read-only probe passed".to_string());
-                }
-                Err(err) => {
-                    verification.blocked_reasons.push(format!(
-                        "frankensqlite read-only probe failed for prior-live backup DB: {err}"
-                    ));
-                }
-            }
+        if let Err(err) = doctor_backup_source_bundle_is_complete(&verification) {
+            verification.blocked_reasons.push(err);
         }
     } else {
         verification
             .blocked_reasons
             .push("restore requires a checksum-matched prior-live archive DB backup".to_string());
+    }
+    if verification.blocked_reasons.is_empty()
+        && let Some(db_path) = verification.prior_live_db_path.as_ref()
+    {
+        match open_franken_with_flags(
+            &db_path.to_string_lossy(),
+            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(mut connection) => {
+                if let Err(err) = connection.close_without_checkpoint_in_place() {
+                    connection.close_best_effort_in_place();
+                    verification.storage_probe_status = "failed";
+                    verification.blocked_reasons.push(format!(
+                        "closing the prior-live backup read-only probe failed: {err}"
+                    ));
+                } else {
+                    verification.storage_probe_status = "passed";
+                    verification
+                        .warnings
+                        .push("frankensqlite read-only probe passed".to_string());
+                }
+            }
+            Err(err)
+                if matches!(
+                    err,
+                    crate::franken_sync::FrankenError::BusyRecovery
+                        | crate::franken_sync::FrankenError::ReadOnly
+                ) && verification
+                    .prior_live_wal_path
+                    .as_ref()
+                    .is_some_and(|path| {
+                        std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 32)
+                    }) =>
+            {
+                verification.storage_probe_status = "requires_private_wal_index_recovery";
+                verification.warnings.push(
+                    "manifest checksums matched; storage admission requires WAL-index recovery on a private restore candidate before restore can succeed".to_string(),
+                );
+            }
+            Err(err) => {
+                verification.storage_probe_status = "failed";
+                verification.blocked_reasons.push(format!(
+                    "frankensqlite read-only probe failed for prior-live backup DB: {err}"
+                ));
+            }
+        }
     }
     verification.restore_rehearsal_allowed = verification.blocked_reasons.is_empty();
     verification.status = if verification.restore_rehearsal_allowed {
@@ -56058,8 +56184,21 @@ fn doctor_restore_plan_payload(
 
 fn copy_doctor_backup_restore_bundle(
     verification: &DoctorBackupVerification,
+    candidate_root: &Path,
     candidate_db_path: &Path,
 ) -> Result<BTreeMap<String, String>, String> {
+    if !verification.restore_rehearsal_allowed {
+        return Err("refusing to copy an unverified backup bundle".to_string());
+    }
+    // Recheck the optional-sidecar inventory at consumption time too: adding
+    // a WAL after verification must not turn a later copy into a DB-only restore.
+    doctor_backup_source_bundle_is_complete(verification)?;
+    let relative_db = candidate_db_path
+        .strip_prefix(candidate_root)
+        .map_err(|_| "restore candidate DB is outside its staging root".to_string())?;
+    if !doctor_forensic_relative_path_is_safe(relative_db) {
+        return Err("restore candidate DB has an unsafe staging-relative path".to_string());
+    }
     let Some(parent) = candidate_db_path.parent() else {
         return Err(format!(
             "restore candidate DB has no parent: {}",
@@ -56076,16 +56215,20 @@ fn copy_doctor_backup_restore_bundle(
     let copy_component = |source: &Path,
                           expected: Option<&str>,
                           target: &Path,
-                          relative: &str,
                           checksum_set: &mut BTreeMap<String, String>|
      -> Result<(), String> {
+        let expected = expected
+            .ok_or_else(|| "restore component has no verified manifest checksum".to_string())?;
         let (_, hash) = doctor_copy_regular_file_to_private_target(
             source,
             target,
-            expected,
+            Some(expected),
             "doctor backup restore candidate component",
         )?;
-        checksum_set.insert(relative.to_string(), hash);
+        let relative = target
+            .strip_prefix(candidate_root)
+            .map_err(|_| "restore component is outside its staging root".to_string())?;
+        checksum_set.insert(relative.to_string_lossy().replace('\\', "/"), hash);
         Ok(())
     };
     let db_source = verification
@@ -56096,28 +56239,158 @@ fn copy_doctor_backup_restore_bundle(
         db_source,
         verification.prior_live_db_blake3.as_deref(),
         candidate_db_path,
-        "database/candidate.db",
         &mut checksum_set,
     )?;
     if let Some(wal_source) = verification.prior_live_wal_path.as_ref() {
+        let target = doctor_sqlite_sidecar_path(candidate_db_path, "-wal")
+            .ok_or_else(|| "restore candidate DB has no file name".to_string())?;
         copy_component(
             wal_source,
             verification.prior_live_wal_blake3.as_deref(),
-            &candidate_db_path.with_file_name("candidate.db-wal"),
-            "database/candidate.db-wal",
+            &target,
             &mut checksum_set,
         )?;
     }
     if let Some(shm_source) = verification.prior_live_shm_path.as_ref() {
+        let target = doctor_sqlite_sidecar_path(candidate_db_path, "-shm")
+            .ok_or_else(|| "restore candidate DB has no file name".to_string())?;
         copy_component(
             shm_source,
             verification.prior_live_shm_blake3.as_deref(),
-            &candidate_db_path.with_file_name("candidate.db-shm"),
-            "database/candidate.db-shm",
+            &target,
             &mut checksum_set,
         )?;
     }
+    doctor_backup_source_bundle_is_complete(verification)?;
     Ok(checksum_set)
+}
+
+/// Read only the private, checksum-matched copy. The narrow engine constructor
+/// may rebuild its derived SHM; it cannot write database pages or WAL frames and
+/// cannot checkpoint. Both rehearsal and apply use this exact admission path.
+fn validate_doctor_backup_restore_candidate(
+    verification: &DoctorBackupVerification,
+    candidate_root: &Path,
+    candidate_db_path: &Path,
+    checksum_set: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut connection = crate::franken_sync::Connection::open_schema_only_with_wal_index_recovery(
+        candidate_db_path.to_string_lossy().into_owned(),
+    )
+    .map_err(|err| {
+        format!(
+            "private restore candidate admission failed ({:?})",
+            err.error_code()
+        )
+    })?;
+    let mut saw_ok = false;
+    let mut diagnostic_rows = 0usize;
+    let mut diagnostic_failure = None;
+    let probe = connection.query_with_params_for_each("PRAGMA quick_check(1);", &[], |row| {
+        diagnostic_rows += 1;
+        if diagnostic_rows > 8 {
+            diagnostic_failure = Some("private restore quick_check exceeded its diagnostic bound");
+            return Err(crate::franken_sync::FrankenError::Internal(
+                "private restore quick_check exceeded its diagnostic bound".to_string(),
+            ));
+        }
+        let diagnostic = row.get_typed::<String>(0).inspect_err(|_| {
+            diagnostic_failure =
+                Some("private restore quick_check returned an unreadable diagnostic");
+        })?;
+        let diagnostic = diagnostic.trim();
+        if diagnostic.eq_ignore_ascii_case("ok") {
+            saw_ok = true;
+        } else if !diagnostic.starts_with("note:") {
+            diagnostic_failure = Some("private restore quick_check reported damage");
+            return Err(crate::franken_sync::FrankenError::Internal(
+                "private restore quick_check reported damage".to_string(),
+            ));
+        }
+        Ok(())
+    });
+    let close = connection.close_without_checkpoint_in_place();
+    if close.is_err() {
+        connection.close_best_effort_in_place();
+    }
+    probe.map_err(|err| {
+        diagnostic_failure.map_or_else(
+            || {
+                format!(
+                    "private restore candidate quick_check failed ({:?}); live archive was not replaced",
+                    err.error_code()
+                )
+            },
+            |reason| format!("{reason}; live archive was not replaced"),
+        )
+    })?;
+    close.map_err(|err| {
+        format!(
+            "private restore candidate close failed ({:?})",
+            err.error_code()
+        )
+    })?;
+    if !saw_ok {
+        return Err(
+            "private restore candidate quick_check returned no successful verdict".to_string(),
+        );
+    }
+
+    let relative_key = |path: &Path| -> Result<String, String> {
+        let relative = path
+            .strip_prefix(candidate_root)
+            .map_err(|_| "restore component is outside its staging root".to_string())?;
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    };
+    for (suffix, expected) in [
+        ("", verification.prior_live_db_blake3.as_deref()),
+        ("-wal", verification.prior_live_wal_blake3.as_deref()),
+    ] {
+        let path = if suffix.is_empty() {
+            candidate_db_path.to_path_buf()
+        } else {
+            doctor_sqlite_sidecar_path(candidate_db_path, suffix)
+                .ok_or_else(|| "restore candidate DB has no file name".to_string())?
+        };
+        let key = relative_key(&path)?;
+        if let Some(expected) = expected {
+            let hash = file_blake3_hex(&path)?;
+            if hash != expected {
+                return Err(format!(
+                    "private restore component {key} changed during storage admission; live archive was not replaced"
+                ));
+            }
+            checksum_set.insert(key, hash);
+        } else {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "private restore candidate gained an unauthorized {suffix} component"
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!(
+                        "cannot inspect private restore {suffix} component: {err}"
+                    ));
+                }
+            }
+        }
+    }
+    let shm_path = doctor_sqlite_sidecar_path(candidate_db_path, "-shm")
+        .ok_or_else(|| "restore candidate DB has no file name".to_string())?;
+    let shm_key = relative_key(&shm_path)?;
+    match std::fs::symlink_metadata(&shm_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            checksum_set.insert(shm_key, file_blake3_hex(&shm_path)?);
+        }
+        Ok(_) => return Err("private restore SHM is not a regular non-symlink file".to_string()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            checksum_set.remove(&shm_key);
+        }
+        Err(err) => return Err(format!("cannot inspect private restore SHM: {err}")),
+    }
+    Ok(())
 }
 
 fn write_doctor_restore_candidate_manifest(
@@ -56137,6 +56410,7 @@ fn write_doctor_restore_candidate_manifest(
         "artifact_count": checksum_set.len(),
         "checksum_set": checksum_set,
         "selected_authority": "verified_backup_restore",
+        "storage_probe_status": "passed",
         "created_at_ms": now_ms,
         "updated_at_ms": now_ms,
         "live_inventory_after": live_inventory,
@@ -56173,22 +56447,26 @@ fn run_doctor_backup_restore_rehearsal(
     let candidate_db_path = rehearsal_dir.join("candidate").join("agent_search.db");
     let mut blocked_reasons = Vec::new();
     let mut checksum_set = BTreeMap::new();
+    let mut storage_probe_status = "not_attempted";
     if !verification.restore_rehearsal_allowed {
         blocked_reasons.extend(verification.blocked_reasons.clone());
     } else {
-        match copy_doctor_backup_restore_bundle(verification, &candidate_db_path) {
+        match copy_doctor_backup_restore_bundle(verification, &rehearsal_dir, &candidate_db_path) {
             Ok(checksums) => checksum_set = checksums,
             Err(err) => blocked_reasons.push(err),
         }
         if blocked_reasons.is_empty() {
-            match open_franken_with_flags(
-                &candidate_db_path.to_string_lossy(),
-                FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+            match validate_doctor_backup_restore_candidate(
+                verification,
+                &rehearsal_dir,
+                &candidate_db_path,
+                &mut checksum_set,
             ) {
-                Ok(connection) => drop(connection),
-                Err(err) => blocked_reasons.push(format!(
-                    "restore rehearsal frankensqlite probe failed: {err}"
-                )),
+                Ok(()) => storage_probe_status = "passed",
+                Err(err) => {
+                    storage_probe_status = "failed";
+                    blocked_reasons.push(err);
+                }
             }
         }
     }
@@ -56213,6 +56491,7 @@ fn run_doctor_backup_restore_rehearsal(
         "rehearsal_id": rehearsal_id,
         "backup_id": backup_id,
         "status": status,
+        "storage_probe_status": storage_probe_status,
         "started_at_ms": started_at_ms,
         "finished_at_ms": doctor_now_ms(),
         "candidate_db_path": candidate_db_path.display().to_string(),
@@ -56232,6 +56511,7 @@ fn run_doctor_backup_restore_rehearsal(
         "schema_version": 1,
         "rehearsal_id": receipt["rehearsal_id"],
         "status": status,
+        "storage_probe_status": storage_probe_status,
         "receipt_path": receipt_path.display().to_string(),
         "redacted_receipt_path": doctor_redacted_path(&receipt_path.display().to_string(), data_dir),
         "receipt_blake3": receipt_blake3,
@@ -56387,16 +56667,26 @@ fn run_doctor_backup_restore_apply(
         .join(format!("{started_at_ms}-{backup_id}"));
     let candidate_db_path = candidate_dir.join("database").join("candidate.db");
     let mut blocked_reasons = Vec::new();
-    match copy_doctor_backup_restore_bundle(verification, &candidate_db_path) {
-        Ok(checksum_set) => {
-            if let Err(err) = write_doctor_restore_candidate_manifest(
-                db_path,
-                &index_path,
+    match copy_doctor_backup_restore_bundle(verification, &candidate_dir, &candidate_db_path) {
+        Ok(mut checksum_set) => {
+            match validate_doctor_backup_restore_candidate(
+                verification,
                 &candidate_dir,
-                backup_id,
-                checksum_set,
+                &candidate_db_path,
+                &mut checksum_set,
             ) {
-                blocked_reasons.push(err);
+                Ok(()) => {
+                    if let Err(err) = write_doctor_restore_candidate_manifest(
+                        db_path,
+                        &index_path,
+                        &candidate_dir,
+                        backup_id,
+                        checksum_set,
+                    ) {
+                        blocked_reasons.push(err);
+                    }
+                }
+                Err(err) => blocked_reasons.push(err),
             }
         }
         Err(err) => blocked_reasons.push(err),
@@ -56497,6 +56787,7 @@ pub(crate) fn run_doctor_backups_impl(
                         "manifest_blake3": verification.manifest_blake3,
                         "verification_status": verification.status,
                         "restore_rehearsal_allowed": verification.restore_rehearsal_allowed,
+                        "storage_probe_status": verification.storage_probe_status,
                         "sidecar_bundle_status": verification.sidecar_bundle_status,
                         "artifact_count": verification.artifact_count,
                         "total_size_bytes": verification.total_size_bytes,
@@ -62108,12 +62399,25 @@ fn doctor_candidate_promotion_record_derived_metadata(
 fn doctor_candidate_promotion_derived_status(
     live_inventory_before: &DoctorCandidateLiveInventory,
     candidate_db_blake3: Option<&str>,
+    candidate_wal_blake3: Option<&str>,
 ) -> (String, bool, bool) {
     if !live_inventory_before.index_exists {
         return ("no-live-derived-index-to-promote".to_string(), false, false);
     }
+    // Committed rows can live entirely in WAL while the checkpointed DB bytes
+    // stay unchanged. SHM only indexes those WAL frames and is rebuildable.
+    let same_wal = match (
+        live_inventory_before.db_wal_exists,
+        live_inventory_before.db_wal_blake3.as_deref(),
+        candidate_wal_blake3,
+    ) {
+        (false, None, None) => true,
+        (true, Some(live), Some(candidate)) => live == candidate,
+        _ => false,
+    };
     if live_inventory_before.db_blake3.as_deref().is_some()
         && live_inventory_before.db_blake3.as_deref() == candidate_db_blake3
+        && same_wal
     {
         return (
             "live-derived-assets-reusable-same-archive-identity".to_string(),
@@ -62908,7 +63212,28 @@ fn promote_doctor_reconstruct_candidate_bundle(
         &manifest,
         &live_inventory_before,
     );
+    let candidate_checksums = manifest
+        .get("checksum_set")
+        .and_then(serde_json::Value::as_object);
     for item in &mut bundle_items {
+        if item.suffix != "-shm" {
+            let recorded = candidate_checksums
+                .is_some_and(|checksums| checksums.contains_key(&item.manifest_relative_path));
+            if recorded && !item.candidate_exists {
+                report.blocked_reasons.push(format!(
+                    "candidate sqlite bundle component {} is recorded in the completed manifest but is missing",
+                    item.manifest_relative_path
+                ));
+                continue;
+            }
+            if item.candidate_exists && item.expected_candidate_blake3.is_none() {
+                report.blocked_reasons.push(format!(
+                    "candidate sqlite bundle component {} has no checksum in the completed manifest",
+                    item.manifest_relative_path
+                ));
+                continue;
+            }
+        }
         if item.suffix.is_empty() && !item.candidate_exists {
             report.blocked_reasons.push(format!(
                 "candidate archive bundle is missing required DB component {}",
@@ -62979,10 +63304,20 @@ fn promote_doctor_reconstruct_candidate_bundle(
         // `-shm` is transient and excluded from the completeness contract
         // (see the per-item warning above); only WAL carries data.
         .filter(|item| item.suffix != "-shm")
-        .all(|item| !item.live_exists || item.candidate_exists);
+        .all(|item| {
+            if item.candidate_exists {
+                item.candidate_blake3.is_some()
+                    && item.candidate_blake3 == item.expected_candidate_blake3
+            } else {
+                !item.live_exists
+                    && !candidate_checksums.is_some_and(|checksums| {
+                        checksums.contains_key(&item.manifest_relative_path)
+                    })
+            }
+        });
     if !report.sidecar_bundle_complete {
         report.blocked_reasons.push(
-            "sqlite sidecar bundle is incomplete; every live WAL component must have a verified candidate replacement"
+            "sqlite sidecar bundle is incomplete; candidate WAL must match the completed manifest and replace any live WAL"
                 .to_string(),
         );
     }
@@ -63030,8 +63365,16 @@ fn promote_doctor_reconstruct_candidate_bundle(
         .find(|item| item.suffix.is_empty())
         .and_then(|item| item.candidate_blake3.clone())
         .unwrap_or_default();
+    let candidate_wal_blake3 = bundle_items
+        .iter()
+        .find(|item| item.suffix == "-wal")
+        .and_then(|item| item.candidate_blake3.as_deref());
     let (derived_status, lexical_rebuild_required, semantic_rebuild_required) =
-        doctor_candidate_promotion_derived_status(&live_inventory_before, Some(&source_hash));
+        doctor_candidate_promotion_derived_status(
+            &live_inventory_before,
+            Some(&source_hash),
+            candidate_wal_blake3,
+        );
     report.derived_assets_consistency_status = derived_status;
     report.derived_lexical_rebuild_required = lexical_rebuild_required;
     report.derived_semantic_rebuild_required = semantic_rebuild_required;

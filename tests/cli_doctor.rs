@@ -333,6 +333,20 @@ fn write_candidate_promotion_backup_fixture(
             "promoted_to_live": false
         }));
     }
+    let live_shm_path = live_db_path.with_file_name("agent_search.db-shm");
+    if live_shm_path.exists() {
+        artifacts.push(json!({
+            "artifact_kind": "prior_live_archive_shm_backup",
+            "asset_class": "backup_bundle",
+            "source_path": data_dir.join("agent_search.db-shm").to_string_lossy(),
+            "backup_path": live_shm_path.to_string_lossy(),
+            "target_path": data_dir.join("agent_search.db-shm").to_string_lossy(),
+            "size_bytes": fs::metadata(&live_shm_path).expect("live shm metadata").len(),
+            "checksum_blake3": test_file_blake3(&live_shm_path),
+            "copied_to_backup": true,
+            "promoted_to_live": false
+        }));
+    }
     let manifest_path = backup_dir.join("manifest.json");
     fs::create_dir_all(manifest_path.parent().expect("backup manifest parent"))
         .expect("create backup manifest parent");
@@ -4150,7 +4164,7 @@ fn doctor_backups_list_and_verify_candidate_promotion_manifest() {
     assert!(
         matches!(
             verification["sidecar_bundle_status"].as_str(),
-            Some("single-file-db" | "complete-with-wal")
+            Some("single-file-db" | "complete-with-wal" | "complete-with-sidecars")
         ),
         "unexpected sidecar status: {verification:#}"
     );

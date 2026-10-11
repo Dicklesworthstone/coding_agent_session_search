@@ -207,6 +207,29 @@ fingerprint:
 cass doctor backups restore <backup_id> --yes --plan-fingerprint <plan_fingerprint> --json
 ```
 
+The database and its write-ahead log (WAL) form one backup. Committed messages
+may exist only in the WAL until a checkpoint writes them into the database.
+Verification requires the declared files to match their recorded checksums and
+rejects missing, changed, unrecorded, or ambiguously assigned bundle components.
+A WAL failure must never downgrade the backup to a verified single-file database.
+Keep the original bundle for inspection; changing its manifest checksums does not
+repair missing or damaged data.
+
+SHM is a derived index of the WAL. If the database engine needs to rebuild it,
+verification reports `storage_probe_status=requires_private_wal_index_recovery`:
+the manifest checks passed, but storage admission still requires rehearsal.
+Rehearsal rebuilds SHM only in the private candidate and runs a database check.
+The original backup remains unchanged, and the candidate database and WAL must
+still match their recorded checksums after the probe. Apply runs the same check
+before promotion.
+
+Rehearsal copies sidecars beside the candidate using the candidate database's
+actual filename, so its database probe sees the verified WAL. Apply checks the
+recorded checksums again while copying and requires the completed candidate's
+database and WAL inventory before changing the live archive. A WAL change also
+invalidates derived search assets even when the main database bytes match; inspect
+the promotion receipt's lexical and semantic rebuild requirements.
+
 Restore apply must capture a pre-restore backup, build a candidate, verify the
 candidate, promote atomically, and emit a restore receipt. If any verification
 fails, stop and keep all artifacts for inspection.
