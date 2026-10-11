@@ -45,6 +45,8 @@ fn receipt(output: Output) -> Value {
 }
 
 fn export(home: &Path, source: &Path, output: &Path) -> Value {
+    // Keep an explicit v2 large-row journey alongside the default-v3 coverage
+    // in cli_logical_archive: legacy readers must retain their wire contract.
     receipt(
         command(home)
             .args(["archive", "export", "--db"])
@@ -337,7 +339,8 @@ fn legacy_v1_backup_restores_and_compares_against_current_v2_snapshots() {
     let current = root.path().join("current.jsonl");
     let exported = export(root.path(), &source, &current);
     let old = root.path().join("legacy-v1.jsonl");
-    // Request v1 explicitly for an older receiver; the default remains v2.
+    // Request v1 explicitly for an older receiver. This module's export helper
+    // explicitly selects v2; those formats retain their original shared digest.
     let original = receipt(
         command(root.path())
             .args(["archive", "export", "--db"])

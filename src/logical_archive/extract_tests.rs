@@ -11,6 +11,7 @@ fn fixture(version: u32, body: &str, raw: Cell) -> (Vec<u8>, String) {
         record_types: codec::record_types(version),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".into()],
+        sequences: (version == codec::SEQUENCE_VERSION).then(Vec::new),
     };
     let mut bytes = codec::encode(&Record::Header {
         header: header.clone(),
@@ -62,7 +63,11 @@ fn decode(bytes: &[u8], digest: &str, field: Field) -> (Vec<u8>, Payload) {
 
 #[test]
 fn complete_text_and_json_are_exact_in_both_versions_without_added_newlines() {
-    for version in [codec::VERSION, codec::CHUNKED_VERSION] {
+    for version in [
+        codec::VERSION,
+        codec::CHUNKED_VERSION,
+        codec::SEQUENCE_VERSION,
+    ] {
         let text = "PRIVATE-TEXT 雪\0line\r\nlast byte";
         let (bytes, digest) = fixture(version, text, Cell::Null);
         assert_eq!(decode(&bytes, &digest, Field::Content).0, text.as_bytes());

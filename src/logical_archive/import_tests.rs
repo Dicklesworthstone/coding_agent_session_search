@@ -14,6 +14,7 @@ fn header() -> Header {
             .collect(),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
+        sequences: None,
     }
 }
 
@@ -65,6 +66,111 @@ fn typed_rows_and_child_before_parent_relationships_round_trip() {
         child.get_typed::<f64>(2).unwrap().to_bits(),
         (-1.25_f64).to_bits()
     );
+}
+
+#[test]
+fn v3_restores_absent_zero_negative_and_exhausted_allocation_state() -> Result<()> {
+    for saved in [None, Some(0), Some(-7), Some(9001), Some(i64::MAX)] {
+        let source = fixture();
+        source.execute(
+            "CREATE TABLE allocations (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)",
+        )?;
+        if let Some(value) = saved {
+            source.execute_with_params(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('allocations', ?1)",
+                &[SqliteValue::Integer(value)],
+            )?;
+        }
+        let bytes = encoded(&source);
+        let target = fixture();
+        target.execute_batch(
+            "CREATE TABLE allocations (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);
+             INSERT INTO allocations VALUES (99999, 'PRIVATE-INITIALIZER-ROW');
+             DELETE FROM allocations;",
+        )?;
+        let receipt = replay(&target, &bytes)?;
+        assert_eq!(receipt.0.schema_version, codec::SEQUENCE_VERSION);
+        assert_eq!(
+            receipt.0.sequences,
+            Some(vec![codec::Sequence {
+                table: "allocations".into(),
+                value: saved,
+            }])
+        );
+        assert_eq!(
+            receipt.1,
+            codec::verify(&mut Cursor::new(encoded(&target)))?.1
+        );
+
+        // This is a real engine allocation, after clearing both initializer
+        // rows and their previous high-water mark from private replay.
+        let inserted = target.execute("INSERT INTO allocations (body) VALUES ('after-restore')");
+        if saved == Some(i64::MAX) {
+            assert!(
+                inserted.is_err(),
+                "an exhausted allocator was reset by restore"
+            );
+            assert_eq!(
+                target
+                    .query_row("SELECT COUNT(*) FROM allocations")?
+                    .get_typed::<i64>(0)?,
+                0
+            );
+        } else {
+            inserted?;
+            assert_eq!(
+                target
+                    .query_row("SELECT id FROM allocations")?
+                    .get_typed::<i64>(0)?,
+                saved.unwrap_or(0).max(0) + 1
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn authenticated_v3_missing_allocation_inventory_never_publishes() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source)?);
+    let original = root.path().join("original.jsonl");
+    export::export_file(&source, &original, "restore-test".into())?;
+    let source_before = fs::read(&source)?;
+    let mut reader = BufReader::new(File::open(&original)?);
+    let Some(Record::Header { mut header }) = codec::read_record(&mut reader, 1)? else {
+        bail!("fixture header missing");
+    };
+    assert!(!header.sequences.as_ref().unwrap().is_empty());
+    header.sequences = Some(Vec::new());
+    let mut validator = Validator::new(header.clone())?;
+    let mut changed = codec::encode(&Record::Header { header })?;
+    let mut line = 2;
+    while let Some(record) = codec::read_record(&mut reader, line)? {
+        if matches!(record, Record::Completion { .. }) {
+            break;
+        }
+        validator.prepare(&record)?.write_to(&mut changed)?;
+        line += 1;
+    }
+    let completion = validator.completion();
+    validator
+        .prepare(&Record::Completion { completion })?
+        .write_to(&mut changed)?;
+    // A checksum authenticates the supplied metadata, not its agreement with
+    // this binary's canonical schema. Import must enforce that separately.
+    codec::verify(&mut Cursor::new(&changed))?;
+    let input = root.path().join("omitted-sequences.jsonl");
+    fs::write(&input, &changed)?;
+    let destination = root.path().join("refused.db");
+    let error = import_file(&input, &destination, "restore-test")
+        .expect_err("a complete allocator inventory is required by v3 restoration");
+    assert!(error.to_string().contains("AUTOINCREMENT table inventory"));
+    assert!(!error.to_string().contains("PRIVATE-"));
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&source)?, source_before);
+    assert_eq!(fs::read(&input)?, changed);
+    Ok(())
 }
 
 #[test]

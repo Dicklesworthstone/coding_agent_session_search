@@ -10,7 +10,9 @@ use std::time::Duration;
 use assert_cmd::Command;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::compat::{
+    ConnectionExt, OpenFlags, RowExt, open_with_flags,
+};
 use coding_agent_search::franken_sync::{Connection, SqliteValue};
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::storage::sqlite::SqliteStorage;
@@ -48,20 +50,24 @@ fn receipt(output: Output) -> Value {
 }
 
 fn export(home: &Path, source: &Path, output: &Path) -> Value {
-    receipt(
-        command(home)
-            .args(["archive", "export", "--db"])
-            .arg(source)
-            .args([
-                "--archive-id",
-                "cli-archive",
-                "--include-private",
-                "--output",
-            ])
-            .arg(output)
-            .output()
-            .unwrap(),
-    )
+    export_version(home, source, output, None)
+}
+
+fn export_version(home: &Path, source: &Path, output: &Path, version: Option<u32>) -> Value {
+    let mut cmd = command(home);
+    cmd.args(["archive", "export", "--db"])
+        .arg(source)
+        .args([
+            "--archive-id",
+            "cli-archive",
+            "--include-private",
+            "--output",
+        ])
+        .arg(output);
+    if let Some(version) = version {
+        cmd.args(["--format-version", &version.to_string()]);
+    }
+    receipt(cmd.output().unwrap())
 }
 
 fn import(home: &Path, input: &Path, output: &Path, identical: bool) -> Output {
@@ -164,6 +170,105 @@ fn collection_fixture(source: &Path) {
             connection.execute("COMMIT").unwrap();
         }
     }
+    connection.close().unwrap();
+}
+
+/// Use ordinary inserts and deletes so the fixture carries real allocation
+/// history that cannot be reconstructed from the remaining canonical rows.
+fn seed_allocation_history(connection: &Connection) {
+    connection
+        .execute_batch(
+            "INSERT INTO embedding_jobs (id, db_path, model_id, status)
+             VALUES (2, '/absent/private/history.db', 'retained-job', 'completed');
+             INSERT INTO embedding_jobs (id, db_path, model_id, status)
+             VALUES (100, '/absent/private/history.db', 'deleted-job', 'completed');
+             DELETE FROM embedding_jobs WHERE id = 100;
+             INSERT INTO token_usage
+                 (id, message_id, conversation_id, agent_id, timestamp_ms, day_id, role, content_chars)
+             VALUES (7, 10000, 7, 1, 1733000000000, 20057, 'assistant', 23);
+             INSERT INTO token_usage
+                 (id, message_id, conversation_id, agent_id, timestamp_ms, day_id, role, content_chars)
+             VALUES (200, 10003, 7, 1, 1733000000001, 20057, 'assistant', 23);
+             DELETE FROM token_usage WHERE id = 200;",
+        )
+        .unwrap();
+}
+
+fn allocation_fixture(source: &Path) {
+    let connection = SqliteStorage::open(source).unwrap().into_raw();
+    connection
+        .execute_batch(
+            "INSERT INTO agents (id, slug, name, kind, created_at, updated_at)
+             VALUES (1, 'allocation_fixture', 'Allocation fixture', 'cli', 1733000000000, 1733000000000);
+             INSERT INTO conversations (id, agent_id, source_id, external_id, source_path)
+             VALUES (7, 1, 'local', 'allocation-history', '/absent/private/history.jsonl');
+             INSERT INTO messages (id, conversation_id, idx, role, content)
+             VALUES (10000, 7, 0, 'assistant', 'PRIVATE-ALLOCATION-DATA');
+             INSERT INTO messages (id, conversation_id, idx, role, content)
+             VALUES (10003, 7, 1, 'assistant', 'PRIVATE-ALLOCATION-DATA');
+             INSERT INTO messages (id, conversation_id, idx, role, content)
+             VALUES (10006, 7, 2, 'assistant', 'PRIVATE-ALLOCATION-DATA');",
+        )
+        .unwrap();
+    seed_allocation_history(&connection);
+    connection.close().unwrap();
+}
+
+fn allocation_state(database: &Path) -> BTreeMap<String, i64> {
+    let connection =
+        open_with_flags(database.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let state = connection
+        .query("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_typed::<String>(0).unwrap(),
+                row.get_typed::<i64>(1).unwrap(),
+            )
+        })
+        .collect();
+    connection.close_without_checkpoint().unwrap();
+    state
+}
+
+fn wire_header(archive: &Path) -> Value {
+    let mut line = String::new();
+    BufReader::new(fs::File::open(archive).unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.len() <= RECORD_LIMIT_BYTES);
+    let record: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(record["type"], "header");
+    record["header"].clone()
+}
+
+fn assert_next_allocation(database: &Path, expected_job: i64, expected_usage: i64) {
+    // Reopen through ordinary storage, then exercise the public job API and a
+    // new usage insertion. A matching archive digest alone cannot prove these.
+    let storage = SqliteStorage::open(database).unwrap();
+    let job = storage
+        .upsert_embedding_job("/absent/recovered.db", "new-job", 3)
+        .unwrap();
+    assert_eq!(job, expected_job);
+    storage.start_embedding_job(job).unwrap();
+    storage.complete_embedding_job(job).unwrap();
+    let connection = storage.into_raw();
+    connection
+        .execute(
+            "INSERT INTO token_usage
+                 (message_id, conversation_id, agent_id, timestamp_ms, day_id, role, content_chars)
+             VALUES (10006, 7, 1, 1733000000002, 20057, 'assistant', 23)",
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT id FROM token_usage WHERE message_id = 10006")
+            .unwrap()
+            .get_typed::<i64>(0)
+            .unwrap(),
+        expected_usage
+    );
     connection.close().unwrap();
 }
 
@@ -322,7 +427,7 @@ fn real_binary_large_collection_exports_all_typed_rows_and_verifies_the_backup()
     let before = source_file_digests(&source_directory);
     let input = root.path().join("large-collection.jsonl");
     let exported = export(root.path(), &source, &input);
-    assert_eq!(exported["schema_version"], 2);
+    assert_eq!(exported["schema_version"], 3);
     assert_eq!(exported["tables"]["messages"], COLLECTION_ROWS);
     assert_eq!(exported["integrity_verified"], true);
     assert_eq!(exported["contains_private_data"], true);
@@ -335,7 +440,7 @@ fn real_binary_large_collection_exports_all_typed_rows_and_verifies_the_backup()
             .unwrap(),
     );
     assert_eq!(verified["operation"], "verify");
-    assert_eq!(verified["schema_version"], 2);
+    assert_eq!(verified["schema_version"], 3);
     for field in ["content_sha256", "records", "tables"] {
         assert_eq!(verified[field], exported[field], "{field}");
     }
@@ -356,7 +461,7 @@ fn real_binary_large_collection_exports_all_typed_rows_and_verifies_the_backup()
         let record: Value = serde_json::from_str(&line).unwrap();
         match record["type"].as_str().unwrap() {
             "header" => {
-                assert_eq!(record["header"]["schema_version"], 2);
+                assert_eq!(record["header"]["schema_version"], 3);
                 assert_eq!(record["header"]["contains_private_data"], true);
             }
             "table" => {
@@ -526,6 +631,12 @@ fn real_binary_continued_rows_round_trip_with_bounded_frames_and_identical_bytes
     fs::create_dir(&source_directory).unwrap();
     let source = source_directory.join("agent_search.db");
     collection_fixture(&source);
+    let connection = Connection::open(source.to_str().unwrap()).unwrap();
+    seed_allocation_history(&connection);
+    connection.close().unwrap();
+    let expected_allocation = allocation_state(&source);
+    assert_eq!(expected_allocation["embedding_jobs"], 100);
+    assert_eq!(expected_allocation["token_usage"], 200);
     for raw_payload in [true, false] {
         let case = if raw_payload {
             "raw-payload-and-blob"
@@ -554,7 +665,7 @@ fn real_binary_continued_rows_round_trip_with_bounded_frames_and_identical_bytes
         let before = source_file_digests(&source_directory);
         let input = destination.path().join("continued.jsonl");
         let exported = export(root.path(), &source, &input);
-        assert_eq!(exported["schema_version"], 2);
+        assert_eq!(exported["schema_version"], 3);
         assert_eq!(exported["tables"]["messages"], COLLECTION_ROWS);
         assert_eq!(exported["integrity_verified"], true);
         let verified = receipt(
@@ -564,7 +675,7 @@ fn real_binary_continued_rows_round_trip_with_bounded_frames_and_identical_bytes
                 .output()
                 .unwrap(),
         );
-        assert_eq!(verified["schema_version"], 2);
+        assert_eq!(verified["schema_version"], 3);
         for field in ["content_sha256", "records", "tables"] {
             assert_eq!(verified[field], exported[field], "{case}: {field}");
         }
@@ -585,7 +696,16 @@ fn real_binary_continued_rows_round_trip_with_bounded_frames_and_identical_bytes
                 assert!(line.len() <= RECORD_LIMIT_BYTES, "{case}: oversized frame");
                 let frame: Value = serde_json::from_str(&line).unwrap();
                 match frame["type"].as_str().unwrap() {
-                    "header" => assert_eq!(frame["header"]["schema_version"], 2),
+                    "header" => {
+                        assert_eq!(frame["header"]["schema_version"], 3);
+                        assert_eq!(
+                            frame["header"]["sequences"],
+                            serde_json::json!([
+                                {"table": "embedding_jobs", "value": 100},
+                                {"table": "token_usage", "value": 200}
+                            ])
+                        );
+                    }
                     "table" => table = frame["table"]["name"].as_str().unwrap().to_owned(),
                     "row" if table == "messages" => {
                         message_rows += 1;
@@ -618,7 +738,7 @@ fn real_binary_continued_rows_round_trip_with_bounded_frames_and_identical_bytes
         fs::create_dir(&restored_directory).unwrap();
         let target = restored_directory.join("agent_search.db");
         let imported = receipt(import(root.path(), &input, &target, false));
-        assert_eq!(imported["schema_version"], 2);
+        assert_eq!(imported["schema_version"], 3);
         assert_eq!(imported["destination_status"], "created");
         for field in ["content_sha256", "records", "tables"] {
             assert_eq!(imported[field], exported[field], "{case}: {field}");
@@ -652,18 +772,19 @@ fn real_binary_continued_rows_round_trip_with_bounded_frames_and_identical_bytes
             COLLECTION_ROWS
         );
         connection.close().unwrap();
+        assert_eq!(allocation_state(&target), expected_allocation);
         let reexported = export(
             root.path(),
             &target,
             &destination.path().join("restored.jsonl"),
         );
-        assert_eq!(reexported["schema_version"], 2);
+        assert_eq!(reexported["schema_version"], 3);
         for field in ["content_sha256", "records", "tables"] {
             assert_eq!(reexported[field], exported[field], "{case}: {field}");
         }
         let restored_before = source_file_digests(&restored_directory);
         let repeated = receipt(import(root.path(), &input, &target, true));
-        assert_eq!(repeated["schema_version"], 2);
+        assert_eq!(repeated["schema_version"], 3);
         assert_eq!(repeated["destination_status"], "unchanged");
         assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
         assert_eq!(source_file_digests(&restored_directory), restored_before);
@@ -754,25 +875,30 @@ fn real_binary_late_invalid_text_failure_is_private_and_never_published() {
 }
 
 #[test]
-fn real_binary_v1_round_trip_and_repeat_import_have_truthful_json_receipts() {
+fn real_binary_v3_preserves_deleted_allocation_history_and_next_insertions() {
     let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("source.db");
-    drop(SqliteStorage::open(&source).unwrap());
+    let source_directory = root.path().join("source");
+    let restored_directory = root.path().join("restored");
+    fs::create_dir(&source_directory).unwrap();
+    fs::create_dir(&restored_directory).unwrap();
+    let source = source_directory.join("agent_search.db");
+    allocation_fixture(&source);
+    let expected = allocation_state(&source);
+    assert_eq!(expected["embedding_jobs"], 100);
+    assert_eq!(expected["token_usage"], 200);
+    let source_before = source_file_digests(&source_directory);
     let input = root.path().join("history.jsonl");
     let exported = export(root.path(), &source, &input);
-    assert_eq!(exported["schema_version"], 2);
-    // This empty canonical fixture has only v1-sized ordinary records. Rewrite
-    // its transport header to exercise an actual legacy input; the canonical
-    // completion digest is deliberately identical across the two versions.
-    let bytes = fs::read(&input).unwrap();
-    let header_end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
-    let mut header: Value = serde_json::from_slice(&bytes[..header_end]).unwrap();
-    header["header"]["schema_version"] = Value::from(1);
-    header["header"]["record_types"] = serde_json::json!(["table", "row", "completion"]);
-    let mut legacy = serde_json::to_vec(&header).unwrap();
-    legacy.push(b'\n');
-    legacy.extend_from_slice(&bytes[header_end..]);
-    fs::write(&input, legacy).unwrap();
+    assert_eq!(exported["schema_version"], 3);
+    assert_eq!(exported["tables"]["embedding_jobs"], 1);
+    assert_eq!(exported["tables"]["token_usage"], 1);
+    assert_eq!(
+        wire_header(&input)["sequences"],
+        serde_json::json!([
+            {"table": "embedding_jobs", "value": 100},
+            {"table": "token_usage", "value": 200}
+        ])
+    );
     let verified = receipt(
         command(root.path())
             .args(["archive", "verify"])
@@ -780,29 +906,196 @@ fn real_binary_v1_round_trip_and_repeat_import_have_truthful_json_receipts() {
             .output()
             .unwrap(),
     );
-    assert_eq!(verified["schema_version"], 1);
+    assert_eq!(verified["schema_version"], 3);
     assert_eq!(verified["content_sha256"], exported["content_sha256"]);
-    let target = root.path().join("restored.db");
+    let target = restored_directory.join("agent_search.db");
     let imported = receipt(import(root.path(), &input, &target, false));
-    assert_eq!(imported["schema_version"], 1);
-    assert_eq!(imported["operation"], "import");
+    assert_eq!(imported["schema_version"], 3);
     assert_eq!(imported["destination_status"], "created");
     assert_eq!(imported["content_sha256"], exported["content_sha256"]);
-    assert_eq!(imported["tables"], exported["tables"]);
-    assert_eq!(
-        imported["derived_search_assets"],
-        "omitted_rebuild_required"
-    );
-    let before = fs::read(&target).unwrap();
+    assert_eq!(allocation_state(&target), expected);
+    let before = source_file_digests(&restored_directory);
     let repeated = receipt(import(root.path(), &input, &target, true));
-    assert_eq!(repeated["schema_version"], 1);
+    assert_eq!(repeated["schema_version"], 3);
     assert_eq!(repeated["destination_status"], "unchanged");
     assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
-    assert_eq!(before, fs::read(&target).unwrap());
+    assert_eq!(before, source_file_digests(&restored_directory));
     let after = root.path().join("restored.jsonl");
     let reexported = export(root.path(), &target, &after);
-    assert_eq!(reexported["schema_version"], 2);
+    assert_eq!(reexported["schema_version"], 3);
     assert_eq!(reexported["content_sha256"], exported["content_sha256"]);
+    assert_eq!(
+        wire_header(&after)["sequences"],
+        wire_header(&input)["sequences"]
+    );
+    assert_next_allocation(&target, 101, 201);
+    assert_eq!(source_file_digests(&source_directory), source_before);
+    assert!(!root.path().join("unused-default").exists());
+}
+
+#[test]
+fn real_binary_v3_sequence_only_conflict_is_read_only_and_private() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    allocation_fixture(&source);
+    let input = root.path().join("history.jsonl");
+    let exported = export(root.path(), &source, &input);
+    let restored_directory = root.path().join("restored");
+    fs::create_dir(&restored_directory).unwrap();
+    let target = restored_directory.join("agent_search.db");
+    receipt(import(root.path(), &input, &target, false));
+    let connection = Connection::open(target.to_str().unwrap()).unwrap();
+    assert_eq!(
+        connection
+            .execute("UPDATE sqlite_sequence SET seq = 101 WHERE name = 'embedding_jobs'")
+            .unwrap(),
+        1
+    );
+    connection.close().unwrap();
+    let changed = export(root.path(), &target, &root.path().join("changed.jsonl"));
+    assert_eq!(changed["tables"], exported["tables"]);
+    assert_eq!(changed["records"], exported["records"]);
+    assert_ne!(changed["content_sha256"], exported["content_sha256"]);
+    let before = source_file_digests(&restored_directory);
+    let refused = import(root.path(), &input, &target, true);
+    assert_eq!(refused.status.code(), Some(9));
+    assert!(refused.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "logical-archive-error");
+    assert_eq!(error["error"]["retryable"], false);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflict")
+    );
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    assert!(!diagnostic.contains("PRIVATE-ALLOCATION-DATA"));
+    assert!(!diagnostic.contains("/absent/private/"));
+    assert_eq!(before, source_file_digests(&restored_directory));
+    assert_eq!(allocation_state(&target)["embedding_jobs"], 101);
+}
+
+#[test]
+fn real_binary_v3_distinguishes_empty_missing_and_zero_allocation_state() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    allocation_fixture(&source);
+    let connection = Connection::open(source.to_str().unwrap()).unwrap();
+    connection
+        .execute_batch("DELETE FROM embedding_jobs; DELETE FROM token_usage;")
+        .unwrap();
+    connection.close().unwrap();
+    let mut digests = Vec::new();
+    // Reuse one source so the canonical rows, including migration timestamps,
+    // are identical: any digest change must authenticate allocation state.
+    for case in ["retained", "zero", "absent"] {
+        let directory = root.path().join(case);
+        fs::create_dir(&directory).unwrap();
+        let connection = Connection::open(source.to_str().unwrap()).unwrap();
+        match case {
+            "absent" => {
+                connection.execute("DELETE FROM sqlite_sequence").unwrap();
+            }
+            "zero" => {
+                connection
+                    .execute("UPDATE sqlite_sequence SET seq = 0")
+                    .unwrap();
+            }
+            _ => {}
+        }
+        connection.close().unwrap();
+        let expected = allocation_state(&source);
+        let values = match case {
+            "retained" => (Some(100), Some(200)),
+            "zero" => (Some(0), Some(0)),
+            _ => (None, None),
+        };
+        assert_eq!(expected.get("embedding_jobs").copied(), values.0);
+        assert_eq!(expected.get("token_usage").copied(), values.1);
+        let input = directory.join("history.jsonl");
+        let exported = export(root.path(), &source, &input);
+        assert_eq!(exported["schema_version"], 3);
+        assert_eq!(exported["tables"]["embedding_jobs"], 0);
+        assert_eq!(exported["tables"]["token_usage"], 0);
+        assert_eq!(
+            wire_header(&input)["sequences"],
+            serde_json::json!([
+                {"table": "embedding_jobs", "value": values.0},
+                {"table": "token_usage", "value": values.1}
+            ])
+        );
+        let target = directory.join("restored.db");
+        let imported = receipt(import(root.path(), &input, &target, false));
+        assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+        assert_eq!(allocation_state(&target), expected);
+        let restored = export(root.path(), &target, &directory.join("restored.jsonl"));
+        assert_eq!(restored["content_sha256"], exported["content_sha256"]);
+        digests.push(exported["content_sha256"].clone());
+        assert_next_allocation(
+            &target,
+            if case == "retained" { 101 } else { 1 },
+            if case == "retained" { 201 } else { 1 },
+        );
+    }
+    assert_ne!(digests[0], digests[1]);
+    assert_ne!(digests[0], digests[2]);
+    assert_ne!(digests[1], digests[2]);
+}
+
+#[test]
+fn real_binary_v1_v2_round_trips_keep_their_original_digest_and_omission_contract() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.db");
+    allocation_fixture(&source);
+    let mut legacy_digest = None;
+    for version in [1, 2] {
+        let directory = root.path().join(format!("v{version}"));
+        fs::create_dir(&directory).unwrap();
+        let input = directory.join("history.jsonl");
+        let exported = export_version(root.path(), &source, &input, Some(version));
+        assert_eq!(exported["schema_version"], version);
+        assert!(wire_header(&input).get("sequences").is_none());
+        if let Some(expected) = &legacy_digest {
+            assert_eq!(&exported["content_sha256"], expected);
+        } else {
+            legacy_digest = Some(exported["content_sha256"].clone());
+        }
+        let verified = receipt(
+            command(root.path())
+                .args(["archive", "verify"])
+                .arg(&input)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(verified["schema_version"], version);
+        assert_eq!(verified["content_sha256"], exported["content_sha256"]);
+        let target = directory.join("restored.db");
+        let imported = receipt(import(root.path(), &input, &target, false));
+        assert_eq!(imported["schema_version"], version);
+        assert_eq!(imported["destination_status"], "created");
+        assert_eq!(imported["content_sha256"], exported["content_sha256"]);
+        // The old formats intentionally did not record deleted allocation IDs.
+        assert_eq!(allocation_state(&target)["embedding_jobs"], 2);
+        assert_eq!(allocation_state(&target)["token_usage"], 7);
+        let before = source_file_digests(&directory);
+        let repeated = receipt(import(root.path(), &input, &target, true));
+        assert_eq!(repeated["schema_version"], version);
+        assert_eq!(repeated["destination_status"], "unchanged");
+        assert_eq!(repeated["content_sha256"], exported["content_sha256"]);
+        assert_eq!(before, source_file_digests(&directory));
+        let after = export_version(
+            root.path(),
+            &target,
+            &directory.join("restored-v2.jsonl"),
+            Some(2),
+        );
+        assert_eq!(after["content_sha256"], exported["content_sha256"]);
+        let current = export(root.path(), &target, &directory.join("restored-v3.jsonl"));
+        assert_eq!(current["schema_version"], 3);
+        assert_ne!(current["content_sha256"], exported["content_sha256"]);
+        assert_next_allocation(&target, 3, 8);
+    }
     assert!(!root.path().join("unused-default").exists());
     assert!(!root.path().join("data/cass/models").exists());
 }
@@ -1577,7 +1870,11 @@ fn busy_index_rebuild_retains_a_verified_database_and_identical_retry_finishes()
     assert_eq!(fs::read(&input).unwrap(), input_before);
     let database_before = fs::read(&target).unwrap();
     assert_eq!(
-        export(root.path(), &target, &root.path().join("busy-retained.jsonl"))["content_sha256"],
+        export(
+            root.path(),
+            &target,
+            &root.path().join("busy-retained.jsonl")
+        )["content_sha256"],
         exported["content_sha256"]
     );
 
@@ -1672,7 +1969,11 @@ fn indexed_retry_preserves_database_aliased_by_a_maintenance_file() {
     assert_eq!(fs::read(&alias).unwrap(), before);
     assert_eq!(fs::read(&input).unwrap(), input_before);
     assert_eq!(
-        export(root.path(), &target, &root.path().join("alias-retained.jsonl"))["content_sha256"],
+        export(
+            root.path(),
+            &target,
+            &root.path().join("alias-retained.jsonl")
+        )["content_sha256"],
         exported["content_sha256"]
     );
 }

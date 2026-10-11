@@ -524,6 +524,7 @@ fn restore_reviewed<R: BufRead>(
     schema_marker.finish().map_err(super::integrity_unless_io)?;
 
     drop(statement);
+    super::import::restore_sequences(connection, &inspected.header, &inspected.tables)?;
     for trigger in triggers {
         connection.execute_batch(&trigger).map_err(|error| {
             super::database_failure("cannot reinstate canonical migration triggers", error)
@@ -857,6 +858,7 @@ fn verify_projection_rows(
         cursor.finish()? == (inspected.header.clone(), inspected.completion.clone()),
         "logical archive changed during persisted verification"
     );
+    super::import::verify_sequences(connection, &inspected.header, &inspected.tables)?;
     Ok(())
 }
 
@@ -1065,6 +1067,7 @@ mod tests {
             record_types: codec::record_types(format_version),
             contains_private_data: true,
             omissions: vec!["derived_search_assets".into()],
+            sequences: (format_version == codec::SEQUENCE_VERSION).then(Vec::new),
         }
     }
 
@@ -1627,6 +1630,22 @@ mod tests {
         descriptor_drift: bool,
         carry_added_tables: bool,
     ) -> Result<PathBuf> {
+        versioned_archive_with_format(
+            root,
+            source_version,
+            descriptor_drift,
+            carry_added_tables,
+            codec::VERSION,
+        )
+    }
+
+    fn versioned_archive_with_format(
+        root: &Path,
+        source_version: u32,
+        descriptor_drift: bool,
+        carry_added_tables: bool,
+        format_version: u32,
+    ) -> Result<PathBuf> {
         ensure!(
             target_version()? == REVIEWED_TARGET_VERSION,
             "reviewed migration tests require schema v{REVIEWED_TARGET_VERSION}; update policy before accepting a newer target"
@@ -1641,20 +1660,35 @@ mod tests {
             kind: AgentKind::Cli,
         })?;
         drop(storage);
+        if format_version == codec::SEQUENCE_VERSION {
+            let writer = Connection::open(export::path_text(&source)?)?;
+            writer.execute_batch(
+                "INSERT INTO embedding_jobs (id, db_path, model_id, status) VALUES
+                    (2, 'PRIVATE-RETAINED-JOB', 'fixture', 'completed'),
+                    (100, 'PRIVATE-DELETED-JOB', 'fixture', 'completed');
+                 DELETE FROM embedding_jobs WHERE id = 100;",
+            )?;
+            writer.close()?;
+        }
 
         let connection = export::open_source(&source)?;
         let header = Header {
             format: codec::FORMAT.to_owned(),
-            schema_version: codec::VERSION,
+            schema_version: format_version,
             archive_id: "reviewed-migration".to_owned(),
             exported_at_ms: 1,
             storage_schema_version: source_version.to_string(),
-            record_types: ["table", "row", "completion"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            record_types: codec::record_types(format_version),
             contains_private_data: true,
             omissions: vec!["derived_search_assets".to_owned()],
+            sequences: if format_version == codec::SEQUENCE_VERSION {
+                Some(export::sequences(
+                    &connection,
+                    &export::tables(&connection)?,
+                )?)
+            } else {
+                None
+            },
         };
         let mut validator = Validator::new(header.clone())?;
         let path = root.join(format!("schema-{source_version}.jsonl"));
@@ -1884,6 +1918,68 @@ mod tests {
         assert!(!repeated.created);
         assert!(repeated.migration.is_some());
         assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
+    fn reviewed_v3_migration_preserves_allocation_and_refuses_sequence_only_conflicts() -> Result<()>
+    {
+        for source_version in [20, 21] {
+            let root = tempfile::tempdir()?;
+            let input = versioned_archive_with_format(
+                root.path(),
+                source_version,
+                false,
+                false,
+                codec::SEQUENCE_VERSION,
+            )?;
+            let input_before = fs::read(&input)?;
+            let destination = root.path().join("restored.db");
+            let restored = import_compatible(&input, &destination, "reviewed-migration", false)?;
+            assert!(restored.created);
+            assert_eq!(restored.header.schema_version, codec::SEQUENCE_VERSION);
+            assert_eq!(restored.completion, export::verify_file(&input)?.1);
+            let before = database_files(&destination);
+            let repeated = import_compatible(&input, &destination, "reviewed-migration", true)?;
+            assert!(!repeated.created);
+            assert_eq!(before, database_files(&destination));
+
+            // No canonical row changed. A historical allocation change must
+            // still invalidate the same authenticated migration projection.
+            let writer = Connection::open(export::path_text(&destination)?)?;
+            assert_eq!(
+                writer
+                    .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'embedding_jobs'")?
+                    .get_typed::<i64>(0)?,
+                100
+            );
+            writer.execute("UPDATE sqlite_sequence SET seq = 200 WHERE name = 'embedding_jobs'")?;
+            writer.close()?;
+            let before_conflict = database_files(&destination);
+            let error = import_compatible(&input, &destination, "reviewed-migration", true)
+                .err()
+                .context("sequence-only drift was accepted as an identical migrated archive")?;
+            assert!(error.to_string().contains("allocation history differs"));
+            assert!(!error.to_string().contains("PRIVATE-"));
+            assert_eq!(before_conflict, database_files(&destination));
+            assert_eq!(input_before, fs::read(&input)?);
+
+            // Exercise the normal storage API on a separately restored image,
+            // including opening it under current migration authority.
+            let usable = root.path().join("usable.db");
+            import_compatible(&input, &usable, "reviewed-migration", false)?;
+            let storage = SqliteStorage::open(&usable)?;
+            let next = storage.upsert_embedding_job("after-restore", "fixture", 1)?;
+            assert_eq!(next, 101);
+            storage.start_embedding_job(next)?;
+            assert_eq!(
+                storage
+                    .raw()
+                    .query_row("SELECT status FROM embedding_jobs WHERE id = 101")?
+                    .get_typed::<String>(0)?,
+                "running"
+            );
+        }
         Ok(())
     }
 

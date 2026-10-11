@@ -55,7 +55,12 @@ pub(super) fn verify_existing(
         })? == Some(admitted),
         "restore destination changed before comparison; nothing was replaced"
     );
-    let actual = export::snapshot(&reader, expected.0.archive_id.clone(), &mut io::sink())?;
+    let actual = export::snapshot_for_version(
+        &reader,
+        expected.0.archive_id.clone(),
+        expected.0.schema_version,
+        &mut io::sink(),
+    )?;
     ensure!(
         actual.1 == expected.1,
         "restore conflict: existing canonical data differs from the verified input; nothing was replaced"

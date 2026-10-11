@@ -11,6 +11,7 @@ fn header(version: u32) -> Header {
         record_types: record_types(version),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
+        sequences: (version == SEQUENCE_VERSION).then(Vec::new),
     }
 }
 
@@ -54,7 +55,7 @@ fn streaming_validation_matches_the_independent_v1_digest_oracle() {
 
 #[test]
 fn streaming_and_materialized_validation_have_identical_sizes_and_receipts() {
-    for version in [VERSION, CHUNKED_VERSION] {
+    for version in [VERSION, CHUNKED_VERSION, SEQUENCE_VERSION] {
         let mut streaming = Validator::new(header(version)).unwrap();
         let mut materialized = Validator::new(header(version)).unwrap();
         let mut wire = encode(&Record::Header {

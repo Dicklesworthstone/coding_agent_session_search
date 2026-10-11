@@ -61,6 +61,130 @@ fn export_preserves_every_source_file_and_verifies_published_bytes() {
 }
 
 #[test]
+fn allocation_declarations_ignore_literals_identifiers_comments_and_expressions() {
+    for sql in [
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY /* allocation */ KEY autoincrement)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY ASC ON CONFLICT REPLACE AUTOINCREMENT)",
+        "CREATE TABLE [AUTOINCREMENT] (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+    ] {
+        assert!(declares_autoincrement(sql), "missed declaration: {sql}");
+    }
+    for sql in [
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'AUTOINCREMENT')",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'quote '' AUTOINCREMENT')",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, \"AUTOINCREMENT\" TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, `AUTOINCREMENT` TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, [AUTOINCREMENT] TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY /* AUTOINCREMENT */)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY -- AUTOINCREMENT\n)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY CHECK (id != 'AUTOINCREMENT'))",
+        "CREATE TABLE AUTOINCREMENT (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, prefixAUTOINCREMENT TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, 雪AUTOINCREMENT TEXT)",
+    ] {
+        assert!(!declares_autoincrement(sql), "invented declaration: {sql}");
+    }
+}
+
+fn allocation_fixture() -> Result<Connection> {
+    let connection = Connection::open(":memory:")?;
+    connection.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('schema_version', '9');
+         CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);
+         INSERT INTO jobs VALUES (100, 'deleted private history');
+         DELETE FROM jobs;
+         INSERT INTO jobs VALUES (2, 'remaining private job');
+         CREATE TABLE never_used (id INTEGER PRIMARY KEY AUTOINCREMENT);
+         CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'AUTOINCREMENT');",
+    )?;
+    Ok(connection)
+}
+
+#[test]
+fn export_authenticates_deleted_allocation_history_and_preserves_explicit_state() -> Result<()> {
+    let connection = allocation_fixture()?;
+    let expected = vec![
+        Sequence {
+            table: "jobs".to_owned(),
+            value: Some(100),
+        },
+        Sequence {
+            table: "never_used".to_owned(),
+            value: None,
+        },
+    ];
+    assert_eq!(sequences(&connection, &tables(&connection)?)?, expected);
+    let legacy = snapshot_for_version(
+        &connection,
+        "allocation".to_owned(),
+        codec::CHUNKED_VERSION,
+        &mut io::sink(),
+    )?;
+    assert_eq!(legacy.0.sequences, None);
+    let mut bytes = Vec::new();
+    let original = snapshot(&connection, "allocation".to_owned(), &mut bytes)?;
+    assert_eq!(original.0.schema_version, codec::SEQUENCE_VERSION);
+    assert_eq!(original.0.sequences, Some(expected));
+    assert_eq!(original, codec::verify(&mut bytes.as_slice())?);
+    assert_eq!(original.1.tables["jobs"], 1);
+
+    for value in [0, -7, 200, i64::MIN, i64::MAX] {
+        connection.execute_with_params(
+            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'jobs'",
+            &[SqliteValue::Integer(value)],
+        )?;
+        let changed = snapshot(&connection, "allocation".to_owned(), &mut io::sink())?;
+        assert_eq!(changed.0.sequences.as_ref().unwrap()[0].value, Some(value));
+        assert_eq!(changed.1.tables, original.1.tables);
+        assert_ne!(changed.1.content_sha256, original.1.content_sha256);
+        assert_eq!(
+            snapshot_for_version(
+                &connection,
+                "allocation".to_owned(),
+                codec::CHUNKED_VERSION,
+                &mut io::sink()
+            )?
+            .1,
+            legacy.1,
+            "old formats keep their explicit historical omission semantics"
+        );
+    }
+    connection.execute("DELETE FROM sqlite_sequence WHERE name = 'jobs'")?;
+    let absent = snapshot(&connection, "allocation".to_owned(), &mut io::sink())?;
+    assert_eq!(absent.0.sequences.as_ref().unwrap()[0].value, None);
+    assert_ne!(absent.1.content_sha256, original.1.content_sha256);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn malformed_or_ambiguous_allocation_catalog_cannot_emit_a_backup_prefix() -> Result<()> {
+    for sql in [
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('orphan_private_name', 1)",
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('jobs', 200)",
+        "UPDATE sqlite_sequence SET seq = 'PRIVATE-SEQUENCE-PAYLOAD' WHERE name = 'jobs'",
+        "UPDATE sqlite_sequence SET seq = NULL WHERE name = 'jobs'",
+        "UPDATE sqlite_sequence SET name = X'50524956415445' WHERE name = 'jobs'",
+    ] {
+        let connection = allocation_fixture()?;
+        connection.execute(sql)?;
+        let mut output = Vec::new();
+        let error = snapshot(&connection, "invalid-allocation".to_owned(), &mut output)
+            .expect_err("unsupported allocation state must not be silently discarded");
+        assert!(
+            output.is_empty(),
+            "allocation admission precedes the header write"
+        );
+        assert!(!error.to_string().contains("PRIVATE-SEQUENCE-PAYLOAD"));
+        assert!(!error.to_string().contains("orphan_private_name"));
+        connection.close()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn existing_output_is_never_replaced() {
     let root = tempfile::tempdir().unwrap();
     let output = root.path().join("archive.jsonl");
@@ -368,7 +492,7 @@ fn exact_physical_limit_row_stays_an_ordinary_verified_record() -> Result<()> {
     connection.close()?;
 
     let receipt = export_file(&database, &output, "boundary-archive".to_owned())?;
-    assert_eq!(receipt.0.schema_version, codec::CHUNKED_VERSION);
+    assert_eq!(receipt.0.schema_version, codec::SEQUENCE_VERSION);
     assert_eq!(receipt, verify_file(&output)?);
     assert_eq!(receipt.1.records, 3);
     assert_eq!(receipt.1.tables["messages"], 2);
@@ -547,7 +671,7 @@ fn json_expansion_beyond_one_frame_is_published_and_verified() -> Result<()> {
     let before = contents(source.path());
     let output = destination.path().join("archive.jsonl");
     let receipt = export_file(&database, &output, "encoding-continuation".to_owned())?;
-    assert_eq!(receipt.0.schema_version, codec::CHUNKED_VERSION);
+    assert_eq!(receipt.0.schema_version, codec::SEQUENCE_VERSION);
     assert_eq!(receipt.1.tables["messages"], 2);
     assert_eq!(receipt, verify_file(&output)?);
     let mut input = BufReader::new(File::open(&output)?);
@@ -1144,6 +1268,10 @@ fn wal_writer_committing_during_export_cannot_mix_snapshot_generations() -> Resu
     fixture(&database);
     let writer = Connection::open(path_text(&database)?)?;
     writer.execute("PRAGMA journal_mode = WAL")?;
+    writer.execute_batch(
+        "CREATE TABLE z_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);
+         INSERT INTO z_jobs VALUES (100, 'old allocation generation');",
+    )?;
     let reader = open_source(&database)?;
     let changed = Flag::new(false);
     let mut output = ObservingWriter {
@@ -1161,6 +1289,8 @@ fn wal_writer_committing_during_export_cannot_mix_snapshot_generations() -> Resu
                          UPDATE messages SET body = 'PRIVATE-NEW-GENERATION' WHERE id = 7;
                          INSERT INTO messages VALUES (9, 'PRIVATE-NEW-GENERATION', NULL, NULL);
                          UPDATE meta SET value = '10' WHERE key = 'schema_version';
+                         INSERT INTO z_jobs VALUES (1000, 'PRIVATE-NEW-GENERATION');
+                         DELETE FROM z_jobs;
                          COMMIT;",
                     )
                     .expect(
@@ -1176,11 +1306,20 @@ fn wal_writer_committing_during_export_cannot_mix_snapshot_generations() -> Resu
     );
     assert_eq!(receipt.0.storage_schema_version, "9");
     assert_eq!(receipt.1.tables["messages"], 2);
-    assert_eq!(receipt.1.records, 3);
+    assert_eq!(receipt.1.records, 4);
+    assert_eq!(receipt.1.tables["z_jobs"], 1);
+    assert_eq!(
+        receipt.0.sequences,
+        Some(vec![Sequence {
+            table: "z_jobs".to_owned(),
+            value: Some(100),
+        }])
+    );
     assert_eq!(receipt, codec::verify(&mut output.bytes.as_slice())?);
     assert!(reader.as_async().in_transaction());
     let mut saw_old_body = false;
     let mut saw_old_meta = false;
+    let mut saw_old_job = false;
     for line in output.bytes.split_inclusive(|byte| *byte == b'\n') {
         if let Record::Row { values } = serde_json::from_slice(line)? {
             if values[0] == Cell::Integer(7) {
@@ -1189,10 +1328,16 @@ fn wal_writer_committing_during_export_cannot_mix_snapshot_generations() -> Resu
             } else if values[0] == Cell::Text("schema_version".to_owned()) {
                 assert_eq!(values[1], Cell::Text("9".to_owned()));
                 saw_old_meta = true;
+            } else if values[0] == Cell::Integer(100) {
+                assert_eq!(
+                    values[1],
+                    Cell::Text("old allocation generation".to_owned())
+                );
+                saw_old_job = true;
             }
         }
     }
-    assert!(saw_old_body && saw_old_meta);
+    assert!(saw_old_body && saw_old_meta && saw_old_job);
     assert!(!String::from_utf8_lossy(&output.bytes).contains("PRIVATE-NEW-GENERATION"));
     reader.execute("ROLLBACK")?;
     reader.close_without_checkpoint()?;
@@ -1207,6 +1352,18 @@ fn wal_writer_committing_during_export_cannot_mix_snapshot_generations() -> Resu
             .query_row("SELECT value FROM meta WHERE key = 'schema_version'")?
             .get_typed::<String>(0)?,
         "10"
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT COUNT(*) FROM z_jobs")?
+            .get_typed::<i64>(0)?,
+        0
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'z_jobs'")?
+            .get_typed::<i64>(0)?,
+        1000
     );
     writer.close()?;
     Ok(())

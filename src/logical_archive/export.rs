@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD;
 use coding_agent_search::franken_sync::compat::{OpenFlags, RowExt, open_with_flags};
 use coding_agent_search::franken_sync::{Connection, FrankenError, SqliteValue};
 
-use super::codec::{self, Cell, Completion, Header, Record, Table, Validator};
+use super::codec::{self, Cell, Completion, Header, Record, Sequence, Table, Validator};
 
 // Bound extra I/O memory independently of archive size. The existing codec
 // still enforces its separate 8 MiB per-record limit.
@@ -252,11 +252,241 @@ pub fn tables(connection: &Connection) -> Result<Vec<Table>> {
     Ok(output)
 }
 
+/// Inspect syntax only. A keyword in a quoted identifier, literal, comment or
+/// nested expression is not an allocation declaration. The engine has already
+/// admitted the stored CREATE TABLE; no archived SQL is executed here.
+fn declares_autoincrement(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut position = 0;
+    let mut depth = 0usize;
+    let mut previous: Option<&[u8]> = None;
+    let mut primary_key = false;
+    while position < bytes.len() {
+        match bytes[position] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                previous = None;
+                position += 1;
+                while position < bytes.len() {
+                    if bytes[position] == quote {
+                        position += 1;
+                        if bytes.get(position) != Some(&quote) {
+                            break;
+                        }
+                    }
+                    position += 1;
+                }
+            }
+            b'[' => {
+                previous = None;
+                position += 1;
+                while position < bytes.len() && bytes[position] != b']' {
+                    position += 1;
+                }
+                position += usize::from(position < bytes.len());
+            }
+            b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                position += 2;
+                while position < bytes.len() && bytes[position] != b'\n' {
+                    position += 1;
+                }
+            }
+            b'/' if bytes.get(position + 1) == Some(&b'*') => {
+                position += 2;
+                while position < bytes.len() {
+                    if bytes[position] == b'*' && bytes.get(position + 1) == Some(&b'/') {
+                        position += 2;
+                        break;
+                    }
+                    position += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                previous = None;
+                position += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                previous = None;
+                position += 1;
+            }
+            b',' if depth == 1 => {
+                primary_key = false;
+                previous = None;
+                position += 1;
+            }
+            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 128 => {
+                let start = position;
+                while position < bytes.len()
+                    && (bytes[position].is_ascii_alphanumeric()
+                        || matches!(bytes[position], b'_' | b'$')
+                        || bytes[position] >= 128)
+                {
+                    position += 1;
+                }
+                let token = &bytes[start..position];
+                if depth == 1 {
+                    if token.eq_ignore_ascii_case(b"KEY")
+                        && previous.is_some_and(|word| word.eq_ignore_ascii_case(b"PRIMARY"))
+                    {
+                        primary_key = true;
+                    }
+                    let follows_key = previous.is_some_and(|word| {
+                        [
+                            "KEY", "ASC", "DESC", "ROLLBACK", "ABORT", "FAIL", "IGNORE", "REPLACE",
+                        ]
+                        .iter()
+                        .any(|keyword| word.eq_ignore_ascii_case(keyword.as_bytes()))
+                    });
+                    if primary_key && follows_key && token.eq_ignore_ascii_case(b"AUTOINCREMENT") {
+                        return true;
+                    }
+                    previous = Some(token);
+                }
+            }
+            _ => position += 1,
+        }
+    }
+    false
+}
+
+/// Complete allocation-state inventory for the admitted canonical tables.
+/// One bounded DDL declaration and at most 256 short sequence rows are retained.
+/// Call inside the same read transaction as tables/rows to avoid mixing epochs.
+pub(super) fn sequences(connection: &Connection, tables: &[Table]) -> Result<Vec<Sequence>> {
+    ensure!(
+        tables.len() <= codec::MAX_TABLES,
+        "logical allocation state exceeds 256 tables"
+    );
+    let mut output = Vec::new();
+    for table in tables {
+        table.validate()?;
+        let rows = connection
+            .query_with_params(
+                "SELECT substr(sql, 1, 65537) FROM sqlite_master \
+                 WHERE type = 'table' AND name = ?1 LIMIT 2",
+                &[SqliteValue::Text(table.name.clone().into())],
+            )
+            .map_err(|error| {
+                source_failure(
+                    format!(
+                        "cannot inspect allocation schema for logical table {}",
+                        table.name
+                    ),
+                    error,
+                )
+            })?;
+        ensure!(
+            rows.len() == 1,
+            "logical allocation schema is missing or ambiguous for table {}",
+            table.name
+        );
+        let sql = rows[0].get_typed::<String>(0).map_err(|error| {
+            source_failure(
+                format!(
+                    "cannot decode allocation schema for logical table {}",
+                    table.name
+                ),
+                error,
+            )
+        })?;
+        ensure!(
+            sql.len() <= 65536,
+            "allocation schema for logical table {} exceeds 64 KiB",
+            table.name
+        );
+        if declares_autoincrement(&sql) {
+            ensure!(
+                table.primary_key.len() == 1,
+                "logical allocation table {} requires a single integer primary key",
+                table.name
+            );
+            output.push(Sequence {
+                table: table.name.clone(),
+                value: None,
+            });
+        }
+    }
+    output.sort_by(|left, right| left.table.cmp(&right.table));
+    ensure!(
+        output.windows(2).all(|pair| pair[0].table < pair[1].table),
+        "logical allocation table inventory is ambiguous"
+    );
+    let catalog = connection
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence' LIMIT 2")
+        .map_err(|error| source_failure("cannot inspect logical allocation catalog", error))?;
+    ensure!(
+        catalog.len() <= 1,
+        "logical allocation catalog is ambiguous"
+    );
+    if catalog.is_empty() {
+        ensure!(output.is_empty(), "logical allocation catalog is missing");
+        return Ok(output);
+    }
+    // CASE prevents a malformed value from becoming an arbitrarily large
+    // returned text/blob. Type errors are reported by position, never payload.
+    let rows = connection
+        .query(
+            "SELECT CASE WHEN typeof(name) = 'text' THEN substr(name, 1, 129) END, \
+             CASE WHEN typeof(seq) = 'integer' THEN seq END \
+             FROM sqlite_sequence LIMIT 257",
+        )
+        .map_err(|error| source_failure("cannot read logical allocation state", error))?;
+    ensure!(
+        rows.len() <= codec::MAX_TABLES,
+        "logical allocation catalog exceeds 256 rows"
+    );
+    for (position, row) in rows.into_iter().enumerate() {
+        let name = row.get_typed::<String>(0).map_err(|error| {
+            source_failure(
+                format!(
+                    "cannot decode allocation table at catalog row {}",
+                    position + 1
+                ),
+                error,
+            )
+        })?;
+        ensure!(
+            codec::identifier(&name),
+            "invalid allocation table identifier at catalog row {}",
+            position + 1
+        );
+        let index = output
+            .binary_search_by(|sequence| sequence.table.cmp(&name))
+            .map_err(|_| {
+                anyhow!(
+                    "unrecognized allocation table at catalog row {}",
+                    position + 1
+                )
+            })?;
+        let sequence = &mut output[index];
+        ensure!(
+            sequence.value.is_none(),
+            "duplicate logical allocation state for table {}",
+            sequence.table
+        );
+        let value = row.get_typed::<i64>(1).map_err(|error| {
+            source_failure(
+                format!(
+                    "cannot decode integer allocation state for logical table {}",
+                    sequence.table
+                ),
+                error,
+            )
+        })?;
+        // SQLite permits explicit signed-integer sequence edits. Preserve the
+        // value, including zero, negative values and i64::MAX, without guessing
+        // a next ID or normalizing an operator's deliberate allocation state.
+        sequence.value = Some(value);
+    }
+    Ok(output)
+}
+
 fn row_limit(format_version: u32) -> Result<usize> {
     match format_version {
         codec::VERSION => Ok(codec::MAX_RECORD_BYTES),
-        codec::CHUNKED_VERSION => Ok(codec::MAX_ROW_BYTES),
-        _ => Err(super::ArchiveUsageError("--format-version must be 1 or 2".into()).into()),
+        codec::CHUNKED_VERSION | codec::SEQUENCE_VERSION => Ok(codec::MAX_ROW_BYTES),
+        _ => Err(super::ArchiveUsageError("--format-version must be 1, 2 or 3".into()).into()),
     }
 }
 
@@ -432,10 +662,10 @@ pub fn snapshot(
     archive_id: String,
     output: &mut impl Write,
 ) -> Result<(Header, Completion)> {
-    snapshot_for_version(connection, archive_id, codec::CHUNKED_VERSION, output)
+    snapshot_for_version(connection, archive_id, codec::SEQUENCE_VERSION, output)
 }
 
-fn snapshot_for_version(
+pub(super) fn snapshot_for_version(
     connection: &Connection,
     archive_id: String,
     format_version: u32,
@@ -452,6 +682,11 @@ fn snapshot_for_version(
         record_types: codec::record_types(format_version),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
+        sequences: if format_version == codec::SEQUENCE_VERSION {
+            Some(sequences(connection, &tables)?)
+        } else {
+            None
+        },
     };
     let mut validator = Validator::new(header.clone())?;
     output
@@ -546,7 +781,7 @@ fn buffered_snapshot(
     archive_id: String,
     output: &mut impl Write,
 ) -> Result<(Header, Completion)> {
-    buffered_snapshot_for_version(connection, archive_id, codec::CHUNKED_VERSION, output)
+    buffered_snapshot_for_version(connection, archive_id, codec::SEQUENCE_VERSION, output)
 }
 
 fn buffered_snapshot_for_version(
@@ -560,7 +795,7 @@ fn buffered_snapshot_for_version(
     // discard buffered bytes rather than letting Drop silently retry a failed
     // write or flush an abandoned prefix. Publication remains export_file's
     // responsibility, after sync and read-back verification.
-    let result = if format_version == codec::CHUNKED_VERSION {
+    let result = if format_version == codec::SEQUENCE_VERSION {
         snapshot(connection, archive_id, &mut buffered)
     } else {
         snapshot_for_version(connection, archive_id, format_version, &mut buffered)
@@ -574,7 +809,7 @@ pub fn export_file(
     destination: &Path,
     archive_id: String,
 ) -> Result<(Header, Completion)> {
-    export_file_for_version(source, destination, archive_id, codec::CHUNKED_VERSION)
+    export_file_for_version(source, destination, archive_id, codec::SEQUENCE_VERSION)
 }
 
 pub(super) fn export_file_for_version(
@@ -593,7 +828,7 @@ pub(super) fn export_file_for_version(
     let connection = open_source(source)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent(destination)?)
         .map_err(|error| io_failure("cannot create staged logical archive", error))?;
-    let result = if format_version == codec::CHUNKED_VERSION {
+    let result = if format_version == codec::SEQUENCE_VERSION {
         buffered_snapshot(&connection, archive_id, &mut temporary)?
     } else {
         buffered_snapshot_for_version(&connection, archive_id, format_version, &mut temporary)?

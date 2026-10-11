@@ -463,6 +463,7 @@ fn restore<R: BufRead>(
     );
     // Release the final prepared program before restoring schema objects.
     drop(statement);
+    restore_sequences(connection, &result.0, &expected)?;
     for statement in triggers {
         connection.execute_batch(&statement).map_err(|error| {
             super::database_failure("cannot reinstate canonical restore triggers", error)
@@ -473,6 +474,82 @@ fn restore<R: BufRead>(
         super::database_failure("cannot commit the verified private restore database", error)
     })?;
     Ok(result)
+}
+
+/// Allocation history is canonical state even when the row which advanced it
+/// has been deleted. Install it only after replay: ordinary INSERTs would
+/// otherwise advance or recreate the saved entries. All writes remain inside
+/// the final private restore transaction, after input completion was verified.
+pub(super) fn restore_sequences(
+    connection: &Connection,
+    header: &Header,
+    tables: &[Table],
+) -> Result<()> {
+    let Some(expected) = &header.sequences else {
+        // Legacy v1/v2 archives never carried allocation history. Their
+        // original restoration and digest contract cannot reconstruct it.
+        return Ok(());
+    };
+    let actual = export::sequences(connection, tables)?;
+    ensure!(
+        actual
+            .iter()
+            .map(|sequence| &sequence.table)
+            .eq(expected.iter().map(|sequence| &sequence.table)),
+        "logical archive AUTOINCREMENT table inventory does not match the canonical schema"
+    );
+    for sequence in expected {
+        let name = SqliteValue::Text(sequence.table.clone().into());
+        connection
+            .execute_with_params(
+                "DELETE FROM sqlite_sequence WHERE name = ?1",
+                std::slice::from_ref(&name),
+            )
+            .map_err(|error| {
+                super::database_failure(
+                    format!(
+                        "cannot clear private allocation history for logical table {}",
+                        sequence.table
+                    ),
+                    error,
+                )
+            })?;
+        if let Some(value) = sequence.value {
+            connection
+                .execute_with_params(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                    &[name, SqliteValue::Integer(value)],
+                )
+                .map_err(|error| {
+                    super::database_failure(
+                        format!(
+                            "cannot restore private allocation history for logical table {}",
+                            sequence.table
+                        ),
+                        error,
+                    )
+                })?;
+        }
+    }
+    verify_sequences(connection, header, tables)
+}
+
+/// Shared by exact restoration and reviewed migration. A migrated row
+/// projection must also compare allocation state; equal live rows alone are
+/// insufficient to authorize an identical retry.
+pub(super) fn verify_sequences(
+    connection: &Connection,
+    header: &Header,
+    tables: &[Table],
+) -> Result<()> {
+    if let Some(expected) = &header.sequences {
+        let actual = export::sequences(connection, tables)?;
+        ensure!(
+            actual == *expected,
+            "restore conflict: canonical AUTOINCREMENT allocation history differs from the verified archive"
+        );
+    }
+    Ok(())
 }
 
 pub fn import_file(
@@ -652,7 +729,12 @@ fn import_open_file(
     let reader = export::open_source(&candidate)?;
     verify_schema_authority(&reader, &result.0.storage_schema_version)?;
     verify_database(&reader)?;
-    let actual = export::snapshot(&reader, result.0.archive_id.clone(), &mut io::sink())?;
+    let actual = export::snapshot_for_version(
+        &reader,
+        result.0.archive_id.clone(),
+        result.0.schema_version,
+        &mut io::sink(),
+    )?;
     reader.execute("ROLLBACK").map_err(|error| {
         super::database_failure(
             "cannot release the restored database verification snapshot",

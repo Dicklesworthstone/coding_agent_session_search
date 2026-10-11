@@ -60,9 +60,9 @@ enum Operation {
         /// Acknowledge that full session bodies and metadata are exported.
         #[arg(long)]
         include_private: bool,
-        /// Wire version: 2 supports large rows; 1 targets older backup readers.
-        /// Version 1 refuses rows beyond 8 MiB instead of truncating them.
-        #[arg(long, default_value_t = codec::CHUNKED_VERSION, value_parser = clap::value_parser!(u32).range(1..=2))]
+        /// Wire version: 3 preserves allocation history and supports large rows.
+        /// Legacy 1/2 omit allocation history; 1 also limits rows to 8 MiB.
+        #[arg(long, default_value_t = codec::SEQUENCE_VERSION, value_parser = clap::value_parser!(u32).range(1..=3))]
         format_version: u32,
     },
     /// Verify framing, identities, counts and digest without opening a database.
@@ -412,7 +412,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
                         "export requires an explicit --db or --data-dir (or CASS_DATA_DIR)".into(),
                     )
                 })?;
-            let (header, completion) = if format_version == codec::CHUNKED_VERSION {
+            let (header, completion) = if format_version == codec::SEQUENCE_VERSION {
                 export::export_file(&source, &output, archive_id)?
             } else {
                 export::export_file_for_version(&source, &output, archive_id, format_version)?

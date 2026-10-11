@@ -722,6 +722,7 @@ mod tests {
             record_types: codec::record_types(version),
             contains_private_data: true,
             omissions: vec!["derived_search_assets".into()],
+            sequences: (version == codec::SEQUENCE_VERSION).then(Vec::new),
         };
         let mut bytes = codec::encode(&Record::Header {
             header: header.clone(),
@@ -742,7 +743,11 @@ mod tests {
 
     #[test]
     fn search_and_view_receipts_report_the_verified_wire_version() {
-        for version in [codec::VERSION, codec::CHUNKED_VERSION] {
+        for version in [
+            codec::VERSION,
+            codec::CHUNKED_VERSION,
+            codec::SEQUENCE_VERSION,
+        ] {
             let bytes = wire_version(records(), version);
             let search = search_stream(&mut Cursor::new(&bytes), "needle", 2, None).unwrap();
             assert_eq!(search["schema_version"], version);

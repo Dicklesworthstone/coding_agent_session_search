@@ -11,6 +11,7 @@ fn header() -> Header {
         record_types: ["table", "row", "completion"].map(str::to_owned).to_vec(),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
+        sequences: None,
     }
 }
 
@@ -57,6 +58,149 @@ fn complete_archive_round_trips_and_preserves_unicode() {
         matches!(read_record(&mut reader, 3).unwrap(), Some(Record::Row { values })
         if values == vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())])
     );
+}
+
+#[test]
+fn legacy_headers_and_digest_remain_byte_compatible_without_sequence_metadata() {
+    for version in [VERSION, CHUNKED_VERSION] {
+        let mut input_header = header();
+        input_header.schema_version = version;
+        input_header.record_types = record_types(version);
+        let bytes = archive(
+            input_header,
+            vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())],
+        );
+        let first_line = bytes.split(|byte| *byte == b'\n').next().unwrap();
+        assert!(
+            !first_line
+                .windows(b"sequences".len())
+                .any(|part| part == b"sequences")
+        );
+        let (got, completion) = verify(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(got.sequences, None);
+        // Independent canonical-v1 fixture: timestamp 0, one messages row.
+        assert_eq!(
+            completion.content_sha256,
+            "cc479f79dd8d5edb3af938722254d954846d29b37580c41c17ea2f5af95b963e"
+        );
+    }
+}
+
+fn sequence_header(value: Option<i64>) -> Header {
+    let mut header = header();
+    header.schema_version = SEQUENCE_VERSION;
+    header.record_types = record_types(SEQUENCE_VERSION);
+    header.sequences = Some(vec![Sequence {
+        table: "messages".to_owned(),
+        value,
+    }]);
+    header
+}
+
+#[test]
+fn allocation_state_is_authenticated_including_absence_and_signed_extremes() {
+    let mut digests = std::collections::BTreeSet::new();
+    for value in [
+        None,
+        Some(0),
+        Some(-7),
+        Some(9001),
+        Some(i64::MIN),
+        Some(i64::MAX),
+    ] {
+        let expected_header = sequence_header(value);
+        let bytes = archive(expected_header.clone(), vec![Cell::Integer(7), Cell::Null]);
+        let (got, completion) = verify(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(got, expected_header);
+        assert!(digests.insert(completion.content_sha256.clone()));
+
+        let first_newline = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let mut changed = expected_header;
+        changed.sequences.as_mut().unwrap()[0].value = Some(42);
+        let mut tampered = encode(&Record::Header { header: changed }).unwrap();
+        tampered.extend_from_slice(&bytes[first_newline..]);
+        assert!(verify(&mut Cursor::new(tampered)).is_err());
+    }
+    let legacy = verify(&mut Cursor::new(archive(
+        header(),
+        vec![Cell::Integer(7), Cell::Null],
+    )))
+    .unwrap()
+    .1;
+    assert!(!digests.contains(&legacy.content_sha256));
+}
+
+#[test]
+fn allocation_inventory_rejects_undeclared_or_ambiguous_state_before_use() {
+    let mut missing = sequence_header(None);
+    missing.sequences = None;
+    assert!(Validator::new(missing).is_err());
+    for version in [VERSION, CHUNKED_VERSION] {
+        let mut legacy = sequence_header(None);
+        legacy.schema_version = version;
+        legacy.record_types = record_types(version);
+        assert!(Validator::new(legacy).is_err());
+    }
+    for names in [
+        vec!["messages", "messages"],
+        vec!["z", "a"],
+        vec!["PRIVATE-INVALID-IDENTIFIER"],
+    ] {
+        let mut input_header = sequence_header(None);
+        input_header.sequences = Some(
+            names
+                .into_iter()
+                .map(|name| Sequence {
+                    table: name.to_owned(),
+                    value: None,
+                })
+                .collect(),
+        );
+        let error = Validator::new(input_header).err().unwrap();
+        assert!(!error.to_string().contains("PRIVATE-INVALID-IDENTIFIER"));
+    }
+    let mut too_many = sequence_header(None);
+    too_many.sequences = Some(
+        (0..=MAX_TABLES)
+            .map(|index| Sequence {
+                table: format!("t{index:03}"),
+                value: None,
+            })
+            .collect(),
+    );
+    assert!(Validator::new(too_many).is_err());
+}
+
+#[test]
+fn allocation_tables_must_be_present_and_have_integer_single_keys() {
+    let mut composite = table();
+    composite.primary_key = vec![0, 1];
+    let mut validator = Validator::new(sequence_header(None)).unwrap();
+    assert!(validator.push(&Record::Table { table: composite }).is_err());
+    validator.push(&Record::Table { table: table() }).unwrap();
+    assert!(
+        validator
+            .push(&Record::Row {
+                values: vec![Cell::Text("PRIVATE-KEY".to_owned()), Cell::Null],
+            })
+            .is_err()
+    );
+    assert_eq!(validator.completion().records, 0);
+    validator
+        .push(&Record::Row {
+            values: vec![Cell::Integer(7), Cell::Null],
+        })
+        .unwrap();
+    let completion = validator.completion();
+    validator.push(&Record::Completion { completion }).unwrap();
+    validator.finish().unwrap();
+
+    let mut validator = Validator::new(sequence_header(None)).unwrap();
+    let mut other = table();
+    other.name = "other".to_owned();
+    validator.push(&Record::Table { table: other }).unwrap();
+    let completion = validator.completion();
+    assert!(validator.push(&Record::Completion { completion }).is_err());
 }
 
 #[test]

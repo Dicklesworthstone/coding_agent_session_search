@@ -13,6 +13,7 @@ fn fixture(version: u32, large: bool, empty: bool) -> (Vec<u8>, String, Vec<Reco
         record_types: codec::record_types(version),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".into()],
+        sequences: (version == codec::SEQUENCE_VERSION).then(Vec::new),
     };
     let table = |name: &str, columns: &[&str]| Record::Table {
         table: Table {
@@ -97,8 +98,12 @@ fn assert_integrity(error: anyhow::Error) {
 }
 
 #[test]
-fn recovers_all_typed_fields_and_only_the_selected_conversation_for_both_versions() {
-    for version in [codec::VERSION, codec::CHUNKED_VERSION] {
+fn recovers_all_typed_fields_and_only_the_selected_conversation_for_all_versions() {
+    for version in [
+        codec::VERSION,
+        codec::CHUNKED_VERSION,
+        codec::SEQUENCE_VERSION,
+    ] {
         let (source, digest, expected) = fixture(version, false, false);
         let root = tempfile::tempdir().unwrap();
         let input = root.path().join("backup.jsonl");

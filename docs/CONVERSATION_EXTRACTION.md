@@ -55,6 +55,12 @@ The first JSONL record has `type: "conversation_extract"`,
 original `source_header`, expected `source_content_sha256`, conversation ID,
 `row_transport: "cass.logical_archive.v2"`, and `restorable_as_archive: false`.
 
+Source backups may use logical-archive version 1, 2 or 3. A v3 source header,
+including its authenticated AUTOINCREMENT inventory, is retained as provenance.
+The excerpt does not install that allocation state or include the other
+canonical tables needed for a full database restore. Its `row_transport` remains
+v2 because version 3 uses the same bounded row and continuation encoding.
+
 Following records use the logical-archive typed `table` and `row` definitions.
 A large row uses the existing v2 `row_start`, numbered `row_chunk`, `row_end`
 transport with its row checksum. Each physical frame fits within 8 MiB; the

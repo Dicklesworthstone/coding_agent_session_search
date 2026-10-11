@@ -22,7 +22,7 @@ fn fixture(body: &str) -> Connection {
 }
 
 #[test]
-fn v2_exports_json_expansion_that_v1_refuses_without_shortening_the_row() -> Result<()> {
+fn continued_formats_preserve_json_expansion_that_v1_refuses() -> Result<()> {
     let body = format!(
         "PRIVATE-CONTINUED-ROW{}",
         "\0".repeat(codec::MAX_RECORD_BYTES / 6 + 1)
@@ -38,45 +38,43 @@ fn v2_exports_json_expansion_that_v1_refuses_without_shortening_the_row() -> Res
         )
         .is_err()
     );
-    let mut bytes = Vec::new();
-    let receipt = snapshot_for_version(
-        &connection,
-        "bounded-export".into(),
-        codec::CHUNKED_VERSION,
-        &mut bytes,
-    )?;
-    assert_eq!(receipt.0.schema_version, 2);
-    assert_eq!(receipt.1.tables["messages"], 1);
-    assert_eq!(codec::verify(&mut bytes.as_slice())?, receipt);
-    assert!(
-        bytes
-            .split_inclusive(|byte| *byte == b'\n')
-            .all(|frame| frame.len() <= codec::MAX_RECORD_BYTES)
-    );
-    let mut input = bytes.as_slice();
-    let mut found = false;
-    let mut position = 1;
-    while let Some(record) = codec::read_record(&mut input, position)? {
-        if let Record::Row { values } = &record
-            && values.first() == Some(&Cell::Integer(7))
-        {
-            assert_eq!(values[1], Cell::Text(body.clone()));
-            assert_eq!(values[2], Cell::Blob("AP+A".into()));
-            assert!(
-                codec::encode(&record).is_err(),
-                "the v1 frame limit must stay unchanged"
-            );
-            found = true;
+    for version in [codec::CHUNKED_VERSION, codec::SEQUENCE_VERSION] {
+        let mut bytes = Vec::new();
+        let receipt =
+            snapshot_for_version(&connection, "bounded-export".into(), version, &mut bytes)?;
+        assert_eq!(receipt.0.schema_version, version);
+        assert_eq!(receipt.1.tables["messages"], 1);
+        assert_eq!(codec::verify(&mut bytes.as_slice())?, receipt);
+        assert!(
+            bytes
+                .split_inclusive(|byte| *byte == b'\n')
+                .all(|frame| frame.len() <= codec::MAX_RECORD_BYTES)
+        );
+        let mut input = bytes.as_slice();
+        let mut found = false;
+        let mut position = 1;
+        while let Some(record) = codec::read_record(&mut input, position)? {
+            if let Record::Row { values } = &record
+                && values.first() == Some(&Cell::Integer(7))
+            {
+                assert_eq!(values[1], Cell::Text(body.clone()));
+                assert_eq!(values[2], Cell::Blob("AP+A".into()));
+                assert!(
+                    codec::encode(&record).is_err(),
+                    "the v1 frame limit must stay unchanged"
+                );
+                found = true;
+            }
+            position += 1;
         }
-        position += 1;
+        assert!(found, "an oversized canonical row must not disappear");
     }
-    assert!(found, "an oversized canonical row must not disappear");
     connection.close()?;
     Ok(())
 }
 
 #[test]
-fn v2_failed_chunk_output_keeps_io_class_and_does_not_retry_on_drop() -> Result<()> {
+fn continued_formats_keep_chunk_io_failure_class_and_do_not_retry_on_drop() -> Result<()> {
     struct Fails {
         writes: usize,
     }
@@ -97,23 +95,21 @@ fn v2_failed_chunk_output_keeps_io_class_and_does_not_retry_on_drop() -> Result<
         }
     }
     let connection = fixture(&"x".repeat(codec::MAX_RECORD_BYTES + 1));
-    let mut output = Fails { writes: 0 };
-    let error = buffered_snapshot_for_version(
-        &connection,
-        "failed-chunk".into(),
-        codec::CHUNKED_VERSION,
-        &mut output,
-    )
-    .expect_err("a failed chunk write must not produce a completion receipt");
-    assert_eq!(
-        super::super::classify_failure(&error),
-        (14, "logical-archive-io", true)
-    );
-    assert_eq!(
-        output.writes, 2,
-        "Drop must not silently retry the failed write"
-    );
-    assert!(!error.to_string().contains("PRIVATE-SINK-DETAIL"));
+    for version in [codec::CHUNKED_VERSION, codec::SEQUENCE_VERSION] {
+        let mut output = Fails { writes: 0 };
+        let error =
+            buffered_snapshot_for_version(&connection, "failed-chunk".into(), version, &mut output)
+                .expect_err("a failed chunk write must not produce a completion receipt");
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (14, "logical-archive-io", true)
+        );
+        assert_eq!(
+            output.writes, 2,
+            "Drop must not silently retry the failed write"
+        );
+        assert!(!error.to_string().contains("PRIVATE-SINK-DETAIL"));
+    }
     connection.close()?;
     Ok(())
 }
@@ -126,7 +122,7 @@ fn unsupported_export_format_is_refused_before_creating_files() {
         &root.path().join("missing.db"),
         &output,
         "invalid-format".into(),
-        3,
+        4,
     )
     .unwrap_err();
     assert_eq!(

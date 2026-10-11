@@ -16,25 +16,38 @@ identity, acknowledgement of private content, and a **new** output path. Reuse
 that identity for subsequent exports of the same archive. Do not use a pathname
 as identity. Receipts are JSON on stdout; failures are JSON on stderr.
 
-Current exports default to **wire format version 2**. This binary also reads, verifies
-and restores version 1 backups with their original limits. Version 2 supports a
-complete encoded logical row up to 256 MiB by splitting large rows into physical
-JSONL frames of at most 8 MiB each. An older binary that supports only version 1
-refuses version 2 backups, including those containing only small rows; use a
-version 2 reader for new exports. The receipt's `schema_version` reports the
-version of the archive actually exported or read. The header's separate
-`storage_schema_version` identifies the canonical database schema. Use
-`--format-version 1` when an older reader is required and every encoded row fits
-within 8 MiB; an oversized row is refused without publishing a partial archive.
-`--format-version 2` explicitly selects the default large-row transport.
+Current exports default to **wire format version 3**, which preserves the
+database's AUTOINCREMENT allocation history as well as its canonical rows.
+Versions 2 and 3 support a complete encoded logical row up to 256 MiB by splitting
+large rows into physical JSONL frames of at most 8 MiB each. This binary also
+reads, verifies and restores versions 1 and 2 under their original contracts.
+
+| Export selection | Complete encoded row limit | Allocation history |
+|---|---|---|
+| Default, or `--format-version 3` | 256 MiB | Preserved and authenticated |
+| `--format-version 2` | 256 MiB | Omitted under the original v2 contract |
+| `--format-version 1` | 8 MiB | Omitted under the original v1 contract |
+
+Every version keeps the 8 MiB physical-frame limit. Use an explicit legacy
+version only when required by an older reader. It cannot preserve the historical
+AUTOINCREMENT state of deleted rows; restoring that archive can reuse their IDs.
+Legacy verification and identical-import comparisons retain their original
+digests, which do not check allocation history. A binary without v3 support
+refuses a v3 archive even when all its rows are small. The receipt's
+`schema_version` reports the wire version actually exported or read; the header's
+separate `storage_schema_version` identifies the canonical database schema.
+An oversized row is refused without publishing a partial archive.
 
 Export opens FrankenSQLite read-only and holds one transaction across schema
-inspection and all table scans. It does not migrate, repair, checkpoint, acquire
-models, or update source export metadata. Physical logical tables are streamed
-one row at a time; the known derived `fts_messages` virtual table and its exact
-FTS5 shadow names, and SQLite internal tables, are omitted. Other prefix-sharing
-tables are not discarded. Unknown virtual tables and unkeyed tables are refused
-rather than silently losing data. Unsupported identifiers, key types, and rows
+inspection, allocation-state capture and all table scans. It does not migrate,
+repair, checkpoint, acquire models, or update source export metadata. Physical
+logical tables are streamed one row at a time. The known derived `fts_messages`
+virtual table, its exact FTS5 shadow names, and SQLite internal tables are omitted
+from the table stream.
+Version 3 separately records the `sqlite_sequence` state of every declared
+AUTOINCREMENT table in its bounded header. Other prefix-sharing tables are not
+discarded. Unknown virtual tables and unkeyed tables are refused rather than
+silently losing data. Unsupported identifiers, key types, and rows
 exceeding the 256 MiB encoded logical-row limit are refused explicitly. Export
 never truncates them or substitutes references to external provider files.
 
@@ -198,6 +211,15 @@ commits are never exposed as a valid partial restore: the complete stream,
 footer, counts, digest, canonical schema metadata, foreign keys and database
 integrity must all pass first.
 
+Version 3 also checks the header's AUTOINCREMENT-table inventory against the
+canonical schema. After all rows are replayed, it installs their authenticated
+allocation state inside the private database: a saved integer remains exact,
+and an absent `sqlite_sequence` row remains absent. This happens after row
+insertion because inserting explicit IDs can advance those counters. In
+particular, deleting a highest ID or emptying a table before export does not
+reset future allocations after restore. Versions 1 and 2 cannot supply that
+history and retain their original row-only restoration contract.
+
 Before publication or an identical-retry success, the migration ledger and
 `meta.schema_version` must agree with the admitted storage version. Every active
 initializer migration through that version must have a ledger entry: ordinary
@@ -231,8 +253,9 @@ and its sidecars and the separate publication image during restoration.
 
 Import rejects content-bearing sidecars beside the image, closes the writer,
 then reopens that image read-only. It checks persisted foreign keys and integrity
-and re-exports the actual typed rows to a digest sink. Its digest must equal the
-input completion. This catches storage-affinity conversions, missing writes and
+and re-exports the actual typed rows, plus v3 allocation state, to a digest sink
+using the input's admitted wire version. Its digest must equal the input
+completion. This catches storage-affinity conversions, missing writes and
 schema side effects that input-only verification would miss. Sidecar absence is
 checked again after closing the reader. Only this synced image is published,
 using a same-filesystem hard link that cannot replace an existing destination;
@@ -459,7 +482,45 @@ continued using a different snapshot. Corruption, constraint violations,
 database capacity limits and ambiguous multi-process consistency failures stay
 nonretryable. Engine error strings do not determine the classification.
 
-## Version 2 wire contract
+## Version 3 allocation-state contract
+
+Version 3 has `schema_version: 3` and uses the version 2 row and continuation
+transport below. Its header additionally requires `sequences`, a sorted list
+with exactly one entry for each declared AUTOINCREMENT table. The current
+canonical schema declares `embedding_jobs` and `token_usage`:
+
+```json
+{
+  "sequences": [
+    {"table": "embedding_jobs", "value": 100},
+    {"table": "token_usage", "value": null}
+  ]
+}
+```
+
+An integer is the exact signed 64-bit `sqlite_sequence.seq` value. `null` means
+the table has no `sqlite_sequence` row; it is distinct from a present row whose
+counter is zero. It does not represent a SQL NULL counter. Missing, duplicate,
+unordered, unknown-table or unsupported counter entries are refused. The list
+is bounded by the 256-table schema limit and uses the same bounded identifiers;
+capture and restoration do not retain an archive-sized allocation inventory.
+These entries are header metadata, so they do not increase table-row or total-row
+counts. They are captured in the same read transaction as the canonical rows.
+
+The v3 digest starts with `cass.logical_archive.v3\0`. It hashes the canonical
+header, including every sequence entry and absence marker, with only its export
+timestamp normalized to zero, followed by canonical table and row records.
+Allocation-state changes therefore change the digest even when all live rows
+and their counts are identical. Persisted-image verification, identical retries
+and reviewed migrations check this state before reporting success. A
+sequence-only conflict never authorizes an update to an existing destination.
+
+Versions 1 and 2 omit this header field and retain their original shared digest
+domain and row-only meaning. Their old digests are unchanged. A v3 digest is
+deliberately different and must not be compared directly with a legacy digest
+as though both authenticated the same state.
+
+## Version 2 row transport, also used by version 3
 
 Version 2 exports have `schema_version: 2` and declare these `record_types`, in order:
 `table`, `row`, `row_start`, `row_chunk`, `row_end`, `completion`. The header,
@@ -507,12 +568,13 @@ are not a promise of a 256 MiB whole-process memory ceiling.
 
 A continuation group contributes **one logical row** to table and archive
 counts. The completion digest covers canonical reconstructed rows, not the
-continuation envelopes. For hashing, both versions use the version 1 domain and
+continuation envelopes. For hashing, versions 1 and 2 use the version 1 domain and
 normalize the header's wire version and record-type list to version 1, with its
 timestamp set to zero. Equal logical content under the same archive identity
-therefore retains the same digest across versions. Each group's checksum is an
-additional consistency check; it does not replace the final archive completion
-or provide a signature. Restore, repeated-import comparison, search and view
+therefore retains the same digest across those two versions. Version 3 also
+authenticates allocation history using its separate domain above. Each group's
+checksum is an additional consistency check; it does not replace the final
+archive completion or provide a signature. Restore, repeated-import comparison, search and view
 consume the reconstructed row through the same validation path.
 
 ## Version 1 wire contract

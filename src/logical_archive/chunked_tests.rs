@@ -38,6 +38,7 @@ fn header(version: u32) -> Header {
         record_types: codec::record_types(version),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
+        sequences: (version == codec::SEQUENCE_VERSION).then(Vec::new),
     }
 }
 
@@ -135,21 +136,23 @@ fn chunked_unicode_and_blob_are_byte_exact_and_each_frame_is_bounded() {
 #[test]
 fn continuation_group_is_one_logical_row_and_leaves_the_next_record_unread() {
     let row: Record = serde_json::from_slice(row_bytes()).unwrap();
-    let (bytes, expected) = archive(codec::CHUNKED_VERSION, &row);
-    let (header, completion) = codec::verify(&mut Cursor::new(&bytes)).unwrap();
-    assert_eq!(header.schema_version, codec::CHUNKED_VERSION);
-    assert_eq!(completion, expected);
-    assert_eq!(completion.records, 1);
-    assert_eq!(completion.tables["messages"], 1);
-    let mut reader = Cursor::new(&bytes);
-    for position in 1..=3 {
-        assert!(codec::read_record(&mut reader, position).unwrap().is_some());
+    for version in [codec::CHUNKED_VERSION, codec::SEQUENCE_VERSION] {
+        let (bytes, expected) = archive(version, &row);
+        let (header, completion) = codec::verify(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(header.schema_version, version);
+        assert_eq!(completion, expected);
+        assert_eq!(completion.records, 1);
+        assert_eq!(completion.tables["messages"], 1);
+        let mut reader = Cursor::new(&bytes);
+        for position in 1..=3 {
+            assert!(codec::read_record(&mut reader, position).unwrap().is_some());
+        }
+        assert!(matches!(
+            codec::read_record(&mut reader, 4).unwrap(),
+            Some(Record::Completion { .. })
+        ));
+        assert!(codec::read_record(&mut reader, 5).unwrap().is_none());
     }
-    assert!(matches!(
-        codec::read_record(&mut reader, 4).unwrap(),
-        Some(Record::Completion { .. })
-    ));
-    assert!(codec::read_record(&mut reader, 5).unwrap().is_none());
 }
 
 #[test]

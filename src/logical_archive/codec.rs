@@ -17,6 +17,9 @@ pub const FORMAT: &str = "cass.logical_archive";
 /// Version 1 remains readable, with its original per-row limit and digest.
 pub const VERSION: u32 = 1;
 pub const CHUNKED_VERSION: u32 = 2;
+/// Version 3 also preserves AUTOINCREMENT allocation state, including the
+/// absence of a sqlite_sequence entry for a table that has never allocated.
+pub const SEQUENCE_VERSION: u32 = 3;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 /// Separate from the wire-frame bound. Reconstruction and SQLite parameter
 /// binding require one complete logical row; never assemble an unbounded row.
@@ -26,7 +29,7 @@ pub const MAX_COLUMNS: usize = 256;
 const MAX_KEY_BYTES: usize = 64 * 1024;
 
 pub fn record_types(version: u32) -> Vec<String> {
-    let names: &[&str] = if version == CHUNKED_VERSION {
+    let names: &[&str] = if matches!(version, CHUNKED_VERSION | SEQUENCE_VERSION) {
         &[
             "table",
             "row",
@@ -52,13 +55,27 @@ pub struct Header {
     pub record_types: Vec<String>,
     pub contains_private_data: bool,
     pub omissions: Vec<String>,
+    /// None is the historical v1/v2 omission. Version 3 requires a complete,
+    /// sorted inventory, including entries whose allocation value is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequences: Option<Vec<Sequence>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Sequence {
+    pub table: String,
+    pub value: Option<i64>,
 }
 
 impl Header {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.format == FORMAT, "unknown logical archive format");
         ensure!(
-            matches!(self.schema_version, VERSION | CHUNKED_VERSION),
+            matches!(
+                self.schema_version,
+                VERSION | CHUNKED_VERSION | SEQUENCE_VERSION
+            ),
             "unsupported logical archive version"
         );
         ensure!(
@@ -91,6 +108,33 @@ impl Header {
             self.omissions == ["derived_search_assets"],
             "unsupported archive omissions"
         );
+        if self.schema_version == SEQUENCE_VERSION {
+            let sequences = self
+                .sequences
+                .as_ref()
+                .ok_or_else(|| anyhow!("logical archive version 3 requires allocation state"))?;
+            ensure!(
+                sequences.len() <= MAX_TABLES,
+                "logical allocation state exceeds 256 tables"
+            );
+            let mut previous: Option<&str> = None;
+            for sequence in sequences {
+                ensure!(
+                    identifier(&sequence.table),
+                    "invalid logical allocation table identifier"
+                );
+                ensure!(
+                    previous.is_none_or(|name| name < sequence.table.as_str()),
+                    "logical allocation tables must be unique and ordered"
+                );
+                previous = Some(&sequence.table);
+            }
+        } else {
+            ensure!(
+                self.sequences.is_none(),
+                "logical archive versions 1 and 2 cannot declare allocation state"
+            );
+        }
         Ok(())
     }
 }
@@ -754,6 +798,7 @@ enum KeyCell {
 pub struct Validator {
     pub header: Header,
     current: Option<Table>,
+    current_has_sequence: bool,
     last_key: Option<Vec<KeyCell>>,
     counts: BTreeMap<String, u64>,
     rows: u64,
@@ -766,17 +811,23 @@ impl Validator {
         header.validate()?;
         let mut identity = header.clone();
         identity.exported_at_ms = 0;
-        // v2 changes transport, not canonical identity. Keeping the v1 digest
-        // domain also lets a v1 backup compare with a freshly exported v2
-        // snapshot during restore verification and read-only --if-identical.
-        identity.schema_version = VERSION;
-        identity.record_types = record_types(VERSION);
         let mut digest = Sha256::new();
-        digest.update(b"cass.logical_archive.v1\0");
+        if header.schema_version == SEQUENCE_VERSION {
+            // Allocation state changes logical identity, unlike the v2 framing
+            // extension. An absent old-format state must not equal an empty or
+            // reset v3 inventory merely because every live row matches.
+            digest.update(b"cass.logical_archive.v3\0");
+        } else {
+            // Preserve the original v1/v2 digest and byte representation.
+            identity.schema_version = VERSION;
+            identity.record_types = record_types(VERSION);
+            digest.update(b"cass.logical_archive.v1\0");
+        }
         digest.update(encode(&Record::Header { header: identity })?);
         Ok(Self {
             header,
             current: None,
+            current_has_sequence: false,
             last_key: None,
             counts: BTreeMap::new(),
             rows: 0,
@@ -843,7 +894,11 @@ impl Validator {
     }
 
     fn record_limit(&self, record: &Record) -> usize {
-        if self.header.schema_version == CHUNKED_VERSION && matches!(record, Record::Row { .. }) {
+        if matches!(
+            self.header.schema_version,
+            CHUNKED_VERSION | SEQUENCE_VERSION
+        ) && matches!(record, Record::Row { .. })
+        {
             MAX_ROW_BYTES
         } else {
             MAX_RECORD_BYTES
@@ -857,6 +912,15 @@ impl Validator {
             Record::Header { .. } => bail!("duplicate archive header"),
             Record::Table { table } => {
                 table.validate()?;
+                let has_sequence = self.header.sequences.as_ref().is_some_and(|sequences| {
+                    sequences
+                        .binary_search_by(|sequence| sequence.table.cmp(&table.name))
+                        .is_ok()
+                });
+                ensure!(
+                    !has_sequence || table.primary_key.len() == 1,
+                    "logical allocation tables require a single integer primary key"
+                );
                 ensure!(
                     self.counts.len() < MAX_TABLES,
                     "logical archive exceeds 256 tables"
@@ -869,6 +933,7 @@ impl Validator {
                 );
                 self.counts.insert(table.name.clone(), 0);
                 self.current = Some(table.clone());
+                self.current_has_sequence = has_sequence;
                 self.last_key = None;
             }
             Record::Row { values } => {
@@ -883,6 +948,11 @@ impl Validator {
                 for cell in values {
                     cell.validate()?;
                 }
+                ensure!(
+                    !self.current_has_sequence
+                        || matches!(values.get(table.primary_key[0]), Some(Cell::Integer(_))),
+                    "logical allocation tables require an integer primary key"
+                );
                 let next_key = key(values, table)?;
                 ensure!(
                     self.last_key
@@ -907,6 +977,14 @@ impl Validator {
             }
             Record::Completion { completion } => {
                 ensure!(self.current.is_some(), "logical archive contains no tables");
+                ensure!(
+                    self.header.sequences.as_ref().is_none_or(|sequences| {
+                        sequences
+                            .iter()
+                            .all(|sequence| self.counts.contains_key(&sequence.table))
+                    }),
+                    "logical allocation state references an absent table"
+                );
                 ensure!(
                     *completion == self.completion(),
                     "logical archive completion count or digest mismatch"
