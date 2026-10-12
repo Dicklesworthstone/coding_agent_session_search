@@ -64,10 +64,23 @@ fn serve(
     let mut stdout = String::new();
     let mut stderr = String::new();
     use std::io::Read;
-    child.0.stdout.take().context("child stdout")?.read_to_string(&mut stdout)?;
-    child.0.stderr.take().context("child stderr")?.read_to_string(&mut stderr)?;
+    child
+        .0
+        .stdout
+        .take()
+        .context("child stdout")?
+        .read_to_string(&mut stdout)?;
+    child
+        .0
+        .stderr
+        .take()
+        .context("child stderr")?
+        .read_to_string(&mut stderr)?;
     ensure!(status.success(), "worker exited {status}: {stderr}");
-    stdout.lines().map(|line| Ok(serde_json::from_str(line)?)).collect()
+    stdout
+        .lines()
+        .map(|line| Ok(serde_json::from_str(line)?))
+        .collect()
 }
 
 fn document(conversation_id: i64, ordinal: usize, content: &str) -> CassDocument {
@@ -103,7 +116,10 @@ fn fixture(root: &Path) -> Result<(PathBuf, PathBuf, Vec<i64>)> {
     for (ordinal, content) in [
         "git fixture establishes the repository test environment",
         "test isolation prevents state from leaking between cases",
-    ].iter().enumerate() {
+    ]
+    .iter()
+    .enumerate()
+    {
         let inserted = storage.insert_conversation_tree(
             agent,
             None,
@@ -132,7 +148,11 @@ fn fixture(root: &Path) -> Result<(PathBuf, PathBuf, Vec<i64>)> {
                 }],
             },
         )?;
-        writer.add_prebuilt_documents_slice(&[document(inserted.conversation_id, ordinal, content)])?;
+        writer.add_prebuilt_documents_slice(&[document(
+            inserted.conversation_id,
+            ordinal,
+            content,
+        )])?;
         identities.push(inserted.conversation_id);
     }
     writer.commit()?;
@@ -146,11 +166,18 @@ fn gh518_fuel_refusal_uses_explicit_archive_and_reports_actual_backend() -> Resu
     let temp = tempfile::tempdir()?;
     let (index, archive, identities) = fixture(temp.path())?;
     let before = std::fs::read(&archive)?;
-    let replies = serve(temp.path(), &index, Some(&archive), true, 1, &[
-        json!({"id":1,"op":"search","query":"git fixture","limit":1}),
-        json!({"id":2,"op":"search","query":"test isolation","limit":1}),
-        json!({"id":3,"op":"status"}),
-    ])?;
+    let replies = serve(
+        temp.path(),
+        &index,
+        Some(&archive),
+        true,
+        1,
+        &[
+            json!({"id":1,"op":"search","query":"git fixture","limit":1}),
+            json!({"id":2,"op":"search","query":"test isolation","limit":1}),
+            json!({"id":3,"op":"status"}),
+        ],
+    )?;
     assert_eq!(replies.len(), 3);
     for (ordinal, reply) in replies[..2].iter().enumerate() {
         assert_eq!(reply["ok"], true, "{reply}");
@@ -181,10 +208,17 @@ fn gh518_db_option_alone_does_not_grant_fallback_consent() -> Result<()> {
     let (index, _, _) = fixture(temp.path())?;
     let corrupt = temp.path().join("must-not-open.db");
     std::fs::write(&corrupt, b"not SQLite")?;
-    let replies = serve(temp.path(), &index, Some(&corrupt), false, 1, &[
-        json!({"id":1,"op":"search","query":"git fixture","limit":1}),
-        json!({"id":2,"op":"status"}),
-    ])?;
+    let replies = serve(
+        temp.path(),
+        &index,
+        Some(&corrupt),
+        false,
+        1,
+        &[
+            json!({"id":1,"op":"search","query":"git fixture","limit":1}),
+            json!({"id":2,"op":"status"}),
+        ],
+    )?;
     assert_eq!(replies[0]["ok"], false);
     let message = replies[0]["error"]["message"].as_str().unwrap();
     assert!(message.contains("fallback is disabled"), "{message}");
@@ -205,17 +239,27 @@ fn gh518_oversized_and_corrupt_fallbacks_preserve_the_original_refusal() -> Resu
     let corrupt = temp.path().join("corrupt.db");
     std::fs::write(&corrupt, b"not SQLite")?;
     for path in [&oversized, &corrupt] {
-        let replies = serve(temp.path(), &index, Some(path), true, 1, &[
-            json!({"id":1,"op":"search","query":"git fixture","limit":1}),
-            json!({"id":2,"op":"status"}),
-        ])?;
+        let replies = serve(
+            temp.path(),
+            &index,
+            Some(path),
+            true,
+            1,
+            &[
+                json!({"id":1,"op":"search","query":"git fixture","limit":1}),
+                json!({"id":2,"op":"status"}),
+            ],
+        )?;
         assert_eq!(replies[0]["ok"], false, "{}", replies[0]);
         let message = replies[0]["error"]["message"].as_str().unwrap();
         assert!(message.contains("query fuel exhausted"), "{message}");
         assert!(message.contains("fallback failed"), "{message}");
         assert!(message.contains("cass index --full --json"), "{message}");
         if path == &oversized {
-            assert!(message.contains("exceeds the automatic search budget"), "{message}");
+            assert!(
+                message.contains("exceeds the automatic search budget"),
+                "{message}"
+            );
         }
         assert_eq!(replies[1]["result"]["lexical_fallback"]["completed"], 0);
     }
@@ -231,10 +275,17 @@ fn gh518_authoritative_empty_result_never_falls_back_to_archive_matches() -> Res
     writer.add_prebuilt_documents_slice(&[document(99, 99, "unrelated corpus")])?;
     writer.commit()?;
     drop(writer);
-    let replies = serve(temp.path(), &index, Some(&archive), true, 10_000_000, &[
-        json!({"id":1,"op":"search","query":"git fixture","limit":1}),
-        json!({"id":2,"op":"status"}),
-    ])?;
+    let replies = serve(
+        temp.path(),
+        &index,
+        Some(&archive),
+        true,
+        10_000_000,
+        &[
+            json!({"id":1,"op":"search","query":"git fixture","limit":1}),
+            json!({"id":2,"op":"status"}),
+        ],
+    )?;
     assert_eq!(replies[0]["ok"], true, "{}", replies[0]);
     assert_eq!(replies[0]["result"]["count"], 0);
     assert_eq!(replies[0]["result"]["backend"], "quill");
@@ -258,18 +309,32 @@ fn gh518_206_real_segments_serve_both_two_word_queries_without_fallback() -> Res
         writer.commit()?;
     }
     drop(writer);
-    assert_eq!(live_segment_count(&index), Some(206), "fixture must remain fragmented");
-    let replies = serve(temp.path(), &index, None, false, 80_000, &[
-        json!({"id":1,"op":"search","query":"git fixture","limit":1}),
-        json!({"id":2,"op":"search","query":"test isolation","limit":1}),
-    ])?;
+    assert_eq!(
+        live_segment_count(&index),
+        Some(206),
+        "fixture must remain fragmented"
+    );
+    let replies = serve(
+        temp.path(),
+        &index,
+        None,
+        false,
+        80_000,
+        &[
+            json!({"id":1,"op":"search","query":"git fixture","limit":1}),
+            json!({"id":2,"op":"search","query":"test isolation","limit":1}),
+        ],
+    )?;
     assert_eq!(replies.len(), 2);
     for reply in &replies {
         assert_eq!(reply["ok"], true, "{reply}");
         assert_eq!(reply["result"]["count"], 1);
         assert_eq!(reply["result"]["backend"], "quill");
         assert_eq!(reply["result"]["degraded"], false);
-        assert_eq!(reply["result"]["snapshot"]["lexical_fallback"]["attempts"], 0);
+        assert_eq!(
+            reply["result"]["snapshot"]["lexical_fallback"]["attempts"],
+            0
+        );
     }
     Ok(())
 }

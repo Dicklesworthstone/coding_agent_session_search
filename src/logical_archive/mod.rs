@@ -3,10 +3,10 @@
 //! or the reviewed v20/v21 -> v22 schema migration; export and verification never do so.
 
 mod codec;
-mod conversation_extract;
 #[cfg(test)]
 #[path = "conversation_extract_cli_tests.rs"]
 mod conversation_cli_tests;
+mod conversation_extract;
 mod export;
 mod extract;
 mod import;
@@ -483,8 +483,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 include_private,
                 "conversation extraction writes complete private session data; pass --include-private to acknowledge this",
             )?;
-            let result =
-                conversation_extract::extract_file(&input, &output, conversation_id, &content_sha256)?;
+            let result = conversation_extract::extract_file(
+                &input,
+                &output,
+                conversation_id,
+                &content_sha256,
+            )?;
             println!("{result}");
             return Ok(());
         }
@@ -689,7 +693,10 @@ mod tests {
                 error.downcast_ref::<FrankenError>().is_some(),
                 has_engine_cause
             );
-            assert_eq!(error.downcast_ref::<std::io::Error>().is_some(), has_io_cause);
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().is_some(),
+                has_io_cause
+            );
             let message = error.to_string();
             assert!(message.contains("verified unchanged and is retained at"));
             assert!(message.contains("recovered/agent_search.db"));

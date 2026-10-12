@@ -27,7 +27,13 @@ fn extract(root: &Path, input: &Path, output: &Path, private: bool) -> Output {
     command
         .args(["archive", "extract-conversation"])
         .arg(input)
-        .args(["--conversation-id", "7", "--content-sha256", SOURCE_DIGEST, "--output"])
+        .args([
+            "--conversation-id",
+            "7",
+            "--content-sha256",
+            SOURCE_DIGEST,
+            "--output",
+        ])
         .arg(output)
         .arg("--json");
     if private {
@@ -48,7 +54,11 @@ fn real_cli_recovers_a_whole_conversation_without_database_setup_and_refuses_uns
         .arg("--json")
         .output()
         .unwrap();
-    assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stderr));
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
     let verification: Value = serde_json::from_slice(&verified.stdout).unwrap();
     assert_eq!(verification["content_sha256"], SOURCE_DIGEST);
 
@@ -56,13 +66,20 @@ fn real_cli_recovers_a_whole_conversation_without_database_setup_and_refuses_uns
     assert_eq!(refusal.status.code(), Some(2));
     assert!(!output.exists());
     let recovered = extract(root.path(), &input, &output, true);
-    assert!(recovered.status.success(), "{}", String::from_utf8_lossy(&recovered.stderr));
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
     let receipt: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     let bytes = fs::read(&output).unwrap();
     assert_eq!(receipt["operation"], "extract-conversation");
     assert_eq!(receipt["message_rows"], 2);
     assert_eq!(receipt["content_sha256"], SOURCE_DIGEST);
-    assert_eq!(receipt["output_sha256"], hex::encode(Sha256::digest(&bytes)));
+    assert_eq!(
+        receipt["output_sha256"],
+        hex::encode(Sha256::digest(&bytes))
+    );
     assert_eq!(receipt["database_opened"], false);
     assert_eq!(receipt["provider_files_opened"], false);
     assert_eq!(receipt["restorable_as_archive"], false);

@@ -26,7 +26,8 @@ fn validate_request(conversation_id: i64, digest: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(super::ArchiveUsageError(
-            "--content-sha256 requires 64 lowercase hex digits from archive search or verify".into(),
+            "--content-sha256 requires 64 lowercase hex digits from archive search or verify"
+                .into(),
         )
         .into());
     }
@@ -237,9 +238,9 @@ fn scan(
             "output_prefix_bytes": prefix.bytes, "output_prefix_sha256": prefix.sha256,
         }),
     )?;
-    output
-        .flush()
-        .map_err(|error| export::io_failure("cannot flush private conversation extraction", error))?;
+    output.flush().map_err(|error| {
+        export::io_failure("cannot flush private conversation extraction", error)
+    })?;
     let digest = output.snapshot();
     let receipt = json!({
         "operation": "extract-conversation", "format": FORMAT, "schema_version": 1,
@@ -267,8 +268,9 @@ fn require_absent(path: &Path) -> Result<()> {
 }
 
 fn verify_stage(file: &mut File, expected: &OutputDigest) -> Result<()> {
-    file.rewind()
-        .map_err(|error| export::io_failure("cannot rewind private conversation extraction", error))?;
+    file.rewind().map_err(|error| {
+        export::io_failure("cannot rewind private conversation extraction", error)
+    })?;
     let mut output = HashedOutput::new(io::sink());
     let mut buffer = [0_u8; IO_BYTES];
     loop {
@@ -304,19 +306,19 @@ pub(super) fn extract_file(
     let mut input = BufReader::with_capacity(IO_BYTES, super::import::open_input(input)?);
     let _lock = DestinationLock::acquire(destination)?;
     require_absent(destination)?;
-    let mut stage = tempfile::NamedTempFile::new_in(export::parent(destination)?).map_err(|error| {
-        export::io_failure("cannot create private conversation extraction", error)
-    })?;
+    let mut stage =
+        tempfile::NamedTempFile::new_in(export::parent(destination)?).map_err(|error| {
+            export::io_failure("cannot create private conversation extraction", error)
+        })?;
     let (receipt, digest) = scan(
         &mut input,
         stage.as_file_mut(),
         conversation_id,
         expected_digest,
     )?;
-    stage
-        .as_file()
-        .sync_all()
-        .map_err(|error| export::io_failure("cannot sync private conversation extraction", error))?;
+    stage.as_file().sync_all().map_err(|error| {
+        export::io_failure("cannot sync private conversation extraction", error)
+    })?;
     verify_stage(stage.as_file_mut(), &digest)?;
     stage.persist_noclobber(destination).map_err(|error| {
         export::io_failure(

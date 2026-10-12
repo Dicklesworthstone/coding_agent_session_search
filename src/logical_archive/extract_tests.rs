@@ -45,7 +45,11 @@ fn fixture(version: u32, body: &str, raw: Cell) -> (Vec<u8>, String) {
             ],
         },
     ] {
-        validator.prepare(&record).unwrap().write_to(&mut bytes).unwrap();
+        validator
+            .prepare(&record)
+            .unwrap()
+            .write_to(&mut bytes)
+            .unwrap();
     }
     let completion = validator.completion();
     let digest = completion.content_sha256.clone();
@@ -80,7 +84,16 @@ fn complete_text_and_json_are_exact_in_both_versions_without_added_newlines() {
 
 #[test]
 fn binary_blocks_preserve_padding_tails_nuls_and_all_byte_values() {
-    for length in [0, 1, 2, 3, BLOB_BYTES - 1, BLOB_BYTES, BLOB_BYTES + 1, BLOB_BYTES * 2 + 2] {
+    for length in [
+        0,
+        1,
+        2,
+        3,
+        BLOB_BYTES - 1,
+        BLOB_BYTES,
+        BLOB_BYTES + 1,
+        BLOB_BYTES * 2 + 2,
+    ] {
         let raw: Vec<u8> = (0..length).map(|index| (index % 256) as u8).collect();
         let (bytes, digest) = fixture(codec::VERSION, "body", Cell::Blob(STANDARD.encode(&raw)));
         assert_eq!(decode(&bytes, &digest, Field::ExtraBin).0, raw);
@@ -91,7 +104,11 @@ fn binary_blocks_preserve_padding_tails_nuls_and_all_byte_values() {
 fn large_continued_message_is_not_subject_to_the_terminal_view_budget() {
     let text = "雪\0".repeat(codec::MAX_RECORD_BYTES / 4 + 1);
     let (bytes, digest) = fixture(codec::CHUNKED_VERSION, &text, Cell::Null);
-    assert!(bytes.windows(b"row_start".len()).any(|window| window == b"row_start"));
+    assert!(
+        bytes
+            .windows(b"row_start".len())
+            .any(|window| window == b"row_start")
+    );
     assert_eq!(decode(&bytes, &digest, Field::Content).0, text.as_bytes());
 }
 
@@ -107,12 +124,28 @@ fn empty_text_is_an_empty_file_not_a_missing_value() {
 #[test]
 fn null_binary_and_wrong_storage_types_are_never_silently_converted() {
     let (bytes, digest) = fixture(codec::VERSION, "body", Cell::Null);
-    let error = scan(&mut Cursor::new(bytes), &mut Vec::new(), 7, &digest, Field::ExtraBin)
-        .unwrap_err();
+    let error = scan(
+        &mut Cursor::new(bytes),
+        &mut Vec::new(),
+        7,
+        &digest,
+        Field::ExtraBin,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("NULL"));
-    let (bytes, digest) = fixture(codec::VERSION, "body", Cell::Text("PRIVATE-WRONG-TYPE".into()));
-    let error = scan(&mut Cursor::new(bytes), &mut Vec::new(), 7, &digest, Field::ExtraBin)
-        .unwrap_err();
+    let (bytes, digest) = fixture(
+        codec::VERSION,
+        "body",
+        Cell::Text("PRIVATE-WRONG-TYPE".into()),
+    );
+    let error = scan(
+        &mut Cursor::new(bytes),
+        &mut Vec::new(),
+        7,
+        &digest,
+        Field::ExtraBin,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("storage type"));
     assert!(!error.to_string().contains("PRIVATE-WRONG-TYPE"));
 }
@@ -125,15 +158,22 @@ fn valid_prefix_with_bad_footer_or_trailing_record_never_publishes() {
     trailing.extend(b"{}\n");
     let mut changed = String::from_utf8(valid.clone()).unwrap();
     changed = changed.replace("not the selected message", "changed unselected body");
-    for (index, bytes) in [valid[..valid.len() - 1].to_vec(), trailing, changed.into_bytes()]
-        .into_iter()
-        .enumerate()
+    for (index, bytes) in [
+        valid[..valid.len() - 1].to_vec(),
+        trailing,
+        changed.into_bytes(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let input = root.path().join(format!("input-{index}.jsonl"));
         fs::write(&input, &bytes).unwrap();
         let output = root.path().join(format!("output-{index}.txt"));
         let error = extract_file(&input, &output, 7, &digest, Field::Content).unwrap_err();
-        assert_eq!(super::super::classify_failure(&error), (5, "logical-archive-integrity", false));
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (5, "logical-archive-integrity", false)
+        );
         assert!(!error.to_string().contains("PRIVATE-EXTRACT-ME"));
         assert!(!output.exists());
         assert_eq!(fs::read(&input).unwrap(), bytes);
@@ -155,8 +195,14 @@ fn extraction_receipt_matches_private_file_and_leaves_the_backup_unchanged() {
     assert_eq!(receipt["schema_version"], 2);
     assert_eq!(receipt["content_sha256"], digest);
     assert_eq!(receipt["field"], "content");
-    assert_eq!(receipt["output_bytes"], fs::metadata(&output).unwrap().len());
-    assert_eq!(receipt["output_sha256"], hex::encode(Sha256::digest(fs::read(&output).unwrap())));
+    assert_eq!(
+        receipt["output_bytes"],
+        fs::metadata(&output).unwrap().len()
+    );
+    assert_eq!(
+        receipt["output_sha256"],
+        hex::encode(Sha256::digest(fs::read(&output).unwrap()))
+    );
     assert_eq!(receipt["database_opened"], false);
     assert_eq!(receipt["provider_files_opened"], false);
     assert_eq!(receipt["database_integrity_checked"], false);
@@ -165,7 +211,10 @@ fn extraction_receipt_matches_private_file_and_leaves_the_backup_unchanged() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&output).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o077,
+            0
+        );
     }
     let error = extract_file(&input, &output, 7, &digest, Field::Content).unwrap_err();
     assert!(error.to_string().contains("already exists"));
@@ -189,15 +238,24 @@ fn wrong_digest_or_missing_message_cannot_publish_a_substitute() {
 #[test]
 fn invalid_request_is_usage_without_filesystem_mutation() {
     let root = tempfile::tempdir().unwrap();
-    for (id, digest) in [(0, "0".repeat(64)), (-1, "0".repeat(64)), (7, "bad".into()), (7, "A".repeat(64))] {
+    for (id, digest) in [
+        (0, "0".repeat(64)),
+        (-1, "0".repeat(64)),
+        (7, "bad".into()),
+        (7, "A".repeat(64)),
+    ] {
         let error = extract_file(
             &root.path().join("missing-input"),
             &root.path().join("missing-output"),
             id,
             &digest,
             Field::Content,
-        ).unwrap_err();
-        assert_eq!(super::super::classify_failure(&error), (2, "logical-archive-usage", false));
+        )
+        .unwrap_err();
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (2, "logical-archive-usage", false)
+        );
     }
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
 }
@@ -242,11 +300,20 @@ fn payload_io_errors_keep_their_type_without_echoing_private_causes() {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::StorageFull, "PRIVATE-SINK"))
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
-    let error = write_payload(Field::Content, &Cell::Text("PRIVATE-CONTENT".into()), &mut Fails)
-        .unwrap_err();
-    assert_eq!(super::super::classify_failure(&error), (14, "logical-archive-io", true));
+    let error = write_payload(
+        Field::Content,
+        &Cell::Text("PRIVATE-CONTENT".into()),
+        &mut Fails,
+    )
+    .unwrap_err();
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
     assert!(!error.to_string().contains("PRIVATE-SINK"));
     assert!(!error.to_string().contains("PRIVATE-CONTENT"));
     assert!(error.downcast_ref::<io::Error>().is_some());
@@ -255,8 +322,12 @@ fn payload_io_errors_keep_their_type_without_echoing_private_causes() {
 #[test]
 fn staged_file_readback_rejects_changed_bytes_and_lengths() {
     let mut stage = tempfile::NamedTempFile::new().unwrap();
-    let expected = write_payload(Field::Content, &Cell::Text("original".into()), stage.as_file_mut())
-        .unwrap();
+    let expected = write_payload(
+        Field::Content,
+        &Cell::Text("original".into()),
+        stage.as_file_mut(),
+    )
+    .unwrap();
     verify_payload(stage.as_file_mut(), &expected).unwrap();
     for replacement in [b"different".as_slice(), b"modified", b"short"] {
         stage.as_file_mut().set_len(0).unwrap();

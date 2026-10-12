@@ -644,11 +644,20 @@ pub(super) fn ordered_scan_sql(connection: &Connection, table: &Table) -> Result
         .map(|name| quoted(name))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    let collation = if default_binary { "" } else { " COLLATE BINARY" };
+    let collation = if default_binary {
+        ""
+    } else {
+        " COLLATE BINARY"
+    };
     let order = table
         .primary_key
         .iter()
-        .map(|&offset| Ok(format!("{}{collation} ASC", quoted(&table.columns[offset])?)))
+        .map(|&offset| {
+            Ok(format!(
+                "{}{collation} ASC",
+                quoted(&table.columns[offset])?
+            ))
+        })
         .collect::<Result<Vec<_>>>()?
         .join(", ");
     Ok(format!(
@@ -1106,7 +1115,10 @@ mod ordering_tests {
                 sql.contains("\"k\" COLLATE BINARY ASC"),
                 "fallback was lost for {name}"
             );
-            assert!(!sql.contains("PRIVATE-"), "DDL contents entered the scan SQL");
+            assert!(
+                !sql.contains("PRIVATE-"),
+                "DDL contents entered the scan SQL"
+            );
             let actual = connection
                 .query(&sql)?
                 .iter()

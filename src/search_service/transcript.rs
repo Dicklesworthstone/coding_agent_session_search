@@ -7,9 +7,8 @@
 //! SQL bounds bytes transferred to CASS, not the engine's internal allocations.
 
 use super::{
-    Anchor, Connection, ConnectionExt, Context, Path, Refusal as CanonicalRefusal, Result,
-    RowExt, Value, View, check_budget, ensure, json, params, require_conversation_identity,
-    with_snapshot,
+    Anchor, Connection, ConnectionExt, Context, Path, Refusal as CanonicalRefusal, Result, RowExt,
+    Value, View, check_budget, ensure, json, params, require_conversation_identity, with_snapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -56,7 +55,9 @@ impl Cursor {
             return Err("transcript cursor coordinates are outside the canonical range");
         }
         if self.byte_offset != 0
-            && self.content_bytes.is_none_or(|bytes| self.byte_offset >= bytes)
+            && self
+                .content_bytes
+                .is_none_or(|bytes| self.byte_offset >= bytes)
         {
             return Err(
                 "a partial-message cursor requires its original content_bytes above byte_offset",
@@ -213,10 +214,7 @@ fn chunk(
         // Only an incomplete *trailing* code point before EOF is deferred.
         // Invalid bytes, mid-code-point input cursors, and incomplete final
         // text are failures, never replaced with U+FFFD or dropped.
-        if error.error_len().is_none()
-            && offset + expected < length
-            && error.valid_up_to() != 0
-        {
+        if error.error_len().is_none() && offset + expected < length && error.valid_up_to() != 0 {
             bytes.truncate(error.valid_up_to());
         } else {
             return Err(Refusal::InvalidContent.into());

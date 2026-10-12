@@ -58,10 +58,10 @@ impl AdmissionRetry {
         let Some(failed_at) = self.failed_at else {
             return 0;
         };
-        let seconds = (1_u64 << self.failures.saturating_sub(1).min(5))
-            .min(MAX_ADMISSION_BACKOFF_SECS);
-        let remaining = Duration::from_secs(seconds)
-            .saturating_sub(now.saturating_duration_since(failed_at));
+        let seconds =
+            (1_u64 << self.failures.saturating_sub(1).min(5)).min(MAX_ADMISSION_BACKOFF_SECS);
+        let remaining =
+            Duration::from_secs(seconds).saturating_sub(now.saturating_duration_since(failed_at));
         // Round up: a sub-millisecond remainder must not look ready. The
         // duration is at most 30 seconds, even for a saturated failure counter.
         u64::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
@@ -137,10 +137,7 @@ enum Refusal {
     #[error(
         "semantic_admission_backoff: retry in {retry_after_ms} ms or unload/reload after resolving the failure; no semantic work was started; last failure: {reason}"
     )]
-    AdmissionBackoff {
-        retry_after_ms: u64,
-        reason: String,
-    },
+    AdmissionBackoff { retry_after_ms: u64, reason: String },
     #[error("semantic retrieval is unavailable: {0}")]
     Unavailable(String),
 }
@@ -722,10 +719,8 @@ mod external_selection_tests {
         assert!(semantic_embedder.is_none());
 
         assert!(
-            ServiceCli::try_parse_from(
-                base.into_iter().chain(["--semantic-embedder", "external"])
-            )
-            .is_err()
+            ServiceCli::try_parse_from(base.into_iter().chain(["--semantic-embedder", "external"]))
+                .is_err()
         );
         let cli = ServiceCli::try_parse_from(base.into_iter().chain([
             "--db",

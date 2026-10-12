@@ -231,7 +231,10 @@ pub(super) fn verify_schema_authority(
     let version = connection
         .query_row("SELECT MAX(version) FROM _schema_migrations")
         .map_err(|error| {
-            super::database_failure("cannot read the canonical schema-migration authority", error)
+            super::database_failure(
+                "cannot read the canonical schema-migration authority",
+                error,
+            )
         })?
         .get_typed::<Option<i64>>(0)
         .map_err(|error| {
@@ -568,14 +571,12 @@ pub fn import_file(
 /// The replay's WAL/journal names must never be moved into the publication.
 fn materialize_candidate(connection: &Connection, candidate: &Path) -> Result<()> {
     require_new_destination(candidate)?;
-    connection
-        .backup_exact_to(candidate)
-        .map_err(|error| {
-            super::database_failure(
-                "cannot materialize a self-contained restore publication image",
-                error,
-            )
-        })?;
+    connection.backup_exact_to(candidate).map_err(|error| {
+        super::database_failure(
+            "cannot materialize a self-contained restore publication image",
+            error,
+        )
+    })?;
     require_candidate_without_sidecars(candidate)
 }
 
@@ -1084,7 +1085,11 @@ mod publication_tests {
                             .to_string()
                             .contains(&format!("missing required migration v{missing}"))
                     );
-                    assert!(!error.to_string().contains("PRIVATE-HISTORICAL-MIGRATION-NAME"));
+                    assert!(
+                        !error
+                            .to_string()
+                            .contains("PRIVATE-HISTORICAL-MIGRATION-NAME")
+                    );
                     connection.execute_with_params(
                         "INSERT INTO _schema_migrations VALUES (?1, 'historical name')",
                         &[SqliteValue::Integer(missing)],
@@ -1157,7 +1162,9 @@ mod publication_tests {
         let reader = export::open_source(&source)?;
         assert_eq!(
             reader
-                .query_row("SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = 1")?
+                .query_row(
+                    "SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = 1"
+                )?
                 .get_typed::<i64>(0)?,
             99,
             "both refused import paths must preserve the newer canonical tail"
@@ -1173,7 +1180,9 @@ mod publication_tests {
         assert_eq!(
             reopened
                 .raw()
-                .query_row("SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = 1")?
+                .query_row(
+                    "SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = 1"
+                )?
                 .get_typed::<i64>(0)?,
             1
         );
@@ -1219,8 +1228,7 @@ mod publication_tests {
             writer.close()?;
 
             let input = root.path().join("history.jsonl");
-            let expected =
-                export::export_file(&source, &input, "schema-authority".to_owned())?;
+            let expected = export::export_file(&source, &input, "schema-authority".to_owned())?;
             assert_eq!(expected, export::verify_file(&input)?);
             let source_before = schema_authority_database_files(&source);
             let input_before = fs::read(&input)?;
@@ -1228,13 +1236,21 @@ mod publication_tests {
             let error = import_file(&input, &destination, "schema-authority")
                 .expect_err("matching rows cannot authorize a contradictory migration ledger");
             assert!(error.to_string().contains("schema-migration authority"));
-            assert!(!error.to_string().contains("PRIVATE-FUTURE-SCHEMA-AUTHORITY"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("PRIVATE-FUTURE-SCHEMA-AUTHORITY")
+            );
             require_new_destination(&destination)?;
 
             let error = import_file_with_policy(&input, &source, "schema-authority", true)
                 .expect_err("an identical retry must validate the existing migration authority");
             assert!(error.to_string().contains("schema-migration authority"));
-            assert!(!error.to_string().contains("PRIVATE-FUTURE-SCHEMA-AUTHORITY"));
+            assert!(
+                !error
+                    .to_string()
+                    .contains("PRIVATE-FUTURE-SCHEMA-AUTHORITY")
+            );
             assert_eq!(source_before, schema_authority_database_files(&source));
             assert_eq!(input_before, fs::read(&input)?);
         }
@@ -1263,8 +1279,7 @@ mod publication_tests {
                 writer.close()?;
             }
             let input = root.path().join("history.jsonl");
-            let expected =
-                export::export_file(&source, &input, "schema-authority".to_owned())?;
+            let expected = export::export_file(&source, &input, "schema-authority".to_owned())?;
             let destination = root.path().join("restored.db");
             assert_eq!(
                 import_file(&input, &destination, "schema-authority")?,
@@ -1299,7 +1314,11 @@ mod publication_tests {
                 .to_string()
                 .contains("cannot decode the canonical schema-migration authority")
         );
-        assert!(!error.to_string().contains("PRIVATE-UNREADABLE-SCHEMA-AUTHORITY"));
+        assert!(
+            !error
+                .to_string()
+                .contains("PRIVATE-UNREADABLE-SCHEMA-AUTHORITY")
+        );
         assert!(
             error
                 .chain()
@@ -1321,7 +1340,11 @@ mod publication_tests {
                 .to_string()
                 .contains("cannot read the canonical schema-migration authority")
         );
-        assert!(!error.to_string().contains("PRIVATE-UNREADABLE-SCHEMA-AUTHORITY"));
+        assert!(
+            !error
+                .to_string()
+                .contains("PRIVATE-UNREADABLE-SCHEMA-AUTHORITY")
+        );
         assert!(error.chain().any(|cause| {
             matches!(
                 cause.downcast_ref::<FrankenError>(),

@@ -892,8 +892,8 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         // even for offline/shared peers or DNS-only status records.
         hosts.retain(|host| {
             let destination = host.hostname.as_deref().unwrap_or(&host.name);
-            let matches_dns = !dns.is_empty()
-                && destination.trim_end_matches('.').eq_ignore_ascii_case(dns);
+            let matches_dns =
+                !dns.is_empty() && destination.trim_end_matches('.').eq_ignore_ascii_case(dns);
             let matches_ip = destination
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| addresses.contains(&ip));

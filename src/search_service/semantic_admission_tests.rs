@@ -141,10 +141,16 @@ fn invalidated_semantic_only_worker_hands_capacity_to_a_peer_without_unload() ->
     let first = semantic_query(&mut session, "semantic");
     assert!(first.ok, "{first:?}");
     assert_eq!(first.result.unwrap()["count"], 1);
-    assert!(session.client.is_none(), "this worker owns only semantic assets");
+    assert!(
+        session.client.is_none(),
+        "this worker owns only semantic assets"
+    );
     let mut peer = Session::new(session.index.clone());
     peer.admission_pool = Some(pool.clone());
-    assert_eq!(lexical_query(&mut peer).error.unwrap().kind, "admission_busy");
+    assert_eq!(
+        lexical_query(&mut peer).error.unwrap().kind,
+        "admission_busy"
+    );
 
     invalidate(root.path())?;
     let failed = semantic_query(&mut session, "semantic");
@@ -180,7 +186,10 @@ fn failed_hybrid_fallback_releases_capacity_after_both_readers_are_gone() -> Res
     assert!(session.client.is_none());
     assert!(session.reader_lease.is_none());
     drop(pool.acquire()?);
-    assert!(!session.index.exists(), "failure must not create a lexical index");
+    assert!(
+        !session.index.exists(),
+        "failure must not create a lexical index"
+    );
     Ok(())
 }
 
@@ -293,12 +302,24 @@ fn failed_cold_admission_backs_off_before_pool_access_and_unload_clears_it() -> 
         assert!(session.reader_lease.is_none());
     }
     let status = session.status();
-    assert_eq!(status["semantic"]["admission_retry"]["retry_after_ms"], 1000);
-    assert_eq!(status["semantic"]["admission_retry"]["automatic_retries"], false);
+    assert_eq!(
+        status["semantic"]["admission_retry"]["retry_after_ms"],
+        1000
+    );
+    assert_eq!(
+        status["semantic"]["admission_retry"]["automatic_retries"],
+        false
+    );
     drop(peer);
     assert!(session.handle(protocol::Request::Unload { id: 3 }).0.ok);
     assert_eq!(session.semantic.admission_retry.failures, 0);
-    assert_eq!(session.semantic.admission_retry.retry_after_ms(Instant::now()), 0);
+    assert_eq!(
+        session
+            .semantic
+            .admission_retry
+            .retry_after_ms(Instant::now()),
+        0
+    );
     assert!(!semantic_query(&mut session, "semantic").ok);
     assert_eq!(session.semantic.load_attempts, 2);
     assert_eq!(session.semantic.admission_retry.failures, 1);

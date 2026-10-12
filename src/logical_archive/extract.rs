@@ -188,7 +188,10 @@ fn scan(
 fn require_absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(export::io_failure("cannot inspect extraction destination", error)),
+        Err(error) => Err(export::io_failure(
+            "cannot inspect extraction destination",
+            error,
+        )),
         Ok(_) => bail!("extraction destination already exists; nothing was replaced"),
     }
 }
@@ -214,7 +217,10 @@ fn verify_payload(file: &mut File, expected: &Payload) -> Result<()> {
         bytes = bytes
             .checked_add(u64::try_from(count)?)
             .ok_or_else(|| anyhow!("extracted field byte count overflow"))?;
-        ensure!(bytes <= expected.bytes, "staged extracted field length changed");
+        ensure!(
+            bytes <= expected.bytes,
+            "staged extracted field length changed"
+        );
         digest.update(&buffer[..count]);
     }
     ensure!(

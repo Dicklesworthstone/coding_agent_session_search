@@ -54,8 +54,12 @@ fn regular_file_identity(path: &Path) -> Result<Handle> {
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     }
-    let file = options.open(path).context("open indexed restore file identity")?;
-    let metadata = file.metadata().context("inspect opened indexed restore file identity")?;
+    let file = options
+        .open(path)
+        .context("open indexed restore file identity")?;
+    let metadata = file
+        .metadata()
+        .context("inspect opened indexed restore file identity")?;
     refuse_link(&metadata)?;
     ensure!(
         metadata.is_file(),
@@ -205,7 +209,9 @@ impl ArchiveIndexPlan {
             "indexed restore maintenance directory exceeds the supported depth"
         );
         for entry in fs::read_dir(root).context("inspect indexed restore maintenance directory")? {
-            let path = entry.context("inspect indexed restore maintenance entry")?.path();
+            let path = entry
+                .context("inspect indexed restore maintenance entry")?
+                .path();
             let metadata = fs::symlink_metadata(&path)
                 .context("inspect indexed restore maintenance entry type")?;
             refuse_link(&metadata)?;
@@ -228,7 +234,10 @@ impl ArchiveIndexPlan {
         let metadata = fs::symlink_metadata(&self.data_dir)
             .context("inspect indexed restore data directory")?;
         refuse_link(&metadata)?;
-        ensure!(metadata.is_dir(), "indexed restore data directory is not a directory");
+        ensure!(
+            metadata.is_dir(),
+            "indexed restore data directory is not a directory"
+        );
         ensure!(
             regular_file_identity(&self.input)? == self.input_identity,
             "logical archive input changed after indexed restore admission"
@@ -239,12 +248,16 @@ impl ArchiveIndexPlan {
             Err(error) => return Err(error).context("inspect indexed restore canonical identity"),
         };
         ensure!(
-            database.as_ref().is_none_or(|database| *database != self.input_identity),
+            database
+                .as_ref()
+                .is_none_or(|database| *database != self.input_identity),
             "indexed restore canonical database aliases the logical archive input"
         );
         let index_root = self.validate_index_layout()?;
         for entry in fs::read_dir(&self.data_dir).context("inspect indexed restore profile")? {
-            let path = entry.context("inspect indexed restore profile entry")?.path();
+            let path = entry
+                .context("inspect indexed restore profile entry")?
+                .path();
             let metadata = fs::symlink_metadata(&path)
                 .context("inspect indexed restore profile entry type")?;
             refuse_link(&metadata)?;
@@ -386,7 +399,11 @@ mod tests {
             fs::hard_link(&input, &alias)?;
             let error = ArchiveIndexPlan::prepare(&data.join("agent_search.db"), &input)
                 .expect_err("maintenance must not gain write authority over a hard-linked input");
-            assert!(error.to_string().contains("aliases the logical archive input"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("aliases the logical archive input")
+            );
             assert_eq!(fs::read(&input)?, b"interchange input");
             assert_eq!(fs::read(&alias)?, b"interchange input");
             assert!(!data.join("agent_search.db").exists());
@@ -439,10 +456,16 @@ mod tests {
             let plan = ArchiveIndexPlan::prepare(&data.join("agent_search.db"), &input)?;
             drop(FrankenStorage::open(plan.database())?);
             let before = fs::read(plan.database())?;
-            let protected = if alias_database { plan.database() } else { &input };
+            let protected = if alias_database {
+                plan.database()
+            } else {
+                &input
+            };
             let alias = data.join("index-run.lock.meta");
             fs::hard_link(protected, &alias)?;
-            let error = plan.rebuild().expect_err("rebuild must recheck protected file identities");
+            let error = plan
+                .rebuild()
+                .expect_err("rebuild must recheck protected file identities");
             assert!(error.to_string().contains(if alias_database {
                 "aliases the canonical database"
             } else {
@@ -463,8 +486,14 @@ mod tests {
         let retained = root.path().join("retained-input.jsonl");
         fs::rename(&input, &retained)?;
         fs::write(&input, b"interchange input")?;
-        let error = plan.rebuild().expect_err("equal bytes do not prove the admitted file identity");
-        assert!(error.to_string().contains("input changed after indexed restore admission"));
+        let error = plan
+            .rebuild()
+            .expect_err("equal bytes do not prove the admitted file identity");
+        assert!(
+            error
+                .to_string()
+                .contains("input changed after indexed restore admission")
+        );
         assert_eq!(fs::read(&input)?, fs::read(&retained)?);
         assert_eq!(fs::read_dir(&data)?.count(), 0);
         Ok(())
@@ -474,7 +503,10 @@ mod tests {
     fn maintenance_walk_refuses_excessive_depth_without_retaining_a_tree() -> Result<()> {
         let (_root, input, data) = fixture()?;
         let index = expected_index_dir(&data);
-        let mut path = index.parent().expect("the index has a staging parent").to_path_buf();
+        let mut path = index
+            .parent()
+            .expect("the index has a staging parent")
+            .to_path_buf();
         fs::create_dir_all(&path)?;
         for _ in 0..MAX_MAINTENANCE_DEPTH {
             path.push("nested");
@@ -498,7 +530,9 @@ mod tests {
             fs::create_dir_all(alias.parent().expect("maintenance path has a parent"))?;
             std::os::unix::fs::symlink(&input, &alias)?;
             assert!(ArchiveIndexPlan::prepare(plan.database(), &input).is_err());
-            let error = plan.rebuild().expect_err("rebuild must not follow a newly added symlink");
+            let error = plan
+                .rebuild()
+                .expect_err("rebuild must not follow a newly added symlink");
             assert!(error.to_string().contains("symlink"));
             assert_eq!(fs::read(&input)?, b"interchange input");
             assert!(!plan.database().exists());

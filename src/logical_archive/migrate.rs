@@ -578,14 +578,12 @@ fn materialize_candidate(connection: &Connection, candidate: &Path) -> Result<()
     require_new_destination(candidate)?;
     // Only the private, committed replay is checkpointed. The engine's page
     // backup avoids VACUUM INTO's whole-database hydration in the pinned engine.
-    connection
-        .backup_exact_to(candidate)
-        .map_err(|error| {
-            super::database_failure(
-                "cannot materialize a self-contained migrated publication image",
-                error,
-            )
-        })?;
+    connection.backup_exact_to(candidate).map_err(|error| {
+        super::database_failure(
+            "cannot materialize a self-contained migrated publication image",
+            error,
+        )
+    })?;
     require_candidate_without_sidecars(candidate)
 }
 
@@ -2015,7 +2013,9 @@ mod tests {
 
             let error = import_compatible(&input, &destination, "reviewed-migration", true)
                 .err()
-                .context("a matching projection must not authorize lower-version migration replay")?;
+                .context(
+                    "a matching projection must not authorize lower-version migration replay",
+                )?;
             assert!(error.to_string().contains("missing required migration v18"));
             assert_eq!(before, database_files(&destination));
             assert_eq!(input_before, fs::read(&input)?);

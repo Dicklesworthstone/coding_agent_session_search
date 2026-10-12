@@ -754,12 +754,8 @@ mod retry {
                 // An explicit skip is different from silently swallowing a
                 // failure. The retained checkpoint permits this caller choice.
                 fs::write(fixture.root.path().join("transports"), "").unwrap();
-                let output = fixture.run(&[
-                    "--json",
-                    "--skip-install",
-                    "--skip-index",
-                    "--skip-sync",
-                ]);
+                let output =
+                    fixture.run(&["--json", "--skip-install", "--skip-index", "--skip-sync"]);
                 fixture.assert_configured(&output);
             }
         }

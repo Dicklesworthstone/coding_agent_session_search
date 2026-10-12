@@ -513,8 +513,7 @@ fn confirm_automatic_probe_fleet(
 ) -> Result<(), SetupError> {
     use std::io::IsTerminal as _;
 
-    if mode == SetupDiscoveryMode::Explicit
-        || host_count <= AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD
+    if mode == SetupDiscoveryMode::Explicit || host_count <= AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD
     {
         return Ok(());
     }

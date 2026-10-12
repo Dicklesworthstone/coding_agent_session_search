@@ -568,25 +568,48 @@ mod transcript_catalog_tests {
         serde_json::from_value(json!({
             "jsonrpc":"2.0", "id":"transcript-雪", "method":"tools/call",
             "params":{"name":"cass_transcript", "arguments":arguments}
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]
     fn transcript_catalog_is_passive_and_bound_to_the_selected_archive() {
         let mut session = Session::new(PathBuf::from("unused-index"));
-        let mut adapter = Adapter { lifecycle: Lifecycle::Ready, ..Adapter::default() };
-        assert!(!tools_for_session(&session).iter().any(|tool| tool["name"] == "cass_transcript"));
-        assert_eq!(adapter.handle(&mut session, call(json!({}))).unwrap()["error"]["code"], -32602);
+        let mut adapter = Adapter {
+            lifecycle: Lifecycle::Ready,
+            ..Adapter::default()
+        };
+        assert!(
+            !tools_for_session(&session)
+                .iter()
+                .any(|tool| tool["name"] == "cass_transcript")
+        );
+        assert_eq!(
+            adapter.handle(&mut session, call(json!({}))).unwrap()["error"]["code"],
+            -32602
+        );
         session.archive = Some(PathBuf::from("unused-archive"));
         let catalog = tools_for_session(&session);
-        let tool = catalog.iter().find(|tool| tool["name"] == "cass_transcript").unwrap();
+        let tool = catalog
+            .iter()
+            .find(|tool| tool["name"] == "cass_transcript")
+            .unwrap();
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert_eq!(tool["annotations"]["openWorldHint"], false);
         let schema = &tool["inputSchema"];
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["limit"]["maximum"], transcript::MAX_MESSAGES);
-        assert_eq!(schema["properties"]["cursor"]["additionalProperties"], false);
-        assert_eq!(schema["properties"]["cursor"]["properties"]["message_index"]["maximum"], (i64::MAX as u64) + 1);
+        assert_eq!(
+            schema["properties"]["limit"]["maximum"],
+            transcript::MAX_MESSAGES
+        );
+        assert_eq!(
+            schema["properties"]["cursor"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["cursor"]["properties"]["message_index"]["maximum"],
+            (i64::MAX as u64) + 1
+        );
         assert_eq!(session.canonical_read_attempts, 0);
         assert_eq!(session.open_attempts, 0);
     }
@@ -595,21 +618,35 @@ mod transcript_catalog_tests {
     fn transcript_dispatch_reuses_validation_and_never_executes_notifications() {
         let mut session = Session::new(PathBuf::from("unused-index"));
         session.archive = Some(PathBuf::from("unused-archive"));
-        let mut adapter = Adapter { lifecycle: Lifecycle::Ready, ..Adapter::default() };
-        let arguments = json!({"source_path":"/source", "source_id":"local", "conversation_id":1, "limit":0});
-        let reply = adapter.handle(&mut session, call(arguments.clone())).unwrap();
+        let mut adapter = Adapter {
+            lifecycle: Lifecycle::Ready,
+            ..Adapter::default()
+        };
+        let arguments =
+            json!({"source_path":"/source", "source_id":"local", "conversation_id":1, "limit":0});
+        let reply = adapter
+            .handle(&mut session, call(arguments.clone()))
+            .unwrap();
         assert_eq!(reply["id"], "transcript-雪");
         assert_eq!(reply["result"]["isError"], true);
-        assert_eq!(reply["result"]["structuredContent"]["error"]["kind"], "invalid_request");
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["kind"],
+            "invalid_request"
+        );
         let mut notification = call(arguments);
         notification.id = None;
         let before = adapter.calls;
         assert!(adapter.handle(&mut session, notification).is_none());
         assert_eq!(adapter.calls, before);
-        let reply = adapter.handle(&mut session, call(json!({
-            "source_path":"/source", "source_id":"local", "conversation_id":1,
-            "cursor":{"message_id":1,"message_index":1,"byte_offset":0,"db":"/other"}
-        }))).unwrap();
+        let reply = adapter
+            .handle(
+                &mut session,
+                call(json!({
+                    "source_path":"/source", "source_id":"local", "conversation_id":1,
+                    "cursor":{"message_id":1,"message_index":1,"byte_offset":0,"db":"/other"}
+                })),
+            )
+            .unwrap();
         assert_eq!(reply["error"]["code"], -32602);
         assert_eq!(session.canonical_read_attempts, 0);
         assert_eq!(session.open_attempts, 0);
@@ -630,14 +667,18 @@ mod transcript_catalog_tests {
             "conversation_id":i64::MAX, "messages":messages, "next_cursor":null,
             "content_bytes":transcript::MAX_PAGE_BYTES, "cross_page_snapshot":false,
         });
-        let response = success("transcript".into(), tool_result(Reply::success(1, result.clone())).unwrap());
+        let response = success(
+            "transcript".into(),
+            tool_result(Reply::success(1, result.clone())).unwrap(),
+        );
         let mut output = Vec::new();
         write_response(&mut output, &response).unwrap();
         assert!(output.len() <= protocol::MAX_RESPONSE_BYTES);
         let reply: Value = serde_json::from_slice(&output).unwrap();
         assert!(reply.get("error").is_none());
         assert_eq!(reply["result"]["structuredContent"], result);
-        let text: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let text: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(text, result);
     }
 }

@@ -111,8 +111,7 @@ fn a_valid_in_place_rewrite_cannot_publish_under_the_previous_inspection() -> Re
     fs::write(&input, changed)?;
     let destination = root.path().join("must-not-publish.db");
     assert_integrity(
-        import_inspected_file(pinned, &destination, &expected.0, &expected.1, false)
-            .unwrap_err(),
+        import_inspected_file(pinned, &destination, &expected.0, &expected.1, false).unwrap_err(),
     );
     assert!(!destination.exists());
     for sidecar in sidecars(&destination) {
@@ -134,8 +133,7 @@ fn a_matching_replacement_destination_cannot_be_reported_as_the_inspected_archiv
     fs::write(&input, same_header_bytes(&replacement, &expected.0)?)?;
     // Input B is valid and matches destination B. It still is not inspected A.
     assert_integrity(
-        import_inspected_file(pinned, &destination, &expected.0, &expected.1, true)
-            .unwrap_err(),
+        import_inspected_file(pinned, &destination, &expected.0, &expected.1, true).unwrap_err(),
     );
     assert_eq!(fs::read(&destination)?, before);
     assert_eq!(note(&destination)?, "PRIVATE-REPLACEMENT");
@@ -159,10 +157,20 @@ fn changed_header_fails_before_any_restore_destination_state_is_created() -> Res
     };
     let before = entries()?;
     assert_integrity(
-        import_inspected_file(open_input(&input)?, &destination, &expected.0, &expected.1, false)
-            .unwrap_err(),
+        import_inspected_file(
+            open_input(&input)?,
+            &destination,
+            &expected.0,
+            &expected.1,
+            false,
+        )
+        .unwrap_err(),
     );
-    assert_eq!(entries()?, before, "even destination lock/staging creation must be deferred");
+    assert_eq!(
+        entries()?,
+        before,
+        "even destination lock/staging creation must be deferred"
+    );
     assert!(!destination.exists());
     Ok(())
 }
@@ -172,16 +180,14 @@ fn unchanged_current_schema_still_delegates_to_exact_restore_and_reimport() -> R
     let root = tempfile::tempdir()?;
     let (input, expected) = backup(root.path(), "original", "PRIVATE-ORIGINAL")?;
     let destination = root.path().join("restored.db");
-    let created = super::super::migrate::import_compatible(
-        &input, &destination, ARCHIVE_ID, false,
-    )?;
+    let created =
+        super::super::migrate::import_compatible(&input, &destination, ARCHIVE_ID, false)?;
     assert!(created.created);
     assert!(created.migration.is_none());
     assert_eq!((created.header, created.completion), expected);
     let before = fs::read(&destination)?;
-    let repeated = super::super::migrate::import_compatible(
-        &input, &destination, ARCHIVE_ID, true,
-    )?;
+    let repeated =
+        super::super::migrate::import_compatible(&input, &destination, ARCHIVE_ID, true)?;
     assert!(!repeated.created);
     assert!(repeated.migration.is_none());
     assert_eq!((repeated.header, repeated.completion), expected);

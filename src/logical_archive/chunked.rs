@@ -144,10 +144,7 @@ pub(super) fn write_record(
     bytes: usize,
     output: &mut impl Write,
 ) -> io::Result<()> {
-    if !matches!(record, Record::Row { .. })
-        || bytes <= MAX_RECORD_BYTES
-        || bytes > MAX_ROW_BYTES
-    {
+    if !matches!(record, Record::Row { .. }) || bytes <= MAX_RECORD_BYTES || bytes > MAX_ROW_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid continued row size or type",

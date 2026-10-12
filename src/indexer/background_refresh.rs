@@ -651,8 +651,7 @@ pub fn maybe_spawn_with_policy(
     {
         debug!(
             reason,
-            remaining_secs,
-            "auto-refresh skipped: previous spawn is still in cooldown"
+            remaining_secs, "auto-refresh skipped: previous spawn is still in cooldown"
         );
         let _ = FileExt::unlock(&guard);
         return AutoRefreshOutcome::Cooldown { remaining_secs };
@@ -1107,7 +1106,10 @@ mod tests {
         // Foreground, scheduled and no-op successful scans all publish the
         // same watermark; there is no separate auto-refresh-only age clock.
         freshness["last_indexed_at"] = serde_json::json!(now);
-        assert_eq!(catch_up_reason_at(&freshness, now + 299_999, interval), None);
+        assert_eq!(
+            catch_up_reason_at(&freshness, now + 299_999, interval),
+            None
+        );
         assert_eq!(
             catch_up_reason_at(&freshness, now + 300_000, interval),
             Some("source-scan-overdue")
@@ -1162,7 +1164,10 @@ mod tests {
             freshness["last_indexed_at"] = serde_json::json!(now - 300_000);
             assert_eq!(catch_up_reason_at(&freshness, now, interval), expected);
             // Zero disables age-based scans, not stale/partial/pending repair.
-            assert_eq!(catch_up_reason_at(&freshness, now, Duration::ZERO), expected);
+            assert_eq!(
+                catch_up_reason_at(&freshness, now, Duration::ZERO),
+                expected
+            );
         }
         let healthy = serde_json::json!({"exists": true, "last_indexed_at": 1});
         assert_eq!(catch_up_reason_at(&healthy, now, Duration::ZERO), None);

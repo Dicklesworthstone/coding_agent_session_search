@@ -186,7 +186,10 @@ impl Process {
             if let Some(status) = self.0.try_wait()? {
                 return Ok(status);
             }
-            ensure!(Instant::now() < deadline, "test child exceeded its deadline");
+            ensure!(
+                Instant::now() < deadline,
+                "test child exceeded its deadline"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -202,21 +205,23 @@ fn command(root: &Path, data: &Path, endpoint: &Endpoint, consent: bool) -> Comm
     let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
     // Keep only OS/runtime necessities, not parent CASS policy, fixture hooks,
     // tracing destinations, credentials, dotenv contents, or provider roots.
-    command.env_clear().envs(std::env::vars_os().filter(|(key, _)| {
-        [
-            "PATH",
-            "SYSTEMROOT",
-            "WINDIR",
-            "TEMP",
-            "TMP",
-            "TMPDIR",
-            "RUST_MIN_STACK",
-            "LD_LIBRARY_PATH",
-            "DYLD_LIBRARY_PATH",
-        ]
-        .iter()
-        .any(|allowed| key.to_string_lossy().eq_ignore_ascii_case(allowed))
-    }));
+    command
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(key, _)| {
+            [
+                "PATH",
+                "SYSTEMROOT",
+                "WINDIR",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "RUST_MIN_STACK",
+                "LD_LIBRARY_PATH",
+                "DYLD_LIBRARY_PATH",
+            ]
+            .iter()
+            .any(|allowed| key.to_string_lossy().eq_ignore_ascii_case(allowed))
+        }));
     command
         .current_dir(root)
         .env("HOME", root)
@@ -511,7 +516,10 @@ fn external_service_reuses_real_backfill_and_unloads_without_local_inference() -
         "passive and lexical paths must never disclose queries"
     );
     for id in 4..=5 {
-        let reply = worker.request(semantic_request(id, &format!("externalneedle request {id}")))?;
+        let reply = worker.request(semantic_request(
+            id,
+            &format!("externalneedle request {id}"),
+        ))?;
         assert_eq!(reply["ok"], true, "{reply}");
         let result = &reply["result"];
         assert_eq!(result["realized_mode"], "semantic");
@@ -616,10 +624,12 @@ fn external_service_refuses_changed_publication_before_sending_another_query() -
     let mut changed = original.clone();
     changed.extend_from_slice(b"\n ");
     fs::write(&path, &changed)?;
-    let refused = worker.request(semantic_request(2, "private query after publication changed"))?;
+    let refused = worker.request(semantic_request(
+        2,
+        "private query after publication changed",
+    ))?;
     assert_eq!(
-        refused["error"]["kind"],
-        "semantic_reload_required",
+        refused["error"]["kind"], "semantic_reload_required",
         "{refused}"
     );
     assert_eq!(endpoint.count(), base);
@@ -631,8 +641,14 @@ fn external_service_refuses_changed_publication_before_sending_another_query() -
     let mut manifest: Value = serde_json::from_slice(&original)?;
     manifest["quality_tier"]["ready"] = json!(false);
     fs::write(&path, serde_json::to_vec(&manifest)?)?;
-    let refused = worker.request(semantic_request(5, "private query for unfinished publication"))?;
-    assert_eq!(refused["error"]["kind"], "semantic_unavailable", "{refused}");
+    let refused = worker.request(semantic_request(
+        5,
+        "private query for unfinished publication",
+    ))?;
+    assert_eq!(
+        refused["error"]["kind"], "semantic_unavailable",
+        "{refused}"
+    );
     assert_eq!(
         endpoint.count(),
         base,

@@ -309,15 +309,10 @@ mod tests {
         let path = root.path().join("primary.jsonl");
         fs::write(&path, b"unchanged transcript").unwrap();
         let mut legacy = file_observation(&path).unwrap();
-        assert!(
-            legacy
-                .as_object_mut()
-                .unwrap()
-                .remove("windows")
-                .is_some()
-        );
+        assert!(legacy.as_object_mut().unwrap().remove("windows").is_some());
         let row = json!({"producer_contract": CONTRACT, "primary": legacy,
-            "dependencies": []}).to_string();
+            "dependencies": []})
+        .to_string();
         assert!(!ledger_matches(&row, &path, false, CONTRACT));
         let new = saved(&path, vec![]);
         assert!(ledger_matches(&new, &path, false, CONTRACT));
@@ -332,7 +327,8 @@ mod tests {
         let absent = file_observation(&missing).unwrap();
         assert_eq!(absent, json!({"path": missing, "absent": true}));
         let row = json!({"producer_contract": CONTRACT, "primary": absent,
-            "dependencies": []}).to_string();
+            "dependencies": []})
+        .to_string();
         assert!(!ledger_matches(&row, &missing, false, CONTRACT));
         let invalid = Path::new("invalid\0path");
         assert!(file_observation(invalid).is_none());
