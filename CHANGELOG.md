@@ -120,6 +120,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   Access is denied". The handles now close first. On Windows, another
   process that has the index open (a search, the TUI) can still block the
   replacement.
+- **On Windows, `cass doctor archive-normalize` keeps the drive in its
+  plan.** The data directory in the plan's fingerprint and in the printed
+  apply command lost its drive: `C:\Users\x\data` became `/Users/x/data`.
+  So `C:\x` and `D:\x` produced the same plan identity, and the printed
+  `--data-dir` named a path on whatever drive was current. Windows plans
+  made by an older binary must be made again.
 - **On Windows, `cass index --watch-once` records plain `C:\...` source
   paths.** It canonicalized each requested path with
   `std::fs::canonicalize`, which on Windows returns the verbatim spelling

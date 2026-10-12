@@ -45793,16 +45793,119 @@ fn doctor_config_exclusion_targets(
     ]
 }
 
+/// `path` with `/` separators, `.` and `..` dropped. A Windows prefix is kept
+/// (`C:`, `//server/share`; the verbatim forms render like the plain ones):
+/// this string is the data dir in the archive-normalize fingerprint and in
+/// the apply command doctor prints, and without the drive `C:\x` and `D:\x`
+/// were one identity and `--data-dir /x` named the current drive (dddwv).
 fn doctor_path_to_slash_string(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
-            std::path::Component::RootDir => Some("/".into()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-        .replace("//", "/")
+    use std::path::{Component, Prefix};
+
+    let mut rendered = String::new();
+    let mut needs_separator = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                match prefix.kind() {
+                    Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                        rendered.push(char::from(drive.to_ascii_uppercase()));
+                        rendered.push(':');
+                    }
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                        rendered.push_str("//");
+                        rendered.push_str(&server.to_string_lossy());
+                        rendered.push('/');
+                        rendered.push_str(&share.to_string_lossy());
+                    }
+                    Prefix::Verbatim(name) => {
+                        rendered.push_str("//?/");
+                        rendered.push_str(&name.to_string_lossy());
+                    }
+                    Prefix::DeviceNS(name) => {
+                        rendered.push_str("//./");
+                        rendered.push_str(&name.to_string_lossy());
+                    }
+                }
+                needs_separator = false;
+            }
+            Component::RootDir => {
+                rendered.push('/');
+                needs_separator = false;
+            }
+            Component::Normal(part) => {
+                if needs_separator {
+                    rendered.push('/');
+                }
+                rendered.push_str(&part.to_string_lossy());
+                needs_separator = true;
+            }
+            Component::CurDir | Component::ParentDir => {}
+        }
+    }
+    rendered
+}
+
+#[cfg(test)]
+mod doctor_path_slash_string_tests {
+    use super::{doctor_path_identity_for_fingerprint, doctor_path_to_slash_string};
+    use std::path::Path;
+
+    #[test]
+    fn rooted_and_relative_paths_render_with_single_slashes() {
+        assert_eq!(
+            doctor_path_to_slash_string(Path::new("/home/x/data")),
+            "/home/x/data"
+        );
+        assert_eq!(doctor_path_to_slash_string(Path::new("/")), "/");
+        assert_eq!(
+            doctor_path_to_slash_string(Path::new("database/candidate.db")),
+            "database/candidate.db"
+        );
+        assert_eq!(doctor_path_to_slash_string(Path::new("./a/../b")), "a/b");
+        assert_eq!(doctor_path_to_slash_string(Path::new("")), "");
+    }
+
+    /// The fingerprint identity is also the `--data-dir` of the apply command
+    /// doctor prints, so it has to name the same directory again.
+    #[test]
+    fn fingerprint_identity_names_the_same_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let identity = doctor_path_identity_for_fingerprint(temp.path());
+        assert_eq!(
+            std::fs::canonicalize(Path::new(&identity)).expect("identity resolves"),
+            std::fs::canonicalize(temp.path()).expect("temp dir resolves"),
+            "{identity}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_keep_their_drive_or_share() {
+        assert_eq!(
+            doctor_path_to_slash_string(Path::new(r"C:\Users\x\data")),
+            "C:/Users/x/data"
+        );
+        assert_eq!(
+            doctor_path_to_slash_string(Path::new(r"\\?\c:\Users\x\data")),
+            "C:/Users/x/data"
+        );
+        assert_ne!(
+            doctor_path_to_slash_string(Path::new(r"C:\x")),
+            doctor_path_to_slash_string(Path::new(r"D:\x"))
+        );
+        assert_eq!(
+            doctor_path_to_slash_string(Path::new(r"\\server\share\dir")),
+            "//server/share/dir"
+        );
+        assert_eq!(
+            doctor_path_to_slash_string(Path::new(r"\\?\UNC\server\share\dir")),
+            "//server/share/dir"
+        );
+        assert_eq!(
+            doctor_path_to_slash_string(Path::new(r"C:rel\x")),
+            "C:rel/x"
+        );
+    }
 }
 
 fn doctor_pattern_matches_relative_path(raw_pattern: &str, relative_path: &Path) -> bool {
@@ -46055,7 +46158,16 @@ fn doctor_scan_text_config_for_exclusion_mentions(
                 .file_name()
                 .map(|name| name.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
-            let target_path = doctor_path_to_slash_string(&target.path).to_ascii_lowercase();
+            // Without its Windows prefix: a config line that names the path
+            // with or without the drive still mentions it.
+            let target_path = doctor_path_to_slash_string(
+                &target
+                    .path
+                    .components()
+                    .filter(|component| !matches!(component, std::path::Component::Prefix(_)))
+                    .collect::<PathBuf>(),
+            )
+            .to_ascii_lowercase();
             let target_mentioned = target.tokens.iter().any(|token| lower.contains(token))
                 || (!target_basename.is_empty() && lower.contains(&target_basename))
                 || lower.contains(&target_path);
