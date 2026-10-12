@@ -615,3 +615,193 @@ fn gh505_safe_alternate_alias_preserves_a_peer_with_an_excluded_numeric_alias() 
         "{output:?}"
     );
 }
+
+fn numbered_fleet_peers(machine_count: usize, provider_count: usize) -> Value {
+    assert!(machine_count <= 254);
+    let mut peers = serde_json::Map::new();
+    for index in 1..=machine_count {
+        peers.insert(
+            format!("machine-{index:03}"),
+            json!({
+                "Online": true,
+                "DNSName": format!("machine-{index}.example.ts.net."),
+                "TailscaleIPs": [format!("100.64.0.{index}")],
+                "ExitNodeOption": true,
+                "Location": {"Country": "Sweden"}
+            }),
+        );
+    }
+    for index in 0..provider_count {
+        let mut peer = json!({
+            "Online": true,
+            "TailscaleIPs": [format!("100.90.{}.{}", index / 250, index % 250 + 1)]
+        });
+        if index % 2 == 0 {
+            peer["Tags"] = json!(["tag:mullvad-exit-node"]);
+        } else {
+            peer["DNSName"] = json!(format!("provider-{index}.mullvad.ts.net."));
+        }
+        peers.insert(format!("provider-{index:03}"), peer);
+    }
+    Value::Object(peers)
+}
+
+fn assert_large_fleet_refused(
+    fixture: &FleetFixture,
+    output: &Output,
+    mode: SetupDiscoveryMode,
+) {
+    assert!(!output.status.success(), "{output:?}");
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for expected in [
+        "65 hosts",
+        "64-host confirmation threshold",
+        "--hosts",
+        "No SSH probes were started",
+    ] {
+        assert!(diagnostics.contains(expected), "{output:?}");
+    }
+    assert!(fixture.attempted_transports().is_empty());
+    let state: SetupState =
+        serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
+    assert!(state.discovery_complete);
+    assert_eq!(state.discovery_mode, Some(mode));
+    assert_eq!(state.discovered_hosts, 65);
+    assert_eq!(state.discovered_host_names.len(), 65);
+    assert_eq!(state.discovered_host_names.iter().collect::<BTreeSet<_>>().len(), 65);
+    assert!(!state.probing_complete);
+    assert!(state.probed_hosts.is_empty());
+    assert!(!state.selection_complete);
+    assert!(!state.installation_complete);
+    assert!(!state.indexing_complete);
+    assert!(!state.configuration_complete);
+    assert!(!state.sync_complete);
+    assert!(!fixture.root.path().join("config/cass/sources.toml").exists());
+}
+
+#[test]
+fn gh505_large_fleet_requires_review_and_can_resume_with_explicit_hosts() {
+    for resume in [false, true] {
+        let fixture = FleetFixture::new(numbered_fleet_peers(65, 536), "");
+        let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+        assert!(output.status.success(), "{output:?}");
+        let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+        // Discovery still reports the entire eligible fleet, not a prefix.
+        assert_eq!(discovery["hosts"].as_array().unwrap().len(), 65);
+        assert!(fixture.attempted_transports().is_empty());
+        let output = if resume {
+            // A cached small count must not bypass review of the current fleet.
+            fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.200"]);
+            fixture.setup_with_options(true, &[])
+        } else {
+            fixture.setup(false)
+        };
+        assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Tailscale);
+        // Refusal is not saved as approval; an unchanged bare resume refuses again.
+        let output = fixture.setup_with_options(true, &[]);
+        assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Tailscale);
+
+        let output = fixture.setup_with_options(
+            true,
+            &["--hosts", "100.64.0.1,100.64.0.65"],
+        );
+        assert_setup_no_hosts(&output);
+        assert_eq!(
+            fixture.attempted_transports(),
+            BTreeSet::from(["100.64.0.1".into(), "100.64.0.65".into()])
+        );
+        // The explicit retry must not rediscover the large automatic inventory.
+        assert_eq!(
+            fs::read_to_string(&fixture.status_calls).unwrap(),
+            "status --json\nstatus --json\nstatus --json\n"
+        );
+    }
+}
+
+#[test]
+fn gh505_large_fleet_json_noninteractive_and_piped_modes_never_probe() {
+    for flags in [
+        vec!["--json"],
+        vec!["--non-interactive"],
+        vec!["--dry-run", "--json"],
+        Vec::new(),
+    ] {
+        let fixture = FleetFixture::new(numbered_fleet_peers(65, 0), "");
+        let mut args = vec![
+            "sources",
+            "setup",
+            "--tailscale",
+            "--skip-install",
+            "--skip-index",
+            "--skip-sync",
+        ];
+        args.extend(flags);
+        // output() captures the streams: even with no mode flag this is not
+        // an interactive terminal and must never block on a confirmation.
+        let output = fixture.run(&args);
+        assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Tailscale);
+        assert_eq!(fs::read_to_string(&fixture.status_calls).unwrap(), "status --json\n");
+    }
+}
+
+#[test]
+fn gh505_large_ssh_only_discovery_also_requires_review() {
+    let aliases: String = (1..=65)
+        .map(|index| format!("Host machine-{index}\n HostName 100.64.0.{index}\n"))
+        .collect();
+    let fixture = FleetFixture::new(mullvad_peers(), &aliases);
+    let output = fixture.setup_with_options(false, &[]);
+    assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Ssh);
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_large_raw_inventory_counts_only_filtered_and_deduplicated_targets() {
+    // 536 providers plus 64 real machines and an alias for machine 1: count
+    // only the 64 final targets, not status records or the duplicate alias.
+    let fixture = FleetFixture::new(numbered_fleet_peers(64, 536), ALIAS);
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    let expected: BTreeSet<_> = (1..=64).map(|index| format!("100.64.0.{index}")).collect();
+    assert_eq!(fixture.attempted_transports(), expected);
+    assert_eq!(fs::read_to_string(&fixture.status_calls).unwrap(), "status --json\n");
+}
+
+#[test]
+fn gh505_large_explicit_lists_are_never_truncated_or_rediscovered() {
+    let names: Vec<_> = (1..=65).map(|index| format!("100.64.0.{index}")).collect();
+    let references: Vec<_> = names.iter().map(String::as_str).collect();
+    let argument = names.join(",");
+    for resume in [false, true] {
+        let fixture = FleetFixture::new(numbered_fleet_peers(65, 536), "");
+        let output = if resume {
+            fixture.save_discovery(Some(SetupDiscoveryMode::Explicit), &references);
+            fixture.setup_with_options(true, &[])
+        } else {
+            fixture.setup_with_options(false, &["--hosts", argument.as_str()])
+        };
+        assert_setup_no_hosts(&output);
+        assert_eq!(fixture.attempted_transports(), names.iter().cloned().collect());
+        assert!(!fixture.status_calls.exists());
+    }
+}
+
+#[test]
+fn gh505_large_completed_probe_phase_does_not_repeat_confirmation_or_transport() {
+    let fixture = FleetFixture::new(numbered_fleet_peers(65, 536), "");
+    let names: Vec<_> = (1..=65).map(|index| format!("100.64.0.{index}")).collect();
+    let references: Vec<_> = names.iter().map(String::as_str).collect();
+    fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &references);
+    let mut state: SetupState =
+        serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
+    state.probing_complete = true;
+    fs::write(fixture.state_path(), serde_json::to_vec(&state).unwrap()).unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(!fixture.status_calls.exists());
+}

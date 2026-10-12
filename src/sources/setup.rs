@@ -13,6 +13,9 @@
 //!
 //! The wizard supports resume capability via state persistence, allowing
 //! interrupted setups to continue where they left off.
+//! Automatic fleets larger than 64 hosts require confirmation before any SSH
+//! probe, including during dry-run or unfinished resume. Unattended callers
+//! must provide a reviewed --hosts list instead; discovery is never truncated.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,7 +39,8 @@ use super::probe::{CassStatus, HostProbeResult, deduplicate_probe_results, probe
 pub struct SetupOptions {
     /// Preview what would happen without making changes.
     pub dry_run: bool,
-    /// Skip interactive prompts (use defaults).
+    /// Skip interactive prompts (use defaults). Large automatic fleets require
+    /// an explicit hosts list rather than assuming consent to probe them all.
     pub non_interactive: bool,
     /// Specific hosts to configure (skips discovery/selection).
     pub hosts: Option<Vec<String>>,
@@ -478,6 +482,64 @@ fn print_phase_done(message: &str) {
     println!("└{}", "─".repeat(70).dimmed());
 }
 
+// A consent threshold, not a discovery limit. Never truncate a valid fleet.
+const AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD: usize = 64;
+
+fn confirm_automatic_probe_fleet(
+    opts: &SetupOptions,
+    mode: SetupDiscoveryMode,
+    host_count: usize,
+) -> Result<(), SetupError> {
+    use std::io::IsTerminal as _;
+
+    if mode == SetupDiscoveryMode::Explicit
+        || host_count <= AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD
+    {
+        return Ok(());
+    }
+
+    let discovery_flag = if mode == SetupDiscoveryMode::Tailscale {
+        " --tailscale"
+    } else {
+        ""
+    };
+    let review_command = format!("cass sources discover{discovery_flag} --json");
+    if opts.non_interactive
+        || opts.json
+        || !std::io::stdin().is_terminal()
+        || !std::io::stderr().is_terminal()
+    {
+        // An unattended automatic selection does not authorize an unexpected
+        // bulk probe. Use the existing setup configuration-validation path.
+        return Err(SetupError::Config(super::config::ConfigError::Validation(
+            format!(
+                "Automatic discovery found {host_count} hosts, above the \
+                 {AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD}-host confirmation threshold. \
+                 Review '{review_command}' and rerun setup interactively, or supply \
+                 a reviewed --hosts list. No SSH probes were started."
+            ),
+        )));
+    }
+
+    eprintln!(
+        "Automatic discovery found {host_count} SSH hosts. \
+         To review them without probing, run '{review_command}'."
+    );
+    let approved = confirm_action(
+        &format!(
+            "Start SSH probes to all {host_count} automatically discovered hosts \
+             (also during --dry-run)?"
+        ),
+        false,
+    )
+    .map_err(SetupError::Interactive)?;
+    if approved {
+        Ok(())
+    } else {
+        Err(SetupError::Cancelled)
+    }
+}
+
 /// Run the setup wizard.
 pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // Set up interruption flag (Ctrl+C handled at CLI level)
@@ -637,6 +699,10 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // =========================================================================
     let probed_hosts = if !state.probing_complete {
         check_interrupted()?;
+        // Count the current filtered candidates, not raw provider inventory or
+        // a cached count. Save discovery but never mark probing complete on
+        // refusal, so --resume can retry with a reviewed explicit selection.
+        confirm_automatic_probe_fleet(opts, discovery_mode, discovered_hosts.len())?;
 
         if !opts.json {
             print_phase_header("Phase 2: Probing hosts");
@@ -1795,5 +1861,53 @@ mod tests {
         let path = SetupState::path();
         assert!(path.ends_with("setup_state.json"));
         assert!(path.to_string_lossy().contains("cass"));
+    }
+
+    #[test]
+    fn test_setup_tailscale_probe_confirmation_boundaries() {
+        let opts = SetupOptions {
+            non_interactive: true,
+            json: true,
+            ..Default::default()
+        };
+        for mode in [SetupDiscoveryMode::Ssh, SetupDiscoveryMode::Tailscale] {
+            for count in [0, 1, 63, 64] {
+                assert!(confirm_automatic_probe_fleet(&opts, mode, count).is_ok());
+            }
+        }
+        // An explicit selection authorizes its whole list, never a prefix.
+        assert!(
+            confirm_automatic_probe_fleet(&opts, SetupDiscoveryMode::Explicit, usize::MAX).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_setup_tailscale_probe_confirmation_rejects_unattended_large_fleets() {
+        for opts in [
+            SetupOptions {
+                non_interactive: true,
+                ..Default::default()
+            },
+            SetupOptions {
+                json: true,
+                ..Default::default()
+            },
+            SetupOptions {
+                non_interactive: true,
+                dry_run: true,
+                resume: true,
+                ..Default::default()
+            },
+        ] {
+            for mode in [SetupDiscoveryMode::Ssh, SetupDiscoveryMode::Tailscale] {
+                let error = confirm_automatic_probe_fleet(&opts, mode, 65).unwrap_err();
+                assert!(matches!(&error, SetupError::Config(_)));
+                let message = error.to_string();
+                assert!(message.contains("65 hosts"));
+                assert!(message.contains("64-host confirmation threshold"));
+                assert!(message.contains("--hosts"));
+                assert!(message.contains("No SSH probes were started"));
+            }
+        }
     }
 }
