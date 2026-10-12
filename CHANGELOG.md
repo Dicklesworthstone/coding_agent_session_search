@@ -145,6 +145,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `std::fs::rename`. On Windows that uses POSIX rename semantics, so a reader
   keeps the generation it mapped, as on Unix, and the install no longer
   fails with "Access is denied".
+- **On Windows, `cass index --semantic --build-hnsw` builds the HNSW graph
+  instead of failing every time.** After dumping the graph, frankensearch-index
+  flushed the graph and data files through read-only handles, and Windows
+  flushes a file only through a handle with write access, so the build
+  exited 9 with "failed to sync dumped HNSW sidecar ... Access is denied".
+  frankensearch-index 0.4.2 (a lockfile update) flushes them through write
+  handles.
 - **`cass index` hashes the lexical index fewer times.** Opening the Quill
   writer verified (hashed) every segment four times: after recovery, again
   for the orphan witness and for the garbage sweep, and once more for the
