@@ -80,6 +80,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`cass search` and `cass pack` open the lexical index once.** Before
+  each search, cass checks that the lexical index is usable by opening it,
+  and every open verifies the hash of every live segment. The search then
+  opened and verified the index a second time. On this project's 41 GB
+  index (23 live segments, cass 0.10.0), a one-hit `cass search` took a
+  median of 20.1 s. The same search with `--no-maintenance`, which already
+  opened the index once, took 10.6 s. The default path now reuses the
+  reader the check opened, whenever the check found the index usable as it
+  is.
 - **OpenCode SQLite exports shut down the connector runtime before Windows
   process teardown (#519).** The connector keeps a separate thread-local
   Asupersync runtime. Dropping it after Windows terminated its worker

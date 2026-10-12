@@ -28502,18 +28502,54 @@ fn search_lexical_self_heal_diagnosis(
     index_path: &Path,
     db_path: &Path,
 ) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
+    search_lexical_self_heal_diagnosis_admitting(index_path, db_path)
+        .map(|(diagnosis, _)| diagnosis)
+}
+
+/// [`search_lexical_self_heal_diagnosis`], keeping the reader its contract
+/// check opened. Every Quill open hashes every live segment, so a default
+/// search that dropped this reader and let the client open another hashed
+/// the whole index twice: about 9 s of a 20 s search on a 41 GB index
+/// (coding_agent_session_search-o9ixv). The reader is `None` when the
+/// contract check failed.
+fn search_lexical_self_heal_diagnosis_admitting(
+    index_path: &Path,
+    db_path: &Path,
+) -> CliResult<(
+    Option<SearchLexicalSelfHealDiagnosis>,
+    Option<crate::search::tantivy::OpenedLexicalIndex>,
+)> {
     if !crate::search::tantivy::searchable_index_exists(index_path) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
-            "searchable lexical metadata missing",
-        )));
+        return Ok((
+            Some(SearchLexicalSelfHealDiagnosis::rebuild(
+                "searchable lexical metadata missing",
+            )),
+            None,
+        ));
     }
 
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
-            "lexical artifact contract is unusable: {err:#}"
-        ))));
-    }
+    let opened = match crate::search::tantivy::open_validated_lexical_index(index_path) {
+        Ok(opened) => opened,
+        Err(err) => {
+            return Ok((
+                Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
+                    "lexical artifact contract is unusable: {err:#}"
+                ))),
+                None,
+            ));
+        }
+    };
+    let diagnosis = search_lexical_checkpoint_diagnosis(index_path, db_path)?;
+    Ok((diagnosis, Some(opened)))
+}
 
+/// The part of [`search_lexical_self_heal_diagnosis`] after the index
+/// contract check: the rebuild checkpoint against the active database. It
+/// never opens the index.
+fn search_lexical_checkpoint_diagnosis(
+    index_path: &Path,
+    db_path: &Path,
+) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
     let checkpoint =
         crate::indexer::load_lexical_rebuild_checkpoint(index_path).map_err(|e| CliError {
             code: 5,
@@ -29132,6 +29168,7 @@ fn verify_search_lexical_repair_publication(
     )
 }
 
+#[cfg(test)]
 fn ensure_lexical_assets_for_search(
     data_dir: &Path,
     db_path: &Path,
@@ -29141,25 +29178,66 @@ fn ensure_lexical_assets_for_search(
     dry_run: bool,
     robot_bounded_degraded: bool,
 ) -> CliResult<SearchLexicalSelfHeal> {
+    // Only the self-heal tests need the verdict without the reader; the CLI
+    // takes both from ensure_lexical_assets_for_search_admitting.
+    ensure_lexical_assets_for_search_admitting(
+        data_dir,
+        db_path,
+        index_path,
+        timeout_ms,
+        started_at,
+        dry_run,
+        robot_bounded_degraded,
+    )
+    .map(|(self_heal, _)| self_heal)
+}
+
+/// The search's lexical self-heal verdict, plus the reader its contract check
+/// opened whenever the search will use that same generation, so the search
+/// client does not open and hash the index a second time
+/// (coding_agent_session_search-o9ixv). It returns `None` after a repair or a
+/// wait for another process's rebuild, and drops the reader before either:
+/// on Windows an open reader blocks the rename that publishes a generation
+/// (coding_agent_session_search-lndgg). Tests that need only the verdict call
+/// `ensure_lexical_assets_for_search`.
+fn ensure_lexical_assets_for_search_admitting(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    timeout_ms: Option<u64>,
+    started_at: Instant,
+    dry_run: bool,
+    robot_bounded_degraded: bool,
+) -> CliResult<(
+    SearchLexicalSelfHeal,
+    Option<crate::search::tantivy::OpenedLexicalIndex>,
+)> {
     if dry_run || !db_path.exists() {
-        return Ok(SearchLexicalSelfHeal::skipped());
+        return Ok((SearchLexicalSelfHeal::skipped(), None));
     }
 
     let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path, true).active;
     if initial_rebuild_active {
         if initial_index_exists {
-            let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path)?;
+            let (diagnosis, opened) =
+                search_lexical_self_heal_diagnosis_admitting(index_path, db_path)?;
             if diagnosis
                 .as_ref()
                 .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild())
             {
-                return Ok(SearchLexicalSelfHeal {
-                    action: "active-rebuild-searching-existing-index",
-                    reason: Some("lexical repair is already running".to_string()),
-                    indexed_docs: None,
-                });
+                return Ok((
+                    SearchLexicalSelfHeal {
+                        action: "active-rebuild-searching-existing-index",
+                        reason: Some("lexical repair is already running".to_string()),
+                        indexed_docs: None,
+                    },
+                    opened,
+                ));
             }
+            // Not searchable as it is: release it before waiting for the
+            // rebuild that will replace it.
+            drop(opened);
         }
 
         // With no searchable generation, the active run is a first build or a
@@ -29181,17 +29259,23 @@ fn ensure_lexical_assets_for_search(
             return Err(search_lock_busy_error_with_progress(data_dir, index_path));
         }
 
-        if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
-            return Ok(SearchLexicalSelfHeal {
-                action: "waited-for-active-rebuild",
-                reason: Some("foreground search waited for active lexical repair".to_string()),
-                indexed_docs: None,
-            });
+        let (diagnosis, opened) =
+            search_lexical_self_heal_diagnosis_admitting(index_path, db_path)?;
+        if diagnosis.is_none() {
+            return Ok((
+                SearchLexicalSelfHeal {
+                    action: "waited-for-active-rebuild",
+                    reason: Some("foreground search waited for active lexical repair".to_string()),
+                    indexed_docs: None,
+                },
+                opened,
+            ));
         }
     }
 
-    let Some(diagnosis) = search_lexical_self_heal_diagnosis(index_path, db_path)? else {
-        return Ok(SearchLexicalSelfHeal::skipped());
+    let (diagnosis, opened) = search_lexical_self_heal_diagnosis_admitting(index_path, db_path)?;
+    let Some(diagnosis) = diagnosis else {
+        return Ok((SearchLexicalSelfHeal::skipped(), opened));
     };
     let reason = diagnosis.reason;
 
@@ -29219,12 +29303,23 @@ fn ensure_lexical_assets_for_search(
             db_path, data_dir,
         ) {
             Ok(()) => {
-                if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
-                    return Ok(SearchLexicalSelfHeal {
-                        action: "refreshed-checkpoint",
-                        reason: Some(reason),
-                        indexed_docs: None,
-                    });
+                // The refresh rewrote checkpoint metadata, not the index, so
+                // a reader that passed the contract check still stands and
+                // only the checkpoint needs a second look.
+                let refreshed = if opened.is_some() {
+                    search_lexical_checkpoint_diagnosis(index_path, db_path)?
+                } else {
+                    search_lexical_self_heal_diagnosis(index_path, db_path)?
+                };
+                if refreshed.is_none() {
+                    return Ok((
+                        SearchLexicalSelfHeal {
+                            action: "refreshed-checkpoint",
+                            reason: Some(reason),
+                            indexed_docs: None,
+                        },
+                        opened,
+                    ));
                 }
             }
             Err(err) => {
@@ -29253,12 +29348,18 @@ fn ensure_lexical_assets_for_search(
             next_step,
             "search detected stale lexical checkpoint metadata; using existing readable lexical index and deferring heavyweight repair"
         );
-        return Ok(SearchLexicalSelfHeal {
-            action: "deferred-repair-searching-existing-index",
-            reason: Some(reason),
-            indexed_docs: None,
-        });
+        return Ok((
+            SearchLexicalSelfHeal {
+                action: "deferred-repair-searching-existing-index",
+                reason: Some(reason),
+                indexed_docs: None,
+            },
+            opened,
+        ));
     }
+    // Everything below waits for or performs a rebuild that replaces this
+    // generation: release it first.
+    drop(opened);
 
     // #287: everything below launches a heavyweight inline lexical rebuild
     // that can run for minutes (and, behind an active ingest-quarantine
@@ -29324,11 +29425,14 @@ fn ensure_lexical_assets_for_search(
                 ));
             }
             if search_existing_lexical_generation_is_usable(index_path, db_path)? {
-                return Ok(SearchLexicalSelfHeal {
-                    action: "concurrent-repair-searching-existing-index",
-                    reason: Some(reason),
-                    indexed_docs: None,
-                });
+                return Ok((
+                    SearchLexicalSelfHeal {
+                        action: "concurrent-repair-searching-existing-index",
+                        reason: Some(reason),
+                        indexed_docs: None,
+                    },
+                    None,
+                ));
             }
 
             let waited = wait_for_searchable_index_after_active_rebuild(
@@ -29341,11 +29445,14 @@ fn ensure_lexical_assets_for_search(
                 return Err(search_lock_busy_error(data_dir));
             }
             if search_existing_lexical_generation_is_usable(index_path, db_path)? {
-                return Ok(SearchLexicalSelfHeal {
-                    action: "waited-for-concurrent-lexical-repair",
-                    reason: Some(reason),
-                    indexed_docs: None,
-                });
+                return Ok((
+                    SearchLexicalSelfHeal {
+                        action: "waited-for-concurrent-lexical-repair",
+                        reason: Some(reason),
+                        indexed_docs: None,
+                    },
+                    None,
+                ));
             }
 
             // The database or WAL can grow while the other indexer holds the
@@ -29359,11 +29466,14 @@ fn ensure_lexical_assets_for_search(
     verify_search_lexical_repair_publication(index_path, db_path, repair.indexed_docs)
         .map_err(|error| search_lexical_repair_failed_error(&reason, error))?;
 
-    Ok(SearchLexicalSelfHeal {
-        action: "rebuilt-from-canonical-db",
-        reason: Some(reason),
-        indexed_docs: Some(repair.indexed_docs),
-    })
+    Ok((
+        SearchLexicalSelfHeal {
+            action: "rebuilt-from-canonical-db",
+            reason: Some(reason),
+            indexed_docs: Some(repair.indexed_docs),
+        },
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -29579,6 +29689,60 @@ mod search_lexical_self_heal_tests {
             assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
         }
         assert_eq!(before, data_tree_snapshot(data_dir));
+    }
+
+    /// coding_agent_session_search-o9ixv: a default (maintaining) search over
+    /// a healthy checkpointed index opens it once. The self-heal contract
+    /// check used to drop its reader and the client opened another, and every
+    /// Quill open hashes every live segment: about 9 s of a 20 s search on a
+    /// 41 GB index.
+    #[test]
+    fn default_search_setup_opens_a_healthy_index_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("build checkpointed lexical generation");
+        let fields = FieldMask::new(false, false, true, false);
+        for mode in [
+            None,
+            Some(crate::search::query::SearchMode::Lexical),
+            Some(crate::search::query::SearchMode::Hybrid),
+        ] {
+            let opens = crate::search::quill_bridge::reader_open_count();
+            let setup = open_cli_search_setup(
+                data_dir,
+                &db_path,
+                &index_path,
+                mode,
+                None,
+                Instant::now(),
+                false,
+                false,
+            )
+            .unwrap_or_else(|err| panic!("open default search ({mode:?}): {err:?}"));
+            assert_eq!(setup.self_heal.action, "skipped", "mode={mode:?}");
+            assert_eq!(
+                crate::search::quill_bridge::reader_open_count() - opens,
+                1,
+                "mode={mode:?}: the contract check's reader must serve the search"
+            );
+            let hits = setup
+                .client
+                .search("autohealneedle", SearchFilters::default(), 10, 0, fields)
+                .expect("search the admitted generation");
+            assert_eq!(hits.len(), 1, "mode={mode:?}");
+            assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+        }
     }
 
     #[test]
@@ -31467,18 +31631,15 @@ fn open_cli_search_setup(
     } else if no_maintenance {
         inspect_lexical_assets_for_search_read_only(data_dir, db_path, index_path)?
     } else {
-        (
-            ensure_lexical_assets_for_search(
-                data_dir,
-                db_path,
-                index_path,
-                timeout_ms,
-                started_at,
-                false,
-                robot_bounded_degraded,
-            )?,
-            None,
-        )
+        ensure_lexical_assets_for_search_admitting(
+            data_dir,
+            db_path,
+            index_path,
+            timeout_ms,
+            started_at,
+            false,
+            robot_bounded_degraded,
+        )?
     };
     let lexical_initialized = crate::search::tantivy::searchable_index_exists(index_path);
     let rebuild_active = probe_index_run_lock(
