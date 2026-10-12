@@ -1971,6 +1971,8 @@ const DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES: u64 = 1024 *
 const DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON: &str = "large_populated_incremental_index_defers_authoritative_lexical_repair_until_explicit_full_or_force_rebuild";
 const BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON: &str =
     "large_populated_incremental_index_bootstraps_missing_scan_watermark";
+const EMPTY_ARCHIVE_LEXICAL_REBUILD_REASON: &str =
+    "empty_archive_defers_lexical_rebuild_to_authoritative_db_rebuild";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeferredIncrementalCanonicalLexicalRepair {
@@ -18027,6 +18029,17 @@ fn run_index_with_storage_ownership(
         needs_rebuild = false;
     }
     let initial_needs_rebuild = needs_rebuild;
+    // at3us: a lexical rebuild on an archive that holds no conversations yet
+    // (a first plain `cass index`) has nothing to preserve, so it takes the
+    // path --full takes: ingest canonically, then rebuild the index once from
+    // the database. Rebuilding inline from the scan commits Quill at every
+    // batch, and every publish re-verifies every segment, so that path is
+    // quadratic in index size (10,252 Codex sessions: 62 min against 7). A
+    // populated archive that needs a rebuild is repaired from the database
+    // before its scan instead, so only an empty archive reached the inline
+    // rebuild here.
+    let empty_archive_lexical_rebuild =
+        !opts.full && initial_needs_rebuild && initial_canonical_sessions_before_salvage == 0;
 
     if needs_rebuild && let Some(p) = &opts.progress {
         p.is_rebuilding.store(true, Ordering::Relaxed);
@@ -18494,6 +18507,12 @@ fn run_index_with_storage_ownership(
                     "skipping broad incremental scan because targeted watch-once paths were supplied after authoritative lexical repair"
                 );
             } else {
+                let defer_empty_archive_rebuild = deferred_incremental_authoritative_lexical_repair
+                    .is_none()
+                    && !legacy_omp_upgrade.lexical_rebuild_required
+                    && empty_archive_lexical_rebuild
+                    && needs_rebuild
+                    && historical_salvage.messages_imported == 0;
                 let (lexical_strategy, lexical_strategy_reason) =
                     if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
                         (
@@ -18504,6 +18523,11 @@ fn run_index_with_storage_ownership(
                         (
                             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                             "legacy_omp_identity_upgrade_requires_authoritative_db_rebuild",
+                        )
+                    } else if defer_empty_archive_rebuild {
+                        (
+                            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                            EMPTY_ARCHIVE_LEXICAL_REBUILD_REASON,
                         )
                     } else {
                         resolve_lexical_population_strategy(
@@ -18783,7 +18807,8 @@ fn run_index_with_storage_ownership(
                 if !scan_lexical_update_deferred
                     && (opts.full
                         || historical_salvage.messages_imported > 0
-                        || legacy_omp_upgrade.lexical_rebuild_required)
+                        || legacy_omp_upgrade.lexical_rebuild_required
+                        || defer_empty_archive_rebuild)
                 {
                     let post_scan_observed_tantivy_docs =
                         observed_tantivy_docs_for_post_full_scan_skip(

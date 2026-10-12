@@ -80,6 +80,16 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **A first `cass index` on a new install is no longer many times slower
+  than `cass index --full`.** With an empty archive, a plain `cass index`
+  rebuilt the lexical index inline from the scan. It committed the index at
+  every batch, and every commit re-verified every segment, so the work grew
+  with the square of the index size: 10,252 Codex sessions took 62 minutes,
+  against 7 with `--full`. An empty archive now ingests first and builds
+  the index once from the database, as `--full` does; on the same host and
+  binary the two now take the same time. As with an interrupted `--full`, an
+  interrupted first index leaves no partial lexical index; the next run
+  builds it from the database before scanning the remaining sources.
 - **`cass search` and `cass pack` open the lexical index once.** Before
   each search, cass checks that the lexical index is usable by opening it,
   and every open verifies the hash of every live segment. The search then
