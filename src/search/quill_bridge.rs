@@ -795,7 +795,9 @@ const ENGINE_LIVENESS_MIN_CPU_ADVANCE: Duration = Duration::from_millis(100);
 /// dropped.
 struct EngineLivenessProbe {
     armed: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    /// Dropping this sender disconnects the sampler's wait, so the probe's
+    /// drop returns at once instead of after the rest of a sample interval.
+    stop: Option<std::sync::mpsc::Sender<()>>,
     heartbeat: EngineHeartbeat,
     sampler: Option<std::thread::JoinHandle<()>>,
 }
@@ -803,20 +805,21 @@ struct EngineLivenessProbe {
 impl EngineLivenessProbe {
     fn spawn(targets: Vec<PathBuf>, heartbeat: EngineHeartbeat) -> Self {
         let armed = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let sampler = {
             let armed = Arc::clone(&armed);
-            let stop = Arc::clone(&stop);
             let heartbeat = Arc::clone(&heartbeat);
             std::thread::Builder::new()
                 .name("cass-quill-liveness".to_string())
                 .spawn(move || {
                     let mut tracker = EngineLivenessTracker::default();
-                    while !stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(ENGINE_LIVENESS_SAMPLE_INTERVAL);
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
+                    // A plain sleep here made every probe drop wait out the
+                    // rest of a whole interval: one second per storage open
+                    // and Quill index drop, two in every `cass index`. The
+                    // probe's drop disconnects the channel, ending the wait.
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        stopped.recv_timeout(ENGINE_LIVENESS_SAMPLE_INTERVAL)
+                    {
                         if !armed.load(Ordering::Relaxed) {
                             // Forget the previous op's baseline so the first
                             // sample of the next op is a fresh comparison.
@@ -833,7 +836,7 @@ impl EngineLivenessProbe {
         };
         Self {
             armed,
-            stop,
+            stop: Some(stop),
             heartbeat,
             sampler,
         }
@@ -850,11 +853,11 @@ impl EngineLivenessProbe {
 
 impl Drop for EngineLivenessProbe {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        drop(self.stop.take());
         if let Some(sampler) = self.sampler.take() {
-            // The sampler wakes at most one interval later; joining bounds
-            // the thread's lifetime to the index's without blocking a drop
-            // on a stuck heartbeat callback.
+            // The disconnected channel wakes the sampler at once; joining
+            // bounds the thread's lifetime to the index's without blocking a
+            // drop on a stuck heartbeat callback.
             if std::thread::current().id() != sampler.thread().id() {
                 drop(sampler.join());
             }
@@ -2491,6 +2494,25 @@ mod tests {
         assert!(
             ticks.load(Ordering::Relaxed) > 0,
             "a growing archive must post at least one liveness tick"
+        );
+    }
+
+    /// Dropping a probe ends its sampler at once. It used to sleep out the
+    /// rest of a whole sample interval first, which put a one-second floor
+    /// on every storage open and Quill index drop: an empty `cass index`
+    /// took 2.4 s, all of it in two such waits.
+    #[test]
+    fn dropping_a_liveness_probe_does_not_wait_out_the_sample_interval() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let probe = EngineLivenessProbe::spawn(vec![tmp.path().to_path_buf()], Arc::new(|| {}));
+        // Let the sampler enter its wait.
+        std::thread::sleep(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        drop(probe);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < ENGINE_LIVENESS_SAMPLE_INTERVAL / 2,
+            "dropping the probe took {elapsed:?}"
         );
     }
 
