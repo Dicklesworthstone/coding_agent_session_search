@@ -95,6 +95,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   Quill query fuel, the whole search failed and the exact query's hits were
   lost. Search now returns them, and robot mode reports
   `_meta.wildcard_fallback_skipped: "query_fuel_exhausted"`.
+- **`cass doctor baseline save|diff|update` works on Windows.** Its path
+  check refused any path with a drive prefix, and every absolute Windows
+  path has one, so every baseline failed with "doctor baseline path is not
+  portable-safe". It now refuses `..` components and relative requests that
+  are not plain names (`D:name`, `\name`), which `join` would let escape the
+  baselines directory.
 - **OpenCode SQLite exports shut down the connector runtime before Windows
   process teardown (#519).** The connector keeps a separate thread-local
   Asupersync runtime. Dropping it after Windows terminated its worker
