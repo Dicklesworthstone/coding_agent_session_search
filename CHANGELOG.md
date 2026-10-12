@@ -341,6 +341,21 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   placeholder with every provider "not wired yet" and every count 0.
   Entering the tab now starts one background read, `r` reads again, and a
   count whose provider could not be read shows `?` instead of 0.
+- **franken-agent-detection 0.3.10 (from 0.3.8) changes what is indexed.**
+  0.3.10 is 0.3.9 plus the shutdown hook of the #519 fix, and 0.3.9
+  carries these connector changes. cass now indexes Qwen Code's native
+  JSONL sessions and Cline's native task directories. Gemini histories are
+  replayed the way Gemini CLI writes them: earlier versions of a reply are
+  no longer kept as separate messages, and turns that hold only thoughts or
+  tool calls are kept. Copilot CLI sessions are indexed only under
+  `copilot_cli`, no longer also under `copilot`. A transcript that fails
+  partway through a read is dropped instead of being indexed as complete.
+  An invalid `CASS_EXCLUDE_PATHS` entry (one that cannot be resolved, or a
+  relative entry with no usable working directory) is now an error from the
+  Claude Code, Codex and Pi-family readers; it used to mean "no
+  exclusions". The first index run with the new build re-reads sources that
+  are already indexed, so existing Gemini, Cline and Copilot CLI sessions
+  change then.
 - **frankensearch 0.7.1 / frankensearch-quill 0.4.0.** This is the first
   main-branch quill release after the 0.3.4 hotfix, and it keeps that
   hotfix's grammar, union and date-filter fixes. Snapshot segments are
