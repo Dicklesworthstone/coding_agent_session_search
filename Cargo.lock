@@ -2062,9 +2062,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96ba5ee4c3ac895ed71946569ff0dca9e35a40a83b159141f40980c2118661a1"
+checksum = "591b7b65ddd7dda52ae77c5e636496c5191b62a2508b2b8955a1bd87560ff4e2"
 dependencies = [
  "ahash",
  "arc-swap",

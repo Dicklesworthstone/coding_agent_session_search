@@ -117,9 +117,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   existing vector index kept its own handles to that file open while it
   renamed the new generation over it, and Windows refuses such a rename:
   `cass index --full` exited 9 with "install complete semantic rebuild |
-  Access is denied". The handles now close first. On Windows, another
-  process that has the index open (a search, the TUI) can still block the
-  replacement.
+  Access is denied". The handles now close first.
+- **On Windows, a search or the TUI that has the semantic index open no
+  longer blocks `cass index` from replacing it.** frankensearch-index 0.4.1
+  (a lockfile update) moves a new vector or HNSW file into place with
+  `std::fs::rename`. On Windows that uses POSIX rename semantics, so a reader
+  keeps the generation it mapped, as on Unix, and the install no longer
+  fails with "Access is denied".
 - **On Windows, `cass doctor archive-normalize` keeps the drive in its
   plan.** The data directory in the plan's fingerprint and in the printed
   apply command lost its drive: `C:\Users\x\data` became `/Users/x/data`.
