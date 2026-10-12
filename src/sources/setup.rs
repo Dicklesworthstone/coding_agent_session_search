@@ -997,27 +997,28 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                         state.current_operation = Some(format!("Installing on {}", host.host_name));
                         opts.save_checkpoint(&state)?;
 
-                        // Create installer for this specific host
-                        // Skip hosts without system info (they likely failed probing)
+                        // Incomplete probe metadata cannot satisfy a requested
+                        // installation. Keep the checkpoint instead of silently
+                        // skipping this host and reporting setup complete.
                         let Some(system_info) = host.system_info.clone() else {
-                            if !opts.json {
-                                println!(
-                                    "│ {} {} skipped (no system info)",
-                                    "⚠".yellow(),
+                            return Err(SetupError::Install(
+                                super::install::InstallError::VerificationFailed(format!(
+                                    "Saved probe for {} has no system information; \
+                                     rerun setup without --resume to refresh probing, \
+                                     or resume with --skip-install.",
                                     host.host_name
-                                );
-                            }
-                            continue;
+                                )),
+                            ));
                         };
                         let Some(resources) = host.resources.clone() else {
-                            if !opts.json {
-                                println!(
-                                    "│ {} {} skipped (no resource info)",
-                                    "⚠".yellow(),
+                            return Err(SetupError::Install(
+                                super::install::InstallError::VerificationFailed(format!(
+                                    "Saved probe for {} has no resource information; \
+                                     rerun setup without --resume to refresh probing, \
+                                     or resume with --skip-install.",
                                     host.host_name
-                                );
-                            }
-                            continue;
+                                )),
+                            ));
                         };
                         let installer =
                             RemoteInstaller::new(host.host_name.clone(), system_info, resources);
@@ -1053,9 +1054,15 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                                 if !opts.json {
                                     println!("│ {} {} failed: {}", "✗".red(), host.host_name, e);
                                 }
-                                if opts.verbose {
-                                    eprintln!("  Install error: {e}");
-                                }
+                                // The installer already exhausted its fallback
+                                // chain. Do not configure/sync or clear the
+                                // successful per-host checkpoints on failure.
+                                eprintln!(
+                                    "Setup paused while installing on {}. Progress is saved; \
+                                     resolve the error before running 'cass sources setup --resume'.",
+                                    host.host_name
+                                );
+                                return Err(SetupError::Install(e));
                             }
                         }
                     }
@@ -1197,6 +1204,16 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                                     e
                                 );
                             }
+                            // In particular, a timeout can leave a remote job
+                            // running: retain the indexer's recovery advice and
+                            // the checkpoint, not a false completion result.
+                            eprintln!(
+                                "Setup paused while indexing on {}. {} Progress is saved; \
+                                 resolve the error before running 'cass sources setup --resume'.",
+                                host.host_name,
+                                e.help_message()
+                            );
+                            return Err(SetupError::Index(e));
                         }
                     }
                 }
