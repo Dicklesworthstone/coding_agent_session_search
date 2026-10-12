@@ -89,6 +89,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   opened the index once, took 10.6 s. The default path now reuses the
   reader the check opened, whenever the check found the index usable as it
   is.
+- **A refused automatic wildcard retry no longer discards the exact hits
+  (#518 follow-up).** On an index of at most 10,000 documents, a sparse
+  exact search retries with `*term*` wildcards. When that retry ran out of
+  Quill query fuel, the whole search failed and the exact query's hits were
+  lost. Search now returns them, and robot mode reports
+  `_meta.wildcard_fallback_skipped: "query_fuel_exhausted"`.
 - **OpenCode SQLite exports shut down the connector runtime before Windows
   process teardown (#519).** The connector keeps a separate thread-local
   Asupersync runtime. Dropping it after Windows terminated its worker

@@ -35843,7 +35843,8 @@ struct SearchModeMeta {
     lexical_degrade_reason: Option<&'static str>,
     /// 2l1b0.68: why a sparse lexical result did not get the automatic
     /// wildcard retry (`index_over_automatic_limit`, `automatic_retry_disabled`,
-    /// `long_query_term`).
+    /// `long_query_term`), or kept its own hits because the retry ran out of
+    /// query fuel (`query_fuel_exhausted`, 7hvlg).
     wildcard_fallback_skipped: Option<&'static str>,
 }
 
@@ -101930,6 +101931,7 @@ fn response_schema_search_meta() -> serde_json::Value {
                     "index_over_automatic_limit",
                     "automatic_retry_disabled",
                     "long_query_term",
+                    "query_fuel_exhausted",
                     null
                 ],
             }),

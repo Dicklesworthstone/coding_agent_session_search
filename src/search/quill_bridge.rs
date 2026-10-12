@@ -456,6 +456,31 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
 }
 
+/// [`open_cass_reader`] with its own query-fuel ceiling, for tests that need a
+/// query to run out of fuel without a process-wide environment variable.
+#[cfg(test)]
+pub(crate) fn open_cass_reader_with_query_fuel_budget(
+    path: &Path,
+    query_fuel_budget: u64,
+) -> Result<QuillSearchIndex> {
+    drive(|cx| {
+        let path = path.to_path_buf();
+        async move {
+            QuillSearchIndex::open_with_schema(
+                &cx,
+                path,
+                CASS_SEMANTIC_SCHEMA,
+                QuillConfig {
+                    query_fuel_budget,
+                    ..cass_quill_config()
+                },
+            )
+            .await
+        }
+    })
+    .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
+}
+
 /// File name pattern of one published Quill segment inside an index directory.
 const QUILL_SEGMENT_FILE_PREFIX: &str = "seg-";
 const QUILL_SEGMENT_FILE_SUFFIX: &str = ".fslx";

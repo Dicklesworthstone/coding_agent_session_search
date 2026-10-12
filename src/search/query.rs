@@ -3472,6 +3472,11 @@ pub const WILDCARD_FALLBACK_SKIPPED_DISABLED: &str = "automatic_retry_disabled";
 /// longer than the automatic retry accepts.
 pub const WILDCARD_FALLBACK_SKIPPED_LONG_TERM: &str = "long_query_term";
 
+/// `_meta.wildcard_fallback_skipped` value when the automatic retry ran out of
+/// Quill query fuel; the plain query's hits are returned
+/// (coding_agent_session_search-7hvlg).
+pub const WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchClientOptions {
     pub enable_reload: bool,
@@ -7449,7 +7454,41 @@ impl SearchClient {
         );
 
         let mut fallback_hits =
-            self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
+            match self.search(&wildcard_query, filters.clone(), limit, offset, field_mask) {
+                Ok(fallback_hits) => fallback_hits,
+                // The retry only refines a search that already succeeded. A
+                // `*term*` dictionary walk can exhaust the query fuel the plain
+                // query fit in (GH #518); that refusal must not discard the
+                // plain query's hits (coding_agent_session_search-7hvlg).
+                // Other failures still fail the search.
+                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
+                    tracing::warn!(
+                        original_query = query,
+                        wildcard_query,
+                        original_count = hits.len(),
+                        error = %format_args!("{error:#}"),
+                        "wildcard_fallback ran out of query fuel; returning the original results"
+                    );
+                    self.record_wildcard_fallback_skip(Some(
+                        WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+                    ));
+                    let suggestions = if hits.is_empty() {
+                        self.generate_suggestions(query, &filters)
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(SearchResult {
+                        hits,
+                        wildcard_fallback: false,
+                        cache_stats: baseline_stats,
+                        suggestions,
+                        ann_stats: None,
+                        ann_unavailable_reason: None,
+                        total_count: tantivy_total,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
         let fallback_stats = self.cache_stats();
         // Re-capture total_count after wildcard search (may have changed)
         let fallback_tantivy_total = self
@@ -19515,6 +19554,129 @@ mod tests {
             snippet_terms_for_query("agent:").is_empty(),
             "a bare field prefix with no value yields no terms"
         );
+    }
+
+    /// coding_agent_session_search-7hvlg (GH #518 follow-up): the automatic
+    /// `*term*` retry only refines a search that already succeeded. Its
+    /// dictionary walk can run out of the query fuel the plain lookup fit in;
+    /// the plain query's hits must come back, with `wildcard_fallback_skipped`
+    /// naming the cause, instead of the whole search failing.
+    #[test]
+    fn search_with_fallback_keeps_exact_hits_when_the_wildcard_retry_runs_out_of_fuel() -> Result<()>
+    {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let conversation = |id: usize, content: String| NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some(format!("doc-{id}")),
+            workspace: Some(std::path::PathBuf::from("/ws")),
+            source_path: dir.path().join(format!("{id}.jsonl")),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content,
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        // Many distinct terms over a few segments give the retry's
+        // dictionary walk real work; one document holds the needle.
+        for id in 0..400 {
+            let words = (0..16)
+                .map(|word| format!("filler{id}x{word}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            index.add_conversation(&conversation(id, words))?;
+            if id % 100 == 99 {
+                index.commit()?;
+            }
+        }
+        index.add_conversation(&conversation(400, "needleword appears once".into()))?;
+        index.commit()?;
+
+        let client_with_budget = |budget: u64| -> Result<SearchClient> {
+            let reader = crate::search::quill_bridge::open_cass_reader_with_query_fuel_budget(
+                dir.path(),
+                budget,
+            )?;
+            SearchClient::from_opened_lexical_index(
+                crate::search::tantivy::OpenedLexicalIndex {
+                    path: dir.path().to_path_buf(),
+                    reader: Some((
+                        reader,
+                        crate::search::quill_bridge::QuillCassFields::compiled(),
+                    )),
+                    federated_readers: None,
+                },
+                None,
+                SearchClientOptions::default(),
+            )?
+            .context("a reader is present")
+        };
+        let plain = |budget: u64| {
+            client_with_budget(budget)?.search(
+                "needleword",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )
+        };
+        let budget = (0..40)
+            .map(|shift| 1_u64 << shift)
+            .find(|budget| plain(*budget).is_ok())
+            .expect("the plain lookup fits some budget");
+        // Precondition: at that budget the retry's walk does not fit.
+        let refused = client_with_budget(budget)?
+            .search(
+                "*needleword*",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )
+            .expect_err("`*needleword*` must cost more fuel than the plain lookup");
+        assert!(
+            crate::search::quill_bridge::is_query_fuel_exhausted(&refused),
+            "{refused:#}"
+        );
+
+        let client = client_with_budget(budget)?;
+        let result = client.search_with_fallback(
+            "needleword",
+            SearchFilters::default(),
+            10,
+            0,
+            5,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(result.hits.len(), 1, "budget {budget}: the plain hit");
+        assert!(!result.wildcard_fallback);
+        assert_eq!(
+            client.wildcard_fallback_skipped_reason(),
+            Some(WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED)
+        );
+
+        // Control: with fuel to spare the retry runs and nothing is skipped.
+        let client = client_with_budget(budget.saturating_mul(1 << 20))?;
+        let result = client.search_with_fallback(
+            "needleword",
+            SearchFilters::default(),
+            10,
+            0,
+            5,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(client.wildcard_fallback_skipped_reason(), None);
+        Ok(())
     }
 
     #[test]
