@@ -212,3 +212,96 @@ fn gh505_tailscale_invalid_status_never_partially_removes_aliases() {
         assert_eq!(hosts[1].name, "workstation");
     }
 }
+
+#[test]
+fn gh505_tailscale_alias_label_does_not_hide_a_different_destination() {
+    let bytes = serde_json::to_vec(&json!({
+        "BackendState": "Running",
+        "Peer": {
+            "real": {
+                "Online": true,
+                "DNSName": "workstation.example.ts.net.",
+                "TailscaleIPs": ["100.64.0.1"]
+            }
+        }
+    }))
+    .unwrap();
+    for name in ["workstation.example.ts.net", "WORKSTATION.example.ts.net."] {
+        let mut hosts = parse_ssh_config(&format!(
+            "Host {name}\n HostName 100.64.0.8\n User developer\n Port 2222\n IdentityFile ~/.ssh/work\n"
+        ));
+        for _ in 0..2 {
+            assert_eq!(merge_tailscale_hosts(&mut hosts, &bytes).unwrap(), 0);
+            assert_eq!(hosts.len(), 2);
+            assert_eq!(hosts[0].name, name);
+            assert_eq!(hosts[0].hostname.as_deref(), Some("100.64.0.8"));
+            assert_eq!(hosts[0].user.as_deref(), Some("developer"));
+            assert_eq!(hosts[0].port, Some(2222));
+            assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/work"));
+            assert_eq!(hosts[1].connection_string(), "100.64.0.1");
+        }
+        // Without a HostName override, the alias really does name the peer.
+        let mut hosts = parse_ssh_config(&format!("Host {name}\n User developer\n"));
+        assert_eq!(merge_tailscale_hosts(&mut hosts, &bytes).unwrap(), 0);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].connection_string(), format!("developer@{name}"));
+    }
+}
+
+#[test]
+fn gh505_tailscale_ip_targets_do_not_recreate_removed_or_remapped_aliases() {
+    let mut hosts = parse_ssh_config(
+        "Host 100.64.0.1\n HostName 100.90.0.1\n\
+         Host 100.64.0.2\n HostName 100.64.0.8\n User developer\n Port 2222\n",
+    );
+    let bytes = serde_json::to_vec(&json!({
+        "BackendState": "Running",
+        "Peer": {
+            "a-real": {"Online": true, "TailscaleIPs": ["100.64.0.1"]},
+            "b-real": {"Online": true, "TailscaleIPs": ["100.64.0.2"]},
+            "z-provider": {
+                "Online": false,
+                "Tags": ["tag:mullvad-exit-node"],
+                "TailscaleIPs": ["100.90.0.1"]
+            }
+        }
+    }))
+    .unwrap();
+    assert_eq!(merge_tailscale_hosts(&mut hosts, &bytes).unwrap(), 2);
+    // The first alias is excluded; adding a raw .1 would invoke that same
+    // still-configured alias. The second alias remains usable for .8, but
+    // must not also be added as a second (misdirected) candidate for .2.
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].name, "100.64.0.2");
+    assert_eq!(hosts[0].hostname.as_deref(), Some("100.64.0.8"));
+    assert_eq!(hosts[0].user.as_deref(), Some("developer"));
+    assert_eq!(hosts[0].port, Some(2222));
+}
+
+#[test]
+fn gh505_tailscale_safe_alias_keeps_peer_with_a_conflicting_numeric_name() {
+    let mut hosts = parse_ssh_config(
+        "Host 100.64.0.1\n HostName 100.90.0.1\n\
+         Host workstation\n HostName 100.64.0.1\n User developer\n Port 2222\n IdentityFile ~/.ssh/work\n",
+    );
+    let bytes = serde_json::to_vec(&json!({
+        "BackendState": "Running",
+        "Peer": {
+            "a-real": {"Online": true, "TailscaleIPs": ["100.64.0.1"]},
+            "z-provider": {
+                "Online": true,
+                "Tags": ["tag:mullvad-exit-node"],
+                "TailscaleIPs": ["100.90.0.1"]
+            }
+        }
+    }))
+    .unwrap();
+    // Prefer the actual destination match before rejecting an ambiguous IP
+    // target: this peer is still reachable through its unambiguous alias.
+    assert_eq!(merge_tailscale_hosts(&mut hosts, &bytes).unwrap(), 0);
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].connection_string(), "developer@workstation");
+    assert_eq!(hosts[0].hostname.as_deref(), Some("100.64.0.1"));
+    assert_eq!(hosts[0].port, Some(2222));
+    assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/work"));
+}

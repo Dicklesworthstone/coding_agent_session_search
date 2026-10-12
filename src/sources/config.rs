@@ -785,7 +785,7 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
     if !tailscale {
         return (hosts, None);
     }
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<usize> {
         let mut command = std::process::Command::new("tailscale");
         command
             .args(["status", "--json"])
@@ -809,15 +809,20 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
         );
         merge_tailscale_hosts(&mut hosts, &output.stdout)
     })();
-    (
-        hosts,
-        result
-            .err()
-            .map(|error| format!("Tailscale discovery unavailable: {error}")),
-    )
+    let warning = match result {
+        Ok(0) => None,
+        Ok(skipped) => Some(format!(
+            "Tailscale discovery skipped {skipped} peer(s) whose IP addresses conflict with SSH aliases; \
+             configure an unambiguous SSH alias for each intended machine."
+        )),
+        Err(error) => Some(format!("Tailscale discovery unavailable: {error}")),
+    };
+    (hosts, warning)
 }
 
-fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyhow::Result<()> {
+/// Merge status into candidates freshly read from SSH configuration.
+/// Returns the number of peers whose direct IP target conflicts with an alias.
+fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyhow::Result<usize> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Status {
@@ -848,6 +853,11 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         status.backend_state == "Running",
         "Tailscale is not running; check local login and daemon status"
     );
+    // Removing a candidate does not remove its Host stanza from SSH config.
+    // Reserve the original names before pruning so a peer's numeric address
+    // cannot recreate an excluded alias and be redirected to that provider.
+    let reserved_names: HashSet<_> = hosts.iter().map(|host| host.name.clone()).collect();
+    let mut shadowed_peers = 0;
     // GH505: Mullvad peers are provider WireGuard endpoints, not SSH hosts.
     // Tags may be absent/null in status JSON. The provider DNS suffix is
     // also used by Tailscale itself (cmd/tailscale/cli/status.go and
@@ -901,31 +911,37 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
             continue;
         };
         let dns = peer.dns_name.trim_end_matches('.');
-        // Preserve explicit aliases, including their User/IdentityFile/ProxyJump.
-        // HostName from Tailscale is not unique and is never a deduplication key.
+        // Preserve aliases for this destination, including their connection
+        // options. A label matching the peer is not equivalent when HostName
+        // explicitly points elsewhere. Tailscale HostName is not unique.
         if hosts.iter().any(|host| {
-            [&host.name, host.hostname.as_ref().unwrap_or(&host.name)]
-                .into_iter()
-                .any(|name| {
-                    (!dns.is_empty() && name.trim_end_matches('.').eq_ignore_ascii_case(dns))
-                        || name
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| addresses.contains(&ip))
-                })
+            let destination = host.hostname.as_deref().unwrap_or(&host.name);
+            (!dns.is_empty() && destination.trim_end_matches('.').eq_ignore_ascii_case(dns))
+                || destination
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| addresses.contains(&ip))
         }) {
+            continue;
+        }
+        let target = address.to_string();
+        if reserved_names.contains(&target) {
+            // A usable alias for the peer would have matched above. Reusing
+            // this name instead would invoke a different configured target.
+            // Do not override SSH configuration or silently guess a DNS route.
+            shadowed_peers += 1;
             continue;
         }
         // Use the assigned address, so --accept-dns=false and disabled MagicDNS
         // do not make an otherwise reachable peer unusable. Downstream SSH uses name.
         hosts.push(DiscoveredHost {
-            name: address.to_string(),
-            hostname: Some(address.to_string()),
+            name: target.clone(),
+            hostname: Some(target),
             user: None,
             port: None,
             identity_file: None,
         });
     }
-    Ok(())
+    Ok(shadowed_peers)
 }
 
 fn discover_ssh_hosts_from_path(path: &Path, home: &Path) -> Vec<DiscoveredHost> {

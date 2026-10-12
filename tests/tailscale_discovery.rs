@@ -526,3 +526,92 @@ fn gh505_bare_resume_filters_provider_aliases_before_peer_deduplication() {
         "status --json\n"
     );
 }
+
+#[test]
+fn gh505_renamed_dns_alias_does_not_suppress_the_real_peer() {
+    let fixture = FleetFixture::new(
+        mixed_peers(),
+        "Host workstation.example.ts.net\n HostName 100.64.0.8\n User developer\n Port 2222\n",
+    );
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(discovery["hosts"].as_array().unwrap().len(), 3, "{discovery}");
+    assert!(fixture.attempted_transports().is_empty());
+
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    // OpenSSH uses the explicit HostName for the alias. The separate peer
+    // bearing that DNS name must also be probed at its assigned address.
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from([
+            "100.64.0.1".into(),
+            "100.64.0.2".into(),
+            "100.64.0.8".into(),
+        ])
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("conflict with SSH aliases"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn gh505_excluded_numeric_alias_is_not_reintroduced_as_a_raw_peer_target() {
+    for resume in [false, true] {
+        let fixture = FleetFixture::new(
+            mixed_peers(),
+            "Host 100.64.0.1\n HostName 100.90.0.1\n",
+        );
+        let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+        assert!(output.status.success(), "{output:?}");
+        let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(discovery["hosts"].as_array().unwrap().len(), 1, "{discovery}");
+        assert!(fixture.attempted_transports().is_empty());
+
+        let output = if resume {
+            fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.1"]);
+            fixture.setup_with_options(true, &[])
+        } else {
+            fixture.setup(false)
+        };
+        assert_setup_no_hosts(&output);
+        // Removing the alias from discovery does not change SSH config. A
+        // raw .1 would still go to provider .90.0.1, not the intended machine.
+        assert_eq!(
+            fixture.attempted_transports(),
+            BTreeSet::from(["100.64.0.2".into()])
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Tailscale discovery skipped 1 peer(s)"), "{output:?}");
+        assert!(stderr.contains("configure an unambiguous SSH alias"), "{output:?}");
+        assert_eq!(
+            fs::read_to_string(&fixture.status_calls).unwrap(),
+            "status --json\nstatus --json\n"
+        );
+    }
+}
+
+#[test]
+fn gh505_safe_alternate_alias_preserves_a_peer_with_an_excluded_numeric_alias() {
+    let aliases = format!("{ALIAS}Host 100.64.0.1\n HostName 100.90.0.1\n");
+    let fixture = FleetFixture::new(mixed_peers(), &aliases);
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(discovery["hosts"].as_array().unwrap().len(), 2, "{discovery}");
+    assert!(fixture.attempted_transports().is_empty());
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    // workstation resolves directly to .1; it does not invoke the separate
+    // Host 100.64.0.1 stanza. Blocking that numeric name must not drop this alias.
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("conflict with SSH aliases"),
+        "{output:?}"
+    );
+}
