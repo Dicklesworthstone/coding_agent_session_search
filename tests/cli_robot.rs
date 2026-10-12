@@ -1372,9 +1372,13 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     assert_eq!(json["evidence"].as_array().expect("pack evidence").len(), 1);
     assert_eq!(json["evidence"][0]["excerpt"], "auth alias evidence");
     let citation = &json["evidence"][0]["citation"];
-    assert_eq!(
-        Path::new(citation["source_path"].as_str().expect("source path")),
-        source_path
+    // Pack redacts paths under a home directory, and a Windows temp dir is
+    // under one.
+    let cited = citation["source_path"].as_str().expect("source path");
+    assert!(
+        Path::new(cited) == source_path
+            || (cited.starts_with("[REDACTED_PATH]") && cited.ends_with(filename)),
+        "the citation names the indexed source, verbatim or redacted: {cited}"
     );
     assert_eq!(citation["verified"], true);
 
@@ -5872,9 +5876,29 @@ fn search_robot_meta_echoes_the_query_grouping() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Midnight of a date in epoch milliseconds as a cass child run with TZ=UTC
+/// reads a bare `--since` date, computed with chrono rather than cass. cass
+/// takes local midnight in its own time zone: Unix honors TZ, so that is UTC
+/// midnight; Windows ignores TZ, so it is the host's (if17v: wlap runs at
+/// UTC+8).
+fn tz_utc_child_midnight_ms(year: i32, month: u32, day: u32) -> Result<i64, Box<dyn Error>> {
+    let midnight = chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .ok_or("valid date")?;
+    #[cfg(unix)]
+    let millis = midnight.and_utc().timestamp_millis();
+    #[cfg(not(unix))]
+    let millis = midnight
+        .and_local_timezone(chrono::Local)
+        .single()
+        .ok_or("unambiguous local midnight")?
+        .timestamp_millis();
+    Ok(millis)
+}
+
 /// 2l1b0.68: `_meta.effective` echoes what search actually ran. Every
-/// expected value here comes from outside cass: the fixture path, a UTC
-/// epoch computed by hand, and the flags as typed. Negative control: before
+/// expected value here comes from outside cass: the fixture path, local
+/// midnight computed with chrono, and the flags as typed. Negative control: before
 /// 2l1b0.68 `_meta.effective` did not exist, so the first assertion fails.
 #[test]
 fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
@@ -5909,8 +5933,13 @@ fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn
         )
     );
     assert_eq!(effective["db_path_source"], "--data-dir");
-    // 2026-01-01T00:00:00Z.
-    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    // A bare date is local midnight in cass's time zone. This child runs
+    // with TZ=UTC: 2026-01-01T00:00:00Z on Unix, eight hours earlier on a
+    // UTC+8 Windows host, which ignores TZ.
+    assert_eq!(
+        effective["time_window"]["since_ms"],
+        tz_utc_child_midnight_ms(2026, 1, 1)?
+    );
     assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
     assert!(effective["time_window"]["until_ms"].is_null());
     assert!(effective["time_window"]["until_from"].is_null());
@@ -5972,8 +6001,13 @@ fn pack_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
         "db_path is the data dir's database, verbatim or redacted: {effective}"
     );
     assert_eq!(effective["db_path_source"], "--data-dir");
-    // 2026-01-01T00:00:00Z.
-    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    // A bare date is local midnight in cass's time zone. This child runs
+    // with TZ=UTC: 2026-01-01T00:00:00Z on Unix, eight hours earlier on a
+    // UTC+8 Windows host, which ignores TZ.
+    assert_eq!(
+        effective["time_window"]["since_ms"],
+        tz_utc_child_midnight_ms(2026, 1, 1)?
+    );
     assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
     assert_eq!(
         effective["filters"]["agents"],
@@ -8700,6 +8734,10 @@ fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // HOME does not isolate Claude Code on Windows (its root comes from the
+    // profile known folder) or under an inherited CLAUDE_CONFIG_DIR. On wlap
+    // the pack alias tests cited the host's own sessions (if17v).
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
     cmd
 }
 

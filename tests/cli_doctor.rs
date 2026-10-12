@@ -223,6 +223,10 @@ fn cass_cmd(test_home: &Path) -> Command {
         .env("XDG_DATA_HOME", test_home)
         .env("XDG_CONFIG_HOME", test_home)
         .env("HOME", test_home)
+        // HOME does not isolate Claude Code or Codex on Windows (their roots
+        // come from the profile known folder) or under inherited overrides.
+        .env("CLAUDE_CONFIG_DIR", test_home.join(".claude"))
+        .env("CODEX_HOME", test_home.join(".codex"))
         .current_dir(test_home);
     cmd
 }
