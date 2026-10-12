@@ -1937,7 +1937,7 @@ fn gh519_export_indexed_source_live_wal_exits_successfully_repeatedly() {
                 if index % 2 == 0 {
                     MessageRole::User
                 } else {
-                    MessageRole::Assistant
+                    MessageRole::Agent
                 },
                 1_700_000_000_000 + index,
                 &format!("GH519 message {index}: complete 🪟"),
