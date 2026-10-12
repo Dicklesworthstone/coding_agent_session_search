@@ -2,11 +2,12 @@
 use coding_agent_search::franken_sync::SqliteValue;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::{Value, json};
+use std::{fs, path::Path, process::Command, time::Duration};
+// Only the signal tests below are unix-only users of these.
+#[cfg(unix)]
 use std::{
-    fs,
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    process::{Child, Stdio},
+    time::Instant,
 };
 
 fn source_term(source: usize) -> String {

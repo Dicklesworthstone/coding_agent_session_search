@@ -8449,6 +8449,7 @@ fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
 /// deferral is planted the cheap way — the probe refuses a non-regular file —
 /// so no multi-hundred-megabyte fixture is needed. No-claim: this does not
 /// make the probe run on large archives; it makes the skip visible.
+#[cfg(unix)]
 #[test]
 fn doctor_reports_integrity_unchecked_reason_code_when_the_deep_probe_is_deferred() {
     let temp = tempfile::tempdir().expect("tempdir");
