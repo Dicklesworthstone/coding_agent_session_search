@@ -563,6 +563,11 @@ fn confirm_automatic_probe_fleet(
 
 /// Run the setup wizard.
 pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
+    // A configuration load failure is not an empty installation. Refuse before
+    // discovery, remote work or checkpoint mutation, including on --resume.
+    // Reload again at selection and merge so later errors are not swallowed.
+    SourcesConfig::load().map_err(SetupError::Config)?;
+
     // Set up interruption flag (Ctrl+C handled at CLI level)
     let interrupted = Arc::new(AtomicBool::new(false));
 
@@ -830,7 +835,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             print_phase_header("Phase 3: Host Selection");
         }
 
-        let existing_config = SourcesConfig::load().unwrap_or_default();
+        let existing_config = SourcesConfig::load().map_err(SetupError::Config)?;
         let existing_name_keys: HashSet<_> = existing_config.configured_name_keys();
 
         if opts.non_interactive {
@@ -1251,7 +1256,9 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             print_phase_header("Phase 6: Configuring sources");
         }
 
-        let mut config = SourcesConfig::load().unwrap_or_default();
+        // Reload rather than merging over a snapshot captured before remote
+        // work. A load error must never turn the existing config into defaults.
+        let mut config = SourcesConfig::load().map_err(SetupError::Config)?;
         let generator = SourceConfigGenerator::new();
 
         // Generate preview

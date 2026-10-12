@@ -1021,3 +1021,152 @@ fn gh505_dry_run_explicit_override_does_not_change_saved_discovery_mode() {
     );
     assert_eq!(fs::read_to_string(&fixture.status_calls).unwrap(), "status --json\n");
 }
+
+#[test]
+fn gh505_setup_invalid_config_stops_before_discovery_and_checkpoint_writes() {
+    for invalid in [
+        "[[sources]\n",
+        "[[sources]]\nname = \"local\"\ntype = \"ssh\"\nhost = \"existing\"\n",
+        "[[sources]]\nname = \"Existing\"\ntype = \"ssh\"\nhost = \"first\"\n\
+         [[sources]]\nname = \"existing\"\ntype = \"ssh\"\nhost = \"second\"\n",
+    ] {
+        for resume in [false, true] {
+            for dry_run in [false, true] {
+                let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+                fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.9"]);
+                let checkpoint_before = checkpoint_files(&fixture);
+                let path = fixture.root.path().join("config/cass/sources.toml");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, invalid).unwrap();
+                let inode = fs::symlink_metadata(&path).unwrap().ino();
+                let mut flags = vec!["--tailscale"];
+                if dry_run {
+                    flags.push("--dry-run");
+                }
+                let output = fixture.setup_with_options(resume, &flags);
+                assert!(!output.status.success(), "{output:?}");
+                let diagnostics = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(diagnostics.contains("Config error:"), "{output:?}");
+                assert!(!fixture.status_calls.exists());
+                assert!(fixture.attempted_transports().is_empty());
+                assert_eq!(checkpoint_files(&fixture), checkpoint_before);
+                assert_eq!(fs::read(&path).unwrap(), invalid.as_bytes());
+                assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+                // Refusal must not publish a replacement, backup or temp file.
+                assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn gh505_setup_config_read_error_preserves_saved_progress() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.9"]);
+    let checkpoint_before = checkpoint_files(&fixture);
+    // A directory at the config path gives a deterministic read error even
+    // under root, where chmod-based permission tests would silently succeed.
+    let path = fixture.root.path().join("config/cass/sources.toml");
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("keep"), b"not a configuration file").unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert!(!output.status.success(), "{output:?}");
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostics.contains("Failed to read config file"), "{output:?}");
+    assert_eq!(checkpoint_files(&fixture), checkpoint_before);
+    assert!(!fixture.status_calls.exists());
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(path.is_dir());
+    assert_eq!(fs::read(path.join("keep")).unwrap(), b"not a configuration file");
+    assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+}
+
+#[test]
+fn gh505_setup_config_error_can_resume_after_repair_without_losing_sources() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    // Resume input with completed probing/selection reaches configuration
+    // without substituting for the production SSH or configuration code.
+    let mut probe = HostProbeResult::unreachable("workstation", "unused fixture error");
+    probe.reachable = true;
+    probe.error = None;
+    probe.cass_status = CassStatus::NotFound;
+    probe.detected_agents = vec![DetectedAgent {
+        agent_type: "claude_code".into(),
+        path: "~/.claude/projects".into(),
+        estimated_sessions: Some(1),
+        estimated_size_mb: Some(1),
+    }];
+    let state = SetupState {
+        discovery_complete: true,
+        discovered_hosts: 1,
+        discovered_host_names: vec!["workstation".into()],
+        discovery_mode: Some(SetupDiscoveryMode::Tailscale),
+        probing_complete: true,
+        probed_hosts: vec![probe],
+        selection_complete: true,
+        selected_host_names: vec!["workstation".into()],
+        ..Default::default()
+    };
+    fs::write(fixture.state_path(), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let checkpoint_before = checkpoint_files(&fixture);
+    let path = fixture.root.path().join("config/cass/sources.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let invalid = b"# preserve the broken configuration for repair\n[[sources]\n";
+    fs::write(&path, invalid).unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(fs::read(&path).unwrap(), invalid);
+    assert_eq!(checkpoint_files(&fixture), checkpoint_before);
+    assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+
+    // The caller repairs the file; retry merges instead of replacing the
+    // existing source, path mappings, schedule and disabled-agent policy.
+    let repaired = r#"disabled_agents = ["openclaw"]
+
+[[sources]]
+name = "existing"
+type = "ssh"
+host = "operator@existing"
+paths = ["~/.codex/sessions"]
+sync_schedule = "daily"
+
+[[sources.path_mappings]]
+from = "/remote/projects"
+to = "/local/projects"
+agents = ["codex"]
+"#;
+    fs::write(&path, repaired).unwrap();
+    let before = SourcesConfig::load_from(&path).unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let after = SourcesConfig::load_from(&path).unwrap();
+    assert_eq!(after.sources.len(), 2);
+    assert_eq!(after.disabled_agents, before.disabled_agents);
+    assert_eq!(
+        serde_json::to_value(after.find_source("existing").unwrap()).unwrap(),
+        serde_json::to_value(before.find_source("existing").unwrap()).unwrap()
+    );
+    let added = after.find_source("workstation").unwrap();
+    assert_eq!(added.host.as_deref(), Some("workstation"));
+    assert_eq!(added.paths, vec!["~/.claude/projects"]);
+    let backups: Vec<_> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|entry| {
+            entry.file_name().unwrap().to_string_lossy().starts_with("sources.toml.backup.")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(&backups[0]).unwrap(), repaired.as_bytes());
+    assert!(!fixture.state_path().exists());
+    assert!(!fixture.status_calls.exists());
+    assert!(fixture.attempted_transports().is_empty());
+}
