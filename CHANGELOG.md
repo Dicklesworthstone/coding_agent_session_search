@@ -145,6 +145,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `std::fs::rename`. On Windows that uses POSIX rename semantics, so a reader
   keeps the generation it mapped, as on Unix, and the install no longer
   fails with "Access is denied".
+- **`cass index` hashes the lexical index fewer times.** Opening the Quill
+  writer verified (hashed) every segment four times: after recovery, again
+  for the orphan witness and for the garbage sweep, and once more for the
+  writer itself. frankensearch-quill 0.4.1 (a lockfile update) keeps the
+  post-recovery view and judges the other passes against it, so a no-op
+  `cass index` verifies the whole index three times instead of six.
 - **On Windows, `cass doctor archive-normalize` keeps the drive in its
   plan.** The data directory in the plan's fingerprint and in the printed
   apply command lost its drive: `C:\Users\x\data` became `/Users/x/data`.
