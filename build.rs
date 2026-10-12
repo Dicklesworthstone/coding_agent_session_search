@@ -183,9 +183,10 @@ const CONTRACTS: &[DependencyContract] = &[
         // entries for the Claude, Pi and Codex readers (cass 0f1k0).
         // 0.3.10 exposes SQLite connector runtime shutdown before Windows
         // process teardown (cass#519) and preserves the full read-error chain.
-        // crates.io refuses git dependencies, hence version-only.
-        expected_git: "",
-        expected_rev: "",
+        // GH#520 needs the post-0.3.10 mirror-root metadata API. Keep the
+        // source contract exact until a registry release carries this fix.
+        expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
+        expected_rev: "b0cabe3e301b0bb2b2a288e06b048067fa037131",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.

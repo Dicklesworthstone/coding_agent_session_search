@@ -33322,7 +33322,8 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                     let mirror_path = mirror_base.join(&safe_name);
 
                     if mirror_path.exists() {
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
+                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform)
+                            .with_mirrored_source_path(path);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
                         roots.push(scan_root);
                         continue;
@@ -33337,7 +33338,8 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                                 let name_str = name.to_string_lossy();
                                 if name_str.ends_with(&safe_suffix) && entry.path().is_dir() {
                                     let mut scan_root =
-                                        ScanRoot::remote(entry.path(), origin.clone(), platform);
+                                        ScanRoot::remote(entry.path(), origin.clone(), platform)
+                                            .with_mirrored_source_path(path);
                                     scan_root.workspace_rewrites = workspace_rewrites.clone();
                                     roots.push(scan_root);
                                     break;
@@ -33430,7 +33432,8 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                             kind: source.kind,
                             host: source.host_label.clone(),
                         };
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
+                        let mut scan_root = ScanRoot::remote(mirror_path, origin, platform)
+                            .with_mirrored_source_path(path);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
                         roots.push(scan_root);
                     } else {
@@ -67744,7 +67747,16 @@ c.close()
         std::fs::create_dir_all(&data_dir).unwrap();
         let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
 
-        for path in ["~", "~/.codex/sessions", "/home/operator/.codex/sessions"] {
+        for path in [
+            "~",
+            "~/.codex/sessions",
+            "/home/operator/.codex/sessions",
+            "~/.factory/sessions",
+            "~/.config/Cursor/User",
+            "~/.gemini/tmp",
+            "~/.vibe/logs",
+            "~/.prime/agent/sessions",
+        ] {
             storage
                 .upsert_source(&crate::sources::provenance::Source {
                     id: "laptop".to_string(),
@@ -67767,6 +67779,80 @@ c.close()
             let remote = roots.iter().find(|root| root.origin.is_remote()).unwrap();
             assert_eq!(remote.path, mirror);
             assert_eq!(remote.origin.source_id, "laptop");
+            assert_eq!(remote.mirrored_source_path.as_deref(), Some(path));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn build_scan_roots_discovers_gh520_mirrored_layouts() {
+        use crate::connectors::Connector;
+        use franken_agent_detection::connectors::{
+            cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+            prime_agent::PrimeAgentConnector, vibe::VibeConnector,
+        };
+        let _guard = ignore_sources_config();
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
+        let cases: Vec<(&str, &str, Box<dyn Connector>)> = vec![
+            (
+                "~/.factory/sessions",
+                "sessions/project/session.jsonl",
+                Box::new(FactoryConnector::new()),
+            ),
+            (
+                "~/.config/Cursor/User",
+                "User/globalStorage/state.vscdb",
+                Box::new(CursorConnector::new()),
+            ),
+            (
+                "~/.gemini/tmp",
+                "tmp/hash/chats/session-test.json",
+                Box::new(GeminiConnector::new()),
+            ),
+            (
+                "~/.vibe/logs",
+                "logs/session/session-test/messages.jsonl",
+                Box::new(VibeConnector::new()),
+            ),
+            (
+                "~/.prime/agent/sessions",
+                "sessions/session.jsonl",
+                Box::new(PrimeAgentConnector::new()),
+            ),
+        ];
+        for (path, relative, connector) in cases {
+            storage
+                .upsert_source(&crate::sources::provenance::Source {
+                    id: "laptop".to_string(),
+                    kind: SourceKind::Ssh,
+                    host_label: Some("user@laptop".to_string()),
+                    machine_id: None,
+                    platform: Some("linux".to_string()),
+                    config_json: Some(serde_json::json!({"paths": [path]})),
+                    created_at: None,
+                    updated_at: None,
+                })
+                .unwrap();
+            let file = data_dir
+                .join("remotes/laptop/mirror")
+                .join(path_to_safe_dirname(path))
+                .join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            // Discovery is deliberately pre-parse, including SQLite sources.
+            std::fs::write(&file, b"").unwrap();
+            let ctx = ScanContext::with_roots(
+                data_dir.clone(),
+                build_scan_roots(Some(&storage), &data_dir),
+                None,
+            );
+            let discovered = connector.discover_source_files(&ctx).unwrap();
+            assert_eq!(discovered.len(), 1, "{path}");
+            assert_eq!(discovered[0].source_path, file);
+            assert_eq!(discovered[0].origin.source_id, "laptop");
+            assert_eq!(discovered[0].origin.host.as_deref(), Some("user@laptop"));
         }
     }
 
