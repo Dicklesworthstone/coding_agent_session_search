@@ -3929,10 +3929,20 @@
         },
         {
           "name": "db",
-          "description": "Opt in to canonical view requests against this fixed read-only archive. Search, status and startup still never open the database",
+          "description": "Opt in to canonical view requests against this fixed read-only archive. Search stays index-only unless --lexical-fallback is also supplied",
           "arg_type": "option",
           "value_type": "path",
           "required": false
+        },
+        {
+          "name": "lexical-fallback",
+          "description": "Recover Quill fuel refusals using this explicit archive's SQLite lane. Admits at most 64 MiB of database plus WAL; shares the request deadline. Results identify the changed backend and are not Quill-score equivalent",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "reranker-model",
@@ -3950,7 +3960,8 @@
           "enum_values": [
             "minilm",
             "multilingual-minilm",
-            "hash"
+            "hash",
+            "external"
           ]
         },
         {
