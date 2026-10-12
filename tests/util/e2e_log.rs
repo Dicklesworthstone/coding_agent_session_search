@@ -659,7 +659,24 @@ fn e2e_output_root() -> std::io::Result<PathBuf> {
 }
 
 fn artifact_dir(suite: &str, test_name: &str) -> std::io::Result<PathBuf> {
-    Ok(e2e_output_root()?.join(suite).join(test_name))
+    Ok(e2e_output_root()?
+        .join(portable_path_component(suite))
+        .join(portable_path_component(test_name)))
+}
+
+/// A tracker name as one directory name. Windows refuses `<>:"|?*` in a
+/// file name (os error 123), and case-parameterized names such as
+/// `approximate_invalid_ann_falls_back_exact_without_mutation::{case:?}`
+/// contain `:`, so those tests could not even start there. Other platforms
+/// keep the name as it is.
+fn portable_path_component(name: &str) -> String {
+    if cfg!(windows) {
+        name.chars()
+            .map(|c| if "<>:\"|?*".contains(c) { '_' } else { c })
+            .collect()
+    } else {
+        name.to_string()
+    }
 }
 
 fn truncate_file(path: &Path) -> std::io::Result<()> {
