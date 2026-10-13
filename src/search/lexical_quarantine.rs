@@ -144,7 +144,7 @@ impl Budget {
 /// Invalid values stop reclamation rather than silently selecting a policy.
 fn retention_enabled() -> io::Result<bool> {
     match dotenvy::var("CASS_LEXICAL_QUARANTINE_RETENTION") {
-        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(true),
         Ok(value) if value == "1" => Ok(true),
         Ok(value) if value == "0" => Ok(false),
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput,
