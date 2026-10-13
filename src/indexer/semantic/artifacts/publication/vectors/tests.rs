@@ -152,7 +152,11 @@ fn admission_checks_live_payload_beyond_the_recorded_count() -> Result<()> {
     fixture.replace_payload(usize::MAX, 1.0e-8, true)?;
     let reader = VectorIndex::open_read_only(&fixture.live)?;
     assert_eq!(reader.record_count(), 4);
-    assert!(!reader.is_vector_usable(3));
+    // Locate by identity: native writers may reorder physical rows.
+    let extra_row = (0..reader.record_count())
+        .find(|&row| reader.doc_id_at(row).unwrap() == "extra-live-document")
+        .expect("the extra live document must be in the persisted image");
+    assert!(!reader.is_vector_usable(extra_row));
     super::super::super::checkpoint_coverage::require_distinct_live(&reader, 3)?;
     drop(reader);
     fixture.assert_refused(data, &approval)
