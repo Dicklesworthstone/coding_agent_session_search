@@ -119045,7 +119045,7 @@ fn run_timeline(
     group_by: TimelineGrouping,
     source: Option<String>,
 ) -> CliResult<()> {
-    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, TransactionExt};
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
     use std::collections::HashMap;
@@ -119097,11 +119097,10 @@ fn run_timeline(
     // correlated lookup rather than a joined column.
     let mut sql = String::from(
         "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, c.title, c.started_at, c.ended_at, c.source_path,
-                COUNT(m.id) as message_count, COALESCE(c.source_id, 'local') as source_id, c.origin_host, s.kind as origin_kind
+                0 as message_count, COALESCE(c.source_id, 'local') as source_id, c.origin_host, s.kind as origin_kind
          FROM conversations c
          LEFT JOIN agents a ON c.agent_id = a.id
          LEFT JOIN sources s ON c.source_id = s.id
-         LEFT JOIN messages m ON m.conversation_id = c.id
          WHERE c.started_at >= ?1 AND c.started_at <= ?2",
     );
 
@@ -119126,8 +119125,21 @@ fn run_timeline(
         append_source_filter_condition(&mut sql, &mut params, filter);
     }
 
-    sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
+    // GH#521: joining messages into GROUP BY sends this query through the
+    // engine's materializing fallback, including message bodies outside the
+    // requested window. Select only conversation metadata first; none of the
+    // time/agent/source predicates may depend on the messages table.
+    sql.push_str(" ORDER BY c.started_at DESC");
 
+    // Keep metadata and the later indexed counts on the same read snapshot,
+    // just as the former single SELECT did while indexing runs concurrently.
+    let mut snapshot = conn.transaction().map_err(|e| CliError {
+        code: 9,
+        kind: CliErrorKind::DbQuery.kind_str(),
+        message: format!("Failed to start timeline snapshot: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
     let rows = conn
         .query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
             Ok((
@@ -119151,7 +119163,7 @@ fn run_timeline(
             retryable: false,
         })?;
     #[allow(clippy::type_complexity)]
-    let sessions: Vec<(
+    let mut sessions: Vec<(
         i64,
         String,
         Option<String>,
@@ -119163,6 +119175,36 @@ fn run_timeline(
         Option<String>,
         Option<String>,
     )> = rows;
+    for session in &mut sessions {
+        // COUNT(*) with a WHERE clause also scans the whole messages table in
+        // this engine version (see run_sessions). Stream the covering index's
+        // idx column instead: no message bodies or per-session Vec of rows,
+        // even for a single conversation with hundreds of thousands of turns.
+        conn.query_with_params_for_each(
+            "SELECT idx FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ?1",
+            &[crate::franken_sync::SqliteValue::Integer(session.0)],
+            |_| {
+                session.6 += 1;
+                Ok(())
+            },
+        )
+        .map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::DbQuery.kind_str(),
+            message: format!("Failed to count timeline messages: {e}"),
+            hint: None,
+            retryable: false,
+        })?;
+    }
+    snapshot.commit().map_err(|e| CliError {
+        code: 9,
+        kind: CliErrorKind::DbQuery.kind_str(),
+        message: format!("Failed to finish timeline snapshot: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+    drop(snapshot);
     close_franken_cli_read_db(conn, &db_path, "timeline")?;
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {

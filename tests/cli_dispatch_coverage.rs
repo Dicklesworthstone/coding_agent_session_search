@@ -1281,6 +1281,259 @@ fn context_help_shows_options() {
 // Timeline command tests
 // =============================================================================
 
+// Deliberately keep message bodies in the fixture: GH#521 was caused by the
+// engine materializing those bodies for a join, even outside the time window.
+fn seed_timeline_count_fixture(db_path: &Path, archive_messages: i64, body_bytes: usize) {
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT);
+         CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+         CREATE TABLE conversations (
+             id INTEGER PRIMARY KEY, agent_id INTEGER, title TEXT,
+             started_at INTEGER, ended_at INTEGER, source_path TEXT,
+             source_id TEXT, origin_host TEXT);
+         CREATE INDEX timeline_started_at ON conversations(started_at);
+         CREATE TABLE messages (
+             id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER,
+             content TEXT, UNIQUE(conversation_id, idx));
+         INSERT INTO agents VALUES (1, 'codex'), (2, 'claude_code');
+         INSERT INTO sources VALUES ('local', 'local'), ('laptop', 'ssh'),
+                                    ('named-local', 'local');
+         INSERT INTO conversations VALUES
+             (1, 1, 'lower boundary', 1700000000000, 1700000005000, '/one', 'local', NULL),
+             (2, 2, 'remote', 1700000030000, NULL, '/two', 'laptop', 'laptop'),
+             (3, 1, 'empty upper boundary', 1700000060000, NULL, '/three', 'local', NULL),
+             (4, 1, 'old archive', 1699999999999, NULL, '/four', 'local', NULL),
+             (5, 1, 'after window', 1700000060001, NULL, '/five', 'local', NULL),
+             (6, NULL, NULL, 1700000020000, NULL, '/six', NULL, NULL),
+             (7, 1, 'named local', 1700000010000, NULL, '/seven', 'named-local', NULL),
+             (8, 1, 'undated', NULL, NULL, '/eight', 'local', NULL);
+         INSERT INTO messages (conversation_id, idx, content) VALUES
+             (1, 0, 'one'), (1, 4, 'two'), (1, 9, 'three'),
+             (2, 0, 'remote'), (5, 0, 'future'), (6, 0, 'unknown'),
+             (7, 0, 'named local');",
+    )
+    .unwrap();
+    let body = "x".repeat(body_bytes);
+    conn.execute("BEGIN").unwrap();
+    if archive_messages > 128 {
+        // Match the report's conversation cardinality with a tiny window.
+        for id in 9..=12_667_i64 {
+            conn.execute_compat(
+                "INSERT INTO conversations (id, agent_id, title, started_at,
+                     source_path, source_id) VALUES (?1, 1, 'archive',
+                     1600000000000, '/archive', 'local')",
+                fparams![id],
+            )
+            .unwrap();
+        }
+    }
+    for idx in 0..archive_messages {
+        conn.execute_compat(
+            "INSERT INTO messages (conversation_id, idx, content) VALUES (4, ?1, ?2)",
+            fparams![idx, body.as_str()],
+        )
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.close().unwrap();
+}
+
+fn timeline_window_command(home: &Path, db_path: &Path) -> Command {
+    let mut cmd = base_cmd(home);
+    cmd.args([
+        "timeline",
+        "--since",
+        "2023-11-14T22:13:20Z",
+        "--until",
+        "2023-11-14T22:14:20Z",
+        "--json",
+        "--db",
+    ]);
+    cmd.arg(db_path);
+    cmd.timeout(Duration::from_secs(60));
+    cmd
+}
+
+#[test]
+fn timeline_counts_only_filtered_sessions_and_preserves_order() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline.db");
+    seed_timeline_count_fixture(&db_path, 128, 4096);
+    for (filters, expected) in [
+        (vec![], vec![(3, 0), (2, 1), (6, 1), (7, 1), (1, 3)]),
+        (vec!["--agent", "codex"], vec![(3, 0), (7, 1), (1, 3)]),
+        (vec!["--agent", "claude_code"], vec![(2, 1)]),
+        (
+            vec!["--source", "local"],
+            vec![(3, 0), (6, 1), (7, 1), (1, 3)],
+        ),
+        (vec!["--source", "remote"], vec![(2, 1)]),
+        (vec!["--source", "named-local"], vec![(7, 1)]),
+        (vec!["--agent", "codex", "--source", "remote"], vec![]),
+    ] {
+        for grouping in ["none", "hour", "day"] {
+            let output = timeline_window_command(tmp.path(), &db_path)
+                .args(&filters)
+                .args(["--group-by", grouping])
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["total_sessions"], expected.len());
+            assert_eq!(value["range"]["start"], 1_700_000_000_000_i64);
+            assert_eq!(value["range"]["end"], 1_700_000_060_000_i64);
+            let rows: Vec<&Value> = if grouping == "none" {
+                value["sessions"].as_array().unwrap().iter().collect()
+            } else {
+                value["groups"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .flat_map(|group| group.as_array().unwrap())
+                    .collect()
+            };
+            let actual: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row["id"].as_i64().unwrap(),
+                        row["message_count"].as_i64().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected, "filters={filters:?}, grouping={grouping}");
+            if let Some(unknown) = rows.iter().find(|row| row["id"] == 6) {
+                assert_eq!(unknown["agent"], "unknown");
+                assert!(unknown["title"].is_null());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn timeline_measured_output(cmd: &Command) -> Value {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut measured = std::process::Command::new(cmd.get_program());
+    measured.args(cmd.get_args());
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            measured.env(key, value);
+        } else {
+            measured.env_remove(key);
+        }
+    }
+    let mut child = measured
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status_path = format!("/proc/{}/status", child.id());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut peak_kib = 0_u64;
+    loop {
+        if let Ok(status) = fs::read_to_string(&status_path) {
+            for line in status.lines() {
+                if let Some(value) = line.strip_prefix("VmHWM:") {
+                    peak_kib =
+                        peak_kib.max(value.split_whitespace().next().unwrap().parse().unwrap());
+                }
+            }
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline || peak_kib >= 192 * 1024 {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "timeline exceeded time/memory budget: peak={peak_kib} KiB, stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(peak_kib > 0, "no child RSS measurement captured");
+    assert!(
+        peak_kib < 192 * 1024,
+        "timeline retained archive payloads: {peak_kib} KiB"
+    );
+    eprintln!(
+        "timeline {:?} peak_rss_kib={peak_kib}",
+        cmd.get_args().collect::<Vec<_>>()
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "256 MiB archive RSS probe; run explicitly with --ignored --test-threads=1"]
+fn timeline_large_archive_peak_memory_is_bounded() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline-large.db");
+    seed_timeline_count_fixture(&db_path, 4096, 64 * 1024);
+    assert!(fs::metadata(&db_path).unwrap().len() >= 256 * 1024 * 1024);
+    for filters in [vec![], vec!["--agent", "codex"], vec!["--source", "local"]] {
+        let mut cmd = timeline_window_command(tmp.path(), &db_path);
+        cmd.args(&filters).args(["--group-by", "none"]);
+        let value = timeline_measured_output(&cmd);
+        assert_eq!(
+            value["total_sessions"],
+            if filters.is_empty() {
+                5
+            } else if filters[0] == "--agent" {
+                3
+            } else {
+                4
+            }
+        );
+    }
+    for window in ["--today", "--since"] {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.args(["timeline", "--json", "--group-by", "none", "--db"])
+            .arg(&db_path)
+            .arg(window);
+        if window == "--since" {
+            cmd.arg("5m");
+        }
+        let value = timeline_measured_output(&cmd);
+        assert_eq!(value["total_sessions"], 0);
+    }
+    // Move the payload-heavy conversation into the window to verify that even
+    // a very large selected session is counted without collecting its bodies.
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute("UPDATE conversations SET started_at = 1700000040000 WHERE id = 4")
+        .unwrap();
+    conn.close().unwrap();
+    let mut cmd = timeline_window_command(tmp.path(), &db_path);
+    cmd.args(["--group-by", "none"]);
+    let value = timeline_measured_output(&cmd);
+    let large = value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == 4)
+        .unwrap();
+    assert_eq!(large["message_count"], 4096);
+    for filters in [vec!["--agent", "claude_code"], vec!["--source", "remote"]] {
+        let mut cmd = timeline_window_command(tmp.path(), &db_path);
+        cmd.args(&filters).args(["--group-by", "none"]);
+        let value = timeline_measured_output(&cmd);
+        assert_eq!(value["total_sessions"], 1);
+        assert_eq!(value["sessions"][0]["id"], 2);
+        assert_eq!(value["sessions"][0]["message_count"], 1);
+    }
+}
+
 #[test]
 fn timeline_json_outputs_valid_structure() {
     let tmp = TempDir::new().unwrap();

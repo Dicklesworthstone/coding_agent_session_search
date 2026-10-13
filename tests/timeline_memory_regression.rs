@@ -44,7 +44,8 @@ fn fixture(root: &Path) {
          CREATE INDEX idx_conversations_started_at ON conversations(started_at);
          CREATE TABLE messages(
              id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL,
-             idx INTEGER NOT NULL, role TEXT, content TEXT, created_at INTEGER
+             idx INTEGER NOT NULL, role TEXT, content TEXT, created_at INTEGER,
+             UNIQUE(conversation_id, idx)
          );
          CREATE INDEX idx_messages_conversation ON messages(conversation_id);",
     )
@@ -62,7 +63,14 @@ fn fixture(root: &Path) {
             Some("work-host"),
             4,
         ),
-        (5, Some(2), Some(END), Some("server"), Some("server-host"), 1),
+        (
+            5,
+            Some(2),
+            Some(END),
+            Some("server"),
+            Some("server-host"),
+            1,
+        ),
         (6, Some(2), Some(END + 1), Some("local"), None, 3),
         (7, None, Some(START + 3000), None, None, 0),
         (
@@ -184,7 +192,10 @@ fn timeline_boundaries_counts_nulls_and_readonly_contract() {
     assert_eq!(value["sessions"][3]["source_id"], "remote-host");
     assert_eq!(value["sessions"][3]["origin_kind"], "remote");
     assert_eq!(value["sessions"][7]["duration_seconds"], 3660);
-    assert_eq!(fs::read(root.path().join("agent_search.db")).unwrap(), before);
+    assert_eq!(
+        fs::read(root.path().join("agent_search.db")).unwrap(),
+        before
+    );
 }
 
 #[test]
@@ -228,8 +239,13 @@ fn timeline_relative_and_today_windows_apply_agent_and_source_filters() {
     let root = TempDir::new().unwrap();
     fixture(root.path());
     let now = Utc::now().timestamp_millis();
-    let conn =
-        Connection::open(root.path().join("agent_search.db").to_string_lossy().as_ref()).unwrap();
+    let conn = Connection::open(
+        root.path()
+            .join("agent_search.db")
+            .to_string_lossy()
+            .as_ref(),
+    )
+    .unwrap();
     conn.execute("BEGIN IMMEDIATE").unwrap();
     conn.execute("UPDATE conversations SET started_at = NULL")
         .unwrap();
@@ -323,8 +339,13 @@ fn timeline_relative_and_today_windows_apply_agent_and_source_filters() {
 fn timeline_equal_start_times_do_not_drop_or_duplicate_sessions() {
     let root = TempDir::new().unwrap();
     fixture(root.path());
-    let conn =
-        Connection::open(root.path().join("agent_search.db").to_string_lossy().as_ref()).unwrap();
+    let conn = Connection::open(
+        root.path()
+            .join("agent_search.db")
+            .to_string_lossy()
+            .as_ref(),
+    )
+    .unwrap();
     conn.execute_compat(
         "UPDATE conversations SET started_at = ?1 WHERE id = 3",
         params![START],
@@ -357,8 +378,7 @@ fn timeline_grouping_and_human_output_preserve_session_order_and_totals() {
         for entries in groups.values() {
             let entries = entries.as_array().unwrap();
             assert!(entries.windows(2).all(|rows| {
-                rows[0]["started_at"].as_i64().unwrap()
-                    >= rows[1]["started_at"].as_i64().unwrap()
+                rows[0]["started_at"].as_i64().unwrap() >= rows[1]["started_at"].as_i64().unwrap()
             }));
             all_ids.extend(entries.iter().map(|row| row["id"].as_i64().unwrap()));
         }
@@ -458,7 +478,8 @@ mod memory {
     }
 
     fn add_unrelated_archive(root: &Path) {
-        let conn = Connection::open(root.join("agent_search.db").to_string_lossy().as_ref()).unwrap();
+        let conn =
+            Connection::open(root.join("agent_search.db").to_string_lossy().as_ref()).unwrap();
         // Exactly 12,667 total conversations. The first 4,096 old sessions
         // each have 32 messages, for 131,072 unrelated 2-KiB message bodies.
         // No Vec of messages, payloads, or conversation objects is built.
