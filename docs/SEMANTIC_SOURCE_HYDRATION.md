@@ -1,0 +1,91 @@
+# Source-bound hydration for retained semantic batches
+
+`SemanticSearchBatch` and `SelectedSemanticBatch` now expose
+`hydrate_in_transaction` and `hydrate_from_connection`. These are explicit
+library entry points; they do not replace ordinary `SearchClient` hydration or
+enable the progressive CLI route.
+
+A semantic vector can outlive the source row that originally produced it. A
+lookup by message ID alone must not attach that vector's score to rewritten
+text. This adapter verifies each selected passage's SHA-256 and its encoded
+message, agent, workspace, source, role, and timestamp fields against source
+rows read through one FrankenSQLite transaction. It also checks every result's
+retained vector owner and physical row before reading source bodies.
+
+The returned text is the **verified canonical passage**, not an unchecked full
+message. Verification deliberately does not certify every raw byte of the full
+message, a physical pathname, the CRC32 source field as a cryptographic source
+identity, or the identity/freshness of the entire archive. The original ranking,
+coverage, execution reports, vector/graph owners, and (for selected batches)
+publication identity remain available through `source()`.
+
+## Usage
+
+```rust
+use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::search::semantic_reader::publication::SelectedSemanticBatch;
+use coding_agent_search::search::semantic_reader::publication::text::hydration::{
+    HydratedSemanticBatch, HydrationBudget, HydrationError, PassageProjection,
+};
+
+fn hydrate(
+    batch: &SelectedSemanticBatch,
+    connection: &mut Connection,
+    selected_projection: PassageProjection,
+) -> Result<HydratedSemanticBatch<SelectedSemanticBatch>, HydrationError> {
+    batch.hydrate_from_connection(
+        connection,
+        selected_projection,
+        HydrationBudget::default(),
+    )
+}
+```
+
+Use the already-open canonical archive connection. The adapter opens no files
+and performs no migrations, model acquisition, index repair, or row writes.
+`hydrate_from_connection` owns and rolls back its read transaction on both
+success and failure. It does not adopt an existing caller transaction. With an
+already-pinned snapshot, pass its `franken_sync::compat::Transaction` to
+`hydrate_in_transaction`; that entry point leaves transaction ownership with
+the caller.
+
+The projection is mandatory. `CanonicalPrefixV1` accepts only the historical
+chunk-zero canonical prefix. `RawPassagesV2` replays the current raw-first
+bounded passage selection, then canonicalizes the selected passage. Select the
+profile that built the retained artifact; there is no automatic fallback or
+upgrade. A digest mismatch is an error in either mode. Short inputs can have
+identical verified bytes under both profiles.
+
+## Failure and resource behavior
+
+No partial hydrated list is returned if a later source is missing, changed,
+oversized, malformed, or otherwise unreadable. Failures do not modify the
+original batch; callers can retain it for a deliberate retry. Errors and the
+hydrated types' `Debug` implementations omit message bodies and source paths.
+
+Default limits are 256 passages, 4 MiB per full source message, 16 MiB aggregate
+source text/metadata, 2 MiB verified output text/locator strings, and five
+seconds. Hard admission ceilings are 1,024 passages, 8 MiB per message, 32 MiB
+for each aggregate byte budget, and 60 seconds. Per-message source metadata has
+a 16 KiB ceiling. Chunks from the same message share one full-body read and one
+locator; full source bodies are released after that message is verified.
+
+A byte-length probe precedes body transfer, in the same transaction. Deadlines
+are checked around SQL and canonicalization, and connection-owned hydration
+counts transaction admission and rollback in its deadline. **These are not hard
+limits on a synchronous engine call, its scratch allocations, or process RSS.**
+Keep the existing command/worker supervision for end-to-end containment.
+
+## Qualification
+
+The added tests cover pure fingerprint/metadata checks plus real FrankenSQLite
+and retained FSVI/hash-control fixtures. No learned model files are required.
+The focused full-crate test command is:
+
+```bash
+RUST_MIN_STACK=134217728 cargo test --locked --lib \
+  search::semantic_reader::publication::text::hydration:: -- --nocapture
+```
+
+Run full compilation, formatting, Clippy, and repository gates separately.
+Availability of this API is not a release-qualification receipt.

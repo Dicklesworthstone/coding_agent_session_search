@@ -5,6 +5,8 @@
 //! when opening the selected reader. This adapter never infers that identity
 //! from a model name, vector file, or the current pointer being inspected.
 
+pub mod hydration;
+
 use super::super::text::{TextQueryProducers, TextSemanticSearch};
 use super::*;
 
