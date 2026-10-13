@@ -194,6 +194,11 @@ fn run_with_limit(
     mut check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<usize> {
     check_cancelled()?;
+    // The native read-to-write transition below releases its shared source
+    // owner. Hold the same outer lease as full rebuilds and backfills across
+    // that gap AND native append/compaction, not only during preparation.
+    // This acquisition does not sweep unrelated interrupted-run artifacts.
+    let _artifacts = super::super::artifacts::BackfillArtifacts::for_existing_writer(data_dir)?;
     let path = vector_index_path(data_dir, indexer.embedder_id());
     let wal = wal_path_for(&path);
     let before = RebuildDestination::capture(&path)?;
@@ -235,8 +240,9 @@ fn run_with_limit(
     // Keep one authoritative persistence implementation. Its native writer
     // validates the contract again and writes one atomic WAL batch, then runs
     // the established compaction/error path. The caller's maintenance lock
-    // must span source selection through this call; the retained observations
-    // are not an atomic upgrade from the shared lock dropped above.
+    // still spans canonical source selection through this call. The artifact
+    // lease serializes these vector writers; it does not make the caller's
+    // previously selected canonical rows current or replace native validation.
     check_cancelled()?;
     indexer.inner.append_to_index(messages, data_dir)?;
     // Preserve the API's input-row count even when repeated identities were
@@ -258,3 +264,6 @@ fn check_contract(indexer: &SemanticIndexer, source: &VectorIndex) -> Result<()>
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_lease;

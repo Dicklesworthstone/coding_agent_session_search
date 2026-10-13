@@ -101,6 +101,29 @@ impl Drop for BackfillArtifacts {
 }
 
 impl BackfillArtifacts {
+    /// Serialize mutation of an existing index with backfill/rebuild/recovery.
+    /// Unlike rebuild admission this never sweeps, reads a manifest, or creates
+    /// an archive/vector directory. Invalid and empty appends must not authorize
+    /// unrelated cleanup. The only possible new entry is the stable lock file.
+    pub(super) fn for_existing_writer(data_dir: &Path) -> Result<Self> {
+        let data_dir = data_dir
+            .canonicalize()
+            .context("semantic writer requires an existing data directory")?;
+        let root = data_dir.join(VECTOR_INDEX_DIR);
+        let metadata = fs::symlink_metadata(&root)
+            .context("semantic writer requires an existing vector_index")?;
+        ensure!(
+            metadata.is_dir() && !is_link_or_reparse(&metadata),
+            "semantic writer requires a real vector_index directory"
+        );
+        let lock = lock_file(&data_dir.join(ARTIFACT_LOCK))
+            .context("another semantic writer owns its artifacts")?;
+        Ok(Self {
+            data_dir,
+            _lock: lock,
+        })
+    }
+
     /// Coordinate direct full/canonical rebuild scratch with the same owner
     /// as backfill recovery. This lease supplements the caller's maintenance
     /// lock; it does not grant publication or canonical-content authority.
