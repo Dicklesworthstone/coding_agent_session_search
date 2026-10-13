@@ -216,7 +216,10 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
     let mut has_index = false;
     let mut has_checkpoint = false;
     let mut has_pending_child = false;
-    for entry in walkdir::WalkDir::new(path).follow_links(false).max_open(8)
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .follow_root_links(false)
+        .max_open(8)
         .max_depth(budget.limits.depth.saturating_add(1))
     {
         budget.check()?;
@@ -294,9 +297,22 @@ fn select(inventory: &mut Inventory) {
     };
     // An incomplete listing cannot prove which bundle is newest. Never let a
     // budget, unreadable path or invalid layout turn a partial inventory into GC.
-    let newest = inventory.artifacts.iter().enumerate()
-        .filter(|(_, artifact)| !artifact.interrupted_reclaim && artifact.has_evidence && artifact.size_complete)
-        .max_by(|(_, a), (_, b)| a.modified.cmp(&b.modified).then_with(|| a.path.cmp(&b.path)))
+    // Prefer an ordinary bundle: a retention rename makes a pending wrapper
+    // look newer without creating newer failure evidence. If ordinary evidence
+    // has disappeared, however, keep the best surviving interrupted bundle.
+    // A prior cleanup decision is not permission to erase the last evidence on
+    // a later run. Empty reservations must never occupy this survivor slot.
+    let newest = inventory
+        .artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, artifact)| artifact.has_evidence && artifact.size_complete)
+        .max_by(|(_, a), (_, b)| {
+            (!a.interrupted_reclaim)
+                .cmp(&(!b.interrupted_reclaim))
+                .then_with(|| a.modified.cmp(&b.modified))
+                .then_with(|| a.path.cmp(&b.path))
+        })
         .map(|(index, _)| index);
     for (index, artifact) in inventory.artifacts.iter_mut().enumerate() {
         let (disposition, reason) = if !inventory.complete || !artifact.size_complete {
@@ -304,7 +320,12 @@ fn select(inventory: &mut Inventory) {
         } else if !inventory.automatic_retention_enabled {
             (Disposition::RetainDisabled, "automatic retention disabled by operator")
         } else if newest == Some(index) {
-            (Disposition::RetainNewest, "newest complete rebuild evidence retained")
+            let reason = if artifact.interrupted_reclaim {
+                "last available rebuild evidence retained after interrupted cleanup"
+            } else {
+                "newest complete rebuild evidence retained"
+            };
+            (Disposition::RetainNewest, reason)
         } else if artifact.age_seconds.is_none_or(|age| age < MIN_AGE.as_secs()) {
             (Disposition::RetainRecent, "recent, future-dated or unknown-age evidence retained")
         } else {
@@ -376,3 +397,6 @@ pub fn inspect(data_dir: &Path) -> io::Result<Inventory> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recovery_tests;
