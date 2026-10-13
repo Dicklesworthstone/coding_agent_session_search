@@ -2,12 +2,10 @@
 //!
 //! The query still owns the selected session summaries. Do not clone their
 //! strings into a second Value tree or buffer the complete encoded document.
-//! Grouping stores only references, retaining the original per-group order.
+//! Grouping borrows contiguous slices, retaining the original per-group order.
 
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-use chrono::{TimeZone, Utc};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
@@ -15,6 +13,8 @@ use crate::{
     TimelineGrouping, normalized_provenance_origin_host, normalized_provenance_origin_kind,
     normalized_provenance_source_id,
 };
+
+mod groups;
 
 #[allow(clippy::type_complexity)]
 pub(crate) type Session = (
@@ -86,7 +86,7 @@ struct Range {
 struct Timeline<'a> {
     sessions: &'a [Session],
     range: Range,
-    groups: Option<BTreeMap<String, Vec<SessionView<'a>>>>,
+    groups: Option<groups::Groups<'a>>,
 }
 
 impl Serialize for Timeline<'_> {
@@ -107,7 +107,7 @@ impl Serialize for Timeline<'_> {
 /// Write the existing JSON envelope, including its trailing newline.
 ///
 /// Flat output needs no collection beyond the caller's summaries. Grouped
-/// output retains references and group labels, not copies of session strings.
+/// output indexes contiguous time buckets, not individual session references.
 /// Other robot formats retain their existing projection/formatting path.
 pub(crate) fn write<W: Write>(
     writer: &mut W,
@@ -120,23 +120,7 @@ pub(crate) fn write<W: Write>(
     let groups = match grouping {
         TimelineGrouping::None => None,
         TimelineGrouping::Hour | TimelineGrouping::Day => {
-            let mut groups: BTreeMap<String, Vec<SessionView<'_>>> = BTreeMap::new();
-            for session in sessions {
-                let date = Utc
-                    .timestamp_millis_opt(session.3)
-                    .single()
-                    .unwrap_or_else(Utc::now);
-                let format = match grouping {
-                    TimelineGrouping::Hour => "%Y-%m-%d %H:00",
-                    TimelineGrouping::Day => "%Y-%m-%d",
-                    TimelineGrouping::None => unreachable!(),
-                };
-                groups.entry(date.format(format).to_string()).or_default().push(SessionView {
-                    session,
-                    include_duration: false,
-                });
-            }
-            Some(groups)
+            Some(groups::Groups::new(sessions, grouping))
         }
     };
     let timeline = Timeline {
@@ -155,7 +139,9 @@ pub(crate) fn write<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
 
     fn fixture() -> Vec<Session> {
         let start = 1_705_276_800_000_i64;
