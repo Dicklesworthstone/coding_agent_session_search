@@ -37900,6 +37900,38 @@ fn source_filter_where_clause_with_columns(
     }
 }
 
+/// `stats --by-source` rows (source, conversations, messages), most
+/// conversations first, from each selected conversation's normalized source.
+/// Message counts come from one streaming pass over the messages index:
+/// joining messages into a GROUP BY by source ran for more than 15 minutes
+/// on a 9.7M-message archive.
+fn stats_source_rows(
+    conn: &crate::franken_sync::Connection,
+    conversation_sources: Vec<(i64, String)>,
+) -> Result<Vec<(String, i64, i64)>, crate::franken_sync::FrankenError> {
+    let mut rows: Vec<(String, i64, i64)> = Vec::new();
+    let mut row_of_source: HashMap<String, usize> = HashMap::new();
+    let mut row_of_conversation: HashMap<i64, usize> =
+        HashMap::with_capacity(conversation_sources.len());
+    for (conversation_id, source_id) in conversation_sources {
+        let row = *row_of_source.entry(source_id.clone()).or_insert_with(|| {
+            rows.push((source_id, 0, 0));
+            rows.len() - 1
+        });
+        rows[row].1 += 1;
+        row_of_conversation.insert(conversation_id, row);
+    }
+    if !rows.is_empty() {
+        for_each_message_conversation_id(conn, |conversation_id| {
+            if let Some(row) = row_of_conversation.get(&conversation_id) {
+                rows[*row].2 += 1;
+            }
+        })?;
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(rows)
+}
+
 fn stats_message_count_sql(source_join: &str, source_where: &str) -> String {
     if source_join.is_empty() && source_where.is_empty() {
         "SELECT COUNT(*) FROM messages".to_string()
@@ -38246,23 +38278,17 @@ fn run_stats(
     let source_rows: Vec<(String, i64, i64)> = if by_source {
         let normalized_source_sql =
             normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
-        let source_sql = format!(
-            "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id) as convs, COUNT(m.id) as msgs
-             FROM conversations c
-             {source_join}
-             LEFT JOIN messages m ON m.conversation_id = c.id
-             {source_where}
-             GROUP BY {normalized_source_sql}
-             ORDER BY convs DESC"
-        );
-        franken_query_map_collect_retry(&conn, &source_sql, &params, |r| {
-            Ok((
-                r.get_typed::<String>(0)?,
-                r.get_typed::<i64>(1)?,
-                r.get_typed::<i64>(2)?,
-            ))
-        })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+        let conversation_sources: Vec<(i64, String)> = franken_query_map_collect_retry(
+            &conn,
+            &format!(
+                "SELECT c.id, {normalized_source_sql} FROM conversations c{source_join}{source_where}"
+            ),
+            &params,
+            |r| Ok((r.get_typed::<i64>(0)?, r.get_typed::<String>(1)?)),
+        )
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+        stats_source_rows(&conn, conversation_sources)
+            .map_err(|e| CliError::unknown(format!("query: {e}")))?
     } else {
         Vec::new()
     };
@@ -52035,42 +52061,53 @@ fn query_doctor_raw_mirror_backfill_candidates(
             .enumerate()
             .map(|(position, candidate)| (candidate.conversation_id, position))
             .collect();
-        let message_indexes: HashSet<String> = conn
-            .query_map_collect(
-                "PRAGMA index_list(messages)",
-                &[],
-                |row: &crate::franken_sync::Row| row.get_typed::<String>(1),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let message_scan_sql = if message_indexes.contains("sqlite_autoindex_messages_1") {
-            // The UNIQUE(conversation_id, idx) autoindex is narrow: scanning it
-            // avoids loading the potentially enormous content column.
-            "SELECT conversation_id \
-             FROM messages INDEXED BY sqlite_autoindex_messages_1"
-        } else {
-            // Historical schemas may lack the modern uniqueness constraint.
-            // A plain table scan remains exact and streaming; unlike GROUP BY
-            // or a correlated COUNT it does not allocate an unbounded sorter or
-            // repeat the scan for every conversation.
-            "SELECT conversation_id FROM messages"
-        };
-        conn.query_with_params_for_each(
-            message_scan_sql,
-            &[] as &[crate::franken_sync::SqliteValue],
-            |row| {
-                let conversation_id: i64 = row.get_typed(0)?;
-                if let Some(position) = candidate_positions.get(&conversation_id) {
-                    candidates[*position].message_count =
-                        candidates[*position].message_count.saturating_add(1);
-                }
-                Ok(())
-            },
-        )?;
+        for_each_message_conversation_id(conn, |conversation_id| {
+            if let Some(position) = candidate_positions.get(&conversation_id) {
+                candidates[*position].message_count =
+                    candidates[*position].message_count.saturating_add(1);
+            }
+        })?;
     }
 
     Ok(candidates)
+}
+
+/// Visit every message's conversation id in one streaming pass, for callers
+/// that need per-conversation message counts across many conversations.
+/// FrankenSQLite runs a correlated or grouped COUNT over messages as a scan
+/// per conversation or a sorter over every joined row; this pass reads the
+/// table once and allocates nothing per message.
+fn for_each_message_conversation_id(
+    conn: &crate::franken_sync::Connection,
+    mut visit: impl FnMut(i64),
+) -> Result<(), crate::franken_sync::FrankenError> {
+    let message_indexes: HashSet<String> = conn
+        .query_map_collect(
+            "PRAGMA index_list(messages)",
+            &[],
+            |row: &crate::franken_sync::Row| row.get_typed::<String>(1),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let message_scan_sql = if message_indexes.contains("sqlite_autoindex_messages_1") {
+        // The UNIQUE(conversation_id, idx) autoindex is narrow: scanning it
+        // avoids loading the potentially enormous content column.
+        "SELECT conversation_id \
+         FROM messages INDEXED BY sqlite_autoindex_messages_1"
+    } else {
+        // Historical schemas may lack the modern uniqueness constraint.
+        // A plain table scan remains exact and streaming.
+        "SELECT conversation_id FROM messages"
+    };
+    conn.query_with_params_for_each(
+        message_scan_sql,
+        &[] as &[crate::franken_sync::SqliteValue],
+        |row| {
+            visit(row.get_typed(0)?);
+            Ok(())
+        },
+    )
 }
 
 fn doctor_raw_mirror_backfill_source_path_blake3(path: &str) -> String {
@@ -114891,6 +114928,86 @@ mod legacy_source_filter_tests {
             )
         );
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn stats_source_rows_match_the_messages_join_with_and_without_the_autoindex() {
+        // (conversation id, source_id, origin_host, messages)
+        let seed: [(i64, Option<&str>, Option<&str>, i64); 6] = [
+            (1, None, None, 3),
+            (2, Some("local"), None, 0),
+            (3, Some("   "), None, 2),
+            (4, Some("laptop"), Some("user@laptop"), 4),
+            (5, Some(" laptop "), Some("user@laptop"), 1),
+            (6, Some(""), Some("srv"), 0),
+        ];
+        // Modern archives carry UNIQUE(conversation_id, idx), whose autoindex
+        // the streaming pass reads; historical ones fall back to a table scan.
+        for unique_index in [true, false] {
+            let tmp = TempDir::new().expect("temp dir");
+            let db_path = tmp.path().join("agent_search.db");
+            with_frankensqlite_connection(&db_path, "stats source rows test", |conn| {
+                conn.execute(
+                    "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_id TEXT, origin_host TEXT)",
+                )?;
+                conn.execute(if unique_index {
+                    "CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL, \
+                     idx INTEGER NOT NULL, UNIQUE(conversation_id, idx))"
+                } else {
+                    "CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL, idx INTEGER)"
+                })?;
+                for (id, source_id, origin_host, messages) in seed {
+                    conn.execute_compat(
+                        "INSERT INTO conversations(id, source_id, origin_host) VALUES (?1, ?2, ?3)",
+                        &[id.into(), source_id.into(), origin_host.into()],
+                    )?;
+                    for idx in 0..messages {
+                        conn.execute_compat(
+                            "INSERT INTO messages(conversation_id, idx) VALUES (?1, ?2)",
+                            &[id.into(), idx.into()],
+                        )?;
+                    }
+                }
+                Ok(())
+            })
+            .expect("seed stats source rows db");
+
+            let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open db");
+            let normalized = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+            let mut oracle: Vec<(String, i64, i64)> = conn
+                .query_map_collect(
+                    &format!(
+                        "SELECT {normalized}, COUNT(DISTINCT c.id), COUNT(m.id) FROM conversations c \
+                         LEFT JOIN messages m ON m.conversation_id = c.id GROUP BY {normalized}"
+                    ),
+                    &[],
+                    |r: &crate::franken_sync::Row| {
+                        Ok((r.get_typed(0)?, r.get_typed(1)?, r.get_typed(2)?))
+                    },
+                )
+                .expect("old join query");
+            oracle.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let conversation_sources: Vec<(i64, String)> = conn
+                .query_map_collect(
+                    &format!("SELECT c.id, {normalized} FROM conversations c"),
+                    &[],
+                    |r: &crate::franken_sync::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+                )
+                .expect("conversation sources");
+            let rows = stats_source_rows(&conn, conversation_sources).expect("source rows");
+
+            assert_eq!(rows, oracle, "unique_index={unique_index}");
+            assert_eq!(
+                rows,
+                [
+                    ("local".to_string(), 3, 5),
+                    ("laptop".to_string(), 2, 5),
+                    ("srv".to_string(), 1, 0),
+                ],
+                "unique_index={unique_index}"
+            );
+            close_franken_cli_read_db(conn, &db_path, "stats source rows test").expect("close db");
+        }
     }
 
     #[test]
