@@ -1,3 +1,5 @@
+mod current;
+
 use super::*;
 use crate::search::embedder::{EmbedderError, EmbedderResult};
 use crate::search::semantic_reader::{SemanticResultPhase, SemanticScoreKind};

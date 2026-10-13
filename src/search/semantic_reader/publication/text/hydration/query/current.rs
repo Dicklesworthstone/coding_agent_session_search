@@ -6,6 +6,7 @@
 //! accumulated passage exclusions. A failed pass never exposes partial text.
 
 mod cache;
+mod progressive;
 
 use std::collections::BTreeSet;
 
@@ -80,12 +81,21 @@ impl<'request> CurrentTextQuery<'request> {
     }
 
     fn admit(&self) -> Result<Work, CurrentSearchError> {
+        self.admit_phases(1)
+    }
+
+    fn admit_phases(&self, phases: usize) -> Result<Work, CurrentSearchError> {
         let started = Instant::now();
         self.refill.validate()?;
+        if self.refill.max_searches < phases {
+            return Err(CurrentSearchError::InvalidRefillBudget);
+        }
         if let Some(policy) = self.ann {
             policy.validate()?;
         }
-        self.hydration.validate(self.limit)?;
+        let requested = self.limit.checked_mul(phases)
+            .ok_or(HydrationError::BudgetExceeded)?;
+        self.hydration.validate(requested)?;
         Ok(Work::new(self.hydration, started)?)
     }
 }
@@ -270,6 +280,19 @@ fn refill<B: BatchSource>(
     retrieve: impl Fn(&dyn SearchFilter) -> SemanticReaderResult<B>,
 ) -> Result<CurrentSemanticBatch<B>, CurrentSearchError> {
     let mut state = RefillState::new(request.refill);
+    refill_accounted(request, transaction, &mut work, &mut state, retrieve)
+}
+
+// Synchronous and progressive retrieval use the same candidate/source boundary.
+// A progressive continuation carries this account AND its exclusions forward;
+// neither a new phase nor successful source verification renews any allowance.
+fn refill_accounted<B: BatchSource>(
+    request: &CurrentTextQuery<'_>,
+    transaction: &Transaction<'_>,
+    work: &mut Work,
+    state: &mut RefillState,
+    retrieve: impl Fn(&dyn SearchFilter) -> SemanticReaderResult<B>,
+) -> Result<CurrentSemanticBatch<B>, CurrentSearchError> {
     loop {
         work.check()?;
         // Admit each complete requested page before native work. Never shrink k
@@ -286,7 +309,7 @@ fn refill<B: BatchSource>(
             return Err(HydrationError::InvalidCandidate.into());
         }
         if let Some(passages) = verify_pass(
-            batch.batch(), transaction, request.projection, &mut work, &mut state,
+            batch.batch(), transaction, request.projection, work, state,
         )? {
             state.stats.source_bytes_read = work.source_bytes;
             state.stats.output_bytes_checked = work.output_bytes;

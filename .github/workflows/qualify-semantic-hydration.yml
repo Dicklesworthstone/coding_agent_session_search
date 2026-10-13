@@ -2,6 +2,12 @@
 name: Verify source-bound semantic hydration
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/qualify-semantic-hydration.yml
+      - src/search/semantic_reader/publication/text/hydration/**
+      - src/search/semantic_reader/publication/text/hydration.rs
 permissions:
   contents: read
 jobs:
@@ -42,17 +48,54 @@ jobs:
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', log)
           if not counts or max(map(int, counts)) < 16:
               raise SystemExit('Expected at least 16 passing hydration tests; an empty filter is not qualification')
+          expected = []
+          for file in [
+              'src/search/semantic_reader/publication/text/hydration/query/current/progressive/tests.rs',
+              'src/search/semantic_reader/publication/text/hydration/query/tests/retained/progressive/current.rs',
+          ]:
+              expected.extend(re.findall(r'#\[test\]\s*fn\s+(\w+)', Path(file).read_text()))
+          if len(expected) != 13:
+              raise SystemExit('Expected all 13 current-progressive regression functions')
+          for name in expected:
+              if not re.search(r'^test [^\n]*::' + re.escape(name) + r' \.\.\. ok$', log, re.M):
+                  raise SystemExit('Regression did not execute successfully: ' + name)
           PY
       - name: Check formatting without modifying the tested source
         shell: bash
         run: |
           set -euo pipefail
           rustfmt --edition 2024 --check --config skip_children=true src/search/semantic_reader/publication/text.rs src/search/semantic_reader/publication/text/hydration.rs src/search/semantic_reader/publication/text/hydration/tests.rs 2>&1 | tee "$RUNNER_TEMP/hydration-evidence/format.log"
+          find src/search/semantic_reader/publication/text/hydration -name '*.rs' -print0 | sort -z | xargs -0 rustfmt --edition 2024 --check --config skip_children=true 2>&1 | tee -a "$RUNNER_TEMP/hydration-evidence/format.log"
       - name: Run full-library Clippy under the shipping lockfile
         shell: bash
         run: |
           set -euo pipefail
           cargo clippy --locked --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/hydration-evidence/clippy.log"
+      - name: Retain exact sources and separate formatter suggestions
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          root = Path('src/search/semantic_reader/publication/text/hydration')
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'hydration-evidence'
+          hashes = {}
+          for path in sorted(root.rglob('*.rs')):
+              data = path.read_bytes()
+              hashes[str(path)] = hashlib.sha256(data).hexdigest()
+              destination = evidence / 'source' / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              destination.write_bytes(data)
+              result = subprocess.run(['rustfmt', '--edition', '2024', '--config',
+                  'skip_children=true', '--emit', 'stdout', str(path)],
+                  capture_output=True, timeout=30)
+              if result.returncode == 0:
+                  formatted = evidence / 'formatted' / path
+                  formatted.parent.mkdir(parents=True, exist_ok=True)
+                  formatted.write_bytes(result.stdout)
+          (evidence / 'all-source.sha256.json').write_text(json.dumps(hashes, indent=2))
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
