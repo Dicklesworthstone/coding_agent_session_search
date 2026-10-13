@@ -1,110 +1,18 @@
-name: Owned semantic backfill snapshot
+# The unstarted snapshot application was retired: this workflow never mutates
+# repository source or refs. The double-copy optimization is not yet integrated.
+name: Semantic recovery payload admission
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/workflows/semantic-snapshot-ownership.yml]
-  workflow_dispatch:
+    paths:
+      - .github/workflows/semantic-snapshot-ownership.yml
+      - src/indexer/semantic/artifacts/publication.rs
+      - src/indexer/semantic/artifacts/publication/**
 permissions:
   contents: read
-concurrency:
-  group: cass-owned-backfill-snapshot
-  cancel-in-progress: false
 jobs:
-  integrate:
-    permissions:
-      contents: write
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      revision: ${{ steps.commit.outputs.revision }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.sha }}
-      - name: Apply only the reviewed snapshot ownership patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -z "$(git status --porcelain)"
-          mkdir -p "$RUNNER_TEMP/snapshot-evidence"
-          git rev-parse HEAD > "$RUNNER_TEMP/snapshot-evidence/base.txt"
-          cp src/indexer/semantic/engine.rs "$RUNNER_TEMP/engine-before.rs"
-          if ! grep -Fq 'fn reconcile_in_private_directory(' src/indexer/semantic/engine.rs; then
-            git apply --check scripts/patches/semantic-snapshot-reuse.patch
-            git apply scripts/patches/semantic-snapshot-reuse.patch
-          fi
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib, os, re
-          path = Path('src/indexer/semantic/engine.rs')
-          before = (Path(os.environ['RUNNER_TEMP']) / 'engine-before.rs').read_text()
-          after = path.read_text()
-          def definition(source, name):
-              pattern = r'^    (?:pub(?:\([^)]*\))? )?fn ' + re.escape(name) + r'\b'
-              matches = list(re.finditer(pattern, source, re.M))
-              if len(matches) != 1:
-                  raise SystemExit('Ambiguous function: ' + name)
-              match = matches[0]
-              end = re.search(r'^    }$', source[match.end():], re.M)
-              if end is None:
-                  raise SystemExit('Missing function end: ' + name)
-              return source[match.start():match.end() + end.end()]
-          for name in ['finish_backfill_batch', 'revoke_backfill_serving', 'run_backfill_from_storage_with_caps_and_sink', 'build_backfill_from_storage']:
-              original, revised = definition(before, name), definition(after, name)
-              assert original == revised, 'Changed checkpoint/publication policy: ' + name
-              print('UNCHANGED', name, hashlib.sha256(original.encode()).hexdigest())
-          if 'fn reconcile_in_private_directory(' not in before:
-              original = definition(before, 'reconcile_index_at_paths')
-              revised = definition(after, 'reconcile_in_private_directory')
-              anchor = '        let embedded_docs = embedded_messages.len();'
-              assert original[original.index(anchor):].replace('FsVectorIndex::open(&staging_path).map_err', 'FsVectorIndex::open_writer(&staging_path).map_err', 1) == revised[revised.index(anchor):], 'Changed reconciliation/publication body'
-          body = definition(after, 'reconcile_backfill_from_storage')
-          assert '|| Ok(snapshot_dir)' in body
-          assert 'self.reconcile_index_at_paths(' not in body
-          assert after.count('self.reconcile_in_private_directory(') == 2
-          assert after.count('self.reconcile_index_at_paths(') == 1
-          assert 'mod snapshot_tests;' in after
-          # The copying wrapper now exists only for the live-source unit tests.
-          anchor = '\n    fn reconcile_index_at_paths('
-          if '\n    #[cfg(test)]' + anchor not in after:
-              assert after.count(anchor) == 1
-              after = after.replace(anchor, '\n    #[cfg(test)]' + anchor, 1)
-          path.write_text(after)
-          PY
-      - name: Parse production Rust and format the connected ownership tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustc --version | tee "$RUNNER_TEMP/snapshot-evidence/toolchain.txt"
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/semantic/engine.rs > "$RUNNER_TEMP/engine-parsed.rs"
-          rustfmt --edition 2024 src/indexer/semantic/engine/snapshot_tests.rs
-          git diff --check
-          git diff -- src/indexer/semantic/engine.rs src/indexer/semantic/engine/snapshot_tests.rs > "$RUNNER_TEMP/snapshot-evidence/source.diff"
-      - name: Commit production integration directly to main
-        id: commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add -- src/indexer/semantic/engine.rs src/indexer/semantic/engine/snapshot_tests.rs
-          if ! git diff --cached --quiet; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'perf(index): transfer the owned backfill snapshot instead of copying it twice' -m 'Activate the existing private-snapshot ownership regression suite. Keep the live-source copying wrapper test-only. Preserve the existing reconciliation, checkpoint, serving-revocation and publication bodies; no replay-cache, dependency, release or reclamation changes. Source invariance, Rust parsing and test formatting checked; runtime qualification runs separately.'
-            git push origin HEAD:refs/heads/main
-          fi
-          revision=$(git rev-parse HEAD)
-          echo "revision=$revision" >> "$GITHUB_OUTPUT"
-          echo "$revision" > "$RUNNER_TEMP/snapshot-evidence/revision.txt"
-          git archive --format=tar.gz HEAD -- src/indexer/semantic src/indexer/semantic.rs Cargo.toml Cargo.lock rust-toolchain.toml scripts/patches/semantic-snapshot-reuse.patch > "$RUNNER_TEMP/snapshot-evidence/exact-source.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: owned-snapshot-source-${{ github.run_id }}
-          path: ${{ runner.temp }}/snapshot-evidence/
-          retention-days: 7
-          if-no-files-found: error
   runtime:
-    needs: integrate
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -116,23 +24,23 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.integrate.outputs.revision }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Run actual owned-snapshot and storage-backfill regressions
+      - name: Run publication, ownership and repair regressions
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/snapshot-runtime"
-          git rev-parse HEAD > "$RUNNER_TEMP/snapshot-runtime/revision.txt"
-          for filter in 'snapshot_tests::' 'gh458_' 'backfill_from_storage' 'semantic_reconciliation'; do
-            logfile="$RUNNER_TEMP/snapshot-runtime/${filter//:/_}.log"
+          mkdir -p "$RUNNER_TEMP/recovery-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/recovery-evidence/revision.txt"
+          for filter in 'indexer::semantic::artifacts::publication::' 'indexer::semantic::artifacts::inspection::tests' 'indexer::semantic::artifact_lifecycle_tests'; do
+            logfile="$RUNNER_TEMP/recovery-evidence/${filter//:/_}.log"
             cargo test --locked --lib "$filter" -- --nocapture --test-threads=1 2>&1 | tee "$logfile"
             grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$logfile"
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: owned-snapshot-runtime-${{ github.run_id }}
-          path: ${{ runner.temp }}/snapshot-runtime/
+          name: semantic-recovery-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/recovery-evidence/
           retention-days: 7
           if-no-files-found: error

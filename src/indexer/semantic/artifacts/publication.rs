@@ -7,6 +7,8 @@ use super::*;
 use crate::search::semantic_manifest::ArtifactRecord;
 use frankensearch::index::VectorIndex;
 
+mod vectors;
+
 /// Data-admission failure, not metadata/cursor authority. Startup may defer
 /// cleanup on this exact type while allowing an explicit canonical backfill
 /// to repair coverage. Preview/apply still fail with all candidates retained.
@@ -80,6 +82,9 @@ fn validate_one(
     // an older ready record. Require at least the recorded distinct count,
     // not exact physical count, size, generation, or a model revision guess.
     checkpoint_coverage::require_distinct_live(&index, artifact.doc_count)?;
+    // A valid header and sufficient IDs do not prove usable persisted signal.
+    // Admit the effective payload before data sync can authorize reclamation.
+    vectors::require_usable_live_vectors(&index)?;
     pin(path, &main, &wal_path, wal.as_ref())
 }
 
