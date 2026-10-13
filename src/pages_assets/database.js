@@ -244,7 +244,7 @@ export function queryValue(sql, params = []) {
 /**
  * Execute a statement (INSERT, UPDATE, DELETE)
  * @param {string} sql - SQL statement
- * @param {Array} params - Statement parameters
+ * @param {Array} params - Query parameters
  * @returns {number} Number of affected rows
  */
 export function execute(sql, params = []) {
@@ -478,6 +478,140 @@ export class ConversationMessageSource {
         params,
       ),
     );
+  }
+
+  /**
+   * Find the next/previous message containing exact, case-sensitive text.
+   * Searches stored message content, not just the mounted DOM. The starting
+   * message is exclusive; wrapping visits it last, so a sole match is reusable.
+   *
+   * Each query returns at most 128 IDs, order keys and match flags, never bodies.
+   * Keyset pages use the same NULL-first (idx, id) order as get()/indexOfId().
+   * No transcript-sized result list or body cache is built. Yield between pages
+   * so callers can cancel, change queries, navigate or lock the archive. This
+   * bounds JavaScript hydration, not the time/memory SQLite needs for one huge
+   * message. A cancelled/invalidated search rejects; it is not an empty result.
+   */
+  async findText(text, { afterMessageId = null, direction = 1, signal, onProgress } = {}) {
+    if (typeof text !== "string" || text.length === 0 || text.length > 4096 ||
+        !text.isWellFormed()) {
+      throw new TypeError("Find text must contain 1-4096 well-formed UTF-16 code units");
+    }
+    if (direction !== 1 && direction !== -1) {
+      throw new RangeError("Find direction must be 1 or -1");
+    }
+    if (afterMessageId !== null &&
+        (!Number.isSafeInteger(afterMessageId) || afterMessageId <= 0)) {
+      throw new TypeError("Find anchor must be a positive safe-integer message ID");
+    }
+    if (onProgress !== undefined && typeof onProgress !== "function") {
+      throw new TypeError("Find progress callback must be a function");
+    }
+    const checkActive = () => {
+      this.#ensureActive();
+      if (signal?.aborted) {
+        const error = new Error("Conversation find cancelled");
+        error.name = "AbortError";
+        throw error;
+      }
+    };
+    checkActive();
+    const total = this.#length;
+    let cursor = null;
+    let position = direction === 1 ? 0 : total - 1;
+    if (afterMessageId !== null) {
+      cursor = queryOne(
+        "SELECT id, idx FROM messages WHERE conversation_id = ? AND id = ?",
+        [this.#conversationId, afterMessageId],
+      );
+      if (!cursor) {
+        throw new Error("Find anchor is not in this conversation");
+      }
+      this.#validateFindRow(cursor);
+      const anchorIndex = this.indexOfId(afterMessageId);
+      if (!Number.isSafeInteger(anchorIndex) || anchorIndex < 0 || anchorIndex >= total) {
+        throw new Error("Conversation changed while locating find anchor");
+      }
+      position = anchorIndex + direction;
+    }
+
+    let checked = 0;
+    let wrapped = false;
+    while (checked < total) {
+      checkActive();
+      if (position < 0 || position >= total) {
+        wrapped = true;
+        cursor = null;
+        position = direction === 1 ? 0 : total - 1;
+      }
+      const toBoundary = direction === 1 ? total - position : position + 1;
+      const limit = Math.min(128, total - checked, toBoundary);
+      const rows = this.#findTextPage(text, cursor, direction, limit);
+      if (rows.length !== limit) {
+        throw new Error("Conversation changed while finding text");
+      }
+      for (const row of rows) {
+        this.#validateFindRow(row);
+        checked += 1;
+        if (row.matched === 1) {
+          checkActive();
+          return { messageId: row.id, index: position, wrapped, checked, total };
+        }
+        cursor = row;
+        position += direction;
+      }
+      onProgress?.({ checked, total });
+      checkActive();
+      if (checked < total) {
+        // A macrotask, not Promise.resolve(): input/lock events need to run.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    checkActive();
+    return { messageId: null, index: -1, wrapped, checked, total };
+  }
+
+  #validateFindRow(row) {
+    if (!Number.isSafeInteger(row.id) || row.id <= 0 ||
+        (row.idx !== null && !Number.isSafeInteger(row.idx))) {
+      throw new Error("Invalid message identity or order key in archive");
+    }
+  }
+
+  #findTextPage(text, cursor, direction, limit) {
+    const order = direction === 1 ? "ASC" : "DESC";
+    const compare = direction === 1 ? ">" : "<";
+    // Separate the NULL partition from tuple comparisons. SQL row comparisons
+    // with NULL are unknown, and a broad OR would lose the composite-index seek.
+    let ranges;
+    if (cursor === null) {
+      ranges = [["", [], `idx ${order}, id ${order}`]];
+    } else if (cursor.idx === null) {
+      ranges = [[` AND idx IS NULL AND id ${compare} ?`, [cursor.id], `id ${order}`]];
+      if (direction === 1) {
+        ranges.push([" AND idx IS NOT NULL", [], "idx ASC, id ASC"]);
+      }
+    } else {
+      ranges = [[
+        ` AND (idx, id) ${compare} (?, ?)`, [cursor.idx, cursor.id], `idx ${order}, id ${order}`,
+      ]];
+      if (direction === -1) {
+        ranges.push([" AND idx IS NULL", [], "id DESC"]);
+      }
+    }
+    const rows = [];
+    for (const [condition, params, sort] of ranges) {
+      if (rows.length === limit) {
+        break;
+      }
+      rows.push(...queryAll(
+        `SELECT id, idx, instr(content, ?) > 0 AS matched
+         FROM messages WHERE conversation_id = ?${condition}
+         ORDER BY ${sort} LIMIT ?`,
+        [text, this.#conversationId, ...params, limit - rows.length],
+      ));
+    }
+    return rows;
   }
 
   // Eager traversal is reserved for short direct-rendered conversations and
