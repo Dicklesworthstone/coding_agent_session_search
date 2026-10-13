@@ -42,16 +42,27 @@ impl<T: ?Sized> ModelSlot<T> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn load_with<E>(
         &self,
         loader: impl FnOnce() -> Result<(Arc<T>, String), E>,
     ) -> Result<(), E> {
-        if self.get().is_some() {
-            return Ok(());
+        self.acquire_with(loader).map(drop)
+    }
+
+    /// Acquire the owner as part of lookup/publication, not in a later lookup.
+    /// A concurrent unload can remove publication but cannot revoke this borrow
+    /// or cause the caller to observe a subsequently loaded replacement.
+    pub(super) fn acquire_with<E>(
+        &self,
+        loader: impl FnOnce() -> Result<(Arc<T>, String), E>,
+    ) -> Result<Arc<T>, E> {
+        if let Some(model) = self.get() {
+            return Ok(model);
         }
         let _loading = self.loading.lock();
-        if self.get().is_some() {
-            return Ok(());
+        if let Some(model) = self.get() {
+            return Ok(model);
         }
         self.published.write().name = "loading".to_owned();
         // This guard also records a panicking loader as failed, without
@@ -59,10 +70,10 @@ impl<T: ?Sized> ModelSlot<T> {
         let _attempt = LoadAttempt(self);
         let (model, name) = loader()?;
         *self.published.write() = ModelSnapshot {
-            model: Some(model),
+            model: Some(Arc::clone(&model)),
             name,
         };
-        Ok(())
+        Ok(model)
     }
 
     pub(super) fn unload(&self) {
@@ -255,3 +266,6 @@ mod tests {
         assert_eq!(name.unwrap(), "not-loaded");
     }
 }
+
+#[cfg(test)]
+mod acquisition_tests;
