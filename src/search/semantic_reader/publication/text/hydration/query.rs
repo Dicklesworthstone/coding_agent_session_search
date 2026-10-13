@@ -31,14 +31,32 @@ pub type HydratedSearchResult<B> = Result<HydratedSemanticBatch<B>, HydratedSear
 // cross this composition boundary. No caller-supplied hit list is accepted.
 trait BatchSource {
     fn batch(&self) -> &SemanticSearchBatch;
+    fn batch_mut(&mut self) -> &mut SemanticSearchBatch;
+}
+
+// Current-source retrieval validates the complete union of the bounded tier
+// windows before selecting its visible prefix. Keep coverage about returned
+// contributors consistent with that prefix, without changing retrieved counts,
+// scores, tier ranks, execution receipts, or the retained publication identity.
+fn retain_verified_prefix<B: BatchSource>(batch: &mut B, k: usize) {
+    let batch = batch.batch_mut();
+    batch.hits.truncate(k);
+    if let Some(coverage) = &mut batch.coverage.fast {
+        coverage.contributed_candidates = batch.hits.iter().filter(|hit| hit.fast.is_some()).count();
+    }
+    if let Some(coverage) = &mut batch.coverage.quality {
+        coverage.contributed_candidates = batch.hits.iter().filter(|hit| hit.quality.is_some()).count();
+    }
 }
 
 impl BatchSource for SemanticSearchBatch {
     fn batch(&self) -> &SemanticSearchBatch { self }
+    fn batch_mut(&mut self) -> &mut SemanticSearchBatch { self }
 }
 
 impl BatchSource for SelectedSemanticBatch {
     fn batch(&self) -> &SemanticSearchBatch { self.batch() }
+    fn batch_mut(&mut self) -> &mut SemanticSearchBatch { &mut self.batch }
 }
 
 fn prepare(k: usize, phases: usize, budget: HydrationBudget) -> Result<Work, HydrationError> {

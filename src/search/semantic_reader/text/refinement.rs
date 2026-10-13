@@ -61,7 +61,42 @@ impl Entry {
     }
 }
 
+// A discarded candidate can still determine another candidate's tier rank.
+// Source verification must see the union BEFORE the final fused page is cut.
+// This is only the bounded k-per-tier candidate universe, not an exhaustive RRF
+// ranking of the whole archive. Public unhydrated searches keep their contract.
+fn rank_evidence_batch(
+    search: &TextSemanticSearch<'_, '_>,
+    phase: SemanticResultPhase,
+    fast: Option<TierResult>,
+    quality: Option<TierResult>,
+) -> SemanticReaderResult<SemanticSearchBatch> {
+    let evidence_limit = fast.as_ref().map_or(0, |tier| tier.candidates.len())
+        .checked_add(quality.as_ref().map_or(0, |tier| tier.candidates.len()))
+        .ok_or(SemanticReaderError::CountOverflow)?;
+    Ok(make_batch(search.reader, search.topology, phase, fast, quality, evidence_limit))
+}
+
 impl TextSemanticSearch<'_, '_> {
+    /// Private current-source lane: return every contributor from each bounded
+    /// tier window for verification/refill, not just the displayed fused page.
+    /// The caller must verify these sources and trim the successful batch.
+    pub(in crate::search::semantic_reader) fn current_candidates(
+        &self,
+        k: usize,
+        filter: &dyn SearchFilter,
+        policy: Option<AnnSearchPolicy>,
+    ) -> SemanticReaderResult<SemanticSearchBatch> {
+        if let Some(policy) = policy {
+            policy.validate()?;
+        }
+        self.revalidate()?;
+        let fast = self.search_tier(TierKind::Fast, k, Some(filter), policy)?;
+        let quality = self.search_tier(TierKind::Quality, k, Some(filter), policy)?;
+        self.revalidate()?;
+        rank_evidence_batch(self, SemanticResultPhase::Complete, fast, quality)
+    }
+
     /// Internal continuation operation. The current-source stream supplies one
     /// fixed request/filter and its append-only exclusion revision. Check both
     /// producers even when no fast work is needed. A cached ranking is not a
@@ -115,13 +150,11 @@ impl TextSemanticSearch<'_, '_> {
             None
         };
         self.revalidate()?;
-        Ok(make_batch(
-            self.reader,
-            self.topology,
+        rank_evidence_batch(
+            self,
             if refined { SemanticResultPhase::Refined } else { SemanticResultPhase::Initial },
             Some(fast),
             quality,
-            k,
-        ))
+        )
     }
 }

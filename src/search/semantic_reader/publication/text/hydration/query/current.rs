@@ -3,7 +3,10 @@
 //! Only missing or changed canonical passages are exclusions. Invalid owners,
 //! malformed source rows, database failures and exhausted budgets remain errors.
 //! Every pass searches the original owners with the caller's original filter AND
-//! accumulated passage exclusions. A failed pass never exposes partial text.
+//! accumulated passage exclusions. Verify the entire union of the bounded tier
+//! windows: even a candidate outside the final fused page can affect its ranks.
+//! A failed pass never exposes partial text or a ranking influenced by an
+//! unverified candidate within those windows.
 
 mod cache;
 mod progressive;
@@ -93,6 +96,9 @@ impl<'request> CurrentTextQuery<'request> {
         if let Some(policy) = self.ann {
             policy.validate()?;
         }
+        // Reserve the minimum visible pages. The actual (deduplicated) union
+        // of tier contributors is charged before reading source bodies, so
+        // disjoint tiers or refills may need more than this minimum allowance.
         let requested = self.limit.checked_mul(phases)
             .ok_or(HydrationError::BudgetExceeded)?;
         self.hydration.validate(requested)?;
@@ -123,7 +129,8 @@ pub enum CurrentSearchError {
 }
 
 /// Counts describe this request, not whole-generation canonical coverage.
-/// Source/output bytes include work discarded during unsuccessful refill passes.
+/// Source/output bytes include hidden rank contributors and work discarded
+/// during unsuccessful refill passes. Counts are not limited to displayed hits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CurrentSearchStats {
     pub searches: usize,
@@ -309,15 +316,24 @@ fn refill_accounted<B: BatchSource>(
             return Err(CurrentSearchError::RefillExhausted);
         }
         state.stats.searches += 1;
-        let batch = retrieve(&Excluding {
+        // Each tier still selects only request.limit candidates. Retain their
+        // union until source verification has rejected every stale contributor,
+        // including those that lost the final fused top-k competition.
+        let candidate_limit = request.limit.checked_mul(match request.producers {
+            TextQueryProducers::Progressive { .. } => 2,
+            _ => 1,
+        }).ok_or(HydrationError::BudgetExceeded)?;
+        let mut batch = retrieve(&Excluding {
             original: request.filter, rejected: &state.rejected,
         })?;
-        if batch.batch().hits().len() > request.limit {
+        if batch.batch().hits().len() > candidate_limit {
             return Err(HydrationError::InvalidCandidate.into());
         }
-        if let Some(passages) = verify_pass(
+        if let Some(mut passages) = verify_pass(
             batch.batch(), transaction, request.projection, work, state,
         )? {
+            retain_verified_prefix(&mut batch, request.limit);
+            passages.truncate(request.limit);
             state.stats.source_bytes_read = work.source_bytes;
             state.stats.output_bytes_checked = work.output_bytes;
             return Ok(CurrentSemanticBatch {
@@ -347,9 +363,8 @@ impl SemanticGenerationReader {
         let work = request.admit()?;
         let cached = CachedProducers::new(request.text, request.producers);
         let search = self.activate_text(request.text, cached.producers())?;
-        refill(&request, transaction, work, |filter| match request.ann {
-            Some(policy) => search.search_with_ann(request.limit, Some(filter), policy),
-            None => search.search(request.limit, Some(filter)),
+        refill(&request, transaction, work, |filter| {
+            search.current_candidates(request.limit, filter, request.ann)
         })
     }
 }
@@ -365,9 +380,9 @@ impl SelectedSemanticGeneration {
         let work = request.admit()?;
         let cached = CachedProducers::new(request.text, request.producers);
         let search = self.activate_text(request.text, cached.producers())?;
-        refill(&request, transaction, work, |filter| match request.ann {
-            Some(policy) => search.search_with_ann(request.limit, Some(filter), policy),
-            None => search.search(request.limit, Some(filter)),
+        refill(&request, transaction, work, |filter| {
+            let batch = search.search.current_candidates(request.limit, filter, request.ann)?;
+            Ok(search.retain(batch))
         })
     }
 }

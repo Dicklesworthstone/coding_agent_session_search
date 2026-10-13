@@ -108,3 +108,34 @@ visits. It also checks source invalidation, quality-only omissions, original
 scope, cumulative byte limits and retained images/ANN fallback receipts. These
 are native regression assertions, not a claim that the author executed them.
 A source commit or an unexecuted workflow is not a passing test receipt.
+
+## Verify rank contributors before trimming the page
+
+Current-source synchronous queries and progressive refinement verify the complete
+union of each tier's bounded candidate window, not only the final displayed page.
+A passage can lose the final reciprocal-rank-fusion competition while still
+shifting the ranks of displayed passages. If that hidden contributor is missing
+or stale, its complete passage ID is excluded and retrieval/refusion repeats.
+Malformed hidden sources and exhausted budgets remain errors, not exclusions.
+
+The public page is trimmed only after the whole candidate union is verified.
+Returned-contributor coverage is then recomputed for that prefix; retrieved-tier
+counts, scores, tier ranks, native execution receipts and publication owners are
+preserved. Public unhydrated retrieval and the older strict hydration entry points
+are unchanged. This does not enable ordinary `SearchClient` or CLI routing.
+
+Each tier still retrieves at most `limit` candidates; a two-tier validation pass
+can therefore inspect up to `2 * limit` distinct passages. A passage shared by
+both tiers is checked once, against both retained source-row references. Actual
+union size is charged before source reads under the existing hydration passage
+budget. Hidden contributors also count toward source/output-byte checks. The
+minimum visible-page admission is not a promise that all additional rank evidence
+or refills will fit; limits are never increased to finish a request. No corpus-wide
+scan, extra inference, or exhaustive full-corpus RRF guarantee is introduced here.
+
+The regression target `semantic_current_rank_evidence` uses real CASS hash
+embeddings and retained one-row FSVI shards to make the documented score-tie law
+deterministic. It compares against an independently filtered unhydrated search;
+its fixture includes a hidden contributor that changes the actual displayed order.
+Execute this target and the existing hydration/fast-reuse suites together under
+the shipping lockfile; source review alone is not runtime qualification.
