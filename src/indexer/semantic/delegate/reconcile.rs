@@ -18,6 +18,10 @@ pub(super) fn run(
     mut check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<VectorIndex> {
     check_cancelled()?;
+    // Declare the lease before any source observations or candidate owners.
+    // Its scratch borrow also prevents releasing it before TempDir cleanup.
+    let artifacts = super::super::artifacts::BackfillArtifacts::for_rebuild(data_dir)?;
+    check_cancelled()?;
     let destination = vector_index_path(data_dir, indexer.embedder_id());
     let wal_path = wal_path_for(&destination);
     let wal_before = ObservedSemanticFile::capture(&wal_path)?;
@@ -97,14 +101,8 @@ pub(super) fn run(
         "incompatible vector space requires a complete canonical replacement"
     );
 
-    let parent = destination
-        .parent()
-        .context("semantic index has no parent")?;
     check_cancelled()?;
-    fs::create_dir_all(parent)?;
-    let scratch = tempfile::Builder::new()
-        .prefix(".semantic-reconcile-")
-        .tempdir_in(parent)?;
+    let scratch = artifacts.scratch()?;
     let candidate_path = scratch.path().join("candidate.fsvi");
     let mut writer = VectorIndex::create_with_revision(
         &candidate_path,

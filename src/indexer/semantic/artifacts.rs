@@ -73,6 +73,20 @@ pub(super) struct BackfillArtifacts {
     _lock: File,
 }
 
+/// A private working directory cannot outlive its ownership lease. TempDir
+/// cleans only this invocation's unpublished files on ordinary return/unwind;
+/// general artifact reclamation still never happens in Drop.
+pub(super) struct LeasedScratch<'a> {
+    directory: tempfile::TempDir,
+    _lease: &'a BackfillArtifacts,
+}
+
+impl LeasedScratch<'_> {
+    pub(super) fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
 impl Drop for BackfillArtifacts {
     fn drop(&mut self) {
         // Closing this descriptor alone does not release a Unix flock while a
@@ -86,6 +100,37 @@ impl Drop for BackfillArtifacts {
 }
 
 impl BackfillArtifacts {
+    /// Coordinate direct full/canonical rebuild scratch with the same owner
+    /// as backfill recovery. This lease supplements the caller's maintenance
+    /// lock; it does not grant publication or canonical-content authority.
+    pub(super) fn for_rebuild(data_dir: &Path) -> Result<Self> {
+        let artifacts = Self::lock(data_dir)?;
+        // Reclaim a previous interrupted operation before allocating its next
+        // potentially multi-GB candidate. Failed ownership/durability checks
+        // retain the candidates, not permission to guess from their names.
+        // Unlike checkpoint resume, direct rebuild admission does not depend
+        // on the mutable ledger; preserve that existing repair capability.
+        if let Err(error) = artifacts.sweep(None, None) {
+            tracing::warn!(%error, "semantic rebuild scratch cleanup incomplete; retained entries will be retried");
+        }
+        Ok(artifacts)
+    }
+
+    /// The historical reuse namespace is already covered by the shared GC.
+    /// The borrow keeps its lease alive until the TempDir has been dropped.
+    /// A process abort skips TempDir cleanup, but releases the OS lease so
+    /// the next writer or explicit recovery can discover the abandoned work.
+    pub(super) fn scratch(&self) -> Result<LeasedScratch<'_>> {
+        let directory = tempfile::Builder::new()
+            .prefix(".backfill-reuse-")
+            .tempdir_in(self.data_dir.join(VECTOR_INDEX_DIR))
+            .context("create lease-owned semantic rebuild scratch")?;
+        Ok(LeasedScratch {
+            directory,
+            _lease: self,
+        })
+    }
+
     fn lock(data_dir: &Path) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
         let data_dir = data_dir.canonicalize()?;
