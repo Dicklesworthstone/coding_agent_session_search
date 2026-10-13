@@ -2,6 +2,7 @@
 // `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
 #![cfg_attr(not(test), deny(unsafe_code))]
 
+mod lexical_quarantine_cli;
 mod logical_archive;
 mod raw_mirror_cli;
 mod search_service;
@@ -307,11 +308,18 @@ fn main() -> anyhow::Result<()> {
     coding_agent_search::register_external_subcommands(|| {
         let mut commands = search_service::clap_commands();
         commands.extend(logical_archive::clap_commands());
+        commands.extend(lexical_quarantine_cli::clap_commands());
         commands.extend(semantic_reclaim_cli::clap_commands());
         commands
     });
 
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_command_name(&raw_args) == Some("lexical-quarantine") {
+        return match lexical_quarantine_cli::run(raw_args) {
+            Ok(()) => Ok(()),
+            Err(error) => handle_fatal_error(error),
+        };
+    }
     if raw_command_name(&raw_args) == Some("archive") {
         // Explicit interchange stays outside ordinary search/maintenance setup.
         let result = logical_archive::run(raw_args);
