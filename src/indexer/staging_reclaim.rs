@@ -184,6 +184,12 @@ pub(crate) fn reclaim_orphaned_staging_dirs_for_data_dir(
         .parent()
         .map_or_else(|| data_dir.join("index"), Path::to_path_buf);
 
+    // GH #523: failed rebuilds are evidence, not orphan staging. Their separate
+    // policy retains the newest bundle and all recent/uncertain evidence. This
+    // entry point already requires the authoritative index-run lock and runs
+    // before disk-headroom admission; do not add quarantines to the prefix sweep.
+    crate::search::lexical_quarantine::reclaim_under_index_run_lock(data_dir, now);
+
     let mut report = reclaim_orphaned_staging_dirs_under_index_run_lock(&staging_root, now);
     if staging_root != *data_dir {
         report.merge(reclaim_orphaned_staging_dirs_under_index_run_lock(
@@ -476,6 +482,27 @@ mod tests {
         assert!(!in_index.exists());
         assert!(!top_level.exists());
         assert!(live_index.exists(), "published index generations survive");
+    }
+
+    #[test]
+    fn startup_wrapper_reclaims_older_quarantines_but_preserves_evidence_and_live_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("index");
+        for suffix in ["000001", "000002", "000003"] {
+            let path = root.join(format!(".lexical-rebuild-quarantine-{suffix}"));
+            fs::create_dir_all(path.join("index")).unwrap();
+            fs::write(path.join("index/MANIFEST"), b"retained failed rebuild").unwrap();
+        }
+        let live = make_dir_with_payload(&root, "v9-quill");
+        let now = SystemTime::now() + Duration::from_secs(24 * 60 * 60);
+        let before = crate::search::lexical_quarantine::inspect(tmp.path()).unwrap();
+        assert_eq!(before.artifacts.len(), 3);
+        reclaim_orphaned_staging_dirs_for_data_dir(tmp.path(), now);
+        let after = crate::search::lexical_quarantine::inspect(tmp.path()).unwrap();
+        assert!(after.complete);
+        assert_eq!(after.artifacts.len(), if before.automatic_retention_enabled { 1 } else { 3 });
+        assert_eq!(fs::read(after.artifacts[0].path.join("index/MANIFEST")).unwrap(), b"retained failed rebuild");
+        assert!(live.join("nested/payload.bin").is_file());
     }
 
     #[test]
