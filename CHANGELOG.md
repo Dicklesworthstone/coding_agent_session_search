@@ -80,6 +80,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **Sessions synced from a remote source are no longer also indexed as Claude
+  or Pi conversations.** Every connector scanned every remote mirror
+  container, and the Claude connector claimed the transcripts it found in
+  other providers' mirrors: each synced Pi, Prime, Factory or Gemini session
+  also appeared as a Claude conversation, and each Prime session as a Pi one.
+  When a source's configured path names a known provider store
+  (`~/.pi/agent/sessions`, `~/.factory/sessions`, ...), only that provider's
+  connectors scan its mirror now. A path that names no known store is still
+  scanned by every connector. Duplicates indexed before this fix stay in the
+  archive.
+
 - **A first `cass index` on a new install is no longer many times slower
   than `cass index --full`.** With an empty archive, a plain `cass index`
   rebuilt the lexical index inline from the scan. It committed the index at

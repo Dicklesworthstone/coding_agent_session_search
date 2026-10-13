@@ -5275,6 +5275,57 @@ fn gh520_remote_mirrors_index_structural_agents_end_to_end() {
     }
     assert_eq!(conversation_count(), i64::try_from(first.len()).unwrap());
 
+    // Each conversation belongs to the agent whose store its file was synced
+    // from. Before mx520 the Claude connector also claimed the Factory, Pi,
+    // Prime and Gemini files, and Pi claimed the Prime file.
+    let expected_agent: std::collections::BTreeMap<String, &str> = [
+        ("~/.claude/projects", "claude_code"),
+        ("~/.codex/sessions", "codex"),
+        ("~/.pi/agent/sessions", "pi_agent"),
+        ("~/.factory/sessions", "factory"),
+        ("~/.vibe/logs/session", "vibe"),
+        ("~/.prime/agent/sessions", "prime_agent"),
+        ("~/.gemini/tmp", "gemini"),
+        ("~/.config/Cursor/User", "cursor"),
+    ]
+    .into_iter()
+    .map(|(path, agent)| (path_to_safe_dirname(path), agent))
+    .collect();
+    let attributions: Vec<(String, String)> = {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query(
+                "SELECT a.slug, c.source_path FROM conversations c \
+                 JOIN agents a ON a.id = c.agent_id WHERE c.source_id = 'laptop'",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get_typed::<String>(0).unwrap(),
+                    row.get_typed::<String>(1).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let misattributed: Vec<&(String, String)> = attributions
+        .iter()
+        .filter(|(agent, source_path)| {
+            let container = Path::new(source_path)
+                .strip_prefix(&mirror)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .map(|component| component.as_os_str().to_string_lossy().into_owned());
+            container.and_then(|container| expected_agent.get(&container).copied())
+                != Some(agent.as_str())
+        })
+        .collect();
+    assert!(
+        misattributed.is_empty(),
+        "conversations attributed to the wrong agent: {misattributed:?}"
+    );
+
     // A second, incremental index re-reads the remote roots: it must find the
     // same conversations under the same identities, with no duplicate rows.
     index(&["index", "--json"]);

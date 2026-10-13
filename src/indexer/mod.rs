@@ -15100,6 +15100,9 @@ fn spawn_connector_producer(
         // Scan explicitly configured additional roots. These may be true remote
         // mirrors or machine-local backup directories wired through sources.toml.
         for root in &config.additional_scan_roots {
+            if !mirrored_root_may_hold(name, root) {
+                continue;
+            }
             let local_since_ts = config
                 .local_since_ts_by_connector
                 .get(name)
@@ -16547,6 +16550,9 @@ fn run_batch_index_with_connector_factories(
 
                 if !additional_scan_roots.is_empty() {
                     for root in &additional_scan_roots {
+                        if !mirrored_root_may_hold(name, root) {
+                            continue;
+                        }
                         let local_since_ts = local_since_ts_by_connector
                             .get(name)
                             .copied()
@@ -16912,6 +16918,45 @@ fn record_scan_contract_with_watermark_held(
             "connector scan contract save failed; the next run scans this connector without a cutoff again"
         );
     }
+}
+
+/// The connectors that own the store a remote root's configured path names.
+///
+/// A remote mirror's scan root is its opaque `<path>_<hash>` container, and
+/// connectors that walk a root recursively claimed whatever transcripts they
+/// found under any container: each synced Pi, Prime, Factory or Gemini
+/// session was also indexed as a Claude conversation, and each Prime session
+/// as a Pi one. The deepest known store component in the configured path
+/// decides (`~/.gemini/antigravity` is Antigravity's, not Gemini's). A path
+/// that names no known store, and any local root, keeps every connector.
+fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static str]> {
+    root.mirrored_source_path
+        .as_deref()?
+        .split(['/', '\\'])
+        .rev()
+        .find_map(|component| match component {
+            ".claude" => Some(&["claude"][..]),
+            ".codex" => Some(&["codex"][..]),
+            ".pi" => Some(&["pi_agent", "pi_durable"][..]),
+            ".prime" => Some(&["prime_agent"][..]),
+            ".omp" | "omp" => Some(&["omp"][..]),
+            ".factory" => Some(&["factory"][..]),
+            ".gemini" => Some(&["gemini", "antigravity"][..]),
+            "antigravity" | "antigravity-cli" => Some(&["antigravity"][..]),
+            ".vibe" => Some(&["vibe"][..]),
+            ".continue" => Some(&["continue"][..]),
+            ".goose" => Some(&["goose"][..]),
+            "opencode" => Some(&["opencode"][..]),
+            ".aider.chat.history.md" => Some(&["aider"][..]),
+            "saoudrizwan.claude-dev" | "rooveterinaryinc.roo-cline" => Some(&["cline"][..]),
+            "Cursor" => Some(&["cursor", "cline"][..]),
+            _ => None,
+        })
+}
+
+/// Whether `connector` scans `root`; see [`mirrored_root_owners`].
+fn mirrored_root_may_hold(connector: &str, root: &ScanRoot) -> bool {
+    mirrored_root_owners(root).is_none_or(|owners| owners.contains(&connector))
 }
 
 fn explicit_scan_root_since_ts(
@@ -30666,7 +30711,7 @@ fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind
 
     for (name, factory) in factories {
         if let Some(kind) = ConnectorKind::from_slug(name) {
-            all_kinds.push(kind);
+            all_kinds.push((name, kind));
             let conn = factory();
             let detection = conn.detect();
             if detection.detected {
@@ -30677,10 +30722,12 @@ fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind
         }
     }
 
-    // Add explicitly configured roots for ALL connectors.
+    // Add explicitly configured roots for every connector that may own them.
     for configured_root in additional_scan_roots {
-        for kind in &all_kinds {
-            roots.push((*kind, configured_root.clone()));
+        for (name, kind) in &all_kinds {
+            if mirrored_root_may_hold(name, &configured_root) {
+                roots.push((*kind, configured_root.clone()));
+            }
         }
     }
 
@@ -67780,6 +67827,83 @@ c.close()
             assert_eq!(remote.path, mirror);
             assert_eq!(remote.origin.source_id, "laptop");
             assert_eq!(remote.mirrored_source_path.as_deref(), Some(path));
+        }
+    }
+
+    #[test]
+    fn mirrored_roots_are_scanned_only_by_the_connectors_that_own_their_store() {
+        let remote = |path: &str| {
+            ScanRoot::remote(
+                PathBuf::from("/cass/remotes/laptop/mirror/opaque_0123456789abcdef"),
+                Origin::remote_with_host("laptop", "user@laptop"),
+                None,
+            )
+            .with_mirrored_source_path(path)
+        };
+        let cases: [(&str, &[&str]); 13] = [
+            ("~/.claude/projects", &["claude"]),
+            ("~/.codex/sessions", &["codex"]),
+            ("~/.pi/agent/sessions", &["pi_agent", "pi_durable"]),
+            ("~/.prime/agent/sessions", &["prime_agent"]),
+            ("~/.omp/agent/sessions", &["omp"]),
+            ("~/.local/share/omp", &["omp"]),
+            ("~/.factory/sessions", &["factory"]),
+            ("~/.vibe/logs/session", &["vibe"]),
+            ("~/.gemini/tmp", &["gemini", "antigravity"]),
+            ("/home/u/.gemini/antigravity", &["antigravity"]),
+            ("~/.config/Cursor/User", &["cursor", "cline"]),
+            (
+                "~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev",
+                &["cline"],
+            ),
+            (r"C:\Users\u\.claude\projects", &["claude"]),
+        ];
+        for (path, owners) in cases {
+            let root = remote(path);
+            assert_eq!(mirrored_root_owners(&root), Some(owners), "{path}");
+            for connector in [
+                "claude",
+                "pi_agent",
+                "prime_agent",
+                "factory",
+                "gemini",
+                "cline",
+            ] {
+                assert_eq!(
+                    mirrored_root_may_hold(connector, &root),
+                    owners.contains(&connector),
+                    "{connector} on {path}"
+                );
+            }
+        }
+        // The misattributions this prevents.
+        assert!(!mirrored_root_may_hold(
+            "claude",
+            &remote("~/.pi/agent/sessions")
+        ));
+        assert!(!mirrored_root_may_hold(
+            "claude",
+            &remote("~/.factory/sessions")
+        ));
+        assert!(!mirrored_root_may_hold(
+            "pi_agent",
+            &remote("~/.prime/agent/sessions")
+        ));
+        // A path naming no known store, an unannotated remote root and a local
+        // root keep every connector.
+        for root in [
+            remote("/backups/claude-sessions"),
+            remote("~"),
+            ScanRoot::remote(
+                PathBuf::from("/cass/remotes/laptop/mirror"),
+                Origin::remote("laptop"),
+                None,
+            ),
+            ScanRoot::local(PathBuf::from("/home/u/.factory/sessions")),
+        ] {
+            assert_eq!(mirrored_root_owners(&root), None, "{root:?}");
+            assert!(mirrored_root_may_hold("claude", &root));
+            assert!(mirrored_root_may_hold("factory", &root));
         }
     }
 
