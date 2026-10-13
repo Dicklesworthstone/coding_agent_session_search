@@ -52,7 +52,7 @@ fn reclaim(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> R
     report
 }
 
-fn reclaim_one(artifact: &Artifact, now: SystemTime, budget: &mut Budget) -> io::Result<()> {
+pub(super) fn reclaim_one(artifact: &Artifact, now: SystemTime, budget: &mut Budget) -> io::Result<()> {
     let parent = artifact.path.parent().ok_or_else(|| io::Error::other("quarantine has no parent"))?;
     real_directory(parent)?;
     // Hold identities through re-observation and rename. This detects ordinary

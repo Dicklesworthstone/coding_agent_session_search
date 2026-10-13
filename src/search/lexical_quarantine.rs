@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+pub mod cleanup;
 mod retention;
 pub(crate) use retention::reclaim_under_index_run_lock;
 
