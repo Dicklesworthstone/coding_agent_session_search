@@ -1,10 +1,10 @@
-//! Index timeline groups by borrowed runs, not by individual sessions.
+//! Stream ordered timeline groups; index only inputs that need reordering.
 //!
-//! The database orders summaries by descending start time, so each valid UTC
-//! hour/day is one contiguous run. A large group therefore needs one slice,
-//! not a growing Vec<SessionView>. Interleaved input remains supported without
-//! sorting its members: later runs are appended in encounter order. Memory is
-//! O(groups + runs), in addition to the caller-owned summaries and writer.
+//! Monotone UTC buckets in years 0000..9999 serialize directly from borrowed
+//! slices with O(1) auxiliary grouping storage, even with many distinct groups.
+//! Interleaved groups, signed/extended years and invalid timestamps retain the
+//! borrowed-run index and its historical ordering/fallback semantics. That
+//! path uses O(groups + runs) storage. Caller-owned summaries are unchanged.
 
 use std::collections::{BTreeMap, btree_map::Entry};
 
@@ -15,7 +15,17 @@ use serde::{Serialize, Serializer};
 use super::{Session, SessionView};
 use crate::TimelineGrouping;
 
-pub(super) struct Groups<'a>(BTreeMap<String, Group<'a>>);
+mod ordered;
+
+pub(super) struct Groups<'a>(BTreeMap<String, Group<'a>>, Option<ordered::OrderedGroups<'a>>);
+
+fn granularity(grouping: TimelineGrouping) -> (i64, &'static str) {
+    match grouping {
+        TimelineGrouping::Hour => (3_600_000, "%Y-%m-%d %H:00"),
+        TimelineGrouping::Day => (86_400_000, "%Y-%m-%d"),
+        TimelineGrouping::None => unreachable!("flat output does not build groups"),
+    }
+}
 
 struct Group<'a> {
     first: &'a [Session],
@@ -26,12 +36,17 @@ struct Group<'a> {
 
 impl<'a> Groups<'a> {
     pub(super) fn new(sessions: &'a [Session], grouping: TimelineGrouping) -> Self {
-        let (width, format) = match grouping {
-            TimelineGrouping::Hour => (3_600_000, "%Y-%m-%d %H:00"),
-            TimelineGrouping::Day => (86_400_000, "%Y-%m-%d"),
-            TimelineGrouping::None => unreachable!("flat output does not build groups"),
-        };
-        let mut groups = Self(BTreeMap::new());
+        if let Some(ordered) = ordered::OrderedGroups::new(sessions, grouping) {
+            return Self(BTreeMap::new(), Some(ordered));
+        }
+        Self::indexed(sessions, grouping)
+    }
+
+    // Retain the previous implementation for inputs whose map-key order
+    // cannot be produced by traversing the contiguous groups in one direction.
+    fn indexed(sessions: &'a [Session], grouping: TimelineGrouping) -> Self {
+        let (width, format) = granularity(grouping);
+        let mut groups = Self(BTreeMap::new(), None);
         // Euclidean division is essential before the Unix epoch: -1 ms
         // belongs to the preceding hour/day, not the bucket beginning at 0.
         for run in sessions.chunk_by(|a, b| a.3.div_euclid(width) == b.3.div_euclid(width)) {
@@ -73,6 +88,9 @@ impl<'a> Groups<'a> {
 
 impl Serialize for Groups<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Some(ordered) = &self.1 {
+            return ordered.serialize(serializer);
+        }
         // Preserve lexical key order even for signed/extended calendar years,
         // where reversing chronological buckets is not equivalent.
         self.0.serialize(serializer)
@@ -188,9 +206,14 @@ mod tests {
             .collect();
         assert_equivalent(&sessions);
         let groups = Groups::new(&sessions, TimelineGrouping::Hour);
-        let prior_hour = &groups.0["1969-12-31 23:00"];
+        assert!(groups.1.is_some(), "pre-epoch dates still use ordered groups");
+        let value = serde_json::to_value(&groups).unwrap();
+        let prior_hour = value["1969-12-31 23:00"].as_array().unwrap();
         assert_eq!(
-            prior_hour.first.iter().map(|s| s.3).collect::<Vec<_>>(),
+            prior_hour
+                .iter()
+                .map(|s| s["started_at"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
             vec![-1, -3_600_000]
         );
     }
@@ -295,15 +318,110 @@ mod tests {
         let sessions: Vec<_> = (0..65_536).map(|id| session(id, 0)).collect();
         for grouping in [TimelineGrouping::Hour, TimelineGrouping::Day] {
             let groups = Groups::new(&sessions, grouping);
-            assert_eq!(groups.0.len(), 1);
-            let group = groups.0.values().next().unwrap();
-            assert!(std::ptr::eq(group.first, sessions.as_slice()));
-            assert_eq!(group.len, sessions.len());
-            assert_eq!(
-                group.later.capacity(),
-                0,
-                "sorted input must not allocate a run vector"
-            );
+            assert!(groups.0.is_empty(), "ordered input must not retain an index");
+            let ordered = groups.1.as_ref().expect("ordered group admission");
+            assert!(std::ptr::eq(ordered.sessions, sessions.as_slice()));
+            assert_eq!(ordered.len, 1);
+            assert_eq!(ordered.sessions.len(), sessions.len());
+        }
+    }
+
+    #[test]
+    fn many_distinct_groups_borrow_the_input_without_a_group_index() {
+        let mut sessions: Vec<_> = (0..65_536)
+            .map(|id| session(id, id * 86_400_000))
+            .collect();
+        for descending in [false, true] {
+            if descending {
+                sessions.reverse();
+            }
+            for grouping in [TimelineGrouping::Hour, TimelineGrouping::Day] {
+                let groups = Groups::new(&sessions, grouping);
+                assert!(groups.0.is_empty());
+                let ordered = groups.1.as_ref().expect("monotone bucket admission");
+                assert!(std::ptr::eq(ordered.sessions, sessions.as_slice()));
+                assert_eq!(ordered.len, sessions.len());
+                // Compare bytes against the live pre-change borrowed-run map,
+                // not just its length or a re-serialization of our own output.
+                assert_eq!(
+                    serde_json::to_vec(&groups).unwrap(),
+                    serde_json::to_vec(&Groups::indexed(&sessions, grouping)).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_groups_reverse_buckets_but_never_members() {
+        for times in [
+            [86_400_003, 86_400_001, 86_400_001, 3, 1, 1],
+            [3, 1, 1, 86_400_003, 86_400_001, 86_400_001],
+        ] {
+            let sessions: Vec<_> = times
+                .into_iter()
+                .enumerate()
+                .map(|(id, time)| session(i64::try_from(id).unwrap(), time))
+                .collect();
+            for grouping in [TimelineGrouping::Hour, TimelineGrouping::Day] {
+                assert!(Groups::new(&sessions, grouping).1.is_some());
+            }
+            assert_equivalent(&sessions);
+        }
+    }
+
+    #[test]
+    fn order_reversals_and_hidden_invalid_dates_use_the_indexed_fallback() {
+        for times in [
+            [0, 86_400_000, 0],
+            [0, -86_400_000, 86_400_000],
+            [0, i64::MAX, 86_400_000],
+            [86_400_000, i64::MIN, 0],
+        ] {
+            let sessions: Vec<_> = times
+                .into_iter()
+                .enumerate()
+                .map(|(id, time)| session(i64::try_from(id).unwrap(), time))
+                .collect();
+            for grouping in [TimelineGrouping::Hour, TimelineGrouping::Day] {
+                let groups = Groups::new(&sessions, grouping);
+                assert!(
+                    groups.1.is_none(),
+                    "must check every bucket, not just endpoints"
+                );
+                assert_eq!(groups.0.values().map(|g| g.len).sum::<usize>(), 3);
+            }
+            if times
+                .iter()
+                .all(|t| Utc.timestamp_millis_opt(*t).single().is_some())
+            {
+                assert_equivalent(&sessions);
+            }
+        }
+    }
+
+    #[test]
+    fn four_digit_year_limits_stream_but_extended_years_keep_lexical_sorting() {
+        let timestamp = |year| {
+            Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0)
+                .single()
+                .unwrap()
+                .timestamp_millis()
+        };
+        for years in [
+            [9999, 1970, 0],
+            [0, 1970, 9999],
+            [10_000, 9999, 0],
+            [0, -1, -2],
+        ] {
+            let sessions: Vec<_> = years
+                .into_iter()
+                .map(|year| session(i64::from(year), timestamp(year)))
+                .collect();
+            for grouping in [TimelineGrouping::Hour, TimelineGrouping::Day] {
+                let ordered = years.iter().all(|year| (0..=9999).contains(year));
+                assert_eq!(Groups::new(&sessions, grouping).1.is_some(), ordered);
+            }
+            assert_equivalent(&sessions);
         }
     }
 
@@ -366,6 +484,61 @@ mod tests {
         #[ignore = "isolated live control of grouped_json_memory_regression"]
         fn reference_grouping_memory_child() {
             run_probe(true);
+        }
+
+        fn run_many_bucket_probe(indexed: bool) {
+            // Unlike the existing one-bucket control, this isolates the map
+            // retained by the immediately preceding borrowed-run implementation.
+            let sessions: Vec<_> = (0..524_288)
+                .rev()
+                .map(|id| session(id, id * 86_400_000))
+                .collect();
+            let baseline = peak_kib();
+            let mut sink = Sink::default();
+            if indexed {
+                serde_json::to_writer(
+                    &mut sink,
+                    &Groups::indexed(&sessions, TimelineGrouping::Day),
+                )
+                .unwrap();
+            } else {
+                serde_json::to_writer(&mut sink, &Groups::new(&sessions, TimelineGrouping::Day))
+                    .unwrap();
+            }
+            println!(
+                "GH521_GROUP_RSS {} {}",
+                peak_kib().saturating_sub(baseline),
+                sink.0
+            );
+        }
+
+        #[test]
+        #[ignore = "isolated child of many_bucket_memory_regression"]
+        fn many_bucket_memory_child() {
+            run_many_bucket_probe(false);
+        }
+
+        #[test]
+        #[ignore = "isolated live borrowed-run map control of many_bucket_memory_regression"]
+        fn indexed_bucket_memory_child() {
+            run_many_bucket_probe(true);
+        }
+
+        #[test]
+        #[ignore = "half-million distinct buckets; run explicitly with --ignored"]
+        fn many_bucket_memory_regression() {
+            let (new_kib, new_bytes) = measure("many_bucket_memory_child");
+            let (old_kib, old_bytes) = measure("indexed_bucket_memory_child");
+            assert_eq!(new_bytes, old_bytes);
+            assert!(new_bytes > 100 * 1024 * 1024);
+            assert!(
+                old_kib >= 24 * 1024,
+                "map control was insensitive: {old_kib} KiB"
+            );
+            assert!(new_kib <= 8 * 1024, "ordered groups grew by {new_kib} KiB");
+            eprintln!(
+                "GH521 many buckets: new={new_kib} KiB, indexed={old_kib} KiB, bytes={new_bytes}"
+            );
         }
 
         fn measure(name: &str) -> (u64, usize) {
