@@ -66,6 +66,7 @@ fn request(model: &dyn Embedder, k: usize) -> CurrentTextQuery<'_> {
 struct Allowed(BTreeSet<String>);
 impl SearchFilter for Allowed {
     fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool { self.0.contains(id) }
+    fn name(&self) -> &str { "allowed" }
 }
 
 #[test]

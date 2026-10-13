@@ -171,6 +171,10 @@ impl SearchFilter for Excluding<'_> {
         !self.rejected.contains(doc_id)
             && self.original.is_none_or(|filter| filter.matches(doc_id, metadata))
     }
+
+    fn name(&self) -> &str {
+        "excluding-rejected"
+    }
 }
 
 struct RefillState {
