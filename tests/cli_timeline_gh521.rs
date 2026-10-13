@@ -15,8 +15,8 @@ const END: i64 = START + 60_000;
 fn archive(root: &Path) -> Connection {
     let db = root.join("agent_search.db");
     let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
-    // An unmigrated, read-only-compatible archive. No indexing or FTS work is
-    // involved: the regression is specifically in the timeline read path.
+    // The UNIQUE constraint is important: production streams the canonical
+    // sqlite_autoindex_messages_1 covering index, not idx_messages_conv_idx.
     conn.execute_batch(
         "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
          INSERT INTO meta VALUES('schema_version', '20');
@@ -33,7 +33,8 @@ fn archive(root: &Path) -> Connection {
          CREATE INDEX idx_conversations_started_at ON conversations(started_at);
          CREATE TABLE messages(
              id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL,
-             idx INTEGER NOT NULL, role TEXT, content TEXT, created_at INTEGER
+             idx INTEGER NOT NULL, role TEXT, content TEXT, created_at INTEGER,
+             UNIQUE(conversation_id, idx)
          );
          CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx);",
     )
@@ -66,8 +67,8 @@ fn conversation(
     )
     .unwrap();
     for idx in 0..count {
-        // Counts are lifetime counts, NOT restricted to the conversation-start
-        // window. Deliberately put every message timestamp outside that window.
+        // Message timestamps deliberately lie OUTSIDE the session-start
+        // window: timeline promises lifetime message counts.
         conn.execute_compat(
             "INSERT INTO messages(conversation_id, idx, role, content, created_at)
              VALUES(?1, ?2, 'user', 'small message', 0)",
@@ -90,6 +91,9 @@ fn command(root: &Path) -> std::process::Command {
         .env("CASS_DATA_DIR", root)
         .env("CASS_AUTO_REFRESH", "0")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env_remove("CASS_DB_PATH")
+        .env_remove("CASS_ROBOT_FORMAT")
+        .env_remove("CASS_FORMAT")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("NO_COLOR", "1")
         .env("RAYON_NUM_THREADS", "2")
@@ -121,8 +125,8 @@ fn entries(payload: &Value) -> Vec<&Value> {
         payload["total_sessions"].as_u64().unwrap() as usize,
         rows.len()
     );
-    // Every member of this one-minute window belongs to the same hour/day;
-    // the original newest-first ordering must therefore survive grouping too.
+    // This fixture's selected sessions belong to one minute, so grouping
+    // must preserve the same descending order as the flat result.
     assert!(rows.windows(2).all(|w| {
         w[0]["started_at"].as_i64().unwrap() >= w[1]["started_at"].as_i64().unwrap()
     }));
@@ -215,6 +219,11 @@ fn gh521_filters_counts_nulls_and_grouping_preserve_the_timeline_contract() {
                 assert_eq!(row["message_count"], count, "session {id}");
                 assert!(row["title"].is_null());
                 assert_eq!(row["source_path"], format!("/sessions/{id}.jsonl"));
+                if grouping == "none" {
+                    assert_eq!(row["duration_seconds"], 20);
+                } else {
+                    assert!(row.get("duration_seconds").is_none());
+                }
                 if id == 10 {
                     assert_eq!(row["agent"], "unknown");
                 }
@@ -236,19 +245,147 @@ fn gh521_filters_counts_nulls_and_grouping_preserve_the_timeline_contract() {
     );
 }
 
+#[test]
+fn gh521_filters_json_and_compact_preserve_escaping_and_nullable_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let conn = archive(tmp.path());
+    conversation(&conn, 1, Some(1), Some(START), Some("local"), None, 2);
+    let title = "quote \" and slash \\ and newline\n Unicode λ\0";
+    conn.execute_compat(
+        "UPDATE conversations SET title = ?1, ended_at = NULL WHERE id = 1",
+        params![title],
+    )
+    .unwrap();
+    finish(conn);
+    for grouping in ["none", "hour", "day"] {
+        let mut payloads = Vec::new();
+        for format in ["json", "compact"] {
+            let output = Command::from(command(tmp.path()))
+                .args(["--robot-format", format, "--group-by", grouping])
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            assert!(output.stdout.ends_with(b"\n"));
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let rows = entries(&value);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["title"], title);
+            assert!(rows[0]["ended_at"].is_null());
+            if grouping == "none" {
+                assert!(rows[0]["duration_seconds"].is_null());
+            } else {
+                assert!(rows[0].get("duration_seconds").is_none());
+            }
+            payloads.push(value);
+        }
+        assert_eq!(payloads[0], payloads[1], "grouping={grouping}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_timeline(root: &Path, flags: &[&str], expected: &[(i64, i64)]) {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let out = root.join("timeline.stdout");
+    let err = root.join("timeline.stderr");
+    let mut child_cmd = command(root);
+    child_cmd
+        .args(["--json", "--group-by", "none"])
+        .args(flags)
+        .stdout(Stdio::from(fs::File::create(&out).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&err).unwrap()));
+    let mut child = child_cmd.spawn().unwrap();
+    let started = Instant::now();
+    let mut peak_kib = 0_u64;
+    let status = loop {
+        if let Ok(text) = fs::read_to_string(format!("/proc/{}/status", child.id())) {
+            for line in text
+                .lines()
+                .filter(|s| s.starts_with("VmHWM:") || s.starts_with("VmRSS:"))
+            {
+                if let Some(kib) = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    peak_kib = peak_kib.max(kib);
+                }
+            }
+        }
+        if peak_kib > 384 * 1024 || started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "GH521 flags={flags:?} peak_kib={peak_kib} elapsed={:?}; stderr={}",
+                started.elapsed(),
+                fs::read_to_string(&err).unwrap_or_default()
+            );
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "{status}: {}",
+        fs::read_to_string(&err).unwrap()
+    );
+    assert!(
+        peak_kib > 0,
+        "RSS probe observed no process samples; cannot claim a memory pass"
+    );
+    assert!(
+        fs::metadata(&out).unwrap().len() < 16 * 1024,
+        "narrow output must be small"
+    );
+    let payload: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+    let actual: Vec<(i64, i64)> = entries(&payload)
+        .into_iter()
+        .map(|row| {
+            (
+                row["id"].as_i64().unwrap(),
+                row["message_count"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(actual.as_slice(), expected, "flags={flags:?}");
+    eprintln!(
+        "GH521 flags={flags:?} peak_kib={peak_kib} elapsed={:?}",
+        started.elapsed()
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "GH521 archive-scale RSS regression; run explicitly with --ignored"]
 fn gh521_narrow_window_does_not_materialize_unrelated_message_payloads() {
-    use std::process::Stdio;
-    use std::time::Instant;
-
     let tmp = TempDir::new().unwrap();
     let conn = archive(tmp.path());
     conversation(&conn, 1, Some(1), Some(START - 1), Some("local"), None, 0);
     conversation(&conn, 2, Some(1), Some(START), Some("local"), None, 2);
-    // More than 512 MiB of unrelated message content. Keep fixture creation
-    // bounded too: one reused payload and 64-row transactions, no Vec<Message>.
+    // Match the reporter's conversation cardinality without retaining a tree
+    // of conversations/messages in the fixture builder.
+    for batch in 0..127_i64 {
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        for id in (3 + batch * 100)..(3 + (batch + 1) * 100).min(12_668) {
+            conversation(
+                &conn,
+                id,
+                Some(2),
+                Some(START - 86_400_000 - id),
+                Some("local"),
+                None,
+                0,
+            );
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    // More than 512 MiB of payload. Only one reusable buffer and 64-row
+    // transactions are held while constructing it.
     let payload = "x".repeat(64 * 1024);
     for batch in 0..128_i64 {
         conn.execute("BEGIN IMMEDIATE").unwrap();
@@ -269,74 +406,37 @@ fn gh521_narrow_window_does_not_materialize_unrelated_message_payloads() {
             .len()
             > 512 * 1024 * 1024
     );
-
     for flags in [
         vec![],
         vec!["--agent", "claude_code"],
         vec!["--source", "local"],
-        vec!["--agent", "codex", "--source", "remote"],
     ] {
-        let out = tmp.path().join("timeline.stdout");
-        let err = tmp.path().join("timeline.stderr");
-        let mut child_cmd = command(tmp.path());
-        child_cmd
-            .args(["--json", "--group-by", "none"])
-            .args(&flags)
-            .stdout(Stdio::from(fs::File::create(&out).unwrap()))
-            .stderr(Stdio::from(fs::File::create(&err).unwrap()));
-        let mut child = child_cmd.spawn().unwrap();
-        let started = Instant::now();
-        let mut peak_kib = 0_u64;
-        let status = loop {
-            if let Ok(text) = fs::read_to_string(format!("/proc/{}/status", child.id())) {
-                for line in text
-                    .lines()
-                    .filter(|s| s.starts_with("VmHWM:") || s.starts_with("VmRSS:"))
-                {
-                    if let Some(kib) = line
-                        .split_whitespace()
-                        .nth(1)
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        peak_kib = peak_kib.max(kib);
-                    }
-                }
-            }
-            if peak_kib > 384 * 1024 || started.elapsed() > Duration::from_secs(60) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "GH521 flags={flags:?} peak_kib={peak_kib} elapsed={:?}; stderr={}",
-                    started.elapsed(),
-                    fs::read_to_string(&err).unwrap_or_default()
-                );
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert!(
-            status.success(),
-            "{status}: {}",
-            fs::read_to_string(&err).unwrap()
-        );
-        assert!(
-            fs::metadata(&out).unwrap().len() < 16 * 1024,
-            "narrow output must be small"
-        );
-        let payload: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
-        let rows = entries(&payload);
-        if flags.contains(&"codex") {
-            assert!(rows.is_empty());
-        } else {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0]["id"], 2);
-            assert_eq!(rows[0]["message_count"], 2);
-        }
-        eprintln!(
-            "GH521 flags={flags:?} peak_kib={peak_kib} elapsed={:?}",
-            started.elapsed()
-        );
+        bounded_timeline(tmp.path(), &flags, &[(2, 2)]);
     }
+    bounded_timeline(
+        tmp.path(),
+        &["--agent", "codex", "--source", "remote"],
+        &[],
+    );
+
+    // Now select the huge conversation too. Counting its turns must remain
+    // bounded even when the time/agent/source predicates all match it.
+    let conn = Connection::open(
+        tmp.path()
+            .join("agent_search.db")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .unwrap();
+    conn.execute_compat(
+        "UPDATE conversations SET started_at = ?1, ended_at = ?2 WHERE id = 1",
+        params![START + 1, START + 20_001],
+    )
+    .unwrap();
+    finish(conn);
+    bounded_timeline(
+        tmp.path(),
+        &["--agent", "claude_code", "--source", "local"],
+        &[(1, 8192), (2, 2)],
+    );
 }
