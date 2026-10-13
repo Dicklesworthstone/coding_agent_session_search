@@ -198,7 +198,13 @@ fn hashed_mirrors_parse_like_local_stores_across_copy_layouts() {
 
             let actual = case.connector.scan(&ctx).unwrap();
             assert_eq!(signature(&actual), signature(&expected), "{label}");
-            assert_eq!(actual[0].source_path, mirrored_file, "{label}");
+            let conversation_path = if case.slug == "cursor" {
+                // Each composer in a shared SQLite store has a synthetic path.
+                mirrored_file.join("mirror-cursor")
+            } else {
+                mirrored_file.clone()
+            };
+            assert_eq!(actual[0].source_path, conversation_path, "{label}");
             let mut streamed = Vec::new();
             case.connector
                 .scan_with_callback(&ctx, &mut |conversation| {
