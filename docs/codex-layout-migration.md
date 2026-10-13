@@ -3,9 +3,9 @@
 CASS normally preserves directory-scoped Codex external IDs. A filename or
 native UUID alone is not permission to merge conversations from different
 roots. For the snapshot-to-live transition reported in #524, use the explicit
-`cass-codex-layout-migrate` companion command **before indexing the second
-layout**. It retains whichever external ID is already indexed, including a
-dated ID when the dated layout was indexed first.
+`cass codex-layout-migrate` command **before indexing the second layout**. It
+retains whichever external ID is already indexed, including a dated ID when
+the dated layout was indexed first.
 
 This is an opt-in identity registration, not destructive deduplication. It
 supports an existing `agent_search.db` in the selected data directory, a named
@@ -15,11 +15,12 @@ The two `sessions` directories may be different snapshot/live roots.
 
 ## Procedure
 
-Build both binaries from this checkout (the companion is not part of older
-published CASS installers):
+The command is built into `cass` in this checkout; a separately installed
+migration executable is not required. Older binaries without this subcommand
+need a build containing the change:
 
 ```sh
-cargo build --release --bin cass --bin cass-codex-layout-migrate
+cargo build --locked --release --bin cass
 ```
 
 Pause the watcher and session writer during registration. Keep the original
@@ -43,7 +44,7 @@ flat="/tmp/cass-identity/flat/sessions/$name"
 dated="/tmp/cass-identity/dated/sessions/2026/10/13/$name"
 data=/path/to/existing/cass-data
 
-target/release/cass-codex-layout-migrate \
+target/release/cass codex-layout-migrate \
   --data-dir "$data" --source full-history-plan \
   --from "$flat" --to "$dated" --json
 ```
@@ -52,7 +53,7 @@ Review the reported canonical conversation ID, external ID, message count and
 paths. Publish the receipt only after the dry run succeeds:
 
 ```sh
-target/release/cass-codex-layout-migrate \
+target/release/cass codex-layout-migrate \
   --data-dir "$data" --source full-history-plan \
   --from "$flat" --to "$dated" --apply --json
 
@@ -65,6 +66,20 @@ binary for subsequent indexing; an older binary does not understand receipts.
 Resume the watcher normally. The original snapshot no longer needs to remain
 in the active scan roots once registration and indexing succeed. Keep ordinary
 backups rather than deleting source data as part of migration.
+
+The optional `cass-codex-layout-migrate` companion remains compatible. Both
+entry points call the same migration proof and use the same receipt format;
+there is no second migration algorithm. Place the migration options after the
+subcommand. Run `cass codex-layout-migrate --help` for its explicit options;
+`--db`, `--force` and indexing/model flags are intentionally not accepted.
+
+With `--json` (or `--robot`), the native command writes one success report to
+stdout; proof/registration failures use an error envelope on stderr and exit 5.
+Argument errors use normal CLI diagnostics and exit 2. Handled report-output
+failures exit 9; pipelines retain CASS's normal SIGPIPE behavior. The native
+command tears down its thread-local SQL bridges before returning. If output
+fails after `--apply`, the receipt may already be durable: inspect it before
+retrying, rather than assuming the registration was rolled back.
 
 ## Proof and failure behavior
 
@@ -127,10 +142,17 @@ search test.
 ```sh
 cargo test --lib connectors::codex::layout_identity::tests
 cargo test --test codex_layout_migration
+cargo test --locked --bin cass codex_layout_cli::tests
+cargo test --locked --test cli_codex_layout_migrate
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+The native-command suite additionally drives both indexing orders in both
+streaming modes, cross-checks companion/native dry-run reports and receipt
+reuse, exercises real archive-lock refusal, and verifies that help/parse errors
+do not initialize an archive. All original companion regressions remain intact.
 
 These Rust commands were not executed in the implementation environment, which
 had no Rust toolchain or package-network access. The committed tests are
