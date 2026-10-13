@@ -133,3 +133,5 @@ fn gh525_message_cursor_filtering_does_not_advance_on_an_empty_candidate() -> Re
     assert!(grouped.contains_key(&2));
     Ok(())
 }
+
+mod real_storage;
