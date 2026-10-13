@@ -22,6 +22,8 @@ mod inspection;
 #[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
+mod checkpoint_tests_live;
+#[cfg(test)]
 mod lease_tests;
 #[cfg(test)]
 mod storage_tests;
@@ -660,17 +662,25 @@ fn validate_reclaim_checkpoint(path: &Path, checkpoint: &BuildCheckpoint) -> Res
         index.embedder_id(),
         checkpoint.embedder_id
     );
-    // Read-only recovery can ignore an incomplete or stale WAL batch. Even
-    // this upper bound (physical main slots + replayable WAL records) must
-    // cover the durable checkpoint's acknowledged count before retiring a
-    // fallback. Extra records are allowed: a killed writer may have durably
-    // appended its next batch without advancing the checkpoint yet.
-    let available = u64::try_from(index.record_count())
+    // A tombstoned main slot cannot stand in for an acknowledged document.
+    // In particular, a lost/torn replacement WAL can leave all physical slots
+    // present while the old copy of its document is already tombstoned. Counting
+    // that slot would authorize deleting the last recoverable fallback copy.
+    // Read only the record flags, not the potentially multi-GB vector slab.
+    let live_main = index
+        .record_count()
+        .checked_sub(index.tombstone_count())
+        .context("invalid checkpoint tombstone count; retaining fallback artifacts")?;
+    // This remains an upper bound, not an exact canonical-coverage proof:
+    // replayable WAL entries may overlap surviving main IDs after a crash.
+    // Extra live records are allowed when a writer appended its next batch
+    // without advancing the durable checkpoint. Never repair or compact here.
+    let available = u64::try_from(live_main)
         .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(index.wal_record_count()).unwrap_or(u64::MAX));
     ensure!(
         available >= checkpoint.docs_embedded,
-        "resumable semantic checkpoint {} has at most {} records, below its recorded {}; retaining fallback artifacts",
+        "resumable semantic checkpoint {} has at most {} live records, below its recorded {}; retaining fallback artifacts",
         path.display(),
         available,
         checkpoint.docs_embedded
