@@ -14,6 +14,7 @@ use crate::search::semantic_manifest::TierKind;
 use crate::search::vector_index::{SemanticDocId, vector_index_path};
 
 mod append;
+mod hnsw;
 mod rebuild;
 mod reconcile;
 
@@ -234,6 +235,9 @@ impl SemanticIndexer {
         Ok(Some(source))
     }
 
+    /// Serialize native graph verification/publication with backfill recovery.
+    /// The caller retains canonical-source authority; this lease never reclaims
+    /// its source or promotes manifest readiness.
     pub fn build_hnsw_index(
         &self,
         vector_index: &VectorIndex,
@@ -241,8 +245,9 @@ impl SemanticIndexer {
         m: Option<usize>,
         ef_construction: Option<usize>,
     ) -> Result<PathBuf> {
-        self.inner
-            .build_hnsw_index(vector_index, data_dir, m, ef_construction)
+        hnsw::run(self, vector_index, data_dir, m, ef_construction, || {
+            self.inner.check_external_cancelled()
+        })
     }
 
     pub(crate) fn completed_backfill_fingerprint(
@@ -371,6 +376,7 @@ mod full_rebuild_tests {
 
     mod cancellation;
     mod canonical;
+    mod hnsw;
 
     fn embedded(indexer: &SemanticIndexer) -> Result<Vec<EmbeddedMessage>> {
         indexer.embed_messages(&[
