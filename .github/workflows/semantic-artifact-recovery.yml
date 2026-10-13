@@ -90,6 +90,7 @@ jobs:
           run_suite lifecycle --lib indexer::semantic::artifact_lifecycle_tests
           run_suite approval --lib indexer::semantic::artifacts::inspection::tests
           run_suite checkpoint --lib indexer::semantic::artifacts::checkpoint_tests
+          run_suite published-data --lib indexer::semantic::artifacts::publication::tests
           run_suite storage --lib indexer::semantic::artifacts::storage_tests
           run_suite authority --lib search::semantic_reader::publication::tests::replaced_bytes_cannot_borrow_the_selected_manifests_authority
           run_suite optional-ann --lib search::semantic_reader::publication::tests::corrupt_graph_fails_strict_audit_but_preserves_fresh_exact_and_retained_ann

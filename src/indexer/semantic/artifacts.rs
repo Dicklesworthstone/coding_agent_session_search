@@ -19,6 +19,7 @@ use crate::search::vector_index::VECTOR_INDEX_DIR;
 
 mod checkpoint_coverage;
 mod inspection;
+mod publication;
 
 #[cfg(test)]
 mod checkpoint_tests;
@@ -182,7 +183,17 @@ impl BackfillArtifacts {
         // lease current. Reject stale ownership/cursors BEFORE the sweep or
         // engine can mutate anything, including after a failed prior save.
         artifacts.validate_input(input)?;
-        artifacts.sweep(Some(input), None)?;
+        if let Err(error) = artifacts.sweep(Some(input), None) {
+            if !error.is::<publication::PublicationUnavailable>() {
+                return Err(error);
+            }
+            // A missing/damaged completed publication is not permission to
+            // discard its fallbacks, nor should GC prevent a canonical rebuild
+            // from replacing it. Only this typed data-admission failure defers
+            // cleanup; stale callers, invalid metadata and checkpoint-validation
+            // errors still refuse the operation before the engine runs.
+            tracing::warn!(%error, "published semantic data unavailable; retaining scratch while backfill repairs coverage");
+        }
         Ok(artifacts)
     }
 
@@ -249,14 +260,13 @@ impl BackfillArtifacts {
         let mut metadata = RecoveryMetadata::new(durable);
         let mut protected = ProtectedPaths::default();
         let mut resumable_checkpoint = None;
-        if let Some(manifest) =
-            metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?
-        {
+        let manifest = metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?;
+        if let Some(manifest) = &manifest {
             ensure!(
                 manifest.manifest_version <= MANIFEST_FORMAT_VERSION,
                 "unsupported semantic manifest version; refusing artifact reclamation"
             );
-            protected.manifest(&self.data_dir, &manifest)?;
+            protected.manifest(&self.data_dir, manifest)?;
             if let Some(checkpoint) = &manifest.checkpoint {
                 // Also pin the resumable artifact/WAL before retiring any
                 // previous copy. A dangling checkpoint is a recovery problem,
@@ -336,6 +346,16 @@ impl BackfillArtifacts {
             // zero-length/truncated file can survive an interrupted writer.
             // Check the current checkpoint before deleting any fallback copy.
             validate_reclaim_checkpoint(&path, &checkpoint)?;
+        }
+
+        if !candidates.is_empty()
+            && let Some(manifest) = &manifest
+        {
+            // A durable ledger without its published vectors is no stronger
+            // than a dangling checkpoint. Admit and pin ready legacy tiers
+            // before returning ANY candidates, including after publication
+            // has cleared the resumable checkpoint.
+            publication::validate_ready(&self.data_dir, manifest, durable)?;
         }
 
         Ok(Discovery {

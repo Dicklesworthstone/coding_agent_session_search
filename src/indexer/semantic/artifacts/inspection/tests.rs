@@ -296,8 +296,19 @@ fn nested_links_are_not_followed_and_referenced_aliases_are_not_reclaimed() -> R
     let outside = tempfile::tempdir()?;
     fs::write(outside.path().join("evidence"), b"external")?;
     let data = temp.path();
-    publish(data)?;
+    let published = publish(data)?;
     let (staging, reuse) = scratch(data)?;
+    // This alias is recorded as READY, so use a real vector image and native
+    // WAL, not the scratch helper's deliberately invalid placeholder bytes.
+    // Not-ready references are covered independently above; keep this ready.
+    fs::copy(&published, &staging)?;
+    fs::rename(wal_path_for(&staging), data.join("retained-fixture-placeholder.wal"))?;
+    let mut writer = VectorIndex::open(&staging)?;
+    let vector = writer.vector_at_f32(0)?;
+    writer.append("alias-wal-document", &vector)?;
+    drop(writer);
+    let main_before = fs::read(&staging)?;
+    let wal_before = fs::read(wal_path_for(&staging))?;
     symlink(outside.path(), reuse.join("external"))?;
     let alias = data.join(VECTOR_INDEX_DIR).join("published-alias.fsvi");
     symlink(&staging, &alias)?;
@@ -313,6 +324,9 @@ fn nested_links_are_not_followed_and_referenced_aliases_are_not_reclaimed() -> R
     assert_eq!(plan.reclaimable_bytes, 12);
     apply_backfill_artifact_plan(data, &plan.plan_fingerprint)?;
     assert!(staging.is_file() && wal_path_for(&staging).is_file());
+    assert_eq!(fs::read(&staging)?, main_before);
+    assert_eq!(fs::read(wal_path_for(&staging))?, wal_before);
+    assert!(SemanticManifest::load(data)?.unwrap().quality_tier.unwrap().ready);
     assert_eq!(fs::read(outside.path().join("evidence"))?, b"external");
     Ok(())
 }
