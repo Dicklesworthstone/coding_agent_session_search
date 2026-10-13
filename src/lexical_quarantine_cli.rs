@@ -1,4 +1,7 @@
-//! Read-only rebuild evidence inventory, including when the archive cannot open.
+//! Rebuild evidence inventory and explicitly approved offline cleanup.
+//! Ordinary invocation remains read-only, including when the archive cannot open.
+
+mod cleanup;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -17,7 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Inspect retained failed lexical rebuilds without opening the database.
-    /// No files are deleted. Normal index startup applies conservative retention.
+    /// Read-only by default; --apply requires the exact fingerprint from --plan.
     LexicalQuarantine {
         /// Explicit archive directory; never defaults to another user's archive.
         #[arg(long, value_name = "PATH")]
@@ -25,6 +28,12 @@ enum Command {
         /// Emit one complete inventory; complete=false exits with code 8.
         #[arg(long, alias = "robot")]
         json: bool,
+        /// Preview the complete cleanup policy and its approval fingerprint; no writes.
+        #[arg(long, conflicts_with = "apply")]
+        plan: bool,
+        /// Apply only a matching preview under the indexer lock. Preserves newest/recent evidence.
+        #[arg(long, value_name = "FINGERPRINT", conflicts_with = "plan", value_parser = cleanup::parse_approval)]
+        apply: Option<String>,
     },
 }
 
@@ -78,7 +87,13 @@ pub fn run(args: Vec<String>) -> CliResult<()> {
             };
         }
     };
-    let Command::LexicalQuarantine { data_dir, json } = cli.command;
+    let Command::LexicalQuarantine { data_dir, json, plan, apply } = cli.command;
+    if let Some(approval) = apply {
+        return cleanup::apply(&data_dir, &approval, json, &mut io::stdout().lock());
+    }
+    if plan {
+        return cleanup::plan(&data_dir, json, &mut io::stdout().lock());
+    }
     let inventory = lexical_quarantine::inspect(&data_dir).map_err(failure)?;
     render(&inventory, json, &mut io::stdout().lock()).map_err(failure)?;
     if !inventory.complete {

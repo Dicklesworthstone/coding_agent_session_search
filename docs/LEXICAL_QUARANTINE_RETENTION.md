@@ -14,7 +14,7 @@ cass lexical-quarantine --data-dir /path/to/cass-data
 ```
 
 `--robot` is an alias for `--json`. The data directory is required and must already
-exist. The command does not open the canonical database, validate lexical index
+exist. Ordinary inspection does not open the canonical database, validate lexical index
 payloads, load models, create directories, acquire mutation locks, or delete
 anything. It can inventory evidence while the archive itself is unreadable.
 The command is registered in the ordinary CLI's external-command discovery,
@@ -32,7 +32,64 @@ inventory is still printed as a complete JSON document with `complete: false`,
 zero eligible bytes and exit 8. Invalid arguments/configuration use exit 2,
 missing paths use exit 3, and other I/O failures use exit 9. Check both the exit
 status and `complete`, rather than interpreting an incomplete list as empty.
-There is no `--apply` flag on this read-only command.
+Ordinary invocation remains read-only. Explicit cleanup requires the separate
+preview-and-approval operation below.
+
+## Explicit cleanup without starting an index run
+
+Preview the current policy and review its eligible bundles:
+
+```sh
+cass lexical-quarantine --data-dir /path/to/cass-data --plan --json
+```
+
+The result contains `inventory` (the ordinary inventory schema), the resolved
+`data_dir`, and `approval_fingerprint`. Incomplete or disabled inventories have
+no approval fingerprint. Preview does not create or acquire a lock and can run
+while an indexer holds its lock. It never creates a missing data directory.
+
+After reviewing a complete preview, copy its entire fingerprint:
+
+```sh
+cass lexical-quarantine --data-dir /path/to/cass-data \
+  --apply 'lq-cleanup-v1-<64-lowercase-hex-digits-from-the-preview>' --json
+```
+
+`--apply` requires a value; a bare flag, malformed approval, or combining it with
+`--plan` is rejected by argument parsing. This is not an override of retention:
+the newest bundle, recent evidence, unknown layouts and the operator opt-out
+remain protected. No database, model, index rebuild or disk-headroom preflight
+is started. The existing permanent `index-run.lock` may be created if absent,
+but is never truncated, renamed or removed; heartbeat bytes remain unchanged.
+
+Apply nonblockingly acquires that same lock used by normal indexing, rebuilds
+the complete bounded inventory, and compares its approval before any quarantine
+mutation. Approval binds the resolved data directory, observed root identities,
+all recognized bundle metadata and all retention decisions. It does not expire
+merely because a second passes, but newly eligible evidence, changed/new/removed
+bundles or a changed newest selection require another preview. Non-Unix root
+identity uses creation time; unavailable creation time refuses a plan. The token
+is a plan identifier, not a secret or a substitute for filesystem permissions.
+It is metadata-based change detection, not cryptographic content authentication
+or protection against hostile ancestor replacement.
+
+Every target still passes the existing identity, metadata and age recheck before
+the unchanged rename/remove routine runs. Execution stops on the first failure.
+The complete JSON report includes `selected_bundles`, `retained_bundles`,
+`attempted_bundles`, `removed_bundles`, `removed_logical_bytes`, `errors`, and
+`complete`. An attempted bundle may have been renamed or partly removed even if
+it is not counted as fully removed. No rollback or immediate free-space gain is
+claimed. If report output fails, cleanup may already have happened: inspect
+again rather than blindly replaying an approval.
+
+Exit 6 means approval changed; 7 means the indexer lock is busy; 8 means the
+inventory or execution is incomplete. Invalid approval/disabled retention uses
+exit 2, missing paths 3, and I/O/report-write failure 9. A disabled preview can
+still exit 0 with no approval. A successful apply with no eligible bundles is
+an explicit no-op. Reusing a pre-cleanup approval after removals fails rather
+than silently approving the remaining inventory. Obtain a new preview after
+partial execution. Plain inspection and automatic startup retention keep their
+existing behavior; this command does not change `diag` or doctor schemas.
 
 ## Automatic retention during normal indexing
 
@@ -103,6 +160,7 @@ cargo test --locked --lib lexical_quarantine
 cargo test --locked --lib staging_reclaim
 cargo test --locked --bin cass lexical_quarantine_cli
 cargo test --locked --test cli_lexical_quarantine
+cargo test --locked --test cli_lexical_quarantine_cleanup
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 ```
