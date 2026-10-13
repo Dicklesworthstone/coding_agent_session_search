@@ -50,6 +50,8 @@ use crate::storage::sqlite::FrankenStorage;
 mod shard_publication_tests;
 #[cfg(test)]
 mod snapshot_tests;
+#[cfg(test)]
+mod gh525_tests;
 
 /// Default embedder batch size — the **maximum row count** per embed batch.
 /// 128 is a sweet spot for short messages: big enough to amortize dispatch
@@ -1751,18 +1753,24 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    let (selection, mut grouped_messages) = select_checkpoint_capped_conversations_lazily(
+        conversations,
+        after_message_id,
+        caps,
+        |conversation_id| {
+            let mut loaded = storage.fetch_messages_for_lexical_rebuild_batch(
+                &[conversation_id],
+                None,
+                None,
+            )?;
+            Ok(loaded.remove(&conversation_id).unwrap_or_default())
+        },
+    )?;
     let CheckpointCappedSelection {
         conversations,
         last_conversation_id,
         stopped_before_candidate,
-    } = select_checkpoint_capped_conversations(
-        conversations,
-        &mut grouped_messages,
-        after_message_id,
-        caps,
-    );
+    } = selection;
     let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
         &conversations,
         &mut grouped_messages,
@@ -1786,33 +1794,35 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
         inputs,
         conversations_in_batch,
         last_conversation_id: last_conversation_id.unwrap_or(after_conversation_id),
-        total_conversations,
-        cursor_exhausted,
-    })
-}
-
-struct CheckpointCappedSelection {
+        total_fn select_checkpoint_capped_conversations_lazily<F>(
     conversations: Vec<CanonicalEmbeddingConversationRow>,
-    last_conversation_id: Option<i64>,
-    stopped_before_candidate: bool,
-}
-
-fn select_checkpoint_capped_conversations(
-    conversations: Vec<CanonicalEmbeddingConversationRow>,
-    grouped_messages: &mut HashMap<i64, Vec<Message>>,
     after_message_id: Option<i64>,
     caps: SemanticCheckpointCaps,
-) -> CheckpointCappedSelection {
+    mut load_messages: F,
+) -> Result<(CheckpointCappedSelection, HashMap<i64, Vec<Message>>)>
+where
+    F: FnMut(i64) -> Result<Vec<Message>>,
+{
     let mut selected = Vec::new();
+    let mut grouped_messages = HashMap::new();
     let mut selected_messages = 0usize;
     let mut selected_bytes = 0u64;
     let mut last_conversation_id = None;
     let mut stopped_before_candidate = false;
 
     for conversation in conversations {
-        let mut messages = grouped_messages
-            .remove(&conversation.conversation_id)
-            .unwrap_or_default();
+        let message_cap_full = caps.message_limited()
+            && !selected.is_empty()
+            && selected_messages >= caps.max_messages;
+        let byte_cap_full = caps.byte_limited()
+            && !selected.is_empty()
+            && selected_bytes >= caps.max_bytes;
+        if message_cap_full || byte_cap_full {
+            stopped_before_candidate = true;
+            break;
+        }
+
+        let mut messages = load_messages(conversation.conversation_id)?;
         if let Some(min_exclusive) = after_message_id {
             messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
         }
@@ -1851,6 +1861,19 @@ fn select_checkpoint_capped_conversations(
         selected_bytes = selected_bytes.saturating_add(byte_count);
         last_conversation_id = Some(conversation.conversation_id);
         grouped_messages.insert(conversation.conversation_id, messages);
+        selected.push(conversation);
+    }
+
+    Ok((
+        CheckpointCappedSelection {
+            conversations: selected,
+            last_conversation_id,
+            stopped_before_candidate,
+        },
+        grouped_messages,
+    ))
+}
+(conversation.conversation_id, messages);
         selected.push(conversation);
     }
 
