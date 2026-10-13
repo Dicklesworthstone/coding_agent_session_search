@@ -1,5 +1,5 @@
-# Publication bridge for the oversized src/lib.rs; retire the write job once
-# the source change lands. Validation has read-only repository permissions.
+# Publication bridge for the oversized src/lib.rs. Validation has read-only
+# repository permissions; the guarded source publication never force-pushes.
 name: Apply and validate timeline GH521
 
 on:
@@ -35,61 +35,97 @@ jobs:
         run: |
           set -euo pipefail
           rustfmt --version
-      - name: Apply only the guarded timeline query change
+      - name: Integrate borrowed JSON output and the canonical message index fixture
         shell: bash
         run: |
           set -euo pipefail
-          # Refresh before editing; never overwrite another writer's commit.
           git fetch origin main
           git merge --ff-only origin/main
           python3 - <<'PY'
           import difflib
-          import hashlib
           import re
           from pathlib import Path
 
-          path = Path('src/lib.rs')
-          raw = path.read_bytes()
-          source = raw.decode('utf-8')
-          starts = list(re.finditer(r'(?m)^fn run_timeline\s*\(', source))
-          if len(starts) != 1:
-              raise SystemExit('Expected exactly one top-level run_timeline')
-          start = starts[0].start()
-          close = re.search(r'(?m)^}\s*$', source[starts[0].end():])
-          if close is None:
-              raise SystemExit('Missing run_timeline terminator')
-          end = starts[0].end() + close.end()
-          body = source[start:end]
-          print('timeline_before_sha256=' + hashlib.sha256(body.encode()).hexdigest())
-          count = re.compile(r'COUNT\(m\.id\)(\s+(?i:as)\s+message_count)')
-          join = re.compile(r'(?m)^[ \t]*LEFT JOIN messages m ON m\.conversation_id = c\.id[ \t]*\n')
-          group = re.compile(r'GROUP BY c\.id(?= ORDER BY c\.started_at DESC)')
-          replacement = '(SELECT COUNT(m.id) FROM messages m WHERE m.conversation_id = c.id)'
-          if replacement in body and not join.search(body) and not group.search(body):
-              print('Exact GH521 query change already present; no source rewrite')
-          else:
-              for name, pattern in [('count projection', count), ('message join', join), ('group operator', group)]:
-                  if len(list(pattern.finditer(body))) != 1:
-                      print(body)
-                      raise SystemExit('Refusing unexpected timeline source: ' + name)
-              c, j, g = count.search(body), join.search(body), group.search(body)
-              if not c.start() < j.start() < g.start():
-                  raise SystemExit('Unexpected timeline query layout')
-              if 'FROM conversations c' not in body[c.end():j.start()] or 'WHERE' not in body[j.end():g.start()]:
-                  raise SystemExit('Conversation selection/filter guard failed')
-              # Preserve the WHERE clauses, all parameter bindings, provenance
-              # normalization, timestamp units, ORDER BY and all output code.
-              updated_body = count.sub(lambda m: replacement + m.group(1), body)
-              updated_body = join.sub('', updated_body)
-              updated_body = group.sub('', updated_body)
-              updated = source[:start] + updated_body + source[end:]
-              if path.read_bytes() != raw:
-                  raise SystemExit('src/lib.rs changed during preparation')
-              print(''.join(difflib.unified_diff(source.splitlines(True), updated.splitlines(True), fromfile='a/src/lib.rs', tofile='b/src/lib.rs')))
-              path.write_bytes(updated.encode('utf-8'))
-              print('timeline_after_sha256=' + hashlib.sha256(updated_body.encode()).hexdigest())
+          CALL = '''    // GH#521: serialize borrowed summaries directly, rather than cloning all
+              // selected title/path strings into a second JSON Value tree. Keep the
+              // other robot formats on their existing projection/formatting path.
+              if let Some(fmt) = structured_format
+                  && matches!(fmt, RobotFormat::Json | RobotFormat::Compact)
+              {
+                  let stdout = std::io::stdout();
+                  let mut writer = std::io::BufWriter::new(stdout.lock());
+                  timeline_json::write(
+                      &mut writer,
+                      &sessions,
+                      start_ts,
+                      end_ts,
+                      group_by,
+                      matches!(fmt, RobotFormat::Json),
+                  )
+                  .and_then(|()| writer.flush())
+                  .map_err(|error| CliError {
+                      code: 9,
+                      kind: CliErrorKind::EncodeJson.kind_str(),
+                      message: format!("failed to write structured output: {error}"),
+                      hint: None,
+                      retryable: false,
+                  })?;
+                  return Ok(());
+              }
+
+          '''
+
+          def integrate(source, fixture):
+              matches = list(re.finditer(r'(?m)^fn run_timeline\s*\(', source))
+              if len(matches) != 1:
+                  raise ValueError('Expected exactly one run_timeline')
+              start = matches[0].start()
+              close = re.search(r'(?m)^}\s*$', source[matches[0].end():])
+              if close is None:
+                  raise ValueError('Missing timeline terminator')
+              end = matches[0].end() + close.end()
+              body = source[start:end]
+              for required in ['INDEXED BY sqlite_autoindex_messages_1', 'ORDER BY c.started_at DESC',
+                               'snapshot.commit()', 'let structured_format =']:
+                  if required not in body:
+                      raise ValueError('Missing current timeline invariant: ' + required)
+              for forbidden in ['LEFT JOIN messages', 'GROUP BY c.id']:
+                  if forbidden in body:
+                      raise ValueError('Do not replace the production indexed streaming count fix')
+              anchor = '    if let Some(fmt) = structured_format {\n        let output = match group_by {'
+              module = 'mod timeline_json;\n'
+              module_anchor = 'pub mod top_session_summary;\n'
+              if 'timeline_json::write(' in body:
+                  if CALL not in body or source.count(module) != 1:
+                      raise ValueError('Partial or changed JSON integration; manual reconciliation required')
+              else:
+                  if body.count(anchor) != 1 or source.count(module_anchor) != 1 or module in source:
+                      raise ValueError('Unexpected dispatcher/module layout')
+                  body = body.replace(anchor, CALL + anchor, 1)
+                  source = source[:start] + body + source[end:]
+                  source = source.replace(module_anchor, module + module_anchor, 1)
+              old = 'idx INTEGER NOT NULL, role TEXT, content TEXT, created_at INTEGER\n         );'
+              new = 'idx INTEGER NOT NULL, role TEXT, content TEXT, created_at INTEGER,\n             UNIQUE(conversation_id, idx)\n         );'
+              if old in fixture:
+                  if fixture.count(old) != 1:
+                      raise ValueError('Ambiguous message schema')
+                  fixture = fixture.replace(old, new, 1)
+              elif new not in fixture:
+                  raise ValueError('Unexpected GH521 fixture schema; no verified replacement')
+              return source, fixture
+
+          paths = [Path('src/lib.rs'), Path('tests/cli_timeline_gh521.rs')]
+          before = [path.read_text() for path in paths]
+          after = integrate(*before)
+          if any(path.read_text() != text for path, text in zip(paths, before)):
+              raise SystemExit('Files changed while preparing integration')
+          for path, old, new in zip(paths, before, after):
+              print(''.join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+                                               fromfile='a/' + str(path), tofile='b/' + str(path))))
+              if new != old:
+                  path.write_text(new)
           PY
-          rustfmt --edition 2024 tests/cli_timeline_gh521.rs
+          rustfmt --edition 2024 src/timeline_json.rs tests/cli_timeline_gh521.rs
           git diff --check
           git diff --stat
       - name: Commit directly to main without force or a PR
@@ -97,13 +133,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Only these two paths are ours; no bulk staging of concurrent work.
-          git add src/lib.rs tests/cli_timeline_gh521.rs
+          git add src/lib.rs src/timeline_json.rs tests/cli_timeline_gh521.rs
           if ! git diff --cached --quiet; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'fix(timeline): count only selected conversations without archive-wide grouping (GH521)' \
-              -m 'Keep time, agent and source predicates and all output/order semantics unchanged. Remove the outer messages join and GROUP BY so message content is not materialized to calculate counts. Engine validation runs separately on this exact commit; no passing result is claimed by publication.'
+            git commit -m 'fix(timeline): stream borrowed JSON summaries and use the canonical index fixture (GH521)' \
+              -m 'Preserve the landed metadata-first indexed streaming message counts and read snapshot. JSON and compact output serialize borrowed summaries without a second Value tree; other formats retain their prior paths. Correct the regression fixture to create the canonical covering autoindex. Native validation runs separately against this exact commit.'
             git push origin HEAD:main
           fi
           sha=$(git rev-parse HEAD)
@@ -132,13 +167,15 @@ jobs:
       - name: Record the exact source and compiler
         run: |
           git rev-parse HEAD
-          git hash-object src/lib.rs tests/cli_timeline_gh521.rs Cargo.toml Cargo.lock
+          git hash-object src/lib.rs src/timeline_json.rs tests/cli_timeline_gh521.rs Cargo.toml Cargo.lock
           rustc --version
           cargo --version
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Compile and lint the affected integration suites
         run: cargo clippy --locked --test cli_timeline_gh521 --test cli_dispatch_coverage -- -D warnings
+      - name: Borrowed JSON byte contracts, errors and large output
+        run: cargo test --locked --lib timeline_json::tests -- --nocapture
       - name: Existing CLI timeline regressions
         run: cargo test --locked --test cli_dispatch_coverage timeline -- --nocapture
       - name: Inclusive windows, filters, lifetime counts and output contracts
