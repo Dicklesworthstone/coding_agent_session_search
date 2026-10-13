@@ -2,6 +2,9 @@
 name: Verify search retrieval
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/land-message-topk-once.yml]
 permissions:
   contents: read
 jobs:
@@ -20,6 +23,21 @@ jobs:
           ref: ${{ github.sha }}
           path: cass-source
           persist-credentials: false
+      - name: Preserve the exact source before qualification
+        shell: bash
+        working-directory: cass-source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/search-source"
+          git rev-parse HEAD > "$RUNNER_TEMP/search-source/commit.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/search-source/source.tar.gz"
+          sha256sum "$RUNNER_TEMP/search-source/source.tar.gz" > "$RUNNER_TEMP/search-source/source.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: search-source-${{ github.sha }}
+          path: ${{ runner.temp }}/search-source/
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Dicklesworthstone/frankensearch
