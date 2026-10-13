@@ -306,6 +306,18 @@ export class VirtualList {
   }
 }
 
+// The Fenwick low-bit operation uses signed 32-bit indices. This is an
+// arithmetic bound, not a promise to exceed a browser's scroll-canvas limit.
+function validateVirtualCount(count, estimatedHeight) {
+  if (!Number.isSafeInteger(count) || count < 0 || count > 0x7fffffff) {
+    throw new RangeError("Virtual list count must be an integer between 0 and 2147483647");
+  }
+  if (!Number.isFinite(estimatedHeight) || estimatedHeight <= 0 ||
+      count * estimatedHeight > Number.MAX_SAFE_INTEGER) {
+    throw new RangeError("Virtual list estimated height must be positive with a safe total height");
+  }
+}
+
 /**
  * Virtual List for variable-height items
  *
@@ -331,6 +343,10 @@ export class VariableHeightVirtualList {
    * @param {number} [options.overscan=5] - Extra items to render above/below viewport
    */
   constructor({ container, totalCount, estimatedItemHeight, renderItem, overscan = 5 }) {
+    validateVirtualCount(totalCount, estimatedItemHeight);
+    if (!Number.isSafeInteger(overscan) || overscan < 0) {
+      throw new RangeError("Virtual list overscan must be a non-negative safe integer");
+    }
     this.container = container;
     this.totalCount = totalCount;
     this.estimatedHeight = estimatedItemHeight;
@@ -342,7 +358,10 @@ export class VariableHeightVirtualList {
 
     // Height tracking
     this.heights = new Map(); // index -> measured height
-    this.positions = []; // cumulative positions
+    // Sparse Fenwick tree of deviations from the estimated height. Opening a
+    // large transcript allocates no entry for an unseen row. Measurements and
+    // offset lookups take O(log N), not a walk over every following message.
+    this._heightTree = new Map();
 
     // DOM tracking
     this.items = new Map(); // index -> element
@@ -408,13 +427,43 @@ export class VariableHeightVirtualList {
    * @private
    */
   _calculatePositions() {
-    this.positions = new Array(this.totalCount + 1);
-    this.positions[0] = 0;
-
-    for (let i = 0; i < this.totalCount; i++) {
-      const height = this.heights.get(i) ?? this.estimatedHeight;
-      this.positions[i + 1] = this.positions[i] + height;
+    this._heightTree.clear();
+    // Count changes rebuild only measured rows; removed rows must not regain
+    // obsolete heights if the list subsequently grows again.
+    for (const [index, height] of this.heights) {
+      if (index >= this.totalCount) {
+        this.heights.delete(index);
+      } else {
+        this._addHeightDelta(index, height - this.estimatedHeight);
+      }
     }
+  }
+
+  _addHeightDelta(index, delta) {
+    if (delta === 0) {
+      return;
+    }
+    for (let node = index + 1; node <= this.totalCount; node += node & -node) {
+      const value = (this._heightTree.get(node) ?? 0) + delta;
+      if (value === 0) {
+        this._heightTree.delete(node);
+      } else {
+        this._heightTree.set(node, value);
+      }
+    }
+  }
+
+  _setItemHeight(index, height) {
+    // Hidden/detached elements report zero. Keeping a positive estimate also
+    // preserves the monotonic prefix sums needed for offset lookup.
+    if (!Number.isInteger(index) || index < 0 || index >= this.totalCount ||
+        !Number.isFinite(height) || height <= 0) {
+      return false;
+    }
+    const previous = this._getItemHeight(index);
+    this.heights.set(index, height);
+    this._addHeightDelta(index, height - previous);
+    return previous !== height;
   }
 
   /**
@@ -422,7 +471,7 @@ export class VariableHeightVirtualList {
    * @private
    */
   _updateTotalHeight() {
-    const totalHeight = this.positions[this.totalCount] ?? this.totalCount * this.estimatedHeight;
+    const totalHeight = this._getItemPosition(this.totalCount);
     this.inner.style.height = `${totalHeight}px`;
   }
 
@@ -439,7 +488,11 @@ export class VariableHeightVirtualList {
    * @private
    */
   _getItemPosition(index) {
-    return this.positions[index] ?? index * this.estimatedHeight;
+    let position = index * this.estimatedHeight;
+    for (let node = index; node > 0; node -= node & -node) {
+      position += this._heightTree.get(node) ?? 0;
+    }
+    return position;
   }
 
   /**
@@ -447,19 +500,31 @@ export class VariableHeightVirtualList {
    * @private
    */
   _findIndexAtPosition(scrollTop) {
-    let low = 0;
-    let high = this.totalCount - 1;
-
-    while (low < high) {
-      const mid = Math.floor((low + high + 1) / 2);
-      if (this._getItemPosition(mid) <= scrollTop) {
-        low = mid;
-      } else {
-        high = mid - 1;
+    if (this.totalCount === 0 || !(scrollTop > 0)) {
+      return 0;
+    }
+    // Binary lifting over the implicit estimated-height tree finds the last
+    // prefix <= scrollTop in O(log N), including exact item boundaries.
+    let index = 0;
+    let position = 0;
+    for (let step = 2 ** Math.floor(Math.log2(this.totalCount)); step >= 1; step /= 2) {
+      const next = index + step;
+      if (next <= this.totalCount) {
+        const blockHeight = (next & -next) * this.estimatedHeight +
+          (this._heightTree.get(next) ?? 0);
+        if (position + blockHeight <= scrollTop) {
+          index = next;
+          position += blockHeight;
+        }
       }
     }
+    return Math.min(index, this.totalCount - 1);
+  }
 
-    return low;
+  _setScrollTop(top) {
+    const maximum = Math.max(0, this._getItemPosition(this.totalCount) - this.containerHeight);
+    this.container.scrollTop = Math.max(0, Math.min(top, maximum));
+    this.scrollTop = this.container.scrollTop;
   }
 
   /**
@@ -558,29 +623,19 @@ export class VariableHeightVirtualList {
    * @private
    */
   _measureItem(index, element) {
-    if (this.destroyed || !this.inner || !element?.isConnected) {
+    if (this.destroyed || !this.inner || !element?.isConnected ||
+        this.items.get(index) !== element) {
       return;
     }
-    const measuredHeight = element.offsetHeight;
-    const previousHeight = this.heights.get(index);
-
-    if (previousHeight !== measuredHeight) {
-      this.heights.set(index, measuredHeight);
-
-      // Recalculate positions from this index forward
-      for (let i = index; i < this.totalCount; i++) {
-        const height = this.heights.get(i) ?? this.estimatedHeight;
-        this.positions[i + 1] = this.positions[i] + height;
-      }
-
+    if (this._setItemHeight(index, element.offsetHeight)) {
       this._updateTotalHeight();
-
-      // Update positions of rendered items after this one
+      // Only mounted rows need DOM updates. The height tree accounts for all
+      // other positions without materializing them.
       for (const [idx, el] of this.items) {
-        if (idx > index) {
-          el.style.top = `${this._getItemPosition(idx)}px`;
-        }
+        el.style.top = `${this._getItemPosition(idx)}px`;
       }
+      this._setScrollTop(this.container.scrollTop);
+      this._render();
     }
   }
 
@@ -590,6 +645,9 @@ export class VariableHeightVirtualList {
    * @param {string} [align='start'] - Alignment: 'start' | 'center' | 'end'
    */
   scrollToIndex(index, align = "start") {
+    if (this.destroyed || !Number.isSafeInteger(index) || index < 0 || index >= this.totalCount) {
+      return;
+    }
     let targetTop = this._getItemPosition(index);
     const itemHeight = this._getItemHeight(index);
 
@@ -599,8 +657,7 @@ export class VariableHeightVirtualList {
       targetTop = targetTop - this.containerHeight + itemHeight;
     }
 
-    this.container.scrollTop = Math.max(0, targetTop);
-    this.scrollTop = this.container.scrollTop;
+    this._setScrollTop(targetTop);
     this._render();
   }
 
@@ -609,9 +666,14 @@ export class VariableHeightVirtualList {
    * @param {number} newCount - New total count
    */
   updateTotalCount(newCount) {
+    if (this.destroyed) {
+      return;
+    }
+    validateVirtualCount(newCount, this.estimatedHeight);
     this.totalCount = newCount;
     this._calculatePositions();
     this._updateTotalHeight();
+    this._setScrollTop(this.container.scrollTop);
     this.lastVisibleRange = { start: -1, end: -1 };
     this._render();
   }
@@ -620,6 +682,9 @@ export class VariableHeightVirtualList {
    * Force re-render all visible items
    */
   refresh() {
+    if (this.destroyed) {
+      return;
+    }
     for (const [, element] of this.items) {
       element.remove();
     }
@@ -632,7 +697,12 @@ export class VariableHeightVirtualList {
    * Clean up resources
    */
   destroy() {
+    if (this.destroyed) {
+      return;
+    }
     this.destroyed = true;
+    this.heights.clear();
+    this._heightTree.clear();
 
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
