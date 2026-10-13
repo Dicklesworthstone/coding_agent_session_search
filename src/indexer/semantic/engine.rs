@@ -48,6 +48,8 @@ use crate::storage::sqlite::FrankenStorage;
 
 #[cfg(test)]
 mod shard_publication_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
 /// Default embedder batch size — the **maximum row count** per embed batch.
 /// 128 is a sweet spot for short messages: big enough to amortize dispatch
@@ -3155,12 +3157,63 @@ impl SemanticIndexer {
 
     fn reconcile_index_at_paths(
         &self,
-        mut embedded_messages: Vec<EmbeddedMessage>,
+        embedded_messages: Vec<EmbeddedMessage>,
         index_path: &Path,
         final_index_path: &Path,
         tier: TierKind,
         db_fingerprint: &str,
         current_doc_ids: &HashSet<String>,
+    ) -> Result<FsVectorIndex> {
+        self.reconcile_in_private_directory(
+            embedded_messages,
+            final_index_path,
+            current_doc_ids,
+            || {
+                let index_parent = index_path.parent().with_context(|| {
+                    format!(
+                        "semantic reconciliation index path has no parent: {}",
+                        index_path.display()
+                    )
+                })?;
+                fs::create_dir_all(index_parent)?;
+                let temp_prefix = format!(
+                    ".reconcile-{}-{}-{:08x}-",
+                    tier.as_str(),
+                    safe_path_component(self.embedder_id()),
+                    crc32fast::hash(db_fingerprint.as_bytes())
+                );
+                let directory = tempfile::Builder::new()
+                    .prefix(&temp_prefix)
+                    .tempdir_in(index_parent)?;
+                let candidate = directory.path().join("candidate.fsvi");
+                fs::copy(index_path, &candidate).with_context(|| {
+                    format!("snapshot live semantic index {}", index_path.display())
+                })?;
+                let source_wal = fsvi_wal_path_for(index_path);
+                if source_wal.exists() {
+                    fs::copy(&source_wal, fsvi_wal_path_for(&candidate)).with_context(|| {
+                        format!("snapshot live semantic WAL {}", source_wal.display())
+                    })?;
+                }
+                Ok(directory)
+            },
+        )
+    }
+
+    /// Consume an exclusively owned scratch directory, never a published
+    /// pathname disguised as scratch. Ordinary reconciliation creates its
+    /// snapshot lazily; backfill transfers the snapshot it already copied and
+    /// compacted while selecting coverage. No second full-file copy is needed.
+    ///
+    /// Keeping preparation behind FnOnce preserves validation-before-I/O for
+    /// invalid replacements. The directory remains owned until publication or
+    /// error cleanup, and the old-WAL replay probe still runs on its exact image.
+    fn reconcile_in_private_directory(
+        &self,
+        mut embedded_messages: Vec<EmbeddedMessage>,
+        final_index_path: &Path,
+        current_doc_ids: &HashSet<String>,
+        prepare: impl FnOnce() -> Result<tempfile::TempDir>,
     ) -> Result<FsVectorIndex> {
         let mut replacement_doc_ids = HashSet::with_capacity(embedded_messages.len());
         for embedded in &embedded_messages {
@@ -3185,54 +3238,18 @@ impl SemanticIndexer {
             }
         }
 
-        let index_parent = index_path.parent().with_context(|| {
-            format!(
-                "semantic reconciliation index path has no parent: {}",
-                index_path.display()
-            )
-        })?;
-        fs::create_dir_all(index_parent)?;
-        let temp_prefix = format!(
-            ".reconcile-{}-{}-{:08x}-",
-            tier.as_str(),
-            safe_path_component(self.embedder_id()),
-            crc32fast::hash(db_fingerprint.as_bytes())
-        );
-        let staging_dir = tempfile::Builder::new()
-            .prefix(&temp_prefix)
-            .tempdir_in(index_parent)
-            .with_context(|| {
-                format!(
-                    "create semantic reconciliation staging directory in {}",
-                    index_parent.display()
-                )
-            })?;
+        let staging_dir = prepare()?;
         let staging_path = staging_dir.path().join("candidate.fsvi");
-        fs::copy(index_path, &staging_path).with_context(|| {
-            format!(
-                "snapshot live semantic index {} at {}",
-                index_path.display(),
-                staging_path.display()
-            )
-        })?;
-        let live_wal_path = fsvi_wal_path_for(index_path);
+        let live_wal_path = fsvi_wal_path_for(&staging_path);
         let live_wal_snapshot_path = staging_dir.path().join("live.wal.snapshot");
         if live_wal_path.exists() {
             fs::copy(&live_wal_path, &live_wal_snapshot_path).with_context(|| {
                 format!(
-                    "snapshot live semantic WAL {} at {}",
+                    "retain pre-reconciliation WAL {} at {}",
                     live_wal_path.display(),
                     live_wal_snapshot_path.display()
                 )
             })?;
-            fs::copy(&live_wal_snapshot_path, fsvi_wal_path_for(&staging_path)).with_context(
-                || {
-                    format!(
-                        "attach semantic WAL snapshot to candidate {}",
-                        staging_path.display()
-                    )
-                },
-            )?;
         }
 
         let embedded_docs = embedded_messages.len();
@@ -3250,7 +3267,7 @@ impl SemanticIndexer {
                 &staging_path,
             )?
         } else {
-            FsVectorIndex::open(&staging_path).map_err(|err| {
+            FsVectorIndex::open_writer(&staging_path).map_err(|err| {
                 anyhow::anyhow!(
                     "open semantic reconciliation snapshot {}: {err}",
                     staging_path.display()
@@ -3834,13 +3851,17 @@ impl SemanticIndexer {
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.check_external_cancelled()?;
         let (candidate_path, caps) = candidate;
-        // Read the retained candidate in place. The artifact lease held by the
-        // facade prevents cooperating writers/recovery from replacing it while
-        // this pass selects canonical deltas. Mutation still happens only after
-        // reconcile_index_at_paths copies this source into its private staging
-        // directory, so the live/checkpoint artifact is never compacted here.
-        // This removes the former archive-sized .backfill-reuse snapshot copy.
-        let snapshot = FsVectorIndex::open_read_only(candidate_path)
+        let snapshot_dir = tempfile::Builder::new()
+            .prefix(".backfill-reuse-")
+            .tempdir_in(data_dir.join(VECTOR_INDEX_DIR))?;
+        let snapshot_path = snapshot_dir.path().join("candidate.fsvi");
+        fs::copy(candidate_path, &snapshot_path).context("snapshot semantic backfill candidate")?;
+        let candidate_wal = fsvi_wal_path_for(candidate_path);
+        if candidate_wal.is_file() {
+            fs::copy(candidate_wal, fsvi_wal_path_for(&snapshot_path))
+                .context("snapshot semantic backfill candidate WAL")?;
+        }
+        let mut snapshot = FsVectorIndex::open_writer(&snapshot_path)
             .map_err(|err| anyhow::anyhow!("open semantic backfill candidate: {err}"))?;
         // Historical hash indexes used the generic "1.0" revision. Those
         // vectors cannot be appended to or served as the current space, but
@@ -3866,34 +3887,21 @@ impl SemanticIndexer {
             bail!("semantic backfill candidate has an incompatible vector space");
         }
         self.revoke_backfill_serving(data_dir, manifest)?;
-        let mut existing_ids = HashSet::new();
-        let mut wal_ids = HashSet::new();
-        wal_ids.try_reserve(snapshot.wal_record_count())?;
-        for (id, _) in snapshot.wal_records() {
-            self.check_external_cancelled()?;
-            if !wal_ids.insert(id) {
-                bail!("semantic backfill candidate WAL contains duplicate document {id}");
-            }
-            if !existing_ids.insert(id.to_owned()) {
-                bail!("semantic backfill candidate contains duplicate document {id}");
-            }
+        if snapshot.wal_record_count() > 0 {
+            snapshot.compact().map_err(|err| {
+                anyhow::anyhow!("compact semantic backfill candidate snapshot: {err}")
+            })?;
         }
+        let mut existing_ids = HashSet::new();
         for record in 0..snapshot.record_count() {
             self.check_external_cancelled()?;
-            if snapshot.is_deleted(record) {
-                continue;
-            }
-            let id = snapshot.doc_id_at(record).map_err(|err| {
-                anyhow::anyhow!("read semantic backfill candidate identity: {err}")
-            })?;
-            // Native WAL rows are last-write-wins and can coexist with an
-            // untombstoned main row after interruption. Count the effective
-            // identity once without mutating/compacting the retained source.
-            if wal_ids.contains(id) {
-                continue;
-            }
-            if !existing_ids.insert(id.to_owned()) {
-                bail!("semantic backfill candidate contains duplicate document {id}");
+            if !snapshot.is_deleted(record) {
+                let id = snapshot.doc_id_at(record).map_err(|err| {
+                    anyhow::anyhow!("read semantic backfill candidate identity: {err}")
+                })?;
+                if !existing_ids.insert(id.to_owned()) {
+                    bail!("semantic backfill candidate contains duplicate document {id}");
+                }
             }
         }
         drop(snapshot);
@@ -4027,13 +4035,13 @@ impl SemanticIndexer {
             &plan.db_fingerprint,
         );
         self.check_external_cancelled()?;
-        let staged_index = self.reconcile_index_at_paths(
+        let staged_index = self.reconcile_in_private_directory(
             embeddings,
-            candidate_path,
             &staging_path,
-            plan.tier,
-            &plan.db_fingerprint,
             &covered_ids,
+            // Move the actual TempDir owner, not a reusable path flag. The
+            // existing snapshot and its compacted vectors become the candidate.
+            || Ok(snapshot_dir),
         )?;
         let outcome = self.finish_backfill_batch(
             staged_index,
