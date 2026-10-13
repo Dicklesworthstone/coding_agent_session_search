@@ -12,6 +12,14 @@ let currentDek = null;
 let activeUnlockGeneration = 0;
 let activeDecryptGeneration = 0;
 let argon2LoadPromise = null;
+let argon2DownloadController = null;
+let argon2RuntimeDownloadFailed = false;
+
+// A derivation/unwrap owns admission until it settles, even after cancellation.
+// Only the latest waiting unlock is retained; replaced credentials are scrubbed.
+let activeUnlockJob = null;
+let pendingUnlockJob = null;
+const MAX_UNLOCK_SECRET_BYTES = 64 * 1024;
 
 // Only one full plaintext database may be owned by the decrypt pipeline.
 // A superseding request replaces the one waiting job, not a promise-chain queue.
@@ -114,15 +122,26 @@ function clearCurrentDek() {
 }
 
 function beginUnlockAttempt() {
-  activeUnlockGeneration += 1;
+  invalidateUnlockAttempts();
   invalidateDecryptAttempts();
-  clearCurrentDek();
   return activeUnlockGeneration;
 }
 
 function invalidateUnlockAttempts() {
   activeUnlockGeneration += 1;
   clearCurrentDek();
+  argon2DownloadController?.abort(new Error("Unlock request was superseded"));
+  if (pendingUnlockJob) {
+    const pending = pendingUnlockJob;
+    pendingUnlockJob = null;
+    pending.secret.fill(0);
+    pending.secret = null;
+    pending.cfg = null;
+    pending.reject(new Error("Unlock request was superseded"));
+  }
+  // Native KDF/WebCrypto promises are not preemptible. Keep the active slot
+  // until finally, but do not retain a readable source credential needlessly.
+  activeUnlockJob?.secret?.fill(0);
 }
 
 function ensureCurrentUnlockAttempt(generation) {
@@ -190,17 +209,104 @@ function commitUnlockResult(generation, unwrappedDek, requestId) {
 }
 
 /**
+ * Bound queued credentials separately from native KDF memory. Strings received
+ * from the UI cannot be zeroized; jobs own mutable UTF-8/secret bytes instead.
+ */
+function unlockSecret(kind, value) {
+  let bytes = null;
+  try {
+    if (kind === "password") {
+      if (typeof value !== "string" || value.trim().length === 0) {
+        throw new Error("Please enter a password");
+      }
+      // UTF-8 is at least one byte per UTF-16 unit for valid scalar input.
+      if (value.length > MAX_UNLOCK_SECRET_BYTES) {
+        throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+      }
+      bytes = new TextEncoder().encode(value);
+    } else if (typeof value === "string") {
+      // Preserve URL-safe base64 and the historical literal-text fallback.
+      if (value.length > 4 * Math.ceil(MAX_UNLOCK_SECRET_BYTES / 3)) {
+        throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+      }
+      try {
+        bytes = base64ToArray(value);
+      } catch {
+        bytes = new TextEncoder().encode(value);
+      }
+    } else if (value instanceof Uint8Array) {
+      if (value.byteLength > MAX_UNLOCK_SECRET_BYTES) {
+        throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+      }
+      bytes = new Uint8Array(value);
+    }
+    if (!bytes || (kind === "recovery" && bytes.byteLength < MIN_RECOVERY_SECRET_BYTES)) {
+      throw new Error("Recovery secret must contain at least 24 bytes");
+    }
+    if (bytes.byteLength > MAX_UNLOCK_SECRET_BYTES) {
+      throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+    }
+    return bytes;
+  } catch (error) {
+    bytes?.fill(0);
+    throw error;
+  }
+}
+
+function handleUnlockPassword(password, cfg, requestId) {
+  return enqueueUnlock("password", password, cfg, requestId);
+}
+
+function handleUnlockRecovery(recoverySecret, cfg, requestId) {
+  return enqueueUnlock("recovery", recoverySecret, cfg, requestId);
+}
+
+function enqueueUnlock(kind, credential, cfg, requestId) {
+  // Even a malformed replacement revokes the prior session and waiting job.
+  const generation = beginUnlockAttempt();
+  validateSupportedPayloadFormat(cfg);
+  const secret = unlockSecret(kind, credential);
+  return new Promise((resolve, reject) => {
+    pendingUnlockJob = { kind, generation, secret, cfg, requestId, resolve, reject };
+    startNextUnlockJob();
+  });
+}
+
+function startNextUnlockJob() {
+  if (activeUnlockJob || !pendingUnlockJob) return;
+  const job = pendingUnlockJob;
+  pendingUnlockJob = null;
+  activeUnlockJob = job;
+  void runUnlockJob(job);
+}
+
+async function runUnlockJob(job) {
+  try {
+    ensureCurrentUnlockAttempt(job.generation);
+    if (job.kind === "password") {
+      await runPasswordUnlock(job);
+    } else {
+      await runRecoveryUnlock(job);
+    }
+    job.resolve();
+  } catch (error) {
+    job.reject(error);
+  } finally {
+    job.secret.fill(0);
+    job.secret = null;
+    job.cfg = null;
+    activeUnlockJob = null;
+    startNextUnlockJob();
+  }
+}
+
+/**
  * Handle password-based unlock
  */
-async function handleUnlockPassword(password, cfg, requestId) {
-  const generation = beginUnlockAttempt();
+async function runPasswordUnlock(job) {
+  const { generation, secret: password, cfg, requestId } = job;
   let committed = false;
   try {
-    validateSupportedPayloadFormat(cfg);
-    if (typeof password !== "string" || password.trim().length === 0) {
-      throw new Error("Please enter a password");
-    }
-
     const passwordSlots = cfg.key_slots.filter(
       (slot) => slot.slot_type === "password" && isValidKeySlotMetadata(slot),
     );
@@ -212,7 +318,9 @@ async function handleUnlockPassword(password, cfg, requestId) {
 
     for (const slot of passwordSlots) {
       ensureCurrentUnlockAttempt(generation);
-      const kek = await deriveKekFromPassword(password, slot);
+      const kek = await deriveKekFromPassword(password, slot, () => {
+        ensureCurrentUnlockAttempt(generation);
+      });
       let unwrappedDek = null;
       try {
         ensureCurrentUnlockAttempt(generation);
@@ -245,13 +353,10 @@ async function handleUnlockPassword(password, cfg, requestId) {
 /**
  * Handle recovery secret-based unlock
  */
-async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
-  const generation = beginUnlockAttempt();
+async function runRecoveryUnlock(job) {
+  const { generation, secret: secretBytes, cfg, requestId } = job;
   let committed = false;
-  let secretBytes = null;
   try {
-    validateSupportedPayloadFormat(cfg);
-
     const recoverySlots = cfg.key_slots.filter(
       (slot) => slot.slot_type === "recovery" && isValidKeySlotMetadata(slot),
     );
@@ -260,19 +365,6 @@ async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
     }
 
     self.postMessage({ type: "PROGRESS", phase: "Deriving key...", percent: 10, requestId });
-
-    if (typeof recoverySecret === "string") {
-      try {
-        secretBytes = base64ToArray(recoverySecret);
-      } catch {
-        secretBytes = new TextEncoder().encode(recoverySecret);
-      }
-    } else if (recoverySecret instanceof Uint8Array) {
-      secretBytes = new Uint8Array(recoverySecret);
-    }
-    if (!secretBytes || secretBytes.byteLength < MIN_RECOVERY_SECRET_BYTES) {
-      throw new Error("Recovery secret must contain at least 24 bytes");
-    }
 
     for (const slot of recoverySlots) {
       ensureCurrentUnlockAttempt(generation);
@@ -310,24 +402,40 @@ async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
 /**
  * Derive KEK from password using Argon2id
  */
-async function deriveKekFromPassword(password, slot) {
+async function deriveKekFromPassword(password, slot, checkCurrent = () => {}) {
   const params = slot.argon2_params;
   const salt = base64ToArray(slot.salt);
-  const passwordBytes = new TextEncoder().encode(password);
+  // Keep the job's original bytes intact for fallback through password slots.
+  const passwordBytes = typeof password === "string"
+    ? new TextEncoder().encode(password) : new Uint8Array(password);
   try {
     if (!self.argon2) {
       await loadArgon2();
     }
+    checkCurrent();
 
-    const result = await self.argon2.hash({
-      pass: passwordBytes,
-      salt,
-      time: params.iterations,
-      mem: params.memory_kb,
-      parallelism: params.parallelism,
-      hashLen: 32,
-      type: self.argon2.ArgonType.Argon2id,
-    });
+    let result;
+    try {
+      result = await self.argon2.hash({
+        pass: passwordBytes,
+        salt,
+        time: params.iterations,
+        mem: params.memory_kb,
+        parallelism: params.parallelism,
+        hashLen: 32,
+        type: self.argon2.ArgonType.Argon2id,
+      });
+    } catch (error) {
+      if (argon2RuntimeDownloadFailed) {
+        // The vendor caches a rejected loadModule promise. Retire that API only
+        // after its failed call drains, so the next admitted unlock can retry.
+        // No WASM module was initialized when the binary fetch failed.
+        argon2RuntimeDownloadFailed = false;
+        argon2LoadPromise = null;
+        self.argon2 = null;
+      }
+      throw error;
+    }
     if (!(result?.hash instanceof Uint8Array) || result.hash.byteLength !== 32) {
       result?.hash?.fill?.(0);
       throw new Error("Argon2 returned an invalid key");
@@ -1232,11 +1340,21 @@ async function loadArgon2() {
   argon2LoadPromise = (async () => {
     self.loadArgon2WasmBinary = async () => {
       const wasmUrl = new URL("./vendor/argon2.wasm", self.location.href);
-      const response = await fetch(wasmUrl);
-      if (!response.ok) {
-        throw new Error(`Argon2 WASM request failed with status ${response.status}`);
+      const controller = new AbortController();
+      argon2DownloadController = controller;
+      try {
+        if (activeUnlockJob) ensureCurrentUnlockAttempt(activeUnlockJob.generation);
+        // Reuse bounded streaming I/O, late-response disposal and the 120-second
+        // header/body deadline. Do not race non-cancellable KDF execution itself.
+        return await fetchDatabaseChunk(
+          wasmUrl, MAX_ARGON2_WASM_SIZE, "Argon2 WASM runtime", controller.signal,
+        );
+      } catch (error) {
+        argon2RuntimeDownloadFailed = true;
+        throw error;
+      } finally {
+        if (argon2DownloadController === controller) argon2DownloadController = null;
       }
-      return readResponseBytesBounded(response, MAX_ARGON2_WASM_SIZE, "Argon2 WASM runtime");
     };
     self.loadArgon2WasmModule = () => {
       importScripts("./vendor/argon2-wasm.js");
