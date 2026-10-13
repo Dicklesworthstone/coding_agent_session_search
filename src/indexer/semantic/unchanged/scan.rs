@@ -2,6 +2,7 @@
 //! require exact nonempty-parent coverage and the caller's final file fences.
 
 use super::engine;
+#[cfg(test)]
 use crate::franken_sync::{Connection, SqliteValue, compat::RowExt};
 use crate::indexer::semantic_progress::{
     SemanticProgressEvent, SemanticProgressFields, SemanticProgressSink,
@@ -10,12 +11,17 @@ use crate::storage::sqlite::FrankenStorage;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
+#[cfg(test)]
 const PARENT_PAGE_SIZE: usize = 128;
+#[cfg(test)]
 const FIRST_PARENTS: &str = "SELECT id FROM conversations ORDER BY id ASC LIMIT ?1";
+#[cfg(test)]
 const NEXT_PARENTS: &str =
     "SELECT id FROM conversations WHERE id > ?1 ORDER BY id ASC LIMIT ?2";
+#[cfg(test)]
 const INDEXED_MESSAGE: &str = "SELECT 1 FROM messages INDEXED BY sqlite_autoindex_messages_1
     WHERE conversation_id = ?1 LIMIT 1";
+#[cfg(test)]
 const LEGACY_MESSAGE: &str = "SELECT 1 FROM messages WHERE conversation_id = ?1 LIMIT 1";
 
 #[derive(Debug, thiserror::Error)]
@@ -30,13 +36,30 @@ pub(super) struct Comparison {
     pub(super) visited: u64,
 }
 
+/// A complete count and maximum of canonical parents that contain messages.
+pub(super) type Coverage = (u64, i64);
+
+// Preserve the existing comparison regressions through the exact production
+// implementation. The independent SQL coverage oracle below stays test-only.
+#[cfg(test)]
 pub(super) fn compare(
     storage: &FrankenStorage,
     remaining: &mut HashSet<&str>,
     sink: &SemanticProgressSink,
     rows_total: u64,
-    mut check_cancelled: impl FnMut() -> Result<()>,
+    check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<Comparison> {
+    compare_with_coverage(storage, remaining, sink, rows_total, check_cancelled)
+        .map(|(comparison, _)| comparison)
+}
+
+pub(super) fn compare_with_coverage(
+    storage: &FrankenStorage,
+    remaining: &mut HashSet<&str>,
+    sink: &SemanticProgressSink,
+    rows_total: u64,
+    mut check_cancelled: impl FnMut() -> Result<()>,
+) -> Result<(Comparison, Option<Coverage>)> {
     check_cancelled()?;
     let mut visited = 0u64;
     let replay = replay::visit(storage, |input| {
@@ -61,13 +84,16 @@ pub(super) fn compare(
         }
         Ok(())
     }, &mut check_cancelled);
-    let matches = match replay {
-        Ok(()) => remaining.is_empty(),
-        Err(error) if error.is::<CanonicalDelta>() => false,
+    // Partial scans cannot supply coverage. Even a complete replay with
+    // leftover retained IDs is a mismatch, not a count receipt for a no-op.
+    let coverage = match replay {
+        Ok(coverage) if remaining.is_empty() => Some(coverage),
+        Ok(_) => None,
+        Err(error) if error.is::<CanonicalDelta>() => None,
         Err(error) => return Err(error),
     };
     check_cancelled()?;
-    Ok(Comparison { matches, visited })
+    Ok((Comparison { matches: coverage.is_some(), visited }, coverage))
 }
 
 /// Match COUNT(nonempty parents), COALESCE(MAX(nonempty parent id), 0)
@@ -78,6 +104,7 @@ pub(super) fn compare(
 /// probe independent of the conversation's body/history size. A legacy schema
 /// missing that exact index uses the unhinted probe, never a guessed count.
 /// This remains O(parents) probes, not a constant-time archive summary.
+#[cfg(test)]
 pub(super) fn nonempty_conversations(
     connection: &Connection,
     mut check_cancelled: impl FnMut() -> Result<()>,

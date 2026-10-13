@@ -240,3 +240,5 @@ fn empty_and_deleted_conversations_advance_without_inventing_inputs() -> Result<
     storage.close()?;
     Ok(())
 }
+
+mod coverage;

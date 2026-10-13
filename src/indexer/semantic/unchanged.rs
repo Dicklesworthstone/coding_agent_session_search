@@ -147,7 +147,7 @@ where
             ..Default::default()
         },
     );
-    let comparison = scan::compare(storage, &mut remaining, sink, artifact.doc_count, || {
+    let (comparison, coverage) = scan::compare_with_coverage(storage, &mut remaining, sink, artifact.doc_count, || {
         engine.check_external_cancelled()
     })?;
     tracing::debug!(
@@ -156,16 +156,10 @@ where
         "compared canonical replay with retained semantic identities"
     );
     engine.check_external_cancelled()?;
-    // A known identity delta needs no coverage-count scan: the writer must
-    // reconcile it anyway. Keep the final change/cancellation fences below,
-    // even when comparison stopped early, before returning that cache miss.
-    let coverage = if comparison.matches {
-        Some(scan::nonempty_conversations(storage.raw(), || {
-            engine.check_external_cancelled()
-        })?)
-    } else {
-        None
-    };
+    // Replay already observed every nonempty canonical parent. Reuse that
+    // exact coverage instead of running another archive-wide query/probe pass.
+    // Partial or mismatching replay supplies no coverage. Keep all final file
+    // and cancellation fences before accepting this receipt or a cache miss.
     checkpoint()?;
     engine.check_external_cancelled()?;
     // Detect mutation across the entire proof, including WAL-only commits,

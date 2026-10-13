@@ -4,7 +4,7 @@
 //! before visiting it, and stop before another body load on a delta/error/stop.
 //! A whole conversation can still be large; this is not a byte or RSS ceiling.
 
-use super::engine;
+use super::{Coverage, engine};
 use crate::franken_sync::{SqliteValue, compat::{ConnectionExt, ParamValue, RowExt}};
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
@@ -90,7 +90,7 @@ pub(super) fn visit(
     storage: &FrankenStorage,
     consume: impl FnMut(engine::EmbeddingInput) -> Result<()>,
     check_cancelled: impl FnMut() -> Result<()>,
-) -> Result<()> {
+) -> Result<Coverage> {
     visit_with_loader(storage, |id| messages(storage, id), consume, check_cancelled)
 }
 
@@ -99,8 +99,9 @@ fn visit_with_loader(
     mut load: impl FnMut(i64) -> Result<Vec<Message>>,
     mut consume: impl FnMut(engine::EmbeddingInput) -> Result<()>,
     mut check_cancelled: impl FnMut() -> Result<()>,
-) -> Result<()> {
+) -> Result<Coverage> {
     let mut cursor = None;
+    let mut coverage: Coverage = (0, 0);
     loop {
         check_cancelled()?;
         // No preliminary count/tail scan. No lower bound on the first page:
@@ -121,7 +122,8 @@ fn visit_with_loader(
             Ok(())
         }).context("page unchanged-proof canonical parents")?;
         if ids.is_empty() {
-            return check_cancelled();
+            check_cancelled()?;
+            return Ok(coverage);
         }
         ensure!(
             ids.windows(2).all(|pair| pair[0] < pair[1])
@@ -136,6 +138,10 @@ fn visit_with_loader(
             if envelope.conversation.messages.is_empty() {
                 continue;
             }
+            // Count actual nonempty parents before semantic projection: blank
+            // messages count, empty parents do not, and passage count is unrelated.
+            coverage.0 = coverage.0.checked_add(1).context("canonical parent count overflow")?;
+            coverage.1 = envelope.context.conversation_id;
             // Move message strings into the established canonical encoder,
             // rather than cloning a second full conversation. Use its semantic
             // projection/chunking/provenance, not a parallel document-ID format.
@@ -153,7 +159,8 @@ fn visit_with_loader(
         }
         cursor = ids.last().copied();
         if ids.len() < PAGE_SIZE {
-            return check_cancelled();
+            check_cancelled()?;
+            return Ok(coverage);
         }
     }
 }
