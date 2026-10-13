@@ -23,6 +23,8 @@ use crate::search::semantic_reader::{SemanticPassageHit, SemanticSearchBatch};
 use crate::search::vector_index::{ROLE_USER, SemanticDocId, role_code_from_str};
 use crate::sources::provenance::LOCAL_SOURCE_ID;
 
+pub mod query;
+
 #[cfg(test)]
 mod tests;
 
@@ -258,6 +260,19 @@ struct Work {
 }
 
 impl Work {
+    fn new(budget: HydrationBudget, start: Instant) -> Result<Self, HydrationError> {
+        budget.validate(0)?;
+        let work = Self { start, budget, source_bytes: 0, output_bytes: 0 };
+        work.check()?;
+        Ok(work)
+    }
+
+    fn passages(&mut self, count: usize) -> Result<(), HydrationError> {
+        self.budget.max_passages = self.budget.max_passages.checked_sub(count)
+            .ok_or(HydrationError::BudgetExceeded)?;
+        Ok(())
+    }
+
     fn check(&self) -> Result<(), HydrationError> {
         if self.start.elapsed() >= self.budget.timeout {
             Err(HydrationError::DeadlineExceeded)
@@ -286,9 +301,20 @@ fn hydrate(
     budget: HydrationBudget,
     started: Instant,
 ) -> Result<Vec<HydratedPassage>, HydrationError> {
-    budget.validate(batch.hits().len())?;
-    let mut work = Work { start: started, budget, source_bytes: 0, output_bytes: 0 };
+    let mut work = Work::new(budget, started)?;
+    hydrate_with_work(batch, transaction, projection, &mut work)
+}
+
+// One work account may span initial/refined phases. Only successfully verified
+// passages are returned; an exhausted account is never reset by phase progress.
+fn hydrate_with_work(
+    batch: &SemanticSearchBatch,
+    transaction: &Transaction<'_>,
+    projection: PassageProjection,
+    work: &mut Work,
+) -> Result<Vec<HydratedPassage>, HydrationError> {
     work.check()?;
+    work.passages(batch.hits().len())?;
     // Finish candidate/owner checks before reading any source bodies.
     let mut by_message = BTreeMap::<u64, Vec<usize>>::new();
     for (rank, hit) in batch.hits().iter().enumerate() {
@@ -299,7 +325,7 @@ fn hydrate(
     let mut verified = vec![None; batch.hits().len()];
     for (message_id, ranks) in by_message {
         work.check()?;
-        let source = read_message(transaction, message_id, &mut work)?;
+        let source = read_message(transaction, message_id, work)?;
         let location = Arc::new(source.location());
         // Count a shared locator once, not once per chunk from the message.
         work.output(location.source_id.len().saturating_add(location.source_path.len()))?;
