@@ -5048,3 +5048,241 @@ to = "/work/projects"
     assert_eq!(code, Some(1));
     tracker.complete();
 }
+
+/// GH #520, end to end: `sources sync` keeps only a configured path's
+/// basename inside its safe-name container (`~/.factory/sessions` arrives as
+/// `<container>/sessions`). Factory, Vibe, Prime, Gemini and Cursor recognise
+/// a store by its parent chain, so they indexed nothing from such a mirror.
+/// The real binary indexes a mirror laid out exactly that way: every agent
+/// must index, each marker must be searchable, and a second index must not
+/// add or rekey a conversation.
+#[test]
+fn gh520_remote_mirrors_index_structural_agents_end_to_end() {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+    use std::collections::BTreeSet;
+
+    let tracker = tracker_for("gh520_remote_mirrors_index_structural_agents_end_to_end");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    let config = root.join("config");
+    let data = root.join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+
+    let paths = [
+        "~/.claude/projects",
+        "~/.codex/sessions",
+        "~/.pi/agent/sessions",
+        "~/.factory/sessions",
+        "~/.vibe/logs/session",
+        "~/.prime/agent/sessions",
+        "~/.gemini/tmp",
+        "~/.config/Cursor/User",
+    ];
+    create_sources_config(
+        &config,
+        &format!(
+            "[[sources]]\nname = \"laptop\"\ntype = \"ssh\"\nhost = \"operator@laptop\"\npaths = {}\n",
+            serde_json::to_string(&paths).unwrap()
+        ),
+    );
+
+    // The layout every sync method produces: <container>/<basename>/...
+    let mirror = data.join("remotes/laptop/mirror");
+    let container = |path: &str| mirror.join(path_to_safe_dirname(path));
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let copy_tree = |from: &Path, to: &Path| {
+        for entry in walkdir::WalkDir::new(from) {
+            let entry = entry.unwrap();
+            let target = to.join(entry.path().strip_prefix(from).unwrap());
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target).unwrap();
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    };
+    let write = |path: std::path::PathBuf, lines: &[String]| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, lines.join("\n") + "\n").unwrap();
+    };
+    copy_tree(
+        &fixtures.join("claude_code_real/projects"),
+        &container("~/.claude/projects").join("projects"),
+    );
+    copy_tree(
+        &fixtures.join("codex_real/sessions"),
+        &container("~/.codex/sessions").join("sessions"),
+    );
+    copy_tree(
+        &fixtures.join("pi_agent/sessions"),
+        &container("~/.pi/agent/sessions").join("sessions"),
+    );
+    write(
+        container("~/.factory/sessions").join("sessions/-home-operator-proj/fac-520.jsonl"),
+        &[
+            r#"{"type":"session_start","id":"fac-520","title":"Factory mirror","owner":"operator","cwd":"/home/operator/proj"}"#.into(),
+            r#"{"type":"message","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"factorymirrorprobe question"}}"#.into(),
+            r#"{"type":"message","timestamp":"2026-10-01T10:00:05Z","message":{"role":"assistant","content":"factory answer"}}"#.into(),
+        ],
+    );
+    write(
+        container("~/.vibe/logs/session").join("session/vibe-520/messages.jsonl"),
+        &[
+            r#"{"role":"user","content":"vibemirrorprobe question","timestamp":"2026-10-01T10:00:00.000Z"}"#.into(),
+            r#"{"role":"assistant","content":"vibe answer","timestamp":"2026-10-01T10:00:05.000Z"}"#.into(),
+        ],
+    );
+    write(
+        container("~/.prime/agent/sessions")
+            .join("sessions/2026-10-01T10-00-00-000Z_0192aa11-0000-7000-8000-000000000520.jsonl"),
+        &[
+            r#"{"type":"session","version":3,"id":"0192aa11-0000-7000-8000-000000000520","timestamp":"2026-10-01T10:00:00.000Z","cwd":"/home/operator/proj"}"#.into(),
+            r#"{"type":"message","id":"aaaa0001","parentId":null,"timestamp":"2026-10-01T10:00:01.000Z","message":{"role":"user","content":"primemirrorprobe question"}}"#.into(),
+            r#"{"type":"message","id":"aaaa0002","parentId":"aaaa0001","timestamp":"2026-10-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"prime answer"}]}}"#.into(),
+        ],
+    );
+    write(
+        container("~/.gemini/tmp").join("tmp/hash520/chats/session-520.json"),
+        &[serde_json::json!({
+            "sessionId": "gemini-520",
+            "projectHash": "hash520",
+            "startTime": "2026-10-01T10:00:00Z",
+            "lastUpdated": "2026-10-01T10:05:00Z",
+            "messages": [
+                {"type": "user", "content": "geminimirrorprobe question", "timestamp": "2026-10-01T10:00:00Z"},
+                {"type": "model", "content": "gemini answer", "timestamp": "2026-10-01T10:01:00Z"}
+            ]
+        })
+        .to_string()],
+    );
+    {
+        let db_path = container("~/.config/Cursor/User").join("User/globalStorage/state.vscdb");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn =
+            coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
+                .unwrap();
+        conn.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            coding_agent_search::franken_sync::params![
+                "composerData:cursor-520",
+                r#"{"text":"cursormirrorprobe question"}"#
+            ],
+        )
+        .unwrap();
+    }
+
+    let command = || {
+        let mut command = tracker.cass_std_command();
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", root.join("xdg"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home);
+        tracker.command_environment().apply_to_std(&mut command);
+        command
+    };
+    let run = |args: &[&str]| {
+        let output = command().args(args).output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let index = |args: &[&str]| {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!(code, Some(0), "{args:?}\nstdout={stdout}\nstderr={stderr}");
+    };
+    let rows = || -> BTreeSet<(String, Option<String>)> {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query(
+                "SELECT a.slug, c.external_id FROM conversations c \
+                 JOIN agents a ON a.id = c.agent_id WHERE c.source_id = 'laptop'",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get_typed::<String>(0).unwrap(),
+                    row.get_typed::<Option<String>>(1).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let conversation_count = || -> i64 {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE source_id = 'laptop'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    };
+    let hits = |marker: &str| -> usize {
+        let (code, stdout, stderr) = run(&[
+            "search",
+            marker,
+            "--robot",
+            "--mode",
+            "lexical",
+            "--no-daemon",
+        ]);
+        assert_eq!(code, Some(0), "search {marker}\nstderr={stderr}");
+        let payload: Value = serde_json::from_str(&stdout).unwrap();
+        payload["hits"].as_array().unwrap().len()
+    };
+
+    index(&["index", "--full", "--json"]);
+    let first = rows();
+    eprintln!("gh520 indexed: {first:?}");
+    let slugs: BTreeSet<String> = first.iter().map(|(slug, _)| slug.clone()).collect();
+    for slug in [
+        "claude_code",
+        "codex",
+        "pi_agent",
+        "factory",
+        "vibe",
+        "prime_agent",
+        "gemini",
+        "cursor",
+    ] {
+        assert!(slugs.contains(slug), "{slug} missing: {first:?}");
+    }
+    for marker in [
+        "factorymirrorprobe",
+        "vibemirrorprobe",
+        "primemirrorprobe",
+        "geminimirrorprobe",
+        "cursormirrorprobe",
+    ] {
+        assert!(hits(marker) > 0, "{marker} not searchable");
+    }
+    assert_eq!(conversation_count(), i64::try_from(first.len()).unwrap());
+
+    // A second, incremental index re-reads the remote roots: it must find the
+    // same conversations under the same identities, with no duplicate rows.
+    index(&["index", "--json"]);
+    assert_eq!(
+        rows(),
+        first,
+        "a second index changed remote conversation identity"
+    );
+    assert_eq!(conversation_count(), i64::try_from(first.len()).unwrap());
+    tracker.complete();
+}
