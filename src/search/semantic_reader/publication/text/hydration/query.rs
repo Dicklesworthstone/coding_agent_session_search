@@ -5,6 +5,7 @@
 //! inference, vector scans and SQL remain cooperative boundaries, not preemptible
 //! calls. No returned text bypasses the retained-batch fingerprint verifier.
 
+pub mod current;
 mod progressive;
 
 use super::*;

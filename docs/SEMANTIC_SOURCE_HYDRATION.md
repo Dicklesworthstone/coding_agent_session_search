@@ -147,3 +147,49 @@ not cover model allocations, all vector owners, or process RSS.
 
 These are retained-reader library APIs. They do not switch ordinary
 `SearchClient` hydration or the normal/progressive CLI onto this path.
+
+
+## Current-source refill during replacement
+
+`SemanticGenerationReader::search_current_text_in_transaction` and
+`SelectedSemanticGeneration::search_current_text_in_transaction` accept a
+`query::current::CurrentTextQuery`. Unlike strict whole-batch hydration, this
+opt-in operation excludes a missing source or a passage whose content/provenance
+has changed, then repeats top-k retrieval over the same retained owners. The
+original filter is preserved and exclusions use complete passage IDs, not message
+IDs: a stale chunk cannot discard a different, still-valid chunk of that message.
+
+Each requested producer's actual identity-bearing query response is reused only
+within this request. Attested response overrides and current-producer identity
+checks are preserved; no raw vector receives invented identity metadata.
+Missing tiers, foreign producers, corrupt owners/source rows, database errors and
+resource limits remain failures. A refill limit never produces a false-empty or
+partially verified page. A genuinely empty page requires a subsequent filtered
+retrieval returning no candidates.
+
+```rust
+use coding_agent_search::search::semantic_reader::publication::text::hydration::query::current::CurrentTextQuery;
+
+let mut query = CurrentTextQuery::new(
+    query_text, producers, 10, PassageProjection::RawPassagesV2,
+);
+query.filter = Some(&snapshot_filter);
+let current = selected.search_current_text_in_transaction(query, &transaction)?;
+consume(current.verified());
+// current.stats() reports searches, exclusions and cumulative byte work.
+```
+
+Keep the caller-owned transaction and filter stable throughout the call. Select
+the projection appropriate to the admitted document contract, not the replacement
+writer's projection. This API verifies selected passage content and encoded
+metadata, not arbitrary text outside the selected passage or whole-archive
+coverage. It does not loosen publication admission, maintenance locks, or the
+normal CLI's `OwnerBackedReaderRequired` refusal.
+
+The deadline starts before producer activation. Native calls are cooperative,
+not preemptible. All passes share one hydration passage/source/output account;
+repeated reads and provisional verified text discarded during refill are charged
+again. `RefillBudget` additionally bounds retrieval passes, excluded passages and
+excluded-ID bytes. Memory held by model/vector owners is outside these limits.
+The result keeps the final filtered ranking, execution receipts and exact
+publication identity; exclusion counts do not certify current corpus coverage.
