@@ -78,7 +78,29 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `systemd-run -p MemoryMax=16G` that landed outside the scope looked the
   same as one inside it.
 
+- **`cass mirror prune --keep-latest N` (#522).** Retires every capture of
+  a source file except its newest N, and keeps those N out of reach of
+  `--older-than` and `--max-size`. A size or age rule alone retires the
+  oldest captures first, which can include the only copy of a session whose
+  provider has since deleted it. `--keep-latest 1 --safety-hold-down 6h
+  --apply` is a safe prune to run on a timer. When `cass index` refuses to
+  start because the data dir's filesystem is short of space, the refusal
+  now gives the raw mirror's size and this prune command. Doctor's
+  `raw_mirror_size` finding recommends `--keep-latest 1` instead of
+  `--older-than 90d`.
+
 ### Fixed
+
+- **An appended transcript no longer adds its whole length to the raw
+  mirror on every index run (#522).** Transcripts under 8 MiB were captured
+  as one new blob whenever they changed, so a session appended to between
+  runs was copied in full each time; one report saw the mirror grow 32 GB in
+  75 minutes. Transcript captures are now 256 KiB content-addressed chunks,
+  and an appended file stores only its changed tail chunk and a manifest
+  ([`4c10a2a1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/4c10a2a1)).
+  The test workload was a 2.9 MB Codex transcript with ten 14.6 KB appends,
+  each followed by `cass index`. The mirror grew 30.1 MB on v0.10.0 and
+  1.3 MB with the fix.
 
 - **`cass timeline` and `cass sessions` read `--since`/`--until` the way
   `cass search` does.** Timeline understood only dates, `today`,

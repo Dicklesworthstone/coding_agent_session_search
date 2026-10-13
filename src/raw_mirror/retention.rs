@@ -243,6 +243,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         providers: Vec::new(), source_path: None, scope_blob_bytes: None,
         orphan_blob_count: 0, orphan_blob_bytes: 0,
         safety_hold_down_ms: policy.safety_hold_down_ms, keep_tags: policy.keep_tags.clone(),
+        keep_latest: Some(policy.keep_latest),
         pinned_manifest_count: result.protected_manifests,
         pinned_blob_count: references.values().filter(|(_, retained)| *retained).count() as u64,
         planned_manifest_count: selected.len() as u64, planned_blob_count: 0, planned_reclaim_bytes: 0,

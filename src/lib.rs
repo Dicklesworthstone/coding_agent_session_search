@@ -1971,6 +1971,11 @@ pub enum MirrorCommand {
         #[arg(long = "keep-tag")]
         keep_tag: Vec<String>,
 
+        /// Retire every capture of a source file except its newest N. Those N
+        /// survive --older-than and --max-size too.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        keep_latest: Option<u64>,
+
         /// Refuse to prune blobs referenced by captures newer than this duration.
         #[arg(long, default_value = "7d")]
         safety_hold_down: String,
@@ -10184,14 +10189,15 @@ fn run_mirror_prune(command: MirrorCommand, output_format: Option<RobotFormat>) 
         providers,
         source_path,
         keep_tag: keep_tags,
+        keep_latest,
         safety_hold_down,
         apply,
         ..
     } = command;
-    if older_than.is_none() && max_size.is_none() {
+    if older_than.is_none() && max_size.is_none() && keep_latest.is_none() {
         return Err(CliError::usage(
             "cass mirror prune needs at least one retention predicate",
-            Some("Pass --older-than 90d and/or --max-size 100GB. Dry-run is the default; add --apply to prune.".to_string()),
+            Some("Pass --older-than 90d, --max-size 100GB and/or --keep-latest 1. Dry-run is the default; add --apply to prune.".to_string()),
         ));
     }
     if providers.iter().any(|provider| provider.trim().is_empty()) {
@@ -10250,6 +10256,7 @@ fn run_mirror_prune(command: MirrorCommand, output_format: Option<RobotFormat>) 
             providers,
             source_path,
             keep_tags,
+            keep_latest: keep_latest.map(|count| usize::try_from(count).unwrap_or(usize::MAX)),
             safety_hold_down_ms,
             apply,
         },
@@ -10301,6 +10308,9 @@ fn run_mirror_prune(command: MirrorCommand, output_format: Option<RobotFormat>) 
     }
     println!("  Orphan blobs: {}", report.orphan_blob_count);
     println!("  Orphan blob bytes: {}", report.orphan_blob_bytes);
+    if let Some(count) = report.keep_latest {
+        println!("  Kept per source file: newest {count}");
+    }
     println!("  Pinned manifests: {}", report.pinned_manifest_count);
     println!("  Pinned blobs: {}", report.pinned_blob_count);
     println!("  Planned manifests: {}", report.planned_manifest_count);
@@ -27092,7 +27102,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
-            "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),
+            "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),
             "  cass context <path> [--json]     Find related sessions for a given source path.".to_string(),
             "  cass export <path> [--format markdown] [--output FILE]  Export a conversation to markdown / other formats.".to_string(),
             "  cass export-html <path> [--output-dir DIR] [--json]  Self-contained HTML export (optional encryption).".to_string(),
@@ -49917,7 +49927,7 @@ fn doctor_raw_mirror_size_warn_threshold_bytes() -> u64 {
 fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -> Option<String> {
     (threshold_bytes > 0 && total_blob_bytes >= threshold_bytes).then(|| {
         format!(
-            "raw_mirror.size: verified raw-mirror blobs use {total_blob_bytes} bytes, at or above the warn threshold of {threshold_bytes} bytes; inspect `cass mirror prune --older-than 90d --json` and apply only after reviewing the plan"
+            "raw_mirror.size: verified raw-mirror blobs use {total_blob_bytes} bytes, at or above the warn threshold of {threshold_bytes} bytes; inspect `cass mirror prune --keep-latest 1 --json`, which retires superseded captures and keeps the newest capture of every source file, and apply only after reviewing the plan"
         )
     })
 }
@@ -51078,7 +51088,7 @@ fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorA
             dedupe_seed: "raw-mirror-size",
             evidence: vec![warning],
             confidence: "high",
-            recommendation: "cass mirror prune --older-than 90d --json",
+            recommendation: "cass mirror prune --keep-latest 1 --json",
             safe_to_normalize: false,
             normalization_kind: None,
         }));
@@ -82018,7 +82028,7 @@ paths = ["~/.claude/projects"]
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("raw_mirror.size")
-                    && warning.contains("cass mirror prune --older-than 90d --json")),
+                    && warning.contains("cass mirror prune --keep-latest 1 --json")),
             "raw mirror size warning should include the canonical prune dry-run: {report:#?}"
         );
     }

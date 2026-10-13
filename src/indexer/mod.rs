@@ -22153,15 +22153,39 @@ fn ensure_index_storage_headroom(
 
         return Err(anyhow::anyhow!(
             "canonical archive disk headroom check failed for {}: available={} bytes, required={} bytes. \
-             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit. \
+             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit.{} \
              Run 'cass doctor check --json' for a read-only health report.",
             probe_path.display(),
             available,
-            required
+            required,
+            raw_mirror_headroom_note(data_dir, &probe_path)
         ));
     }
 
     Ok(())
+}
+
+/// The raw mirror sits in the data dir and is the one large store there that
+/// cass shrinks on request, so a refusal on the data dir's filesystem names
+/// its size and the prune that retires superseded captures (#522: a 69 GB
+/// mirror left a timer-driven index refusing to start).
+fn raw_mirror_headroom_note(data_dir: &Path, probe_path: &Path) -> String {
+    let probes_data_dir = nearest_existing_path(data_dir)
+        .is_some_and(|data_dir_probe| same_headroom_probe_path(&data_dir_probe, probe_path));
+    if !probes_data_dir {
+        return String::new();
+    }
+    let mirror_bytes = crate::raw_mirror::physical_storage_bytes(data_dir);
+    if mirror_bytes == 0 {
+        return String::new();
+    }
+    format!(
+        " The raw mirror in {} holds {mirror_bytes} bytes; \
+         'cass mirror prune --keep-latest 1 --safety-hold-down 6h --json' previews retiring \
+         every capture older than 6 hours except the newest of each source file, and \
+         --apply reclaims them.",
+        data_dir.display()
+    )
 }
 
 pub(crate) fn index_disk_headroom_check_disabled() -> bool {
@@ -56290,6 +56314,43 @@ mod tests {
             existing_headroom_probe_paths(&data_dir, &db_parent.join("agent_search.db")),
             vec![data_dir, db_parent]
         );
+    }
+
+    #[test]
+    fn headroom_refusal_names_the_raw_mirror_only_on_the_data_dir_probe() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let db_parent = tmp.path().join("custom-db");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&db_parent).unwrap();
+        assert_eq!(raw_mirror_headroom_note(&data_dir, &data_dir), "");
+
+        let source = tmp.path().join("session.jsonl");
+        std::fs::write(&source, b"{\"text\":\"mirrored\"}\n").unwrap();
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        })
+        .unwrap();
+        let mirror_bytes = crate::raw_mirror::physical_storage_bytes(&data_dir);
+        assert!(mirror_bytes > 0);
+
+        let note = raw_mirror_headroom_note(&data_dir, &data_dir);
+        assert!(
+            note.contains(&format!("holds {mirror_bytes} bytes")),
+            "{note}"
+        );
+        assert!(
+            note.contains("cass mirror prune --keep-latest 1 --safety-hold-down 6h --json"),
+            "{note}"
+        );
+        // A shortfall at a database directory elsewhere is not the mirror's.
+        assert_eq!(raw_mirror_headroom_note(&data_dir, &db_parent), "");
     }
 
     #[test]

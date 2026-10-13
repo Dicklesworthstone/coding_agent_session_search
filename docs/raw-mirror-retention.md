@@ -89,7 +89,10 @@ or rebuild can still fail its unchanged safety check.
 
 Inspect `cass mirror prune --help` and run the desired prune policy without
 `--apply` first. Review pins, hold-downs and recovery requirements before applying
-it. Alternatively, free unrelated space or provision more storage. Automatic
+it. `cass mirror prune --keep-latest 1 --safety-hold-down 6h` retires every
+older capture of a source file, including divergent history that automatic
+retention keeps, but never the newest capture of any source file.
+Alternatively, free unrelated space or provision more storage. Automatic
 maintenance can reclaim eligible old prefixes before the next index preflight;
 capture resumes when a new copy fits. During a capture pause, newer source bytes
 are not independently preserved against upstream deletion.

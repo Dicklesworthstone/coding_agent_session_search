@@ -690,6 +690,17 @@ Use `--provider opencode` and/or `--source-path '*/opencode.db'` with an age
 or size rule to target one source without retiring unrelated captures.
 Repeated providers are alternatives; a source-path glob further narrows them.
 
+`--keep-latest N` retires every capture of a source file except its newest N
+(a source file is one provider, source and original path) and keeps those N
+out of reach of `--older-than` and `--max-size`. Use it for a prune that runs
+on a timer: `cass mirror prune --keep-latest 1 --safety-hold-down 6h --apply`
+keeps the mirror to the newest capture of each source file plus whatever was
+captured inside the hold-down window, and never retires the only copy of a
+session whose provider has since deleted it. Older captures of an appended
+transcript share their complete chunks with the newest one, so retiring them
+frees only their superseded tail chunks; for a file that was rewritten rather
+than appended to, it also drops the earlier versions.
+
 A pruned capture of a source that is still on disk is copied again by the next
 index run. On a machine whose providers never delete their session files, set
 `CASS_RAW_MIRROR=0` (or `false`, `no`, `off`) to stop capturing altogether.
@@ -701,9 +712,12 @@ With a selector, `--max-size` measures unique blobs in that selection. Shared
 blobs still referenced outside it and orphan blobs without source provenance
 remain protected. The JSON plan records the selectors and `scope_blob_bytes`.
 
-Large mutable sources are stored as 4 MiB content-addressed chunks. Growing
-JSONL files reuse every unchanged complete chunk, and SQLite sources reuse
-unchanged 4 MiB byte regions, so each historical snapshot remains byte-exact without
+Large mutable sources are stored as content-addressed chunks: JSONL and
+NDJSON transcripts of 256 KiB or more in 256 KiB chunks, and other sources of
+8 MiB or more, such as SQLite stores, in 4 MiB chunks. A growing transcript
+reuses every unchanged complete chunk, so an index run after an append stores
+only its changed tail chunk and a manifest, and SQLite sources reuse unchanged
+4 MiB byte regions. Each historical snapshot remains byte-exact without
 writing another full-file blob. Existing whole-blob manifests remain readable;
 `cass doctor --json` reports `storage_kind`, `chunk_count`, the full-source
 digest, and verifies every referenced chunk before treating a snapshot as
