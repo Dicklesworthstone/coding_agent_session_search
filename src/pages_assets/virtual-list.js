@@ -369,6 +369,9 @@ export class VariableHeightVirtualList {
     this.destroyed = false;
     this._scrollFramePending = false;
     this._scrollFrameId = null;
+    this._measureFrameId = null;
+    this._pendingMeasurements = new Map();
+    this._containerWidth = null;
 
     this._init();
   }
@@ -386,6 +389,9 @@ export class VariableHeightVirtualList {
     this.inner.className = "virtual-list-inner variable-height";
     this.inner.style.position = "relative";
     this.inner.style.width = "100%";
+    // This list maintains its own visible-row anchor across height edits.
+    // Disable native anchoring for these absolutely positioned descendants.
+    this.inner.style.overflowAnchor = "none";
     this._updateTotalHeight();
 
     // Set up container
@@ -394,7 +400,13 @@ export class VariableHeightVirtualList {
     this.container.style.position = "relative";
     this.container.appendChild(this.inner);
 
-    // Set up resize observer
+    // Observe only mounted rows. Tool expansion, images, font loading and
+    // wrapping may all change a message after its initial measurement.
+    this._itemResizeObserver = new ResizeObserver((entries) => {
+      for (const { target } of entries) {
+        this._queueMeasurement(Number(target.dataset.virtualIndex), target);
+      }
+    });
     this._resizeObserver = new ResizeObserver(() => this._onResize());
     this._resizeObserver.observe(this.container);
 
@@ -535,8 +547,27 @@ export class VariableHeightVirtualList {
     if (this.destroyed) {
       return;
     }
+    const width = this.container.clientWidth;
+    const widthChanged = width > 0 && this._containerWidth !== null &&
+      width !== this._containerWidth;
     this.containerHeight = this.container.clientHeight;
-    this._render();
+    if (width > 0) {
+      this._containerWidth = width;
+    }
+    if (widthChanged) {
+      // Offscreen measurements were taken at the old wrapping width. Keep
+      // the reader's row, but do not reuse those heights when scrolling back.
+      const anchor = this._captureAnchor();
+      this.heights.clear();
+      this._heightTree.clear();
+      this._commitLayout(anchor);
+    } else {
+      this._setScrollTop(this.container.scrollTop);
+      this._render();
+    }
+    for (const [index, element] of this.items) {
+      this._queueMeasurement(index, element);
+    }
   }
 
   /**
@@ -597,19 +628,16 @@ export class VariableHeightVirtualList {
         this.inner.appendChild(element);
         this.items.set(i, element);
 
-        // Measure actual height after render
-        requestAnimationFrame(() => {
-          if (this.destroyed) {
-            return;
-          }
-          this._measureItem(i, element);
-        });
+        this._itemResizeObserver.observe(element, { box: "border-box" });
+        this._queueMeasurement(i, element);
       }
     }
 
     // Remove items no longer visible
     for (const [index, element] of this.items) {
       if (!visible.has(index)) {
+        this._itemResizeObserver.unobserve(element);
+        this._pendingMeasurements.delete(index);
         element.remove();
         this.items.delete(index);
       }
@@ -622,21 +650,68 @@ export class VariableHeightVirtualList {
    * Measure rendered item and update positions if needed
    * @private
    */
-  _measureItem(index, element) {
-    if (this.destroyed || !this.inner || !element?.isConnected ||
-        this.items.get(index) !== element) {
+  _isMountedItem(index, element) {
+    return !this.destroyed && this.inner && element?.isConnected &&
+      this.items.get(index) === element;
+  }
+
+  _queueMeasurement(index, element) {
+    if (!this._isMountedItem(index, element)) {
       return;
     }
-    if (this._setItemHeight(index, element.offsetHeight)) {
-      this._updateTotalHeight();
-      // Only mounted rows need DOM updates. The height tree accounts for all
-      // other positions without materializing them.
-      for (const [idx, el] of this.items) {
-        el.style.top = `${this._getItemPosition(idx)}px`;
-      }
-      this._setScrollTop(this.container.scrollTop);
-      this._render();
+    this._pendingMeasurements.set(index, element);
+    if (this._measureFrameId === null) {
+      this._measureFrameId = requestAnimationFrame(() => {
+        this._measureFrameId = null;
+        const pending = [...this._pendingMeasurements];
+        this._pendingMeasurements.clear();
+        this._applyMeasurements(pending);
+      });
     }
+  }
+
+  _captureAnchor() {
+    const top = Math.max(0, this.container.scrollTop);
+    const index = this._findIndexAtPosition(top);
+    return { index, offset: top - this._getItemPosition(index) };
+  }
+
+  _commitLayout(anchor) {
+    this._updateTotalHeight();
+    for (const [index, element] of this.items) {
+      element.style.top = `${this._getItemPosition(index)}px`;
+    }
+    const offset = Math.min(anchor.offset, Math.max(0, this._getItemHeight(anchor.index) - 1));
+    this._setScrollTop(this._getItemPosition(anchor.index) + offset);
+    // Smaller measured rows can expose more messages even without a scroll
+    // event. Recompute the window now rather than leaving a blank viewport.
+    this._render();
+  }
+
+  _applyMeasurements(entries) {
+    if (this.destroyed || !this.inner) {
+      return;
+    }
+    const anchor = this._captureAnchor();
+    // Batch all layout reads before any positioning writes. Observer events
+    // in the same frame coalesce, and recycled/replaced elements are rejected.
+    const measured = [];
+    for (const [index, element] of entries) {
+      if (this._isMountedItem(index, element)) {
+        measured.push([index, element.offsetHeight]);
+      }
+    }
+    let changed = false;
+    for (const [index, height] of measured) {
+      changed = this._setItemHeight(index, height) || changed;
+    }
+    if (changed) {
+      this._commitLayout(anchor);
+    }
+  }
+
+  _measureItem(index, element) {
+    this._applyMeasurements([[index, element]]);
   }
 
   /**
@@ -686,8 +761,10 @@ export class VariableHeightVirtualList {
       return;
     }
     for (const [, element] of this.items) {
+      this._itemResizeObserver.unobserve(element);
       element.remove();
     }
+    this._pendingMeasurements.clear();
     this.items.clear();
     this.lastVisibleRange = { start: -1, end: -1 };
     this._render();
@@ -703,6 +780,12 @@ export class VariableHeightVirtualList {
     this.destroyed = true;
     this.heights.clear();
     this._heightTree.clear();
+    this._pendingMeasurements.clear();
+    this._itemResizeObserver.disconnect();
+    if (this._measureFrameId !== null) {
+      cancelAnimationFrame(this._measureFrameId);
+      this._measureFrameId = null;
+    }
 
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();

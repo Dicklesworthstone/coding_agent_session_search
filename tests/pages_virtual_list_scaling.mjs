@@ -292,3 +292,189 @@ test("start, center and end navigation use the measured variable row height", ()
   list.scrollToIndex(50, "end");
   assert.equal(list.scrollTop, 4900);
 });
+
+function notifyRows(list, indices) {
+  const rows = indices.map((index) => list.items.get(index));
+  for (const observer of Observer.instances) {
+    const observed = rows.filter((row) => observer.observed.has(row));
+    if (observed.length) observer.notify(observed);
+  }
+}
+
+test("post-render expansion and collapse update subsequent message positions", () => {
+  const list = listWith(100);
+  flushFrames();
+  const first = list.items.get(0);
+  first.offsetHeight = 400;
+  notifyRows(list, [0]);
+  flushFrames();
+  assert.equal(list._getItemPosition(1), 400);
+  assert.equal(list.items.get(1).style.top, "400px");
+  assert.equal(list.scrollTop, 0);
+  first.offsetHeight = 50;
+  notifyRows(list, [0]);
+  flushFrames();
+  assert.equal(list.items.get(1).style.top, "50px");
+  assert.equal(list._getItemPosition(100), 9950);
+});
+
+test("resize notifications coalesce into one measurement frame and one layout write phase", () => {
+  const list = listWith(100);
+  flushFrames();
+  const events = [];
+  const rows = [list.items.get(0), list.items.get(1)];
+  rows.forEach((row, index) => {
+    Object.defineProperty(row, "offsetHeight", {
+      get() { events.push(`read${index}`); return 130 + index * 20; },
+    });
+    Object.defineProperty(row.style, "top", {
+      set() { events.push(`write${index}`); },
+    });
+  });
+  let commits = 0;
+  const commit = list._commitLayout.bind(list);
+  list._commitLayout = (anchor) => { commits += 1; commit(anchor); };
+  for (let n = 0; n < 20; n += 1) notifyRows(list, [0, 1]);
+  assert.equal(frames.size, 1);
+  assert.deepEqual(events, []);
+  flushFrames();
+  assert.equal(commits, 1);
+  assert.deepEqual(events.slice(0, 2), ["read0", "read1"]);
+  assert.equal(list._getItemPosition(2), 280);
+});
+
+test("an overscan row growing above the viewport preserves the visible row and offset", () => {
+  const list = listWith(100);
+  flushFrames();
+  list.scrollToIndex(20);
+  list.container.scrollTop += 25;
+  list._onScroll();
+  flushFrames();
+  const above = list.items.get(19);
+  above.offsetHeight = 250;
+  notifyRows(list, [19]);
+  flushFrames();
+  assert.equal(list.scrollTop, 2175);
+  assert.equal(list._findIndexAtPosition(list.scrollTop), 20);
+  assert.equal(list.scrollTop - list._getItemPosition(20), 25);
+  list.items.get(21).offsetHeight = 200;
+  notifyRows(list, [21]);
+  flushFrames();
+  assert.equal(list.scrollTop, 2175, "changes below the anchor must not move it");
+});
+
+test("measurement uses the latest native scroll position rather than a stale scroll frame", () => {
+  const list = listWith(100);
+  flushFrames();
+  list.scrollToIndex(20);
+  flushFrames();
+  list.items.get(19).offsetHeight = 200;
+  notifyRows(list, [19]);
+  // A wheel event arrives after resize notification but before its RAF.
+  list.container.scrollTop = 2225;
+  list.container.listeners.get("scroll")();
+  flushFrames();
+  assert.equal(list.scrollTop, 2325);
+  assert.equal(list._findIndexAtPosition(list.scrollTop), 22);
+  assert.equal(list.scrollTop - list._getItemPosition(22), 25);
+});
+
+test("collapsing the anchor itself clamps its offset into the remaining row", () => {
+  const list = listWith(100);
+  flushFrames();
+  list.scrollToIndex(20);
+  list.container.scrollTop += 75;
+  list._onScroll();
+  flushFrames();
+  list.items.get(20).offsetHeight = 10;
+  notifyRows(list, [20]);
+  flushFrames();
+  assert.equal(list.scrollTop, 2009);
+  assert.equal(list._findIndexAtPosition(list.scrollTop), 20);
+});
+
+test("short measured rows fill the viewport without needing a user scroll", () => {
+  const list = listWith(100, {
+    renderItem: () => Object.assign(new Element(), { offsetHeight: 20 }),
+  });
+  flushFrames();
+  const end = list._findIndexAtPosition(list.containerHeight);
+  assert.equal(end, 15);
+  for (let index = 0; index <= end; index += 1) assert.ok(list.items.has(index));
+  assert.ok(list.items.size <= 18);
+});
+
+test("width reflow invalidates offscreen heights while retaining the reader's anchor", () => {
+  const list = listWith(100);
+  flushFrames();
+  list.items.get(0).offsetHeight = 170;
+  notifyRows(list, [0]);
+  flushFrames();
+  list.scrollToIndex(50);
+  list.container.scrollTop += 25;
+  list._onScroll();
+  flushFrames();
+  assert.equal(list.heights.get(0), 170);
+  list.container.clientWidth = 400;
+  for (const element of list.items.values()) element.offsetHeight = 180;
+  list._resizeObserver.notify();
+  flushFrames();
+  assert.equal(list.heights.has(0), false, "old wrapping measurements must be discarded");
+  assert.equal(list._findIndexAtPosition(list.scrollTop), 50);
+  assert.equal(list.scrollTop - list._getItemPosition(50), 25);
+  assert.equal(list.items.get(50).style.top, `${list._getItemPosition(50)}px`);
+});
+
+test("hidden rows keep estimates and are measured when shown again", () => {
+  const list = listWith(100);
+  flushFrames();
+  const row = list.items.get(0);
+  row.offsetHeight = 0;
+  notifyRows(list, [0]);
+  flushFrames();
+  assert.equal(list._getItemPosition(1), 100);
+  row.offsetHeight = 220;
+  notifyRows(list, [0]);
+  flushFrames();
+  assert.equal(list._getItemPosition(1), 220);
+});
+
+test("recycled elements are unobserved and pending stale callbacks cannot replace refreshed rows", () => {
+  const list = listWith(100);
+  flushFrames();
+  const oldRow = list.items.get(0);
+  oldRow.offsetHeight = 900;
+  notifyRows(list, [0]);
+  list.refresh();
+  assert.ok(!list._itemResizeObserver.observed.has(oldRow));
+  list.container.appendChild(oldRow);
+  list._itemResizeObserver.notify([oldRow]);
+  flushFrames();
+  assert.equal(list._getItemPosition(1), 100);
+  list.scrollToIndex(80);
+  flushFrames();
+  assert.deepEqual(new Set(list.items.values()), list._itemResizeObserver.observed);
+  assert.ok(list._itemResizeObserver.observed.size <= 7);
+});
+
+test("destroy cancels queued scroll/measurement work and disconnects both observers", () => {
+  const list = listWith(100);
+  const row = list.items.get(0);
+  const itemObserver = list._itemResizeObserver;
+  const containerObserver = list._resizeObserver;
+  list.container.listeners.get("scroll")();
+  assert.equal(frames.size, 2);
+  const lateCallbacks = [...frames.values()];
+  list.destroy();
+  assert.equal(frames.size, 0);
+  assert.equal(itemObserver.observed.size, 0);
+  assert.equal(containerObserver.observed.size, 0);
+  assert.equal(list._pendingMeasurements.size, 0);
+  assert.equal(list.container.listeners.size, 0);
+  for (const callback of lateCallbacks) callback();
+  itemObserver.notify([row]);
+  containerObserver.notify([list.container]);
+  assert.equal(frames.size, 0);
+  assert.equal(list.items.size, 0);
+  assert.equal(list._heightTree.size, 0);
+});
