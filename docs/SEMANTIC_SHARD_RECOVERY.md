@@ -50,3 +50,25 @@ no-candidate path, and sufficient IDs with unusable F16 signal. The tests are
 authored; no local Rust execution is claimed. Existing vector-admission tests
 and helpers are retained unchanged. The storage-backfill double-copy path is
 unchanged by this fix.
+
+## Shard publishers participate in the lease
+
+The public shard-build facade acquires the same artifact lease before the engine
+reads the sidecar, consumes input, or writes a generation. It retains that lease
+through the engine's final sidecar save. Unique generation filenames alone cannot
+serialize sidecar read/modify/write or a concurrent recovery ownership snapshot.
+A contended operation refuses before consuming input; retry after the active
+publisher finishes. The caller still owns canonical selection and its maintenance
+lock, and direct low-level filesystem/manifest writes must obey that contract.
+
+Shard-publication admission only locks; it never sweeps scratch or validates old
+ready data as a prerequisite to repair. The engine's existing strict sidecar
+metadata checks, native writers and publication policy are unchanged. Invalid
+fingerprint or shard-size arguments still fail before creating archive directories.
+The lease is released on success, errors and unwinding. This does not add mid-build
+cancellation or garbage collection for abandoned historical shard generations.
+
+Six additional file-backed `publication::tests_shards_lease` regressions cover
+contention, cross-tier retry, exclusion through input exhaustion, failure/unwind,
+invalid plans/metadata, and retention of not-ready references and unrelated scratch.
+The existing publication test filter selects these as well.

@@ -9,6 +9,15 @@ use frankensearch::index::VectorIndex;
 
 mod vectors;
 
+impl BackfillArtifacts {
+    /// Serialize shard-sidecar read/modify/write with backfill and recovery.
+    /// A shard build may create its archive, but lease acquisition never scans
+    /// or reclaims fallback data. Publication remains the engine's decision.
+    pub(in crate::indexer::semantic) fn for_shard_publication(data_dir: &Path) -> Result<Self> {
+        Self::lock(data_dir)
+    }
+}
+
 /// Data-admission failure, not metadata/cursor authority. Startup may defer
 /// cleanup on this exact type while allowing an explicit canonical backfill
 /// to repair coverage. Preview/apply still fail with all candidates retained.
@@ -164,3 +173,5 @@ fn sync_reference_parent(path: &Path) -> Result<()> {
 mod tests;
 #[cfg(test)]
 mod tests_shards;
+#[cfg(test)]
+mod tests_shards_lease;
