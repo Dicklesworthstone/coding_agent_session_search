@@ -1,0 +1,342 @@
+//! GH#521: filter conversation metadata before counting messages.
+//! These exercise the real CLI/FrankenSQLite reader, not a stock SQLite model.
+use assert_cmd::Command;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
+use coding_agent_search::franken_sync::{Connection, params};
+use serde_json::{Value, json};
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+use tempfile::TempDir;
+
+const START: i64 = 1_705_276_800_000;
+const END: i64 = START + 60_000;
+
+fn archive(root: &Path) -> Connection {
+    let db = root.join("agent_search.db");
+    let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    // An unmigrated, read-only-compatible archive. No indexing or FTS work is
+    // involved: the regression is specifically in the timeline read path.
+    conn.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO meta VALUES('schema_version', '20');
+         CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+         INSERT INTO agents VALUES(1, 'claude_code'), (2, 'codex');
+         CREATE TABLE sources(id TEXT PRIMARY KEY, kind TEXT);
+         INSERT INTO sources VALUES('local', 'local'), ('backup', 'local'), ('laptop', 'ssh');
+         CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+         CREATE TABLE conversations(
+             id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER,
+             title TEXT, started_at INTEGER, ended_at INTEGER, source_path TEXT,
+             source_id TEXT, origin_host TEXT
+         );
+         CREATE INDEX idx_conversations_started_at ON conversations(started_at);
+         CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL,
+             idx INTEGER NOT NULL, role TEXT, content TEXT, created_at INTEGER
+         );
+         CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx);",
+    )
+    .unwrap();
+    conn
+}
+
+fn conversation(
+    conn: &Connection,
+    id: i64,
+    agent: Option<i64>,
+    started: Option<i64>,
+    source: Option<&str>,
+    host: Option<&str>,
+    count: i64,
+) {
+    conn.execute_compat(
+        "INSERT INTO conversations
+         (id, agent_id, title, started_at, ended_at, source_path, source_id, origin_host)
+         VALUES(?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            agent,
+            started,
+            started.map(|t| t + 20_000),
+            format!("/sessions/{id}.jsonl"),
+            source,
+            host
+        ],
+    )
+    .unwrap();
+    for idx in 0..count {
+        // Counts are lifetime counts, NOT restricted to the conversation-start
+        // window. Deliberately put every message timestamp outside that window.
+        conn.execute_compat(
+            "INSERT INTO messages(conversation_id, idx, role, content, created_at)
+             VALUES(?1, ?2, 'user', 'small message', 0)",
+            params![id, idx],
+        )
+        .unwrap();
+    }
+}
+
+fn finish(conn: Connection) {
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+}
+
+fn command(root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.env("HOME", root)
+        .env("XDG_DATA_HOME", root.join("xdg-data"))
+        .env("XDG_CONFIG_HOME", root.join("xdg-config"))
+        .env("CASS_DATA_DIR", root)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("NO_COLOR", "1")
+        .env("RAYON_NUM_THREADS", "2")
+        .env("RUST_LOG", "error")
+        .args(["timeline", "--data-dir"])
+        .arg(root)
+        .args([
+            "--since",
+            "2024-01-15T00:00:00Z",
+            "--until",
+            "2024-01-15T00:01:00Z",
+        ]);
+    cmd
+}
+
+fn entries(payload: &Value) -> Vec<&Value> {
+    assert_eq!(payload["range"], json!({"start": START, "end": END}));
+    let rows: Vec<&Value> = if let Some(rows) = payload["sessions"].as_array() {
+        rows.iter().collect()
+    } else {
+        payload["groups"]
+            .as_object()
+            .expect("grouped timeline")
+            .values()
+            .flat_map(|group| group.as_array().expect("group array"))
+            .collect()
+    };
+    assert_eq!(
+        payload["total_sessions"].as_u64().unwrap() as usize,
+        rows.len()
+    );
+    // Every member of this one-minute window belongs to the same hour/day;
+    // the original newest-first ordering must therefore survive grouping too.
+    assert!(rows.windows(2).all(|w| {
+        w[0]["started_at"].as_i64().unwrap() >= w[1]["started_at"].as_i64().unwrap()
+    }));
+    rows
+}
+
+#[test]
+fn gh521_filters_counts_nulls_and_grouping_preserve_the_timeline_contract() {
+    let tmp = TempDir::new().unwrap();
+    let conn = archive(tmp.path());
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conversation(&conn, 1, Some(1), Some(START - 1), Some("local"), None, 3);
+    conversation(&conn, 2, Some(1), Some(START), Some("local"), None, 2);
+    conversation(&conn, 3, Some(2), Some(START + 1_000), Some("local"), None, 0);
+    conversation(
+        &conn,
+        4,
+        Some(1),
+        Some(START + 2_000),
+        Some("backup"),
+        Some("user@backup"),
+        4,
+    );
+    conversation(
+        &conn,
+        5,
+        Some(1),
+        Some(START + 3_000),
+        Some("laptop"),
+        Some("user@laptop"),
+        1,
+    );
+    conversation(
+        &conn,
+        6,
+        Some(2),
+        Some(START + 4_000),
+        Some("   "),
+        Some("user@remote"),
+        3,
+    );
+    conversation(&conn, 7, Some(1), Some(END), Some("local"), None, 1);
+    conversation(&conn, 8, Some(1), Some(END + 1), Some("local"), None, 2);
+    conversation(&conn, 9, Some(1), None, Some("local"), None, 1);
+    conversation(&conn, 10, None, Some(START + 5_000), None, None, 0);
+    conn.execute("COMMIT").unwrap();
+    finish(conn);
+    let before = fs::read(tmp.path().join("agent_search.db")).unwrap();
+
+    let cases: &[(&[&str], &[i64])] = &[
+        (&[], &[7, 10, 6, 5, 4, 3, 2]),
+        (&["--agent", "claude_code"], &[7, 5, 4, 2]),
+        (&["--agent", "codex"], &[6, 3]),
+        (
+            &["--agent", "claude_code", "--agent", "codex"],
+            &[7, 6, 5, 4, 3, 2],
+        ),
+        (&["--source", "local"], &[7, 10, 4, 3, 2]),
+        (&["--source", "remote"], &[6, 5]),
+        (&["--source", "backup"], &[4]),
+        (&["--source", "user@remote"], &[6]),
+        (&["--agent", "claude_code", "--source", "local"], &[7, 4, 2]),
+        (&["--agent", "codex", "--source", "backup"], &[]),
+        (&["--agent", "does-not-exist"], &[]),
+    ];
+    for grouping in ["none", "hour", "day"] {
+        for (flags, expected) in cases {
+            let output = Command::from(command(tmp.path()))
+                .timeout(Duration::from_secs(30))
+                .args(["--json", "--group-by", grouping])
+                .args(*flags)
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let rows = entries(&payload);
+            let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+            assert_eq!(ids.as_slice(), *expected, "grouping={grouping} flags={flags:?}");
+            for row in rows {
+                let id = row["id"].as_i64().unwrap();
+                let count = match id {
+                    2 => 2,
+                    3 | 10 => 0,
+                    4 => 4,
+                    5 | 7 => 1,
+                    6 => 3,
+                    _ => unreachable!(),
+                };
+                assert_eq!(row["message_count"], count, "session {id}");
+                assert!(row["title"].is_null());
+                assert_eq!(row["source_path"], format!("/sessions/{id}.jsonl"));
+                if id == 10 {
+                    assert_eq!(row["agent"], "unknown");
+                }
+                if id == 4 {
+                    assert_eq!(row["source_id"], "backup");
+                    assert_eq!(row["origin_kind"], "local");
+                }
+                if id == 6 {
+                    assert_eq!(row["source_id"], "user@remote");
+                    assert_eq!(row["origin_kind"], "remote");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        fs::read(tmp.path().join("agent_search.db")).unwrap(),
+        before,
+        "timeline must not migrate or rewrite an archive"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "GH521 archive-scale RSS regression; run explicitly with --ignored"]
+fn gh521_narrow_window_does_not_materialize_unrelated_message_payloads() {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let tmp = TempDir::new().unwrap();
+    let conn = archive(tmp.path());
+    conversation(&conn, 1, Some(1), Some(START - 1), Some("local"), None, 0);
+    conversation(&conn, 2, Some(1), Some(START), Some("local"), None, 2);
+    // More than 512 MiB of unrelated message content. Keep fixture creation
+    // bounded too: one reused payload and 64-row transactions, no Vec<Message>.
+    let payload = "x".repeat(64 * 1024);
+    for batch in 0..128_i64 {
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        for offset in 0..64_i64 {
+            conn.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content, created_at)
+                 VALUES(1, ?1, 'user', ?2, 0)",
+                params![batch * 64 + offset, payload.as_str()],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    finish(conn);
+    assert!(
+        fs::metadata(tmp.path().join("agent_search.db"))
+            .unwrap()
+            .len()
+            > 512 * 1024 * 1024
+    );
+
+    for flags in [
+        vec![],
+        vec!["--agent", "claude_code"],
+        vec!["--source", "local"],
+        vec!["--agent", "codex", "--source", "remote"],
+    ] {
+        let out = tmp.path().join("timeline.stdout");
+        let err = tmp.path().join("timeline.stderr");
+        let mut child_cmd = command(tmp.path());
+        child_cmd
+            .args(["--json", "--group-by", "none"])
+            .args(&flags)
+            .stdout(Stdio::from(fs::File::create(&out).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&err).unwrap()));
+        let mut child = child_cmd.spawn().unwrap();
+        let started = Instant::now();
+        let mut peak_kib = 0_u64;
+        let status = loop {
+            if let Ok(text) = fs::read_to_string(format!("/proc/{}/status", child.id())) {
+                for line in text
+                    .lines()
+                    .filter(|s| s.starts_with("VmHWM:") || s.starts_with("VmRSS:"))
+                {
+                    if let Some(kib) = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        peak_kib = peak_kib.max(kib);
+                    }
+                }
+            }
+            if peak_kib > 384 * 1024 || started.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "GH521 flags={flags:?} peak_kib={peak_kib} elapsed={:?}; stderr={}",
+                    started.elapsed(),
+                    fs::read_to_string(&err).unwrap_or_default()
+                );
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "{status}: {}",
+            fs::read_to_string(&err).unwrap()
+        );
+        assert!(
+            fs::metadata(&out).unwrap().len() < 16 * 1024,
+            "narrow output must be small"
+        );
+        let payload: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        let rows = entries(&payload);
+        if flags.contains(&"codex") {
+            assert!(rows.is_empty());
+        } else {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], 2);
+            assert_eq!(rows[0]["message_count"], 2);
+        }
+        eprintln!(
+            "GH521 flags={flags:?} peak_kib={peak_kib} elapsed={:?}",
+            started.elapsed()
+        );
+    }
+}
