@@ -3834,17 +3834,13 @@ impl SemanticIndexer {
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.check_external_cancelled()?;
         let (candidate_path, caps) = candidate;
-        let snapshot_dir = tempfile::Builder::new()
-            .prefix(".backfill-reuse-")
-            .tempdir_in(data_dir.join(VECTOR_INDEX_DIR))?;
-        let snapshot_path = snapshot_dir.path().join("candidate.fsvi");
-        fs::copy(candidate_path, &snapshot_path).context("snapshot semantic backfill candidate")?;
-        let candidate_wal = fsvi_wal_path_for(candidate_path);
-        if candidate_wal.is_file() {
-            fs::copy(candidate_wal, fsvi_wal_path_for(&snapshot_path))
-                .context("snapshot semantic backfill candidate WAL")?;
-        }
-        let mut snapshot = FsVectorIndex::open(&snapshot_path)
+        // Read the retained candidate in place. The artifact lease held by the
+        // facade prevents cooperating writers/recovery from replacing it while
+        // this pass selects canonical deltas. Mutation still happens only after
+        // reconcile_index_at_paths copies this source into its private staging
+        // directory, so the live/checkpoint artifact is never compacted here.
+        // This removes the former archive-sized .backfill-reuse snapshot copy.
+        let snapshot = FsVectorIndex::open_read_only(candidate_path)
             .map_err(|err| anyhow::anyhow!("open semantic backfill candidate: {err}"))?;
         // Historical hash indexes used the generic "1.0" revision. Those
         // vectors cannot be appended to or served as the current space, but
@@ -3870,21 +3866,34 @@ impl SemanticIndexer {
             bail!("semantic backfill candidate has an incompatible vector space");
         }
         self.revoke_backfill_serving(data_dir, manifest)?;
-        if snapshot.wal_record_count() > 0 {
-            snapshot.compact().map_err(|err| {
-                anyhow::anyhow!("compact semantic backfill candidate snapshot: {err}")
-            })?;
-        }
         let mut existing_ids = HashSet::new();
+        let mut wal_ids = HashSet::new();
+        wal_ids.try_reserve(snapshot.wal_record_count())?;
+        for (id, _) in snapshot.wal_records() {
+            self.check_external_cancelled()?;
+            if !wal_ids.insert(id) {
+                bail!("semantic backfill candidate WAL contains duplicate document {id}");
+            }
+            if !existing_ids.insert(id.to_owned()) {
+                bail!("semantic backfill candidate contains duplicate document {id}");
+            }
+        }
         for record in 0..snapshot.record_count() {
             self.check_external_cancelled()?;
-            if !snapshot.is_deleted(record) {
-                let id = snapshot.doc_id_at(record).map_err(|err| {
-                    anyhow::anyhow!("read semantic backfill candidate identity: {err}")
-                })?;
-                if !existing_ids.insert(id.to_owned()) {
-                    bail!("semantic backfill candidate contains duplicate document {id}");
-                }
+            if snapshot.is_deleted(record) {
+                continue;
+            }
+            let id = snapshot.doc_id_at(record).map_err(|err| {
+                anyhow::anyhow!("read semantic backfill candidate identity: {err}")
+            })?;
+            // Native WAL rows are last-write-wins and can coexist with an
+            // untombstoned main row after interruption. Count the effective
+            // identity once without mutating/compacting the retained source.
+            if wal_ids.contains(id) {
+                continue;
+            }
+            if !existing_ids.insert(id.to_owned()) {
+                bail!("semantic backfill candidate contains duplicate document {id}");
             }
         }
         drop(snapshot);
@@ -4020,7 +4029,7 @@ impl SemanticIndexer {
         self.check_external_cancelled()?;
         let staged_index = self.reconcile_index_at_paths(
             embeddings,
-            &snapshot_path,
+            candidate_path,
             &staging_path,
             plan.tier,
             &plan.db_fingerprint,
