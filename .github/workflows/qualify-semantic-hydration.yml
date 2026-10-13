@@ -1,0 +1,51 @@
+name: Qualify semantic hydration
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/qualify-semantic-hydration.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect-and-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: false
+      - name: Preserve exact tracked source for review
+        run: |
+          mkdir -p "$RUNNER_TEMP/hydration-source" "$RUNNER_TEMP/hydration-build"
+          git rev-parse HEAD > "$RUNNER_TEMP/hydration-source/commit.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/hydration-source/source.tar.gz"
+          sha256sum Cargo.lock Cargo.toml rust-toolchain.toml > "$RUNNER_TEMP/hydration-build/shipping-inputs.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hydration-source-${{ github.sha }}
+          path: ${{ runner.temp }}/hydration-source/
+          retention-days: 7
+      - name: Check complete shipping library without dependency overrides
+        shell: bash
+        run: |
+          set +e
+          timeout 1200 cargo check --locked --lib > "$RUNNER_TEMP/hydration-build/check.log" 2>&1
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/hydration-build/check.exit"
+          cat "$RUNNER_TEMP/hydration-build/check.log"
+          git diff --exit-code -- Cargo.toml Cargo.lock rust-toolchain.toml || exit 1
+          exit "$status"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hydration-build-${{ github.sha }}
+          path: ${{ runner.temp }}/hydration-build/
+          retention-days: 7
