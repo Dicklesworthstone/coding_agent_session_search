@@ -1,13 +1,14 @@
 //! Current-source progressive delivery over one retained generation and snapshot.
 //!
 //! Each phase completes bounded stale-hit refill before exposing text. Refinement
-//! recomputes both filtered tier rankings so new quality-side exclusions cannot
-//! leave stale fast ranks in the fused result. Query inference is request-cached;
+//! reuses fast ranking only while its exclusions are unchanged. New quality-side
+//! exclusions force both tier rankings to be recomputed before refusion. Query inference is request-cached;
 //! no model is run twice merely because retrieval needs another pass.
 
 use std::iter::FusedIterator;
 
 use super::*;
+use crate::search::semantic_reader::text::refinement::FastTierCache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -21,6 +22,7 @@ struct Continuation<'request> {
     work: Work,
     state: RefillState,
     phase: Phase,
+    ranking: FastTierCache,
 }
 
 struct CurrentStream<'request, 'connection, F> {
@@ -35,7 +37,8 @@ where
         &CachedProducers<'request>,
         &CurrentTextQuery<'request>,
         Phase,
-        &dyn SearchFilter,
+        &Excluding<'_>,
+        &mut FastTierCache,
     ) -> SemanticReaderResult<B>,
     B: BatchSource,
 {
@@ -48,18 +51,23 @@ where
         let phase = current.phase;
         let cached = &current.cached;
         let request = &current.request;
-        let result = refill_accounted(
+        let ranking = &mut current.ranking;
+        let mut result = refill_accounted(
             request,
             self.transaction,
             &mut current.work,
             &mut current.state,
-            |filter| (self.retrieve)(cached, request, phase, filter),
+            |filter| (self.retrieve)(cached, request, phase, filter, ranking),
         );
+        current.state.stats.fast_tier_reuses = current.ranking.reuses();
+        if let Ok(batch) = &mut result {
+            batch.stats.fast_tier_reuses = current.state.stats.fast_tier_reuses;
+        }
         if result.is_ok() && current.phase == Phase::Initial {
             current.phase = Phase::Refined;
             self.continuation = Some(current);
         }
-        // After Refined, cached embeddings and exclusions are released now.
+        // After Refined, embeddings, fast candidates and exclusions are released now.
         // A later poll cannot manufacture a third deadline error.
         Some(result)
     }
@@ -80,7 +88,8 @@ where
         &CachedProducers<'request>,
         &CurrentTextQuery<'request>,
         Phase,
-        &dyn SearchFilter,
+        &Excluding<'_>,
+        &mut FastTierCache,
     ) -> SemanticReaderResult<B>,
     B: BatchSource,
 {
@@ -103,12 +112,12 @@ fn prepare<'request>(
     validate(&request, &cached)?;
     work.check()?;
     let state = RefillState::new(request.refill);
-    Ok(Continuation { request, cached, work, state, phase: Phase::Initial })
+    Ok(Continuation { request, cached, work, state, phase: Phase::Initial, ranking: FastTierCache::default() })
 }
 
-// Obtain genuine phase batches from the existing lazy engine. Never relabel a
-// one-tier or Initial result as a successful refinement. For a refill of Refined,
-// recompute fast under the new exclusions before independent quality retrieval.
+// Incumbent phase driver retained only for its existing control tests.
+// Runtime uses the native TierResult continuation rather than repeating Initial.
+#[cfg(test)]
 fn phase_batch<B>(
     mut phases: impl Iterator<Item = SemanticReaderResult<B>>,
     phase: Phase,
@@ -156,13 +165,10 @@ impl SemanticGenerationReader {
         Ok(CurrentStream {
             continuation: Some(continuation),
             transaction,
-            retrieve: move |cached: &CachedProducers<'call>, request: &CurrentTextQuery<'call>, phase, filter: &dyn SearchFilter| {
+            retrieve: move |cached: &CachedProducers<'call>, request: &CurrentTextQuery<'call>, phase, filter: &Excluding<'_>, ranking: &mut FastTierCache| {
                 let search = self.activate_text(request.text, cached.producers())?;
-                if let Some(policy) = request.ann {
-                    phase_batch(search.progressive_with_ann(request.limit, Some(filter), policy)?, phase)
-                } else {
-                    phase_batch(search.progressive(request.limit, Some(filter))?, phase)
-                }
+                search.current_phase(ranking, phase == Phase::Refined, request.limit,
+                    filter, request.ann, filter.rejected.len())
             },
         })
     }
@@ -192,13 +198,11 @@ impl SelectedSemanticGeneration {
         Ok(CurrentStream {
             continuation: Some(continuation),
             transaction,
-            retrieve: move |cached: &CachedProducers<'call>, request: &CurrentTextQuery<'call>, phase, filter: &dyn SearchFilter| {
+            retrieve: move |cached: &CachedProducers<'call>, request: &CurrentTextQuery<'call>, phase, filter: &Excluding<'_>, ranking: &mut FastTierCache| {
                 let search = self.activate_text(request.text, cached.producers())?;
-                if let Some(policy) = request.ann {
-                    phase_batch(search.progressive_with_ann(request.limit, Some(filter), policy)?, phase)
-                } else {
-                    phase_batch(search.progressive(request.limit, Some(filter))?, phase)
-                }
+                let batch = search.search.current_phase(ranking, phase == Phase::Refined,
+                    request.limit, filter, request.ann, filter.rejected.len())?;
+                Ok(search.retain(batch))
             },
         })
     }

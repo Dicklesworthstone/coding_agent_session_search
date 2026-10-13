@@ -48,7 +48,7 @@ fn continuation(model: &HashEmbedder) -> Continuation<'_> {
     let work = request.admit_phases(2).unwrap();
     let cached = CachedProducers::new(request.text, request.producers);
     let state = RefillState::new(request.refill);
-    Continuation { request, cached, work, state, phase: Phase::Initial }
+    Continuation { request, cached, work, state, phase: Phase::Initial, ranking: FastTierCache::default() }
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn expired_continuation_is_terminal_before_any_retrieval() {
     let mut stream = CurrentStream {
         continuation: Some(current),
         transaction: &transaction,
-        retrieve: |_: &CachedProducers<'_>, _: &CurrentTextQuery<'_>, _: Phase, _: &dyn SearchFilter|
+        retrieve: |_: &CachedProducers<'_>, _: &CurrentTextQuery<'_>, _: Phase, _: &Excluding<'_>, _: &mut FastTierCache|
             -> SemanticReaderResult<SemanticSearchBatch> {
             calls.set(calls.get() + 1);
             Err(SemanticReaderError::InvalidCandidate)
@@ -89,7 +89,7 @@ fn a_caught_retrieval_panic_cannot_resume_the_owned_continuation() {
     let mut stream = CurrentStream {
         continuation: Some(continuation(&model)),
         transaction: &transaction,
-        retrieve: |_: &CachedProducers<'_>, _: &CurrentTextQuery<'_>, _: Phase, _: &dyn SearchFilter|
+        retrieve: |_: &CachedProducers<'_>, _: &CurrentTextQuery<'_>, _: Phase, _: &Excluding<'_>, _: &mut FastTierCache|
             -> SemanticReaderResult<SemanticSearchBatch> {
             calls.set(calls.get() + 1);
             panic!("injected retrieval panic");

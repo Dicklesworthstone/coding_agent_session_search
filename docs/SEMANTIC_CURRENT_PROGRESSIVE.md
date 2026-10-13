@@ -37,15 +37,17 @@ identity inspection or model loading.
 
 The first step runs fast retrieval, excludes missing/changed passages and refills
 until it has a verified Initial batch or reaches an error. Only the second step
-runs quality inference/retrieval. It recomputes fast retrieval under the current
-exclusion set before fusing independent tier rankings. A newly discovered stale
-quality-side passage triggers refusion with the expanded exclusion set; old fast
-ranks are not reused after exclusions change.
+runs quality inference/retrieval. It retains the actual fast-tier candidates and
+reuses that ranking when the original filter and exclusion revision are unchanged.
+A newly discovered stale quality-side passage invalidates the fast candidates:
+both tier rankings are then recomputed under the expanded exclusion set before
+refusion. No projected/fused result page is used to reconstruct native candidates.
 
 Each selected producer's actual identity-bearing query response is cached only
 within this request, including its overrides and producer checks. Refill and
 refinement therefore do not rerun successful query inference. Cached embeddings
-and exclusions are released on completion, error, unwinding, or iterator drop.
+and bounded fast candidates/exclusions are released on completion, error,
+unwinding, or iterator drop. Retained vector images are shared, not copied.
 Dropping after Initial never starts quality work.
 
 The original filter and exact serving/publication owners remain fixed. Exclusions
@@ -64,6 +66,11 @@ does not renew the account. Time between iterator polls counts too.
 Stats on Initial and Refined are cumulative snapshots. Do not add them together.
 Refined keeps the final filtered ranking and its execution receipts; counters
 report request work, not whole-generation coverage or a recall guarantee.
+`fast_tier_reuses` counts passes using the retained fast ranking. Its fast-shard
+execution receipts refer to the original work that produced those candidates,
+not another scan performed during refinement. Source verification and its byte
+charges are never reused: the entire final phase is checked in the caller's
+transaction even when its fast vector candidates were retained.
 
 Missing or changed source passages can be excluded. Malformed rows, corrupt
 owners, producer failures and budget exhaustion remain errors. An error or panic
@@ -89,5 +96,15 @@ cargo test --locked --lib search::semantic_reader::publication::text::hydration:
   -- --nocapture --test-threads=2
 ```
 
-The read-only hydration workflow also checks this command and full-library
-Clippy. A source commit or an unexecuted workflow is not a passing test receipt.
+The complete-file regression target for fast-tier reuse is:
+
+```sh
+cargo test --locked --test semantic_current_fast_reuse -- --nocapture --test-threads=1
+```
+
+It executes the prior duplicate-scan control flow and the new continuation
+against the same real FSVI images and compares both ranked results and filter
+visits. It also checks source invalidation, quality-only omissions, original
+scope, cumulative byte limits and retained images/ANN fallback receipts. These
+are native regression assertions, not a claim that the author executed them.
+A source commit or an unexecuted workflow is not a passing test receipt.

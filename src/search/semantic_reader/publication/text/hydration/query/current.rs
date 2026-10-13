@@ -127,6 +127,9 @@ pub enum CurrentSearchError {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CurrentSearchStats {
     pub searches: usize,
+    /// Progressive passes reusing the retained fast ranking, not new fast scans.
+    /// Its execution receipts describe the original work that produced that ranking.
+    pub fast_tier_reuses: usize,
     pub missing_passages: usize,
     pub stale_passages: usize,
     pub exclusion_bytes: usize,
@@ -284,7 +287,7 @@ fn refill<B: BatchSource>(
     retrieve: impl Fn(&dyn SearchFilter) -> SemanticReaderResult<B>,
 ) -> Result<CurrentSemanticBatch<B>, CurrentSearchError> {
     let mut state = RefillState::new(request.refill);
-    refill_accounted(request, transaction, &mut work, &mut state, retrieve)
+    refill_accounted(request, transaction, &mut work, &mut state, |scope| retrieve(scope))
 }
 
 // Synchronous and progressive retrieval use the same candidate/source boundary.
@@ -295,7 +298,7 @@ fn refill_accounted<B: BatchSource>(
     transaction: &Transaction<'_>,
     work: &mut Work,
     state: &mut RefillState,
-    retrieve: impl Fn(&dyn SearchFilter) -> SemanticReaderResult<B>,
+    mut retrieve: impl FnMut(&Excluding<'_>) -> SemanticReaderResult<B>,
 ) -> Result<CurrentSemanticBatch<B>, CurrentSearchError> {
     loop {
         work.check()?;
@@ -325,7 +328,8 @@ fn refill_accounted<B: BatchSource>(
             });
         }
         // Both provisional text and native candidates are dropped before refill.
-        // The exclusion set is the only per-passage state carried to another pass.
+        // Progressive retrieval may also retain bounded fast candidates; their
+        // exclusion revision must match before they can contribute to another pass.
     }
 }
 
