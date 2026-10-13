@@ -4,6 +4,7 @@
 
 mod logical_archive;
 mod search_service;
+pub mod semantic_reclaim_cli;
 
 fn env_requests_robot_output() -> bool {
     let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
@@ -251,6 +252,18 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     sigpipe::reset();
 
+    // Offline recovery must work even when normal startup cannot open the
+    // archive. Use the same handler as the companion, before environment-driven
+    // setup, provider initialization, database probes, or runtime construction.
+    if let Some(args) = semantic_reclaim_cli::cass_args(&std::env::args_os().collect::<Vec<_>>()) {
+        let code = semantic_reclaim_cli::run_cass(args);
+        // The handler has finished and released its locks before process exit.
+        if code != 0 {
+            std::process::exit(i32::from(code));
+        }
+        return Ok(());
+    }
+
     // (cass #308) The semantic stack is now pure-Rust (frankensearch `native`
     // frankentorch embedder + reranker), so there is no prebuilt ONNX Runtime and
     // no AVX/AVX2 static-init hazard. The old pre-AVX2 preflight + `-baseline`
@@ -267,13 +280,14 @@ fn main() -> anyhow::Result<()> {
     // this must run before try_run_with_parsed_fast.
     apply_default_fsqlite_read_witness_cap();
 
-    // serve and archive are dispatched below, before the main CLI parses;
+    // Independent commands are dispatched before the main CLI parses;
     // registering their trees lets help, completions, the man page,
     // capabilities and introspect list them. Built only when one of those
     // asks.
     coding_agent_search::register_external_subcommands(|| {
         let mut commands = search_service::clap_commands();
         commands.extend(logical_archive::clap_commands());
+        commands.extend(semantic_reclaim_cli::clap_commands());
         commands
     });
 
