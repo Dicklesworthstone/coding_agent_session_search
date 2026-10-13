@@ -80,6 +80,16 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **Factory, Vibe, Prime, Gemini and Cursor sessions synced from a remote
+  source are indexed (#520).** `cass sources sync` keeps only a configured
+  path's last component inside its `<path>_<hash>` mirror container, so
+  `~/.factory/sessions` arrives as `<container>/sessions` without its
+  `.factory` parent. Those connectors recognise a store by that parent
+  chain and indexed nothing from a correctly synced mirror. cass now passes
+  each configured remote path to the connectors with the mirror root, and
+  they find the store inside the container. Mirrors are unchanged on disk,
+  and conversations that already indexed keep their identities.
+
 - **Sessions synced from a remote source are no longer also indexed as Claude
   or Pi conversations.** Every connector scanned every remote mirror
   container, and the Claude connector claimed the transcripts it found in
@@ -90,6 +100,22 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   connectors scan its mirror now. A path that names no known store is still
   scanned by every connector. Duplicates indexed before this fix stay in the
   archive.
+
+- **`cass timeline` no longer runs out of memory on a large archive (#521).**
+  To count each conversation's messages it joined every message row into a
+  `GROUP BY`, and FrankenSQLite evaluated that over the whole messages table
+  before the time window narrowed anything, so on a large archive every
+  timeline was OOM-killed whatever its window or filters. Timeline now
+  selects the window's conversations first and counts each one's messages
+  through the messages index, so its cost follows the window.
+
+- **`cass stats --by-source` returns on a large archive.** The per-source
+  breakdown joined every message row into a `GROUP BY` by source. On a
+  9.7-million-message archive, v0.10.0 was still running it after 15
+  minutes, while plain `cass stats` returned in about a minute. It now takes
+  each selected conversation's source from the conversations table and
+  counts messages in one streaming pass over the messages index: 13.5
+  seconds on the same archive.
 
 - **A first `cass index` on a new install is no longer many times slower
   than `cass index --full`.** With an empty archive, a plain `cass index`
