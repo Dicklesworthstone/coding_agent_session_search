@@ -19,6 +19,11 @@ let argon2LoadPromise = null;
 let activeDatabaseJob = null;
 let pendingDatabaseJob = null;
 const DATABASE_CHUNK_DOWNLOAD_TIMEOUT_MS = 120_000;
+// Credits include completed ciphertext awaiting ordered consumption and the
+// current chunk. Reserve two copies for the bounded streaming concatenation.
+// A format-maximum chunk can exceed this prefetch budget: it stays serial.
+const DATABASE_PREFETCH_MAX_CHUNKS = 4;
+const DATABASE_PREFETCH_BUFFER_BYTES = 32 * 1024 * 1024;
 
 const MAX_ARCHIVE_CHUNK_SIZE = 32 * 1024 * 1024;
 const MAX_ARCHIVE_CHUNKS = 0xffffffff;
@@ -457,10 +462,14 @@ async function runDatabaseJob(job) {
 }
 
 async function decryptDatabase(job) {
-  const { generation, cfg, requestId, requestDek, controller } = job;
+  const { cfg, requestId, requestDek, controller } = job;
   let dbBytes = null;
   let baseNonce = null;
   let exportId = null;
+  const scrubDatabase = () => {
+    if (dbBytes?.byteLength) dbBytes.fill(0);
+  };
+  controller.signal.addEventListener("abort", scrubDatabase, { once: true });
   try {
     if (requestDek.byteLength !== 32) {
       throw new Error("Invalid data encryption key length");
@@ -469,7 +478,7 @@ async function decryptDatabase(job) {
     const totalChunks = payload.chunk_count;
     baseNonce = base64ToArray(cfg.base_nonce);
     exportId = base64ToArray(cfg.export_id);
-    ensureCurrentDecryptAttempt(generation);
+    checkDatabaseJob(job);
     dbBytes = new Uint8Array(payload.total_plaintext_size);
     job.dbBytes = dbBytes;
 
@@ -480,7 +489,7 @@ async function decryptDatabase(job) {
     const dekKey = await crypto.subtle.importKey("raw", requestDek, { name: "AES-GCM" }, false, [
       "decrypt",
     ]);
-    ensureCurrentDecryptAttempt(generation);
+    checkDatabaseJob(job);
 
     // Decrypt and decompress each chunk. Rust writes one independent deflate
     // stream per encrypted chunk, so concatenating compressed streams before
@@ -488,25 +497,11 @@ async function decryptDatabase(job) {
     let totalDecrypted = 0;
     let totalCiphertext = 0;
 
-    for (let i = 0; i < totalChunks; i++) {
-      const chunkName = `chunk-${String(i).padStart(5, "0")}.bin`;
-      const expectedChunkPath = `payload/${chunkName}`;
-      if (payload.files[i] !== expectedChunkPath) {
-        throw new Error(`Invalid payload file entry ${i}: expected ${expectedChunkPath}`);
-      }
-      const chunkUrl = `./payload/${chunkName}`;
-
-      let encryptedChunk = null;
+    for await (const { index: i, bytes: encryptedChunk } of prefetchDatabaseChunks(payload, controller)) {
       let chunkNonce = null;
       let aad = null;
       try {
-        encryptedChunk = await fetchDatabaseChunk(
-          chunkUrl,
-          maxCiphertextChunkSize(payload.chunk_size),
-          `encrypted chunk ${i}`,
-          controller.signal,
-        );
-        ensureCurrentDecryptAttempt(generation);
+        checkDatabaseJob(job);
         totalCiphertext += encryptedChunk.byteLength;
         if (
           !Number.isSafeInteger(totalCiphertext) ||
@@ -532,10 +527,10 @@ async function decryptDatabase(job) {
         );
         const compressedChunk = new Uint8Array(decrypted);
         try {
-          ensureCurrentDecryptAttempt(generation);
+          checkDatabaseJob(job);
           const plaintext = await decompressDeflate(compressedChunk, payload.chunk_size);
           try {
-            ensureCurrentDecryptAttempt(generation);
+            checkDatabaseJob(job);
             const nextTotal = totalDecrypted + plaintext.byteLength;
             if (!Number.isSafeInteger(nextTotal) || nextTotal > payload.total_plaintext_size) {
               throw new Error("Decrypted payload exceeds its declared total size");
@@ -558,14 +553,17 @@ async function decryptDatabase(job) {
           requestId,
         });
       } catch (error) {
+        // Cancellation may scrub ciphertext while a native call is pending.
+        // Keep the first transfer/cancellation cause, not a secondary AES error.
+        checkDatabaseJob(job);
         throw new Error(`Failed to decrypt chunk ${i}: ${error?.message || String(error)}`);
       } finally {
-        encryptedChunk?.fill(0);
         chunkNonce?.fill(0);
         aad?.fill(0);
       }
     }
 
+    checkDatabaseJob(job);
     if (totalCiphertext !== payload.total_compressed_size) {
       throw new Error(
         `Encrypted payload size mismatch: got ${totalCiphertext}, expected ${payload.total_compressed_size}`,
@@ -578,7 +576,7 @@ async function decryptDatabase(job) {
     }
 
     self.postMessage({ type: "PROGRESS", phase: "Loading database...", percent: 95, requestId });
-    ensureCurrentDecryptAttempt(generation);
+    checkDatabaseJob(job);
 
     const dbSize = dbBytes.byteLength;
     // dbBytes is the exact preallocated database buffer. Transfer it
@@ -595,12 +593,111 @@ async function decryptDatabase(job) {
       [transfer],
     );
   } finally {
+    controller.signal.removeEventListener("abort", scrubDatabase);
     requestDek.fill(0);
     baseNonce?.fill(0);
     exportId?.fill(0);
     if (dbBytes?.byteLength) {
       dbBytes.fill(0);
     }
+  }
+}
+
+function checkDatabaseJob(job) {
+  ensureCurrentDecryptAttempt(job.generation);
+  throwIfAborted(job.controller.signal);
+}
+
+/**
+ * Keep a small, byte-admitted window of encrypted transfers ahead of the single
+ * decrypt/decompress consumer. A completed response still occupies its slot:
+ * fast later chunks cannot accumulate an archive behind a slow first chunk.
+ * All tasks settle without rejecting, so out-of-order failures are observed
+ * immediately and abort siblings rather than becoming unhandled rejections.
+ */
+async function* prefetchDatabaseChunks(payload, controller) {
+  const { signal } = controller;
+  const maximumBytes = Math.min(
+    maxCiphertextChunkSize(payload.chunk_size), payload.total_compressed_size,
+  );
+  const width = Math.min(
+    DATABASE_PREFETCH_MAX_CHUNKS,
+    Math.max(1, Math.floor(DATABASE_PREFETCH_BUFFER_BYTES / (2 * maximumBytes))),
+  );
+  const slots = new Map();
+  let next = 0;
+  let downloadedBytes = 0;
+  const scrub = () => {
+    for (const slot of slots.values()) {
+      slot.bytes?.fill(0);
+      slot.bytes = null;
+    }
+  };
+  signal.addEventListener("abort", scrub, { once: true });
+
+  const fill = () => {
+    while (!signal.aborted && next < payload.chunk_count && slots.size < width) {
+      const index = next++;
+      const path = `payload/chunk-${String(index).padStart(5, "0")}.bin`;
+      const slot = { bytes: null, task: null };
+      // Insert before starting asynchronous work. The consumer releases this
+      // credit only after authentication, decompression and copying complete.
+      slots.set(index, slot);
+      slot.task = (async () => {
+        let bytes = null;
+        try {
+          if (payload.files[index] !== path) {
+            throw new Error(`Invalid payload file entry ${index}: expected ${path}`);
+          }
+          bytes = await fetchDatabaseChunk(
+            `./${path}`, maximumBytes, `encrypted chunk ${index}`, signal,
+          );
+          throwIfAborted(signal);
+          downloadedBytes += bytes.byteLength;
+          if (!Number.isSafeInteger(downloadedBytes) || downloadedBytes > payload.total_compressed_size) {
+            throw new Error("Encrypted payload exceeds its declared total size");
+          }
+          slot.bytes = bytes;
+          bytes = null; // Ownership moves to the bounded window until consumed.
+        } catch (error) {
+          // Abort also scrubs completed siblings and accumulated plaintext. A
+          // late native call still holds the existing full-database job slot.
+          if (!signal.aborted) controller.abort(error);
+        } finally {
+          bytes?.fill(0);
+        }
+      })();
+    }
+  };
+
+  try {
+    fill();
+    for (let index = 0; index < payload.chunk_count; index++) {
+      throwIfAborted(signal);
+      const slot = slots.get(index);
+      await slot.task;
+      throwIfAborted(signal);
+      try {
+        yield { index, bytes: slot.bytes };
+      } finally {
+        slot.bytes?.fill(0);
+        slot.bytes = null;
+        slots.delete(index);
+      }
+      fill();
+    }
+  } finally {
+    // for-await closes us on a crypto/DEFLATE failure as well as supersession.
+    // Cancel before awaiting: the bounded I/O helper disposes even late values
+    // without waiting for an arbitrary underlying stream's cancel promise.
+    if (slots.size > 0 && !signal.aborted) {
+      controller.abort(new Error("Archive download stopped before completion"));
+    }
+    scrub();
+    await Promise.all(Array.from(slots.values(), (slot) => slot.task));
+    scrub();
+    slots.clear();
+    signal.removeEventListener("abort", scrub);
   }
 }
 
@@ -1184,7 +1281,7 @@ function base64ToArray(base64) {
   const normalized = normalizeBase64(base64);
   const binary = atob(normalized);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
+  for (let i = 0; i < bytes.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
