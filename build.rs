@@ -186,7 +186,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // GH#520 needs the post-0.3.10 mirror-root metadata API. Keep the
         // source contract exact until a registry release carries this fix.
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "b0cabe3e301b0bb2b2a288e06b048067fa037131",
+        expected_rev: "6b337ba434b72c65c6c5a748b7ec47885f840ac0",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
