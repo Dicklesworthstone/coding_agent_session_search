@@ -32,6 +32,8 @@ fn passage_and_byte_accounts_are_cumulative_not_per_phase() {
 // CASS hash producer. No model download or learned relevance claim is involved.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod retained {
+    mod progressive;
+
     use super::*;
     use crate::franken_sync::SqliteValue;
     use crate::search::embedder::Embedder;

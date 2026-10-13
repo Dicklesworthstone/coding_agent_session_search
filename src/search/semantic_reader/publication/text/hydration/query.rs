@@ -5,6 +5,8 @@
 //! inference, vector scans and SQL remain cooperative boundaries, not preemptible
 //! calls. No returned text bypasses the retained-batch fingerprint verifier.
 
+mod progressive;
+
 use super::*;
 use crate::search::semantic_reader::ann::AnnSearchPolicy;
 use crate::search::semantic_reader::text::TextSemanticSearch;

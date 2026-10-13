@@ -89,3 +89,61 @@ RUST_MIN_STACK=134217728 cargo test --locked --lib \
 
 Run full compilation, formatting, Clippy, and repository gates separately.
 Availability of this API is not a release-qualification receipt.
+
+## Composed text queries and progressive delivery
+
+An activated `TextSemanticSearch` or `SelectedTextSemanticSearch` also exposes
+`search_hydrated_in_transaction` and
+`search_hydrated_with_ann_in_transaction`. These compose inference, retrieval
+and source verification rather than returning unchecked text between them.
+The returned batch retains the same ranking and owners as the unhydrated
+search; the selected variant retains its publication identity too.
+
+`progressive_hydrated_in_transaction` and
+`progressive_hydrated_with_ann_in_transaction` return lazy fused iterators.
+The first step runs fast inference/retrieval and verifies the Initial passages.
+Only a subsequent step runs independent quality inference/retrieval and
+verifies the Refined passages. Dropping after Initial does not start quality
+work. A retrieval or source-verification error terminates the iterator; an
+already-returned Initial batch is not relabelled as a completed refinement.
+A caught panic cannot restart the abandoned continuation either.
+
+All composed entry points borrow an existing `franken_sync::compat::Transaction`.
+Keep that transaction's snapshot and the filter stable throughout the operation.
+The iterator does not begin, commit or roll back it. Drop the iterator before
+finalizing the transaction. The results retain verified text and vector owners,
+not a borrow of the transaction.
+
+```rust
+let request = selected.activate_text(query_text, producers)?;
+let mut phases = request.progressive_hydrated_in_transaction(
+    10,
+    None,
+    &transaction,
+    PassageProjection::RawPassagesV2,
+    HydrationBudget::default(),
+)?;
+// Each successful item contains verified canonical passages and its original
+// phase/publication evidence. On error, later next() calls return None.
+for phase in phases.by_ref() {
+    let verified = phase?;
+    consume(verified);
+}
+drop(phases);
+// The caller still owns transaction finalization, including error paths.
+```
+
+Composed-query deadlines start at the query method or iterator construction,
+not after retrieval. They include time between iterator polls. Earlier reader
+admission and producer activation are outside this deadline. An in-progress
+native call is still not forcibly interrupted; a late result is withheld.
+
+Progressive admission reserves `2 * k` passage slots before native work, and
+source/output byte counters are shared across both phases. Repeated reads in
+Refined are charged again, not given a fresh allowance. Full source messages
+are not cached across phases. After Refined, the iterator is terminal even if
+the caller waits past the deadline before polling it again. These limits do
+not cover model allocations, all vector owners, or process RSS.
+
+These are retained-reader library APIs. They do not switch ordinary
+`SearchClient` hydration or the normal/progressive CLI onto this path.
