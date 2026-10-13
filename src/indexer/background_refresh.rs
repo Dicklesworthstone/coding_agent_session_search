@@ -213,17 +213,72 @@ fn rfc3339(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
-/// The index watermark carried by a freshness block: `last_indexed_at` is an
-/// RFC 3339 string in `cass status`/`--robot-meta` output; a bare millisecond
-/// integer is accepted too.
-pub fn last_indexed_at_ms_from_freshness(index_freshness: &serde_json::Value) -> Option<i64> {
-    let value = index_freshness.get("last_indexed_at")?;
+fn freshness_timestamp_ms(value: Option<&serde_json::Value>) -> Option<i64> {
+    let value = value?;
     if let Some(ms) = value.as_i64() {
         return Some(ms);
     }
     chrono::DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()
         .map(|t| t.timestamp_millis())
+}
+
+/// Latest successful refresh watermark carried by a freshness block.
+///
+/// `last_indexed_at` proves a lexical publication. `source_scan_completed_at_ms`
+/// proves that source discovery completed even when the scan was a no-op and no
+/// lexical generation needed publication. Treating those as one clock was the
+/// GH #514 blind spot: a clean scan could not reset stale-on-read cadence or the
+/// detached-child breaker.
+pub fn last_indexed_at_ms_from_freshness(index_freshness: &serde_json::Value) -> Option<i64> {
+    [
+        freshness_timestamp_ms(index_freshness.get("last_indexed_at")),
+        freshness_timestamp_ms(index_freshness.get("source_scan_completed_at_ms")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| *value > 0)
+    .max()
+}
+
+/// Read the canonical source-scan watermark without mutating the archive.
+/// Missing/unreadable metadata is unknown, never synthesized as epoch zero.
+pub fn source_scan_completed_at_ms_from_db(db_path: &Path) -> Option<i64> {
+    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
+    storage.get_last_scan_ts().ok().flatten().filter(|value| *value > 0)
+}
+
+/// Pure source-scan cadence policy. A missing watermark means a scan is due;
+/// zero disables age-triggered scans. Future timestamps are treated as fresh
+/// rather than causing a spawn storm after a wall-clock correction.
+pub fn source_scan_is_due(
+    completed_at_ms: Option<i64>,
+    now_ms: i64,
+    threshold: Duration,
+) -> bool {
+    if threshold.is_zero() {
+        return false;
+    }
+    let Some(completed_at_ms) = completed_at_ms.filter(|value| *value > 0) else {
+        return true;
+    };
+    let Some(elapsed_ms) = now_ms.checked_sub(completed_at_ms) else {
+        return false;
+    };
+    if elapsed_ms < 0 {
+        return false;
+    }
+    Duration::from_millis(u64::try_from(elapsed_ms).unwrap_or(u64::MAX)) >= threshold
+}
+
+/// Daemon/read-path helper using the same configurable source-scan cadence as
+/// the freshness policy. This is a metadata read only; it performs no scan.
+pub fn source_scan_due_for_db(db_path: &Path) -> bool {
+    source_scan_is_due(
+        source_scan_completed_at_ms_from_db(db_path),
+        now_ms(),
+        source_scan_interval_from_env(),
+    )
 }
 
 /// What the breaker says about spawning right now.
@@ -574,12 +629,20 @@ pub fn maybe_spawn_background_index_refresh(
     reason: &str,
     last_indexed_at_ms: Option<i64>,
 ) -> AutoRefreshOutcome {
+    // A successful no-op scan is still successful catch-up work. Use the
+    // canonical scan watermark to reset breaker/cooldown judgement even when
+    // no lexical publication advanced `last_indexed_at`.
+    let source_scan_completed_at_ms = source_scan_completed_at_ms_from_db(db_path);
+    let effective_watermark = [last_indexed_at_ms, source_scan_completed_at_ms]
+        .into_iter()
+        .flatten()
+        .max();
     maybe_spawn_with_policy(
         data_dir,
         db_path,
         reason,
         false,
-        last_indexed_at_ms,
+        effective_watermark,
         AutoRefreshPolicy::from_env(),
     )
 }
@@ -803,6 +866,9 @@ pub struct BackgroundPriority {
     pub ionice_class: u32,
     pub ionice_applied: bool,
 }
+
+#[cfg(test)]
+mod gh514_tests;
 
 #[cfg(test)]
 mod tests {
