@@ -95631,6 +95631,12 @@ fn run_sessions(
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
+    // Parse flags before opening anything, so a bad value is a usage error
+    // even where no archive exists.
+    let since_ms: Option<i64> = match since {
+        None => None,
+        Some(raw) => Some(parse_search_time_bound("--since", raw, TimeBound::Since)?),
+    };
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
         (Some(path), _) => Some(normalize_session_filter_path(path)?),
@@ -95648,19 +95654,6 @@ fn run_sessions(
         Some(n) => Some(n),
         None if current_determined_workspace => Some(1),
         None => Some(10),
-    };
-    let since_ms: Option<i64> = match since {
-        None => None,
-        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!(
-                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
-                 'today', 'yesterday', or a relative offset like -7d / -24h."
-            ),
-            hint: Some("Example: cass sessions --since -7d".into()),
-            retryable: false,
-        })?),
     };
 
     // cass#323: enumerate conversations WITHOUT joining messages. The old
@@ -119170,9 +119163,6 @@ fn run_timeline(
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
-    let db_path = analytics_db_path(data_dir, db_override.as_ref());
-    let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
-
     let now = Local::now();
     let (start_ts, end_ts) = if today {
         let start_of_day = now
@@ -119186,12 +119176,17 @@ fn run_timeline(
         };
         (local_start.timestamp_millis(), now.timestamp_millis())
     } else {
-        let start = since
-            .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| (now - chrono::Duration::days(7)).timestamp_millis());
-        let end = until
-            .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| now.timestamp_millis());
+        // The same grammar as search's --since/--until. An unparseable value
+        // is a usage error: it used to become the 7-day default silently, so
+        // `--since 5m` ran a week's timeline with exit 0.
+        let start = match since {
+            Some(raw) => parse_search_time_bound("--since", raw, TimeBound::Since)?,
+            None => (now - chrono::Duration::days(7)).timestamp_millis(),
+        };
+        let end = match until {
+            Some(raw) => parse_search_time_bound("--until", raw, TimeBound::Until)?,
+            None => now.timestamp_millis(),
+        };
         (start, end)
     };
 
@@ -119207,6 +119202,9 @@ fn run_timeline(
             )),
         ));
     }
+
+    let db_path = analytics_db_path(data_dir, db_override.as_ref());
+    let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
     // LEFT JOIN + COALESCE on agents so timeline reporting doesn't silently
     // drop legacy conversations with NULL agent_id.  Agent filter becomes
@@ -126284,87 +126282,16 @@ fn run_mappings_test(source_name: &str, path: &str, agent: Option<&str>) -> CliR
     Ok(())
 }
 
-fn parse_datetime_flexible(s: &str) -> Option<i64> {
-    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-
-    fn local_from_naive(dt: NaiveDateTime) -> i64 {
-        match Local.from_local_datetime(&dt) {
-            chrono::LocalResult::Single(local) => local.timestamp_millis(),
-            chrono::LocalResult::Ambiguous(local, _) => local.timestamp_millis(),
-            chrono::LocalResult::None => Local.from_utc_datetime(&dt).timestamp_millis(),
-        }
-    }
-
-    fn local_midnight_ts(date: NaiveDate) -> Option<i64> {
-        let dt = date.and_hms_opt(0, 0, 0)?;
-        Some(local_from_naive(dt))
-    }
-
-    fn relative_past_days(now: &chrono::DateTime<Local>, days: i64) -> Option<i64> {
-        let magnitude = days.checked_abs()?;
-        let offset = chrono::Duration::try_days(magnitude)?;
-        (*now)
-            .checked_sub_signed(offset)
-            .map(|dt| dt.timestamp_millis())
-    }
-
-    fn relative_past_hours(now: &chrono::DateTime<Local>, hours: i64) -> Option<i64> {
-        let magnitude = hours.checked_abs()?;
-        let offset = chrono::Duration::try_hours(magnitude)?;
-        (*now)
-            .checked_sub_signed(offset)
-            .map(|dt| dt.timestamp_millis())
-    }
-
-    // Returns timestamp in milliseconds to match SQLite storage format
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp_millis());
-    }
-
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        && let Some(ts) = local_midnight_ts(date)
-    {
-        return Some(ts);
-    }
-
-    let now = Local::now();
-    match s.to_lowercase().as_str() {
-        "today" => {
-            let date = now.date_naive();
-            local_midnight_ts(date)
-        }
-        "yesterday" => {
-            let yesterday = (now - chrono::Duration::days(1)).date_naive();
-            local_midnight_ts(yesterday)
-        }
-        _ => {
-            // Both `7d` and `-7d` mean "7 days ago": a leading '-' is an
-            // offset-direction hint, not a sign to add to `now`. Use checked
-            // arithmetic so pathological magnitudes are rejected instead of
-            // panicking or overflowing while parsing CLI input (#280).
-            if let Some(days_str) = s.strip_suffix('d')
-                && let Ok(days) = days_str.parse::<i64>()
-            {
-                return relative_past_days(&now, days);
-            }
-            if let Some(hours_str) = s.strip_suffix('h')
-                && let Ok(hours) = hours_str.parse::<i64>()
-            {
-                return relative_past_hours(&now, hours);
-            }
-            None
-        }
-    }
-}
-
+/// Timeline and sessions parse their time flags with search's grammar
+/// (parse_time_bound); these pin the relative forms they rely on.
 #[cfg(test)]
 mod timeline_datetime_parse_tests {
-    use super::parse_datetime_flexible;
+    use super::{TimeBound, parse_time_bound};
 
     #[test]
     fn signed_relative_offsets_use_magnitude() {
-        let positive = parse_datetime_flexible("7d").expect("positive relative days parse");
-        let negative = parse_datetime_flexible("-7d").expect("negative relative days parse");
+        let positive = parse_time_bound("7d", TimeBound::Since).expect("7d parses");
+        let negative = parse_time_bound("-7d", TimeBound::Since).expect("-7d parses");
 
         assert!(
             positive.abs_diff(negative) < 2_000,
@@ -126372,10 +126299,25 @@ mod timeline_datetime_parse_tests {
         );
     }
 
+    /// `--since 5m` used to fall back to the 7-day default with exit 0.
+    #[test]
+    fn minutes_are_minutes_ago() {
+        let now = chrono::Utc::now().timestamp_millis();
+        for raw in ["5m", "-5m", "5 minutes ago"] {
+            let start = parse_time_bound(raw, TimeBound::Since).expect("minutes parse");
+            assert!(
+                (now - start - 300_000).abs() < 60_000,
+                "{raw} should be five minutes ago, got {} ms before now",
+                now - start
+            );
+        }
+        assert!(parse_time_bound("5x", TimeBound::Since).is_none());
+    }
+
     #[test]
     fn overflowing_relative_offsets_are_rejected_without_panicking() {
-        assert!(parse_datetime_flexible("-9223372036854775808d").is_none());
-        assert!(parse_datetime_flexible("9223372036854775807h").is_none());
+        assert!(parse_time_bound("-9223372036854775808d", TimeBound::Since).is_none());
+        assert!(parse_time_bound("9223372036854775807h", TimeBound::Since).is_none());
     }
 }
 

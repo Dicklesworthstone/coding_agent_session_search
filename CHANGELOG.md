@@ -80,6 +80,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`cass timeline` and `cass sessions` read `--since`/`--until` the way
+  `cass search` does.** Timeline understood only dates, `today`,
+  `yesterday` and day or hour offsets, and replaced anything else with its
+  7-day default: `cass timeline --since 5m` showed a week, with exit 0.
+  Both commands now accept search's forms (minutes and weeks, `5 minutes
+  ago`, `now`, US dates, unix timestamps), an `--until` date includes that
+  whole day, and a value they cannot read is a usage error (exit 2) before
+  the archive is opened.
+
 - **Factory, Vibe, Prime, Gemini and Cursor sessions synced from a remote
   source are indexed (#520).** `cass sources sync` keeps only a configured
   path's last component inside its `<path>_<hash>` mirror container, so

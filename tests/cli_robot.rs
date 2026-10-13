@@ -6220,16 +6220,30 @@ fn cass_db_path_env_selects_the_archive_like_db_flag() -> Result<(), Box<dyn Err
 /// 2l1b0.64: an unparseable `--since`/`--until` used to be dropped, so the
 /// search ran unfiltered with exit 0 (or, on an empty data dir, failed later
 /// with exit 3 missing-index). It is a usage error before anything opens.
+/// tsp52: timeline turned such a value (including `--since 5m`) into its
+/// 7-day default, and sessions only failed after opening the archive.
 #[test]
 fn unparseable_time_bound_is_a_usage_error() -> Result<(), Box<dyn Error>> {
-    for (subcommand, flag, value) in [
-        ("search", "--since", "2026-13-01"),
-        ("search", "--until", "yesterdayish"),
-        ("pack", "--since", "not-a-date"),
+    for (args, flag) in [
+        (
+            &["search", "anything", "--since", "2026-13-01"][..],
+            "--since",
+        ),
+        (
+            &["search", "anything", "--until", "yesterdayish"],
+            "--until",
+        ),
+        (&["pack", "anything", "--since", "not-a-date"], "--since"),
+        (&["timeline", "--since", "5x"], "--since"),
+        (&["timeline", "--until", "yesterdayish"], "--until"),
+        (&["sessions", "--since", "5x"], "--since"),
     ] {
+        let subcommand = args[0];
+        let value = args[args.len() - 1];
         let tmp = TempDir::new()?;
         let output = base_cmd()
-            .args([subcommand, "anything", flag, value, "--json"])
+            .args(args)
+            .arg("--json")
             .env("CASS_DATA_DIR", tmp.path().join("data"))
             .env("HOME", tmp.path())
             .output()?;
