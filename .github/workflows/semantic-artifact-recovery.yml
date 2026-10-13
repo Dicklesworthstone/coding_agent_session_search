@@ -16,7 +16,10 @@ on:
       - 'src/search/semantic_manifest/**'
       - 'src/search/semantic_reader/publication/**'
       - 'src/bin/cass-semantic-reclaim.rs'
+      - 'src/main.rs'
+      - 'src/semantic_reclaim_cli.rs'
       - 'tests/semantic_artifact_reclaim_cli.rs'
+      - 'tests/semantic_reclaim_entrypoint.rs'
       - 'tests/semantic_rebuild_publication.rs'
       - 'scripts/check_dependency_features.py'
       - 'scripts/tests/test_dependency_features.py'
@@ -73,6 +76,8 @@ jobs:
               raise SystemExit('Expected recovery tests did not run; zero tests is not success')
           PY
           }
+          run_suite embedded-command --bin cass semantic_reclaim_cli::tests
+          run_suite embedded-preview --test semantic_reclaim_entrypoint
           run_suite daemon-worker --lib daemon::worker
           run_suite append-admission --lib indexer::semantic::delegate::append::tests
           run_suite rebuild-publication --test semantic_rebuild_publication

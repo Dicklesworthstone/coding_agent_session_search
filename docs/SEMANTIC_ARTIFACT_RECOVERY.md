@@ -1,23 +1,28 @@
 # Semantic backfill scratch recovery (GH #490)
 
-`cass-semantic-reclaim` is a companion Cargo binary for inspecting and reclaiming
-interrupted semantic-backfill scratch without starting another rebuild. It uses
-exactly the same ownership classifier as automatic backfill cleanup. It is not a
-new `cass storage` or `cass doctor` subcommand. Build this companion explicitly;
-this change does not add it to release archives or installer workflows.
+`cass semantic-reclaim` inspects and reclaims interrupted semantic-backfill
+scratch without starting another rebuild. It is included in the normal `cass`
+executable built from this source, and uses exactly the same ownership classifier
+as automatic backfill cleanup. It runs before database, model, and runtime
+startup. This is a top-level command; `cass storage` and `cass doctor` are unchanged.
+
+The original `cass-semantic-reclaim` companion remains compatible. Both command
+forms share the parser, recovery handler, JSON schema, and approval fingerprint.
+The main executable does not locate or spawn the companion. No already-published
+release or installer is changed by this source addition.
 
 ## Build and inspect
 
 Build from a checkout containing the recovery implementation:
 
 ```sh
-cargo build --locked --release --bin cass-semantic-reclaim
+cargo build --locked --release --bin cass
 ```
 
 Stop active index and backfill writers, then preview the existing archive:
 
 ```sh
-./target/release/cass-semantic-reclaim \
+./target/release/cass semantic-reclaim \
   --data-dir "/path/to/cass-data" --json
 ```
 
@@ -25,7 +30,11 @@ Preview is the default; `--dry-run` is an equivalent explicit spelling. The data
 directory is mandatory: this command never guesses which archive to clean or
 creates a missing archive/vector root. It can create its two lock files, but it
 does not rewrite manifests, checkpoints, vector files, or scratch artifacts.
-Neither the canonical database nor an embedding model is opened.
+Neither the canonical database nor an embedding model is opened. `CASS_DATA_DIR`
+and other environment defaults cannot replace the explicit `--data-dir` argument.
+Use `cass semantic-reclaim --help` for its options. `--robot` aliases `--json`;
+the command's own options may also precede `semantic-reclaim`. Unrelated startup
+options are not silently accepted or ignored.
 
 The JSON object has `operation: "preview"`, `status: "ready"` or `"blocked"`,
 and a `plan` containing candidate paths, file/directory counts, logical byte
@@ -39,7 +48,7 @@ Copy the exact `plan.plan_fingerprint` from the preview. Apply is a separate,
 explicit invocation against the same archive:
 
 ```sh
-./target/release/cass-semantic-reclaim \
+./target/release/cass semantic-reclaim \
   --data-dir "/path/to/cass-data" \
   --apply --plan-fingerprint "<64-character-plan-fingerprint>" --json
 ```
@@ -82,9 +91,10 @@ checkpoint data retains potential fallback artifacts.
 
 When candidates exist and the manifest names a resumable checkpoint, recovery
 also requires that checkpoint to open through the engine's read-only FSVI reader
-with the recorded producer ID. Its physical main slots plus replayable WAL
-records must also cover the checkpoint's recorded document count. This rejects
-lost acknowledged WAL records without rejecting a valid append ahead of the last
+with the recorded producer ID. Its live main slots (physical slots minus
+tombstones) plus replayable WAL records must also cover the checkpoint's recorded
+document count. This rejects lost acknowledged WAL records without rejecting a
+valid append ahead of the last
 checkpoint. An empty, truncated, unreadable, underfilled, or wrong-producer
 checkpoint cannot authorize deleting older copies. Preview, apply, and automatic
 startup cleanup share this check. Inspection never compacts or repairs its WAL,
@@ -130,7 +140,9 @@ cargo test --locked --lib indexer::semantic::artifacts::inspection::tests
 cargo test --locked --lib indexer::semantic::artifact_lifecycle_tests
 cargo test --locked --lib indexer::semantic::artifacts::checkpoint_tests
 cargo test --locked --lib indexer::semantic::artifacts::storage_tests
+cargo test --locked --bin cass semantic_reclaim_cli::tests
 cargo test --locked --bin cass-semantic-reclaim
+cargo test --locked --test semantic_reclaim_entrypoint
 cargo test --locked --test semantic_artifact_reclaim_cli
 ```
 
@@ -147,3 +159,9 @@ content-fingerprint rollover after ingest, appended turns in covered conversatio
 vector reuse, same-fingerprint resume, cleanup after a rejected reuse candidate,
 and the completed-cache fast path. This exercises the public cleanup wrapper,
 not only the inner embedding engine. It does not qualify native model quality.
+
+The embedded-entrypoint suite is non-mutating: it compares preview inventories
+and fingerprints between executable forms, preserves manifest-owned staging
+bytes, checks explicit archive selection, and covers both direct and registered
+help. Apply/crash tests continue to use the existing companion and library suites;
+the new entrypoint tests do not claim a separate end-to-end apply qualification.
