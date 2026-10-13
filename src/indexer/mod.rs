@@ -16929,7 +16929,7 @@ fn record_scan_contract_with_watermark_held(
 /// as a Pi one. The deepest known store component in the configured path
 /// decides (`~/.gemini/antigravity` is Antigravity's, not Gemini's). A path
 /// that names no known store, and any local root, keeps every connector.
-fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static str]> {
+pub(crate) fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static str]> {
     root.mirrored_source_path
         .as_deref()?
         .split(['/', '\\'])

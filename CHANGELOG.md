@@ -99,6 +99,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   they find the store inside the container. Mirrors are unchanged on disk,
   and conversations that already indexed keep their identities.
 
+- **`cass dedup` removes the duplicate Claude and Pi rows that remote
+  mirrors created before the fix below.** It now also lists every
+  remote-mirror conversation archived under an agent that does not own the
+  mirrored store (`misattributed_mirror` in `--json`). With `--apply` it
+  deletes such a row only when the same file is also archived under the
+  right agent, so nothing but a duplicate is removed. A misattributed row
+  that is the only copy is reported and kept; run `cass index` to index the
+  file under the right agent, then `cass dedup` again.
+
 - **Sessions synced from a remote source are no longer also indexed as Claude
   or Pi conversations.** Every connector scanned every remote mirror
   container, and the Claude connector claimed the transcripts it found in
@@ -108,7 +117,7 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   (`~/.pi/agent/sessions`, `~/.factory/sessions`, ...), only that provider's
   connectors scan its mirror now. A path that names no known store is still
   scanned by every connector. Duplicates indexed before this fix stay in the
-  archive.
+  archive until `cass dedup --apply` removes them (above).
 
 - **`cass timeline` no longer runs out of memory on a large archive (#521).**
   To count each conversation's messages it joined every message row into a

@@ -38732,6 +38732,12 @@ fn run_dedup(
                 "messages_removed": 0,
                 "lexical_rebuilt": false,
                 "pairs": [],
+                "misattributed_mirror": {
+                    "conversations_removed": 0,
+                    "messages_removed": 0,
+                    "unmatched": 0,
+                    "rows": [],
+                },
                 "recommended_action": "No database found. Run 'cass index --full' first.",
             });
             return output_structured_value(payload, fmt);
@@ -38763,10 +38769,28 @@ fn run_dedup(
             retryable: false,
         })?;
 
+    let mirror_result = storage
+        .collapse_misattributed_mirror_rows(
+            &misattributed_mirror_containers(&storage, &data_dir),
+            !apply,
+        )
+        .map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("misattributed mirror cleanup failed: {err}"),
+            hint: Some(
+                "Re-run without --apply to inspect, or 'cass doctor check --json' for diagnosis."
+                    .to_string(),
+            ),
+            retryable: false,
+        })?;
+    let conversations_removed =
+        result.conversations_affected + mirror_result.conversations_affected;
+
     // On apply, rebuild the lexical FTS index so the dropped twins stop
     // surfacing in search. Only worth doing when something was removed.
     let mut lexical_rebuilt = false;
-    if apply && result.conversations_affected > 0 {
+    if apply && conversations_removed > 0 {
         match storage.rebuild_lexical_index_after_dedup() {
             Ok(()) => lexical_rebuilt = true,
             Err(err) => {
@@ -38782,7 +38806,7 @@ fn run_dedup(
     // not replay that work from the WAL. Dry runs and no-op applies wrote
     // nothing and must not checkpoint anything.
     if apply
-        && result.conversations_affected > 0
+        && conversations_removed > 0
         && let Err(err) =
             crate::indexer::close_storage_with_wal_checkpoint(storage, &db_path, "dedup")
     {
@@ -38794,26 +38818,36 @@ fn run_dedup(
         eprintln!("Warning: final WAL checkpoint after dedup did not complete: {err:#}");
     }
 
-    let recommended_action = if result.conversations_affected == 0 {
+    let messages_removed = result.messages_affected + mirror_result.messages_affected;
+    let mut recommended_action = if conversations_removed == 0 {
         "No pre-existing duplicate conversations found. Nothing to do.".to_string()
     } else if apply {
         if lexical_rebuilt {
             format!(
-                "Collapsed {} duplicate conversation(s) and rebuilt the in-DB FTS shadow. Run 'cass index --full' to also refresh the on-disk lexical search index.",
-                result.conversations_affected
+                "Collapsed {conversations_removed} duplicate conversation(s) and rebuilt the in-DB FTS shadow. Run 'cass index --full' to also refresh the on-disk lexical search index."
             )
         } else {
             format!(
-                "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
-                result.conversations_affected
+                "Collapsed {conversations_removed} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index."
             )
         }
     } else {
         format!(
-            "Found {} duplicate conversation(s) ({} message rows). Re-run with --apply to collapse them.",
-            result.conversations_affected, result.messages_affected
+            "Found {conversations_removed} duplicate conversation(s) ({messages_removed} message rows). Re-run with --apply to collapse them."
         )
     };
+    if mirror_result.unmatched > 0 {
+        recommended_action.push_str(&format!(
+            " {} conversation(s) from a remote mirror are archived under an agent that does not own that store and have no copy under the right agent, so they were kept; run 'cass index' to index them under the right agent, then dedup again.",
+            mirror_result.unmatched
+        ));
+    }
+    let misattributed_mirror = serde_json::json!({
+        "conversations_removed": mirror_result.conversations_affected,
+        "messages_removed": mirror_result.messages_affected,
+        "unmatched": mirror_result.unmatched,
+        "rows": mirror_result.rows,
+    });
 
     if let Some(fmt) = structured_format {
         let pairs: Vec<serde_json::Value> = result
@@ -38839,6 +38873,7 @@ fn run_dedup(
             "messages_removed": result.messages_affected,
             "lexical_rebuilt": lexical_rebuilt,
             "pairs": pairs,
+            "misattributed_mirror": misattributed_mirror,
             "recommended_action": recommended_action,
         });
         return output_structured_value(payload, fmt);
@@ -38857,32 +38892,81 @@ fn run_dedup(
         }
     );
     println!();
-    if result.conversations_affected == 0 {
+    if conversations_removed == 0 && mirror_result.unmatched == 0 {
         println!("No pre-existing duplicate conversations found.");
         return Ok(());
     }
-    println!(
-        "Duplicate conversation pairs (projects/<rel> twin vs bare canonical): {}",
-        result.conversations_affected
-    );
-    println!(
-        "Message rows in the dropped twins: {}",
-        result.messages_affected
-    );
-    println!();
-    for pair in result.pairs.iter().take(20) {
+    if result.conversations_affected > 0 {
         println!(
-            "  drop id={:<8} keep id={:<8} {}",
-            pair.drop_conversation_id, pair.keep_conversation_id, pair.source_path
+            "Duplicate conversation pairs (projects/<rel> twin vs bare canonical): {}",
+            result.conversations_affected
         );
+        println!(
+            "Message rows in the dropped twins: {}",
+            result.messages_affected
+        );
+        println!();
+        for pair in result.pairs.iter().take(20) {
+            println!(
+                "  drop id={:<8} keep id={:<8} {}",
+                pair.drop_conversation_id, pair.keep_conversation_id, pair.source_path
+            );
+        }
+        if result.pairs.len() > 20 {
+            println!("  ... and {} more", result.pairs.len() - 20);
+        }
+        println!();
     }
-    if result.pairs.len() > 20 {
-        println!("  ... and {} more", result.pairs.len() - 20);
+    if !mirror_result.rows.is_empty() {
+        println!(
+            "Remote mirror rows under an agent that does not own the store: {} duplicate(s) ({} message rows), {} without a copy under the right agent (kept)",
+            mirror_result.conversations_affected,
+            mirror_result.messages_affected,
+            mirror_result.unmatched
+        );
+        println!();
+        for row in mirror_result.rows.iter().take(20) {
+            let action = match row.owner_conversation_id {
+                Some(owner) => format!("drop (copy id={owner})"),
+                None => "keep (no copy)".to_string(),
+            };
+            println!(
+                "  id={:<8} {:<12} {:<22} {}",
+                row.conversation_id, row.agent, action, row.source_path
+            );
+        }
+        if mirror_result.rows.len() > 20 {
+            println!("  ... and {} more", mirror_result.rows.len() - 20);
+        }
+        println!();
     }
-    println!();
     println!("{recommended_action}");
 
     Ok(())
+}
+
+/// Remote mirror containers whose configured path names a known provider
+/// store, with the archive agent slugs that own it: the ownership rule the
+/// indexer applies to remote roots (mx520).
+fn misattributed_mirror_containers(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    data_dir: &Path,
+) -> Vec<crate::storage::sqlite::MirrorContainerOwners> {
+    crate::indexer::build_scan_roots(Some(storage), data_dir)
+        .into_iter()
+        .filter(|root| root.origin.is_remote())
+        .filter_map(|root| {
+            let owners = crate::indexer::mirrored_root_owners(&root)?;
+            Some(crate::storage::sqlite::MirrorContainerOwners {
+                source_id: root.origin.source_id.clone(),
+                owner_agents: owners
+                    .iter()
+                    .map(|owner| public_connector_slug(owner).to_string())
+                    .collect(),
+                container: root.path,
+            })
+        })
+        .collect()
 }
 
 /// Count files (not bytes) recursively under a directory for the storage

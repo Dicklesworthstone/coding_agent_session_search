@@ -8036,6 +8036,47 @@ fn clear_semantic_embed_watermark_after_deletion(tx: &FrankenTransaction<'_>) ->
     Ok(())
 }
 
+/// Delete one duplicate conversation and its children inside `tx`. Messages,
+/// snippets, conversation_tags, token_usage, etc. carry `ON DELETE CASCADE`;
+/// the two external-lookup tables do not, so they go first (mirrors
+/// `purge_agent_archive`). The caller clears the semantic watermark and
+/// invalidates the FTS presence cache once for the whole batch.
+fn delete_duplicate_conversation_rows(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<()> {
+    tx.execute_compat(
+        "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    tx.execute_compat(
+        "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    // Explicit message delete (do not rely solely on cascade) so the
+    // operation is correct even if FK enforcement is toggled off.
+    tx.execute_compat(
+        "DELETE FROM messages WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    tx.execute_compat(
+        "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    tx.execute_compat(
+        "DELETE FROM token_usage WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    // NOTE: `embedding_jobs` is a per-(db_path, model_id) job table, NOT a
+    // per-conversation table — it has no conversation_id column, so there is
+    // nothing conversation-scoped to delete there.
+    tx.execute_compat(
+        "DELETE FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+    )?;
+    Ok(())
+}
+
 /// Reconcile only the provider-owned attribution fields. A missing workspace
 /// in an ordinary partial packet must never erase a known association.
 fn franken_reconcile_provider_workspace(
@@ -11338,33 +11379,7 @@ impl FrankenStorage {
         // not, so delete them explicitly first (mirrors `purge_agent_archive`).
         let mut tx = self.conn.transaction()?;
         for candidate in &result.pairs {
-            let drop_id = candidate.drop_conversation_id;
-            tx.execute_compat(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // Explicit message delete (do not rely solely on cascade) so the
-            // operation is correct even if FK enforcement is toggled off.
-            tx.execute_compat(
-                "DELETE FROM messages WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM token_usage WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // NOTE: `embedding_jobs` is a per-(db_path, model_id) job table,
-            // NOT a per-conversation table — it has no conversation_id column,
-            // so there is nothing conversation-scoped to delete there.
-            tx.execute_compat("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
+            delete_duplicate_conversation_rows(&tx, candidate.drop_conversation_id)?;
         }
         clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
@@ -11375,6 +11390,114 @@ impl FrankenStorage {
         self.invalidate_fts_messages_present_cache();
 
         Ok(result)
+    }
+
+    /// Remove the rows a remote mirror attributed to an agent that does not
+    /// own the mirrored store (mxr52). Before mx520 every connector scanned
+    /// every mirror container, so a synced Pi, Prime, Factory or Gemini
+    /// session was also archived as a Claude conversation. A row is deleted
+    /// only when the same source file is also archived under one of the
+    /// store's owning agents, so every deletion is a duplicate; a
+    /// misattributed row without that counterpart is reported and kept.
+    pub fn collapse_misattributed_mirror_rows(
+        &self,
+        containers: &[MirrorContainerOwners],
+        dry_run: bool,
+    ) -> Result<MisattributedMirrorCleanupResult> {
+        let mut result = MisattributedMirrorCleanupResult {
+            dry_run,
+            ..Default::default()
+        };
+        for container in containers {
+            let source_rows: Vec<(i64, String, String)> = self.conn.query_map_collect(
+                "SELECT c.id, a.slug, c.source_path FROM conversations c
+                 JOIN agents a ON a.id = c.agent_id
+                 WHERE c.source_id = ?1",
+                fparams![container.source_id.as_str()],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )?;
+            let mut by_path: HashMap<&str, Vec<(i64, &str)>> = HashMap::new();
+            for (id, agent, source_path) in &source_rows {
+                if Path::new(source_path).starts_with(&container.container) {
+                    by_path
+                        .entry(source_path.as_str())
+                        .or_default()
+                        .push((*id, agent.as_str()));
+                }
+            }
+            let owns = |agent: &str| container.owner_agents.iter().any(|owner| owner == agent);
+            for (source_path, rows) in by_path {
+                let owner_conversation_id = rows
+                    .iter()
+                    .filter(|(_, agent)| owns(agent))
+                    .map(|(id, _)| *id)
+                    .min();
+                for (conversation_id, agent) in rows.iter().filter(|(_, agent)| !owns(agent)) {
+                    result.rows.push(MisattributedMirrorRow {
+                        conversation_id: *conversation_id,
+                        source_id: container.source_id.clone(),
+                        source_path: source_path.to_string(),
+                        agent: (*agent).to_string(),
+                        owner_agents: container.owner_agents.clone(),
+                        owner_conversation_id,
+                    });
+                }
+            }
+        }
+        result.rows.sort_by_key(|row| row.conversation_id);
+        let drop_ids: Vec<i64> = result
+            .rows
+            .iter()
+            .filter(|row| row.owner_conversation_id.is_some())
+            .map(|row| row.conversation_id)
+            .collect();
+        result.unmatched = result.rows.len() - drop_ids.len();
+        result.conversations_affected = drop_ids.len();
+        for drop_id in &drop_ids {
+            result.messages_affected = result
+                .messages_affected
+                .saturating_add(self.conversation_message_count(*drop_id)?);
+        }
+        if dry_run || drop_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let mut tx = self.conn.transaction()?;
+        for drop_id in &drop_ids {
+            delete_duplicate_conversation_rows(&tx, *drop_id)?;
+        }
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
+        tx.commit()?;
+        self.invalidate_fts_messages_present_cache();
+        Ok(result)
+    }
+
+    /// Messages of one conversation, counted through the UNIQUE(conversation_id,
+    /// idx) autoindex where the schema has it: FrankenSQLite runs
+    /// `COUNT(*) ... WHERE conversation_id = ?` as a whole-table scan.
+    fn conversation_message_count(&self, conversation_id: i64) -> Result<usize> {
+        let indexed: bool = self
+            .conn
+            .query_map_collect("PRAGMA index_list(messages)", fparams![], |row| {
+                row.get_typed::<String>(1)
+            })?
+            .iter()
+            .any(|name| name == "sqlite_autoindex_messages_1");
+        let sql = if indexed {
+            "SELECT idx FROM messages INDEXED BY sqlite_autoindex_messages_1 WHERE conversation_id = ?1"
+        } else {
+            "SELECT idx FROM messages WHERE conversation_id = ?1"
+        };
+        let mut count = 0_usize;
+        self.conn.query_with_params_for_each(
+            sql,
+            &[SqliteValue::Integer(conversation_id)],
+            |_| {
+                count += 1;
+                Ok(())
+            },
+        )?;
+        Ok(count)
     }
 
     /// List all registered workspaces.
@@ -23424,6 +23547,43 @@ pub struct ExternalIdDuplicateCleanupResult {
     pub pairs: Vec<ExternalIdDuplicateCandidate>,
 }
 
+/// A remote mirror container and the agents that own the store its
+/// configured path names (mxr52).
+#[derive(Debug, Clone)]
+pub struct MirrorContainerOwners {
+    pub source_id: String,
+    pub container: PathBuf,
+    pub owner_agents: Vec<String>,
+}
+
+/// A conversation a remote mirror attributed to an agent that does not own
+/// the mirrored store.
+#[derive(Debug, Clone, Serialize)]
+pub struct MisattributedMirrorRow {
+    pub conversation_id: i64,
+    pub source_id: String,
+    pub source_path: String,
+    pub agent: String,
+    pub owner_agents: Vec<String>,
+    /// The row archiving the same source file under an owning agent; `None`
+    /// means the misattributed row is the only copy and is kept.
+    pub owner_conversation_id: Option<i64>,
+}
+
+/// Outcome of [`FrankenStorage::collapse_misattributed_mirror_rows`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MisattributedMirrorCleanupResult {
+    pub dry_run: bool,
+    /// Misattributed rows removed (or, on a dry run, that would be), each
+    /// with an owner counterpart.
+    pub conversations_affected: usize,
+    /// Message rows belonging to those conversations.
+    pub messages_affected: usize,
+    /// Misattributed rows without an owner counterpart: reported, never removed.
+    pub unmatched: usize,
+    pub rows: Vec<MisattributedMirrorRow>,
+}
+
 /// Health status of daily stats table.
 #[derive(Debug, Clone)]
 pub struct DailyStatsHealth {
@@ -26706,6 +26866,164 @@ mod tests {
             .unwrap();
         assert_eq!(again.conversations_affected, 0);
         assert!(again.pairs.is_empty());
+    }
+
+    /// mxr52: rows a remote mirror attributed to an agent that does not own
+    /// the mirrored store are removed only when the same file is also archived
+    /// under an owning agent; a misattributed only copy is reported and kept,
+    /// and rows of other sources, other containers and local rows are untouched.
+    #[test]
+    fn collapse_misattributed_mirror_rows_drops_only_duplicates_of_owned_files() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("agent_search.db")).unwrap();
+        let mirror = PathBuf::from("/cass/remotes/laptop/mirror");
+        let factory_container = mirror.join(".factory_sessions_0123456789abcdef");
+        let pi_container = mirror.join(".pi_agent_sessions_0123456789abcdef");
+        let claude_container = mirror.join(".claude_projects_0123456789abcdef");
+        let seed = |slug: &str, source_id: &str, path: &Path, external_id: &str| -> i64 {
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: slug.into(),
+                    name: slug.into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conversation = Conversation {
+                id: None,
+                agent_slug: slug.into(),
+                workspace: None,
+                external_id: Some(external_id.into()),
+                title: Some(external_id.into()),
+                source_path: path.to_path_buf(),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: (0..2)
+                    .map(|idx| Message {
+                        id: None,
+                        idx,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_010 + idx),
+                        content: format!("{external_id} {idx}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+                source_id: source_id.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap()
+                .conversation_id
+        };
+        let factory_file = factory_container.join("sessions/-proj/fac.jsonl");
+        let factory_row = seed("factory", "laptop", &factory_file, "fac");
+        let claude_dup = seed(
+            "claude_code",
+            "laptop",
+            &factory_file,
+            "sessions/-proj/fac.jsonl",
+        );
+        let pi_file = pi_container.join("sessions/--proj--/pi.jsonl");
+        let claude_only = seed(
+            "claude_code",
+            "laptop",
+            &pi_file,
+            "sessions/--proj--/pi.jsonl",
+        );
+        let claude_ok = seed(
+            "claude_code",
+            "laptop",
+            &claude_container.join("projects/-proj/c.jsonl"),
+            "projects/-proj/c.jsonl",
+        );
+        let local = seed(
+            "claude_code",
+            LOCAL_SOURCE_ID,
+            Path::new("/home/u/.claude/projects/-proj/l.jsonl"),
+            "-proj/l.jsonl",
+        );
+        let other_source = seed("claude_code", "server", &factory_file, "server-copy");
+
+        let containers = [
+            MirrorContainerOwners {
+                source_id: "laptop".into(),
+                container: factory_container.clone(),
+                owner_agents: vec!["factory".into()],
+            },
+            MirrorContainerOwners {
+                source_id: "laptop".into(),
+                container: pi_container.clone(),
+                owner_agents: vec!["pi_agent".into(), "pi_durable".into()],
+            },
+            MirrorContainerOwners {
+                source_id: "laptop".into(),
+                container: claude_container.clone(),
+                owner_agents: vec!["claude_code".into()],
+            },
+        ];
+        let ids = |storage: &FrankenStorage| -> Vec<i64> {
+            storage
+                .conn
+                .query_map_collect(
+                    "SELECT id FROM conversations ORDER BY id",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap()
+        };
+        let all = ids(&storage);
+
+        let dry = storage
+            .collapse_misattributed_mirror_rows(&containers, true)
+            .unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.conversations_affected, 1);
+        assert_eq!(dry.messages_affected, 2);
+        assert_eq!(dry.unmatched, 1);
+        let reported: Vec<(i64, Option<i64>)> = dry
+            .rows
+            .iter()
+            .map(|row| (row.conversation_id, row.owner_conversation_id))
+            .collect();
+        assert_eq!(
+            reported,
+            [(claude_dup, Some(factory_row)), (claude_only, None)]
+        );
+        assert_eq!(ids(&storage), all, "a dry run deletes nothing");
+
+        let applied = storage
+            .collapse_misattributed_mirror_rows(&containers, false)
+            .unwrap();
+        assert_eq!(applied.conversations_affected, 1);
+        let mut expected = vec![factory_row, claude_only, claude_ok, local, other_source];
+        expected.sort_unstable();
+        assert_eq!(ids(&storage), expected, "only the duplicate is removed");
+        let orphan_messages: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                fparams![claude_dup],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_messages, 0);
+
+        let again = storage
+            .collapse_misattributed_mirror_rows(&containers, false)
+            .unwrap();
+        assert_eq!(again.conversations_affected, 0);
+        assert_eq!(
+            again.unmatched, 1,
+            "the only copy is still reported, never removed"
+        );
     }
 
     /// bgn6s: the cap bounds each message, never the conversation. A cumulative
