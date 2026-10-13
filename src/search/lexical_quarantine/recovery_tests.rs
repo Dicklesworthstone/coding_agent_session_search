@@ -42,7 +42,7 @@ fn execute_selection(root: &Path, now: SystemTime) -> usize {
     let mut removed = 0;
     for artifact in &inventory.artifacts {
         if artifact.disposition == Disposition::Eligible {
-            retention::reclaim_one(artifact, now, &mut budget).unwrap();
+            retention::reclaim_one(artifact, &inventory, now, &mut budget).unwrap();
             removed += 1;
         }
     }

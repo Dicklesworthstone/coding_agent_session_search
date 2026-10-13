@@ -27,6 +27,20 @@ completeness, and disposition: `retain_newest`, `retain_recent`, `retain_disable
 approval. The metadata fingerprint detects observed tree changes; it does not
 hash file contents, certify freshness, or authorize an apply operation.
 
+Each artifact also includes `failure_evidence`: metadata-only pointers to known
+checkpoint, finalization-failure, generation-manifest and index-manifest files.
+Each pointer has `kind`, `relative_path`, `size_bytes`, and `modified_at_ms`.
+The paths remain relative to their bundle, including the `quarantine/` wrapper
+for an interrupted cleanup. No diagnostic contents are opened or parsed, and a
+failure record in the current live index is not attributed to every candidate.
+An empty catalog does not establish absence when `size_complete` is false.
+
+Human inspection and cleanup preview show tree age and these evidence locations.
+An incomplete size is labeled unknown instead of being presented as zero; an
+incomplete aggregate is not a total. Paths and diagnostic reasons are escaped
+for terminal output. Multiple ordinary evidence bundles produce a warning that
+retention does not repair the underlying rebuild-certification failure.
+
 Exit 0 means a complete inventory, including an empty inventory. An incomplete
 inventory is still printed as a complete JSON document with `complete: false`,
 zero eligible bytes and exit 8. Invalid arguments/configuration use exit 2,
@@ -74,7 +88,13 @@ It is metadata-based change detection, not cryptographic content authentication
 or protection against hostile ancestor replacement.
 
 Every target still passes the existing identity, metadata and age recheck before
-the unchanged rename/remove routine runs. Execution stops on the first failure.
+the unchanged rename/remove routine runs. The shared deletion path also verifies
+that the target is still a selected member of a complete, enabled inventory and
+rechecks the protected survivor's metadata before each mutation. Missing,
+changed, unreadable or ambiguous surviving evidence stops further reclamation;
+a stale cleanup plan cannot knowingly discard the last available candidate.
+These checks also apply to automatic startup retention. Execution stops on the
+first failure. This is not atomic protection against non-cooperating writers.
 The complete JSON report includes `selected_bundles`, `retained_bundles`,
 `attempted_bundles`, `removed_bundles`, `removed_logical_bytes`, `errors`, and
 `complete`. An attempted bundle may have been renamed or partly removed even if
@@ -97,7 +117,8 @@ Normal index startup invokes retention through the existing exclusive
 `index-run.lock` sweep, **before disk-headroom preflight**. It uses one policy
 across the data directory and the versioned index's parent (`index/`):
 
-* Keep the newest normal bundle containing recognized rebuild evidence.
+* Keep the newest normal bundle containing recognized rebuild evidence, or the
+  best surviving interrupted bundle when no normal evidence remains.
 * Keep every bundle with any entry modified within the last six hours, or whose
   age is unknown/future-dated.
 * Reclaim older recognized bundles only after the entire inventory completes and
@@ -107,8 +128,11 @@ The regular staging sweep remains separate; quarantine names were not added to
 its broad prefix allowlist. A target is first moved into a newly reserved sibling
 `.lexical-rebuild-reclaim-<suffix>/quarantine`, then removed. Interrupted deletions
 are recognized on later startups; recent partial deletions wait for the same age
-threshold. Empty reservations cannot displace actual evidence from the newest
-retained slot. A failed mutation stops the quarantine sweep and logs a warning.
+threshold. Empty reservations and `index/` directory shells cannot displace
+actual evidence from the newest retained slot. At least one regular file under
+`index/`, or a retained checkpoint, is needed to occupy that slot; a zero-length
+regular file can still be diagnostic evidence. A failed mutation stops the
+quarantine sweep and logs a warning.
 The canonical archive, live lexical index and publish backups are outside this
 policy. No new background task or timer is installed.
 
@@ -136,8 +160,11 @@ against a hostile process replacing path components during filesystem calls.
 
 Inspection bounds the combined roots to 16,384 entries, 1,024 bundles, 65,536 tree
 entries, 4 MiB of retained relative-path bytes, depth 32, and a five-second
-cooperative scan deadline. Candidate rechecks share one additional budget of the
-same size. An incomplete/unreadable/over-budget inventory authorizes **no**
+cooperative scan deadline. Candidate and survivor rechecks share one additional
+budget of the same size across the whole sweep. The survivor is re-observed for
+each target, so a large survivor can exhaust that budget and stop a sweep early;
+no per-target allowance is renewed. An incomplete/unreadable/over-budget initial
+inventory authorizes **no**
 quarantine deletion, even if earlier entries looked eligible. Path bytes and
 file lengths are not total process-memory or allocated-disk-block measurements.
 Synchronous filesystem calls and recursive deletion are not forcibly preempted.

@@ -40,8 +40,8 @@ fn reclaim(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> R
     // renewed allowance per bundle. remove_dir_all itself is synchronous and
     // cannot be forcibly interrupted by this cooperative metadata deadline.
     let mut budget = Budget::new(limits);
-    for artifact in inventory.artifacts.into_iter().filter(|a| a.disposition == Disposition::Eligible) {
-        if let Err(error) = reclaim_one(&artifact, now, &mut budget) {
+    for artifact in inventory.artifacts.iter().filter(|a| a.disposition == Disposition::Eligible) {
+        if let Err(error) = reclaim_one(artifact, &inventory, now, &mut budget) {
             report.errors.push(format!("{}: {error}", artifact.path.display()));
             // Do not multiply work or keep mutating after a changed/failed target.
             break;
@@ -52,7 +52,13 @@ fn reclaim(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> R
     report
 }
 
-pub(super) fn reclaim_one(artifact: &Artifact, now: SystemTime, budget: &mut Budget) -> io::Result<()> {
+pub(super) fn reclaim_one(
+    artifact: &Artifact,
+    inventory: &Inventory,
+    now: SystemTime,
+    budget: &mut Budget,
+) -> io::Result<()> {
+    survivor::validate_selection(artifact, inventory)?;
     let parent = artifact.path.parent().ok_or_else(|| io::Error::other("quarantine has no parent"))?;
     real_directory(parent)?;
     // Hold identities through re-observation and rename. This detects ordinary
@@ -66,6 +72,10 @@ pub(super) fn reclaim_one(artifact: &Artifact, now: SystemTime, budget: &mut Bud
     {
         return Err(io::Error::other("quarantine changed since inventory; no deletion attempted"));
     }
+    // Recheck the retained evidence, not only the target, immediately before
+    // mutation. Another operator may have moved it after the locked inventory.
+    // Both walks consume the same sweep-wide budget; exhaustion fails closed.
+    survivor::recheck(inventory, now, budget)?;
     budget.check()?;
     let doomed = if artifact.interrupted_reclaim {
         artifact.path.clone()
@@ -161,7 +171,7 @@ mod tests {
         let plan = inspect_at(root.path(), instant, true, Limits::default()).unwrap();
         let artifact = plan.artifacts.iter().find(|a| a.disposition == Disposition::Eligible).unwrap();
         fs::write(artifact.path.join("index/new-entry"), b"changed evidence").unwrap();
-        let result = reclaim_one(artifact, instant, &mut Budget::new(Limits::default()));
+        let result = reclaim_one(artifact, &plan, instant, &mut Budget::new(Limits::default()));
         assert!(result.is_err());
         assert_eq!(fs::read(artifact.path.join("index/new-entry")).unwrap(), b"changed evidence");
     }

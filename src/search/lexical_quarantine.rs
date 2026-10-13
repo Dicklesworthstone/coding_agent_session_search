@@ -17,6 +17,7 @@ pub mod cleanup;
 mod evidence;
 pub use evidence::{EvidenceKind, FailureEvidence};
 mod retention;
+mod survivor;
 pub(crate) use retention::reclaim_under_index_run_lock;
 
 const QUARANTINE_PREFIX: &str = ".lexical-rebuild-quarantine-";
@@ -219,7 +220,7 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
     let mut bytes = 0_u64;
     let mut nodes = Vec::new();
     let mut failure_evidence = Vec::new();
-    let mut has_index = false;
+    let mut has_index_payload = false;
     let mut has_checkpoint = false;
     let mut has_pending_child = false;
     for entry in walkdir::WalkDir::new(path)
@@ -258,7 +259,8 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
             if first.as_os_str() == "index" {
                 if parts.len() == 1 {
                     if !metadata.is_dir() { return Err(io::Error::other("quarantine index is not a directory")); }
-                    has_index = true;
+                } else if metadata.is_file() {
+                    has_index_payload = true;
                 }
             } else if first.as_os_str() == CHECKPOINT && parts.len() == 1 && metadata.is_file() {
                 has_checkpoint = true;
@@ -278,7 +280,10 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
     // Empty reservations can remain after a failed rename, or after interrupted
     // deletion removed the last child. They never displace actual evidence from
     // the newest-retained slot. Unknown children were refused above.
-    let has_evidence = has_index || has_checkpoint;
+    // Empty directory shells can survive partial deletion. They are not
+    // diagnostic evidence and must not displace the last file-bearing bundle.
+    // A zero-length regular file still records a real (possibly corrupt) input.
+    let has_evidence = has_index_payload || has_checkpoint;
     if pending && has_evidence && !has_pending_child {
         return Err(io::Error::other("invalid interrupted quarantine layout"));
     }

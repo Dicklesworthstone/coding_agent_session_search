@@ -169,7 +169,7 @@ fn execute(sealed: SealedPlan, lease: &lease::Lease, now: SystemTime, limits: Li
         // Conservative: reclaim_one can fail before mutation, after its rename,
         // or during recursive deletion. Never call a failed attempt read-only.
         report.attempted_bundles += 1;
-        if let Err(error) = retention::reclaim_one(artifact, now, &mut budget) {
+        if let Err(error) = retention::reclaim_one(artifact, &plan.inventory, now, &mut budget) {
             report.complete = false;
             report.errors.push(format!("{}: {error}", artifact.path.display()));
             break;
@@ -208,3 +208,6 @@ pub fn apply(data_dir: &Path, approval: &str) -> Result<CleanupReport, CleanupEr
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod survivor_tests;
