@@ -39,13 +39,12 @@ pub(super) fn compare(
 ) -> Result<Comparison> {
     check_cancelled()?;
     let mut visited = 0u64;
-    let replay = engine::visit_packet_embedding_inputs_from_storage(storage, |input| {
-        check_cancelled()?;
+    let replay = replay::visit(storage, |input| {
         if let Some(id) = engine::semantic_doc_id_for_input(&input) {
             visited = visited.checked_add(1).context("semantic replay count overflow")?;
             // Removing instead of looking up also refuses duplicate canonical
-            // identities. The engine visitor propagates this error immediately;
-            // its current replay page may already have been materialized.
+            // identities. Lazy replay stops before loading another conversation
+            // when this callback detects a delta.
             if !remaining.remove(id.as_str()) {
                 return Err(CanonicalDelta.into());
             }
@@ -61,7 +60,7 @@ pub(super) fn compare(
             }
         }
         Ok(())
-    });
+    }, &mut check_cancelled);
     let matches = match replay {
         Ok(()) => remaining.is_empty(),
         Err(error) if error.is::<CanonicalDelta>() => false,
@@ -155,3 +154,5 @@ pub(super) fn nonempty_conversations(
 
 #[cfg(test)]
 mod tests;
+
+mod replay;
