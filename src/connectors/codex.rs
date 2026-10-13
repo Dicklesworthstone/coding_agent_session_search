@@ -1,6 +1,8 @@
 //! Codex history from active and archived rollout collections.
 
 mod archives;
+#[doc(hidden)]
+pub mod layout_identity;
 #[path = "codex/implementation.rs"]
 mod implementation;
 // Also consumed by raw-mirror admission, including the legacy fallback route.
