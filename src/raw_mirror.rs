@@ -5,12 +5,20 @@
 //! exclusions here too, before source access, mirror creation, locks or caches.
 
 mod exclusions;
-mod store;
+// Keep the policy next to the store's private validation/publication helpers.
+// The v1 codec and its existing test module remain byte-for-byte unchanged.
+mod store {
+    include!("raw_mirror/store.rs");
+    pub(super) mod policy {
+        include!("raw_mirror/policy.rs");
+    }
+}
 
 use std::fmt;
 
 pub use exclusions::RawMirrorSourceExcluded;
 pub use store::*;
+pub use store::policy::{RawMirrorCapturePaused, RawMirrorRetentionPolicy};
 
 /// Capture was switched off by the operator with `CASS_RAW_MIRROR` (GH #506).
 /// Like [`RawMirrorSourceExcluded`], it names no source path or contents.
@@ -60,8 +68,8 @@ fn is_append_transcript(path: &std::path::Path) -> bool {
 ///
 /// With capture switched off this returns [`RawMirrorCaptureDisabled`], and an
 /// excluded source returns [`RawMirrorSourceExcluded`]; neither reads the
-/// source or changes the mirror. Existing captures are not purged by either
-/// setting; pruning remains a separate, explicit operation.
+/// source or changes the mirror. Budget pressure returns
+/// [`RawMirrorCapturePaused`] without discarding existing evidence.
 pub fn capture_source_file(
     input: RawMirrorCaptureInput<'_>,
 ) -> anyhow::Result<RawMirrorCaptureRecord> {
@@ -69,14 +77,16 @@ pub fn capture_source_file(
         return Err(RawMirrorCaptureDisabled.into());
     }
     exclusions::ensure_allowed(input.source_path)?;
+    let policy = RawMirrorRetentionPolicy::from_env()?;
     if is_append_transcript(input.source_path) {
-        store::capture_source_file_with_chunk_policy(
+        store::policy::capture(
             input,
             TRANSCRIPT_CHUNK_BYTES as u64,
             TRANSCRIPT_CHUNK_BYTES,
+            policy,
         )
     } else {
-        store::capture_source_file(input)
+        store::policy::capture_default(input, policy)
     }
 }
 
@@ -90,7 +100,7 @@ pub(crate) fn capture_source_file_with_chunk_policy(
         return Err(RawMirrorCaptureDisabled.into());
     }
     exclusions::ensure_allowed(input.source_path)?;
-    store::capture_source_file_with_chunk_policy(input, chunk_threshold_bytes, chunk_size_bytes)
+    store::policy::capture(input, chunk_threshold_bytes, chunk_size_bytes, RawMirrorRetentionPolicy::from_env()?)
 }
 
 #[cfg(test)]
