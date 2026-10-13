@@ -57,6 +57,7 @@
     "omp",
     "factory",
     "openclaw",
+    "continue",
     "antigravity",
     "pi_durable",
     "prime_agent",
@@ -3650,6 +3651,153 @@
         {
           "name": "json",
           "description": "Receipts are JSON regardless of this compatibility flag",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "codex-layout-migrate",
+      "description": "Prove a same-source flat/dated Codex transition before indexing its second layout. Dry-run by default. --apply registers a receipt without rewriting archive rows",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit CASS directory containing the existing agent_search.db; no custom DB",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact named local source configured in sources.toml and the archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": true
+        },
+        {
+          "name": "from",
+          "description": "Existing flat or native dated rollout. Both inputs must remain accessible",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "to",
+          "description": "Matching rollout in the other layout, belonging to the same local source",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "apply",
+          "description": "Register the proven identity before indexing the second layout; default is dry-run",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Emit the migration report as JSON. Fatal errors use stderr, not stdout",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "lexical-quarantine",
+      "description": "Inspect retained failed lexical rebuilds without opening the database. Read-only by default; --apply requires the exact fingerprint from --plan",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit archive directory; never defaults to another user's archive",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "json",
+          "description": "Emit one complete inventory; complete=false exits with code 8",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan",
+          "description": "Preview the complete cleanup policy and its approval fingerprint; no writes",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Apply only a matching preview under the indexer lock. Preserves newest/recent evidence",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "semantic-reclaim",
+      "description": "Preview or reclaim unreferenced semantic backfill scratch",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Existing CASS data directory; no default archive is guessed",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "dry-run",
+          "description": "Explicitly preview without deleting artifacts (also the default)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Delete only the candidates in a still-current approved preview",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan-fingerprint",
+          "description": "Exact plan_fingerprint from a prior preview of this archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Emit one JSON result on stdout and structured failures on stderr",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
