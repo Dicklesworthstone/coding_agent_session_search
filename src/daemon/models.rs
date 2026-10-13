@@ -6,6 +6,9 @@
 
 mod slot;
 
+#[cfg(test)]
+mod test_support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

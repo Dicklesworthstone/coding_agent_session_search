@@ -3,6 +3,10 @@
 //! between model calls; an already-running loader/kernel is not forcibly killed.
 
 mod budget;
+mod owned;
+
+#[cfg(test)]
+mod ownership_tests;
 
 use frankensearch::{DaemonChallengeV1, DaemonOperationV1};
 
@@ -10,8 +14,10 @@ use super::{DaemonAttestationState, ModelDaemon};
 use crate::daemon::protocol::{
     EmbedResponse, ErrorCode, ErrorResponse, Request, RerankResponse, Response,
 };
+use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::fastembed_reranker::FastEmbedReranker;
+use crate::search::reranker::rerank_texts;
 
 pub(super) use budget::InferenceGate;
 use budget::{Budget, collect_batches, error, plan};
@@ -198,18 +204,21 @@ fn verify_challenge(
 }
 
 fn verify_live_identity(
-    daemon: &ModelDaemon,
+    producer: &dyn Embedder,
     state: &DaemonAttestationState,
 ) -> Result<(), ErrorResponse> {
-    let (identity, category) = daemon.models.embedder_attestation_identity().map_err(|_| {
+    let identity = producer.identity().and_then(|identity| {
+        identity.validate()?;
+        Ok(identity)
+    }).map_err(|_| {
         error(
             ErrorCode::ModelLoadFailed,
             "loaded embedding producer cannot be verified",
             false,
         )
     })?;
-    if identity != state.connection.embedding_identity
-        || category != state.connection.model_category
+    if identity != &state.connection.embedding_identity
+        || producer.category() != state.connection.model_category
     {
         return Err(error(
             ErrorCode::ModelLoadFailed,
@@ -253,7 +262,9 @@ fn embedding(
         verify_challenge(state.as_ref(), challenge, operation, &inputs)?;
     }
     budget.check()?;
-    daemon.models.warm_embedder().map_err(|source| {
+    // Retain one owner before observing metadata or running any chunk. Slot
+    // eviction/reload may affect later requests, never the rest of this one.
+    let owner = daemon.models.acquire_embedder().map_err(|source| {
         tracing::warn!(error = %source, "Daemon embedder load failed");
         error(
             ErrorCode::ModelLoadFailed,
@@ -262,26 +273,34 @@ fn embedding(
         )
     })?;
     budget.check()?;
-    let served = daemon.models.embedder_id();
-    let dimension = daemon.models.embedder_dimension();
+    let served = owner.id().to_owned();
+    let dimension = owner.dimension();
     validate_served_embedding(model, &served, dimension)?;
     if challenge.is_some() {
         verify_live_identity(
-            daemon,
+            owner.as_ref(),
             state.as_ref().ok_or_else(|| {
                 error(ErrorCode::ModelLoadFailed, "attestation unavailable", false)
             })?,
         )?;
     }
     let vectors = collect_batches(texts, &ranges, budget, |batch| {
-        let vectors = daemon.models.embed_batch(batch).map_err(|source| {
-            tracing::warn!(error = %source, "Daemon embedding inference failed");
-            error(
-                ErrorCode::Internal,
-                "native embedding inference failed",
-                false,
-            )
-        })?;
+        let inputs = batch.iter().map(String::as_str).collect::<Vec<_>>();
+        let vectors = if challenge.is_some() {
+            let state = state.as_ref().ok_or_else(|| {
+                error(ErrorCode::ModelLoadFailed, "attestation unavailable", false)
+            })?;
+            owned::attested_batch(
+                owner.as_ref(), state, operation.ok_or_else(|| {
+                    error(ErrorCode::InvalidInput, "attested operation missing", false)
+                })?, &inputs, budget,
+            )?
+        } else {
+            owner.embed_batch_sync(&inputs).map_err(|source| {
+                tracing::warn!(error = %source, "Daemon embedding inference failed");
+                error(ErrorCode::Internal, "native embedding inference failed", false)
+            })?
+        };
         validate_vectors(&vectors, dimension)?;
         Ok(vectors)
     })?;
@@ -290,7 +309,7 @@ fn embedding(
         let state = state
             .as_ref()
             .ok_or_else(|| error(ErrorCode::ModelLoadFailed, "attestation unavailable", false))?;
-        verify_live_identity(daemon, state)?;
+        verify_live_identity(owner.as_ref(), state)?;
         budget.check()?;
         let response = state
             .sign_vectors(challenge, operation, &inputs, vectors)
@@ -335,7 +354,7 @@ fn reranking(
         )?;
     }
     budget.check()?;
-    daemon.models.warm_reranker().map_err(|source| {
+    let owner = daemon.models.acquire_reranker().map_err(|source| {
         tracing::warn!(error = %source, "Daemon reranker load failed");
         error(
             ErrorCode::ModelLoadFailed,
@@ -344,7 +363,7 @@ fn reranking(
         )
     })?;
     budget.check()?;
-    let served = daemon.models.reranker_id();
+    let served = owner.id().to_owned();
     if served != FastEmbedReranker::reranker_id_static() {
         return Err(error(
             ErrorCode::ModelNotFound,
@@ -353,7 +372,8 @@ fn reranking(
         ));
     }
     let scores = collect_batches(documents, &ranges, budget, |batch| {
-        let scores = daemon.models.rerank(query, batch).map_err(|source| {
+        let documents = batch.iter().map(String::as_str).collect::<Vec<_>>();
+        let scores = rerank_texts(owner.as_ref(), query, &documents).map_err(|source| {
             tracing::warn!(error = %source, "Daemon rerank inference failed");
             error(
                 ErrorCode::Internal,
