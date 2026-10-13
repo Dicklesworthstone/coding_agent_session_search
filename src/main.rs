@@ -241,6 +241,25 @@ fn apply_default_fsqlite_read_witness_cap() {
     }
 }
 
+/// Keep serialized archive reads off the CPU-sized outer scheduler pool.
+///
+/// Timeline and sessions execute their SQL through the thread-affine sync
+/// bridge; extra outer workers cannot parallelize those reads. Use the same
+/// current-thread driver as search/health without bypassing normal parsing,
+/// startup, command dispatch, error reporting, or bridge/runtime shutdown.
+/// Indexing and every other command retain the multithreaded runtime.
+fn command_uses_current_thread(command: Option<&coding_agent_search::Commands>) -> bool {
+    matches!(
+        command,
+        Some(
+            coding_agent_search::Commands::Search { .. }
+                | coding_agent_search::Commands::Health { .. }
+                | coding_agent_search::Commands::Timeline { .. }
+                | coding_agent_search::Commands::Sessions { .. }
+        )
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     // (cass #356) Restore the default SIGPIPE disposition so an early-exiting
     // pipe consumer (`cass ... --json | head`) terminates cass quietly with
@@ -342,14 +361,7 @@ fn main() -> anyhow::Result<()> {
 
     apply_default_tantivy_writer_thread_cap();
 
-    let use_current_thread = matches!(
-        parsed.cli.command,
-        Some(
-            coding_agent_search::Commands::Search { .. }
-                | coding_agent_search::Commands::Health { .. }
-        )
-    );
-    let runtime = if use_current_thread {
+    let runtime = if command_uses_current_thread(parsed.cli.command.as_ref()) {
         asupersync::runtime::RuntimeBuilder::current_thread().build()?
     } else {
         asupersync::runtime::RuntimeBuilder::multi_thread().build()?
@@ -369,5 +381,63 @@ fn main() -> anyhow::Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(err) => handle_fatal_error(err),
+    }
+}
+
+#[cfg(test)]
+mod command_runtime_tests {
+    use super::command_uses_current_thread;
+    use clap::Parser;
+    use coding_agent_search::Cli;
+
+    fn current_thread(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).expect("valid CLI runtime-policy fixture");
+        command_uses_current_thread(cli.command.as_ref())
+    }
+
+    #[test]
+    fn timeline_and_sessions_use_the_serial_read_runtime() {
+        let cases: &[&[&str]] = &[
+            &["cass", "timeline"],
+            &["cass", "timeline", "--today", "--json"],
+            &["cass", "timeline", "--since", "5m", "--json"],
+            &[
+                "cass",
+                "timeline",
+                "--agent",
+                "claude_code",
+                "--source",
+                "local",
+                "--group-by",
+                "hour",
+                "--robot-format",
+                "compact",
+            ],
+            &["cass", "--quiet", "--robot-format", "json", "timeline"],
+            &["cass", "sessions"],
+        ];
+        for args in cases {
+            assert!(current_thread(args), "serialized read: {args:?}");
+        }
+    }
+
+    #[test]
+    fn existing_search_and_health_runtime_policy_is_preserved() {
+        for args in [&["cass", "search", "probe"][..], &["cass", "health"][..]] {
+            assert!(current_thread(args), "existing current-thread path: {args:?}");
+        }
+    }
+
+    #[test]
+    fn indexing_watch_and_default_paths_keep_the_parallel_runtime() {
+        for args in [
+            &["cass", "index"][..],
+            &["cass", "index", "--full"][..],
+            &["cass", "index", "--watch"][..],
+            &["cass", "tui", "--once"][..],
+            &["cass"][..],
+        ] {
+            assert!(!current_thread(args), "parallel path: {args:?}");
+        }
     }
 }
