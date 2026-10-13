@@ -289,16 +289,16 @@ impl BackfillArtifacts {
         if let Some(output) = output {
             protected.index(output)?;
         }
-        if let Some(shards) =
-            metadata.read::<SemanticShardManifest>(&SemanticShardManifest::path(&self.data_dir))?
-        {
+        let shards =
+            metadata.read::<SemanticShardManifest>(&SemanticShardManifest::path(&self.data_dir))?;
+        if let Some(shards) = &shards {
             ensure!(
                 shards.manifest_version <= MANIFEST_FORMAT_VERSION,
                 "unsupported semantic shard manifest version; refusing artifact reclamation"
             );
-            for shard in shards.shards {
-                protected.index(&self.data_dir.join(shard.index_path))?;
-                if let Some(path) = shard.ann_index_path {
+            for shard in &shards.shards {
+                protected.index(&self.data_dir.join(&shard.index_path))?;
+                if let Some(path) = &shard.ann_index_path {
                     protected.index(&self.data_dir.join(path))?;
                 }
             }
@@ -356,6 +356,15 @@ impl BackfillArtifacts {
             // before returning ANY candidates, including after publication
             // has cleared the resumable checkpoint.
             publication::validate_ready(&self.data_dir, manifest, durable)?;
+        }
+
+        if !candidates.is_empty()
+            && let Some(shards) = &shards
+        {
+            // Shard-only archives need not have a legacy manifest. Validate
+            // the same sidecar snapshot that protected its paths, not a second
+            // read whose ownership may disagree with discovery.
+            publication::validate_shards(&self.data_dir, shards, durable)?;
         }
 
         Ok(Discovery {

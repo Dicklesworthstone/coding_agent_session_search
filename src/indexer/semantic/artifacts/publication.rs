@@ -1,7 +1,7 @@
 //! A saved ready record is not sufficient authority to retire fallback data.
 //! Read through the native, non-repairing reader, then make its main/WAL pair
-//! durable. Ownership of not-ready tiers, ANN, shards and selections remains
-//! independent of this additional admission of ready legacy publications.
+//! durable. Not-ready records, ANN and selected-generation references retain
+//! their ownership independently of ready legacy and shard data admission.
 
 use super::*;
 use crate::search::semantic_manifest::ArtifactRecord;
@@ -24,16 +24,40 @@ pub(super) fn validate_ready(
     durable: bool,
 ) -> Result<()> {
     validate_with(data_dir, manifest, |path, main, wal_path, wal| {
-        if durable {
-            sync_file(path, main)?;
-            if let Some(wal) = wal {
-                sync_file(wal_path, wal)?;
-                sync_reference_parent(wal_path)?;
-            }
-            sync_reference_parent(path)?;
-        }
-        Ok(())
+        pin_data(path, main, wal_path, wal, durable)
     })
+}
+
+/// Use the exact sidecar snapshot that supplied discovery's protected paths.
+/// A shard-only archive need not have a legacy SemanticManifest at all. Ready
+/// shards in partial or older groups still acknowledge data: do not discard
+/// their fallbacks merely because the group is not currently queryable.
+pub(super) fn validate_shards(
+    data_dir: &Path,
+    manifest: &SemanticShardManifest,
+    durable: bool,
+) -> Result<()> {
+    validate_shards_with(data_dir, manifest, |path, main, wal_path, wal| {
+        pin_data(path, main, wal_path, wal, durable)
+    })
+}
+
+fn pin_data(
+    path: &Path,
+    main: &File,
+    wal_path: &Path,
+    wal: Option<&File>,
+    durable: bool,
+) -> Result<()> {
+    if durable {
+        sync_file(path, main)?;
+        if let Some(wal) = wal {
+            sync_file(wal_path, wal)?;
+            sync_reference_parent(wal_path)?;
+        }
+        sync_reference_parent(path)?;
+    }
+    Ok(())
 }
 
 fn validate_with(
@@ -53,9 +77,44 @@ fn validate_with(
     Ok(())
 }
 
+fn validate_shards_with(
+    data_dir: &Path,
+    manifest: &SemanticShardManifest,
+    mut pin: impl FnMut(&Path, &File, &Path, Option<&File>) -> Result<()>,
+) -> Result<()> {
+    for shard in manifest.shards.iter().filter(|shard| shard.ready) {
+        let path = data_dir.join(&shard.index_path);
+        validate_data(
+            &path,
+            &shard.embedder_id,
+            shard.dimension,
+            shard.doc_count,
+            &mut pin,
+        )
+        .with_context(|| PublicationUnavailable { path })?;
+    }
+    Ok(())
+}
+
 fn validate_one(
     path: &Path,
     artifact: &ArtifactRecord,
+    pin: &mut impl FnMut(&Path, &File, &Path, Option<&File>) -> Result<()>,
+) -> Result<()> {
+    validate_data(
+        path,
+        &artifact.embedder_id,
+        artifact.dimension,
+        artifact.doc_count,
+        pin,
+    )
+}
+
+fn validate_data(
+    path: &Path,
+    embedder_id: &str,
+    dimension: usize,
+    doc_count: u64,
     pin: &mut impl FnMut(&Path, &File, &Path, Option<&File>) -> Result<()>,
 ) -> Result<()> {
     // Check regular-file types before opening, including the WAL, so a FIFO
@@ -66,7 +125,7 @@ fn validate_one(
     let index = VectorIndex::open_read_only(path)
         .context("open published vectors without repairing them")?;
     ensure!(
-        index.embedder_id() == artifact.embedder_id && index.dimension() == artifact.dimension,
+        index.embedder_id() == embedder_id && index.dimension() == dimension,
         "published vector producer or dimension differs from its ready record"
     );
     let available = index
@@ -75,13 +134,13 @@ fn validate_one(
         .and_then(|main| main.checked_add(index.wal_record_count()))
         .context("published vector record count is invalid")?;
     ensure!(
-        u64::try_from(available)? >= artifact.doc_count,
+        u64::try_from(available)? >= doc_count,
         "published vector image has fewer live records than its ready record"
     );
     // Updates can leave a main/WAL overlap, while ordinary appends can extend
     // an older ready record. Require at least the recorded distinct count,
     // not exact physical count, size, generation, or a model revision guess.
-    checkpoint_coverage::require_distinct_live(&index, artifact.doc_count)?;
+    checkpoint_coverage::require_distinct_live(&index, doc_count)?;
     // A valid header and sufficient IDs do not prove usable persisted signal.
     // Admit the effective payload before data sync can authorize reclamation.
     vectors::require_usable_live_vectors(&index)?;
@@ -103,3 +162,5 @@ fn sync_reference_parent(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_shards;
