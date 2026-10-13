@@ -10,8 +10,8 @@ use std::path::Path;
 
 use coding_agent_search::sources::sync::path_to_safe_dirname;
 use franken_agent_detection::{
-    Connector, CursorConnector, FactoryConnector, GeminiConnector, NormalizedConversation,
-    Origin, Platform, PrimeAgentConnector, ScanContext, ScanRoot, VibeConnector,
+    Connector, CursorConnector, FactoryConnector, GeminiConnector, NormalizedConversation, Origin,
+    Platform, PrimeAgentConnector, ScanContext, ScanRoot, VibeConnector,
 };
 
 include!("support/remote_mirror_cursor_fixture.rs");
@@ -159,11 +159,7 @@ fn hashed_mirrors_parse_like_local_stores_across_copy_layouts() {
             assert_eq!(expected[0].messages.len(), 2, "native {}", case.source);
             assert!(expected[0].external_id.is_some());
 
-            let source = format!(
-                "{}{}",
-                case.source,
-                if trailing_slash { "/" } else { "" }
-            );
+            let source = format!("{}{}", case.source, if trailing_slash { "/" } else { "" });
             let wrapper = tmp
                 .path()
                 .join("remotes/mirror-host/mirror")
@@ -183,11 +179,8 @@ fn hashed_mirrors_parse_like_local_stores_across_copy_layouts() {
                 root.rewrite_workspace("/srv/project", Some(case.slug)),
                 "/mapped/project"
             );
-            let mut ctx = ScanContext::with_roots(
-                tmp.path().join("state"),
-                vec![root.clone(), root],
-                None,
-            );
+            let mut ctx =
+                ScanContext::with_roots(tmp.path().join("state"), vec![root.clone(), root], None);
             let label = format!("{source}, retained={retain_basename}");
             let sources = case.connector.discover_source_files(&ctx).unwrap();
             assert_eq!(sources.len(), 1, "{label}");
@@ -216,7 +209,12 @@ fn hashed_mirrors_parse_like_local_stores_across_copy_layouts() {
             assert_eq!(fs::read(&mirrored_file).unwrap(), case.bytes, "{label}");
 
             ctx.since_ts = Some(i64::MAX);
-            assert!(case.connector.discover_source_files(&ctx).unwrap().is_empty());
+            assert!(
+                case.connector
+                    .discover_source_files(&ctx)
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(case.connector.scan(&ctx).unwrap().is_empty());
         }
     }
@@ -238,11 +236,19 @@ fn prime_mirrors_require_prime_ownership_not_a_shared_wire_format() {
         put(&wrapper.join("sessions/prime-test.jsonl"), &prime.bytes);
         let ctx = ScanContext::with_roots(
             tmp.path().join("state"),
-            vec![ScanRoot::remote(wrapper, Origin::remote("mirror-host"), None)
-                .with_mirrored_source_path(source)],
+            vec![
+                ScanRoot::remote(wrapper, Origin::remote("mirror-host"), None)
+                    .with_mirrored_source_path(source),
+            ],
             None,
         );
-        assert!(prime.connector.discover_source_files(&ctx).unwrap().is_empty());
+        assert!(
+            prime
+                .connector
+                .discover_source_files(&ctx)
+                .unwrap()
+                .is_empty()
+        );
         assert!(prime.connector.scan(&ctx).unwrap().is_empty());
     }
 }
