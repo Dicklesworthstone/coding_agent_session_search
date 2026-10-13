@@ -1,0 +1,101 @@
+name: GH520 prepare exact mirror dependency pin
+
+# This job only prepares Git blobs. It cannot publish a branch or a release.
+# The calling session reviews the complete diff before updating main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/gh520-prepare-mirror-pin.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # Git blob creation only; no ref update in this workflow.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prove exact replacements and prepare immutable Git objects
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import tomllib
+          import urllib.request
+
+          old = 'b0cabe3e301b0bb2b2a288e06b048067fa037131'
+          new = '4e668da3828cc6a73467ee241d63f89fd26e742e'
+          repo = 'Dicklesworthstone/coding_agent_session_search'
+          base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if base != os.environ['GITHUB_SHA']:
+              raise SystemExit('checkout differs from the triggering commit')
+          paths = {'Cargo.toml': 1, 'Cargo.lock': 2, 'build.rs': 1}
+          before = {path: pathlib.Path(path).read_bytes() for path in paths}
+          if all(old.encode() not in data and data.count(new.encode()) == paths[path]
+                 for path, data in before.items()):
+              print('GH520: all three dependency files already use the selected revision')
+              raise SystemExit(0)
+          after = {}
+          for path, count in paths.items():
+              data = before[path]
+              if data.count(old.encode()) != count or new.encode() in data:
+                  raise SystemExit(f'{path}: source revision drift; refusing replacement')
+              candidate = data.replace(old.encode(), new.encode())
+              if candidate.replace(new.encode(), old.encode()) != data:
+                  raise SystemExit(f'{path}: replacement is not byte-reversible')
+              after[path] = candidate
+
+          manifest_before = tomllib.loads(before['Cargo.toml'].decode())
+          manifest_after = tomllib.loads(after['Cargo.toml'].decode())
+          dep = manifest_after['dependencies']['franken-agent-detection']
+          if dep['rev'] != new or dep['version'] != '=0.3.10':
+              raise SystemExit('unexpected FAD manifest dependency')
+          dep['rev'] = old
+          if manifest_after != manifest_before:
+              raise SystemExit('manifest changed beyond the FAD revision')
+          lock_before = tomllib.loads(before['Cargo.lock'].decode())
+          lock_after = tomllib.loads(after['Cargo.lock'].decode())
+          packages = [p for p in lock_after['package'] if p['name'] == 'franken-agent-detection']
+          expected_source = f'git+https://github.com/Dicklesworthstone/franken_agent_detection?rev={new}#{new}'
+          if len(packages) != 1 or packages[0]['source'] != expected_source:
+              raise SystemExit('unexpected FAD lockfile identity')
+          packages[0]['source'] = expected_source.replace(new, old)
+          if lock_after != lock_before:
+              raise SystemExit('lockfile packages, checksums or graph changed beyond the FAD source')
+          if f'expected_rev: "{new}"'.encode() not in after['build.rs']:
+              raise SystemExit('build-time contract is not aligned')
+
+          result = {'base_commit': base, 'fad_revision': new, 'files': {}}
+          for path, data in after.items():
+              digest = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              request = urllib.request.Request(
+                  f'https://api.github.com/repos/{repo}/git/blobs',
+                  data=json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
+                           'X-GitHub-Api-Version': '2022-11-28'}, method='POST')
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  blob = json.load(response)
+              if blob.get('sha') != digest:
+                  raise SystemExit(f'{path}: GitHub returned an unexpected blob identity')
+              result['files'][path] = {'sha': digest, 'bytes': len(data)}
+          encoded = json.dumps(result, sort_keys=True)
+          print('GH520_PREPARED_BLOBS=' + encoded)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Exact byte-reversible FAD pin replacements prepared; no branch updated.\n\n```json\n' + encoded + '\n```\n')
+          PY
