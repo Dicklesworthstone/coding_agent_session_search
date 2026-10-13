@@ -82,6 +82,16 @@ and the authenticated current generation protect referenced paths and resolved
 aliases, including references marked not ready. Main/WAL ownership is protected
 as a pair.
 
+Direct full rebuilds and canonical reconciliation now take the same artifact
+lease and put new private candidates in `.backfill-reuse-*` directories. The
+lease outlives their temporary directory. Ordinary return or unwinding removes
+only that invocation's private scratch; process termination leaves it available
+for the next lock-guarded recovery. A direct rebuild attempts recovery before
+allocating another candidate. Cleanup failure retains evidence and does not
+change that writer's independent native publication-admission contract.
+Historical `.semantic-full-rebuild-*` and `.semantic-reconcile-*` directories
+remain excluded: their writers did not require this lease.
+
 Canonical index names, generation directories, shard directories, quarantine,
 and unrelated files are not swept. Candidate symlinks and Windows reparse
 points are not followed. Links inside an otherwise orphaned scratch directory
@@ -91,11 +101,14 @@ checkpoint data retains potential fallback artifacts.
 
 When candidates exist and the manifest names a resumable checkpoint, recovery
 also requires that checkpoint to open through the engine's read-only FSVI reader
-with the recorded producer ID. Its live main slots (physical slots minus
-tombstones) plus replayable WAL records must also cover the checkpoint's recorded
-document count. This rejects lost acknowledged WAL records without rejecting a
-valid append ahead of the last
-checkpoint. An empty, truncated, unreadable, underfilled, or wrong-producer
+with the recorded producer ID. First, live main slots (physical slots minus
+tombstones) plus replayable WAL records must cover the recorded document count.
+Then the union of distinct live main and replayed WAL document IDs must cover
+that count too. An interrupted append can leave its older main slot live after
+the new WAL entry becomes durable: the overlap is one document, not two.
+Duplicate legacy main IDs cannot stand in for other acknowledged documents.
+Additional distinct records ahead of the last checkpoint remain permitted.
+An empty, truncated, unreadable, underfilled, or wrong-producer
 checkpoint cannot authorize deleting older copies. Preview, apply, and automatic
 startup cleanup share this check. Inspection never compacts or repairs its WAL,
 and does not select an orphan as a replacement. Resolve the checkpoint problem
@@ -108,8 +121,12 @@ directories. Byte figures are logical regular-file lengths, not allocated disk
 blocks or a guarantee of immediately freed physical space. A failed partial
 removal is not included in the reclaimed-byte total. Inspection walks scratch
 metadata with an entry budget; approval fingerprints do not hash vector payloads.
-The separate checkpoint-reader admission above may read the checkpoint's WAL;
-it is skipped when there are no candidate deletions or no active checkpoint.
+The separate checkpoint-reader admission above may read the checkpoint's WAL
+and main document-ID table, but does not read the main vector slab. Its temporary
+hash set borrows IDs rather than copying text or vectors, grows fallibly, and
+stops at the acknowledged distinct-document count. Additional memory is
+proportional to that count; this is not a constant-memory checkpoint check.
+It is skipped when there are no candidate deletions or no active checkpoint.
 
 The locks serialize cooperating CASS writers. This is not a sandbox against an
 uncooperative same-user process changing the filesystem during recovery. The
@@ -140,6 +157,7 @@ cargo test --locked --lib indexer::semantic::artifacts::inspection::tests
 cargo test --locked --lib indexer::semantic::artifact_lifecycle_tests
 cargo test --locked --lib indexer::semantic::artifacts::checkpoint_tests
 cargo test --locked --lib indexer::semantic::artifacts::storage_tests
+cargo test --locked --lib indexer::semantic::delegate::rebuild::scratch_tests
 cargo test --locked --bin cass semantic_reclaim_cli::tests
 cargo test --locked --bin cass-semantic-reclaim
 cargo test --locked --test semantic_reclaim_entrypoint

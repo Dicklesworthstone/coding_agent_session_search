@@ -17,6 +17,7 @@ use crate::search::semantic_manifest::{
 };
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 
+mod checkpoint_coverage;
 mod inspection;
 
 #[cfg(test)]
@@ -716,10 +717,9 @@ fn validate_reclaim_checkpoint(path: &Path, checkpoint: &BuildCheckpoint) -> Res
         .record_count()
         .checked_sub(index.tombstone_count())
         .context("invalid checkpoint tombstone count; retaining fallback artifacts")?;
-    // This remains an upper bound, not an exact canonical-coverage proof:
-    // replayable WAL entries may overlap surviving main IDs after a crash.
-    // Extra live records are allowed when a writer appended its next batch
-    // without advancing the durable checkpoint. Never repair or compact here.
+    // Reject a short physical upper bound before allocating an identity set.
+    // Passing this bound alone is insufficient: replayable WAL entries may
+    // overlap surviving main IDs after a crash. Check distinct identities below.
     let available = u64::try_from(live_main)
         .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(index.wal_record_count()).unwrap_or(u64::MAX));
@@ -730,7 +730,8 @@ fn validate_reclaim_checkpoint(path: &Path, checkpoint: &BuildCheckpoint) -> Res
         available,
         checkpoint.docs_embedded
     );
-    Ok(())
+    checkpoint_coverage::require_distinct_live(&index, checkpoint.docs_embedded)
+        .with_context(|| format!("validate resumable checkpoint {}", path.display()))
 }
 
 fn open_checkpoint_file(path: &Path) -> Result<Option<File>> {
