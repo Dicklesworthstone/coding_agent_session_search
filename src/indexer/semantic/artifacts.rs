@@ -783,6 +783,11 @@ fn validate_reclaim_checkpoint(path: &Path, checkpoint: &BuildCheckpoint) -> Res
         checkpoint.docs_embedded
     );
     checkpoint_coverage::require_distinct_live(&index, checkpoint.docs_embedded)
+        .with_context(|| format!("validate resumable checkpoint {}", path.display()))?;
+    // IDs alone do not make a replacement usable: quantization can leave a
+    // complete checkpoint with zero/non-finite signal. Check effective live
+    // payloads before any fallback is retired, just as for ready publications.
+    publication::validate_checkpoint_payload(&index)
         .with_context(|| format!("validate resumable checkpoint {}", path.display()))
 }
 

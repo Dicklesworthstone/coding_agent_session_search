@@ -156,6 +156,16 @@ fn validate_data(
     pin(path, &main, &wal_path, wal.as_ref())
 }
 
+/// Apply the same effective-vector contract to a retained resumable checkpoint.
+/// Keep failures untyped here: unlike an unavailable completed publication, an
+/// invalid checkpoint must not let startup enter the engine with its old cursor.
+/// This reads live payloads, respects WAL replacement precedence, and never
+/// repairs or compacts the main/WAL pair.
+pub(super) fn validate_checkpoint_payload(index: &VectorIndex) -> Result<()> {
+    vectors::require_usable_live_vectors(index)
+        .context("resumable checkpoint payload is unusable; retaining fallback artifacts")
+}
+
 fn sync_reference_parent(path: &Path) -> Result<()> {
     let parent = path.parent().context("published vector has no directory")?;
     sync_directory(parent)?;
