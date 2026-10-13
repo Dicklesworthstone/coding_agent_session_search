@@ -1,0 +1,147 @@
+# Publication bridge for the oversized src/lib.rs; retire the write job once
+# the source change lands. Validation has read-only repository permissions.
+name: Apply and validate timeline GH521
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply-timeline-gh521-once.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cass-timeline-gh521
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.publish.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Resolve the repository-pinned formatter
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --version
+      - name: Apply only the guarded timeline query change
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Refresh before editing; never overwrite another writer's commit.
+          git fetch origin main
+          git merge --ff-only origin/main
+          python3 - <<'PY'
+          import difflib
+          import hashlib
+          import re
+          from pathlib import Path
+
+          path = Path('src/lib.rs')
+          raw = path.read_bytes()
+          source = raw.decode('utf-8')
+          starts = list(re.finditer(r'(?m)^fn run_timeline\s*\(', source))
+          if len(starts) != 1:
+              raise SystemExit('Expected exactly one top-level run_timeline')
+          start = starts[0].start()
+          close = re.search(r'(?m)^}\s*$', source[starts[0].end():])
+          if close is None:
+              raise SystemExit('Missing run_timeline terminator')
+          end = starts[0].end() + close.end()
+          body = source[start:end]
+          print('timeline_before_sha256=' + hashlib.sha256(body.encode()).hexdigest())
+          count = re.compile(r'COUNT\(m\.id\)(\s+(?i:as)\s+message_count)')
+          join = re.compile(r'(?m)^[ \t]*LEFT JOIN messages m ON m\.conversation_id = c\.id[ \t]*\n')
+          group = re.compile(r'GROUP BY c\.id(?= ORDER BY c\.started_at DESC)')
+          replacement = '(SELECT COUNT(m.id) FROM messages m WHERE m.conversation_id = c.id)'
+          if replacement in body and not join.search(body) and not group.search(body):
+              print('Exact GH521 query change already present; no source rewrite')
+          else:
+              for name, pattern in [('count projection', count), ('message join', join), ('group operator', group)]:
+                  if len(list(pattern.finditer(body))) != 1:
+                      print(body)
+                      raise SystemExit('Refusing unexpected timeline source: ' + name)
+              c, j, g = count.search(body), join.search(body), group.search(body)
+              if not c.start() < j.start() < g.start():
+                  raise SystemExit('Unexpected timeline query layout')
+              if 'FROM conversations c' not in body[c.end():j.start()] or 'WHERE' not in body[j.end():g.start()]:
+                  raise SystemExit('Conversation selection/filter guard failed')
+              # Preserve the WHERE clauses, all parameter bindings, provenance
+              # normalization, timestamp units, ORDER BY and all output code.
+              updated_body = count.sub(lambda m: replacement + m.group(1), body)
+              updated_body = join.sub('', updated_body)
+              updated_body = group.sub('', updated_body)
+              updated = source[:start] + updated_body + source[end:]
+              if path.read_bytes() != raw:
+                  raise SystemExit('src/lib.rs changed during preparation')
+              print(''.join(difflib.unified_diff(source.splitlines(True), updated.splitlines(True), fromfile='a/src/lib.rs', tofile='b/src/lib.rs')))
+              path.write_bytes(updated.encode('utf-8'))
+              print('timeline_after_sha256=' + hashlib.sha256(updated_body.encode()).hexdigest())
+          PY
+          rustfmt --edition 2024 tests/cli_timeline_gh521.rs
+          git diff --check
+          git diff --stat
+      - name: Commit directly to main without force or a PR
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only these two paths are ours; no bulk staging of concurrent work.
+          git add src/lib.rs tests/cli_timeline_gh521.rs
+          if ! git diff --cached --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m 'fix(timeline): count only selected conversations without archive-wide grouping (GH521)' \
+              -m 'Keep time, agent and source predicates and all output/order semantics unchanged. Remove the outer messages join and GROUP BY so message content is not materialized to calculate counts. Engine validation runs separately on this exact commit; no passing result is claimed by publication.'
+            git push origin HEAD:main
+          fi
+          sha=$(git rev-parse HEAD)
+          printf 'source_sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'Published source commit: `%s`\n\nEngine validation is the separate validate job.\n' "$sha" >> "$GITHUB_STEP_SUMMARY"
+
+  validate:
+    needs: apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '16777216'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.apply.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Record the exact source and compiler
+        run: |
+          git rev-parse HEAD
+          git hash-object src/lib.rs tests/cli_timeline_gh521.rs Cargo.toml Cargo.lock
+          rustc --version
+          cargo --version
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Compile and lint the affected integration suites
+        run: cargo clippy --locked --test cli_timeline_gh521 --test cli_dispatch_coverage -- -D warnings
+      - name: Existing CLI timeline regressions
+        run: cargo test --locked --test cli_dispatch_coverage timeline -- --nocapture
+      - name: Inclusive windows, filters, lifetime counts and output contracts
+        run: cargo test --locked --test cli_timeline_gh521 gh521_filters -- --nocapture
+      - name: Archive-scale real-CASS RSS regression
+        run: cargo test --locked --test cli_timeline_gh521 gh521_narrow_window -- --ignored --nocapture
