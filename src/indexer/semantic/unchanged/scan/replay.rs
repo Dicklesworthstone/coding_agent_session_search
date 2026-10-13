@@ -1,8 +1,8 @@
 //! Lazy canonical replay for a read-only unchanged proof.
 //!
-//! Page only parent IDs and envelopes. Load one parent's messages immediately
-//! before visiting it, and stop before another body load on a delta/error/stop.
-//! A whole conversation can still be large; this is not a byte or RSS ceiling.
+//! Page only parent IDs and envelopes, then stream each parent's message rows.
+//! The proof retains one message's packet/passages, not a conversation's history.
+//! One message and engine scratch can still be large; this is not an RSS ceiling.
 
 use super::{Coverage, engine};
 use crate::franken_sync::{SqliteValue, compat::{ConnectionExt, ParamValue, RowExt}};
@@ -79,6 +79,7 @@ fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn messages(storage: &FrankenStorage, id: i64) -> Result<Vec<Message>> {
     // Use the SAME uncapped projection as engine replay. The lexical-only
     // single-conversation helper truncates content and cannot prove semantics.
@@ -91,12 +92,39 @@ pub(super) fn visit(
     consume: impl FnMut(engine::EmbeddingInput) -> Result<()>,
     check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<Coverage> {
-    visit_with_loader(storage, |id| messages(storage, id), consume, check_cancelled)
+    visit_with_reader(
+        storage,
+        |id, emit| stream::messages(storage.raw(), id, emit),
+        consume,
+        check_cancelled,
+    )
 }
 
+// Keep the original loader regressions on the same packet/coverage path. Only
+// this test adapter collects bodies; production never enters the Vec loader.
+#[cfg(test)]
 fn visit_with_loader(
     storage: &FrankenStorage,
     mut load: impl FnMut(i64) -> Result<Vec<Message>>,
+    consume: impl FnMut(engine::EmbeddingInput) -> Result<()>,
+    check_cancelled: impl FnMut() -> Result<()>,
+) -> Result<Coverage> {
+    visit_with_reader(
+        storage,
+        |id, emit| {
+            for message in load(id)? {
+                emit(message)?;
+            }
+            Ok(())
+        },
+        consume,
+        check_cancelled,
+    )
+}
+
+fn visit_with_reader(
+    storage: &FrankenStorage,
+    mut read: impl FnMut(i64, &mut dyn FnMut(Message) -> Result<()>) -> Result<()>,
     mut consume: impl FnMut(engine::EmbeddingInput) -> Result<()>,
     mut check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<Coverage> {
@@ -131,30 +159,40 @@ fn visit_with_loader(
             "unchanged-proof parent page did not advance strictly"
         );
         check_cancelled()?;
-        for mut envelope in envelopes(storage, &ids)? {
+        for envelope in envelopes(storage, &ids)? {
             check_cancelled()?;
-            envelope.conversation.messages = load(envelope.context.conversation_id)?;
-            check_cancelled()?;
-            if envelope.conversation.messages.is_empty() {
-                continue;
-            }
-            // Count actual nonempty parents before semantic projection: blank
-            // messages count, empty parents do not, and passage count is unrelated.
-            coverage.0 = coverage.0.checked_add(1).context("canonical parent count overflow")?;
-            coverage.1 = envelope.context.conversation_id;
-            // Move message strings into the established canonical encoder,
-            // rather than cloning a second full conversation. Use its semantic
-            // projection/chunking/provenance, not a parallel document-ID format.
-            let packet = ConversationPacket::from_canonical_replay_owned(
-                envelope.conversation, envelope.provenance,
-            );
-            let inputs = engine::semantic_inputs_from_packets(
-                std::slice::from_ref(&packet), std::slice::from_ref(&envelope.context),
-            )?;
-            drop(packet);
-            for input in inputs {
+            let mut nonempty = false;
+            read(envelope.context.conversation_id, &mut |message| {
                 check_cancelled()?;
-                consume(input)?;
+                nonempty = true;
+                // The canonical semantic projection/chunking is per message.
+                // Clone only the empty envelope; move this row's full text into
+                // the existing packet encoder. No content truncation or second
+                // identity format is introduced, and no SQL is issued here.
+                let mut conversation = envelope.conversation.clone();
+                conversation.messages.push(message);
+                let packet = ConversationPacket::from_canonical_replay_owned(
+                    conversation, envelope.provenance.clone(),
+                );
+                let inputs = engine::semantic_inputs_from_packets(
+                    std::slice::from_ref(&packet), std::slice::from_ref(&envelope.context),
+                )?;
+                drop(packet);
+                for input in inputs {
+                    check_cancelled()?;
+                    consume(input)?;
+                    // A stop observed after an input must unwind the active
+                    // cursor before it admits another row of this same history.
+                    check_cancelled()?;
+                }
+                check_cancelled()
+            })?;
+            check_cancelled()?;
+            if nonempty {
+                // Blank/unsupported messages still make the parent nonempty.
+                // Never return partial coverage after a consumer or SQL error.
+                coverage.0 = coverage.0.checked_add(1).context("canonical parent count overflow")?;
+                coverage.1 = envelope.context.conversation_id;
             }
         }
         cursor = ids.last().copied();
@@ -165,5 +203,10 @@ fn visit_with_loader(
     }
 }
 
+mod stream;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod streaming_tests;
