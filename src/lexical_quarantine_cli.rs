@@ -64,13 +64,38 @@ fn render(inventory: &Inventory, json: bool, output: &mut impl Write) -> io::Res
     } else {
         writeln!(output, "Lexical rebuild quarantines: {} (complete: {})",
             inventory.artifacts.len(), inventory.complete)?;
-        writeln!(output, "Logical bytes retained: {}; eligible under index-run lock: {}",
+        let byte_label = if inventory.complete {
+            "Logical bytes retained"
+        } else {
+            "Observed logical bytes (incomplete; not a total)"
+        };
+        writeln!(output, "{byte_label}: {}; eligible under index-run lock: {}",
             inventory.total_bytes, inventory.eligible_bytes)?;
         for artifact in &inventory.artifacts {
-            writeln!(output, "{}\t{} bytes\t{:?}\t{}",
-                artifact.path.display(), artifact.size_bytes, artifact.disposition, artifact.reason)?;
+            let age = artifact.age_seconds.map_or_else(
+                || "unknown/future".to_owned(), |seconds| format!("{seconds}s"));
+            let size = if artifact.size_complete {
+                format!("{} bytes", artifact.size_bytes)
+            } else {
+                "unknown (scan incomplete)".to_owned()
+            };
+            // Debug formatting escapes control characters in paths and reasons.
+            writeln!(output, "{:?}\t{size}\tage={age}\t{:?}\t{:?}",
+                artifact.path, artifact.disposition, artifact.reason)?;
+            for evidence in &artifact.failure_evidence {
+                writeln!(output, "  evidence: {:?}\t{:?}\t{} bytes (contents not inspected)",
+                    evidence.kind, evidence.relative_path, evidence.size_bytes)?;
+            }
+            if !artifact.size_complete {
+                writeln!(output, "  evidence inventory incomplete; absence is not established")?;
+            }
         }
-        for warning in &inventory.warnings { writeln!(output, "Warning: {warning}")?; }
+        for warning in &inventory.warnings { writeln!(output, "Warning: {warning:?}")?; }
+        if inventory.artifacts.iter().filter(|artifact|
+            artifact.has_evidence && !artifact.interrupted_reclaim).take(2).count() > 1
+        {
+            writeln!(output, "Repeated failed rebuild evidence is present; retention does not repair rebuild certification.")?;
+        }
         writeln!(output, "Read-only inspection. The newest bundle and evidence newer than six hours are retained.")?;
     }
     output.flush()
@@ -116,3 +141,6 @@ mod tests {
         assert_eq!(clap_commands()[0].get_name(), "lexical-quarantine");
     }
 }
+
+#[cfg(test)]
+mod evidence_tests;

@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 pub mod cleanup;
+mod evidence;
+pub use evidence::{EvidenceKind, FailureEvidence};
 mod retention;
 pub(crate) use retention::reclaim_under_index_run_lock;
 
@@ -43,6 +45,9 @@ pub struct Artifact {
     pub path: PathBuf,
     pub interrupted_reclaim: bool,
     pub has_evidence: bool,
+    /// Known diagnostic files, observed without reading their contents.
+    /// An empty list is not proof of absence unless size_complete is true.
+    pub failure_evidence: Vec<FailureEvidence>,
     /// Logical regular-file lengths, not allocated blocks or guaranteed savings.
     pub size_bytes: u64,
     pub size_complete: bool,
@@ -213,6 +218,7 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
     let mut latest = root.modified()?;
     let mut bytes = 0_u64;
     let mut nodes = Vec::new();
+    let mut failure_evidence = Vec::new();
     let mut has_index = false;
     let mut has_checkpoint = false;
     let mut has_pending_child = false;
@@ -264,6 +270,9 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
         if metadata.is_file() {
             bytes = bytes.checked_add(metadata.len()).ok_or_else(|| io::Error::other("quarantine byte count overflow"))?;
         }
+        if let Some(evidence) = evidence::observe_file(relative, pending, &metadata) {
+            failure_evidence.push(evidence);
+        }
         nodes.push((relative.to_owned(), stamp(relative, &metadata)?));
     }
     // Empty reservations can remain after a failed rename, or after interrupted
@@ -273,12 +282,13 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
     if pending && has_evidence && !has_pending_child {
         return Err(io::Error::other("invalid interrupted quarantine layout"));
     }
+    failure_evidence.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     nodes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut hash = blake3::Hasher::new();
     for (_, node) in nodes { hash.update(node.as_bytes()); }
     budget.check()?;
     Ok(Artifact {
-        path: path.to_owned(), interrupted_reclaim: pending, has_evidence, size_bytes: bytes,
+        path: path.to_owned(), interrupted_reclaim: pending, has_evidence, failure_evidence, size_bytes: bytes,
         size_complete: true, age_seconds: now.duration_since(latest).ok().map(|age| age.as_secs()),
         disposition: Disposition::Inspect, reason: String::new(), modified: Some(latest),
         metadata_fingerprint: Some(hash.finalize().to_hex().to_string()),
@@ -371,7 +381,7 @@ fn inspect_at(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -
                 Err(error) => {
                     inventory.complete = false;
                     inventory.artifacts.push(Artifact {
-                        path, interrupted_reclaim: pending, has_evidence: false, size_bytes: 0, size_complete: false,
+                        path, interrupted_reclaim: pending, has_evidence: false, failure_evidence: Vec::new(), size_bytes: 0, size_complete: false,
                         age_seconds: None, disposition: Disposition::Inspect, reason: error.to_string(),
                         modified: None, metadata_fingerprint: None,
                     });
