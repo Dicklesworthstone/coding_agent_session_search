@@ -18,7 +18,10 @@ use std::fmt;
 
 pub use exclusions::RawMirrorSourceExcluded;
 pub use store::*;
-pub use store::policy::{RawMirrorCapturePaused, RawMirrorRetentionPolicy};
+pub use store::policy::{
+    RawMirrorAutomaticRetention, RawMirrorCapturePaused, RawMirrorMaintenanceReport,
+    RawMirrorRetentionPolicy, maintain_before_index,
+};
 
 /// Capture was switched off by the operator with `CASS_RAW_MIRROR` (GH #506).
 /// Like [`RawMirrorSourceExcluded`], it names no source path or contents.

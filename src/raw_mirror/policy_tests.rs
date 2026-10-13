@@ -174,6 +174,7 @@ fn whole_blob_and_chunked_captures_remain_mutually_readable() {
     assert_eq!(contents(&data, &bounded), original);
 }
 
+#[cfg(unix)]
 #[test]
 fn persisted_cache_is_still_usable_without_a_source_copy() {
     let temp = tempfile::tempdir().unwrap();

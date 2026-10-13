@@ -83,7 +83,7 @@ impl Budget<'_> {
     fn reserve_with_available(&mut self, bytes: u64, available: u64) -> Result<()> {
         // Include one allocation block per new file in admission. Filesystem
         // free space is checked independently; the mirror cap is file bytes.
-        let requested = bytes.checked_add(4096).unwrap_or(u64::MAX);
+        let requested = bytes.saturating_add(4096);
         let next = bytes.checked_add(4096).and_then(|size| self.used.checked_add(size));
         if next.is_none_or(|next| next > self.policy.max_bytes)
             || available < self.policy.min_free_bytes
@@ -209,7 +209,6 @@ fn prepare_bounded(
         remaining -= length as u64;
         if remaining == 0 { break; }
     }
-    drop(snapshot);
     if source_file_changed_during_capture(metadata, &source.metadata()?)
         || source_path_changed_identity_during_capture(input.source_path, metadata)
     {
@@ -404,3 +403,8 @@ mod tests {
 pub(crate) fn capture_default(input: RawMirrorCaptureInput<'_>, policy: RawMirrorRetentionPolicy) -> Result<RawMirrorCaptureRecord> {
     capture(input, RAW_MIRROR_CHUNK_THRESHOLD_BYTES, RAW_MIRROR_CHUNK_SIZE_BYTES, policy)
 }
+
+mod retention {
+    include!("retention.rs");
+}
+pub use retention::{RawMirrorAutomaticRetention, RawMirrorMaintenanceReport, maintain_before_index};
