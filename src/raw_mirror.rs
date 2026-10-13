@@ -41,6 +41,21 @@ pub fn capture_enabled() -> bool {
         .unwrap_or(true)
 }
 
+// GH #522: the v1 store already deduplicates complete chunks. The amplification
+// is the whole-file path below 8 MiB and the changing, up-to-4-MiB final chunk.
+// Use the SAME fixed_chunks_v1 codec with smaller chunks for append-oriented
+// transcript formats. This keeps old captures readable and bounds a recapture's
+// duplicate tail to less than 256 KiB, without assuming an unchanged prefix.
+const TRANSCRIPT_CHUNK_BYTES: usize = 256 * 1024;
+
+fn is_append_transcript(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("jsonl") || extension.eq_ignore_ascii_case("ndjson")
+        })
+}
+
 /// Capture an admitted source using the existing raw-mirror storage policy.
 ///
 /// With capture switched off this returns [`RawMirrorCaptureDisabled`], and an
@@ -54,7 +69,15 @@ pub fn capture_source_file(
         return Err(RawMirrorCaptureDisabled.into());
     }
     exclusions::ensure_allowed(input.source_path)?;
-    store::capture_source_file(input)
+    if is_append_transcript(input.source_path) {
+        store::capture_source_file_with_chunk_policy(
+            input,
+            TRANSCRIPT_CHUNK_BYTES as u64,
+            TRANSCRIPT_CHUNK_BYTES,
+        )
+    } else {
+        store::capture_source_file(input)
+    }
 }
 
 #[cfg(test)]
@@ -69,6 +92,9 @@ pub(crate) fn capture_source_file_with_chunk_policy(
     exclusions::ensure_allowed(input.source_path)?;
     store::capture_source_file_with_chunk_policy(input, chunk_threshold_bytes, chunk_size_bytes)
 }
+
+#[cfg(test)]
+mod append_tests;
 
 #[cfg(all(test, unix))]
 mod tests {
