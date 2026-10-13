@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
     paths:
+      - src/lib.rs
+      - src/franken_sync.rs
       - scripts/apply_gh521_timeline_fix.py
       - tests/timeline_memory_regression.rs
       - .github/workflows/gh521-timeline-memory.yml
@@ -54,23 +56,6 @@ jobs:
           rustfmt --edition 2024 tests/timeline_memory_regression.rs
           cargo fmt --all -- --check
           git diff --check
-      - name: Commit the focused fix directly to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! git diff --quiet -- src/lib.rs tests/timeline_memory_regression.rs; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add src/lib.rs tests/timeline_memory_regression.rs
-            git commit -m 'fix(timeline): count selected sessions without a whole-message-table join (#521)'
-            git pull --rebase origin main
-            python3 scripts/apply_gh521_timeline_fix.py --check
-            git push origin HEAD:main
-            # The repository requires the legacy compatibility ref to follow main.
-            # Never force either branch: concurrent updates must not be overwritten.
-            git push origin HEAD:master || echo "::warning::Legacy ref was not fast-forwardable; main is preserved"
-          fi
-          git rev-parse HEAD | tee test-results/gh521/candidate-commit.txt
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh521-timeline
@@ -95,6 +80,24 @@ jobs:
         run: |
           set -euo pipefail
           cargo clippy --locked --test timeline_memory_regression -- -D warnings 2>&1 | tee test-results/gh521/clippy.log
+      - name: Commit the validated fix directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- src/lib.rs tests/timeline_memory_regression.rs; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add src/lib.rs tests/timeline_memory_regression.rs
+            git commit -m 'fix(timeline): count selected sessions without a whole-message-table join (#521)'
+            # Do not rebase after testing: that would publish an untested merge.
+            # A concurrent main update must reject this fast-forward-only push.
+            python3 scripts/apply_gh521_timeline_fix.py --check
+            git push origin HEAD:main
+            # The repository requires the legacy compatibility ref to follow main.
+            # Never force either branch: concurrent updates must not be overwritten.
+            git push origin HEAD:master || echo "::warning::Legacy ref was not fast-forwardable; main is preserved"
+          fi
+          git rev-parse HEAD | tee test-results/gh521/validated-commit.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
