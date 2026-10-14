@@ -48,6 +48,10 @@ use super::{
 /// Default connection timeout in seconds.
 pub const DEFAULT_PROBE_TIMEOUT: u64 = 10;
 
+/// Network fan-out per probe batch, independent of CPU count or Rayon settings.
+/// This bounds simultaneous SSH probes, not the number of eligible hosts.
+const MAX_PARALLEL_PROBES: usize = 4;
+
 /// Result of probing an SSH host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostProbeResult {
@@ -729,8 +733,11 @@ fn infer_agent_type(path: &str) -> String {
 
 /// Probe multiple hosts in parallel.
 ///
-/// Uses rayon's parallel iterator to probe hosts concurrently, calling the
-/// progress callback as each probe completes.
+/// Uses a dedicated Rayon pool with at most four workers per batch, calling
+/// the progress callback as each probe completes. CPU count, a caller's Rayon
+/// pool and RAYON_NUM_THREADS cannot increase SSH fan-out. Every supplied host
+/// still receives one result, in input order; the limit never truncates a fleet.
+/// If worker creation fails, the same probes run sequentially on the caller.
 ///
 /// # Arguments
 /// * `hosts` - Slice of discovered hosts to probe
@@ -751,22 +758,33 @@ where
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    if hosts.is_empty() {
+        return Vec::new();
+    }
     let total = hosts.len();
     let completed = Arc::new(AtomicUsize::new(0));
     let on_progress = Arc::new(on_progress);
+    let probe = |host: &DiscoveredHost| {
+        let result = probe_host(host, timeout_secs);
+        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+        on_progress(done, total, &host.name);
+        result
+    };
 
-    // Use rayon for true parallel execution
-    hosts
-        .par_iter()
-        .map(|host| {
-            let result = probe_host(host, timeout_secs);
-
-            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-            on_progress(done, total, &host.name);
-
-            result
-        })
-        .collect()
+    // GH505: a CPU-sized pool is not a network admission policy. Do not use
+    // the global/caller's Rayon pool, including as a thread-creation fallback.
+    // The empty case above also prevents num_threads(0) selecting CPU count.
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(total.min(MAX_PARALLEL_PROBES))
+        .thread_name(|index| format!("cass-ssh-probe-{index}"))
+        .build()
+    {
+        Ok(pool) => pool.install(|| hosts.par_iter().map(probe).collect()),
+        Err(error) => {
+            tracing::warn!(%error, "SSH probe worker pool unavailable; probing sequentially");
+            hosts.iter().map(probe).collect()
+        }
+    }
 }
 
 /// Cache for probe results to avoid repeated probing.
@@ -1840,12 +1858,7 @@ CASS_VERSION=0.4.2
                     .unwrap();
                 assert_eq!(source.host.as_deref(), Some(name));
                 assert_eq!(source.paths, vec![path]);
-                assert!(
-                    source
-                        .path_mappings
-                        .iter()
-                        .any(|mapping| mapping.from == home)
-                );
+                assert!(source.path_mappings.iter().any(|mapping| mapping.from == home));
                 assert!(source.validate().is_ok());
             }
             let (again, merged_again) = deduplicate_probe_results(deduped.clone());
@@ -1923,5 +1936,258 @@ CASS_VERSION=0.4.2
             serde_json::to_value([failed, good]).unwrap()
         );
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_probe_empty_never_reports_progress() {
+        let results = probe_hosts_parallel(&[], 1, |_, _, _| {
+            panic!("an empty batch must not report a completed probe");
+        });
+        assert!(results.is_empty());
+    }
+
+    /// Run only the named test in an isolated environment. Real OpenSSH uses
+    /// a refusing ProxyCommand; only external Tailscale status is a fixture.
+    /// No process-wide environment changes leak into parallel library tests.
+    #[cfg(target_os = "linux")]
+    fn bounded_probe_fixture_child(test_name: &str) -> bool {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        if dotenvy::var("CASS_TEST_BOUNDED_PROBE_CHILD").is_ok_and(|name| name == test_name) {
+            return true;
+        }
+        assert!(
+            Command::new("/usr/bin/ssh")
+                .arg("-V")
+                .output()
+                .expect("real OpenSSH is required")
+                .status
+                .success()
+        );
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["bin", "home", "config", "cache", "data"] {
+            fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let recorder = root.path().join("record-transport.sh");
+        fs::write(
+            &recorder,
+            r#"#!/bin/sh
+set -eu
+printf 'start %s\n' "$1" >> "$CASS_TEST_PROBE_ROOT/transports"
+/bin/sleep 0.1
+printf 'end %s\n' "$1" >> "$CASS_TEST_PROBE_ROOT/transports"
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::write(root.path().join("transports"), "").unwrap();
+        fs::write(
+            root.path().join("ssh_config"),
+            format!(
+                "Host *\n ProxyCommand /bin/sh \"{}\" %h\n BatchMode yes\n ConnectionAttempts 1\n\
+                 Host workstation\n HostName 100.64.0.1\n User developer\n Port 2222\n",
+                recorder.display()
+            ),
+        )
+        .unwrap();
+        let tailscale = root.path().join("bin/tailscale");
+        fs::write(
+            &tailscale,
+            r#"#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] && [ "$1" = status ] && [ "$2" = --json ] || exit 64
+printf 'status\n' >> "$CASS_TEST_PROBE_ROOT/status-calls"
+exec /bin/cat "$CASS_TEST_PROBE_ROOT/status.json"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&tailscale, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut peers = serde_json::Map::new();
+        for index in 1..=17 {
+            peers.insert(
+                format!("machine-{index}"),
+                serde_json::json!({"Online": true, "TailscaleIPs": [format!("100.64.0.{index}")]}),
+            );
+        }
+        peers.insert(
+            "tagged-provider".into(),
+            serde_json::json!({"Online": true, "Tags": ["tag:mullvad-exit-node"], "TailscaleIPs": ["100.90.0.1"]}),
+        );
+        peers.insert(
+            "dns-provider".into(),
+            serde_json::json!({"Online": true, "DNSName": "SE-STO-WG-001.MULLVAD.TS.NET.", "Tags": null, "TailscaleIPs": ["100.90.0.2"]}),
+        );
+        fs::write(
+            root.path().join("status.json"),
+            serde_json::to_vec(&serde_json::json!({"BackendState": "Running", "Peer": peers}))
+                .unwrap(),
+        )
+        .unwrap();
+        let output = assert_cmd::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .current_dir(root.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            )
+            .env("HOME", root.path().join("home"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("CASS_DATA_DIR", root.path().join("cass-data"))
+            .env("CASS_SSH_CONFIG", root.path().join("ssh_config"))
+            .env("CASS_TEST_PROBE_ROOT", root.path())
+            .env("CASS_TEST_BOUNDED_PROBE_CHILD", test_name)
+            .env("RAYON_NUM_THREADS", "32")
+            .env("RUST_MIN_STACK", "134217728")
+            .args([
+                "--exact",
+                test_name,
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .timeout(Duration::from_secs(60))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "the isolated regression must actually run: {output:?}"
+        );
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_bounded_probe_transports(expected: &[String]) {
+        use std::collections::BTreeSet;
+
+        let root = std::path::PathBuf::from(dotenvy::var("CASS_TEST_PROBE_ROOT").unwrap());
+        let trace = std::fs::read_to_string(root.join("transports")).unwrap();
+        let mut active = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for line in trace.lines() {
+            let (event, host) = line.split_once(' ').expect("transport event");
+            match event {
+                "start" => {
+                    assert!(active.insert(host.to_string()), "duplicate start: {trace}");
+                    assert!(seen.insert(host.to_string()), "repeated probe: {trace}");
+                    assert!(active.len() <= 4, "excessive SSH fan-out: {trace}");
+                }
+                "end" => assert!(active.remove(host), "unmatched completion: {trace}"),
+                _ => panic!("unexpected transport event: {line}"),
+            }
+        }
+        assert!(active.is_empty(), "unfinished transports: {trace}");
+        assert_eq!(seen, expected.iter().cloned().collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parallel_probe_fleet_is_bounded_and_complete() {
+        if !bounded_probe_fixture_child(
+            "sources::probe::tests::test_parallel_probe_fleet_is_bounded_and_complete",
+        ) {
+            return;
+        }
+        let root = std::path::PathBuf::from(dotenvy::var("CASS_TEST_PROBE_ROOT").unwrap());
+        for parent_workers in [1, 32] {
+            let parent = rayon::ThreadPoolBuilder::new()
+                .num_threads(parent_workers)
+                .build()
+                .unwrap();
+            for count in [1, 3, 4, 5, 17] {
+                std::fs::write(root.join("transports"), "").unwrap();
+                let hosts: Vec<_> = (1..=count)
+                    .rev()
+                    .map(|index| DiscoveredHost {
+                        name: format!("100.64.0.{index}"),
+                        hostname: None,
+                        user: None,
+                        port: None,
+                        identity_file: None,
+                    })
+                    .collect();
+                let progress = std::sync::Mutex::new(Vec::new());
+                let results = parent.install(|| {
+                    probe_hosts_parallel(&hosts, 10, |done, total, name| {
+                        progress.lock().unwrap().push((
+                            done,
+                            total,
+                            name.to_string(),
+                            rayon::current_num_threads(),
+                        ));
+                    })
+                });
+                let expected: Vec<_> = hosts.iter().map(|host| host.name.clone()).collect();
+                assert_eq!(
+                    results
+                        .iter()
+                        .map(|host| host.host_name.clone())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(
+                    results
+                        .iter()
+                        .all(|host| !host.reachable && host.error.is_some())
+                );
+                let mut progress = progress.into_inner().unwrap();
+                progress.sort_by_key(|entry| entry.0);
+                assert_eq!(progress.len(), count);
+                for (index, (done, total, _, workers)) in progress.iter().enumerate() {
+                    assert_eq!(*done, index + 1);
+                    assert_eq!(*total, count);
+                    // This also catches inherited 32-worker execution without
+                    // relying on sleep timings to expose excessive overlap.
+                    assert!(*workers <= 4, "inherited a {workers}-worker pool");
+                }
+                let reported: std::collections::BTreeSet<_> =
+                    progress.into_iter().map(|entry| entry.2).collect();
+                assert_eq!(
+                    reported,
+                    expected.iter().cloned().collect::<std::collections::BTreeSet<_>>()
+                );
+                assert_bounded_probe_transports(&expected);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parallel_probe_setup_excludes_provider_transports() {
+        if !bounded_probe_fixture_child(
+            "sources::probe::tests::test_parallel_probe_setup_excludes_provider_transports",
+        ) {
+            return;
+        }
+        let parent = rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .unwrap();
+        parent.install(|| {
+            let error = super::super::setup::run_setup(&super::super::setup::SetupOptions {
+                non_interactive: true,
+                json: true,
+                tailscale: true,
+                skip_install: true,
+                skip_index: true,
+                skip_sync: true,
+                ..Default::default()
+            })
+            .unwrap_err();
+            // All eligible hosts reach real OpenSSH; the refusing transport
+            // makes each unreachable. Provider endpoints must never get here.
+            assert!(matches!(error, super::super::setup::SetupError::NoHosts));
+        });
+        let expected: Vec<_> = (1..=17).map(|index| format!("100.64.0.{index}")).collect();
+        assert_bounded_probe_transports(&expected);
+        let root = std::path::PathBuf::from(dotenvy::var("CASS_TEST_PROBE_ROOT").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(root.join("status-calls")).unwrap(),
+            "status\n"
+        );
+        assert!(!root.join("config/cass/sources.toml").exists());
     }
 }
