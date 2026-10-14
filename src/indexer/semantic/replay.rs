@@ -102,6 +102,37 @@ fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
     Ok(rows)
 }
 
+/// Stream one canonical conversation through the same bounded body pager used
+/// by full replay. No conversation-sized body vector is retained here, and a
+/// cancellation check runs before/after every decoded message and emitted input.
+pub(crate) fn visit_packet_embedding_inputs_for_conversation<F, C>(
+    storage: &FrankenStorage,
+    conversation_id: i64,
+    mut consume: F,
+    mut check_cancelled: C,
+) -> Result<()>
+where
+    F: FnMut(engine::EmbeddingInput) -> Result<()>,
+    C: FnMut() -> Result<()>,
+{
+    check_cancelled()?;
+    let mut rows = envelopes(storage, &[conversation_id])?;
+    let envelope = rows
+        .pop()
+        .context("canonical semantic replay parent disappeared")?;
+    ensure!(rows.is_empty(), "single-parent semantic replay returned extra envelopes");
+    pages::messages(storage.raw(), conversation_id, &mut |message: Message| {
+        check_cancelled()?;
+        for input in envelope.project(message)? {
+            check_cancelled()?;
+            consume(input)?;
+            check_cancelled()?;
+        }
+        check_cancelled()
+    })?;
+    check_cancelled()
+}
+
 /// Existing reconciliation entry point. Explicit facade re-export replaces the
 /// conversation-sized engine visitor without changing its signature. Set
 /// CASS_SEMANTIC_STREAM_REPLAY=0 for the retained legacy path when diagnosing

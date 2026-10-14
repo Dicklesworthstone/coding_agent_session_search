@@ -157,3 +157,42 @@ fn stale_empty_parent_pages_and_signed_parent_ids_are_not_skipped() -> Result<()
     storage.close()?;
     Ok(())
 }
+
+#[test]
+fn single_parent_replay_stays_scoped_and_stops_before_later_body_pages() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 2, pages::MAX_ROWS + 1)?;
+    let parents: Vec<i64> = storage.raw().query_map_collect(
+        "SELECT id FROM conversations ORDER BY id",
+        &[] as &[ParamValue],
+        |row| row.get_typed(0),
+    )?;
+    let target = parents[1];
+    storage.raw().execute_compat(
+        "UPDATE messages SET role = X'00' WHERE conversation_id = ?1 AND idx = ?2",
+        &[ParamValue::from(target), ParamValue::from(pages::MAX_ROWS as i64)],
+    )?;
+
+    let mut delivered = 0usize;
+    let error = visit_packet_embedding_inputs_for_conversation(
+        &storage,
+        target,
+        |_| {
+            delivered += 1;
+            Err(Stop.into())
+        },
+        || Ok(()),
+    )
+    .expect_err("consumer stop must preempt the corrupt later page");
+    assert!(error.is::<Stop>());
+    assert_eq!(delivered, 1);
+
+    let foreign: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+        &[ParamValue::from(parents[0])],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(foreign, (pages::MAX_ROWS + 1) as i64);
+    storage.close()?;
+    Ok(())
+}

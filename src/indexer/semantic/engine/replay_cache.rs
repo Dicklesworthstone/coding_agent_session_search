@@ -125,24 +125,31 @@ impl ReplayProof {
 }
 
 fn project_conversation(
+    indexer: &SemanticIndexer,
     storage: &FrankenStorage,
     conversation_id: i64,
+    retain_inputs: bool,
 ) -> Result<(ConversationIdentity, Vec<EmbeddingInput>)> {
-    let (inputs, _) = packet_embedding_inputs_from_selected_canonical_messages(
-        storage, &[conversation_id], |_| true,
-    )?;
     let mut documents = Vec::new();
     let mut projected_inputs = Vec::new();
-    for input in inputs {
-        if let Some(id) = semantic_doc_id_for_input(&input) {
-            documents.push(DocumentIdentity {
-                id: id.into_boxed_str(),
-                message_id: input.message_id,
-                content_bytes: input.content.len(),
-            });
-            projected_inputs.push(input);
-        }
-    }
+    super::super::replay::visit_packet_embedding_inputs_for_conversation(
+        storage,
+        conversation_id,
+        |input| {
+            if let Some(id) = semantic_doc_id_for_input(&input) {
+                documents.push(DocumentIdentity {
+                    id: id.into_boxed_str(),
+                    message_id: input.message_id,
+                    content_bytes: input.content.len(),
+                });
+                if retain_inputs {
+                    projected_inputs.push(input);
+                }
+            }
+            Ok(())
+        },
+        || indexer.check_external_cancelled(),
+    )?;
     Ok((ConversationIdentity {
         conversation_id,
         documents: documents.into_boxed_slice(),
@@ -153,6 +160,7 @@ impl ReconcileSelection {
     #[allow(clippy::too_many_arguments)]
     fn visit(
         &mut self,
+        indexer: &SemanticIndexer,
         storage: &FrankenStorage,
         conversation: &ConversationIdentity,
         fresh_inputs: Option<Vec<EmbeddingInput>>,
@@ -192,7 +200,8 @@ impl ReconcileSelection {
             let inputs = match fresh_inputs {
                 Some(inputs) => inputs,
                 None => {
-                    let (observed, inputs) = project_conversation(storage, conversation.conversation_id)?;
+                    let (observed, inputs) =
+                        project_conversation(indexer, storage, conversation.conversation_id, true)?;
                     anyhow::ensure!(observed.documents == conversation.documents,
                         "canonical semantic projection changed since cached replay; retry backfill");
                     self.loaded_selected_conversations += 1;
@@ -247,7 +256,7 @@ impl CanonicalReplayCache {
         let inventory = if let Some(cached) = cached {
             for conversation in &cached.conversations {
                 indexer.check_external_cancelled()?;
-                selected.visit(storage, conversation, None, existing_ids, plan, caps, sink)?;
+                selected.visit(indexer, storage, conversation, None, existing_ids, plan, caps, sink)?;
             }
             Some(cached)
         } else {
@@ -267,9 +276,9 @@ impl CanonicalReplayCache {
                 for id in ids {
                     indexer.check_external_cancelled()?;
                     anyhow::ensure!(id > after_id, "canonical semantic replay cursor did not advance");
-                    let (conversation, inputs) = project_conversation(storage, id)?;
+                    let (conversation, _) = project_conversation(indexer, storage, id, false)?;
                     selected.replayed_conversations += 1;
-                    selected.visit(storage, &conversation, Some(inputs), existing_ids, plan, caps, sink)?;
+                    selected.visit(indexer, storage, &conversation, None, existing_ids, plan, caps, sink)?;
                     if let Some(cache) = building.as_mut() {
                         let new_bytes = conversation.retained_bytes()
                             .and_then(|bytes| cache.retained_bytes.checked_add(bytes));

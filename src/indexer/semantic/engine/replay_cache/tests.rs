@@ -79,7 +79,7 @@ fn replay_cache_reads_the_archive_once_and_only_reloads_selected_text() -> Resul
         assert_eq!(actual.last_covered_conversation, expected.last_covered_conversation);
         assert_eq!(actual.last_message_id, expected.last_message_id);
         assert_eq!(actual.replayed_conversations, if round == 0 { 4 } else { 0 });
-        assert_eq!(actual.loaded_selected_conversations, usize::from(round != 0));
+        assert_eq!(actual.loaded_selected_conversations, 1);
         assert_eq!(actual.inputs[0].message_id, round + 1);
         proof.verify(&storage)?;
         canonical.get_or_insert_with(|| actual.current_ids.clone());
