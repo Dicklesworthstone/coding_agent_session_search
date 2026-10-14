@@ -40,7 +40,7 @@ struct Page {
     exhausted: bool,
 }
 
-fn decode(row: &Row) -> Result<Message, FrankenError> {
+pub(super) fn decode(row: &Row) -> Result<Message, FrankenError> {
     let role: String = row.get_typed(2)?;
     Ok(Message {
         id: Some(row.get_typed(0)?),

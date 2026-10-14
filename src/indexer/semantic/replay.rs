@@ -19,6 +19,9 @@ use anyhow::{Context, Result, ensure};
 use std::path::PathBuf;
 
 mod pages;
+mod selected;
+
+pub(crate) use selected::packet_embedding_inputs_from_storage_for_message_ids;
 
 const PARENT_PAGE_SIZE: usize = 64;
 
@@ -26,6 +29,19 @@ struct Envelope {
     conversation: Conversation,
     context: engine::SemanticPacketContext,
     provenance: ConversationPacketProvenance,
+}
+
+impl Envelope {
+    fn project(&self, message: Message) -> Result<Vec<engine::EmbeddingInput>> {
+        let mut conversation = self.conversation.clone();
+        conversation.messages.push(message);
+        let packet = ConversationPacket::from_canonical_replay_owned(
+            conversation, self.provenance.clone(),
+        );
+        engine::semantic_inputs_from_packets(
+            std::slice::from_ref(&packet), std::slice::from_ref(&self.context),
+        )
+    }
 }
 
 fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
@@ -134,15 +150,7 @@ fn visit(
             check_cancelled()?;
             pages::messages(storage.raw(), envelope.context.conversation_id, &mut |message: Message| {
                 check_cancelled()?;
-                let mut conversation = envelope.conversation.clone();
-                conversation.messages.push(message);
-                let packet = ConversationPacket::from_canonical_replay_owned(
-                    conversation, envelope.provenance.clone(),
-                );
-                let inputs = engine::semantic_inputs_from_packets(
-                    std::slice::from_ref(&packet), std::slice::from_ref(&envelope.context),
-                )?;
-                drop(packet);
+                let inputs = envelope.project(message)?;
                 for input in inputs {
                     check_cancelled()?;
                     consume(input)?;

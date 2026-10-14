@@ -19,7 +19,10 @@ pub use artifacts::{
 };
 pub use engine::*;
 // Explicitly select bounded message replay over the engine glob export.
-pub(crate) use replay::visit_packet_embedding_inputs_from_storage;
+pub(crate) use replay::{
+    packet_embedding_inputs_from_storage_for_message_ids,
+    visit_packet_embedding_inputs_from_storage,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
