@@ -1575,7 +1575,7 @@ pub(crate) struct SemanticPacketContext {
 /// Invariants:
 /// - The `i`th element of `contexts` describes the `i`th packet.
 /// - Returns `Err` if the lengths disagree, so a callsite cannot
-///   silently mis-correlate packets and contexts.
+///   silently mis-correlate ids.
 /// - `source_id_hash` is derived from `packet.payload.provenance.source_id`
 ///   the same way `embedding_inputs_from_conversation_packet` derives
 ///   it from the canonical row, so the produced `EmbeddingInput.source_id`
@@ -1794,7 +1794,18 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
         inputs,
         conversations_in_batch,
         last_conversation_id: last_conversation_id.unwrap_or(after_conversation_id),
-        total_fn select_checkpoint_capped_conversations_lazily<F>(
+        total_conversations,
+        cursor_exhausted,
+    })
+}
+
+struct CheckpointCappedSelection {
+    conversations: Vec<CanonicalEmbeddingConversationRow>,
+    last_conversation_id: Option<i64>,
+    stopped_before_candidate: bool,
+}
+
+fn select_checkpoint_capped_conversations_lazily<F>(
     conversations: Vec<CanonicalEmbeddingConversationRow>,
     after_message_id: Option<i64>,
     caps: SemanticCheckpointCaps,
@@ -1827,6 +1838,10 @@ where
             messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
         }
         if messages.is_empty() {
+            // This candidate was actually inspected. Advancing past it avoids
+            // replaying an all-empty page selected through stale tail metadata.
+            // Unread and over-budget nonempty candidates never reach this arm.
+            last_conversation_id = Some(conversation.conversation_id);
             continue;
         }
 
@@ -1872,16 +1887,6 @@ where
         },
         grouped_messages,
     ))
-}
-(conversation.conversation_id, messages);
-        selected.push(conversation);
-    }
-
-    CheckpointCappedSelection {
-        conversations: selected,
-        last_conversation_id,
-        stopped_before_candidate,
-    }
 }
 
 #[cfg(test)]
