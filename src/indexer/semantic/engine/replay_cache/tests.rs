@@ -459,7 +459,7 @@ fn replay_cache_is_not_available_inside_an_explicit_read_transaction() -> Result
         &plan,
         SemanticCheckpointCaps::unlimited(),
     )?;
-    storage.raw().as_async().begin_transaction_sync()?;
+    storage.raw().execute("BEGIN")?;
     let result = select(
         &cache,
         &indexer,
@@ -468,7 +468,7 @@ fn replay_cache_is_not_available_inside_an_explicit_read_transaction() -> Result
         &plan,
         SemanticCheckpointCaps::unlimited(),
     );
-    storage.raw().as_async().rollback_transaction_sync()?;
+    storage.raw().execute("ROLLBACK")?;
     let (selected, proof) = result?;
     assert_eq!(selected.replayed_conversations, 1);
     assert!(proof.0.is_none());
