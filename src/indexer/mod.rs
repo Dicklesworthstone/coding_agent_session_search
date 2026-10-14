@@ -6617,6 +6617,7 @@ fn commit_lexical_rebuild_progress(
     let pending_progress_started = perf_profile.as_ref().map(|_| Instant::now());
     persist_pending_lexical_rebuild_progress(
         state_path,
+        content_path,
         rebuild_state,
         next_conversation_id,
         processed_conversations,
@@ -9937,10 +9938,25 @@ fn reconcile_pending_lexical_commit(
     // directory that commit_lexical_rebuild_progress fingerprinted.
     let content_path = lexical_rebuild_resume_content_path(index_path, &state)?;
     let current_meta_fingerprint = index_meta_fingerprint(&content_path)?;
-    if pending_commit_landed(
-        pending.base_meta_fingerprint.as_deref(),
-        current_meta_fingerprint.as_deref(),
-    ) {
+    // A staged candidate's MANIFEST counts what really committed, and that
+    // count decides. A fingerprint cannot: a heartbeat's uncommitted progress
+    // in a checkpoint from an older cass carries the live generation's
+    // fingerprint, which always differs from the candidate's (so it was
+    // promoted, and the resume check then quarantined a candidate that was
+    // only behind its own heartbeat, GH #523), while the terminal checkpoint
+    // is written after the folding commit, so its base already describes the
+    // committed generation. The resume check applies the same count rule.
+    let landed = match (content_path != index_path)
+        .then(|| crate::search::tantivy::searchable_index_live_doc_count(&content_path))
+        .flatten()
+    {
+        Some(live_docs) => u128::from(live_docs) >= pending.indexed_docs as u128,
+        None => pending_commit_landed(
+            pending.base_meta_fingerprint.as_deref(),
+            current_meta_fingerprint.as_deref(),
+        ),
+    };
+    if landed {
         state.finalize_commit(current_meta_fingerprint);
     } else {
         state.clear_pending();
@@ -10114,12 +10130,8 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     processed_conversations: usize,
     indexed_docs: usize,
     runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-    base_meta_fingerprint_override: Option<&str>,
+    base_meta_fingerprint: Option<String>,
 ) -> Result<()> {
-    let base_meta_fingerprint = match base_meta_fingerprint_override {
-        Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
-        None => index_meta_fingerprint(index_path)?,
-    };
     let checkpoint_runtime = runtime.checkpoint_snapshot();
     let current_processed_conversations = state.reported_processed_conversations();
     let current_indexed_docs = state.reported_indexed_docs();
@@ -10161,8 +10173,18 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     persist_lexical_rebuild_state(index_path, state)
 }
 
+/// `index_path` locates the checkpoint; `content_path` is the directory the
+/// next commit writes. After a crash, reconcile_pending_lexical_commit decides
+/// whether the pending commit landed by comparing its base fingerprint with
+/// that same content directory. A staged rebuild commits into its scratch
+/// sibling, so a base taken from `index_path` (the untouched live generation)
+/// always differs: every heartbeat's uncommitted counts were promoted, the
+/// resume check found the candidate short, and each killed run quarantined
+/// its candidate and restarted from zero (GH #523).
+#[allow(clippy::too_many_arguments)]
 fn persist_pending_lexical_rebuild_progress(
     index_path: &Path,
+    content_path: &Path,
     state: &mut LexicalRebuildState,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
@@ -10176,7 +10198,7 @@ fn persist_pending_lexical_rebuild_progress(
         processed_conversations,
         indexed_docs,
         runtime,
-        None,
+        index_meta_fingerprint(content_path)?,
     )
 }
 
@@ -10212,6 +10234,10 @@ fn maybe_persist_staged_lexical_rebuild_progress(
     }
 
     let heartbeat_progress_started = perf_profile.as_ref().map(|_| Instant::now());
+    let base_meta_fingerprint = match base_meta_fingerprint_override {
+        Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
+        None => index_meta_fingerprint(index_path)?,
+    };
     persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         index_path,
         state,
@@ -10219,7 +10245,7 @@ fn maybe_persist_staged_lexical_rebuild_progress(
         processed_conversations,
         indexed_docs,
         runtime,
-        base_meta_fingerprint_override,
+        base_meta_fingerprint,
     )?;
     bump_index_run_lock_progress_if_present(progress_bump);
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), heartbeat_progress_started) {
@@ -27462,6 +27488,7 @@ fn rebuild_tantivy_from_db_once(
                     );
                     persist_pending_lexical_rebuild_progress(
                         &index_path,
+                        &build_path,
                         &mut rebuild_state,
                         last_processed_conversation_id,
                         processed_conversations,
@@ -69259,6 +69286,7 @@ c.close()
 
         persist_pending_lexical_rebuild_progress(
             &index_path,
+            &index_path,
             &mut state,
             Some(6),
             6,
@@ -69345,6 +69373,7 @@ c.close()
 
         persist_pending_lexical_rebuild_progress(
             &index_path,
+            &index_path,
             &mut state,
             Some(6),
             6,
@@ -69411,6 +69440,7 @@ c.close()
         };
 
         persist_pending_lexical_rebuild_progress(
+            &index_path,
             &index_path,
             &mut state,
             Some(5),
@@ -69502,7 +69532,7 @@ c.close()
             5,
             10,
             &runtime,
-            cached_base_meta_fingerprint.as_deref(),
+            cached_base_meta_fingerprint.clone(),
         )
         .unwrap();
 

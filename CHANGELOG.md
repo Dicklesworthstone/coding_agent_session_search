@@ -118,6 +118,16 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   file as their database, so their scan failed and the run exited 9. They
   now get such a file only when it is a SQLite database.
 
+- **A lexical rebuild killed between commits resumes instead of starting
+  over (#523).** A rebuild checkpoints its progress every few seconds. When a
+  run was killed (for example by `timeout`), the next `cass index` read the
+  latest progress as committed, found the staged candidate short of it,
+  moved the candidate aside as a 1 GB `.lexical-rebuild-quarantine-*`
+  directory and rebuilt from zero. On a loaded host that is killed every
+  run, the rebuild never finished and a new quarantine directory appeared
+  each time. A killed rebuild now resumes from its last commit. Checkpoints
+  written by earlier versions are read the same way.
+
 - **`cass timeline` and `cass sessions` read `--since`/`--until` the way
   `cass search` does.** Timeline understood only dates, `today`,
   `yesterday` and day or hour offsets, and replaced anything else with its
