@@ -45,6 +45,8 @@ pub struct SetupOptions {
     /// an explicit hosts list rather than assuming consent to probe them all.
     pub non_interactive: bool,
     /// Specific hosts to configure (skips discovery/selection).
+    /// After completed probing, resume only accepts the saved discovery or
+    /// selection set; a different host list requires a new setup.
     pub hosts: Option<Vec<String>>,
     /// Include online peers from local Tailscale status during discovery.
     pub tailscale: bool,
@@ -80,6 +82,41 @@ impl SetupOptions {
             SetupState::clear()?;
         }
         Ok(())
+    }
+
+    fn validate_resume_hosts(&self, state: &SetupState) -> Result<(), SetupError> {
+        if !self.resume || !state.probing_complete {
+            return Ok(());
+        }
+        let Some(hosts) = &self.hosts else {
+            return Ok(());
+        };
+
+        // Completed phases are resumed from saved probes/selection, not from
+        // this invocation's discovery arguments. Never silently ignore a new
+        // host list and install/index on the previous list instead. Preserve
+        // the original plan rather than discarding completed per-host work.
+        // Exact SSH tokens matter: do not collapse usernames or alias spelling
+        // using source-name normalization. Order and repetition do not matter.
+        let requested: HashSet<&str> = hosts.iter().map(String::as_str).collect();
+        let matches = |saved: &[String]| {
+            requested == saved.iter().map(String::as_str).collect::<HashSet<_>>()
+        };
+        // Repeating the original discovery list is also valid after selection
+        // or physical-machine deduplication narrowed the saved target set.
+        if matches(&state.discovered_host_names)
+            || (state.selection_complete && matches(&state.selected_host_names))
+        {
+            return Ok(());
+        }
+
+        Err(SetupError::Config(super::config::ConfigError::Validation(
+            "Cannot change --hosts after setup probing has completed. \
+             Resume without --hosts to continue the saved plan, or start a new \
+             setup without --resume to use a different host list. \
+             No remote operations were started; the checkpoint is unchanged."
+                .into(),
+        )))
     }
 }
 
@@ -576,6 +613,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     } else {
         SetupState::default()
     };
+    opts.validate_resume_hosts(&state)?;
 
     if state.started_at.is_none() {
         state.started_at = Some(Utc::now().to_rfc3339());
@@ -1953,5 +1991,77 @@ mod tests {
                 assert!(message.contains("No SSH probes were started"));
             }
         }
+    }
+
+    #[test]
+    fn test_setup_resume_hosts_accepts_only_unchanged_discovery_or_selection() {
+        let state = SetupState {
+            discovery_complete: true,
+            discovered_host_names: vec!["Alpha".into(), "operator@beta".into(), "alias".into()],
+            probing_complete: true,
+            selection_complete: true,
+            selected_host_names: vec!["Alpha".into(), "operator@beta".into()],
+            ..Default::default()
+        };
+        for hosts in [
+            vec!["alias", "operator@beta", "Alpha", "alias"],
+            vec!["operator@beta", "Alpha", "Alpha"],
+        ] {
+            let opts = SetupOptions {
+                resume: true,
+                hosts: Some(hosts.into_iter().map(str::to_owned).collect()),
+                ..Default::default()
+            };
+            assert!(opts.validate_resume_hosts(&state).is_ok());
+        }
+        for hosts in [
+            vec![],
+            vec!["Alpha"],
+            vec!["Alpha", "operator@beta", "new-machine"],
+            vec!["alpha", "operator@beta"],
+            vec!["Alpha", "other@beta"],
+        ] {
+            let opts = SetupOptions {
+                resume: true,
+                hosts: Some(hosts.into_iter().map(str::to_owned).collect()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                opts.validate_resume_hosts(&state),
+                Err(SetupError::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_setup_resume_hosts_does_not_lock_unfinished_discovery() {
+        let state = SetupState {
+            discovery_complete: true,
+            discovered_host_names: vec!["old-machine".into()],
+            // A list is not an approved selection until the phase completes.
+            selected_host_names: vec!["new-machine".into()],
+            ..Default::default()
+        };
+        let opts = SetupOptions {
+            resume: true,
+            hosts: Some(vec!["new-machine".into()]),
+            ..Default::default()
+        };
+        assert!(opts.validate_resume_hosts(&state).is_ok());
+        let probed = SetupState {
+            probing_complete: true,
+            ..state
+        };
+        assert!(opts.validate_resume_hosts(&probed).is_err());
+        let fresh = SetupOptions {
+            resume: false,
+            ..opts
+        };
+        assert!(fresh.validate_resume_hosts(&probed).is_ok());
+        let bare_resume = SetupOptions {
+            resume: true,
+            ..Default::default()
+        };
+        assert!(bare_resume.validate_resume_hosts(&probed).is_ok());
     }
 }
