@@ -30922,6 +30922,7 @@ impl ConnectorKind {
             "hermes" => Some(Self::Hermes),
             "codebuff" => Some(Self::Codebuff),
             "pi_durable" => Some(Self::PiDurable),
+            "continue" => Some(Self::Continue),
             _ => None,
         }
     }
@@ -30961,6 +30962,7 @@ impl ConnectorKind {
             Self::Hermes => "hermes",
             Self::Codebuff => "codebuff",
             Self::PiDurable => "pi_durable",
+            Self::Continue => "continue",
         }
     }
 
@@ -31001,6 +31003,7 @@ impl ConnectorKind {
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
             Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
             Self::PiDurable => Box::new(franken_agent_detection::PiDurableConnector::new()),
+            Self::Continue => Box::new(franken_agent_detection::ContinueConnector::new()),
         }
     }
 }
@@ -32767,6 +32770,8 @@ enum ConnectorKind {
     /// Pi durable-harness stores (franken_agent_detection #28).
     #[serde(rename = "pd", alias = "PiDurable")]
     PiDurable,
+    #[serde(rename = "ct", alias = "Continue")]
+    Continue,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

@@ -34,6 +34,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **Continue sessions are indexed.** Continue's IDE extension and CLI keep one
+  JSON snapshot per session under `~/.continue/sessions` (or
+  `$CONTINUE_GLOBAL_DIR/sessions`). A full index picks them up. `cass index
+  --watch` and `--watch-once <file>` route changes to the Continue connector.
+  HTML exports label the agent "Continue".
 - **`cass index --rebuild-profile bounded` (#483).** One flag now runs the
   documented single-core, low-memory lexical rebuild for a wedged or
   memory-starved archive: one rebuild worker, one page-prep thread, a

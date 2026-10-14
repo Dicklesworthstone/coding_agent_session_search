@@ -680,8 +680,9 @@ cass robot-docs guide         # LLM-optimized docs
 | Shelley | FAD `shelley` (feature `shelley`) | SQLite |
 | Pi Durable | FAD `pi_durable` (SQLite stores with feature `pi-durable`) | SQLite / JSONL commit log |
 | Kiro CLI | FAD `kiro` | event-log JSONL + JSON snapshot |
+| Continue | FAD `continue` | JSON session snapshots |
 
-All 33 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
+All 34 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
 
 ### HTML Export (Robot Mode)
 
