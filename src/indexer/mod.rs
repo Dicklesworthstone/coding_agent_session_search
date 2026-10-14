@@ -12943,6 +12943,67 @@ fn lexical_storage_physical_identity(db_path: &Path) -> Option<ArchivePhysicalId
     })
 }
 
+fn write_archive_fingerprint_cache_for_identity(
+    identity: &ArchivePhysicalIdentity,
+    cache_dir: &Path,
+    fingerprint: &str,
+) {
+    if !fingerprint.starts_with("content-v1:") || !cache_dir.is_dir() {
+        return;
+    }
+    let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+    let payload = ArchiveFingerprintCache {
+        schema_version: ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION,
+        identity: identity.clone(),
+        fingerprint: fingerprint.to_string(),
+        computed_at_ms: semantic_indexing_now_ms(),
+    };
+    // Per-process temp name: concurrent one-shot searches may all miss at once.
+    let tmp_path = cache_dir.join(format!(
+        "{ARCHIVE_FINGERPRINT_CACHE_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    let written = serde_json::to_vec(&payload)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| fs::write(&tmp_path, bytes))
+        .and_then(|()| fs::rename(&tmp_path, &cache_path));
+    if let Err(err) = written {
+        tracing::debug!(
+            error = %err,
+            cache = %cache_path.display(),
+            "archive fingerprint cache write skipped"
+        );
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+pub(crate) fn write_archive_fingerprint_cache_best_effort(
+    db_path: &Path,
+    cache_dir: &Path,
+    fingerprint: &str,
+) {
+    let Some(identity) = lexical_storage_physical_identity(db_path) else {
+        return;
+    };
+    write_archive_fingerprint_cache_for_identity(&identity, cache_dir, fingerprint);
+}
+
+pub(crate) fn prime_archive_fingerprint_cache_from_completed_checkpoint(
+    db_path: &Path,
+    index_path: &Path,
+) {
+    let Ok(Some(checkpoint)) = load_lexical_rebuild_checkpoint(index_path) else {
+        return;
+    };
+    if checkpoint.completed && crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
+        write_archive_fingerprint_cache_best_effort(
+            db_path,
+            index_path,
+            &checkpoint.storage_fingerprint,
+        );
+    }
+}
+
 /// The on-disk layer of [`lexical_storage_fingerprint_for_db_cached`]: serve
 /// the sidecar's fingerprint when it was computed for exactly this physical
 /// identity, otherwise compute the strict fingerprint and rewrite the sidecar
@@ -12973,29 +13034,7 @@ fn lexical_storage_fingerprint_for_db_disk_cached(
         "archive fingerprint recomputed from the canonical database"
     );
     let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
-    let payload = ArchiveFingerprintCache {
-        schema_version: ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION,
-        identity: identity.clone(),
-        fingerprint: fingerprint.clone(),
-        computed_at_ms: semantic_indexing_now_ms(),
-    };
-    // Per-process temp name: concurrent one-shot searches may all miss at once.
-    let tmp_path = cache_dir.join(format!(
-        "{ARCHIVE_FINGERPRINT_CACHE_FILE}.{}.tmp",
-        std::process::id()
-    ));
-    let written = serde_json::to_vec(&payload)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| fs::write(&tmp_path, bytes))
-        .and_then(|()| fs::rename(&tmp_path, &cache_path));
-    if let Err(err) = written {
-        tracing::debug!(
-            error = %err,
-            cache = %cache_path.display(),
-            "archive fingerprint cache write skipped"
-        );
-        let _ = fs::remove_file(&tmp_path);
-    }
+    write_archive_fingerprint_cache_for_identity(identity, cache_dir, &fingerprint);
     Ok(fingerprint)
 }
 
@@ -17722,7 +17761,9 @@ fn run_index_with_storage_ownership(
             path_count,
             "skipping unchanged explicit watch-once index run before startup maintenance"
         );
-        return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+        close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+        prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
+        return Ok(());
     }
 
     preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
@@ -19852,7 +19893,9 @@ fn run_index_with_storage_ownership(
                 path_count,
                 "skipping unchanged explicit watch-once paths before opening Tantivy"
             );
-            return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+            close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+            prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
+            return Ok(());
         }
 
         // Startup watch ingest defers WAL auto-checkpoints for bulk import.
@@ -20174,6 +20217,7 @@ fn run_index_with_storage_ownership(
             return Err(err);
         }
         close_result?;
+        prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
         return Ok(());
     }
 
@@ -20191,7 +20235,9 @@ fn run_index_with_storage_ownership(
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
-    close_storage_after_index(storage, &opts.db_path, "index run")
+    close_storage_after_index(storage, &opts.db_path, "index run")?;
+    prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
+    Ok(())
 }
 
 /// Close a write handle the way `cass index` closes its own: restore the
@@ -24617,7 +24663,7 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         })?;
     }
     recover_or_finalize_interrupted_lexical_publish_backup(index_path)?;
-    ensure_lexical_publish_backups_dir(index_path)?;
+    remove_empty_lexical_index_dir_placeholder(index_path);
 
     if !index_path.exists() {
         rename_lexical_publish_path(
@@ -24635,6 +24681,8 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         sync_parent_directory(index_path)?;
         return Ok(());
     }
+
+    ensure_lexical_publish_backups_dir(index_path)?;
 
     let retained_backup_path = unique_lexical_publish_backup_path(index_path);
 
@@ -25020,11 +25068,27 @@ fn ensure_lexical_publish_backups_dir(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_empty_lexical_index_dir_placeholder(index_path: &Path) {
+    // `index_dir(&data_dir)` calls `fs::create_dir_all` at startup, creating an
+    // empty directory before any lexical generation has been published. `fs::remove_dir`
+    // only succeeds when the directory has zero entries (failing with ENOTEMPTY
+    // if any file or subdirectory exists), so calling it here turns the empty
+    // placeholder back into `!index_path.exists()` without touching a populated
+    // live index (dcp01).
+    if index_path.is_dir()
+        && fs::read_dir(index_path).is_ok_and(|mut entries| entries.next().is_none())
+    {
+        let _ = fs::remove_dir(index_path);
+    }
+}
+
 fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> Result<()> {
     let in_progress_backup_path = lexical_publish_in_progress_backup_path(index_path);
     if !in_progress_backup_path.exists() {
         return Ok(());
     }
+
+    remove_empty_lexical_index_dir_placeholder(index_path);
 
     if index_path.exists() {
         ensure_lexical_publish_backups_dir(index_path)?;
@@ -60941,6 +61005,63 @@ c.close()
             assert!(
                 entries.is_empty(),
                 "first publish must not create retained backups; got {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_first_publish_over_empty_index_dir_does_not_retain_empty_backup()
+     {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        // `index_dir(&data_dir)` creates the empty `index/v9-quill` directory at
+        // startup before any lexical generation is published (dcp01).
+        let index_path = index_dir(&data_dir).unwrap();
+        assert!(
+            index_path.is_dir(),
+            "precondition: empty index_dir placeholder exists"
+        );
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-first-publish-empty-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("first-publish-empty-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "first publish over empty index_dir placeholder must land the staged index"
+        );
+        assert!(
+            !staged_index_path.exists(),
+            "staged path must be consumed by the rename"
+        );
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        if backups_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&backups_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "first publish over empty index_dir placeholder must not retain an empty backup; got {entries:?}"
             );
         }
     }
