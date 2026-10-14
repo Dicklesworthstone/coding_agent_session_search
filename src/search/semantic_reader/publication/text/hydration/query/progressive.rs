@@ -157,7 +157,6 @@ mod tests {
         assert!(stream.next().is_none());
         assert_eq!(polled.get(), 0);
         assert_eq!(stream.size_hint(), (0, Some(0)));
-        drop(stream);
         transaction.rollback().map_err(|_| HydrationError::Rollback)?;
         Ok(())
     }
@@ -177,7 +176,6 @@ mod tests {
         assert!(stream.next().is_none());
         assert!(stream.inner.is_none());
         assert_eq!(polled.get(), 1);
-        drop(stream);
         transaction.rollback().map_err(|_| HydrationError::Rollback)?;
         Ok(())
     }
@@ -198,7 +196,6 @@ mod tests {
         assert!(stream.next().is_none());
         assert_eq!(stream.size_hint(), (0, Some(0)));
         assert_eq!(polled.get(), 1);
-        drop(stream);
         transaction.rollback().map_err(|_| HydrationError::Rollback)?;
         Ok(())
     }

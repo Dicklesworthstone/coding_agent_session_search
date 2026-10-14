@@ -90,9 +90,12 @@ impl Fixture {
     }
 }
 
+/// Path, whether it is a directory, and its bytes when it is a regular file.
+type PathSnapshot = Vec<(PathBuf, bool, Option<Vec<u8>>)>;
+
 // Preserve directories and missing entries as well as file bytes. Recovery may
 // create its stable lock files, which are deliberately outside this inventory.
-fn snapshot(paths: &[PathBuf]) -> Result<Vec<(PathBuf, bool, Option<Vec<u8>>)>> {
+fn snapshot(paths: &[PathBuf]) -> Result<PathSnapshot> {
     paths.iter().map(|path| {
         let kind = match fs::symlink_metadata(path) {
             Ok(metadata) => Some(metadata),
