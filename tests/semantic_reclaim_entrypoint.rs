@@ -24,7 +24,7 @@ fn seed(data: &Path) -> Result<()> {
     )?;
     writer.write_record("retained-document", &[1.0, 0.0, 0.0, 0.0])?;
     writer.finish()?;
-    let manifest = SemanticManifest {
+    let mut manifest = SemanticManifest {
         fast_tier: Some(ArtifactRecord {
             tier: TierKind::Fast,
             embedder_id: "fnv1a-384".into(),
