@@ -2635,7 +2635,6 @@ fn cached_raw_mirror_blob_record_is_verified(
     Ok(())
 }
 
-#[cfg(test)]
 fn remove_cached_raw_mirror_blob_record_if_unchanged(
     cache: &Mutex<HashMap<RawMirrorBlobSourceKey, CachedRawMirrorBlobRecord>>,
     key: &RawMirrorBlobCacheKey,
@@ -6723,10 +6722,8 @@ mod tests {
         let paused = err
             .downcast_ref::<policy::RawMirrorCapturePaused>()
             .expect("error should downcast to RawMirrorCapturePaused");
-        assert_eq!(
-            paused.reason,
-            policy::RawMirrorCapturePauseReason::MaxBytesExceeded
-        );
+        assert_eq!(paused.max_bytes, 32);
+        assert!(paused.requested_bytes >= 2048);
         assert!(
             !data_dir.join("raw-mirror/v1/manifests").exists(),
             "paused capture must not publish manifests"
