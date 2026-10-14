@@ -177,7 +177,7 @@ pub struct SystemInfo {
     pub has_wget: bool,
     /// Remote home directory.
     pub remote_home: String,
-    /// Unique machine identifier (for deduplication of SSH aliases).
+    /// Unique machine identifier (combined with remote_home for alias deduplication).
     /// On Linux: /etc/machine-id, on macOS: IOPlatformUUID.
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -820,11 +820,12 @@ impl ProbeCache {
     }
 }
 
-/// Deduplicate probe results that point to the same physical machine.
+/// Deduplicate successful probe results for the same home on the same machine.
 ///
-/// Multiple SSH aliases may point to the same machine. This function identifies
-/// duplicates using the machine_id from the probe and keeps only one entry per
-/// physical machine.
+/// A machine ID alone does not identify a session source: SSH logins with
+/// different home directories can expose different histories and installations.
+/// Merge only when both machine_id and remote_home are known and exactly equal.
+/// Missing/blank identity metadata and failed probes remain separate candidates.
 ///
 /// # Selection criteria (when duplicates found)
 /// 1. Prefer hosts with cass already installed
@@ -837,34 +838,37 @@ impl ProbeCache {
 pub fn deduplicate_probe_results(
     results: Vec<HostProbeResult>,
 ) -> (Vec<HostProbeResult>, HashMap<String, Vec<String>>) {
-    // Group by machine_id (skip hosts without machine_id - can't dedupe them)
-    let mut by_machine_id: HashMap<String, Vec<HostProbeResult>> = HashMap::new();
-    let mut no_machine_id: Vec<HostProbeResult> = Vec::new();
+    let mut by_remote_home: HashMap<(String, String), Vec<HostProbeResult>> = HashMap::new();
+    let mut ungrouped: Vec<HostProbeResult> = Vec::new();
 
     for result in results {
-        if let Some(ref machine_id) = result
-            .system_info
-            .as_ref()
-            .and_then(|s| s.machine_id.clone())
+        if result.reachable
+            && let Some(info) = &result.system_info
+            && let Some(machine_id) = &info.machine_id
+            && !machine_id.trim().is_empty()
+            && !info.remote_home.trim().is_empty()
         {
-            by_machine_id
-                .entry(machine_id.clone())
+            // Do not infer identity from an alias label or normalize remote
+            // paths using this machine's filesystem semantics. Preserve the
+            // exact reported home, including case and symlink spellings.
+            by_remote_home
+                .entry((machine_id.clone(), info.remote_home.clone()))
                 .or_default()
                 .push(result);
         } else {
-            no_machine_id.push(result);
+            ungrouped.push(result);
         }
     }
 
     let mut deduplicated: Vec<HostProbeResult> = Vec::new();
     let mut merged_aliases: HashMap<String, Vec<String>> = HashMap::new();
 
-    // Process groups with machine_id
-    for (_machine_id, mut group) in by_machine_id {
+    // Rank only aliases with the same established remote-home identity.
+    for (_identity, mut group) in by_remote_home {
         if group.len() == 1 {
             deduplicated.push(group.remove(0));
         } else {
-            // Multiple aliases for same machine - pick the best one
+            // Multiple aliases for the same remote home - pick the best one
             group.sort_by(|a, b| {
                 // 1. Prefer installed cass
                 let a_installed = a.cass_status.is_installed();
@@ -901,8 +905,8 @@ pub fn deduplicate_probe_results(
         }
     }
 
-    // Add back hosts without machine_id
-    deduplicated.extend(no_machine_id);
+    // Unestablished identities must not suppress any other candidate.
+    deduplicated.extend(ungrouped);
 
     // Sort final list by name for consistent ordering
     deduplicated.sort_by(|a, b| a.host_name.cmp(&b.host_name));
@@ -1779,5 +1783,140 @@ CASS_VERSION=0.4.2
                 mid
             );
         }
+    }
+
+    #[test]
+    fn test_deduplicate_distinct_homes_survive_source_configuration() {
+        let records = [
+            ("alice", "/home/alice", "~/.claude/projects", 10),
+            ("alice-alias", "/home/alice", "~/.claude/projects", 5),
+            ("bob", "/home/bob", "~/.codex/sessions", 1000),
+        ];
+        let results: Vec<_> = records
+            .iter()
+            .map(|(name, home, path, sessions)| {
+                parse_probe_output(
+                    name,
+                    &format!(
+                        "===PROBE_START===\nOS=linux\nARCH=x86_64\n\
+                         HOME={home}\nMACHINE_ID=shared-machine\nCASS_VERSION=0.10.0\n\
+                         CASS_HEALTH=OK\nCASS_SESSIONS={sessions}\n\
+                         AGENT_DATA={path}|5|{sessions}\n===PROBE_END===\n"
+                    ),
+                    1,
+                )
+            })
+            .collect();
+        let mut reversed = results.clone();
+        reversed.reverse();
+        for input in [results, reversed] {
+            // Exercise both discovery orders; Bob's larger archive must never
+            // cause Alice's different home to disappear during setup selection.
+            let (deduped, merged) = deduplicate_probe_results(input);
+            assert_eq!(
+                deduped
+                    .iter()
+                    .map(|host| host.host_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["alice", "bob"]
+            );
+            assert_eq!(
+                merged,
+                HashMap::from([("alice".to_string(), vec!["alice-alias".to_string()])])
+            );
+            let generator = super::super::config::SourceConfigGenerator::new();
+            let probes: Vec<_> = deduped
+                .iter()
+                .map(|host| (host.host_name.as_str(), host))
+                .collect();
+            let preview = generator.generate_preview(&probes, &Default::default());
+            assert!(preview.sources_skipped.is_empty());
+            assert_eq!(preview.sources_to_add.len(), 2);
+            for (name, home, path, _) in [records[0], records[2]] {
+                let source = preview
+                    .sources_to_add
+                    .iter()
+                    .find(|source| source.name == name)
+                    .unwrap();
+                assert_eq!(source.host.as_deref(), Some(name));
+                assert_eq!(source.paths, vec![path]);
+                assert!(source.path_mappings.iter().any(|mapping| mapping.from == home));
+                assert!(source.validate().is_ok());
+            }
+            let (again, merged_again) = deduplicate_probe_results(deduped.clone());
+            assert_eq!(
+                serde_json::to_value(again).unwrap(),
+                serde_json::to_value(deduped).unwrap()
+            );
+            assert!(merged_again.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_deduplicate_requires_nonblank_machine_and_home() {
+        for (machine_id, home) in [
+            (None, "/home/user"),
+            (Some(""), "/home/user"),
+            (Some(" \t"), "/home/user"),
+            (Some("same-machine"), ""),
+            (Some("same-machine"), " \t"),
+        ] {
+            let mut results = vec![
+                make_probe_result("first", machine_id, Some(10)),
+                make_probe_result("second", machine_id, Some(1000)),
+            ];
+            for result in &mut results {
+                result.system_info.as_mut().unwrap().remote_home = home.into();
+            }
+            let expected = serde_json::to_value(&results).unwrap();
+            let (deduped, merged) = deduplicate_probe_results(results);
+            assert_eq!(serde_json::to_value(deduped).unwrap(), expected);
+            assert!(merged.is_empty());
+        }
+        let mut results = vec![
+            make_probe_result("first", Some("same-machine"), Some(10)),
+            make_probe_result("second", Some("same-machine"), Some(1000)),
+        ];
+        for result in &mut results {
+            result.system_info = None;
+        }
+        let (deduped, merged) = deduplicate_probe_results(results);
+        assert_eq!(deduped.len(), 2);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_preserves_exact_remote_home_spelling() {
+        for (first_home, second_home) in [
+            ("/home/Alice", "/home/alice"),
+            ("/home/alice", "/home/alice-backup"),
+            ("/home/alice", "/home/alice/"),
+            ("/home/link/../alice", "/home/alice"),
+        ] {
+            let mut first = make_probe_result("first", Some("same-machine"), Some(10));
+            let mut second = make_probe_result("second", Some("same-machine"), Some(1000));
+            first.system_info.as_mut().unwrap().remote_home = first_home.into();
+            second.system_info.as_mut().unwrap().remote_home = second_home.into();
+            let expected = serde_json::to_value([&first, &second]).unwrap();
+            let (deduped, merged) = deduplicate_probe_results(vec![second, first]);
+            assert_eq!(serde_json::to_value(deduped).unwrap(), expected);
+            assert!(merged.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_deduplicate_failed_probe_cannot_hide_reachable_home() {
+        let good = make_probe_result("good", Some("same-machine"), Some(10));
+        let mut failed = make_probe_result("failed", Some("same-machine"), Some(1000));
+        // Even if a caller retains metadata alongside a failed observation,
+        // stale installation/session counts cannot suppress a reachable alias.
+        failed.reachable = false;
+        failed.error = Some("connection failed after an earlier observation".into());
+        let (deduped, merged) = deduplicate_probe_results(vec![good.clone(), failed.clone()]);
+        assert_eq!(
+            serde_json::to_value(deduped).unwrap(),
+            serde_json::to_value([failed, good]).unwrap()
+        );
+        assert!(merged.is_empty());
     }
 }
