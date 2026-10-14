@@ -9,6 +9,7 @@ fn indexer() -> SemanticIndexer {
         batch_size: 2,
         exact_reuse: false,
         external_cancelled: None,
+        replay_cache: replay_cache::CanonicalReplayCache::default(),
     }
 }
 

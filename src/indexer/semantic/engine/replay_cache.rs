@@ -234,6 +234,7 @@ impl CanonicalReplayCache {
         caps: SemanticCheckpointCaps,
         sink: &SemanticProgressSink,
     ) -> Result<(ReconcileSelection, ReplayProof)> {
+        indexer.check_external_cancelled()?;
         let key = ReplayKey::capture(indexer, storage, plan)?;
         let budget = self.max_bytes.min(responsiveness::effective_inflight_byte_limit(self.max_bytes));
         // Poison only disables the optimization, never canonical reconciliation.
@@ -245,6 +246,7 @@ impl CanonicalReplayCache {
         let mut selected = ReconcileSelection::default();
         let inventory = if let Some(cached) = cached {
             for conversation in &cached.conversations {
+                indexer.check_external_cancelled()?;
                 selected.visit(storage, conversation, None, existing_ids, plan, caps, sink)?;
             }
             Some(cached)
@@ -254,6 +256,7 @@ impl CanonicalReplayCache {
             });
             let mut after_id = 0i64;
             loop {
+                indexer.check_external_cancelled()?;
                 let ids: Vec<i64> = storage.raw().query_map_collect(
                     "SELECT id FROM conversations WHERE id > ?1 ORDER BY id LIMIT ?2",
                     &[ParamValue::from(after_id),
@@ -262,6 +265,7 @@ impl CanonicalReplayCache {
                 )?;
                 if ids.is_empty() { break; }
                 for id in ids {
+                    indexer.check_external_cancelled()?;
                     anyhow::ensure!(id > after_id, "canonical semantic replay cursor did not advance");
                     let (conversation, inputs) = project_conversation(storage, id)?;
                     selected.replayed_conversations += 1;
@@ -287,6 +291,7 @@ impl CanonicalReplayCache {
             }
             building
         };
+        indexer.check_external_cancelled()?;
         proof.verify(storage)?;
         let retained_bytes = inventory.as_ref().map_or(0, |cache| cache.retained_bytes);
         if let Some(inventory) = inventory
