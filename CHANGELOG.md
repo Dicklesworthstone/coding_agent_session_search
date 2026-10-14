@@ -111,6 +111,23 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   each followed by `cass index`. The mirror grew 30.1 MB on v0.10.0 and
   1.3 MB with the fix.
 
+- **`cass index --watch-once <file>` no longer fails on a session under a
+  shared configured source.** When the path alone did not tie the file to an
+  agent (a Codex rollout outside `~/.codex`, for example), every connector
+  whose root contained it scanned it. Shelley and Devin open any explicit
+  file as their database, so their scan failed and the run exited 9. They
+  now get such a file only when it is a SQLite database.
+
+- **A lexical rebuild killed between commits resumes instead of starting
+  over (#523).** A rebuild checkpoints its progress every few seconds. When a
+  run was killed (for example by `timeout`), the next `cass index` read the
+  latest progress as committed, found the staged candidate short of it,
+  moved the candidate aside as a 1 GB `.lexical-rebuild-quarantine-*`
+  directory and rebuilt from zero. On a loaded host that is killed every
+  run, the rebuild never finished and a new quarantine directory appeared
+  each time. A killed rebuild now resumes from its last commit. Checkpoints
+  written by earlier versions are read the same way.
+
 - **`cass timeline` and `cass sessions` read `--since`/`--until` the way
   `cass search` does.** Timeline understood only dates, `today`,
   `yesterday` and day or hour offsets, and replaced anything else with its
