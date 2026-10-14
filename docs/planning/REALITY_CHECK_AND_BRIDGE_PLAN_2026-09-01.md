@@ -1,4 +1,146 @@
-# Reality Check and Bridge Plan — refreshed 2026-09-23 (night)
+# Reality Check and Bridge Plan — refreshed 2026-10-14
+
+## Assessment: 2026-10-14 (Antigravity)
+
+Scope: local `main` at `80ed2952` (~461 commits ahead of the `v0.10.0` release tag from 2026-10-01; ~711 commits ahead of the 2026-09-23 reality check at `71759163`). Read all 1,371 lines of `AGENTS.md`, all 472 lines of `/data/projects/AGENTS.md`, all 3,840 lines of `README.md`, `/home/ubuntu/.codex/skills/reality-check-for-project/SKILL.md` (plus its 5 reference files), `/home/ubuntu/.codex/skills/just-say-no-to-process-porn-and-ceremony/SKILL.md`, `/home/ubuntu/.codex/skills/idea-wizard/SKILL.md`, `/home/ubuntu/.codex/skills/modes-of-reasoning-project-analysis/SKILL.md`, and `/home/ubuntu/.codex/skills/brennerbot-with-ntm/SKILL.md`. Cross-referenced all **39 open GitHub issues** (`#526` down to `#320`), all `coding_agent_session_search-2l1b0.*` campaign beads (`.1` through `.79`), and all tracker issues (`bv --robot-triage`). Executed read-only runtime probes against the host archive (`/home/ubuntu/.local/share/coding-agent-search`, `cass 0.10.0`), `./scripts/validate_docs.sh --readme --links --keys --env`, and `./scripts/gate.sh --verify-fmt`. No live archive was written and no file was deleted.
+
+### Codebase Scale & Tracker Snapshot at `80ed2952`
+
+| Metric | 2026-09-01 | 2026-09-23 (`71759163`) | 2026-10-14 (`80ed2952`) |
+|---|---:|---:|---:|
+| Rust source files in `src/` | 245 | 491 | **515** |
+| Lines of Rust in `src/` | 541,218 | ~664,000 | **697,114** |
+| Top 4 monoliths (`src/lib.rs` + `src/indexer/mod.rs` + `src/ui/app.rs` + `src/storage/sqlite.rs`) | ~235,000 | ~281,000 | **295,062** (`127,705` + `72,580` + `48,647` + `46,130`) |
+| Total `#[test]` functions (`src/` + `tests/`) | ~10,800 | ~12,100 | **12,803** (`9,081` unit + `3,722` integration; `136` `#[ignore]`) |
+| SQLite `CURRENT_SCHEMA_VERSION` (`src/storage/sqlite.rs:4100`) | 19 | 22 | **22** |
+| Connectors in `capabilities.json.golden` | 31 | 32 | **35** (added `continue`, `cline`, `qwen`, `pi_durable`) |
+| Tracker issues (`bv --robot-triage`) | ~2,000 | ~2,280 | **2,424** total (`2,179` closed, `245` unfinished: `86` open, `126` in_progress, `33` blocked, `183` actionable, `0` cycles) |
+
+---
+
+### Phase 1: The Five Core Reality-Check Questions ("Where Are We REALLY?")
+
+#### 1. What specifically IS working right now?
+
+1. **Discovery & Canonical Ingestion across 35 Agent Connectors**:
+   - `franken-agent-detection` + CASS local connectors enumerate **35 connectors** in `tests/golden/robot/capabilities.json.golden` (`aider`, `amp`, `antigravity`, `chatgpt`, `claude_code`, `clawdbot`, `cline`, `codex`, `Continue`, `copilot`, `copilot_cli`, `crush`, `cursor`, `devin`, `droid`, `factory`, `gemini`, `goose`, `hermes`, `kimi`, `kilo_code`, `kilocode`, `mastra`, `omp`, `openclaw`, `opencode`, `pi_agent`, `pi_agent_rust`, `pi_durable`, `plandex`, `qoder`, `qwen`, `shelley`, `vibe`, `windsurf`).
+   - Recent connector/ingest/mirror fixes landed and verified on `main`:
+     - **GH #520 (`m520r`, `mx520`, `mxr52` CLOSED)**: Codex JSONL lines where `payload` is not a JSON object skip cleanly instead of aborting the whole file; remote mirrors scan only connectors owning the configured store path (`e39ce023`), and `cass dedup` cleans prior misattributed rows (`9f20b562`).
+     - **GH #521 (`sbs52`, `t521m`, `tsp52` CLOSED)**: `provenance_summary` is stripped before parsing `source_bytes_seen` so incremental runs no longer re-parse multi-GB Claude/Codex transcripts from byte 0.
+     - **GH #522 (`rm522` CLOSED)**: JSONL/NDJSON transcripts capture as 256 KiB `fixed_chunks_v1` (`4c10a2a1`, 22.8x less mirror growth on append workloads), enforce capture budgets (`bc585092`, `924eb886`), and support `cass mirror prune --keep-latest N` (`99ad3d01`).
+     - **GH #523 (`rq523`, `ms523` CLOSED)**: Failed lexical rebuilds retain only the newest bundle (`9c258ea3`), and `cass mirror prune` reclaims abandoned `raw-mirror/v1/tmp/capture.*` staging directories (`0fa1be65`, `d4b74ebe`).
+     - **GH #511 (`b7rhs`, `mt90z` CLOSED)**, **GH #513 (`codex-zstd`)**, **GH #504 (`opencode` v2)**, **GH #500 (`claude_code` mid-turn prompts)**, **GH #486 (`CASS_EXCLUDE_PATHS`)**.
+2. **Canonical SQLite v22 + Quill v9 Lexical Search & Filtering**:
+   - On the live host archive (`/home/ubuntu/.local/share/coding-agent-search`), `cass health --json` and `cass status --json` verify a healthy `1.64 GB` database (`wal_bytes = 0`), `944` conversations, `490,786` messages, `14` Quill segments (`live_docs = 490,786`), `checkpoint.completed = true`, and `semantic.status = "ready"` (`hash-384`, `535,442` docs).
+   - **17 of the 31 `2l1b0.49`–`.79` beads from the 2026-09-23 reality check are now CLOSED** with real implementations:
+     - **GH #499 (`2l1b0.49` CLOSED)**: `frankensearch =0.7.1` / `frankensearch-quill =0.4.1` restores live-doc scoring on tombstoned segments with date/agent filters.
+     - **Boolean Query Precedence (`2l1b0.52` CLOSED)**: Standard `NOT > AND > OR` precedence and parenthesized groups work in Quill (`frankensearch#56`).
+     - **Date Filter Validation & Inclusive `--until` (`2l1b0.64` CLOSED)**: `--since`/`--until` reject malformed dates and treat `YYYY-MM-DD` `--until` as end-of-day across `search`, `timeline`, and `sessions`.
+     - **Privacy / Erasure Convergence (`2l1b0.50`, `2l1b0.78`, `2l1b0.79` CLOSED)**: `cass forget --apply` purges hits from Quill lexical segments, semantic vector assets recover cleanly after `forget`, and incremental indexing converges lexical doc counts after out-of-band DB deletions.
+     - **TUI & CLI Polish (`2l1b0.51`, `.53`, `.56`, `.57`, `.59`, `.60`, `.66`, `.70`, `.71`, `.75`, `.76`, `.77` CLOSED)**: `status --jsn` typo routing, TUI F12 ranking cycle, TUI first-run background index without blocking update prompt, `CASS_DB_PATH` honoring, Pages share profiles & `pages_bundle` 64/64 green, TUI semantic auto-enablement, and OMP analytics fresh writer.
+3. **Delegated Subcommands & Operational Repair Tooling**:
+   - `cass` dispatches `serve`, `archive`, `codex-layout-migrate`, `lexical-quarantine`, and `semantic-reclaim` (`src/main.rs:309-316`), backed by companion binaries (`cass-codex-layout-migrate`, `cass-lexical-quarantine`, `cass-semantic-reclaim`).
+4. **Documentation Validation (`scripts/validate_docs.sh`)**:
+   - `./scripts/validate_docs.sh --readme --links --keys --env` passes with **0 errors**: all 38 CLI subcommands exist in `README.md`, all 29 internal anchor links resolve, all 52 keybindings match `src/ui/input.rs`, and all 70 `README.md` environment variables are read in `src/`.
+
+#### 2. What is NOT working or not yet implemented?
+
+1. **[NEW DISCOVERY — `NO_BEAD` -> `coding_agent_session_search-2l1b0.81`] `--stale-threshold` and `index.stale` / `index.fresh` Are Permanently Suppressed in `cass status` and `cass health`**:
+   - **Live Evidence**: On `/home/ubuntu/.local/share/coding-agent-search`, `cass status --json` and `cass health --json` report `last_indexed_at: "2026-10-13T21:25:42.429+00:00"`, `age_seconds: 14741` (4.1 hours), `stale_threshold_seconds: 1800` (30 minutes), yet **`stale: false, fresh: true, healthy: true`** (and `cass health --stale-threshold 60` exits `0`).
+   - **Exact Code Cause (`src/search/asset_state.rs:1660-1662`)**:
+     ```rust
+     let age_exceeds_threshold = age_seconds.is_some_and(|age| age > stale_threshold_seconds);
+     let age_stale_covered_by_fingerprint =
+         age_seconds.is_some() && fingerprint_matches == Some(true);
+     let age_stale = age_exceeds_threshold && !age_stale_covered_by_fingerprint;
+     ```
+     Commit `6a398535` (for GH #452) added `age_stale_covered_by_fingerprint` so `cass search` wouldn't treat an old-but-matching index as `status = "stale"` and trigger an expensive archive-scale lexical rebuild. However, because coding agents write to external session files (`~/.claude`, `~/.codex`, etc.) and never write directly to `agent_search.db`, `current_db_fingerprint` (`content-v1:<convs>:<max_conv_id>:<max_msg_id>`) **always** equals `checkpoint_fingerprint` after any completed `cass index` run until the next `cass index` run. Therefore `fingerprint_matches` is always `Some(true)`, `age_stale_covered_by_fingerprint` is always `true`, and `age_stale` is **permanently `false`**.
+   - **Why `synme` (GH #514, commit `107fabfa`) Only Masked Part of the Bug**: `107fabfa` added a 5-minute `source-scan-overdue` check in `src/indexer/background_refresh.rs:133-155` so `search`/`pack`/TUI still trigger background scans, but its author assumed `asset_state.rs` still flipped `stale: true` at 30 minutes (`DEFAULT_STALE_THRESHOLD_SECS = 1800`). Because `asset_state.rs:1660-1662` suppresses `age_stale`, `cass health` and `cass status` lie about archive freshness regardless of `--stale-threshold`.
+2. **[NEW DISCOVERY — `NO_BEAD` -> `coding_agent_session_search-2l1b0.80`] GH #526 Has Zero Beads and `STAGE=fmt` Fails on 91 Files on `main`**:
+   - Across all 39 open GitHub issues, **GH #526** (`main fails cargo fmt --check since 2026-10-07 (b2c46a14); 74e02103 left engine.rs unparseable until c119b343`) was the **only** issue with no bead in `.beads/issues.jsonl`.
+   - `./scripts/gate.sh --verify-fmt` fails (`STAGE=fmt EXIT=1`) on **91 Rust files** on `main`.
+3. **[ROOT-CAUSE DIAGNOSED — `coding_agent_session_search-dcp01`] Three `tests/cli_doctor.rs` Cleanup Tests Fail 0/3 on `main` Because `publish_staged_lexical_index` Backs Up an Empty Directory Created by `index_dir()`**:
+   - In `publish_staged_lexical_index` (`src/indexer/mod.rs:24622`), the fast-path `if !index_path.exists()` never triggers in production because `index_dir(data_dir)` (`frankensearch::index_dir`) calls `std::fs::create_dir_all(&index_path)` at the start of every index run!
+   - When `1f5d790e` (`at3us`) routed first-run empty-archive indexing through `rebuild_tantivy_from_db` -> `publish_staged_lexical_index`, `seed_healthy_empty_index` in `tests/cli_doctor.rs` began swapping the empty `index_path` directory into `.lexical-publish-backups/v9-quill.<ts>.bak` as a bogus retained backup, breaking all three `cli_doctor.rs` cleanup tests (`6426`, `7420`, `7647`).
+4. **Active Regressions & High-Severity Open Bugs on `main`**:
+   - **Watch-Once Single-File Regression (GH #524 / `wo524` P0 `in_progress`)**: Commit `7cfebcb7` (`discover_watch_once_source_paths`) treats single-file `--watch-once <codex-rollout.jsonl>` paths as directories (`ENOTDIR`, exit 9) and passes `.jsonl` files to Shelley/Devin SQLite readers.
+   - **Continue Connector Watch/HTML Wiring (`ctd01` P1 `in_progress`)**: FAD's `continue` connector lacks a `ConnectorKind` arm and HTML export identity.
+   - **Timeout-Killed Index Runs Quarantine Partial Lexical Candidate (GH #523 / `rr523` P1 `in_progress`)**.
+   - **Semantic Checkpoint Memory Spike (GH #525 / `se525` P1 `in_progress`)**: Commits `bb60f352`..`80ed2952` landed bounded message-ID delta hydration and paged replay-cache inventory streaming; awaiting final gate verification.
+   - **Windows OpenCode Live-WAL Export Crash (GH #519 / `zjv7m` P1 `open`)** & **macOS `watch_startup` Wedge Under Daemon (GH #515 / `362yj` P1 `open`)**.
+5. **Incomplete Architectural Milestones & Nearly-Wired Code**:
+   - **Two-Tier Progressive Search (`ds7uy.3` P1 `in_progress`)**: `src/search/vector_index.rs:228` still hardcodes `owner_backed_progressive_reader: false`.
+   - **Native ANN Over Retained WAL Updates (`ds7uy.3.3` P2 `open`) & Persistent Serve ANN (`3rz35` / `2l1b0.32`, GH #452)**.
+   - **Five Production `sqlite3` CLI Fallbacks Remain in `src/storage/sqlite.rs` (`2l1b0.65`)** (awaiting upstream `frankensqlite` repair-mode open).
+   - **Nearly-Complete Campaign Beads (`2l1b0.54`, `2l1b0.55`, `2l1b0.58`, `2l1b0.61`, `2l1b0.67`, `2l1b0.68`, `2l1b0.74`)**:
+     - `2l1b0.67` (encrypted `export-html` title/metadata sealing) and `2l1b0.61` (Pages typed recovery key + non-reused slot IDs) and `2l1b0.74` (Windows lock contention) are already implemented and tested in Rust (`52394e56`, `2af63546`, `2d123091`, `d4a82574`, `b4521d34`), with only their final verification/closeout items remaining!
+     - `2l1b0.55` has `F9` match mode and saved-view query persistence landed (`d05c29b3`), leaving only the `F7`/`Ctrl+Space` context-window consumer in `src/ui/app.rs`!
+6. **[NEW DISCOVERY — `NO_BEAD` -> `coding_agent_session_search-2l1b0.82`] Documentation, Manifest & `robot-docs env` Drift**:
+   - `Cargo.toml:167` and `build.rs:188-190` pin `franken-agent-detection` to `git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "6b337ba434b72c65c6c5a748b7ec47885f840ac0"` (tracked for crates.io publication by `zztql`), contradicting `README.md:3678,3683` and `AGENTS.md:225`.
+   - `codex-layout-migrate` and `lexical-quarantine` are shipped subcommands (`src/main.rs:309-316`), companion binaries (`Cargo.toml:45-61`), and robot capabilities (`capabilities.json.golden:119-120`), with **zero mentions** in `README.md` or `AGENTS.md`.
+   - `capabilities.json.golden` lists **35 connectors**, while `AGENTS.md:721-754` lists 32.
+   - `./scripts/validate_docs.sh --env` warns that **49 of 70 `README.md` environment variables** are absent from `cass robot-docs env`.
+
+#### 3. What is blocking us from getting there?
+
+1. **SQLite Family Qualification (`gi7k7` P0 `in_progress`, GH #516)**: Qualifying `fsqlite =0.4.12` across all 20 crates (`5309f842` recorded gate b35 evidence).
+2. **Registry Publication of `franken-agent-detection` (`zztql` P2 `open`)**: Publishing FAD `>= 6b337ba4` to crates.io so `cass 0.11.0` can be published on crates.io and released via `/dsr`.
+3. **Red Gate Baseline on `main` (`2l1b0.80` / GH #526, `dcp01`, `wo524`, `ctd01`)**: Restoring `STAGE=fmt`, the 3 `cli_doctor` cleanup tests (`dcp01`), `--watch-once` single-file handling (`wo524`), and `Continue` connector registry tests (`ctd01`).
+
+#### 4. If we were to implement all open and in-progress beads, would we close the gap completely? Why or why not?
+
+**With `coding_agent_session_search-2l1b0.80`, `coding_agent_session_search-2l1b0.81`, and `coding_agent_session_search-2l1b0.82` created and wired into `.beads/issues.jsonl`: YES.** Every vision requirement, open GitHub issue, and architectural invariant has an explicit bead owner with falsifiable acceptance criteria.
+
+#### 5. What goals from the vision were NOT covered by ANY existing bead (and are now owned)?
+
+| Uncovered Goal / Gap Found on `HEAD` | Code / Doc Location | Prior Bead Status | New Bead Created |
+|---|---|---|---|
+| **GH #526**: `cargo fmt --check` (`STAGE=fmt`) fails on 91 Rust files on `main` since `b2c46a14` | `scripts/gate.sh`, 91 `.rs` files | `NO_BEAD` | **`coding_agent_session_search-2l1b0.80`** (`P1`, bug; blocks `2l1b0.25`) |
+| **Truthful `--stale-threshold` & `index.stale` / `index.fresh` in `status` and `health`**: `age_stale` is suppressed whenever `fingerprint_matches == Some(true)` | `src/search/asset_state.rs:1660-1662`, `src/indexer/background_refresh.rs:133-155` | `NO_BEAD` (`synme` closed with workaround in `background_refresh.rs`) | **`coding_agent_session_search-2l1b0.81`** (`P1`, bug; related to `synme`, blocks `2l1b0.25`) |
+| **2026-10-14 Manifest, Subcommand, Connector & `robot-docs env` Parity**: FAD git pin vs registry doc claim, undocumented `codex-layout-migrate` & `lexical-quarantine`, 35 vs 32 connectors, 49 env vars missing from `cass robot-docs env` | `Cargo.toml:167`, `build.rs:188-190`, `src/main.rs:309-316`, `README.md`, `AGENTS.md`, `src/lib.rs` | `NO_BEAD` | **`coding_agent_session_search-2l1b0.82`** (`P2`, task; related to `2l1b0.26`, `2l1b0.69`, `zztql`, blocks `2l1b0.25`) |
+
+---
+
+### BrennerBot + Modes-of-Reasoning + Idea-Wizard High-Leverage Triage (30 -> Top 5 + Next 10)
+
+Applying `/idea-wizard` (30 candidate improvements winnowed to Top 5 + Next 10), `/modes-of-reasoning-project-analysis` (independent claim audit separating code facts from stale tracker claims), and `/brennerbot-with-ntm`'s Hypothesis Opportunity Matrix (`Score = (MindChange × Falsifiability × OptionValue) / (Cost × Ambiguity × InfraRisk)`):
+
+| Rank & Bead | Improvement / Gap-Closing Target | Mind | Falsify | Option | Cost | Ambig | Infra | Score | Execution Disposition |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| **#1 (`dcp01`)** | **Fix `publish_staged_lexical_index` empty-`index_path` backup bug (`src/indexer/mod.rs:24622`)**: `index_dir()` creates an empty `index_path` dir before first publish, causing `publish_staged_lexical_index` to retain a bogus empty backup in `.lexical-publish-backups/` and breaking 3 `tests/cli_doctor.rs` tests (`6426`, `7420`, `7647`). | 5 | 5 | 5 | 1 | 1 | 1 | **125.0** | **Execute immediately** (unclaimed `P1`, 15-line surgical fix + regression test). |
+| **#2 (`2l1b0.81`)** | **Two-Edge Freshness Model in `src/search/asset_state.rs:1660-1662`**: Decouple **DB-to-Quill projection parity** (`status = "ready"` when `fingerprint_matches == Some(true)`) from **source-to-archive age staleness** (`stale = true, fresh = false` when `age_seconds > stale_threshold_seconds`), making `cass status` and `cass health --stale-threshold` truthful without triggering false inline Quill rebuilds on `cass search`. | 5 | 5 | 5 | 1 | 1 | 1 | **125.0** | **Execute immediately** (unclaimed `P1`, fixes broken `--stale-threshold` contract). |
+| **#3 (`pc522`)** | **Wire `src/raw_mirror/store.rs` capture tests through production `policy::capture`**: Move `store.rs` fixture captures off the dead `#[cfg(test)]` pre-budget path onto `policy::capture` and add a negative over-budget `RawMirrorCapturePaused` test. | 4 | 5 | 4 | 1 | 1 | 1 | **80.0** | **Execute immediately** (unclaimed `P2`, eliminates test-only shadow path). |
+| **#4 (`2l1b0.82`)** | **Complete `cass robot-docs env` (add 49 missing env vars) + document `codex-layout-migrate` & `lexical-quarantine` + 35 connectors**: Turn 49 `./scripts/validate_docs.sh --env` warnings into `0` warnings and bring `README.md`/`AGENTS.md` to 100% subcommand/connector parity. | 4 | 5 | 4 | 1 | 1 | 1 | **80.0** | **Execute immediately** (unclaimed `P2`, high user/agent discoverability). |
+| **#5 (`2l1b0.55`)** | **Wire TUI `F7` / `Ctrl+Space` Context Window (`S`/`M`/`L`/`XL`) into results-list and detail preview rendering**: `context_window` is already tracked in `App` state and status bar (`src/ui/app.rs`), while `F9` match mode and saved-view query persistence already landed in `d05c29b3`. Wiring `context_window` into snippet/preview truncation completes `2l1b0.55`! | 4 | 5 | 4 | 2 | 1 | 1 | **40.0** | **Execute in this wave** (unclaimed `P2`, textbook "finished code waiting to be wired"). |
+
+#### Next 10 High-Leverage Items (#6–#15)
+6. **`2l1b0.80` (GH #526)**: Restore `cargo fmt --check` (`STAGE=fmt EXIT=0`) across all drifted Rust files on `main` without sweeping concurrent dirty files.
+7. **`2l1b0.74`**: Close out Windows `fs2` -> `std::fs::File::try_lock` contention bead (code and native Windows `wlap` test runs already landed in `d4a82574`/`b4521d34` and verified in comment 2026-10-09; audit whether `fs2` can be removed from remaining non-contention sites or if bead is ready to close now that GH Actions is permanently off).
+8. **`2l1b0.58`**: Add the held-operation-lock `exit 7` (`index-busy`) scenario to `doctor_exit_codes_match_the_advertised_contract` in `tests/cli_doctor.rs`.
+9. **`ctd01` / `wo524` / `rr523` / `se525` / `gi7k7`**: Active swarm lane owned by `RainyBluff` (Continue connector wiring, watch-once Codex/Shelley fix, resumable lexical candidate after timeout, bounded semantic delta hydration, `fsqlite =0.4.12`).
+10. **`2l1b0.67` & `2l1b0.61`**: Encrypted `export-html` title/metadata sealing (`52394e56`) and Pages typed recovery-key entry (`2d123091`) — Rust + Node worker crypto tests are already green on `main`; verify DOM/unlock flow without GitHub Actions so both beads can close cleanly.
+11. **`ds7uy.3` & `ds7uy.3.3`**: Enable `owner_backed_progressive_reader: true` in `src/search/vector_index.rs:228` and native ANN over retained WAL updates.
+12. **`3rz35` / `2l1b0.32` (GH #452)**: Keep a warm in-memory HNSW/Quill reader across requests in `cass serve`.
+13. **`zjv7m` (GH #519) & `362yj` (GH #515)**: Windows live-WAL OpenCode export teardown and macOS `watch_startup` daemon handoff.
+14. **`2l1b0.46` / `2l1b0.72` (GH #496 / #320)**: Enforce `CASS_MEMORY_BUDGET_MB` across lexical and semantic rebuilds on multi-million-message archives.
+15. **`zztql` + `55wh0` + `5v57k` + `2l1b0.25`**: Publish `franken-agent-detection` to crates.io, run full `scripts/gate.sh` + `ubs`, and release `v0.11.0` via `/dsr`, closing 12+ already-fixed GitHub issues.
+
+---
+
+### Phase 2–5 Summary: Bridge Plan, 3 Ambition Rounds & 5 Plan-Space Refinement Passes
+
+1. **Three Ambition Rounds (Failure-Class Elimination)**:
+   - **Round 1 — Two-Edge Freshness Model (`2l1b0.81`)**: Separate **Edge 1: Source-to-DB Recency (`age_stale`)** (`age_seconds > stale_threshold_seconds`, which drives `cass status`, `cass health`, and `stale_reasons`) from **Edge 2: DB-to-Quill Projection Parity (`status == "ready"`)** (`fingerprint_matches == Some(true)`, which prevents `cass search` from running an expensive synchronous Quill rebuild when SQLite and Quill already match).
+   - **Round 2 — Idempotent First-Publish & Self-Cleaning Staging (`dcp01`, `ms523`, `rr523`)**: Make `publish_staged_lexical_index` treat an existing-but-empty `index_path` directory as a first publish (`FirstPublish`) rather than retaining an empty backup in `.lexical-publish-backups/`.
+   - **Round 3 — Self-Verifying Contract & Gate Parity Without GitHub Actions (`2l1b0.80`, `2l1b0.82`, `pc522`)**: Restore `STAGE=fmt EXIT=0`, route `store.rs` capture tests through `policy::capture`, and make `cass robot-docs env` cover 100% of the 70 `README.md` environment variables.
+2. **Five Plan-Space Refinement Passes**:
+   - **Pass 1 (Coverage & No Duplicate Ownership)**: Reconciled against `eba1d01c`..`80ed2952` (`ms523` closed, `zztql` and `ctd01` filed); verified zero overlap between `2l1b0.80`, `2l1b0.81`, `2l1b0.82`, `dcp01`, and `pc522`.
+   - **Pass 2 (Exact Source & Proof-Class Anchors)**: Every bead cites exact `HEAD` (`80ed2952`) file and line numbers and specifies `[UNIT]`, `[INTEGRATION]`, or `[E2E]` proof classes.
+   - **Pass 3 (Dependency Graph & Cycle Check)**: Wired `2l1b0.80`, `2l1b0.81`, and `2l1b0.82` under `coding_agent_session_search-2l1b0`, blocking `2l1b0.25`, and related to `synme`, `zztql`, `2l1b0.26`, and `2l1b0.69`; verified `0` cycles via `bv --robot-triage`.
+   - **Pass 4 (Adversarial & Negative Test Specification)**: Every bead includes both positive and planted-negative assertions (e.g., `2l1b0.81` asserts `status: "ready"` AND `stale: true, fresh: false` when `age_seconds > stale_threshold` and `fingerprint_matches == Some(true)`).
+   - **Pass 5 (Immediate Execution & Accretive Delivery)**: Transitioned directly from plan space into code execution per `/just-say-no-to-process-porn-and-ceremony`.
+
+---
 
 ## Assessment: 2026-09-23 night (DarkFinch)
 
