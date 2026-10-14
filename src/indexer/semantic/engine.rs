@@ -3185,6 +3185,7 @@ impl SemanticIndexer {
         )
     }
 
+    #[cfg(test)]
     fn reconcile_index_at_paths(
         &self,
         embedded_messages: Vec<EmbeddedMessage>,
