@@ -42,7 +42,11 @@ fn main() -> Result<()> {
     } else {
         println!(
             "{}: retain Codex conversation {} ({}) and {} existing messages for source {}.",
-            if report.applied { "Registered" } else { "Dry-run verified" },
+            if report.applied {
+                "Registered"
+            } else {
+                "Dry-run verified"
+            },
             report.canonical_conversation_id,
             report.canonical_external_id,
             report.retained_messages,

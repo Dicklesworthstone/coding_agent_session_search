@@ -48,7 +48,13 @@ impl Fixture {
         let reuse = root.join(".backfill-reuse-Publication123");
         fs::create_dir(&reuse)?;
         fs::copy(&live, reuse.join("candidate.fsvi"))?;
-        Ok(Self { indexer, manifest, live, staging, reuse })
+        Ok(Self {
+            indexer,
+            manifest,
+            live,
+            staging,
+            reuse,
+        })
     }
 
     fn watched(&self, data: &Path) -> Vec<PathBuf> {
@@ -61,7 +67,11 @@ impl Fixture {
         ]
     }
 
-    fn assert_retained(&mut self, data: &Path, approval: &BackfillArtifactReclaimPlan) -> Result<()> {
+    fn assert_retained(
+        &mut self,
+        data: &Path,
+        approval: &BackfillArtifactReclaimPlan,
+    ) -> Result<()> {
         let before = snapshot(&self.watched(data))?;
         let input = self.manifest.clone();
         for result in [
@@ -70,20 +80,36 @@ impl Fixture {
             apply_backfill_artifact_plan(data, &approval.plan_fingerprint).map(|_| ()),
         ] {
             let error = result.unwrap_err();
-            assert!(error.is::<PublicationUnavailable>(), "wrong refusal: {error:#}");
+            assert!(
+                error.is::<PublicationUnavailable>(),
+                "wrong refusal: {error:#}"
+            );
         }
         // Post-success GC has the same admission, not a less conservative path.
         let artifacts = BackfillArtifacts::lock(data)?;
         artifacts.after_success(&self.manifest, &self.live);
         drop(artifacts);
         let mut entered = false;
-        let error = self.indexer.with_backfill_artifacts(data, &mut self.manifest, |_, _| {
-            entered = true;
-            assert_eq!(snapshot(&before.iter().map(|(path, _, _)| path.clone()).collect::<Vec<_>>())?, before);
-            bail!("stop the repair before writing anything")
-        });
+        let error = self
+            .indexer
+            .with_backfill_artifacts(data, &mut self.manifest, |_, _| {
+                entered = true;
+                assert_eq!(
+                    snapshot(
+                        &before
+                            .iter()
+                            .map(|(path, _, _)| path.clone())
+                            .collect::<Vec<_>>()
+                    )?,
+                    before
+                );
+                bail!("stop the repair before writing anything")
+            });
         assert!(error.is_err());
-        assert!(entered, "data-only admission must not disable the repair writer");
+        assert!(
+            entered,
+            "data-only admission must not disable the repair writer"
+        );
         assert_eq!(self.manifest, input);
         assert_eq!(snapshot(&self.watched(data))?, before);
         Ok(())
@@ -93,22 +119,25 @@ impl Fixture {
 // Preserve directories and missing entries as well as file bytes. Recovery may
 // create its stable lock files, which are deliberately outside this inventory.
 fn snapshot(paths: &[PathBuf]) -> Result<Vec<(PathBuf, bool, Option<Vec<u8>>)>> {
-    paths.iter().map(|path| {
-        let kind = match fs::symlink_metadata(path) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        Ok((
-            path.clone(),
-            kind.as_ref().is_some_and(|metadata| metadata.is_dir()),
-            if kind.as_ref().is_some_and(|metadata| metadata.is_file()) {
-                Some(fs::read(path)?)
-            } else {
-                None
-            },
-        ))
-    }).collect()
+    paths
+        .iter()
+        .map(|path| {
+            let kind = match fs::symlink_metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            Ok((
+                path.clone(),
+                kind.as_ref().is_some_and(|metadata| metadata.is_dir()),
+                if kind.as_ref().is_some_and(|metadata| metadata.is_file()) {
+                    Some(fs::read(path)?)
+                } else {
+                    None
+                },
+            ))
+        })
+        .collect()
 }
 
 #[test]
@@ -134,14 +163,24 @@ fn missing_published_data_keeps_fallbacks_until_explicit_restoration() -> Result
         assert!(report.failed_paths.is_empty());
         assert_eq!(fs::read(&fixture.live)?, original);
         assert_eq!(reader.search_top_k(&query, 3, None)?, hits);
-        assert_eq!(VectorIndex::open_read_only(&fixture.live)?.search_top_k(&query, 3, None)?, hits);
+        assert_eq!(
+            VectorIndex::open_read_only(&fixture.live)?.search_top_k(&query, 3, None)?,
+            hits
+        );
     }
     Ok(())
 }
 
 #[test]
 fn damaged_or_foreign_publications_never_authorize_retiring_complete_copies() -> Result<()> {
-    for damage in ["empty", "truncated", "producer", "dimension", "coverage", "wal-directory"] {
+    for damage in [
+        "empty",
+        "truncated",
+        "producer",
+        "dimension",
+        "coverage",
+        "wal-directory",
+    ] {
         let temp = tempfile::tempdir()?;
         let data = temp.path();
         let mut fixture = Fixture::new(data, TierKind::Quality)?;
@@ -160,9 +199,17 @@ fn damaged_or_foreign_publications_never_authorize_retiring_complete_copies() ->
             }
             _ => {
                 let dimension = if damage == "dimension" { 4 } else { 384 };
-                let producer = if damage == "producer" { "foreign" } else { "fnv1a-384" };
+                let producer = if damage == "producer" {
+                    "foreign"
+                } else {
+                    "fnv1a-384"
+                };
                 let mut writer = VectorIndex::create_with_revision(
-                    &fixture.live, producer, "fixture", dimension, Quantization::F16,
+                    &fixture.live,
+                    producer,
+                    "fixture",
+                    dimension,
+                    Quantization::F16,
                 )?;
                 let mut vector = vec![0.0; dimension];
                 vector[0] = 1.0;
@@ -199,17 +246,30 @@ fn acknowledged_wal_rows_must_survive_before_published_fallbacks_are_reclaimed()
         }
         fixture.assert_retained(data, &approval)?;
         fs::write(&wal, &original)?;
-        let before = snapshot(&[fixture.live.clone(), wal.clone(), SemanticManifest::path(data)])?;
+        let before = snapshot(&[
+            fixture.live.clone(),
+            wal.clone(),
+            SemanticManifest::path(data),
+        ])?;
         let current = plan_backfill_artifacts(data)?;
         let report = apply_backfill_artifact_plan(data, &current.plan_fingerprint)?;
         assert_eq!((report.removed_files, report.removed_directories), (1, 1));
-        assert_eq!(snapshot(&before.iter().map(|(path, _, _)| path.clone()).collect::<Vec<_>>())?, before);
+        assert_eq!(
+            snapshot(
+                &before
+                    .iter()
+                    .map(|(path, _, _)| path.clone())
+                    .collect::<Vec<_>>()
+            )?,
+            before
+        );
     }
     Ok(())
 }
 
 #[test]
-fn repair_of_a_missing_publication_retains_fallbacks_until_new_publication_succeeds() -> Result<()> {
+fn repair_of_a_missing_publication_retains_fallbacks_until_new_publication_succeeds() -> Result<()>
+{
     let temp = tempfile::tempdir()?;
     let data = temp.path();
     let mut fixture = Fixture::new(data, TierKind::Quality)?;
@@ -217,12 +277,18 @@ fn repair_of_a_missing_publication_retains_fallbacks_until_new_publication_succe
     fs::rename(&fixture.live, data.join("retained-publication.fsvi"))?;
     fixture.assert_retained(data, &approval)?;
     let published = fixture.indexer.run_backfill_batch(
-        &rows(), data, &mut fixture.manifest, plan(TierKind::Quality, "content-v1:repaired"),
+        &rows(),
+        data,
+        &mut fixture.manifest,
+        plan(TierKind::Quality, "content-v1:repaired"),
     )?;
     assert!(published.published);
     assert!(fixture.manifest.checkpoint.is_none());
     assert!(!fixture.staging.exists() && !fixture.reuse.exists());
-    assert_eq!(VectorIndex::open_read_only(&published.index_path)?.record_count(), 3);
+    assert_eq!(
+        VectorIndex::open_read_only(&published.index_path)?.record_count(),
+        3
+    );
     assert!(data.join("retained-publication.fsvi").is_file());
     Ok(())
 }
@@ -235,14 +301,28 @@ fn optional_unready_records_stay_protected_without_becoming_cleanup_authority() 
     let mut optional = fixture.manifest.quality_tier.clone().unwrap();
     optional.tier = TierKind::Fast;
     optional.ready = false;
-    optional.index_path = fixture.reuse.join("candidate.fsvi").strip_prefix(data)?.to_string_lossy().into_owned();
-    fs::write(data.join(&optional.index_path), b"unready recovery evidence")?;
+    optional.index_path = fixture
+        .reuse
+        .join("candidate.fsvi")
+        .strip_prefix(data)?
+        .to_string_lossy()
+        .into_owned();
+    fs::write(
+        data.join(&optional.index_path),
+        b"unready recovery evidence",
+    )?;
     fixture.manifest.fast_tier = Some(optional);
     fixture.manifest.save(data)?;
     let report = reclaim_backfill_artifacts(data)?;
     assert_eq!((report.removed_files, report.removed_directories), (1, 0));
-    assert_eq!(fs::read(fixture.reuse.join("candidate.fsvi"))?, b"unready recovery evidence");
-    assert_eq!(VectorIndex::open_read_only(&fixture.live)?.record_count(), 3);
+    assert_eq!(
+        fs::read(fixture.reuse.join("candidate.fsvi"))?,
+        b"unready recovery evidence"
+    );
+    assert_eq!(
+        VectorIndex::open_read_only(&fixture.live)?.record_count(),
+        3
+    );
     Ok(())
 }
 
@@ -259,15 +339,19 @@ fn data_pin_failures_retain_their_type_and_no_pin_runs_on_an_invalid_image() -> 
         assert_eq!(main.metadata()?.len(), fs::metadata(path)?.len());
         assert!(wal.is_none());
         Err(io::Error::other("injected publication fsync failure").into())
-    }).unwrap_err();
+    })
+    .unwrap_err();
     assert!(error.is::<PublicationUnavailable>() && error.is::<io::Error>());
     assert_eq!(pins, 1);
     assert_eq!(snapshot(&fixture.watched(data))?, before);
     fs::write(&fixture.live, [])?;
-    assert!(validate_with(data, &fixture.manifest, |_, _, _, _| {
-        pins += 1;
-        Ok(())
-    }).is_err());
+    assert!(
+        validate_with(data, &fixture.manifest, |_, _, _, _| {
+            pins += 1;
+            Ok(())
+        })
+        .is_err()
+    );
     assert_eq!(pins, 1);
     Ok(())
 }
@@ -281,10 +365,15 @@ fn invalid_authority_still_refuses_startup_and_empty_sweeps_skip_data_admission(
     fs::write(SemanticManifest::path(data), b"{torn authority")?;
     let before = snapshot(&fixture.watched(data))?;
     let mut entered = false;
-    assert!(fixture.indexer.with_backfill_artifacts(data, &mut fixture.manifest, |_, _| {
-        entered = true;
-        bail!("must not enter through invalid authority")
-    }).is_err());
+    assert!(
+        fixture
+            .indexer
+            .with_backfill_artifacts(data, &mut fixture.manifest, |_, _| {
+                entered = true;
+                bail!("must not enter through invalid authority")
+            })
+            .is_err()
+    );
     assert!(!entered);
     assert_eq!(snapshot(&fixture.watched(data))?, before);
     fixture.manifest.save(data)?;

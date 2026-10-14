@@ -99,7 +99,9 @@ impl<'request> CurrentTextQuery<'request> {
         // Reserve the minimum visible pages. The actual (deduplicated) union
         // of tier contributors is charged before reading source bodies, so
         // disjoint tiers or refills may need more than this minimum allowance.
-        let requested = self.limit.checked_mul(phases)
+        let requested = self
+            .limit
+            .checked_mul(phases)
             .ok_or(HydrationError::BudgetExceeded)?;
         self.hydration.validate(requested)?;
         Ok(Work::new(self.hydration, started)?)
@@ -179,7 +181,9 @@ struct Excluding<'filter> {
 impl SearchFilter for Excluding<'_> {
     fn matches(&self, doc_id: &str, metadata: Option<&serde_json::Value>) -> bool {
         !self.rejected.contains(doc_id)
-            && self.original.is_none_or(|filter| filter.matches(doc_id, metadata))
+            && self
+                .original
+                .is_none_or(|filter| filter.matches(doc_id, metadata))
     }
 
     fn name(&self) -> &str {
@@ -195,7 +199,11 @@ struct RefillState {
 
 impl RefillState {
     fn new(budget: RefillBudget) -> Self {
-        Self { rejected: BTreeSet::new(), stats: CurrentSearchStats::default(), budget }
+        Self {
+            rejected: BTreeSet::new(),
+            stats: CurrentSearchStats::default(),
+            budget,
+        }
     }
 
     fn reject(&mut self, doc_id: &str, missing: bool) -> Result<(), CurrentSearchError> {
@@ -203,7 +211,10 @@ impl RefillState {
         if self.rejected.contains(doc_id) {
             return Err(HydrationError::InvalidCandidate.into());
         }
-        let bytes = self.stats.exclusion_bytes.checked_add(doc_id.len())
+        let bytes = self
+            .stats
+            .exclusion_bytes
+            .checked_add(doc_id.len())
             .filter(|&bytes| bytes <= self.budget.max_exclusion_bytes)
             .ok_or(CurrentSearchError::RefillExhausted)?;
         if self.rejected.len() >= self.budget.max_rejected_passages {
@@ -237,7 +248,10 @@ fn verify_pass(
         if state.rejected.contains(&hit.doc_id) {
             return Err(HydrationError::InvalidCandidate.into());
         }
-        by_message.entry(hit.document.message_id).or_default().push(rank);
+        by_message
+            .entry(hit.document.message_id)
+            .or_default()
+            .push(rank);
     }
     let mut verified = vec![None; batch.hits().len()];
     for (message_id, ranks) in by_message {
@@ -267,7 +281,12 @@ fn verify_pass(
             work.check()?;
             if location.is_none() {
                 let value = source.location();
-                work.output(value.source_id.len().saturating_add(value.source_path.len()))?;
+                work.output(
+                    value
+                        .source_id
+                        .len()
+                        .saturating_add(value.source_path.len()),
+                )?;
                 location = Some(Arc::new(value));
             }
             work.output(canonical_text.len())?;
@@ -282,9 +301,12 @@ fn verify_pass(
     if state.rejected.len() != before {
         return Ok(None);
     }
-    Ok(Some(verified.into_iter()
-        .map(|hit| hit.ok_or(HydrationError::InvalidCandidate))
-        .collect::<Result<_, _>>()?))
+    Ok(Some(
+        verified
+            .into_iter()
+            .map(|hit| hit.ok_or(HydrationError::InvalidCandidate))
+            .collect::<Result<_, _>>()?,
+    ))
 }
 
 fn refill<B: BatchSource>(
@@ -294,7 +316,9 @@ fn refill<B: BatchSource>(
     retrieve: impl Fn(&dyn SearchFilter) -> SemanticReaderResult<B>,
 ) -> Result<CurrentSemanticBatch<B>, CurrentSearchError> {
     let mut state = RefillState::new(request.refill);
-    refill_accounted(request, transaction, &mut work, &mut state, |scope| retrieve(scope))
+    refill_accounted(request, transaction, &mut work, &mut state, |scope| {
+        retrieve(scope)
+    })
 }
 
 // Synchronous and progressive retrieval use the same candidate/source boundary.
@@ -319,26 +343,32 @@ fn refill_accounted<B: BatchSource>(
         // Each tier still selects only request.limit candidates. Retain their
         // union until source verification has rejected every stale contributor,
         // including those that lost the final fused top-k competition.
-        let candidate_limit = request.limit.checked_mul(match request.producers {
-            TextQueryProducers::Progressive { .. } => 2,
-            _ => 1,
-        }).ok_or(HydrationError::BudgetExceeded)?;
+        let candidate_limit = request
+            .limit
+            .checked_mul(match request.producers {
+                TextQueryProducers::Progressive { .. } => 2,
+                _ => 1,
+            })
+            .ok_or(HydrationError::BudgetExceeded)?;
         let mut batch = retrieve(&Excluding {
-            original: request.filter, rejected: &state.rejected,
+            original: request.filter,
+            rejected: &state.rejected,
         })?;
         if batch.batch().hits().len() > candidate_limit {
             return Err(HydrationError::InvalidCandidate.into());
         }
-        if let Some(mut passages) = verify_pass(
-            batch.batch(), transaction, request.projection, work, state,
-        )? {
+        if let Some(mut passages) =
+            verify_pass(batch.batch(), transaction, request.projection, work, state)?
+        {
             retain_verified_prefix(&mut batch, request.limit);
             passages.truncate(request.limit);
             state.stats.source_bytes_read = work.source_bytes;
             state.stats.output_bytes_checked = work.output_bytes;
             return Ok(CurrentSemanticBatch {
                 verified: HydratedSemanticBatch {
-                    source: batch, passages, projection: request.projection,
+                    source: batch,
+                    passages,
+                    projection: request.projection,
                 },
                 stats: state.stats,
             });
@@ -381,7 +411,9 @@ impl SelectedSemanticGeneration {
         let cached = CachedProducers::new(request.text, request.producers);
         let search = self.activate_text(request.text, cached.producers())?;
         refill(&request, transaction, work, |filter| {
-            let batch = search.search.current_candidates(request.limit, filter, request.ann)?;
+            let batch = search
+                .search
+                .current_candidates(request.limit, filter, request.ann)?;
             Ok(search.retain(batch))
         })
     }

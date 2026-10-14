@@ -207,16 +207,19 @@ fn verify_live_identity(
     producer: &dyn Embedder,
     state: &DaemonAttestationState,
 ) -> Result<(), ErrorResponse> {
-    let identity = producer.identity().and_then(|identity| {
-        identity.validate()?;
-        Ok(identity)
-    }).map_err(|_| {
-        error(
-            ErrorCode::ModelLoadFailed,
-            "loaded embedding producer cannot be verified",
-            false,
-        )
-    })?;
+    let identity = producer
+        .identity()
+        .and_then(|identity| {
+            identity.validate()?;
+            Ok(identity)
+        })
+        .map_err(|_| {
+            error(
+                ErrorCode::ModelLoadFailed,
+                "loaded embedding producer cannot be verified",
+                false,
+            )
+        })?;
     if identity != &state.connection.embedding_identity
         || producer.category() != state.connection.model_category
     {
@@ -291,14 +294,22 @@ fn embedding(
                 error(ErrorCode::ModelLoadFailed, "attestation unavailable", false)
             })?;
             owned::attested_batch(
-                owner.as_ref(), state, operation.ok_or_else(|| {
+                owner.as_ref(),
+                state,
+                operation.ok_or_else(|| {
                     error(ErrorCode::InvalidInput, "attested operation missing", false)
-                })?, &inputs, budget,
+                })?,
+                &inputs,
+                budget,
             )?
         } else {
             owner.embed_batch_sync(&inputs).map_err(|source| {
                 tracing::warn!(error = %source, "Daemon embedding inference failed");
-                error(ErrorCode::Internal, "native embedding inference failed", false)
+                error(
+                    ErrorCode::Internal,
+                    "native embedding inference failed",
+                    false,
+                )
             })?
         };
         validate_vectors(&vectors, dimension)?;

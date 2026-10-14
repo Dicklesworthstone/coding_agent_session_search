@@ -19,7 +19,10 @@ fn concurrent_acquisitions_return_the_single_published_owner() {
                 })
             })
             .collect();
-        tasks.into_iter().map(|task| task.join().unwrap()).collect::<Vec<_>>()
+        tasks
+            .into_iter()
+            .map(|task| task.join().unwrap())
+            .collect::<Vec<_>>()
     });
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let published = slot.get().unwrap();
@@ -56,11 +59,17 @@ fn waiting_unload_cannot_remove_the_owner_returned_by_loading() {
 #[test]
 fn warm_acquisition_keeps_its_owner_across_unload_and_replacement() {
     let slot = ModelSlot::<usize>::new();
-    let first = slot.acquire_with(|| Ok::<_, ()>((Arc::new(1), "first".to_owned()))).unwrap();
-    let borrowed = slot.acquire_with::<()>(|| panic!("warm acquisition ran a loader")).unwrap();
+    let first = slot
+        .acquire_with(|| Ok::<_, ()>((Arc::new(1), "first".to_owned())))
+        .unwrap();
+    let borrowed = slot
+        .acquire_with::<()>(|| panic!("warm acquisition ran a loader"))
+        .unwrap();
     assert!(Arc::ptr_eq(&first, &borrowed));
     slot.unload();
-    let replacement = slot.acquire_with(|| Ok::<_, ()>((Arc::new(2), "second".to_owned()))).unwrap();
+    let replacement = slot
+        .acquire_with(|| Ok::<_, ()>((Arc::new(2), "second".to_owned())))
+        .unwrap();
     assert!(!Arc::ptr_eq(&first, &replacement));
     assert_eq!(*borrowed, 1);
     assert_eq!(*slot.get().unwrap(), 2);
@@ -74,7 +83,10 @@ fn warm_acquisition_keeps_its_owner_across_unload_and_replacement() {
 #[test]
 fn acquisition_failures_publish_no_owner_and_remain_retryable() {
     let slot = ModelSlot::<usize>::new();
-    assert_eq!(slot.acquire_with(|| Err("injected load error")), Err("injected load error"));
+    assert_eq!(
+        slot.acquire_with(|| Err("injected load error")),
+        Err("injected load error")
+    );
     assert!(slot.get().is_none());
     assert_eq!(slot.snapshot().name, "load-failed");
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -83,7 +95,9 @@ fn acquisition_failures_publish_no_owner_and_remain_retryable() {
     assert!(panic.is_err());
     assert!(slot.get().is_none());
     assert_eq!(slot.snapshot().name, "load-failed");
-    let recovered = slot.acquire_with(|| Ok::<_, ()>((Arc::new(31), "recovered".to_owned()))).unwrap();
+    let recovered = slot
+        .acquire_with(|| Ok::<_, ()>((Arc::new(31), "recovered".to_owned())))
+        .unwrap();
     assert_eq!(*recovered, 31);
     assert!(Arc::ptr_eq(&recovered, &slot.get().unwrap()));
 }

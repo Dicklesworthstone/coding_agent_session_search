@@ -108,7 +108,13 @@ struct Budget {
 
 impl Budget {
     fn new(limits: Limits) -> Self {
-        Self { limits, started: Instant::now(), root_entries: 0, tree_entries: 0, path_bytes: 0 }
+        Self {
+            limits,
+            started: Instant::now(),
+            root_entries: 0,
+            tree_entries: 0,
+            path_bytes: 0,
+        }
     }
 
     fn check(&self) -> io::Result<()> {
@@ -130,9 +136,13 @@ impl Budget {
     fn tree_entry(&mut self, path: &Path, depth: usize) -> io::Result<()> {
         self.check()?;
         if self.tree_entries >= self.limits.tree_entries || depth > self.limits.depth {
-            return Err(io::Error::other("quarantine tree-entry/depth budget exhausted"));
+            return Err(io::Error::other(
+                "quarantine tree-entry/depth budget exhausted",
+            ));
         }
-        self.path_bytes = self.path_bytes.checked_add(path.as_os_str().as_encoded_bytes().len())
+        self.path_bytes = self
+            .path_bytes
+            .checked_add(path.as_os_str().as_encoded_bytes().len())
             .filter(|&bytes| bytes <= self.limits.path_bytes)
             .ok_or_else(|| io::Error::other("quarantine path-byte budget exhausted"))?;
         self.tree_entries += 1;
@@ -147,38 +157,50 @@ fn retention_enabled() -> io::Result<bool> {
         Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(true),
         Ok(value) if value == "1" => Ok(true),
         Ok(value) if value == "0" => Ok(false),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "CASS_LEXICAL_QUARANTINE_RETENTION must be 0 or 1")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CASS_LEXICAL_QUARANTINE_RETENTION must be 0 or 1",
+        )),
     }
 }
 
 fn valid_name(name: &str, prefix: &str) -> bool {
-    name.strip_prefix(prefix).is_some_and(|suffix|
-        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 fn real_directory(path: &Path) -> io::Result<fs::Metadata> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "quarantine root must be a real directory, not a symlink"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "quarantine root must be a real directory, not a symlink",
+        ));
     }
     Ok(metadata)
 }
 
 fn roots(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    if data_dir.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "quarantine data directory must not contain parent traversal"));
+    if data_dir
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "quarantine data directory must not contain parent traversal",
+        ));
     }
     real_directory(data_dir)?;
     let root = crate::search::tantivy::expected_index_dir(data_dir)
-        .parent().ok_or_else(|| io::Error::other("lexical index has no parent"))?.to_owned();
+        .parent()
+        .ok_or_else(|| io::Error::other("lexical index has no parent"))?
+        .to_owned();
     let mut roots = vec![data_dir.to_owned()];
     if root.as_path() != data_dir {
         match real_directory(&root) {
             Ok(_) => roots.push(root),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
@@ -214,7 +236,12 @@ fn stamp(relative: &Path, metadata: &fs::Metadata) -> io::Result<blake3::Hash> {
     Ok(hash.finalize())
 }
 
-fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> io::Result<Artifact> {
+fn observe(
+    path: &Path,
+    pending: bool,
+    now: SystemTime,
+    budget: &mut Budget,
+) -> io::Result<Artifact> {
     let root = real_directory(path)?;
     let mut latest = root.modified()?;
     let mut bytes = 0_u64;
@@ -235,13 +262,17 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
         budget.tree_entry(relative, entry.depth())?;
         let metadata = fs::symlink_metadata(entry.path())?;
         if !metadata.is_dir() && !metadata.is_file() {
-            return Err(io::Error::other("quarantine contains a symlink or special file"));
+            return Err(io::Error::other(
+                "quarantine contains a symlink or special file",
+            ));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             if metadata.dev() != root.dev() || (metadata.is_file() && metadata.nlink() != 1) {
-                return Err(io::Error::other("quarantine crosses a filesystem or contains hard-linked files"));
+                return Err(io::Error::other(
+                    "quarantine crosses a filesystem or contains hard-linked files",
+                ));
             }
         }
         // Only the two layouts actually produced by rebuild recovery are owned:
@@ -254,23 +285,31 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
             }
             has_pending_child = true;
             &parts[1..]
-        } else { parts.as_slice() };
+        } else {
+            parts.as_slice()
+        };
         if let Some(first) = parts.first() {
             if first.as_os_str() == "index" {
                 if parts.len() == 1 {
-                    if !metadata.is_dir() { return Err(io::Error::other("quarantine index is not a directory")); }
+                    if !metadata.is_dir() {
+                        return Err(io::Error::other("quarantine index is not a directory"));
+                    }
                 } else if metadata.is_file() {
                     has_index_payload = true;
                 }
             } else if first.as_os_str() == CHECKPOINT && parts.len() == 1 && metadata.is_file() {
                 has_checkpoint = true;
             } else {
-                return Err(io::Error::other("quarantine contains unrecognized top-level evidence; retain for inspection"));
+                return Err(io::Error::other(
+                    "quarantine contains unrecognized top-level evidence; retain for inspection",
+                ));
             }
         }
         latest = latest.max(metadata.modified()?);
         if metadata.is_file() {
-            bytes = bytes.checked_add(metadata.len()).ok_or_else(|| io::Error::other("quarantine byte count overflow"))?;
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| io::Error::other("quarantine byte count overflow"))?;
         }
         if let Some(evidence) = evidence::observe_file(relative, pending, &metadata) {
             failure_evidence.push(evidence);
@@ -290,23 +329,37 @@ fn observe(path: &Path, pending: bool, now: SystemTime, budget: &mut Budget) -> 
     failure_evidence.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     nodes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut hash = blake3::Hasher::new();
-    for (_, node) in nodes { hash.update(node.as_bytes()); }
+    for (_, node) in nodes {
+        hash.update(node.as_bytes());
+    }
     budget.check()?;
     Ok(Artifact {
-        path: path.to_owned(), interrupted_reclaim: pending, has_evidence, failure_evidence, size_bytes: bytes,
-        size_complete: true, age_seconds: now.duration_since(latest).ok().map(|age| age.as_secs()),
-        disposition: Disposition::Inspect, reason: String::new(), modified: Some(latest),
+        path: path.to_owned(),
+        interrupted_reclaim: pending,
+        has_evidence,
+        failure_evidence,
+        size_bytes: bytes,
+        size_complete: true,
+        age_seconds: now.duration_since(latest).ok().map(|age| age.as_secs()),
+        disposition: Disposition::Inspect,
+        reason: String::new(),
+        modified: Some(latest),
         metadata_fingerprint: Some(hash.finalize().to_hex().to_string()),
     })
 }
 
 fn select(inventory: &mut Inventory) {
-    inventory.total_bytes = match inventory.artifacts.iter().try_fold(0_u64,
-        |sum, artifact| sum.checked_add(artifact.size_bytes)) {
+    inventory.total_bytes = match inventory
+        .artifacts
+        .iter()
+        .try_fold(0_u64, |sum, artifact| sum.checked_add(artifact.size_bytes))
+    {
         Some(total) => total,
         None => {
             inventory.complete = false;
-            inventory.warnings.push("quarantine aggregate byte count overflow".into());
+            inventory
+                .warnings
+                .push("quarantine aggregate byte count overflow".into());
             u64::MAX
         }
     };
@@ -331,9 +384,15 @@ fn select(inventory: &mut Inventory) {
         .map(|(index, _)| index);
     for (index, artifact) in inventory.artifacts.iter_mut().enumerate() {
         let (disposition, reason) = if !inventory.complete || !artifact.size_complete {
-            (Disposition::Inspect, "inventory incomplete; automatic retention refused")
+            (
+                Disposition::Inspect,
+                "inventory incomplete; automatic retention refused",
+            )
         } else if !inventory.automatic_retention_enabled {
-            (Disposition::RetainDisabled, "automatic retention disabled by operator")
+            (
+                Disposition::RetainDisabled,
+                "automatic retention disabled by operator",
+            )
         } else if newest == Some(index) {
             let reason = if artifact.interrupted_reclaim {
                 "last available rebuild evidence retained after interrupted cleanup"
@@ -341,24 +400,51 @@ fn select(inventory: &mut Inventory) {
                 "newest complete rebuild evidence retained"
             };
             (Disposition::RetainNewest, reason)
-        } else if artifact.age_seconds.is_none_or(|age| age < MIN_AGE.as_secs()) {
-            (Disposition::RetainRecent, "recent, future-dated or unknown-age evidence retained")
+        } else if artifact
+            .age_seconds
+            .is_none_or(|age| age < MIN_AGE.as_secs())
+        {
+            (
+                Disposition::RetainRecent,
+                "recent, future-dated or unknown-age evidence retained",
+            )
         } else {
-            (Disposition::Eligible, "older derived rebuild evidence; reclaim only under index-run lock")
+            (
+                Disposition::Eligible,
+                "older derived rebuild evidence; reclaim only under index-run lock",
+            )
         };
         artifact.disposition = disposition;
-        if artifact.reason.is_empty() { artifact.reason = reason.to_owned(); }
+        if artifact.reason.is_empty() {
+            artifact.reason = reason.to_owned();
+        }
     }
-    inventory.eligible_bytes = inventory.artifacts.iter().filter(|artifact| artifact.disposition == Disposition::Eligible)
-        .fold(0_u64, |sum, artifact| sum.saturating_add(artifact.size_bytes));
+    inventory.eligible_bytes = inventory
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.disposition == Disposition::Eligible)
+        .fold(0_u64, |sum, artifact| {
+            sum.saturating_add(artifact.size_bytes)
+        });
 }
 
-fn inspect_at(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> io::Result<Inventory> {
+fn inspect_at(
+    data_dir: &Path,
+    now: SystemTime,
+    enabled: bool,
+    limits: Limits,
+) -> io::Result<Inventory> {
     let mut budget = Budget::new(limits);
     let mut inventory = Inventory {
-        schema_version: 1, complete: true, automatic_retention_enabled: enabled,
-        min_age_seconds: MIN_AGE.as_secs(), keep_newest: 1, total_bytes: 0, eligible_bytes: 0,
-        artifacts: Vec::new(), warnings: Vec::new(),
+        schema_version: 1,
+        complete: true,
+        automatic_retention_enabled: enabled,
+        min_age_seconds: MIN_AGE.as_secs(),
+        keep_newest: 1,
+        total_bytes: 0,
+        eligible_bytes: 0,
+        artifacts: Vec::new(),
+        warnings: Vec::new(),
     };
     for root in roots(data_dir)? {
         for entry in fs::read_dir(&root)? {
@@ -369,15 +455,25 @@ fn inspect_at(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -
             }
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(error) => { inventory.complete = false; inventory.warnings.push(error.to_string()); break; }
+                Err(error) => {
+                    inventory.complete = false;
+                    inventory.warnings.push(error.to_string());
+                    break;
+                }
             };
             let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue; };
+            let Some(name) = name.to_str() else {
+                continue;
+            };
             let pending = valid_name(name, RECLAIM_PREFIX);
-            if !pending && !valid_name(name, QUARANTINE_PREFIX) { continue; }
+            if !pending && !valid_name(name, QUARANTINE_PREFIX) {
+                continue;
+            }
             if inventory.artifacts.len() >= limits.bundles {
                 inventory.complete = false;
-                inventory.warnings.push("quarantine bundle budget exhausted".into());
+                inventory
+                    .warnings
+                    .push("quarantine bundle budget exhausted".into());
                 break;
             }
             let path = entry.path();
@@ -386,9 +482,17 @@ fn inspect_at(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -
                 Err(error) => {
                     inventory.complete = false;
                     inventory.artifacts.push(Artifact {
-                        path, interrupted_reclaim: pending, has_evidence: false, failure_evidence: Vec::new(), size_bytes: 0, size_complete: false,
-                        age_seconds: None, disposition: Disposition::Inspect, reason: error.to_string(),
-                        modified: None, metadata_fingerprint: None,
+                        path,
+                        interrupted_reclaim: pending,
+                        has_evidence: false,
+                        failure_evidence: Vec::new(),
+                        size_bytes: 0,
+                        size_complete: false,
+                        age_seconds: None,
+                        disposition: Disposition::Inspect,
+                        reason: error.to_string(),
+                        modified: None,
+                        metadata_fingerprint: None,
                     });
                 }
             }
@@ -407,7 +511,12 @@ fn inspect_at(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -
 /// Does not acquire mutation locks, create directories, read payloads, open a
 /// database/model or claim that logical file bytes are immediately reclaimable.
 pub fn inspect(data_dir: &Path) -> io::Result<Inventory> {
-    inspect_at(data_dir, SystemTime::now(), retention_enabled()?, Limits::default())
+    inspect_at(
+        data_dir,
+        SystemTime::now(),
+        retention_enabled()?,
+        Limits::default(),
+    )
 }
 
 #[cfg(test)]

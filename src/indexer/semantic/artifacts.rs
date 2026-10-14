@@ -260,7 +260,8 @@ impl BackfillArtifacts {
         let mut metadata = RecoveryMetadata::new(durable);
         let mut protected = ProtectedPaths::default();
         let mut resumable_checkpoint = None;
-        let manifest = metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?;
+        let manifest =
+            metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?;
         if let Some(manifest) = &manifest {
             ensure!(
                 manifest.manifest_version <= MANIFEST_FORMAT_VERSION,

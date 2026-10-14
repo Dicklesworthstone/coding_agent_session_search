@@ -17,7 +17,11 @@ pub(super) struct CachedProducer<'request> {
 
 impl<'request> CachedProducer<'request> {
     fn new(text: &'request str, inner: &'request dyn Embedder) -> Self {
-        Self { text, inner, response: OnceLock::new() }
+        Self {
+            text,
+            inner,
+            response: OnceLock::new(),
+        }
     }
 }
 
@@ -41,22 +45,39 @@ impl Embedder for CachedProducer<'_> {
             bound.validate()?;
             let _ = self.response.set(bound);
         }
-        let bound = self.response.get().ok_or_else(|| SearchError::InvalidConfig {
-            field: "current_semantic_query".into(), value: "redacted".into(),
-            reason: "request-local embedding response was not retained".into(),
-        })?;
-        Ok(IdentityBoundEmbedding { values: bound.values.clone(), identity: bound.identity.clone() })
+        let bound = self
+            .response
+            .get()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "current_semantic_query".into(),
+                value: "redacted".into(),
+                reason: "request-local embedding response was not retained".into(),
+            })?;
+        Ok(IdentityBoundEmbedding {
+            values: bound.values.clone(),
+            identity: bound.identity.clone(),
+        })
     }
 
     fn identity(&self) -> EmbedderResult<&EmbeddingIdentityBundleV1> {
         self.inner.identity()
     }
 
-    fn dimension(&self) -> usize { self.inner.dimension() }
-    fn id(&self) -> &str { self.inner.id() }
-    fn is_semantic(&self) -> bool { self.inner.is_semantic() }
-    fn category(&self) -> ModelCategory { self.inner.category() }
-    fn tier(&self) -> ModelTier { self.inner.tier() }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn is_semantic(&self) -> bool {
+        self.inner.is_semantic()
+    }
+    fn category(&self) -> ModelCategory {
+        self.inner.category()
+    }
+    fn tier(&self) -> ModelTier {
+        self.inner.tier()
+    }
 }
 
 pub(super) enum CachedProducers<'request> {
@@ -69,9 +90,12 @@ impl<'request> CachedProducers<'request> {
     pub(super) fn new(text: &'request str, producers: TextQueryProducers<'request>) -> Self {
         match producers {
             TextQueryProducers::Fast(fast) => Self::Fast(CachedProducer::new(text, fast)),
-            TextQueryProducers::Quality(quality) => Self::Quality(CachedProducer::new(text, quality)),
+            TextQueryProducers::Quality(quality) => {
+                Self::Quality(CachedProducer::new(text, quality))
+            }
             TextQueryProducers::Progressive { fast, quality } => Self::Progressive(
-                CachedProducer::new(text, fast), CachedProducer::new(text, quality),
+                CachedProducer::new(text, fast),
+                CachedProducer::new(text, quality),
             ),
         }
     }

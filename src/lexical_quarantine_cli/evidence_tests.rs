@@ -5,9 +5,15 @@ use std::fs;
 fn human_inventory_shows_age_failure_evidence_and_repeated_failure_warning() {
     let root = tempfile::tempdir().unwrap();
     for suffix in ["000001", "000002"] {
-        let bundle = root.path().join(format!(".lexical-rebuild-quarantine-{suffix}"));
+        let bundle = root
+            .path()
+            .join(format!(".lexical-rebuild-quarantine-{suffix}"));
         fs::create_dir_all(bundle.join("index")).unwrap();
-        fs::write(bundle.join("index/.lexical-rebuild-last-failure.json"), b"private cause").unwrap();
+        fs::write(
+            bundle.join("index/.lexical-rebuild-last-failure.json"),
+            b"private cause",
+        )
+        .unwrap();
     }
     let inventory = lexical_quarantine::inspect(root.path()).unwrap();
     let mut output = Vec::new();
@@ -27,14 +33,28 @@ fn json_inventory_contains_metadata_not_diagnostic_contents() {
     let root = tempfile::tempdir().unwrap();
     let bundle = root.path().join(".lexical-rebuild-quarantine-000001");
     fs::create_dir(&bundle).unwrap();
-    fs::write(bundle.join(".lexical-rebuild-state.json"), b"private checkpoint").unwrap();
+    fs::write(
+        bundle.join(".lexical-rebuild-state.json"),
+        b"private checkpoint",
+    )
+    .unwrap();
     let inventory = lexical_quarantine::inspect(root.path()).unwrap();
     let mut output = Vec::new();
     render(&inventory, true, &mut output).unwrap();
     let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(report["artifacts"][0]["failure_evidence"][0]["kind"], "rebuild_checkpoint");
-    assert_eq!(report["artifacts"][0]["failure_evidence"][0]["size_bytes"], 18);
-    assert!(!String::from_utf8(output).unwrap().contains("private checkpoint"));
+    assert_eq!(
+        report["artifacts"][0]["failure_evidence"][0]["kind"],
+        "rebuild_checkpoint"
+    );
+    assert_eq!(
+        report["artifacts"][0]["failure_evidence"][0]["size_bytes"],
+        18
+    );
+    assert!(
+        !String::from_utf8(output)
+            .unwrap()
+            .contains("private checkpoint")
+    );
 }
 
 #[cfg(unix)]

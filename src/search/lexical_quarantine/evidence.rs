@@ -76,37 +76,81 @@ mod tests {
     fn known_diagnostics_are_enumerated_without_parsing_or_leaking_payloads() {
         for pending in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let prefix = if pending { RECLAIM_PREFIX } else { QUARANTINE_PREFIX };
+            let prefix = if pending {
+                RECLAIM_PREFIX
+            } else {
+                QUARANTINE_PREFIX
+            };
             let bundle = root.path().join(format!("{prefix}000001"));
-            let layout = if pending { bundle.join("quarantine") } else { bundle.clone() };
+            let layout = if pending {
+                bundle.join("quarantine")
+            } else {
+                bundle.clone()
+            };
             fs::create_dir_all(layout.join("index")).unwrap();
             let paths = [
                 (CHECKPOINT, EvidenceKind::RebuildCheckpoint),
-                ("index/.lexical-rebuild-state.json", EvidenceKind::RebuildCheckpoint),
-                ("index/.lexical-rebuild-last-failure.json", EvidenceKind::FinalizationFailure),
-                ("index/lexical-generation-manifest.json", EvidenceKind::GenerationManifest),
+                (
+                    "index/.lexical-rebuild-state.json",
+                    EvidenceKind::RebuildCheckpoint,
+                ),
+                (
+                    "index/.lexical-rebuild-last-failure.json",
+                    EvidenceKind::FinalizationFailure,
+                ),
+                (
+                    "index/lexical-generation-manifest.json",
+                    EvidenceKind::GenerationManifest,
+                ),
                 ("index/MANIFEST", EvidenceKind::IndexManifest),
                 ("index/meta.json", EvidenceKind::IndexManifest),
             ];
             for (path, _) in paths {
                 fs::write(layout.join(path), b"{malformed private diagnostic").unwrap();
             }
-            fs::write(layout.join("index/segment-data"), b"private indexed content").unwrap();
+            fs::write(
+                layout.join("index/segment-data"),
+                b"private indexed content",
+            )
+            .unwrap();
             // An unrelated live failure is not evidence for this candidate.
-            fs::write(root.path().join(".lexical-rebuild-last-failure.json"), b"other failure").unwrap();
+            fs::write(
+                root.path().join(".lexical-rebuild-last-failure.json"),
+                b"other failure",
+            )
+            .unwrap();
             let report = inventory(root.path());
             assert!(report.complete, "{:?}", report.warnings);
             let artifact = &report.artifacts[0];
             assert_eq!(artifact.failure_evidence.len(), paths.len());
             for (path, kind) in paths {
-                let relative = if pending { Path::new("quarantine").join(path) } else { PathBuf::from(path) };
-                let evidence = artifact.failure_evidence.iter().find(|item| item.relative_path == relative).unwrap();
+                let relative = if pending {
+                    Path::new("quarantine").join(path)
+                } else {
+                    PathBuf::from(path)
+                };
+                let evidence = artifact
+                    .failure_evidence
+                    .iter()
+                    .find(|item| item.relative_path == relative)
+                    .unwrap();
                 assert_eq!(evidence.kind, kind);
-                assert_eq!(evidence.size_bytes, b"{malformed private diagnostic".len() as u64);
+                assert_eq!(
+                    evidence.size_bytes,
+                    b"{malformed private diagnostic".len() as u64
+                );
                 assert!(evidence.modified_at_ms.is_some());
-                assert_eq!(fs::read(bundle.join(&evidence.relative_path)).unwrap(), b"{malformed private diagnostic");
+                assert_eq!(
+                    fs::read(bundle.join(&evidence.relative_path)).unwrap(),
+                    b"{malformed private diagnostic"
+                );
             }
-            assert!(artifact.failure_evidence.windows(2).all(|pair| pair[0].relative_path < pair[1].relative_path));
+            assert!(
+                artifact
+                    .failure_evidence
+                    .windows(2)
+                    .all(|pair| pair[0].relative_path < pair[1].relative_path)
+            );
             let json = serde_json::to_string(&report).unwrap();
             assert!(!json.contains("private diagnostic"));
             assert!(!json.contains("private indexed content"));
@@ -123,11 +167,18 @@ mod tests {
         let failure = bundle.join("index/.lexical-rebuild-last-failure.json");
         let file = fs::File::create(&failure).unwrap();
         file.set_len(32 * 1024 * 1024).unwrap();
-        fs::write(bundle.join("index/nested/.lexical-rebuild-last-failure.json"), b"not a root diagnostic").unwrap();
+        fs::write(
+            bundle.join("index/nested/.lexical-rebuild-last-failure.json"),
+            b"not a root diagnostic",
+        )
+        .unwrap();
         let report = inventory(root.path());
         assert!(report.complete);
         assert_eq!(report.artifacts[0].failure_evidence.len(), 1);
-        assert_eq!(report.artifacts[0].failure_evidence[0].size_bytes, 32 * 1024 * 1024);
+        assert_eq!(
+            report.artifacts[0].failure_evidence[0].size_bytes,
+            32 * 1024 * 1024
+        );
         assert_eq!(file.metadata().unwrap().len(), 32 * 1024 * 1024);
     }
 
@@ -137,8 +188,16 @@ mod tests {
         let bundle = root.path().join(format!("{QUARANTINE_PREFIX}000001"));
         fs::create_dir_all(bundle.join("index")).unwrap();
         fs::write(bundle.join("index/MANIFEST"), b"damaged").unwrap();
-        let report = inspect_at(root.path(), SystemTime::now(), true,
-            Limits { tree_entries: 1, ..Default::default() }).unwrap();
+        let report = inspect_at(
+            root.path(),
+            SystemTime::now(),
+            true,
+            Limits {
+                tree_entries: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(!report.complete);
         assert!(!report.artifacts[0].size_complete);
         assert!(report.artifacts[0].failure_evidence.is_empty());
@@ -155,7 +214,11 @@ mod tests {
         fs::write(&sentinel, b"outside sentinel").unwrap();
         let bundle = root.path().join(format!("{QUARANTINE_PREFIX}000001"));
         fs::create_dir_all(bundle.join("index")).unwrap();
-        std::os::unix::fs::symlink(&sentinel, bundle.join("index/.lexical-rebuild-last-failure.json")).unwrap();
+        std::os::unix::fs::symlink(
+            &sentinel,
+            bundle.join("index/.lexical-rebuild-last-failure.json"),
+        )
+        .unwrap();
         let report = inventory(root.path());
         assert!(!report.complete);
         assert!(report.artifacts[0].failure_evidence.is_empty());

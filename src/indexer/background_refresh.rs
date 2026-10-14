@@ -245,17 +245,17 @@ pub fn last_indexed_at_ms_from_freshness(index_freshness: &serde_json::Value) ->
 /// Missing/unreadable metadata is unknown, never synthesized as epoch zero.
 pub fn source_scan_completed_at_ms_from_db(db_path: &Path) -> Option<i64> {
     let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
-    storage.get_last_scan_ts().ok().flatten().filter(|value| *value > 0)
+    storage
+        .get_last_scan_ts()
+        .ok()
+        .flatten()
+        .filter(|value| *value > 0)
 }
 
 /// Pure source-scan cadence policy. A missing watermark means a scan is due;
 /// zero disables age-triggered scans. Future timestamps are treated as fresh
 /// rather than causing a spawn storm after a wall-clock correction.
-pub fn source_scan_is_due(
-    completed_at_ms: Option<i64>,
-    now_ms: i64,
-    threshold: Duration,
-) -> bool {
+pub fn source_scan_is_due(completed_at_ms: Option<i64>, now_ms: i64, threshold: Duration) -> bool {
     if threshold.is_zero() {
         return false;
     }

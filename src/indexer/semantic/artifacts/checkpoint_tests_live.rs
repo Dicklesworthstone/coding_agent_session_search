@@ -134,7 +134,11 @@ impl Fixture {
         for (path, bytes) in before {
             assert_eq!(fs::read(&path)?, bytes, "changed {}", path.display());
         }
-        assert_eq!(fs::read(&wal).ok(), wal_before, "GC must not repair the WAL");
+        assert_eq!(
+            fs::read(&wal).ok(),
+            wal_before,
+            "GC must not repair the WAL"
+        );
         assert_eq!(reader.search_top_k(&query, 3, None)?, hits);
         assert_eq!(
             VectorIndex::open_read_only(&self.live)?.search_top_k(&query, 3, None)?,
@@ -175,7 +179,11 @@ fn missing_or_torn_replacement_wal_cannot_hide_behind_its_tombstoned_main_slot()
             fs::write(&wal, &healthy_wal[..healthy_wal.len() - 1])?;
         }
         let reader = VectorIndex::open_read_only(&fixture.checkpoint)?;
-        assert_eq!(reader.record_count(), 3, "the old physical bound still passes");
+        assert_eq!(
+            reader.record_count(),
+            3,
+            "the old physical bound still passes"
+        );
         assert_eq!(reader.tombstone_count(), 1);
         assert_eq!(reader.wal_record_count(), 0);
         drop(reader);
@@ -197,7 +205,8 @@ fn missing_or_torn_replacement_wal_cannot_hide_behind_its_tombstoned_main_slot()
 }
 
 #[test]
-fn tombstones_with_sufficient_live_main_or_replayable_wal_coverage_remain_reclaimable() -> Result<()> {
+fn tombstones_with_sufficient_live_main_or_replayable_wal_coverage_remain_reclaimable() -> Result<()>
+{
     for replace_in_wal in [false, true] {
         let temp = tempfile::tempdir()?;
         let data = temp.path();

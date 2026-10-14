@@ -64,7 +64,9 @@ pub(super) fn messages(
             Err(error)
                 if sql == INDEXED
                     && !saw_row
-                    && error.to_string().contains("no such index: sqlite_autoindex_messages_1") =>
+                    && error
+                        .to_string()
+                        .contains("no such index: sqlite_autoindex_messages_1") =>
             {
                 // Only missing legacy schema metadata permits another query.
                 // Never replay delivered rows or retry an arbitrary SQL error.

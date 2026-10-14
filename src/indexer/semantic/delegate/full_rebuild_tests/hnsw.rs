@@ -1,8 +1,8 @@
 //! Real graph construction must participate in CASS's artifact ownership lease.
 //! All images below are confined to temporary, hash-produced archive fixtures.
 
-use super::*;
 use super::super::hnsw::run as run_hnsw;
+use super::*;
 use crate::indexer::semantic::artifacts::BackfillArtifacts;
 use crate::indexer::semantic::{
     SemanticShardBuildPlan, apply_backfill_artifact_plan, plan_backfill_artifacts,
@@ -45,8 +45,13 @@ fn image(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
 }
 
 fn assert_busy<T>(result: Result<T>) {
-    let error = result.err().expect("active artifact ownership must refuse the operation");
-    assert!(format!("{error:#}").contains("owns"), "unexpected refusal: {error:#}");
+    let error = result
+        .err()
+        .expect("active artifact ownership must refuse the operation");
+    assert!(
+        format!("{error:#}").contains("owns"),
+        "unexpected refusal: {error:#}"
+    );
 }
 
 #[test]
@@ -73,7 +78,11 @@ fn hnsw_build_and_existing_graph_verification_refuse_a_live_lease_then_retry() -
         assert_eq!(fresh.search_top_k(&query, 3, None)?, hits);
         let published = image(data)?;
         assert_eq!(indexer.build_hnsw_index(&reader, data, None, None)?, graph);
-        assert_eq!(image(data)?, published, "native-current graph must remain unchanged");
+        assert_eq!(
+            image(data)?,
+            published,
+            "native-current graph must remain unchanged"
+        );
         drop(BackfillArtifacts::for_existing_writer(data)?);
     }
     Ok(())
@@ -99,7 +108,9 @@ fn hnsw_excludes_recovery_and_public_vector_writers_at_the_native_handoff() -> R
             assert_busy(indexer.append_to_index(Vec::<EmbeddedMessage>::new(), data));
             assert_busy(indexer.build_and_save_index(Vec::<EmbeddedMessage>::new(), data));
             assert_busy(indexer.build_and_save_index_shards(
-                Vec::<EmbeddedMessage>::new(), data, SemanticShardBuildPlan {
+                Vec::<EmbeddedMessage>::new(),
+                data,
+                SemanticShardBuildPlan {
                     tier: TierKind::Quality,
                     db_fingerprint: "content-v1:hnsw-lease".into(),
                     model_revision: "hash".into(),
@@ -109,7 +120,11 @@ fn hnsw_excludes_recovery_and_public_vector_writers_at_the_native_handoff() -> R
                 },
             ));
             assert_busy(indexer.reconcile_index_with_canonical_documents(
-                Vec::new(), data, TierKind::Quality, "content-v1:hnsw-lease", &canonical,
+                Vec::new(),
+                data,
+                TierKind::Quality,
+                "content-v1:hnsw-lease",
+                &canonical,
             ));
             assert_busy(indexer.build_hnsw_index(&reader, data, None, None));
             assert_eq!(image(data)?, before);
@@ -164,13 +179,19 @@ fn hnsw_native_contract_failures_release_the_lease_and_preserve_existing_data() 
     let graph = indexer.build_hnsw_index(&reader, data, None, None)?;
     let foreign_path = data.join("foreign.fsvi");
     let mut writer = VectorIndex::create_with_revision(
-        &foreign_path, "other-producer", "other-revision", 4, Quantization::F16,
+        &foreign_path,
+        "other-producer",
+        "other-revision",
+        4,
+        Quantization::F16,
     )?;
     writer.write_record("foreign", &[1.0, 0.0, 0.0, 0.0])?;
     writer.finish()?;
     let foreign = VectorIndex::open_read_only(&foreign_path)?;
     let before = image(data)?;
-    let error = indexer.build_hnsw_index(&foreign, data, None, None).unwrap_err();
+    let error = indexer
+        .build_hnsw_index(&foreign, data, None, None)
+        .unwrap_err();
     assert!(format!("{error:#}").contains("incompatible semantic vector space"));
     assert_eq!(image(data)?, before);
     assert!(inspect_hnsw_accelerator(&graph, &reader).is_current());
@@ -182,7 +203,9 @@ fn hnsw_native_contract_failures_release_the_lease_and_preserve_existing_data() 
     let reader = VectorIndex::open_read_only(&source)?;
     assert_eq!(reader.wal_record_count(), 1);
     let before = image(data)?;
-    let error = indexer.build_hnsw_index(&reader, data, None, None).unwrap_err();
+    let error = indexer
+        .build_hnsw_index(&reader, data, None, None)
+        .unwrap_err();
     assert!(format!("{error:#}").contains("pending WAL"));
     assert_eq!(image(data)?, before);
     drop(BackfillArtifacts::for_existing_writer(data)?);
@@ -197,7 +220,10 @@ fn hnsw_lease_does_not_sweep_its_retained_staging_source_or_require_a_valid_ledg
     fs::copy(&source, &staging)?;
     let scratch = data.join("vector_index/.backfill-reuse-HnswEvidence123");
     fs::create_dir(&scratch)?;
-    fs::write(scratch.join("candidate.fsvi"), b"unrelated recovery evidence")?;
+    fs::write(
+        scratch.join("candidate.fsvi"),
+        b"unrelated recovery evidence",
+    )?;
     let ledger = SemanticManifest::path(data);
     fs::write(&ledger, b"{invalid ledger is not graph admission")?;
     let reader = VectorIndex::open_read_only(&staging)?;

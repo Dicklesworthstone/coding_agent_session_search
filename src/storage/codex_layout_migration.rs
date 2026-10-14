@@ -8,16 +8,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
+use super::sqlite::SqliteStorage;
 use crate::connectors::codex::CodexConnector;
 use crate::connectors::codex::layout_identity::{
     LayoutPair, Receipt, ReceiptLock, Snapshot, read_snapshot, receipt_path,
 };
-use crate::connectors::{Connector, NormalizedConversation, NormalizedMessage, ScanContext, ScanRoot};
+use crate::connectors::{
+    Connector, NormalizedConversation, NormalizedMessage, ScanContext, ScanRoot,
+};
 use crate::franken_sync::compat::{ConnectionExt, RowExt};
 use crate::franken_sync::{Connection, params};
 use crate::model::types::{Message, MessageRole};
 use crate::sources::config::SourcesConfig;
-use super::sqlite::SqliteStorage;
 
 #[derive(Debug)]
 pub struct MigrationOptions {
@@ -54,7 +56,8 @@ fn archive_lease(database: &Path) -> Result<(PathBuf, File)> {
         .read(true)
         .write(true)
         .open(PathBuf::from(name))?;
-    file.try_lock().context("archive is being indexed; stop the watcher and retry migration")?;
+    file.try_lock()
+        .context("archive is being indexed; stop the watcher and retry migration")?;
     Ok((database, file))
 }
 
@@ -88,10 +91,18 @@ fn expanded_root(root: &str) -> Option<PathBuf> {
 
 fn verify_ownership(config: &SourcesConfig, source_id: &str, pair: &LayoutPair) -> Result<()> {
     for path in [&pair.flat, &pair.dated] {
-        let owners: Vec<_> = config.sources.iter().filter(|source| {
-            !source.is_remote() && source.paths.iter().filter_map(|root| expanded_root(root))
-                .any(|root| path.starts_with(root))
-        }).collect();
+        let owners: Vec<_> = config
+            .sources
+            .iter()
+            .filter(|source| {
+                !source.is_remote()
+                    && source
+                        .paths
+                        .iter()
+                        .filter_map(|root| expanded_root(root))
+                        .any(|root| path.starts_with(root))
+            })
+            .collect();
         ensure!(
             owners.len() == 1 && owners[0].name == source_id,
             "each rollout must belong unambiguously to the same configured named local source"
@@ -120,15 +131,21 @@ fn same_message(stored: &Message, parsed: &NormalizedMessage) -> bool {
         && stored.extra_json == parsed.extra
         && stored.snippets.len() == parsed.snippets.len()
         && stored.snippets.iter().zip(&parsed.snippets).all(|(a, b)| {
-            a.file_path == b.file_path && a.start_line == b.start_line
-                && a.end_line == b.end_line && a.language == b.language
+            a.file_path == b.file_path
+                && a.start_line == b.start_line
+                && a.end_line == b.end_line
+                && a.language == b.language
                 && a.snippet_text == b.snippet_text
         })
 }
 
 fn covers(stored: &[Message], parsed: &NormalizedConversation) -> bool {
-    !stored.is_empty() && stored.len() <= parsed.messages.len()
-        && stored.iter().zip(&parsed.messages).all(|(a, b)| same_message(a, b))
+    !stored.is_empty()
+        && stored.len() <= parsed.messages.len()
+        && stored
+            .iter()
+            .zip(&parsed.messages)
+            .all(|(a, b)| same_message(a, b))
 }
 
 fn parse_pair(pair: &LayoutPair) -> Result<Vec<NormalizedConversation>> {
@@ -137,16 +154,26 @@ fn parse_pair(pair: &LayoutPair) -> Result<Vec<NormalizedConversation>> {
     let scratch = tempfile::tempdir()?;
     let ctx = ScanContext::with_roots(
         scratch.path().to_path_buf(),
-        vec![ScanRoot::local(pair.flat.clone()), ScanRoot::local(pair.dated.clone())],
+        vec![
+            ScanRoot::local(pair.flat.clone()),
+            ScanRoot::local(pair.dated.clone()),
+        ],
         None,
     );
     let parsed = CodexConnector::new().scan(&ctx)?;
-    ensure!(parsed.len() == 2, "both migration rollouts must produce one complete conversation");
+    ensure!(
+        parsed.len() == 2,
+        "both migration rollouts must produce one complete conversation"
+    );
     for path in [&pair.flat, &pair.dated] {
         ensure!(
-            parsed.iter().filter(|conversation| {
-                conversation.agent_slug == "codex" && &conversation.source_path == path
-            }).count() == 1,
+            parsed
+                .iter()
+                .filter(|conversation| {
+                    conversation.agent_slug == "codex" && &conversation.source_path == path
+                })
+                .count()
+                == 1,
             "Codex migration parsing did not preserve the selected source boundaries"
         );
     }
@@ -157,7 +184,8 @@ fn prove_pair(pair: &LayoutPair, budget: u64) -> Result<(Snapshot, Snapshot)> {
     let flat = read_snapshot(&pair.flat, &[], budget, None)?;
     let dated = read_snapshot(&pair.dated, &[flat.checkpoint.bytes], budget, None)?;
     ensure!(
-        flat.session_id == pair.session_id && dated.session_id == pair.session_id
+        flat.session_id == pair.session_id
+            && dated.session_id == pair.session_id
             && flat.metadata_hash == dated.metadata_hash,
         "conflicting native Codex session metadata; no identity was migrated"
     );
@@ -180,7 +208,10 @@ fn prove_pair(pair: &LayoutPair, budget: u64) -> Result<(Snapshot, Snapshot)> {
 /// Register a proven pair before indexing the second layout. Existing duplicates
 /// are an explicit refusal, not an excuse to delete rows and invalidate IDs.
 pub fn migrate(options: &MigrationOptions) -> Result<MigrationReport> {
-    ensure!(!options.source_id.is_empty(), "a named local source is required");
+    ensure!(
+        !options.source_id.is_empty(),
+        "a named local source is required"
+    );
     let data_dir = fs::canonicalize(&options.data_dir).context("resolve CASS data directory")?;
     let (database, _archive_lease) = archive_lease(&data_dir.join("agent_search.db"))?;
     let pair = LayoutPair::discover(&options.from, &options.to)?;
@@ -192,7 +223,10 @@ pub fn migrate(options: &MigrationOptions) -> Result<MigrationReport> {
         params![options.source_id.clone()],
         |row| row.get_typed::<String>(0),
     )?;
-    ensure!(kinds.len() == 1 && kinds[0] == "local", "archive source ownership is missing, ambiguous or non-local");
+    ensure!(
+        kinds.len() == 1 && kinds[0] == "local",
+        "archive source ownership is missing, ambiguous or non-local"
+    );
     // Do not pick a convenient compatible twin from several candidates. Include
     // scoped suffixes so a third directory identity makes the proof ambiguous.
     let candidates = storage.raw().query_map_collect(
@@ -203,25 +237,45 @@ pub fn migrate(options: &MigrationOptions) -> Result<MigrationReport> {
             OR substr(c.external_id, -length(?2)-1) = char(92) || ?2
             OR c.source_path = ?3 OR c.source_path = ?4)
          LIMIT 3",
-        params![options.source_id.clone(), pair.bare_id.clone(),
-            pair.flat.to_string_lossy().into_owned(), pair.dated.to_string_lossy().into_owned()],
-        |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?, row.get_typed::<String>(2)?)),
+        params![
+            options.source_id.clone(),
+            pair.bare_id.clone(),
+            pair.flat.to_string_lossy().into_owned(),
+            pair.dated.to_string_lossy().into_owned()
+        ],
+        |row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<String>(1)?,
+                row.get_typed::<String>(2)?,
+            ))
+        },
     )?;
     ensure!(
         candidates.len() == 1,
         "migration needs exactly one indexed same-source Codex identity; existing duplicates or missing evidence require separate review"
     );
     let (conversation_id, external_id, original_path) = &candidates[0];
-    ensure!(pair.contains_external_id(external_id), "existing Codex identity has an unrelated directory scope");
-    let original_path = fs::canonicalize(original_path).context("the indexed original rollout must still be accessible when registering migration")?;
-    ensure!(original_path == pair.flat || original_path == pair.dated, "indexed source path does not match either migration input");
+    ensure!(
+        pair.contains_external_id(external_id),
+        "existing Codex identity has an unrelated directory scope"
+    );
+    let original_path = fs::canonicalize(original_path).context(
+        "the indexed original rollout must still be accessible when registering migration",
+    )?;
+    ensure!(
+        original_path == pair.flat || original_path == pair.dated,
+        "indexed source path does not match either migration input"
+    );
     // Parsing initializes the same configured admission budget as normal CASS.
     let parsed = parse_pair(&pair)?;
     let budget = franken_agent_detection::connectors::codex::codex_rollout_byte_budget();
     let (flat, dated) = prove_pair(&pair, budget)?;
     let stored = storage.fetch_messages(*conversation_id)?;
     ensure!(
-        parsed.iter().any(|conversation| covers(&stored, conversation)),
+        parsed
+            .iter()
+            .any(|conversation| covers(&stored, conversation)),
         "stored Codex history conflicts with the supplied rollouts; no identity was migrated"
     );
     // A second parse of these bounded inputs closes the proof/parse interval.
@@ -271,7 +325,10 @@ pub fn migrate(options: &MigrationOptions) -> Result<MigrationReport> {
     }
     if options.apply {
         let lock = ReceiptLock::acquire(path.clone())?;
-        ensure!(lock.load()? == previous, "Codex receipt changed concurrently; retry migration");
+        ensure!(
+            lock.load()? == previous,
+            "Codex receipt changed concurrently; retry migration"
+        );
         if previous.as_ref() != Some(&receipt) {
             lock.write(&receipt)?;
         }

@@ -58,13 +58,13 @@ impl ConversationIdentity {
     // vector growth. This is a retained-payload budget, not an allocator/RSS
     // promise. The current conversation and output sets predate this cache.
     fn retained_bytes(&self) -> Option<usize> {
-        self.documents.iter().try_fold(
-            size_of::<Self>().checked_mul(2)?,
-            |bytes, document| {
-                bytes.checked_add(size_of::<DocumentIdentity>())?
+        self.documents
+            .iter()
+            .try_fold(size_of::<Self>().checked_mul(2)?, |bytes, document| {
+                bytes
+                    .checked_add(size_of::<DocumentIdentity>())?
                     .checked_add(document.id.len())
-            },
-        )
+            })
     }
 }
 
@@ -150,10 +150,13 @@ fn project_conversation(
         },
         || indexer.check_external_cancelled(),
     )?;
-    Ok((ConversationIdentity {
-        conversation_id,
-        documents: documents.into_boxed_slice(),
-    }, projected_inputs))
+    Ok((
+        ConversationIdentity {
+            conversation_id,
+            documents: documents.into_boxed_slice(),
+        },
+        projected_inputs,
+    ))
 }
 
 impl ReconcileSelection {
@@ -173,14 +176,16 @@ impl ReconcileSelection {
         let mut missing_bytes = 0u64;
         let mut missing_count = 0usize;
         for document in conversation.documents.iter() {
-            anyhow::ensure!(self.current_ids.insert(document.id.to_string()),
-                "canonical semantic backfill produced duplicate document {}", document.id);
+            anyhow::ensure!(
+                self.current_ids.insert(document.id.to_string()),
+                "canonical semantic backfill produced duplicate document {}",
+                document.id
+            );
             if !existing_ids.contains(document.id.as_ref()) {
                 missing_count += 1;
                 missing_messages.insert(document.message_id);
-                missing_bytes = missing_bytes.saturating_add(
-                    saturating_u64_from_usize(document.content_bytes),
-                );
+                missing_bytes =
+                    missing_bytes.saturating_add(saturating_u64_from_usize(document.content_bytes));
             }
         }
         // Identical to the existing whole-conversation selection policy,
@@ -189,7 +194,10 @@ impl ReconcileSelection {
             && self.selected_conversations < plan.max_conversations.max(1)
             && (self.selected_conversations == 0
                 || ((!caps.message_limited()
-                    || self.selected_messages.saturating_add(missing_messages.len()) <= caps.max_messages)
+                    || self
+                        .selected_messages
+                        .saturating_add(missing_messages.len())
+                        <= caps.max_messages)
                     && (!caps.byte_limited()
                         || self.selected_bytes.saturating_add(missing_bytes) <= caps.max_bytes)));
         if missing_count == 0 || select {
@@ -202,32 +210,44 @@ impl ReconcileSelection {
                 None => {
                     let (observed, inputs) =
                         project_conversation(indexer, storage, conversation.conversation_id, true)?;
-                    anyhow::ensure!(observed.documents == conversation.documents,
-                        "canonical semantic projection changed since cached replay; retry backfill");
+                    anyhow::ensure!(
+                        observed.documents == conversation.documents,
+                        "canonical semantic projection changed since cached replay; retry backfill"
+                    );
                     self.loaded_selected_conversations += 1;
                     inputs
                 }
             };
-            anyhow::ensure!(inputs.len() == conversation.documents.len(),
-                "canonical semantic projection lost its input binding");
+            anyhow::ensure!(
+                inputs.len() == conversation.documents.len(),
+                "canonical semantic projection lost its input binding"
+            );
             self.selected_conversations += 1;
-            self.selected_messages = self.selected_messages.saturating_add(missing_messages.len());
+            self.selected_messages = self
+                .selected_messages
+                .saturating_add(missing_messages.len());
             self.selected_bytes = self.selected_bytes.saturating_add(missing_bytes);
             for (input, document) in inputs.into_iter().zip(conversation.documents.iter()) {
                 if !existing_ids.contains(document.id.as_ref()) {
                     let id = i64::try_from(input.message_id).unwrap_or(i64::MAX);
-                    self.last_message_id = Some(self.last_message_id.map_or(id, |prior| prior.max(id)));
+                    self.last_message_id =
+                        Some(self.last_message_id.map_or(id, |prior| prior.max(id)));
                     self.selected_ids.insert(document.id.to_string());
                     self.inputs.push(input);
                 }
             }
         }
-        sink.emit(SemanticProgressEvent::PacketReplayProgress, SemanticProgressFields {
-            last_conversation_id: Some(conversation.conversation_id),
-            rows_processed: Some(saturating_u64_from_usize(self.current_ids.len())),
-            conversations_in_batch: Some(saturating_u64_from_usize(self.selected_conversations)),
-            ..Default::default()
-        });
+        sink.emit(
+            SemanticProgressEvent::PacketReplayProgress,
+            SemanticProgressFields {
+                last_conversation_id: Some(conversation.conversation_id),
+                rows_processed: Some(saturating_u64_from_usize(self.current_ids.len())),
+                conversations_in_batch: Some(saturating_u64_from_usize(
+                    self.selected_conversations,
+                )),
+                ..Default::default()
+            },
+        );
         Ok(())
     }
 }
@@ -245,42 +265,79 @@ impl CanonicalReplayCache {
     ) -> Result<(ReconcileSelection, ReplayProof)> {
         indexer.check_external_cancelled()?;
         let key = ReplayKey::capture(indexer, storage, plan)?;
-        let budget = self.max_bytes.min(responsiveness::effective_inflight_byte_limit(self.max_bytes));
+        let budget = self
+            .max_bytes
+            .min(responsiveness::effective_inflight_byte_limit(
+                self.max_bytes,
+            ));
         // Poison only disables the optimization, never canonical reconciliation.
-        let cached = self.slot.lock().ok().and_then(|mut slot| slot.take())
-            .filter(|cached| budget > 0 && cached.retained_bytes <= budget
-                && key.as_ref() == Some(&cached.key));
+        let cached = self
+            .slot
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .filter(|cached| {
+                budget > 0 && cached.retained_bytes <= budget && key.as_ref() == Some(&cached.key)
+            });
         let cache_hit = cached.is_some();
         let proof = ReplayProof(cached.as_ref().map(|cached| cached.key.archive.clone()));
         let mut selected = ReconcileSelection::default();
         let inventory = if let Some(cached) = cached {
             for conversation in &cached.conversations {
                 indexer.check_external_cancelled()?;
-                selected.visit(indexer, storage, conversation, None, existing_ids, plan, caps, sink)?;
+                selected.visit(
+                    indexer,
+                    storage,
+                    conversation,
+                    None,
+                    existing_ids,
+                    plan,
+                    caps,
+                    sink,
+                )?;
             }
             Some(cached)
         } else {
             let mut building = key.clone().filter(|_| budget > 0).map(|key| CachedReplay {
-                key, conversations: Vec::new(), retained_bytes: 0,
+                key,
+                conversations: Vec::new(),
+                retained_bytes: 0,
             });
             let mut after_id = 0i64;
             loop {
                 indexer.check_external_cancelled()?;
                 let ids: Vec<i64> = storage.raw().query_map_collect(
                     "SELECT id FROM conversations WHERE id > ?1 ORDER BY id LIMIT ?2",
-                    &[ParamValue::from(after_id),
-                      ParamValue::from(DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64)],
+                    &[
+                        ParamValue::from(after_id),
+                        ParamValue::from(DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64),
+                    ],
                     |row| row.get_typed(0),
                 )?;
-                if ids.is_empty() { break; }
+                if ids.is_empty() {
+                    break;
+                }
                 for id in ids {
                     indexer.check_external_cancelled()?;
-                    anyhow::ensure!(id > after_id, "canonical semantic replay cursor did not advance");
+                    anyhow::ensure!(
+                        id > after_id,
+                        "canonical semantic replay cursor did not advance"
+                    );
                     let (conversation, _) = project_conversation(indexer, storage, id, false)?;
                     selected.replayed_conversations += 1;
-                    selected.visit(indexer, storage, &conversation, None, existing_ids, plan, caps, sink)?;
+                    selected.visit(
+                        indexer,
+                        storage,
+                        &conversation,
+                        None,
+                        existing_ids,
+                        plan,
+                        caps,
+                        sink,
+                    )?;
                     if let Some(cache) = building.as_mut() {
-                        let new_bytes = conversation.retained_bytes()
+                        let new_bytes = conversation
+                            .retained_bytes()
                             .and_then(|bytes| cache.retained_bytes.checked_add(bytes));
                         if let Some(bytes) = new_bytes.filter(|bytes| *bytes <= budget) {
                             if cache.conversations.try_reserve(1).is_ok() {
@@ -309,11 +366,13 @@ impl CanonicalReplayCache {
         {
             *slot = Some(inventory);
         }
-        tracing::debug!(cache_hit,
+        tracing::debug!(
+            cache_hit,
             canonical_conversations_replayed = selected.replayed_conversations,
             selected_conversations_reloaded = selected.loaded_selected_conversations,
             retained_identity_bytes = retained_bytes,
-            "canonical semantic replay selection complete");
+            "canonical semantic replay selection complete"
+        );
         Ok((selected, proof))
     }
 }

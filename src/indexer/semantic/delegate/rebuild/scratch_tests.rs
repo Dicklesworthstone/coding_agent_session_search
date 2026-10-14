@@ -17,26 +17,35 @@ enum Operation {
     Reconcile,
 }
 
-fn fixture(data: &Path) -> Result<(SemanticIndexer, Vec<EmbeddedMessage>, HashSet<String>, PathBuf)> {
+fn fixture(
+    data: &Path,
+) -> Result<(
+    SemanticIndexer,
+    Vec<EmbeddedMessage>,
+    HashSet<String>,
+    PathBuf,
+)> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let inputs: Vec<_> = (1..=3)
         .map(|id| EmbeddingInput::new(id, format!("compiler checkpoint evidence {id}")))
         .collect();
     let mut manifest = SemanticManifest::default();
-    let live = indexer.run_backfill_batch(
-        &inputs,
-        data,
-        &mut manifest,
-        SemanticBackfillBatchPlan {
-            tier: TierKind::Quality,
-            db_fingerprint: "content-v1:rebuild-scratch".into(),
-            model_revision: "hash".into(),
-            total_conversations: 3,
-            conversations_in_batch: 3,
-            last_offset: 3,
-            cursor_exhausted: true,
-        },
-    )?.index_path;
+    let live = indexer
+        .run_backfill_batch(
+            &inputs,
+            data,
+            &mut manifest,
+            SemanticBackfillBatchPlan {
+                tier: TierKind::Quality,
+                db_fingerprint: "content-v1:rebuild-scratch".into(),
+                model_revision: "hash".into(),
+                total_conversations: 3,
+                conversations_in_batch: 3,
+                last_offset: 3,
+                cursor_exhausted: true,
+            },
+        )?
+        .index_path;
     let reader = VectorIndex::open_read_only(&live)?;
     let ids = (0..reader.record_count())
         .map(|row| reader.doc_id_at(row).map(str::to_owned))
@@ -50,7 +59,12 @@ fn scratch_paths(data: &Path) -> Result<Vec<PathBuf>> {
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<std::io::Result<Vec<_>>>()?
         .into_iter()
-        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with(".backfill-reuse-"))
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".backfill-reuse-")
+        })
         .collect())
 }
 
@@ -65,7 +79,13 @@ fn write(
     match operation {
         Operation::Full => run(indexer, rows, data, None::<fn(usize)>, check),
         Operation::Reconcile => super::super::reconcile::run(
-            indexer, rows, data, TierKind::Quality, "content-v1:rebuild-scratch", ids, check,
+            indexer,
+            rows,
+            data,
+            TierKind::Quality,
+            "content-v1:rebuild-scratch",
+            ids,
+            check,
         ),
     }
 }
@@ -77,16 +97,29 @@ fn both_public_writers_refuse_an_active_artifact_lease_before_consuming_input() 
     let (indexer, rows, ids, live) = fixture(data)?;
     let before = fs::read(&live)?;
     let manifest = fs::read(SemanticManifest::path(data))?;
-    let lock = OpenOptions::new().read(true).write(true)
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
         .open(data.join("semantic-backfill-artifacts.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)?;
     let consumed = Cell::new(false);
     let input = rows.clone().into_iter().inspect(|_| consumed.set(true));
     assert!(indexer.build_and_save_index(input, data).is_err());
-    assert!(!consumed.get(), "a contended rebuild must not start its iterator");
-    assert!(indexer.reconcile_index_with_canonical_documents(
-        rows.clone(), data, TierKind::Quality, "content-v1:rebuild-scratch", &ids,
-    ).is_err());
+    assert!(
+        !consumed.get(),
+        "a contended rebuild must not start its iterator"
+    );
+    assert!(
+        indexer
+            .reconcile_index_with_canonical_documents(
+                rows.clone(),
+                data,
+                TierKind::Quality,
+                "content-v1:rebuild-scratch",
+                &ids,
+            )
+            .is_err()
+    );
     assert_eq!(fs::read(&live)?, before);
     assert_eq!(fs::read(SemanticManifest::path(data))?, manifest);
     assert!(scratch_paths(data)?.is_empty());
@@ -122,12 +155,18 @@ fn active_candidates_are_leased_and_failed_writers_release_only_their_own_scratc
             Ok(())
         });
         assert!(result.is_err(), "{operation:?}");
-        assert!(saw_scratch.get(), "the actual {operation:?} writer must enter owned scratch");
+        assert!(
+            saw_scratch.get(),
+            "the actual {operation:?} writer must enter owned scratch"
+        );
         assert!(scratch_paths(data)?.is_empty());
         assert_eq!(fs::read(&live)?, before);
         assert_eq!(fs::read(SemanticManifest::path(data))?, ledger);
         assert_eq!(reader.search_top_k(&query, 3, None)?, hits);
-        assert_eq!(VectorIndex::open_read_only(&live)?.search_top_k(&query, 3, None)?, hits);
+        assert_eq!(
+            VectorIndex::open_read_only(&live)?.search_top_k(&query, 3, None)?,
+            hits
+        );
         drop(reader);
         // All candidate owners and the artifact lease must have gone away.
         drop(write(operation, &indexer, rows, data, &ids, || Ok(()))?);
@@ -138,7 +177,8 @@ fn active_candidates_are_leased_and_failed_writers_release_only_their_own_scratc
 }
 
 #[test]
-fn next_rebuild_reclaims_abandoned_work_but_keeps_manifest_owners_and_legacy_directories() -> Result<()> {
+fn next_rebuild_reclaims_abandoned_work_but_keeps_manifest_owners_and_legacy_directories()
+-> Result<()> {
     for operation in [Operation::Full, Operation::Reconcile] {
         let temp = tempfile::tempdir()?;
         let data = temp.path();
@@ -151,9 +191,13 @@ fn next_rebuild_reclaims_abandoned_work_but_keeps_manifest_owners_and_legacy_dir
         let before = fs::read(&protected)?;
         let mut manifest = SemanticManifest::load(data)?.unwrap();
         manifest.hnsw = Some(HnswRecord {
-            base_tier: TierKind::Quality, embedder_id: "fnv1a-384".into(), ef_search: 16,
+            base_tier: TierKind::Quality,
+            embedder_id: "fnv1a-384".into(),
+            ef_search: 16,
             index_path: protected.strip_prefix(data)?.to_string_lossy().into_owned(),
-            size_bytes: before.len() as u64, built_at_ms: 1, ready: false,
+            size_bytes: before.len() as u64,
+            built_at_ms: 1,
+            ready: false,
         });
         manifest.save(data)?;
         let ledger = fs::read(SemanticManifest::path(data))?;
@@ -162,8 +206,13 @@ fn next_rebuild_reclaims_abandoned_work_but_keeps_manifest_owners_and_legacy_dir
         fs::write(abandoned.join("candidate.fsvi"), b"interrupted writer")?;
         // Old namespaces did not require the shared lease. Never infer their
         // inactivity or ownership merely from a recognizable-looking name.
-        let legacy: Vec<_> = [".semantic-full-rebuild-Old123", ".semantic-reconcile-Old123"]
-            .into_iter().map(|name| root.join(name)).collect();
+        let legacy: Vec<_> = [
+            ".semantic-full-rebuild-Old123",
+            ".semantic-reconcile-Old123",
+        ]
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect();
         for path in &legacy {
             fs::create_dir(path)?;
             fs::write(path.join("candidate.fsvi"), b"unregistered evidence")?;
@@ -173,7 +222,10 @@ fn next_rebuild_reclaims_abandoned_work_but_keeps_manifest_owners_and_legacy_dir
         assert_eq!(fs::read(&protected)?, before);
         assert_eq!(fs::read(SemanticManifest::path(data))?, ledger);
         for path in &legacy {
-            assert_eq!(fs::read(path.join("candidate.fsvi"))?, b"unregistered evidence");
+            assert_eq!(
+                fs::read(path.join("candidate.fsvi"))?,
+                b"unregistered evidence"
+            );
         }
         assert_eq!(scratch_paths(data)?, vec![retained]);
         assert!(plan_backfill_artifacts(data)?.candidates.is_empty());
@@ -182,7 +234,8 @@ fn next_rebuild_reclaims_abandoned_work_but_keeps_manifest_owners_and_legacy_dir
 }
 
 #[test]
-fn unusable_cleanup_metadata_retains_fallbacks_without_disabling_direct_rebuild_admission() -> Result<()> {
+fn unusable_cleanup_metadata_retains_fallbacks_without_disabling_direct_rebuild_admission()
+-> Result<()> {
     for operation in [Operation::Full, Operation::Reconcile] {
         let temp = tempfile::tempdir()?;
         let data = temp.path();
@@ -196,7 +249,10 @@ fn unusable_cleanup_metadata_retains_fallbacks_without_disabling_direct_rebuild_
         // does not repair this ledger. Only optional scratch cleanup is refused.
         drop(write(operation, &indexer, rows, data, &ids, || Ok(()))?);
         assert_eq!(fs::read(abandoned.join("candidate.fsvi"))?, before);
-        assert_eq!(fs::read(SemanticManifest::path(data))?, b"{unreadable ledger");
+        assert_eq!(
+            fs::read(SemanticManifest::path(data))?,
+            b"{unreadable ledger"
+        );
         assert_eq!(scratch_paths(data)?, vec![abandoned]);
         assert!(plan_backfill_artifacts(data).is_err());
         assert_eq!(VectorIndex::open_read_only(&live)?.record_count(), 3);

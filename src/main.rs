@@ -448,7 +448,10 @@ mod command_runtime_tests {
     #[test]
     fn existing_search_and_health_runtime_policy_is_preserved() {
         for args in [&["cass", "search", "probe"][..], &["cass", "health"][..]] {
-            assert!(current_thread(args), "existing current-thread path: {args:?}");
+            assert!(
+                current_thread(args),
+                "existing current-thread path: {args:?}"
+            );
         }
     }
 

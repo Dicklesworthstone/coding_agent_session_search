@@ -5,7 +5,10 @@
 //! One message and engine scratch can still be large; this is not an RSS ceiling.
 
 use super::{Coverage, engine};
-use crate::franken_sync::{SqliteValue, compat::{ConnectionExt, ParamValue, RowExt}};
+use crate::franken_sync::{
+    SqliteValue,
+    compat::{ConnectionExt, ParamValue, RowExt},
+};
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
 use crate::search::tantivy::{
@@ -24,7 +27,10 @@ struct Envelope {
 }
 
 fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
-    let placeholders = (1..=ids.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+    let placeholders = (1..=ids.len())
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
         "SELECT c.id, COALESCE(a.slug, 'unknown'), COALESCE(c.agent_id, 0),
                 c.workspace_id, w.path, c.external_id, c.title, c.source_path,
@@ -34,46 +40,58 @@ fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
          LEFT JOIN workspaces w ON w.id = c.workspace_id
          WHERE c.id IN ({placeholders}) ORDER BY c.id ASC"
     );
-    let params = ids.iter().copied().map(ParamValue::from).collect::<Vec<_>>();
-    let rows = storage.raw().query_map_collect(&sql, &params, |row| {
-        let conversation_id: i64 = row.get_typed(0)?;
-        let agent_id: i64 = row.get_typed(2)?;
-        let workspace_id: Option<i64> = row.get_typed(3)?;
-        let workspace: Option<String> = row.get_typed(4)?;
-        let source_id: Option<String> = row.get_typed(10)?;
-        let origin_host: Option<String> = row.get_typed(11)?;
-        let source_id = normalized_index_source_id(source_id.as_deref(), None, origin_host.as_deref());
-        let provenance = ConversationPacketProvenance {
-            origin_kind: normalized_index_origin_kind(&source_id, None),
-            origin_host: normalized_index_origin_host(origin_host.as_deref()),
-            source_id,
-        };
-        Ok(Envelope {
-            context: engine::SemanticPacketContext {
-                conversation_id,
-                agent_id: engine::saturating_u32_from_i64(agent_id),
-                workspace_id: engine::saturating_u32_from_i64(workspace_id.unwrap_or(0)),
-            },
-            conversation: Conversation {
-                id: Some(conversation_id),
-                agent_slug: row.get_typed(1)?,
-                workspace: workspace.map(PathBuf::from),
-                external_id: row.get_typed(5)?,
-                title: row.get_typed(6)?,
-                source_path: PathBuf::from(row.get_typed::<String>(7)?),
-                started_at: row.get_typed(8)?,
-                ended_at: row.get_typed(9)?,
-                approx_tokens: None,
-                metadata_json: serde_json::Value::Null,
-                messages: Vec::new(),
-                source_id: provenance.source_id.clone(),
-                origin_host: provenance.origin_host.clone(),
-            },
-            provenance,
+    let params = ids
+        .iter()
+        .copied()
+        .map(ParamValue::from)
+        .collect::<Vec<_>>();
+    let rows = storage
+        .raw()
+        .query_map_collect(&sql, &params, |row| {
+            let conversation_id: i64 = row.get_typed(0)?;
+            let agent_id: i64 = row.get_typed(2)?;
+            let workspace_id: Option<i64> = row.get_typed(3)?;
+            let workspace: Option<String> = row.get_typed(4)?;
+            let source_id: Option<String> = row.get_typed(10)?;
+            let origin_host: Option<String> = row.get_typed(11)?;
+            let source_id =
+                normalized_index_source_id(source_id.as_deref(), None, origin_host.as_deref());
+            let provenance = ConversationPacketProvenance {
+                origin_kind: normalized_index_origin_kind(&source_id, None),
+                origin_host: normalized_index_origin_host(origin_host.as_deref()),
+                source_id,
+            };
+            Ok(Envelope {
+                context: engine::SemanticPacketContext {
+                    conversation_id,
+                    agent_id: engine::saturating_u32_from_i64(agent_id),
+                    workspace_id: engine::saturating_u32_from_i64(workspace_id.unwrap_or(0)),
+                },
+                conversation: Conversation {
+                    id: Some(conversation_id),
+                    agent_slug: row.get_typed(1)?,
+                    workspace: workspace.map(PathBuf::from),
+                    external_id: row.get_typed(5)?,
+                    title: row.get_typed(6)?,
+                    source_path: PathBuf::from(row.get_typed::<String>(7)?),
+                    started_at: row.get_typed(8)?,
+                    ended_at: row.get_typed(9)?,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: Vec::new(),
+                    source_id: provenance.source_id.clone(),
+                    origin_host: provenance.origin_host.clone(),
+                },
+                provenance,
+            })
         })
-    }).context("read unchanged-proof canonical envelopes")?;
+        .context("read unchanged-proof canonical envelopes")?;
     ensure!(
-        rows.len() == ids.len() && rows.iter().zip(ids).all(|(row, id)| row.context.conversation_id == *id),
+        rows.len() == ids.len()
+            && rows
+                .iter()
+                .zip(ids)
+                .all(|(row, id)| row.context.conversation_id == *id),
         "canonical parents changed while loading unchanged-proof envelopes"
     );
     Ok(rows)
@@ -145,10 +163,13 @@ fn visit_with_reader(
             ),
         };
         let mut ids = Vec::with_capacity(PAGE_SIZE);
-        storage.raw().query_with_params_for_each(sql, &params, |row| {
-            ids.push(row.get_typed::<i64>(0)?);
-            Ok(())
-        }).context("page unchanged-proof canonical parents")?;
+        storage
+            .raw()
+            .query_with_params_for_each(sql, &params, |row| {
+                ids.push(row.get_typed::<i64>(0)?);
+                Ok(())
+            })
+            .context("page unchanged-proof canonical parents")?;
         if ids.is_empty() {
             check_cancelled()?;
             return Ok(coverage);
@@ -172,10 +193,12 @@ fn visit_with_reader(
                 let mut conversation = envelope.conversation.clone();
                 conversation.messages.push(message);
                 let packet = ConversationPacket::from_canonical_replay_owned(
-                    conversation, envelope.provenance.clone(),
+                    conversation,
+                    envelope.provenance.clone(),
                 );
                 let inputs = engine::semantic_inputs_from_packets(
-                    std::slice::from_ref(&packet), std::slice::from_ref(&envelope.context),
+                    std::slice::from_ref(&packet),
+                    std::slice::from_ref(&envelope.context),
                 )?;
                 drop(packet);
                 for input in inputs {
@@ -191,7 +214,10 @@ fn visit_with_reader(
             if nonempty {
                 // Blank/unsupported messages still make the parent nonempty.
                 // Never return partial coverage after a consumer or SQL error.
-                coverage.0 = coverage.0.checked_add(1).context("canonical parent count overflow")?;
+                coverage.0 = coverage
+                    .0
+                    .checked_add(1)
+                    .context("canonical parent count overflow")?;
                 coverage.1 = envelope.context.conversation_id;
             }
         }

@@ -8,12 +8,12 @@
 pub mod current;
 mod progressive;
 
+use super::super::SelectedTextSemanticSearch;
 use super::*;
 use crate::search::semantic_reader::ann::AnnSearchPolicy;
 use crate::search::semantic_reader::text::TextSemanticSearch;
 use crate::search::semantic_reader::{SemanticReaderError, SemanticReaderResult};
 use frankensearch::core::filter::SearchFilter;
-use super::super::SelectedTextSemanticSearch;
 
 /// A retrieval error remains distinct from a missing, changed or over-budget
 /// source. Neither kind can turn a scored but unverified batch into text.
@@ -42,28 +42,43 @@ fn retain_verified_prefix<B: BatchSource>(batch: &mut B, k: usize) {
     let batch = batch.batch_mut();
     batch.hits.truncate(k);
     if let Some(coverage) = &mut batch.coverage.fast {
-        coverage.contributed_candidates = batch.hits.iter().filter(|hit| hit.fast.is_some()).count();
+        coverage.contributed_candidates =
+            batch.hits.iter().filter(|hit| hit.fast.is_some()).count();
     }
     if let Some(coverage) = &mut batch.coverage.quality {
-        coverage.contributed_candidates = batch.hits.iter().filter(|hit| hit.quality.is_some()).count();
+        coverage.contributed_candidates = batch
+            .hits
+            .iter()
+            .filter(|hit| hit.quality.is_some())
+            .count();
     }
 }
 
 impl BatchSource for SemanticSearchBatch {
-    fn batch(&self) -> &SemanticSearchBatch { self }
-    fn batch_mut(&mut self) -> &mut SemanticSearchBatch { self }
+    fn batch(&self) -> &SemanticSearchBatch {
+        self
+    }
+    fn batch_mut(&mut self) -> &mut SemanticSearchBatch {
+        self
+    }
 }
 
 impl BatchSource for SelectedSemanticBatch {
-    fn batch(&self) -> &SemanticSearchBatch { self.batch() }
-    fn batch_mut(&mut self) -> &mut SemanticSearchBatch { &mut self.batch }
+    fn batch(&self) -> &SemanticSearchBatch {
+        self.batch()
+    }
+    fn batch_mut(&mut self) -> &mut SemanticSearchBatch {
+        &mut self.batch
+    }
 }
 
 fn prepare(k: usize, phases: usize, budget: HydrationBudget) -> Result<Work, HydrationError> {
     let started = Instant::now();
     // Admit the requested worst-case output before a native search may allocate
     // from k. Progressive streams reserve both result pages, not just Initial.
-    let requested = k.checked_mul(phases).ok_or(HydrationError::BudgetExceeded)?;
+    let requested = k
+        .checked_mul(phases)
+        .ok_or(HydrationError::BudgetExceeded)?;
     budget.validate(requested)?;
     Work::new(budget, started)
 }
@@ -77,7 +92,11 @@ fn verified<B: BatchSource>(
     work.check()?;
     let passages = hydrate_with_work(batch.batch(), transaction, projection, work)?;
     work.check()?;
-    Ok(HydratedSemanticBatch { source: batch, passages, projection })
+    Ok(HydratedSemanticBatch {
+        source: batch,
+        passages,
+        projection,
+    })
 }
 
 fn search<B: BatchSource>(
@@ -119,7 +138,9 @@ impl TextSemanticSearch<'_, '_> {
         budget: HydrationBudget,
     ) -> HydratedSearchResult<SemanticSearchBatch> {
         let work = prepare(k, 1, budget)?;
-        search(transaction, projection, work, || self.search_with_ann(k, filter, policy))
+        search(transaction, projection, work, || {
+            self.search_with_ann(k, filter, policy)
+        })
     }
 }
 
@@ -149,7 +170,9 @@ impl SelectedTextSemanticSearch<'_, '_> {
         budget: HydrationBudget,
     ) -> HydratedSearchResult<SelectedSemanticBatch> {
         let work = prepare(k, 1, budget)?;
-        search(transaction, projection, work, || self.search_with_ann(k, filter, policy))
+        search(transaction, projection, work, || {
+            self.search_with_ann(k, filter, policy)
+        })
     }
 }
 

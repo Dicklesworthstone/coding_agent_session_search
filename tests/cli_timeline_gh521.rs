@@ -127,9 +127,11 @@ fn entries(payload: &Value) -> Vec<&Value> {
     );
     // This fixture's selected sessions belong to one minute, so grouping
     // must preserve the same descending order as the flat result.
-    assert!(rows.windows(2).all(|w| {
-        w[0]["started_at"].as_i64().unwrap() >= w[1]["started_at"].as_i64().unwrap()
-    }));
+    assert!(
+        rows.windows(2).all(|w| {
+            w[0]["started_at"].as_i64().unwrap() >= w[1]["started_at"].as_i64().unwrap()
+        })
+    );
     rows
 }
 
@@ -140,7 +142,15 @@ fn gh521_filters_counts_nulls_and_grouping_preserve_the_timeline_contract() {
     conn.execute("BEGIN IMMEDIATE").unwrap();
     conversation(&conn, 1, Some(1), Some(START - 1), Some("local"), None, 3);
     conversation(&conn, 2, Some(1), Some(START), Some("local"), None, 2);
-    conversation(&conn, 3, Some(2), Some(START + 1_000), Some("local"), None, 0);
+    conversation(
+        &conn,
+        3,
+        Some(2),
+        Some(START + 1_000),
+        Some("local"),
+        None,
+        0,
+    );
     conversation(
         &conn,
         4,
@@ -205,7 +215,11 @@ fn gh521_filters_counts_nulls_and_grouping_preserve_the_timeline_contract() {
             let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
             let rows = entries(&payload);
             let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
-            assert_eq!(ids.as_slice(), *expected, "grouping={grouping} flags={flags:?}");
+            assert_eq!(
+                ids.as_slice(),
+                *expected,
+                "grouping={grouping} flags={flags:?}"
+            );
             for row in rows {
                 let id = row["id"].as_i64().unwrap();
                 let count = match id {
@@ -413,11 +427,7 @@ fn gh521_narrow_window_does_not_materialize_unrelated_message_payloads() {
     ] {
         bounded_timeline(tmp.path(), &flags, &[(2, 2)]);
     }
-    bounded_timeline(
-        tmp.path(),
-        &["--agent", "codex", "--source", "remote"],
-        &[],
-    );
+    bounded_timeline(tmp.path(), &["--agent", "codex", "--source", "remote"], &[]);
 
     // Now select the huge conversation too. Counting its turns must remain
     // bounded even when the time/agent/source predicates all match it.

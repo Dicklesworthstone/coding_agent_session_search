@@ -221,7 +221,11 @@ fn exercise(test_name: &str, trailing_slash: bool, retain_basename: bool) {
         } else {
             file.clone()
         };
-        assert!(expected_paths.insert(conversation_path, (agent, id)).is_none());
+        assert!(
+            expected_paths
+                .insert(conversation_path, (agent, id))
+                .is_none()
+        );
         before.insert(file.clone(), fs::read(&file).unwrap());
         if id == "team-a/run" {
             appended_file = Some(file);
@@ -349,13 +353,13 @@ fn exercise(test_name: &str, trailing_slash: bool, retain_basename: bool) {
     let updated = snapshot(&data);
     assert_eq!(updated.0, initial.0);
     assert_eq!(updated.1.len(), initial.1.len() + 1);
-    let selected_id = initial
-        .0
-        .iter()
-        .find(|row| row.path == file)
-        .unwrap()
-        .id;
-    let added = (selected_id, 2, "user".to_owned(), "vibeappendprobe".to_owned());
+    let selected_id = initial.0.iter().find(|row| row.path == file).unwrap().id;
+    let added = (
+        selected_id,
+        2,
+        "user".to_owned(),
+        "vibeappendprobe".to_owned(),
+    );
     let mut expected_messages = initial.1;
     expected_messages.push(added);
     expected_messages.sort();

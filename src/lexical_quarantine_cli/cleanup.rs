@@ -4,7 +4,9 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use coding_agent_search::search::lexical_quarantine::cleanup::{self as core, CleanupError, CleanupReport};
+use coding_agent_search::search::lexical_quarantine::cleanup::{
+    self as core, CleanupError, CleanupReport,
+};
 use coding_agent_search::{CliError, CliResult};
 
 pub(super) fn parse_approval(value: &str) -> Result<String, String> {
@@ -22,10 +24,12 @@ fn error(error: CleanupError) -> CliError {
         CleanupError::ApprovalChanged => (6, "quarantine-approval-changed", true),
         CleanupError::Busy => (7, "quarantine-cleanup-busy", true),
         CleanupError::Incomplete => (8, "quarantine-incomplete", true),
-        CleanupError::Io(_) => return match error {
-            CleanupError::Io(error) => super::failure(error),
-            _ => unreachable!(),
-        },
+        CleanupError::Io(_) => {
+            return match error {
+                CleanupError::Io(error) => super::failure(error),
+                _ => unreachable!(),
+            };
+        }
     };
     CliError {
         code, kind, message: error.to_string(), retryable,
@@ -59,19 +63,41 @@ pub(super) fn plan(data_dir: &Path, as_json: bool, output: &mut impl Write) -> C
 }
 
 fn render(report: &CleanupReport, as_json: bool, output: &mut impl Write) -> io::Result<()> {
-    if as_json { return json(report, output); }
-    writeln!(output, "Lexical quarantine cleanup complete: {}", report.complete)?;
-    writeln!(output, "Selected: {}; attempted: {}; fully removed: {}; logical bytes removed: {}; protected bundles retained: {}",
-        report.selected_bundles, report.attempted_bundles, report.removed_bundles,
-        report.removed_logical_bytes, report.retained_bundles)?;
-    for error in &report.errors { writeln!(output, "Cleanup stopped: {error}")?; }
+    if as_json {
+        return json(report, output);
+    }
+    writeln!(
+        output,
+        "Lexical quarantine cleanup complete: {}",
+        report.complete
+    )?;
+    writeln!(
+        output,
+        "Selected: {}; attempted: {}; fully removed: {}; logical bytes removed: {}; protected bundles retained: {}",
+        report.selected_bundles,
+        report.attempted_bundles,
+        report.removed_bundles,
+        report.removed_logical_bytes,
+        report.retained_bundles
+    )?;
+    for error in &report.errors {
+        writeln!(output, "Cleanup stopped: {error}")?;
+    }
     if !report.complete {
-        writeln!(output, "Earlier mutations were not rolled back. Inspect the remaining inventory and obtain a new plan before retrying.")?;
+        writeln!(
+            output,
+            "Earlier mutations were not rolled back. Inspect the remaining inventory and obtain a new plan before retrying."
+        )?;
     }
     output.flush()
 }
 
-pub(super) fn apply(data_dir: &Path, approval: &str, as_json: bool, output: &mut impl Write) -> CliResult<()> {
+pub(super) fn apply(
+    data_dir: &Path,
+    approval: &str,
+    as_json: bool,
+    output: &mut impl Write,
+) -> CliResult<()> {
     let report = core::apply(data_dir, approval).map_err(error)?;
     // Execution has already completed or stopped. Even a broken output sink
     // cannot imply that cleanup did not happen or that retry is idempotent.
@@ -84,7 +110,11 @@ pub(super) fn apply(data_dir: &Path, approval: &str, as_json: bool, output: &mut
         retryable: false,
     })?;
     if !report.complete {
-        return Err(CliError::already_reported(8, "quarantine-cleanup-incomplete", true));
+        return Err(CliError::already_reported(
+            8,
+            "quarantine-cleanup-incomplete",
+            true,
+        ));
     }
     Ok(())
 }
@@ -99,12 +129,20 @@ mod tests {
         let approval = format!("lq-cleanup-v1-{}", "a".repeat(64));
         let base = ["cass", "lexical-quarantine", "--data-dir", "."];
         for args in [
-            vec!["--apply"], vec!["--apply", "yes"], vec!["--plan", "--apply", &approval],
+            vec!["--apply"],
+            vec!["--apply", "yes"],
+            vec!["--plan", "--apply", &approval],
         ] {
             assert!(super::super::Cli::try_parse_from(base.iter().copied().chain(args)).is_err());
         }
-        assert!(super::super::Cli::try_parse_from(base.iter().copied().chain(["--plan", "--robot"])).is_ok());
-        let parsed = super::super::Cli::try_parse_from(base.iter().copied().chain(["--apply", approval.as_str()])).unwrap();
+        assert!(
+            super::super::Cli::try_parse_from(base.iter().copied().chain(["--plan", "--robot"]))
+                .is_ok()
+        );
+        let parsed = super::super::Cli::try_parse_from(
+            base.iter().copied().chain(["--apply", approval.as_str()]),
+        )
+        .unwrap();
         let super::super::Command::LexicalQuarantine { apply, plan, .. } = parsed.command;
         assert_eq!(apply.as_deref(), Some(approval.as_str()));
         assert!(!plan);
@@ -113,9 +151,17 @@ mod tests {
     #[test]
     fn refusals_have_distinct_machine_readable_codes() {
         for (cause, code, kind) in [
-            (CleanupError::InvalidApproval, 2, "quarantine-invalid-approval"),
+            (
+                CleanupError::InvalidApproval,
+                2,
+                "quarantine-invalid-approval",
+            ),
             (CleanupError::Disabled, 2, "quarantine-cleanup-disabled"),
-            (CleanupError::ApprovalChanged, 6, "quarantine-approval-changed"),
+            (
+                CleanupError::ApprovalChanged,
+                6,
+                "quarantine-approval-changed",
+            ),
             (CleanupError::Busy, 7, "quarantine-cleanup-busy"),
             (CleanupError::Incomplete, 8, "quarantine-incomplete"),
         ] {
@@ -128,9 +174,15 @@ mod tests {
     #[test]
     fn partial_cleanup_report_does_not_claim_complete_or_read_only() {
         let report = CleanupReport {
-            schema_version: 1, data_dir: ".".into(), approval_fingerprint: "approved fixture".into(),
-            complete: false, selected_bundles: 3, retained_bundles: 1,
-            attempted_bundles: 2, removed_bundles: 1, removed_logical_bytes: 25,
+            schema_version: 1,
+            data_dir: ".".into(),
+            approval_fingerprint: "approved fixture".into(),
+            complete: false,
+            selected_bundles: 3,
+            retained_bundles: 1,
+            attempted_bundles: 2,
+            removed_bundles: 1,
+            removed_logical_bytes: 25,
             errors: vec!["later target changed".into()],
         };
         let mut encoded = Vec::new();
@@ -141,6 +193,10 @@ mod tests {
         assert_eq!(value["removed_bundles"], 1);
         let mut human = Vec::new();
         render(&report, false, &mut human).unwrap();
-        assert!(String::from_utf8(human).unwrap().contains("not rolled back"));
+        assert!(
+            String::from_utf8(human)
+                .unwrap()
+                .contains("not rolled back")
+        );
     }
 }

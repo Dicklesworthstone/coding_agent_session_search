@@ -73,7 +73,11 @@ fn render(report: &MigrationReport, json: bool, output: &mut impl Write) -> io::
     } else {
         let mut text = format!(
             "{}: retain Codex conversation {} ({}) and {} existing messages for source {}.",
-            if report.applied { "Registered" } else { "Dry-run verified" },
+            if report.applied {
+                "Registered"
+            } else {
+                "Dry-run verified"
+            },
             report.canonical_conversation_id,
             report.canonical_external_id,
             report.retained_messages,
@@ -149,9 +153,16 @@ mod tests {
 
     fn arguments() -> Vec<&'static str> {
         vec![
-            "cass", "codex-layout-migrate", "--data-dir", "/archive",
-            "--source", "history", "--from", "/flat/rollout.jsonl",
-            "--to", "/dated/rollout.jsonl",
+            "cass",
+            "codex-layout-migrate",
+            "--data-dir",
+            "/archive",
+            "--source",
+            "history",
+            "--from",
+            "/flat/rollout.jsonl",
+            "--to",
+            "/dated/rollout.jsonl",
         ]
     }
 
@@ -214,7 +225,9 @@ mod tests {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed consumer"))
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

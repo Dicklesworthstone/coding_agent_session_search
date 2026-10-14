@@ -217,9 +217,11 @@ impl Invocation {
         let matches = self.command().try_get_matches_from(raw)?;
         let arguments = match self {
             Self::Standalone => &matches,
-            Self::Cass => matches.subcommand_matches("semantic-reclaim").ok_or_else(|| {
-                clap::Error::raw(ErrorKind::MissingSubcommand, "expected semantic-reclaim")
-            })?,
+            Self::Cass => matches
+                .subcommand_matches("semantic-reclaim")
+                .ok_or_else(|| {
+                    clap::Error::raw(ErrorKind::MissingSubcommand, "expected semantic-reclaim")
+                })?,
         };
         Args::from_arg_matches(arguments)
     }
@@ -240,8 +242,7 @@ pub fn cass_args(raw: &[OsString]) -> Option<Vec<OsString>> {
                 index += 2;
             }
             Some(value)
-                if value.starts_with("--data-dir=")
-                    || value.starts_with("--plan-fingerprint=") =>
+                if value.starts_with("--data-dir=") || value.starts_with("--plan-fingerprint=") =>
             {
                 index += 1;
             }
@@ -386,8 +387,21 @@ mod tests {
             vec!["--apply"],
             vec!["--data-dir", "/unused", "--apply"],
             vec!["--data-dir", "/unused", "--plan-fingerprint", &valid],
-            vec!["--data-dir", "/unused", "--apply", "--plan-fingerprint", "bad"],
-            vec!["--data-dir", "/unused", "--apply", "--dry-run", "--plan-fingerprint", &valid],
+            vec![
+                "--data-dir",
+                "/unused",
+                "--apply",
+                "--plan-fingerprint",
+                "bad",
+            ],
+            vec![
+                "--data-dir",
+                "/unused",
+                "--apply",
+                "--dry-run",
+                "--plan-fingerprint",
+                &valid,
+            ],
             vec!["--data-dir", "/unused", "--force"],
             vec!["--data-dir", "/unused", "--data-dir", "/other"],
         ] {
@@ -395,15 +409,26 @@ mod tests {
                 (Invocation::Cass, vec!["cass", "semantic-reclaim"]),
                 (Invocation::Standalone, vec!["cass-semantic-reclaim"]),
             ] {
-                let args = prefix.into_iter().chain(suffix.iter().copied())
-                    .map(OsString::from).collect();
+                let args = prefix
+                    .into_iter()
+                    .chain(suffix.iter().copied())
+                    .map(OsString::from)
+                    .collect();
                 assert!(invocation.parse(args).is_err());
             }
         }
-        let args = Invocation::Cass.parse(raw(&[
-            "cass", "semantic-reclaim", "--data-dir", "/unused",
-            "--apply", "--plan-fingerprint", &valid, "--robot",
-        ])).unwrap();
+        let args = Invocation::Cass
+            .parse(raw(&[
+                "cass",
+                "semantic-reclaim",
+                "--data-dir",
+                "/unused",
+                "--apply",
+                "--plan-fingerprint",
+                &valid,
+                "--robot",
+            ]))
+            .unwrap();
         assert!(args.apply && args.json);
         assert_eq!(args.plan_fingerprint.as_deref(), Some(valid.as_str()));
     }
@@ -421,21 +446,39 @@ mod tests {
             assert!(cass_args(&raw(&args)).is_none());
         }
         let original = raw(&[
-            "cass", "--data-dir", "/archive with spaces", "--json",
-            "semantic-reclaim", "--dry-run", "--force",
+            "cass",
+            "--data-dir",
+            "/archive with spaces",
+            "--json",
+            "semantic-reclaim",
+            "--dry-run",
+            "--force",
         ]);
         let normalized = cass_args(&original).unwrap();
-        assert_eq!(normalized, raw(&[
-            "cass", "semantic-reclaim", "--data-dir", "/archive with spaces",
-            "--json", "--dry-run", "--force",
-        ]));
+        assert_eq!(
+            normalized,
+            raw(&[
+                "cass",
+                "semantic-reclaim",
+                "--data-dir",
+                "/archive with spaces",
+                "--json",
+                "--dry-run",
+                "--force",
+            ])
+        );
         // Routing must not discard the unknown flag to manufacture approval.
         assert!(Invocation::Cass.parse(normalized).is_err());
-        let args = Invocation::Cass.parse(raw(&[
-            "cass", "--data-dir=/explicit", "--robot", "semantic-reclaim", "--dry-run",
-        ])).unwrap();
+        let args = Invocation::Cass
+            .parse(raw(&[
+                "cass",
+                "--data-dir=/explicit",
+                "--robot",
+                "semantic-reclaim",
+                "--dry-run",
+            ]))
+            .unwrap();
         assert_eq!(args.data_dir, PathBuf::from("/explicit"));
         assert!(args.json && args.dry_run && !args.apply);
     }
-
 }

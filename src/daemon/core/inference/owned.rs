@@ -15,26 +15,44 @@ pub(super) fn attested_batch(
     // Honor producer overrides. Never infer raw vectors and then attach the
     // connection's expected identity to them at this boundary.
     let outcome = match operation {
-        DaemonOperationV1::Embed if texts.len() == 1 => {
-            producer.embed_bound_sync(texts[0]).map(|embedding| vec![embedding])
-        }
+        DaemonOperationV1::Embed if texts.len() == 1 => producer
+            .embed_bound_sync(texts[0])
+            .map(|embedding| vec![embedding]),
         DaemonOperationV1::EmbedBatch => producer.embed_batch_bound_sync(texts),
-        _ => return Err(error(ErrorCode::InvalidInput, "invalid attested embedding operation", false)),
+        _ => {
+            return Err(error(
+                ErrorCode::InvalidInput,
+                "invalid attested embedding operation",
+                false,
+            ));
+        }
     };
     let embeddings = outcome.map_err(|source| {
         tracing::warn!(error = %source, "Daemon bound embedding inference failed");
-        error(ErrorCode::Internal, "native embedding inference failed", false)
+        error(
+            ErrorCode::Internal,
+            "native embedding inference failed",
+            false,
+        )
     })?;
     budget.check()?;
     verify_live_identity(producer, state)?;
     if embeddings.len() != texts.len() {
-        return Err(error(ErrorCode::Internal, "native embedder returned the wrong batch length", false));
+        return Err(error(
+            ErrorCode::Internal,
+            "native embedder returned the wrong batch length",
+            false,
+        ));
     }
     let mut vectors = Vec::with_capacity(embeddings.len());
     for embedding in embeddings {
         budget.check()?;
         embedding.validate().map_err(|_| {
-            error(ErrorCode::Internal, "native embedder returned an invalid bound embedding", false)
+            error(
+                ErrorCode::Internal,
+                "native embedder returned an invalid bound embedding",
+                false,
+            )
         })?;
         if embedding.identity != state.connection.embedding_identity {
             return Err(error(

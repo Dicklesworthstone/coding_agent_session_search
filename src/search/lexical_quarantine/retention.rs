@@ -12,8 +12,11 @@ struct Report {
 impl Report {
     fn log(&self) {
         if self.removed > 0 {
-            tracing::info!(removed_bundles = self.removed, logical_bytes = self.logical_bytes,
-                "reclaimed older failed lexical rebuilds; newest evidence retained (GH #523)");
+            tracing::info!(
+                removed_bundles = self.removed,
+                logical_bytes = self.logical_bytes,
+                "reclaimed older failed lexical rebuilds; newest evidence retained (GH #523)"
+            );
         }
         for error in &self.errors {
             tracing::warn!(error = %error,
@@ -25,24 +28,47 @@ impl Report {
 fn reclaim(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> Report {
     let inventory = match inspect_at(data_dir, now, enabled, limits) {
         Ok(inventory) => inventory,
-        Err(error) => return Report { errors: vec![error.to_string()], ..Default::default() },
+        Err(error) => {
+            return Report {
+                errors: vec![error.to_string()],
+                ..Default::default()
+            };
+        }
     };
-    if !enabled { return Report::default(); }
+    if !enabled {
+        return Report::default();
+    }
     if !inventory.complete {
         let mut errors = inventory.warnings;
-        errors.extend(inventory.artifacts.into_iter().filter(|a| !a.size_complete)
-            .map(|a| format!("{}: {}", a.path.display(), a.reason)));
-        if errors.is_empty() { errors.push("quarantine inventory incomplete; no bundles reclaimed".into()); }
-        return Report { errors, ..Default::default() };
+        errors.extend(
+            inventory
+                .artifacts
+                .into_iter()
+                .filter(|a| !a.size_complete)
+                .map(|a| format!("{}: {}", a.path.display(), a.reason)),
+        );
+        if errors.is_empty() {
+            errors.push("quarantine inventory incomplete; no bundles reclaimed".into());
+        }
+        return Report {
+            errors,
+            ..Default::default()
+        };
     }
     let mut report = Report::default();
     // One additional metadata budget across ALL candidate rechecks, not one
     // renewed allowance per bundle. remove_dir_all itself is synchronous and
     // cannot be forcibly interrupted by this cooperative metadata deadline.
     let mut budget = Budget::new(limits);
-    for artifact in inventory.artifacts.iter().filter(|a| a.disposition == Disposition::Eligible) {
+    for artifact in inventory
+        .artifacts
+        .iter()
+        .filter(|a| a.disposition == Disposition::Eligible)
+    {
         if let Err(error) = reclaim_one(artifact, &inventory, now, &mut budget) {
-            report.errors.push(format!("{}: {error}", artifact.path.display()));
+            report
+                .errors
+                .push(format!("{}: {error}", artifact.path.display()));
             // Do not multiply work or keep mutating after a changed/failed target.
             break;
         }
@@ -59,7 +85,10 @@ pub(super) fn reclaim_one(
     budget: &mut Budget,
 ) -> io::Result<()> {
     survivor::validate_selection(artifact, inventory)?;
-    let parent = artifact.path.parent().ok_or_else(|| io::Error::other("quarantine has no parent"))?;
+    let parent = artifact
+        .path
+        .parent()
+        .ok_or_else(|| io::Error::other("quarantine has no parent"))?;
     real_directory(parent)?;
     // Hold identities through re-observation and rename. This detects ordinary
     // replacement; the data directory and its ancestors must remain trusted.
@@ -67,10 +96,14 @@ pub(super) fn reclaim_one(
     let owner = same_file::Handle::from_path(&artifact.path)?;
     let current = observe(&artifact.path, artifact.interrupted_reclaim, now, budget)?;
     if current.metadata_fingerprint != artifact.metadata_fingerprint
-        || current.age_seconds.is_none_or(|age| age < MIN_AGE.as_secs())
+        || current
+            .age_seconds
+            .is_none_or(|age| age < MIN_AGE.as_secs())
         || owner != same_file::Handle::from_path(&artifact.path)?
     {
-        return Err(io::Error::other("quarantine changed since inventory; no deletion attempted"));
+        return Err(io::Error::other(
+            "quarantine changed since inventory; no deletion attempted",
+        ));
     }
     // Recheck the retained evidence, not only the target, immediately before
     // mutation. Another operator may have moved it after the locked inventory.
@@ -83,16 +116,23 @@ pub(super) fn reclaim_one(
         // Reserve a fresh sibling WITHOUT replacing an existing path. Retain the
         // reservation before moving evidence so any later failure/crash leaves
         // a recognizable, retryable bundle instead of losing its ownership.
-        let reserved = tempfile::Builder::new().prefix(RECLAIM_PREFIX).tempdir_in(parent)?.keep();
+        let reserved = tempfile::Builder::new()
+            .prefix(RECLAIM_PREFIX)
+            .tempdir_in(parent)?
+            .keep();
         fs::rename(&artifact.path, reserved.join("quarantine"))?;
         real_directory(&reserved.join("quarantine"))?;
         if owner != same_file::Handle::from_path(reserved.join("quarantine"))? {
-            return Err(io::Error::other("quarantine identity changed during rename; retained for inspection"));
+            return Err(io::Error::other(
+                "quarantine identity changed during rename; retained for inspection",
+            ));
         }
         reserved
     };
     if parent_owner != same_file::Handle::from_path(parent)? {
-        return Err(io::Error::other("quarantine parent changed; retained for inspection"));
+        return Err(io::Error::other(
+            "quarantine parent changed; retained for inspection",
+        ));
     }
     real_directory(&doomed)?;
     // std's recursive removal does not follow links. Observation additionally
@@ -108,7 +148,11 @@ pub(crate) fn reclaim_under_index_run_lock(data_dir: &Path, now: SystemTime) {
     let enabled = match retention_enabled() {
         Ok(enabled) => enabled,
         Err(error) => {
-            Report { errors: vec![error.to_string()], ..Default::default() }.log();
+            Report {
+                errors: vec![error.to_string()],
+                ..Default::default()
+            }
+            .log();
             return;
         }
     };
@@ -126,7 +170,9 @@ mod tests {
         path
     }
 
-    fn now() -> SystemTime { SystemTime::now() + Duration::from_secs(24 * 60 * 60) }
+    fn now() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(24 * 60 * 60)
+    }
 
     #[test]
     fn older_bundles_are_reclaimed_and_the_newest_remains_byte_identical() {
@@ -136,14 +182,28 @@ mod tests {
         let c = bundle(&root.path().join("index"), "000003");
         let instant = now();
         let plan = inspect_at(root.path(), instant, true, Limits::default()).unwrap();
-        let newest = plan.artifacts.iter().find(|a| a.disposition == Disposition::RetainNewest).unwrap().path.clone();
+        let newest = plan
+            .artifacts
+            .iter()
+            .find(|a| a.disposition == Disposition::RetainNewest)
+            .unwrap()
+            .path
+            .clone();
         let report = reclaim(root.path(), instant, true, Limits::default());
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.removed, 2);
         assert_eq!(report.logical_bytes, 2 * b"derived evidence".len() as u64);
-        assert_eq!(fs::read(newest.join("index/MANIFEST")).unwrap(), b"derived evidence");
-        for path in [a, b, c] { assert_eq!(path.exists(), path == newest); }
-        assert_eq!(reclaim(root.path(), instant, true, Limits::default()).removed, 0);
+        assert_eq!(
+            fs::read(newest.join("index/MANIFEST")).unwrap(),
+            b"derived evidence"
+        );
+        for path in [a, b, c] {
+            assert_eq!(path.exists(), path == newest);
+        }
+        assert_eq!(
+            reclaim(root.path(), instant, true, Limits::default()).removed,
+            0
+        );
     }
 
     #[test]
@@ -154,7 +214,14 @@ mod tests {
         for (instant, enabled, limits) in [
             (SystemTime::now(), true, Limits::default()),
             (now(), false, Limits::default()),
-            (now(), true, Limits { tree_entries: 1, ..Default::default() }),
+            (
+                now(),
+                true,
+                Limits {
+                    tree_entries: 1,
+                    ..Default::default()
+                },
+            ),
         ] {
             assert_eq!(reclaim(root.path(), instant, enabled, limits).removed, 0);
             assert!(a.join("index/MANIFEST").is_file());
@@ -169,11 +236,23 @@ mod tests {
         bundle(root.path(), "000002");
         let instant = now();
         let plan = inspect_at(root.path(), instant, true, Limits::default()).unwrap();
-        let artifact = plan.artifacts.iter().find(|a| a.disposition == Disposition::Eligible).unwrap();
+        let artifact = plan
+            .artifacts
+            .iter()
+            .find(|a| a.disposition == Disposition::Eligible)
+            .unwrap();
         fs::write(artifact.path.join("index/new-entry"), b"changed evidence").unwrap();
-        let result = reclaim_one(artifact, &plan, instant, &mut Budget::new(Limits::default()));
+        let result = reclaim_one(
+            artifact,
+            &plan,
+            instant,
+            &mut Budget::new(Limits::default()),
+        );
         assert!(result.is_err());
-        assert_eq!(fs::read(artifact.path.join("index/new-entry")).unwrap(), b"changed evidence");
+        assert_eq!(
+            fs::read(artifact.path.join("index/new-entry")).unwrap(),
+            b"changed evidence"
+        );
     }
 
     #[test]
@@ -190,7 +269,10 @@ mod tests {
         assert_eq!(report.removed, 2);
         assert!(!pending.exists());
         assert!(!empty.exists());
-        assert_eq!(fs::read(newest.join("index/MANIFEST")).unwrap(), b"derived evidence");
+        assert_eq!(
+            fs::read(newest.join("index/MANIFEST")).unwrap(),
+            b"derived evidence"
+        );
     }
 
     #[test]
@@ -200,16 +282,29 @@ mod tests {
         fs::create_dir_all(root.path().join("index/v9-quill")).unwrap();
         fs::write(root.path().join("index/v9-quill/MANIFEST"), b"live").unwrap();
         fs::create_dir_all(root.path().join("index/.lexical-publish-backups")).unwrap();
-        fs::write(root.path().join("index/.lexical-publish-backups/previous"), b"backup").unwrap();
+        fs::write(
+            root.path().join("index/.lexical-publish-backups/previous"),
+            b"backup",
+        )
+        .unwrap();
         let a = bundle(root.path(), "000001");
         bundle(root.path(), "000002");
         fs::write(a.join("operator-notes"), b"retain").unwrap();
         let report = reclaim(root.path(), now(), true, Limits::default());
         assert_eq!(report.removed, 0);
         assert!(!report.errors.is_empty());
-        assert_eq!(fs::read(root.path().join("agent_search.db")).unwrap(), b"archive sentinel");
-        assert_eq!(fs::read(root.path().join("index/v9-quill/MANIFEST")).unwrap(), b"live");
-        assert_eq!(fs::read(root.path().join("index/.lexical-publish-backups/previous")).unwrap(), b"backup");
+        assert_eq!(
+            fs::read(root.path().join("agent_search.db")).unwrap(),
+            b"archive sentinel"
+        );
+        assert_eq!(
+            fs::read(root.path().join("index/v9-quill/MANIFEST")).unwrap(),
+            b"live"
+        );
+        assert_eq!(
+            fs::read(root.path().join("index/.lexical-publish-backups/previous")).unwrap(),
+            b"backup"
+        );
         assert_eq!(fs::read(a.join("operator-notes")).unwrap(), b"retain");
     }
 
@@ -224,7 +319,15 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), a.join("index/escape")).unwrap();
         let report = reclaim(root.path(), now(), true, Limits::default());
         assert_eq!(report.removed, 0);
-        assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"outside");
-        assert!(fs::symlink_metadata(a.join("index/escape")).unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::read(outside.path().join("sentinel")).unwrap(),
+            b"outside"
+        );
+        assert!(
+            fs::symlink_metadata(a.join("index/escape"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

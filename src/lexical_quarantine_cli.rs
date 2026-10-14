@@ -38,7 +38,11 @@ enum Command {
 }
 
 pub fn clap_commands() -> Vec<clap::Command> {
-    Cli::command().find_subcommand("lexical-quarantine").cloned().into_iter().collect()
+    Cli::command()
+        .find_subcommand("lexical-quarantine")
+        .cloned()
+        .into_iter()
+        .collect()
 }
 
 fn failure(error: io::Error) -> CliError {
@@ -62,41 +66,72 @@ fn render(inventory: &Inventory, json: bool, output: &mut impl Write) -> io::Res
         bytes.push(b'\n');
         output.write_all(&bytes)?;
     } else {
-        writeln!(output, "Lexical rebuild quarantines: {} (complete: {})",
-            inventory.artifacts.len(), inventory.complete)?;
+        writeln!(
+            output,
+            "Lexical rebuild quarantines: {} (complete: {})",
+            inventory.artifacts.len(),
+            inventory.complete
+        )?;
         let byte_label = if inventory.complete {
             "Logical bytes retained"
         } else {
             "Observed logical bytes (incomplete; not a total)"
         };
-        writeln!(output, "{byte_label}: {}; eligible under index-run lock: {}",
-            inventory.total_bytes, inventory.eligible_bytes)?;
+        writeln!(
+            output,
+            "{byte_label}: {}; eligible under index-run lock: {}",
+            inventory.total_bytes, inventory.eligible_bytes
+        )?;
         for artifact in &inventory.artifacts {
             let age = artifact.age_seconds.map_or_else(
-                || "unknown/future".to_owned(), |seconds| format!("{seconds}s"));
+                || "unknown/future".to_owned(),
+                |seconds| format!("{seconds}s"),
+            );
             let size = if artifact.size_complete {
                 format!("{} bytes", artifact.size_bytes)
             } else {
                 "unknown (scan incomplete)".to_owned()
             };
             // Debug formatting escapes control characters in paths and reasons.
-            writeln!(output, "{:?}\t{size}\tage={age}\t{:?}\t{:?}",
-                artifact.path, artifact.disposition, artifact.reason)?;
+            writeln!(
+                output,
+                "{:?}\t{size}\tage={age}\t{:?}\t{:?}",
+                artifact.path, artifact.disposition, artifact.reason
+            )?;
             for evidence in &artifact.failure_evidence {
-                writeln!(output, "  evidence: {:?}\t{:?}\t{} bytes (contents not inspected)",
-                    evidence.kind, evidence.relative_path, evidence.size_bytes)?;
+                writeln!(
+                    output,
+                    "  evidence: {:?}\t{:?}\t{} bytes (contents not inspected)",
+                    evidence.kind, evidence.relative_path, evidence.size_bytes
+                )?;
             }
             if !artifact.size_complete {
-                writeln!(output, "  evidence inventory incomplete; absence is not established")?;
+                writeln!(
+                    output,
+                    "  evidence inventory incomplete; absence is not established"
+                )?;
             }
         }
-        for warning in &inventory.warnings { writeln!(output, "Warning: {warning:?}")?; }
-        if inventory.artifacts.iter().filter(|artifact|
-            artifact.has_evidence && !artifact.interrupted_reclaim).take(2).count() > 1
-        {
-            writeln!(output, "Repeated failed rebuild evidence is present; retention does not repair rebuild certification.")?;
+        for warning in &inventory.warnings {
+            writeln!(output, "Warning: {warning:?}")?;
         }
-        writeln!(output, "Read-only inspection. The newest bundle and evidence newer than six hours are retained.")?;
+        if inventory
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.has_evidence && !artifact.interrupted_reclaim)
+            .take(2)
+            .count()
+            > 1
+        {
+            writeln!(
+                output,
+                "Repeated failed rebuild evidence is present; retention does not repair rebuild certification."
+            )?;
+        }
+        writeln!(
+            output,
+            "Read-only inspection. The newest bundle and evidence newer than six hours are retained."
+        )?;
     }
     output.flush()
 }
@@ -107,12 +142,19 @@ pub fn run(args: Vec<String>) -> CliResult<()> {
         Err(error) => {
             let code = error.exit_code();
             error.print().map_err(failure)?;
-            return if code == 0 { Ok(()) } else {
+            return if code == 0 {
+                Ok(())
+            } else {
                 Err(CliError::already_reported(code, "argument_parsing", false))
             };
         }
     };
-    let Command::LexicalQuarantine { data_dir, json, plan, apply } = cli.command;
+    let Command::LexicalQuarantine {
+        data_dir,
+        json,
+        plan,
+        apply,
+    } = cli.command;
     if let Some(approval) = apply {
         return cleanup::apply(&data_dir, &approval, json, &mut io::stdout().lock());
     }
@@ -134,8 +176,14 @@ mod tests {
     #[test]
     fn inspection_requires_explicit_scope_and_has_no_mutating_flags() {
         assert!(Cli::try_parse_from(["cass", "lexical-quarantine"]).is_err());
-        assert!(Cli::try_parse_from(["cass", "lexical-quarantine", "--data-dir", ".", "--apply"]).is_err());
-        assert!(Cli::try_parse_from(["cass", "lexical-quarantine", "--data-dir", ".", "--robot"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["cass", "lexical-quarantine", "--data-dir", ".", "--apply"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["cass", "lexical-quarantine", "--data-dir", ".", "--robot"])
+                .is_ok()
+        );
         let command = Cli::command();
         command.debug_assert();
         assert_eq!(clap_commands()[0].get_name(), "lexical-quarantine");

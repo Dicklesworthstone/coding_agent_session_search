@@ -1,8 +1,8 @@
 //! Real FSVI files exercise payload admission independently of row cardinality.
 //! Every replacement and recovery operation is confined to a fresh tempdir.
 
-use super::*;
 use super::super::{PublicationUnavailable, validate_with};
+use super::*;
 use crate::indexer::semantic::{
     BackfillArtifactReclaimPlan, EmbeddingInput, HASH_VECTOR_SPACE_REVISION,
     SemanticBackfillBatchPlan, SemanticIndexer, apply_backfill_artifact_plan,
@@ -44,7 +44,12 @@ impl Fixture {
         let indexer = SemanticIndexer::new("hash", None)?;
         let mut manifest = SemanticManifest::default();
         let live = indexer
-            .run_backfill_batch(&inputs(), data, &mut manifest, batch(tier, "content-v1:signal"))?
+            .run_backfill_batch(
+                &inputs(),
+                data,
+                &mut manifest,
+                batch(tier, "content-v1:signal"),
+            )?
             .index_path;
         let reader = VectorIndex::open_read_only(&live)?;
         let ids = (0..reader.record_count())
@@ -56,12 +61,22 @@ impl Fixture {
         let reuse = parent.join(".backfill-reuse-Usability123");
         fs::create_dir(&reuse)?;
         fs::copy(&live, reuse.join("candidate.fsvi"))?;
-        Ok(Self { manifest, live, staging, reuse, ids })
+        Ok(Self {
+            manifest,
+            live,
+            staging,
+            reuse,
+            ids,
+        })
     }
 
     fn replace_payload(&self, bad_row: usize, value: f32, append_extra: bool) -> Result<()> {
         let mut writer = VectorIndex::create_with_revision(
-            &self.live, "fnv1a-384", HASH_VECTOR_SPACE_REVISION, 384, Quantization::F16,
+            &self.live,
+            "fnv1a-384",
+            HASH_VECTOR_SPACE_REVISION,
+            384,
+            Quantization::F16,
         )?;
         for (row, id) in self.ids.iter().enumerate() {
             let mut vector = vec![0.0; 384];
@@ -79,19 +94,31 @@ impl Fixture {
 
     fn assert_refused(&self, data: &Path, approved: &BackfillArtifactReclaimPlan) -> Result<()> {
         let paths = [
-            self.live.clone(), self.staging.clone(), self.reuse.join("candidate.fsvi"),
+            self.live.clone(),
+            self.staging.clone(),
+            self.reuse.join("candidate.fsvi"),
             SemanticManifest::path(data),
         ];
-        let before = paths.iter().map(fs::read).collect::<std::io::Result<Vec<_>>>()?;
+        let before = paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
         let wal_before = optional_bytes(&wal_path_for(&self.live))?;
         let mut pins = 0;
         let error = validate_with(data, &self.manifest, |_, _, _, _| {
             pins += 1;
             Ok(())
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(error.is::<PublicationUnavailable>(), "{error:#}");
-        assert!(format!("{error:#}").contains("unusable live vector"), "{error:#}");
-        assert_eq!(pins, 0, "invalid payload must fail before durability admission");
+        assert!(
+            format!("{error:#}").contains("unusable live vector"),
+            "{error:#}"
+        );
+        assert_eq!(
+            pins, 0,
+            "invalid payload must fail before durability admission"
+        );
         for outcome in [
             plan_backfill_artifacts(data).map(|_| ()),
             reclaim_backfill_artifacts(data).map(|_| ()),
@@ -100,14 +127,20 @@ impl Fixture {
             let error = outcome.unwrap_err();
             assert!(error.is::<PublicationUnavailable>(), "{error:#}");
         }
-        let after = paths.iter().map(fs::read).collect::<std::io::Result<Vec<_>>>()?;
+        let after = paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
         assert_eq!(after, before);
         assert_eq!(optional_bytes(&wal_path_for(&self.live))?, wal_before);
         assert!(self.reuse.is_dir());
         let retained = VectorIndex::open_read_only(&self.staging)?;
         assert_eq!(retained.record_count(), 3);
         for row in 0..retained.record_count() {
-            assert!(retained.is_vector_usable(row), "the fallback must really be usable");
+            assert!(
+                retained.is_vector_usable(row),
+                "the fallback must really be usable"
+            );
         }
         Ok(())
     }
@@ -229,7 +262,10 @@ fn explicit_backfill_can_replace_bad_payload_before_reclaiming_fallbacks() -> Re
     fixture.assert_refused(data, &approved)?;
     let indexer = SemanticIndexer::new("hash", None)?;
     let outcome = indexer.run_backfill_batch(
-        &inputs(), data, &mut fixture.manifest, batch(TierKind::Quality, "content-v1:repaired"),
+        &inputs(),
+        data,
+        &mut fixture.manifest,
+        batch(TierKind::Quality, "content-v1:repaired"),
     )?;
     assert!(outcome.published);
     assert!(!fixture.staging.exists() && !fixture.reuse.exists());
@@ -243,8 +279,12 @@ fn explicit_backfill_can_replace_bad_payload_before_reclaiming_fallbacks() -> Re
 fn wal_payload_contract_rejects_zero_nonfinite_overflow_and_wrong_dimensions() {
     assert!(usable_wal_vector(&[1.0, 0.0], 2));
     for values in [
-        vec![], vec![1.0], vec![0.0, 0.0], vec![f32::NAN, 1.0],
-        vec![f32::INFINITY, 0.0], vec![f32::NEG_INFINITY, 0.0],
+        vec![],
+        vec![1.0],
+        vec![0.0, 0.0],
+        vec![f32::NAN, 1.0],
+        vec![f32::INFINITY, 0.0],
+        vec![f32::NEG_INFINITY, 0.0],
         vec![f32::MAX, 1.0],
     ] {
         assert!(!usable_wal_vector(&values, 2), "{values:?}");

@@ -9,10 +9,7 @@ fn gh514_source_scan_watermark_supersedes_older_index_publication() {
         "last_indexed_at": indexed,
         "source_scan_completed_at_ms": scanned,
     });
-    assert_eq!(
-        last_indexed_at_ms_from_freshness(&freshness),
-        Some(scanned)
-    );
+    assert_eq!(last_indexed_at_ms_from_freshness(&freshness), Some(scanned));
 
     let malformed_scan = serde_json::json!({
         "last_indexed_at": indexed,

@@ -31,17 +31,21 @@ const SINCE_SQL: &str = "SELECT id, conversation_id, idx FROM messages
 
 fn select_since(connection: &Connection, since_message_id: i64) -> Result<Selection> {
     let mut high_water = None;
-    connection.query_with_params_for_each(
-        HIGH_WATER_SQL,
-        &[SqliteValue::from(since_message_id)],
-        |row| {
-            let id: i64 = row.get_typed(0)?;
-            if id <= since_message_id || high_water.replace(id).is_some() {
-                return Err(FrankenError::Internal("invalid semantic catch-up high water".into()));
-            }
-            Ok(())
-        },
-    ).context("capture canonical semantic catch-up high water")?;
+    connection
+        .query_with_params_for_each(
+            HIGH_WATER_SQL,
+            &[SqliteValue::from(since_message_id)],
+            |row| {
+                let id: i64 = row.get_typed(0)?;
+                if id <= since_message_id || high_water.replace(id).is_some() {
+                    return Err(FrankenError::Internal(
+                        "invalid semantic catch-up high water".into(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .context("capture canonical semantic catch-up high water")?;
     let Some(high_water) = high_water else {
         return Ok(Selection::new());
     };
@@ -53,33 +57,48 @@ fn select_since_through(
     since_message_id: i64,
     high_water: i64,
 ) -> Result<Selection> {
-    ensure!(high_water > since_message_id, "invalid semantic catch-up range");
+    ensure!(
+        high_water > since_message_id,
+        "invalid semantic catch-up range"
+    );
     let mut selected = Selection::new();
     let mut cursor = since_message_id;
     while cursor < high_water {
         let mut count = 0;
-        connection.query_with_params_for_each(
-            SINCE_SQL,
-            &[SqliteValue::from(cursor), SqliteValue::from(high_water),
-                SqliteValue::from(pages::MAX_ROWS as i64)],
-            |row| {
-                let id: i64 = row.get_typed(0)?;
-                if count >= pages::MAX_ROWS || id <= cursor || id > high_water {
-                    return Err(FrankenError::Internal(
-                        "semantic catch-up identity page did not advance within its range".into(),
-                    ));
-                }
-                let parent: i64 = row.get_typed(1)?;
-                let idx: i64 = row.get_typed(2)?;
-                selected.entry(parent).or_default().push(MessageKey { id, idx });
-                cursor = id;
-                count += 1;
-                Ok(())
-            },
-        ).context("page canonical semantic catch-up identities")?;
+        connection
+            .query_with_params_for_each(
+                SINCE_SQL,
+                &[
+                    SqliteValue::from(cursor),
+                    SqliteValue::from(high_water),
+                    SqliteValue::from(pages::MAX_ROWS as i64),
+                ],
+                |row| {
+                    let id: i64 = row.get_typed(0)?;
+                    if count >= pages::MAX_ROWS || id <= cursor || id > high_water {
+                        return Err(FrankenError::Internal(
+                            "semantic catch-up identity page did not advance within its range"
+                                .into(),
+                        ));
+                    }
+                    let parent: i64 = row.get_typed(1)?;
+                    let idx: i64 = row.get_typed(2)?;
+                    selected
+                        .entry(parent)
+                        .or_default()
+                        .push(MessageKey { id, idx });
+                    cursor = id;
+                    count += 1;
+                    Ok(())
+                },
+            )
+            .context("page canonical semantic catch-up identities")?;
         // The captured endpoint must be observed. A disappearing endpoint
         // cannot turn an incomplete scan into an acknowledged catch-up batch.
-        ensure!(count > 0, "canonical semantic catch-up endpoint disappeared");
+        ensure!(
+            count > 0,
+            "canonical semantic catch-up endpoint disappeared"
+        );
     }
     Ok(selected)
 }
@@ -110,36 +129,44 @@ fn select_ids(
     for chunk in ids.chunks(pages::MAX_ROWS) {
         let params: Vec<_> = chunk.iter().copied().map(SqliteValue::from).collect();
         let mut previous = None;
-        connection.query_with_params_for_each(&selected_sql(chunk.len()), &params, |row| {
-            let id: i64 = row.get_typed(0)?;
-            if chunk.binary_search(&id).is_err()
-                || previous.is_some_and(|previous| id <= previous)
-            {
-                return Err(FrankenError::Internal(
-                    "selected semantic identity query returned an unexpected row".into(),
-                ));
-            }
-            previous = Some(id);
-            let parent: i64 = row.get_typed(1)?;
-            // Do not decode unrelated bodies, or even their order keys. A
-            // caller-supplied message ID is not permission to widen its scope.
-            if allowed.contains(&parent) {
-                selected.entry(parent).or_default().push(MessageKey {
-                    id,
-                    idx: row.get_typed(2)?,
-                });
-            }
-            Ok(())
-        }).context("select canonical semantic refresh identities")?;
+        connection
+            .query_with_params_for_each(&selected_sql(chunk.len()), &params, |row| {
+                let id: i64 = row.get_typed(0)?;
+                if chunk.binary_search(&id).is_err()
+                    || previous.is_some_and(|previous| id <= previous)
+                {
+                    return Err(FrankenError::Internal(
+                        "selected semantic identity query returned an unexpected row".into(),
+                    ));
+                }
+                previous = Some(id);
+                let parent: i64 = row.get_typed(1)?;
+                // Do not decode unrelated bodies, or even their order keys. A
+                // caller-supplied message ID is not permission to widen its scope.
+                if allowed.contains(&parent) {
+                    selected.entry(parent).or_default().push(MessageKey {
+                        id,
+                        idx: row.get_typed(2)?,
+                    });
+                }
+                Ok(())
+            })
+            .context("select canonical semantic refresh identities")?;
     }
     Ok(selected)
 }
 
 fn load_message(connection: &Connection, parent: i64, key: MessageKey) -> Result<Message> {
-    let row = connection.query_row_with_params(
-        BODY_SQL,
-        &[SqliteValue::from(key.id), SqliteValue::from(parent), SqliteValue::from(key.idx)],
-    ).context("load selected canonical semantic message")?;
+    let row = connection
+        .query_row_with_params(
+            BODY_SQL,
+            &[
+                SqliteValue::from(key.id),
+                SqliteValue::from(parent),
+                SqliteValue::from(key.idx),
+            ],
+        )
+        .context("load selected canonical semantic message")?;
     // Share the full replay's role/text decoder. Extra source envelopes and
     // snippets do not enter semantic identity construction.
     Ok(pages::decode(&row)?)
@@ -167,8 +194,10 @@ fn project_selection(
                 // No SQL cursor remains active here. Only this requested
                 // message, not the rest of its conversation, is materialized.
                 let message = load(parent, key)?;
-                ensure!(message.id == Some(key.id) && message.idx == key.idx,
-                    "canonical message identity changed during selected semantic replay");
+                ensure!(
+                    message.id == Some(key.id) && message.idx == key.idx,
+                    "canonical message identity changed during selected semantic replay"
+                );
                 raw_max_message_id = Some(raw_max_message_id.map_or(key.id, |id| id.max(key.id)));
                 inputs.extend(envelope.project(message)?);
             }
@@ -186,9 +215,14 @@ pub(crate) fn packet_embedding_inputs_from_storage_for_message_ids(
     conversation_ids: &[i64],
     message_ids: &HashSet<i64>,
 ) -> Result<Vec<engine::EmbeddingInput>> {
-    if matches!(dotenvy::var("CASS_SEMANTIC_STREAM_REPLAY").as_deref(), Ok("0")) {
+    if matches!(
+        dotenvy::var("CASS_SEMANTIC_STREAM_REPLAY").as_deref(),
+        Ok("0")
+    ) {
         return engine::packet_embedding_inputs_from_storage_for_message_ids(
-            storage, conversation_ids, message_ids,
+            storage,
+            conversation_ids,
+            message_ids,
         );
     }
     let selected = select_ids(storage.raw(), conversation_ids, message_ids)?;
@@ -207,7 +241,10 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
     storage: &FrankenStorage,
     since_message_id: i64,
 ) -> Result<engine::CanonicalIncrementalEmbeddingBatch> {
-    if matches!(dotenvy::var("CASS_SEMANTIC_STREAM_REPLAY").as_deref(), Ok("0")) {
+    if matches!(
+        dotenvy::var("CASS_SEMANTIC_STREAM_REPLAY").as_deref(),
+        Ok("0")
+    ) {
         return engine::packet_embedding_inputs_from_storage_since(storage, since_message_id);
     }
     let selected = select_since(storage.raw(), since_message_id)?;
@@ -223,6 +260,6 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod since_tests;
+#[cfg(test)]
+mod tests;

@@ -37,7 +37,10 @@ fn gh525_filled_message_cap_stops_before_loading_the_next_conversation() -> Resu
     let (selection, grouped) = select_checkpoint_capped_conversations_lazily(
         vec![conversation(1), conversation(2), conversation(3)],
         None,
-        SemanticCheckpointCaps { max_messages: 1, max_bytes: 0 },
+        SemanticCheckpointCaps {
+            max_messages: 1,
+            max_bytes: 0,
+        },
         |id| {
             loaded.push(id);
             Ok(vec![message(id, 4)])
@@ -45,7 +48,14 @@ fn gh525_filled_message_cap_stops_before_loading_the_next_conversation() -> Resu
     )?;
 
     assert_eq!(loaded, vec![1]);
-    assert_eq!(selection.conversations.iter().map(|row| row.conversation_id).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(
+        selection
+            .conversations
+            .iter()
+            .map(|row| row.conversation_id)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
     assert_eq!(selection.last_conversation_id, Some(1));
     assert!(selection.stopped_before_candidate);
     assert_eq!(grouped.keys().copied().collect::<Vec<_>>(), vec![1]);
@@ -58,7 +68,10 @@ fn gh525_filled_byte_cap_stops_before_loading_the_next_conversation() -> Result<
     let (selection, _) = select_checkpoint_capped_conversations_lazily(
         vec![conversation(1), conversation(2), conversation(3)],
         None,
-        SemanticCheckpointCaps { max_messages: 0, max_bytes: 4 },
+        SemanticCheckpointCaps {
+            max_messages: 0,
+            max_bytes: 4,
+        },
         |id| {
             loaded.push(id);
             Ok(vec![message(id, 4)])
@@ -77,7 +90,10 @@ fn gh525_first_oversized_conversation_still_advances_whole() -> Result<()> {
     let (selection, grouped) = select_checkpoint_capped_conversations_lazily(
         vec![conversation(1), conversation(2)],
         None,
-        SemanticCheckpointCaps { max_messages: 1, max_bytes: 1 },
+        SemanticCheckpointCaps {
+            max_messages: 1,
+            max_bytes: 1,
+        },
         |id| {
             loaded.push(id);
             Ok(vec![message(id, 8), message(id + 100, 8)])
@@ -98,7 +114,10 @@ fn gh525_loads_one_more_candidate_only_when_remaining_capacity_requires_its_size
     let (selection, grouped) = select_checkpoint_capped_conversations_lazily(
         vec![conversation(1), conversation(2), conversation(3)],
         None,
-        SemanticCheckpointCaps { max_messages: 3, max_bytes: 0 },
+        SemanticCheckpointCaps {
+            max_messages: 3,
+            max_bytes: 0,
+        },
         |id| {
             loaded.push(id);
             Ok(vec![message(id * 10, 2), message(id * 10 + 1, 2)])
@@ -106,7 +125,14 @@ fn gh525_loads_one_more_candidate_only_when_remaining_capacity_requires_its_size
     )?;
 
     assert_eq!(loaded, vec![1, 2]);
-    assert_eq!(selection.conversations.iter().map(|row| row.conversation_id).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(
+        selection
+            .conversations
+            .iter()
+            .map(|row| row.conversation_id)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
     assert!(selection.stopped_before_candidate);
     assert!(grouped.contains_key(&1));
     assert!(!grouped.contains_key(&2));
@@ -119,7 +145,10 @@ fn gh525_message_cursor_filtering_does_not_advance_on_an_empty_candidate() -> Re
     let (selection, grouped) = select_checkpoint_capped_conversations_lazily(
         vec![conversation(1), conversation(2)],
         Some(10),
-        SemanticCheckpointCaps { max_messages: 1, max_bytes: 0 },
+        SemanticCheckpointCaps {
+            max_messages: 1,
+            max_bytes: 0,
+        },
         |id| {
             loaded.push(id);
             Ok(vec![message(if id == 1 { 10 } else { 11 }, 4)])
@@ -134,5 +163,5 @@ fn gh525_message_cursor_filtering_does_not_advance_on_an_empty_candidate() -> Re
     Ok(())
 }
 
-mod real_storage;
 mod continuation;
+mod real_storage;

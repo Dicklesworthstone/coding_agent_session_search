@@ -112,7 +112,14 @@ fn prepare<'request>(
     validate(&request, &cached)?;
     work.check()?;
     let state = RefillState::new(request.refill);
-    Ok(Continuation { request, cached, work, state, phase: Phase::Initial, ranking: FastTierCache::default() })
+    Ok(Continuation {
+        request,
+        cached,
+        work,
+        state,
+        phase: Phase::Initial,
+        ranking: FastTierCache::default(),
+    })
 }
 
 // Incumbent phase driver retained only for its existing control tests.
@@ -122,7 +129,9 @@ fn phase_batch<B>(
     mut phases: impl Iterator<Item = SemanticReaderResult<B>>,
     phase: Phase,
 ) -> SemanticReaderResult<B> {
-    let initial = phases.next().ok_or(SemanticReaderError::InvalidCandidate)??;
+    let initial = phases
+        .next()
+        .ok_or(SemanticReaderError::InvalidCandidate)??;
     match phase {
         Phase::Initial => Ok(initial),
         Phase::Refined => {
@@ -150,7 +159,8 @@ impl SemanticGenerationReader {
         request: CurrentTextQuery<'call>,
         transaction: &'call Transaction<'_>,
     ) -> Result<
-        impl FusedIterator<Item = Result<CurrentSemanticBatch<SemanticSearchBatch>, CurrentSearchError>> + 'call,
+        impl FusedIterator<Item = Result<CurrentSemanticBatch<SemanticSearchBatch>, CurrentSearchError>>
+        + 'call,
         CurrentSearchError,
     > {
         let continuation = prepare(request, |request, cached| {
@@ -165,10 +175,20 @@ impl SemanticGenerationReader {
         Ok(CurrentStream {
             continuation: Some(continuation),
             transaction,
-            retrieve: move |cached: &CachedProducers<'call>, request: &CurrentTextQuery<'call>, phase, filter: &Excluding<'_>, ranking: &mut FastTierCache| {
+            retrieve: move |cached: &CachedProducers<'call>,
+                            request: &CurrentTextQuery<'call>,
+                            phase,
+                            filter: &Excluding<'_>,
+                            ranking: &mut FastTierCache| {
                 let search = self.activate_text(request.text, cached.producers())?;
-                search.current_phase(ranking, phase == Phase::Refined, request.limit,
-                    filter, request.ann, filter.rejected.len())
+                search.current_phase(
+                    ranking,
+                    phase == Phase::Refined,
+                    request.limit,
+                    filter,
+                    request.ann,
+                    filter.rejected.len(),
+                )
             },
         })
     }
@@ -183,7 +203,9 @@ impl SelectedSemanticGeneration {
         request: CurrentTextQuery<'call>,
         transaction: &'call Transaction<'_>,
     ) -> Result<
-        impl FusedIterator<Item = Result<CurrentSemanticBatch<SelectedSemanticBatch>, CurrentSearchError>> + 'call,
+        impl FusedIterator<
+            Item = Result<CurrentSemanticBatch<SelectedSemanticBatch>, CurrentSearchError>,
+        > + 'call,
         CurrentSearchError,
     > {
         let continuation = prepare(request, |request, cached| {
@@ -198,10 +220,20 @@ impl SelectedSemanticGeneration {
         Ok(CurrentStream {
             continuation: Some(continuation),
             transaction,
-            retrieve: move |cached: &CachedProducers<'call>, request: &CurrentTextQuery<'call>, phase, filter: &Excluding<'_>, ranking: &mut FastTierCache| {
+            retrieve: move |cached: &CachedProducers<'call>,
+                            request: &CurrentTextQuery<'call>,
+                            phase,
+                            filter: &Excluding<'_>,
+                            ranking: &mut FastTierCache| {
                 let search = self.activate_text(request.text, cached.producers())?;
-                let batch = search.search.current_phase(ranking, phase == Phase::Refined,
-                    request.limit, filter, request.ann, filter.rejected.len())?;
+                let batch = search.search.current_phase(
+                    ranking,
+                    phase == Phase::Refined,
+                    request.limit,
+                    filter,
+                    request.ann,
+                    filter.rejected.len(),
+                )?;
                 Ok(search.retain(batch))
             },
         })

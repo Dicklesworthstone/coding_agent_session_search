@@ -18,9 +18,9 @@ use super::protocol::ModelInfo;
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::fastembed_reranker::FastEmbedReranker;
-use crate::search::reranker::{Reranker, RerankerResult, rerank_texts};
 #[cfg(test)]
 use crate::search::reranker::RerankerError;
+use crate::search::reranker::{Reranker, RerankerResult, rerank_texts};
 use frankensearch::ModelCategory;
 use frankensearch::core::EmbeddingIdentityBundleV1;
 use slot::ModelSlot;

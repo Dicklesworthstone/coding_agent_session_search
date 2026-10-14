@@ -15,7 +15,9 @@ pub(super) struct Lease {
 fn regular_lock(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() {
-        return Err(io::Error::other("index-run lock is not a regular non-symlink file"));
+        return Err(io::Error::other(
+            "index-run lock is not a regular non-symlink file",
+        ));
     }
     #[cfg(unix)]
     {
@@ -33,8 +35,8 @@ impl Lease {
         let directory_owner = same_file::Handle::from_path(directory)?;
         let path = directory.join("index-run.lock");
         match regular_lock(&path) {
-            Ok(()) => {},
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         let mut options = OpenOptions::new();
@@ -42,18 +44,25 @@ impl Lease {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).mode(0o600);
+            options
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .mode(0o600);
         }
         let file = options.open(&path)?;
         if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
             return Err(if error.kind() == io::ErrorKind::WouldBlock {
                 CleanupError::Busy
-            } else { error.into() });
+            } else {
+                error.into()
+            });
         }
         let file_owner = same_file::Handle::from_file(file.try_clone()?)?;
         let lease = Self {
-            _file: file, file_owner, directory_owner,
-            directory: directory.to_owned(), path,
+            _file: file,
+            file_owner,
+            directory_owner,
+            directory: directory.to_owned(),
+            path,
         };
         lease.check()?;
         Ok(lease)
@@ -65,7 +74,9 @@ impl Lease {
         if self.directory_owner != same_file::Handle::from_path(&self.directory)?
             || self.file_owner != same_file::Handle::from_path(&self.path)?
         {
-            return Err(io::Error::other("index-run lock or data directory changed identity"));
+            return Err(io::Error::other(
+                "index-run lock or data directory changed identity",
+            ));
         }
         Ok(())
     }

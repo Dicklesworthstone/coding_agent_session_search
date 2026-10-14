@@ -19,7 +19,11 @@ fn append_before_tombstone(path: &Path, repeats: usize) -> Result<()> {
     drop(writer);
     fs::write(path, before)?;
     let reader = VectorIndex::open_read_only(path)?;
-    assert_eq!(reader.wal_record_count(), 1, "native WAL replay deduplicates updates");
+    assert_eq!(
+        reader.wal_record_count(),
+        1,
+        "native WAL replay deduplicates updates"
+    );
     assert!(reader.wal_records().all(|(wal_id, _)| wal_id == id));
     assert!(
         (0..reader.record_count())
@@ -51,12 +55,17 @@ fn overlap_cannot_cover_another_missing_acknowledged_document() -> Result<()> {
             fixture.tombstone(false)?; // Lose one of three acknowledged documents.
             append_before_tombstone(&fixture.checkpoint, repeats)?;
             let index = VectorIndex::open_read_only(&fixture.checkpoint)?;
-            assert_eq!(index.record_count() - index.tombstone_count() + index.wal_record_count(), 3);
+            assert_eq!(
+                index.record_count() - index.tombstone_count() + index.wal_record_count(),
+                3
+            );
             assert_eq!(distinct_ids(&index)?.len(), 2);
             drop(index);
             let error = validate_reclaim_checkpoint(
-                &fixture.checkpoint, fixture.manifest.checkpoint.as_ref().unwrap(),
-            ).unwrap_err();
+                &fixture.checkpoint,
+                fixture.manifest.checkpoint.as_ref().unwrap(),
+            )
+            .unwrap_err();
             assert!(format!("{error:#}").contains("2 distinct live documents"));
             // Covers startup, post-success deferral, explicit recovery, preview,
             // and approved apply, with byte-for-byte and live-search assertions.
@@ -100,9 +109,16 @@ fn healthy_overlap_and_wal_replacement_are_not_blanket_rejected() -> Result<()> 
                 assert_eq!(fs::read(path)?, bytes);
             }
         }
-        assert_eq!(fs::read(&wal)?, wal_before, "reclamation must not compact or repair");
+        assert_eq!(
+            fs::read(&wal)?,
+            wal_before,
+            "reclamation must not compact or repair"
+        );
         assert_eq!(index.search_top_k(&query, 10, None)?, hits);
-        assert_eq!(VectorIndex::open_read_only(&fixture.checkpoint)?.search_top_k(&query, 10, None)?, hits);
+        assert_eq!(
+            VectorIndex::open_read_only(&fixture.checkpoint)?.search_top_k(&query, 10, None)?,
+            hits
+        );
     }
     Ok(())
 }
@@ -114,8 +130,14 @@ fn duplicate_main_slots_cannot_authorize_retiring_fallbacks() -> Result<()> {
     let mut fixture = Fixture::new(data, TierKind::Quality)?;
     let approval = plan_backfill_artifacts(data)?;
     let reader = VectorIndex::open_read_only(&fixture.checkpoint)?;
-    let rows: Vec<_> = [0, 0, 1].into_iter()
-        .map(|row| Ok((reader.doc_id_at(row)?.to_owned(), reader.vector_at_f32(row)?)))
+    let rows: Vec<_> = [0, 0, 1]
+        .into_iter()
+        .map(|row| {
+            Ok((
+                reader.doc_id_at(row)?.to_owned(),
+                reader.vector_at_f32(row)?,
+            ))
+        })
         .collect::<Result<_>>()?;
     drop(reader);
     let mut writer = VectorIndex::create_with_revision(

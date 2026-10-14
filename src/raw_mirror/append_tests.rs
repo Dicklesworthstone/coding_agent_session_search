@@ -22,8 +22,7 @@ fn lines(start: usize, count: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     for sequence in start..start + count {
         let text = blake3::hash(&sequence.to_le_bytes()).to_hex();
-        writeln!(bytes, "{{\"sequence\":{sequence},\"text\":\"{text}\"}}")
-            .expect("fixture JSONL");
+        writeln!(bytes, "{{\"sequence\":{sequence},\"text\":\"{text}\"}}").expect("fixture JSONL");
     }
     bytes
 }
@@ -37,13 +36,22 @@ fn read_capture(data: &Path, record: &RawMirrorCaptureRecord) -> Vec<u8> {
     let content = match manifest.get("content_storage") {
         Some(storage) if !storage.is_null() => {
             let descriptor = fs::read(root.join(&record.blob_relative_path)).unwrap();
-            assert_eq!(blake3::hash(&descriptor).to_hex().as_str(), record.blob_blake3);
-            assert_eq!(serde_json::from_slice::<Value>(&descriptor).unwrap(), *storage);
+            assert_eq!(
+                blake3::hash(&descriptor).to_hex().as_str(),
+                record.blob_blake3
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&descriptor).unwrap(),
+                *storage
+            );
             let mut content = Vec::new();
             for chunk in storage["chunks"].as_array().unwrap() {
                 let bytes = fs::read(root.join(chunk["blob_relative_path"].as_str().unwrap()))
                     .expect("chunk must survive subsequent captures");
-                assert_eq!(bytes.len() as u64, chunk["blob_size_bytes"].as_u64().unwrap());
+                assert_eq!(
+                    bytes.len() as u64,
+                    chunk["blob_size_bytes"].as_u64().unwrap()
+                );
                 assert_eq!(
                     blake3::hash(&bytes).to_hex().as_str(),
                     chunk["blob_blake3"].as_str().unwrap()
@@ -55,7 +63,10 @@ fn read_capture(data: &Path, record: &RawMirrorCaptureRecord) -> Vec<u8> {
         _ => fs::read(root.join(&record.blob_relative_path)).unwrap(),
     };
     assert_eq!(content.len() as u64, record.source_size_bytes);
-    assert_eq!(blake3::hash(&content).to_hex().as_str(), record.source_content_blake3);
+    assert_eq!(
+        blake3::hash(&content).to_hex().as_str(),
+        record.source_content_blake3
+    );
     content
 }
 
@@ -73,8 +84,12 @@ fn gh522_frequent_appends_bound_tail_amplification_and_preserve_every_capture() 
         for cycle in 0..32 {
             if cycle > 0 {
                 let appended = lines(initial_lines + (cycle - 1) * 101, 101);
-                OpenOptions::new().append(true).open(&source).unwrap()
-                    .write_all(&appended).unwrap();
+                OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .unwrap()
+                    .write_all(&appended)
+                    .unwrap();
                 content.extend(appended);
             }
             let capture = capture_source_file(input(&data, &source)).unwrap();
@@ -93,8 +108,8 @@ fn gh522_frequent_appends_bound_tail_amplification_and_preserve_every_capture() 
         // One final transcript, at most one obsolete partial tail per prior
         // capture, and the measured descriptor overhead -- not N transcripts.
         assert!(
-            summary.total_blob_bytes <= content.len() as u64
-                + 31 * TRANSCRIPT_CHUNK_BYTES as u64 + descriptor_bytes,
+            summary.total_blob_bytes
+                <= content.len() as u64 + 31 * TRANSCRIPT_CHUNK_BYTES as u64 + descriptor_bytes,
             "unexpected amplification: {summary:?}"
         );
         for capture in captures {
@@ -138,5 +153,10 @@ fn gh522_non_transcript_policy_and_old_whole_captures_remain_readable() {
     assert_eq!(read_capture(&data, &chunked), content);
     let container = dir.path().join("session.json");
     fs::write(&container, &content).unwrap();
-    assert_eq!(capture_source_file(input(&data, &container)).unwrap().storage_kind, "whole_blob_v1");
+    assert_eq!(
+        capture_source_file(input(&data, &container))
+            .unwrap()
+            .storage_kind,
+        "whole_blob_v1"
+    );
 }

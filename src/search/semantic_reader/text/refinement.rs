@@ -42,18 +42,21 @@ impl Entry {
         policy: Option<AnnSearchPolicy>,
         exclusion_revision: usize,
     ) -> bool {
-        let same_tier = |left: &Option<Arc<AdmittedTier>>, right: &Option<Arc<AdmittedTier>>| {
-            match (left, right) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
-            }
+        let same_tier = |left: &Option<Arc<AdmittedTier>>, right: &Option<Arc<AdmittedTier>>| match (
+            left, right,
+        ) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
         };
         self.exclusion_revision == exclusion_revision
             && self.k == k
             && self.policy == policy_key(policy)
             && self.text == search.text
-            && search.fast.as_ref().is_some_and(|fast| fast.identity == self.producer)
+            && search
+                .fast
+                .as_ref()
+                .is_some_and(|fast| fast.identity == self.producer)
             && self.reader.generation == search.reader.generation
             && same_tier(&self.reader.fast, &search.reader.fast)
             && same_tier(&self.reader.quality, &search.reader.quality)
@@ -71,10 +74,19 @@ fn rank_evidence_batch(
     fast: Option<TierResult>,
     quality: Option<TierResult>,
 ) -> SemanticReaderResult<SemanticSearchBatch> {
-    let evidence_limit = fast.as_ref().map_or(0, |tier| tier.candidates.len())
+    let evidence_limit = fast
+        .as_ref()
+        .map_or(0, |tier| tier.candidates.len())
         .checked_add(quality.as_ref().map_or(0, |tier| tier.candidates.len()))
         .ok_or(SemanticReaderError::CountOverflow)?;
-    Ok(make_batch(search.reader, search.topology, phase, fast, quality, evidence_limit))
+    Ok(make_batch(
+        search.reader,
+        search.topology,
+        phase,
+        fast,
+        quality,
+        evidence_limit,
+    ))
 }
 
 impl TextSemanticSearch<'_, '_> {
@@ -117,25 +129,35 @@ impl TextSemanticSearch<'_, '_> {
             policy.validate()?;
         }
         self.revalidate()?;
-        let reusable = refined && cache.entry.as_ref().is_some_and(|entry| {
-            entry.matches(self, k, policy, exclusion_revision)
-        });
+        let reusable = refined
+            && cache
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.matches(self, k, policy, exclusion_revision));
         let fast = if reusable {
-            let entry = cache.entry.as_ref().ok_or(SemanticReaderError::InvalidCandidate)?;
+            let entry = cache
+                .entry
+                .as_ref()
+                .ok_or(SemanticReaderError::InvalidCandidate)?;
             cache.reuses = cache.reuses.saturating_add(1);
             entry.result.clone()
         } else {
             // Release old candidates BEFORE the replacement scan. Only the
             // existing reader's shared image owners remain, never another slab.
             cache.entry = None;
-            let fast = self.search_tier(TierKind::Fast, k, Some(filter), policy)?
+            let fast = self
+                .search_tier(TierKind::Fast, k, Some(filter), policy)?
                 .ok_or(SemanticReaderError::MissingTier(TierKind::Fast))?;
             self.revalidate()?;
             cache.entry = Some(Entry {
                 reader: self.reader.clone(),
                 text: self.text.to_owned(),
-                producer: self.fast.as_ref()
-                    .ok_or(SemanticReaderError::MissingTier(TierKind::Fast))?.identity.clone(),
+                producer: self
+                    .fast
+                    .as_ref()
+                    .ok_or(SemanticReaderError::MissingTier(TierKind::Fast))?
+                    .identity
+                    .clone(),
                 k,
                 policy: policy_key(policy),
                 exclusion_revision,
@@ -144,15 +166,21 @@ impl TextSemanticSearch<'_, '_> {
             fast
         };
         let quality = if refined {
-            Some(self.search_tier(TierKind::Quality, k, Some(filter), policy)?
-                .ok_or(SemanticReaderError::MissingTier(TierKind::Quality))?)
+            Some(
+                self.search_tier(TierKind::Quality, k, Some(filter), policy)?
+                    .ok_or(SemanticReaderError::MissingTier(TierKind::Quality))?,
+            )
         } else {
             None
         };
         self.revalidate()?;
         rank_evidence_batch(
             self,
-            if refined { SemanticResultPhase::Refined } else { SemanticResultPhase::Initial },
+            if refined {
+                SemanticResultPhase::Refined
+            } else {
+                SemanticResultPhase::Initial
+            },
             Some(fast),
             quality,
         )

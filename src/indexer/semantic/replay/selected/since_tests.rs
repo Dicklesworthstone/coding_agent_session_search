@@ -1,7 +1,7 @@
 //! Catch-up exercises the actual selector, body loader, packet projection and
 //! facade API. The legacy engine supplies the independent output oracle.
-use super::*;
 use super::tests::{coordinates, fixture, signature};
+use super::*;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue};
 
 #[test]
@@ -12,15 +12,21 @@ fn catch_up_matches_incumbent_in_parent_order_not_message_id_order() -> Result<(
     let since = rows[20].0;
     // Ordering keys may be unrelated to global IDs, including on an older
     // parent receiving a newer append. Neither order is a safe ID cursor.
-    storage.raw().execute("UPDATE messages SET idx = 1000000 - idx")?;
+    storage
+        .raw()
+        .execute("UPDATE messages SET idx = 1000000 - idx")?;
     storage.raw().execute_compat(
         "INSERT INTO messages(conversation_id, idx, role, content, created_at)
          VALUES (?1, 1000, 'assistant', 'new append to an older parent', 1)",
         &[ParamValue::from(rows[0].1)],
     )?;
     let expected = engine::packet_embedding_inputs_from_storage_since(&storage, since)?;
-    let actual = crate::indexer::semantic::packet_embedding_inputs_from_storage_since(&storage, since)?;
-    assert_eq!(actual.conversations_in_batch, expected.conversations_in_batch);
+    let actual =
+        crate::indexer::semantic::packet_embedding_inputs_from_storage_since(&storage, since)?;
+    assert_eq!(
+        actual.conversations_in_batch,
+        expected.conversations_in_batch
+    );
     assert_eq!(actual.raw_max_message_id, expected.raw_max_message_id);
     assert_eq!(signature(actual.inputs), signature(expected.inputs));
     let selected = select_since(storage.raw(), since)?;
@@ -29,8 +35,14 @@ fn catch_up_matches_incumbent_in_parent_order_not_message_id_order() -> Result<(
         loaded.push((key.id, parent, key.idx));
         load_message(storage.raw(), parent, key)
     })?;
-    let expected: Vec<_> = coordinates(&storage)?.into_iter().filter(|row| row.0 > since).collect();
-    assert_eq!(loaded, expected, "every changed body is loaded once, and no old body is loaded");
+    let expected: Vec<_> = coordinates(&storage)?
+        .into_iter()
+        .filter(|row| row.0 > since)
+        .collect();
+    assert_eq!(
+        loaded, expected,
+        "every changed body is loaded once, and no old body is loaded"
+    );
     storage.close()?;
     Ok(())
 }
@@ -46,7 +58,8 @@ fn catch_up_ignores_malformed_old_history_but_never_malformed_new_rows() -> Resu
         &[ParamValue::from(rows[0].0)],
     )?;
     assert!(engine::packet_embedding_inputs_from_storage_since(&storage, since).is_err());
-    let actual = crate::indexer::semantic::packet_embedding_inputs_from_storage_since(&storage, since)?;
+    let actual =
+        crate::indexer::semantic::packet_embedding_inputs_from_storage_since(&storage, since)?;
     assert_eq!(actual.inputs.len(), 1);
     assert_eq!(actual.inputs[0].message_id, rows.last().unwrap().0 as u64);
     assert_eq!(actual.raw_max_message_id, Some(rows.last().unwrap().0));
@@ -119,22 +132,33 @@ fn fixed_high_water_defers_a_later_append_without_losing_it() -> Result<()> {
 #[test]
 fn catch_up_identity_pages_handle_signed_keys_and_i64_max_without_overflow() -> Result<()> {
     let connection = Connection::open(":memory:")?;
-    connection.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER)")?;
+    connection.execute(
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER)",
+    )?;
     let ids = [i64::MIN, -9, 0, 3, i64::MAX];
     for (ordinal, id) in ids.into_iter().enumerate() {
         connection.execute_compat(
             "INSERT INTO messages VALUES (?1, ?2, ?3)",
-            &[ParamValue::from(id), ParamValue::from(ordinal as i64 - 2), ParamValue::from(-1i64)],
+            &[
+                ParamValue::from(id),
+                ParamValue::from(ordinal as i64 - 2),
+                ParamValue::from(-1i64),
+            ],
         )?;
     }
     for since in [i64::MIN, -10, -1, 0, 3, i64::MAX] {
         let selected = select_since(&connection, since)?;
         let mut found: Vec<_> = selected.values().flatten().map(|key| key.id).collect();
         found.sort_unstable();
-        assert_eq!(found, ids.into_iter().filter(|id| *id > since).collect::<Vec<_>>());
+        assert_eq!(
+            found,
+            ids.into_iter().filter(|id| *id > since).collect::<Vec<_>>()
+        );
     }
-    assert!(select_since_through(&connection, 0, 4).is_err(),
-        "a disappearing captured endpoint must not certify a partial range");
+    assert!(
+        select_since_through(&connection, 0, 4).is_err(),
+        "a disappearing captured endpoint must not certify a partial range"
+    );
     connection.close_without_checkpoint()?;
     Ok(())
 }
@@ -149,10 +173,13 @@ fn catch_up_missing_parent_rejects_the_batch_before_returning_cursor_progress() 
     let keys: Vec<_> = selected.into_values().flatten().collect();
     let selected = Selection::from([(i64::MAX, keys)]);
     let mut loads = 0;
-    assert!(project_selection(&storage, selected, |parent, key| {
-        loads += 1;
-        load_message(storage.raw(), parent, key)
-    }).is_err());
+    assert!(
+        project_selection(&storage, selected, |parent, key| {
+            loads += 1;
+            load_message(storage.raw(), parent, key)
+        })
+        .is_err()
+    );
     assert_eq!(loads, 0);
     storage.close()?;
     Ok(())

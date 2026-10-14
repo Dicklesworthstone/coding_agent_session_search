@@ -16,7 +16,11 @@ fn seed(data: &Path) -> Result<()> {
     let relative = "vector_index/.staging-fast-fnv1a-384-11111111.fsvi";
     let live = data.join(relative);
     let mut writer = VectorIndex::create_with_revision(
-        &live, "fnv1a-384", "preview-fixture", 4, Quantization::F16,
+        &live,
+        "fnv1a-384",
+        "preview-fixture",
+        4,
+        Quantization::F16,
     )?;
     writer.write_record("retained-document", &[1.0, 0.0, 0.0, 0.0])?;
     writer.finish()?;
@@ -38,7 +42,10 @@ fn seed(data: &Path) -> Result<()> {
         ready: false,
     });
     manifest.save(data)?;
-    fs::write(root.join(".staging-quality-minilm-384-22222222.fsvi"), b"scratch")?;
+    fs::write(
+        root.join(".staging-quality-minilm-384-22222222.fsvi"),
+        b"scratch",
+    )?;
     let reuse = root.join(".backfill-reuse-Preview123");
     fs::create_dir(&reuse)?;
     fs::write(reuse.join("candidate.fsvi"), b"copy")?;
@@ -69,7 +76,11 @@ fn files(data: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
 }
 
 fn result(output: Output) -> Result<Value> {
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
     Ok(serde_json::from_slice(&output.stdout)?)
 }
@@ -80,11 +91,20 @@ fn both_executables_preview_the_same_inventory_and_preserve_owned_bytes() -> Res
     let data = temp.path().join("archive with spaces");
     seed(&data)?;
     let before = files(&data)?;
-    let companion = result(Command::new(env!("CARGO_BIN_EXE_cass-semantic-reclaim"))
-        .arg("--data-dir").arg(&data).arg("--json").output()?)?;
-    let shipped = result(Command::new(env!("CARGO_BIN_EXE_cass"))
-        .args(["semantic-reclaim", "--data-dir"]).arg(&data)
-        .args(["--json", "--dry-run"]).output()?)?;
+    let companion = result(
+        Command::new(env!("CARGO_BIN_EXE_cass-semantic-reclaim"))
+            .arg("--data-dir")
+            .arg(&data)
+            .arg("--json")
+            .output()?,
+    )?;
+    let shipped = result(
+        Command::new(env!("CARGO_BIN_EXE_cass"))
+            .args(["semantic-reclaim", "--data-dir"])
+            .arg(&data)
+            .args(["--json", "--dry-run"])
+            .output()?,
+    )?;
     assert_eq!(shipped, companion);
     assert_eq!(shipped["operation"], "preview");
     assert_eq!(shipped["plan"]["reclaimable_files"], 1);
@@ -102,10 +122,14 @@ fn prefix_options_do_not_select_the_environment_default_archive() -> Result<()> 
     let unselected = temp.path().join("unselected");
     seed(&data)?;
     let before = files(&data)?;
-    let plan = result(Command::new(env!("CARGO_BIN_EXE_cass"))
-        .env("CASS_DATA_DIR", &unselected)
-        .arg("--data-dir").arg(&data)
-        .args(["--robot", "semantic-reclaim", "--dry-run"]).output()?)?;
+    let plan = result(
+        Command::new(env!("CARGO_BIN_EXE_cass"))
+            .env("CASS_DATA_DIR", &unselected)
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["--robot", "semantic-reclaim", "--dry-run"])
+            .output()?,
+    )?;
     assert_eq!(plan["plan"]["reclaimable_bytes"], 11);
     assert_eq!(files(&data)?, before);
     assert!(!unselected.exists());
@@ -119,7 +143,9 @@ fn missing_archive_argument_and_unknown_flags_are_usage_errors_without_io() -> R
     for extra in [vec![], vec!["--force"], vec!["--apply"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_cass"))
             .env("CASS_DATA_DIR", &absent)
-            .args(["semantic-reclaim", "--json"]).args(extra).output()?;
+            .args(["semantic-reclaim", "--json"])
+            .args(extra)
+            .output()?;
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         let error: Value = serde_json::from_slice(&output.stderr)?;
@@ -131,12 +157,24 @@ fn missing_archive_argument_and_unknown_flags_are_usage_errors_without_io() -> R
 
 #[test]
 fn root_and_subcommand_help_discover_the_recovery_options() -> Result<()> {
-    let output = Command::new(env!("CARGO_BIN_EXE_cass")).arg("--help").output()?;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new(env!("CARGO_BIN_EXE_cass"))
+        .arg("--help")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("semantic-reclaim"));
     for args in [["semantic-reclaim", "--help"], ["help", "semantic-reclaim"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cass")).args(args).output()?;
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let output = Command::new(env!("CARGO_BIN_EXE_cass"))
+            .args(args)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(output.stderr.is_empty());
         let help = String::from_utf8_lossy(&output.stdout);
         assert!(help.contains("--data-dir") && help.contains("--plan-fingerprint"));

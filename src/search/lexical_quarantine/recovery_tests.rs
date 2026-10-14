@@ -56,8 +56,15 @@ fn sole_interrupted_bundle_is_retained_across_repeated_sweeps() {
     let now = old_now();
     for _ in 0..3 {
         let inventory = scan(root.path(), now);
-        assert_eq!(inventory.artifacts[0].disposition, Disposition::RetainNewest);
-        assert!(inventory.artifacts[0].reason.contains("interrupted cleanup"));
+        assert_eq!(
+            inventory.artifacts[0].disposition,
+            Disposition::RetainNewest
+        );
+        assert!(
+            inventory.artifacts[0]
+                .reason
+                .contains("interrupted cleanup")
+        );
         assert_eq!(inventory.eligible_bytes, 0);
         assert_eq!(execute_selection(root.path(), now), 0);
         assert_eq!(
@@ -89,8 +96,11 @@ fn pending_only_sweep_reclaims_older_bundles_but_keeps_one_survivor() {
     }
     let now = old_now();
     let inventory = scan(root.path(), now);
-    let survivors: Vec<_> = inventory.artifacts.iter()
-        .filter(|a| a.disposition == Disposition::RetainNewest).collect();
+    let survivors: Vec<_> = inventory
+        .artifacts
+        .iter()
+        .filter(|a| a.disposition == Disposition::RetainNewest)
+        .collect();
     assert_eq!(survivors.len(), 1);
     let survivor = survivors[0].path.clone();
     assert_eq!(execute_selection(root.path(), now), 2);
@@ -109,7 +119,10 @@ fn fresh_ordinary_evidence_releases_the_pending_survivor() {
     let ordinary = ordinary(root.path(), "000002");
     assert_eq!(execute_selection(root.path(), old_now()), 1);
     assert!(!pending.exists());
-    assert_eq!(fs::read(ordinary.join("index/MANIFEST")).unwrap(), b"ordinary evidence");
+    assert_eq!(
+        fs::read(ordinary.join("index/MANIFEST")).unwrap(),
+        b"ordinary evidence"
+    );
 }
 
 #[test]
@@ -130,7 +143,11 @@ fn checkpoint_only_interrupted_evidence_is_a_survivor() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join(format!("{RECLAIM_PREFIX}000001"));
     fs::create_dir_all(path.join("quarantine")).unwrap();
-    fs::write(path.join("quarantine").join(CHECKPOINT), b"incomplete checkpoint").unwrap();
+    fs::write(
+        path.join("quarantine").join(CHECKPOINT),
+        b"incomplete checkpoint",
+    )
+    .unwrap();
     assert_eq!(execute_selection(root.path(), old_now()), 0);
     assert_eq!(
         fs::read(path.join("quarantine").join(CHECKPOINT)).unwrap(),
@@ -147,6 +164,11 @@ fn unknown_interrupted_contents_disable_the_entire_selection() {
     let inventory = inspect_at(root.path(), old_now(), true, Limits::default()).unwrap();
     assert!(!inventory.complete);
     assert_eq!(inventory.eligible_bytes, 0);
-    assert!(inventory.artifacts.iter().all(|a| a.disposition == Disposition::Inspect));
+    assert!(
+        inventory
+            .artifacts
+            .iter()
+            .all(|a| a.disposition == Disposition::Inspect)
+    );
     assert_eq!(fs::read(path.join("operator-notes")).unwrap(), b"retain");
 }

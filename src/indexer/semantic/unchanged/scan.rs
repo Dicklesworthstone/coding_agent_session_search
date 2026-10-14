@@ -16,8 +16,7 @@ const PARENT_PAGE_SIZE: usize = 128;
 #[cfg(test)]
 const FIRST_PARENTS: &str = "SELECT id FROM conversations ORDER BY id ASC LIMIT ?1";
 #[cfg(test)]
-const NEXT_PARENTS: &str =
-    "SELECT id FROM conversations WHERE id > ?1 ORDER BY id ASC LIMIT ?2";
+const NEXT_PARENTS: &str = "SELECT id FROM conversations WHERE id > ?1 ORDER BY id ASC LIMIT ?2";
 #[cfg(test)]
 const INDEXED_MESSAGE: &str = "SELECT 1 FROM messages INDEXED BY sqlite_autoindex_messages_1
     WHERE conversation_id = ?1 LIMIT 1";
@@ -62,28 +61,34 @@ pub(super) fn compare_with_coverage(
 ) -> Result<(Comparison, Option<Coverage>)> {
     check_cancelled()?;
     let mut visited = 0u64;
-    let replay = replay::visit(storage, |input| {
-        if let Some(id) = engine::semantic_doc_id_for_input(&input) {
-            visited = visited.checked_add(1).context("semantic replay count overflow")?;
-            // Removing instead of looking up also refuses duplicate canonical
-            // identities. Lazy replay stops before loading another conversation
-            // when this callback detects a delta.
-            if !remaining.remove(id.as_str()) {
-                return Err(CanonicalDelta.into());
+    let replay = replay::visit(
+        storage,
+        |input| {
+            if let Some(id) = engine::semantic_doc_id_for_input(&input) {
+                visited = visited
+                    .checked_add(1)
+                    .context("semantic replay count overflow")?;
+                // Removing instead of looking up also refuses duplicate canonical
+                // identities. Lazy replay stops before loading another conversation
+                // when this callback detects a delta.
+                if !remaining.remove(id.as_str()) {
+                    return Err(CanonicalDelta.into());
+                }
+                if visited.is_multiple_of(1024) {
+                    sink.emit(
+                        SemanticProgressEvent::PacketReplayProgress,
+                        SemanticProgressFields {
+                            rows_processed: Some(visited),
+                            rows_total: Some(rows_total),
+                            ..Default::default()
+                        },
+                    );
+                }
             }
-            if visited.is_multiple_of(1024) {
-                sink.emit(
-                    SemanticProgressEvent::PacketReplayProgress,
-                    SemanticProgressFields {
-                        rows_processed: Some(visited),
-                        rows_total: Some(rows_total),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
-        Ok(())
-    }, &mut check_cancelled);
+            Ok(())
+        },
+        &mut check_cancelled,
+    );
     // Partial scans cannot supply coverage. Even a complete replay with
     // leftover retained IDs is a mismatch, not a count receipt for a no-op.
     let coverage = match replay {
@@ -93,7 +98,13 @@ pub(super) fn compare_with_coverage(
         Err(error) => return Err(error),
     };
     check_cancelled()?;
-    Ok((Comparison { matches: coverage.is_some(), visited }, coverage))
+    Ok((
+        Comparison {
+            matches: coverage.is_some(),
+            visited,
+        },
+        coverage,
+    ))
 }
 
 /// Match COUNT(nonempty parents), COALESCE(MAX(nonempty parent id), 0)
@@ -119,10 +130,16 @@ pub(super) fn nonempty_conversations(
         // not disappear from a coverage proof. Subsequent pages do not add to
         // the cursor, so i64::MAX is safe too.
         let (sql, params) = match cursor {
-            None => (FIRST_PARENTS, vec![SqliteValue::from(PARENT_PAGE_SIZE as i64)]),
+            None => (
+                FIRST_PARENTS,
+                vec![SqliteValue::from(PARENT_PAGE_SIZE as i64)],
+            ),
             Some(id) => (
                 NEXT_PARENTS,
-                vec![SqliteValue::from(id), SqliteValue::from(PARENT_PAGE_SIZE as i64)],
+                vec![
+                    SqliteValue::from(id),
+                    SqliteValue::from(PARENT_PAGE_SIZE as i64),
+                ],
             ),
         };
         let mut parents = Vec::with_capacity(PARENT_PAGE_SIZE);
@@ -140,7 +157,11 @@ pub(super) fn nonempty_conversations(
             let params = [SqliteValue::from(id)];
             let mut present = false;
             let result = connection.query_with_params_for_each(
-                if indexed { INDEXED_MESSAGE } else { LEGACY_MESSAGE },
+                if indexed {
+                    INDEXED_MESSAGE
+                } else {
+                    LEGACY_MESSAGE
+                },
                 &params,
                 |_| {
                     present = true;
@@ -149,7 +170,9 @@ pub(super) fn nonempty_conversations(
             );
             if let Err(error) = result {
                 if !indexed
-                    || !error.to_string().contains("no such index: sqlite_autoindex_messages_1")
+                    || !error
+                        .to_string()
+                        .contains("no such index: sqlite_autoindex_messages_1")
                 {
                     return Err(error).context("probe canonical messages for unchanged coverage");
                 }
@@ -166,7 +189,9 @@ pub(super) fn nonempty_conversations(
                     .context("probe legacy messages for unchanged coverage")?;
             }
             if present {
-                conversations = conversations.checked_add(1).context("parent count overflow")?;
+                conversations = conversations
+                    .checked_add(1)
+                    .context("parent count overflow")?;
                 last_nonempty = id;
             }
         }

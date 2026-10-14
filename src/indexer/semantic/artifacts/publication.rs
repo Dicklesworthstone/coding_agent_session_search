@@ -80,8 +80,7 @@ fn validate_with(
         .filter(|artifact| artifact.ready)
     {
         let path = data_dir.join(&artifact.index_path);
-        validate_one(&path, artifact, &mut pin)
-            .with_context(|| PublicationUnavailable { path })?;
+        validate_one(&path, artifact, &mut pin).with_context(|| PublicationUnavailable { path })?;
     }
     Ok(())
 }
@@ -172,7 +171,9 @@ fn sync_reference_parent(path: &Path) -> Result<()> {
     // A manifest may intentionally alias a staging-looking file. Keep both
     // names protected and sync the real file's directory as well as the alias.
     let resolved = path.canonicalize()?;
-    let real_parent = resolved.parent().context("resolved vector has no directory")?;
+    let real_parent = resolved
+        .parent()
+        .context("resolved vector has no directory")?;
     if real_parent != parent {
         sync_directory(real_parent)?;
     }

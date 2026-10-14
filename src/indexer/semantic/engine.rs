@@ -49,11 +49,11 @@ use crate::storage::sqlite::FrankenStorage;
 mod replay_cache;
 
 #[cfg(test)]
+mod gh525_tests;
+#[cfg(test)]
 mod shard_publication_tests;
 #[cfg(test)]
 mod snapshot_tests;
-#[cfg(test)]
-mod gh525_tests;
 
 /// Default embedder batch size — the **maximum row count** per embed batch.
 /// 128 is a sweet spot for short messages: big enough to amortize dispatch
@@ -1760,11 +1760,8 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
         after_message_id,
         caps,
         |conversation_id| {
-            let mut loaded = storage.fetch_messages_for_lexical_rebuild_batch(
-                &[conversation_id],
-                None,
-                None,
-            )?;
+            let mut loaded =
+                storage.fetch_messages_for_lexical_rebuild_batch(&[conversation_id], None, None)?;
             Ok(loaded.remove(&conversation_id).unwrap_or_default())
         },
     )?;
@@ -1827,9 +1824,8 @@ where
         let message_cap_full = caps.message_limited()
             && !selected.is_empty()
             && selected_messages >= caps.max_messages;
-        let byte_cap_full = caps.byte_limited()
-            && !selected.is_empty()
-            && selected_bytes >= caps.max_bytes;
+        let byte_cap_full =
+            caps.byte_limited() && !selected.is_empty() && selected_bytes >= caps.max_bytes;
         if message_cap_full || byte_cap_full {
             stopped_before_candidate = true;
             break;
@@ -3950,9 +3946,9 @@ impl SemanticIndexer {
                 ..Default::default()
             },
         );
-        let (selection, replay_proof) = self.replay_cache.select(
-            self, storage, &plan, &existing_ids, caps, sink,
-        )?;
+        let (selection, replay_proof) =
+            self.replay_cache
+                .select(self, storage, &plan, &existing_ids, caps, sink)?;
         let replay_cache::ReconcileSelection {
             current_ids,
             selected_ids,

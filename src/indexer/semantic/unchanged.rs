@@ -147,9 +147,10 @@ where
             ..Default::default()
         },
     );
-    let (comparison, coverage) = scan::compare_with_coverage(storage, &mut remaining, sink, artifact.doc_count, || {
-        engine.check_external_cancelled()
-    })?;
+    let (comparison, coverage) =
+        scan::compare_with_coverage(storage, &mut remaining, sink, artifact.doc_count, || {
+            engine.check_external_cancelled()
+        })?;
     tracing::debug!(
         visited = comparison.visited,
         matches = comparison.matches,

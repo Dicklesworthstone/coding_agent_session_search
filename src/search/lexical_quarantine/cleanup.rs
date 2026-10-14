@@ -73,7 +73,9 @@ fn check_roots(owners: &[(PathBuf, same_file::Handle)]) -> io::Result<()> {
     for (path, owner) in owners {
         real_directory(path)?;
         if *owner != same_file::Handle::from_path(path)? {
-            return Err(io::Error::other("quarantine root changed during cleanup planning"));
+            return Err(io::Error::other(
+                "quarantine root changed during cleanup planning",
+            ));
         }
     }
     Ok(())
@@ -82,8 +84,9 @@ fn check_roots(owners: &[(PathBuf, same_file::Handle)]) -> io::Result<()> {
 fn seal(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> io::Result<SealedPlan> {
     let data_dir = absolute_directory(data_dir)?;
     let paths = roots(&data_dir)?;
-    let owners = paths.iter().map(|path|
-        Ok((path.clone(), same_file::Handle::from_path(path)?)))
+    let owners = paths
+        .iter()
+        .map(|path| Ok((path.clone(), same_file::Handle::from_path(path)?)))
         .collect::<io::Result<Vec<_>>>()?;
     let mut hash = blake3::Hasher::new();
     field(&mut hash, APPROVAL_PREFIX.as_bytes());
@@ -103,7 +106,9 @@ fn seal(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> io::
     }
     let inventory = inspect_at(&data_dir, now, enabled, limits)?;
     if paths != roots(&data_dir)? {
-        return Err(io::Error::other("quarantine root set changed during cleanup planning"));
+        return Err(io::Error::other(
+            "quarantine root set changed during cleanup planning",
+        ));
     }
     check_roots(&owners)?;
     let approval_fingerprint = if inventory.complete && enabled {
@@ -113,20 +118,39 @@ fn seal(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> io::
         hash.update(&(inventory.artifacts.len() as u64).to_le_bytes());
         for artifact in &inventory.artifacts {
             field(&mut hash, artifact.path.as_os_str().as_encoded_bytes());
-            field(&mut hash, artifact.metadata_fingerprint.as_deref()
-                .ok_or_else(|| io::Error::other("complete inventory lacks a metadata fingerprint"))?.as_bytes());
+            field(
+                &mut hash,
+                artifact
+                    .metadata_fingerprint
+                    .as_deref()
+                    .ok_or_else(|| {
+                        io::Error::other("complete inventory lacks a metadata fingerprint")
+                    })?
+                    .as_bytes(),
+            );
             hash.update(&artifact.size_bytes.to_le_bytes());
-            hash.update(&[u8::from(artifact.interrupted_reclaim), u8::from(artifact.has_evidence)]);
+            hash.update(&[
+                u8::from(artifact.interrupted_reclaim),
+                u8::from(artifact.has_evidence),
+            ]);
             // Commit the decision, not elapsed age. Waiting a second preserves
             // approval; crossing the retention threshold changes the decision.
-            field(&mut hash, &serde_json::to_vec(&artifact.disposition).map_err(io::Error::other)?);
+            field(
+                &mut hash,
+                &serde_json::to_vec(&artifact.disposition).map_err(io::Error::other)?,
+            );
         }
         Some(format!("{APPROVAL_PREFIX}{}", hash.finalize().to_hex()))
     } else {
         None
     };
     Ok(SealedPlan {
-        view: CleanupPlan { schema_version: 1, data_dir, approval_fingerprint, inventory },
+        view: CleanupPlan {
+            schema_version: 1,
+            data_dir,
+            approval_fingerprint,
+            inventory,
+        },
         roots: owners,
     })
 }
@@ -134,19 +158,38 @@ fn seal(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> io::
 /// Read-only preview, including on an unreadable archive. Does not create or
 /// acquire a lock. Incomplete/disabled previews carry no approval fingerprint.
 pub fn plan(data_dir: &Path) -> io::Result<CleanupPlan> {
-    Ok(seal(data_dir, SystemTime::now(), retention_enabled()?, Limits::default())?.view)
+    Ok(seal(
+        data_dir,
+        SystemTime::now(),
+        retention_enabled()?,
+        Limits::default(),
+    )?
+    .view)
 }
 
 /// Reject malformed approval before even opening a lock file.
 pub fn valid_approval(value: &str) -> bool {
-    value.strip_prefix(APPROVAL_PREFIX).is_some_and(|digest|
-        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    value.strip_prefix(APPROVAL_PREFIX).is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
-fn execute(sealed: SealedPlan, lease: &lease::Lease, now: SystemTime, limits: Limits) -> CleanupReport {
+fn execute(
+    sealed: SealedPlan,
+    lease: &lease::Lease,
+    now: SystemTime,
+    limits: Limits,
+) -> CleanupReport {
     let plan = sealed.view;
-    let selected_bundles = plan.inventory.artifacts.iter()
-        .filter(|artifact| artifact.disposition == Disposition::Eligible).count();
+    let selected_bundles = plan
+        .inventory
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.disposition == Disposition::Eligible)
+        .count();
     let mut report = CleanupReport {
         schema_version: 1,
         data_dir: plan.data_dir,
@@ -160,7 +203,12 @@ fn execute(sealed: SealedPlan, lease: &lease::Lease, now: SystemTime, limits: Li
         errors: Vec::new(),
     };
     let mut budget = Budget::new(limits);
-    for artifact in plan.inventory.artifacts.iter().filter(|a| a.disposition == Disposition::Eligible) {
+    for artifact in plan
+        .inventory
+        .artifacts
+        .iter()
+        .filter(|a| a.disposition == Disposition::Eligible)
+    {
         if let Err(error) = lease.check().and_then(|()| check_roots(&sealed.roots)) {
             report.complete = false;
             report.errors.push(error.to_string());
@@ -171,24 +219,38 @@ fn execute(sealed: SealedPlan, lease: &lease::Lease, now: SystemTime, limits: Li
         report.attempted_bundles += 1;
         if let Err(error) = retention::reclaim_one(artifact, &plan.inventory, now, &mut budget) {
             report.complete = false;
-            report.errors.push(format!("{}: {error}", artifact.path.display()));
+            report
+                .errors
+                .push(format!("{}: {error}", artifact.path.display()));
             break;
         }
         report.removed_bundles += 1;
-        report.removed_logical_bytes = report.removed_logical_bytes.saturating_add(artifact.size_bytes);
+        report.removed_logical_bytes = report
+            .removed_logical_bytes
+            .saturating_add(artifact.size_bytes);
     }
     report
 }
 
-fn apply_at(data_dir: &Path, approval: &str, now: SystemTime, enabled: bool, limits: Limits)
-    -> Result<CleanupReport, CleanupError>
-{
-    if !valid_approval(approval) { return Err(CleanupError::InvalidApproval); }
-    if !enabled { return Err(CleanupError::Disabled); }
+fn apply_at(
+    data_dir: &Path,
+    approval: &str,
+    now: SystemTime,
+    enabled: bool,
+    limits: Limits,
+) -> Result<CleanupReport, CleanupError> {
+    if !valid_approval(approval) {
+        return Err(CleanupError::InvalidApproval);
+    }
+    if !enabled {
+        return Err(CleanupError::Disabled);
+    }
     let data_dir = absolute_directory(data_dir)?;
     let lease = lease::Lease::acquire(&data_dir)?;
     let sealed = seal(&data_dir, now, enabled, limits)?;
-    if !sealed.view.inventory.complete { return Err(CleanupError::Incomplete); }
+    if !sealed.view.inventory.complete {
+        return Err(CleanupError::Incomplete);
+    }
     if sealed.view.approval_fingerprint.as_deref() != Some(approval) {
         return Err(CleanupError::ApprovalChanged);
     }
@@ -202,8 +264,16 @@ fn apply_at(data_dir: &Path, approval: &str, now: SystemTime, enabled: bool, lim
 /// inspect `complete`, attempted/removed counts and errors even when this is Ok.
 /// The lock file may be created but is never truncated, removed or renamed.
 pub fn apply(data_dir: &Path, approval: &str) -> Result<CleanupReport, CleanupError> {
-    if !valid_approval(approval) { return Err(CleanupError::InvalidApproval); }
-    apply_at(data_dir, approval, SystemTime::now(), retention_enabled()?, Limits::default())
+    if !valid_approval(approval) {
+        return Err(CleanupError::InvalidApproval);
+    }
+    apply_at(
+        data_dir,
+        approval,
+        SystemTime::now(),
+        retention_enabled()?,
+        Limits::default(),
+    )
 }
 
 #[cfg(test)]

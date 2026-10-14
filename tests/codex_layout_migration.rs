@@ -22,21 +22,28 @@ const AFTER: &str = "codexlayoutappendprobe524";
 const FINAL: &str = "codexlayoutfinalprobe524";
 
 fn message(text: &str) -> String {
-    format!("{}\n", json!({
-        "timestamp":"2026-10-13T16:20:01.000Z", "type":"response_item",
-        "payload":{"type":"message", "role":"user", "content":[{
-            "type":"input_text", "text":text
-        }]}
-    }))
+    format!(
+        "{}\n",
+        json!({
+            "timestamp":"2026-10-13T16:20:01.000Z", "type":"response_item",
+            "payload":{"type":"message", "role":"user", "content":[{
+                "type":"input_text", "text":text
+            }]}
+        })
+    )
 }
 
 fn rollout() -> String {
-    format!("{}\n{}", json!({
-        "timestamp":"2026-10-13T16:20:00.000Z", "type":"session_meta",
-        "payload":{"id":SESSION, "timestamp":"2026-10-13T16:20:00.000Z",
-            "cwd":"/tmp/cass-native-watch-probe", "originator":"codex_cli_rs",
-            "cli_version":"0.1.0"}
-    }), message(BEFORE))
+    format!(
+        "{}\n{}",
+        json!({
+            "timestamp":"2026-10-13T16:20:00.000Z", "type":"session_meta",
+            "payload":{"id":SESSION, "timestamp":"2026-10-13T16:20:00.000Z",
+                "cwd":"/tmp/cass-native-watch-probe", "originator":"codex_cli_rs",
+                "cli_version":"0.1.0"}
+        }),
+        message(BEFORE)
+    )
 }
 
 struct Fixture {
@@ -55,8 +62,13 @@ impl Fixture {
         let data = temp.path().join("data");
         let flat_root = temp.path().join("flat/sessions");
         let dated_root = temp.path().join("dated/sessions");
-        for directory in [&home.join(".config/cass"), &home.join("empty-codex"),
-            &data, &flat_root, &dated_root.join("2026/10/13")] {
+        for directory in [
+            &home.join(".config/cass"),
+            &home.join("empty-codex"),
+            &data,
+            &flat_root,
+            &dated_root.join("2026/10/13"),
+        ] {
             fs::create_dir_all(directory).unwrap();
         }
         let config = format!(
@@ -68,7 +80,14 @@ impl Fixture {
         let name = format!("rollout-2026-10-13T16-20-00-{SESSION}.jsonl");
         let flat = flat_root.join(&name);
         let dated = dated_root.join("2026/10/13").join(&name);
-        Self { temp, home, data, flat, dated, mode }
+        Self {
+            temp,
+            home,
+            data,
+            flat,
+            dated,
+            mode,
+        }
     }
 
     fn command(&self, migration: bool) -> assert_cmd::Command {
@@ -78,7 +97,8 @@ impl Fixture {
             assert_cmd::cargo::cargo_bin!("cass")
         };
         let mut command = assert_cmd::Command::new(binary);
-        command.env_clear()
+        command
+            .env_clear()
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("APPDATA", self.home.join("AppData/Roaming"))
@@ -102,8 +122,11 @@ impl Fixture {
 
     fn index_command(&self, path: &Path) -> assert_cmd::Command {
         let mut command = self.command(false);
-        command.args(["index", "--watch-once"]).arg(path)
-            .arg("--data-dir").arg(&self.data)
+        command
+            .args(["index", "--watch-once"])
+            .arg(path)
+            .arg("--data-dir")
+            .arg(&self.data)
             .args(["--json", "--no-progress-events"]);
         command
     }
@@ -114,26 +137,50 @@ impl Fixture {
 
     fn migrate_command(&self, apply: bool) -> assert_cmd::Command {
         let mut command = self.command(true);
-        command.arg("--data-dir").arg(&self.data)
+        command
+            .arg("--data-dir")
+            .arg(&self.data)
             .args(["--source", SOURCE])
-            .arg("--from").arg(&self.flat)
-            .arg("--to").arg(&self.dated)
+            .arg("--from")
+            .arg(&self.flat)
+            .arg("--to")
+            .arg(&self.dated)
             .arg("--json");
-        if apply { command.arg("--apply"); }
+        if apply {
+            command.arg("--apply");
+        }
         command
     }
 
     fn migrate(&self, apply: bool) -> Value {
-        let output = self.migrate_command(apply).assert().success()
-            .get_output().stdout.clone();
+        let output = self
+            .migrate_command(apply)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
         serde_json::from_slice(&output).unwrap()
     }
 
     fn search(&self, needle: &str, count: usize) -> Value {
-        let output = self.command(false)
-            .args(["search", needle, "--agent", "codex", "--mode", "lexical",
-                "--json", "--no-maintenance"])
-            .assert().success().get_output().stdout.clone();
+        let output = self
+            .command(false)
+            .args([
+                "search",
+                needle,
+                "--agent",
+                "codex",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
         let report: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(report["hits"].as_array().unwrap().len(), count, "{report}");
         report
@@ -141,52 +188,80 @@ impl Fixture {
 
     fn archive(&self) -> Archive {
         let database = self.data.join("agent_search.db");
-        let connection = open_with_flags(
-            database.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ).unwrap();
+        let connection =
+            open_with_flags(database.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         connection.execute("PRAGMA query_only = ON").unwrap();
-        let conversations = connection.query_map_collect(
-            "SELECT c.id, c.external_id FROM conversations c
+        let conversations = connection
+            .query_map_collect(
+                "SELECT c.id, c.external_id FROM conversations c
              JOIN agents a ON a.id=c.agent_id
              WHERE a.slug='codex' AND c.source_id=?1 ORDER BY c.id",
-            params![SOURCE],
-            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
-        ).unwrap();
-        let messages = connection.query_map_collect(
-            "SELECT c.id, m.id, m.idx, m.content FROM conversations c
+                params![SOURCE],
+                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
+            )
+            .unwrap();
+        let messages = connection
+            .query_map_collect(
+                "SELECT c.id, m.id, m.idx, m.content FROM conversations c
              JOIN agents a ON a.id=c.agent_id
              JOIN messages m ON m.conversation_id=c.id
              WHERE a.slug='codex' AND c.source_id=?1 ORDER BY c.id, m.id, m.idx",
-            params![SOURCE],
-            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<i64>(1)?,
-                row.get_typed::<i64>(2)?, row.get_typed::<String>(3)?)),
-        ).unwrap();
+                params![SOURCE],
+                |row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<i64>(1)?,
+                        row.get_typed::<i64>(2)?,
+                        row.get_typed::<String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
         // Use the production encoder and content canonicalizer, not a guessed
         // path-based ID. These short fixtures have exactly one semantic chunk.
-        let semantic_documents = connection.query_map_collect(
-            "SELECT m.id, c.agent_id, COALESCE(c.workspace_id,0), c.source_id,
+        let semantic_documents = connection
+            .query_map_collect(
+                "SELECT m.id, c.agent_id, COALESCE(c.workspace_id,0), c.source_id,
                     m.created_at, m.content, m.role
              FROM messages m JOIN conversations c ON c.id=m.conversation_id
              JOIN agents a ON a.id=c.agent_id
              WHERE a.slug='codex' AND c.source_id=?1 ORDER BY m.id",
-            params![SOURCE],
-            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<i64>(1)?,
-                row.get_typed::<i64>(2)?, row.get_typed::<String>(3)?,
-                row.get_typed::<Option<i64>>(4)?, row.get_typed::<String>(5)?,
-                row.get_typed::<String>(6)?)),
-        ).unwrap().into_iter().map(|(message, agent, workspace, source, created, content, role)| {
-            SemanticDocId {
-                message_id: u64::try_from(message).unwrap(),
-                chunk_idx: 0,
-                agent_id: u32::try_from(agent).unwrap(),
-                workspace_id: u32::try_from(workspace).unwrap(),
-                source_id: crc32fast::hash(source.as_bytes()),
-                role: role_code_from_str(&role).unwrap(),
-                created_at_ms: created.unwrap(),
-                content_hash: Some(content_hash(&canonicalize_for_embedding(&content))),
-            }.to_doc_id_string()
-        }).collect();
-        Archive { conversations, messages, semantic_documents }
+                params![SOURCE],
+                |row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<i64>(1)?,
+                        row.get_typed::<i64>(2)?,
+                        row.get_typed::<String>(3)?,
+                        row.get_typed::<Option<i64>>(4)?,
+                        row.get_typed::<String>(5)?,
+                        row.get_typed::<String>(6)?,
+                    ))
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(
+                |(message, agent, workspace, source, created, content, role)| {
+                    SemanticDocId {
+                        message_id: u64::try_from(message).unwrap(),
+                        chunk_idx: 0,
+                        agent_id: u32::try_from(agent).unwrap(),
+                        workspace_id: u32::try_from(workspace).unwrap(),
+                        source_id: crc32fast::hash(source.as_bytes()),
+                        role: role_code_from_str(&role).unwrap(),
+                        created_at_ms: created.unwrap(),
+                        content_hash: Some(content_hash(&canonicalize_for_embedding(&content))),
+                    }
+                    .to_doc_id_string()
+                },
+            )
+            .collect();
+        Archive {
+            conversations,
+            messages,
+            semantic_documents,
+        }
     }
 }
 
@@ -198,8 +273,12 @@ struct Archive {
 }
 
 fn append(path: &Path, text: &str) {
-    OpenOptions::new().append(true).open(path).unwrap()
-        .write_all(message(text).as_bytes()).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(message(text).as_bytes())
+        .unwrap();
 }
 
 #[test]
@@ -221,11 +300,17 @@ fn both_indexing_orders_keep_canonical_ids_messages_search_and_idempotence() {
             fs::write(second, rollout()).unwrap();
             let dry = fixture.migrate(false);
             assert_eq!(dry["applied"], false);
-            assert_eq!(dry["canonical_conversation_id"], original.conversations[0].0);
+            assert_eq!(
+                dry["canonical_conversation_id"],
+                original.conversations[0].0
+            );
             assert_eq!(fixture.archive(), original);
             assert!(!fixture.data.join(REGISTRY_DIRECTORY).exists());
             let applied = fixture.migrate(true);
-            assert_eq!(applied["canonical_external_id"], original.conversations[0].1);
+            assert_eq!(
+                applied["canonical_external_id"],
+                original.conversations[0].1
+            );
             let receipt = PathBuf::from(applied["receipt_path"].as_str().unwrap());
             let receipt_before = fs::read(&receipt).unwrap();
             assert_eq!(fixture.migrate(true)["already_registered"], true);
@@ -242,12 +327,20 @@ fn both_indexing_orders_keep_canonical_ids_messages_search_and_idempotence() {
             assert_eq!(appended.conversations, original.conversations);
             assert_eq!(appended.messages.len(), 2);
             assert!(appended.messages.contains(&original.messages[0]));
-            assert!(appended.semantic_documents.contains(&original.semantic_documents[0]));
+            assert!(
+                appended
+                    .semantic_documents
+                    .contains(&original.semantic_documents[0])
+            );
             fixture.search(BEFORE, 1);
             fixture.search(AFTER, 1);
             fixture.index(first);
             fixture.index(second);
-            assert_eq!(fixture.archive(), appended, "a shorter old copy must not delete newer history");
+            assert_eq!(
+                fixture.archive(),
+                appended,
+                "a shorter old copy must not delete newer history"
+            );
             // The operator may retire the snapshot after registration; this
             // test retains it outside the configured roots rather than deletes.
             fs::rename(first, fixture.temp.path().join("retained-original.jsonl")).unwrap();
@@ -256,7 +349,9 @@ fn both_indexing_orders_keep_canonical_ids_messages_search_and_idempotence() {
             let final_archive = fixture.archive();
             assert_eq!(final_archive.conversations, original.conversations);
             assert_eq!(final_archive.messages.len(), 3);
-            for old in appended.messages { assert!(final_archive.messages.contains(&old)); }
+            for old in appended.messages {
+                assert!(final_archive.messages.contains(&old));
+            }
             for old in appended.semantic_documents {
                 assert!(final_archive.semantic_documents.contains(&old));
             }
@@ -277,7 +372,11 @@ fn registration_refuses_conflicting_content_or_native_session_metadata_without_m
         let bad = match conflict {
             "content" => rollout().replace(BEFORE, "differentcontentprobe524"),
             "metadata" => rollout().replace(SESSION, "00000000-0000-4000-8000-000000000002"),
-            _ => format!("{}{}", rollout(), rollout().replace(SESSION, "00000000-0000-4000-8000-000000000002")),
+            _ => format!(
+                "{}{}",
+                rollout(),
+                rollout().replace(SESSION, "00000000-0000-4000-8000-000000000002")
+            ),
         };
         fs::write(&fixture.dated, bad).unwrap();
         fixture.migrate_command(true).assert().failure();
@@ -317,10 +416,12 @@ fn divergent_post_migration_append_cannot_overwrite_the_canonical_history() {
     // status. In either case the rejected source must not mutate the archive.
     let output = fixture.index_command(&fixture.flat).output().unwrap();
     let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-    assert!(!output.status.success()
-        || report["success"] == false
-        || report["indexing_stats"]["scan_had_errors"] == true,
-        "conflict must be visible: {report}");
+    assert!(
+        !output.status.success()
+            || report["success"] == false
+            || report["indexing_stats"]["scan_had_errors"] == true,
+        "conflict must be visible: {report}"
+    );
     assert_eq!(fixture.archive(), before);
     fixture.search(AFTER, 1);
     fixture.search("divergentbranchprobe524", 0);
@@ -338,9 +439,12 @@ fn source_configuration_ambiguity_and_cross_source_moves_are_refused() {
             toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let dated_root = fixture.dated.parent().unwrap().ancestors().nth(3).unwrap();
         if !same_owner {
-            config.sources[0].paths.retain(|root| Path::new(root) != dated_root);
+            config.sources[0]
+                .paths
+                .retain(|root| Path::new(root) != dated_root);
         }
-        let mut other = coding_agent_search::sources::config::SourceDefinition::local("other-owner");
+        let mut other =
+            coding_agent_search::sources::config::SourceDefinition::local("other-owner");
         other.paths = vec![dated_root.to_string_lossy().into_owned()];
         config.sources.push(other);
         fs::write(path, toml::to_string(&config).unwrap()).unwrap();
@@ -360,8 +464,13 @@ fn registration_respects_the_existing_archive_writer_lease() {
     let database = fs::canonicalize(fixture.data.join("agent_search.db")).unwrap();
     let mut lock_path = database.as_os_str().to_os_string();
     lock_path.push(".cass-index-run.lock");
-    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true)
-        .open(PathBuf::from(lock_path)).unwrap();
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(PathBuf::from(lock_path))
+        .unwrap();
     lock.try_lock().unwrap();
     let original = fixture.archive();
     fixture.migrate_command(true).assert().failure();
@@ -389,7 +498,11 @@ fn migration_of_an_existing_archive_accepts_an_already_extended_destination() {
         assert_eq!(migrated.conversations, original.conversations);
         assert_eq!(migrated.messages.len(), 2);
         assert!(migrated.messages.contains(&original.messages[0]));
-        assert!(migrated.semantic_documents.contains(&original.semantic_documents[0]));
+        assert!(
+            migrated
+                .semantic_documents
+                .contains(&original.semantic_documents[0])
+        );
         fixture.search(BEFORE, 1);
         fixture.search(AFTER, 1);
         fixture.index(first);

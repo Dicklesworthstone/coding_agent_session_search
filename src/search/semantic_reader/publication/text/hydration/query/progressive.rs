@@ -43,7 +43,16 @@ where
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.inner {
-            Some(inner) => (0, Some(inner.size_hint().1.unwrap_or(self.remaining_phases).min(self.remaining_phases))),
+            Some(inner) => (
+                0,
+                Some(
+                    inner
+                        .size_hint()
+                        .1
+                        .unwrap_or(self.remaining_phases)
+                        .min(self.remaining_phases),
+                ),
+            ),
             None => (0, Some(0)),
         }
     }
@@ -53,7 +62,8 @@ impl<I, B> FusedIterator for HydratedStream<'_, '_, I>
 where
     I: Iterator<Item = SemanticReaderResult<B>>,
     B: BatchSource,
-{}
+{
+}
 
 fn stream<'snapshot, 'connection, I>(
     inner: I,
@@ -62,7 +72,13 @@ fn stream<'snapshot, 'connection, I>(
     work: Work,
 ) -> Result<HydratedStream<'snapshot, 'connection, I>, HydrationError> {
     work.check()?;
-    Ok(HydratedStream { inner: Some(inner), remaining_phases: 2, transaction, projection, work })
+    Ok(HydratedStream {
+        inner: Some(inner),
+        remaining_phases: 2,
+        transaction,
+        projection,
+        work,
+    })
 }
 
 impl TextSemanticSearch<'_, '_> {
@@ -81,9 +97,17 @@ impl TextSemanticSearch<'_, '_> {
         transaction: &'call Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
-    ) -> Result<impl FusedIterator<Item = HydratedSearchResult<SemanticSearchBatch>> + 'call, HydratedSearchError> {
+    ) -> Result<
+        impl FusedIterator<Item = HydratedSearchResult<SemanticSearchBatch>> + 'call,
+        HydratedSearchError,
+    > {
         let work = prepare(k, 2, budget)?;
-        Ok(stream(self.progressive(k, filter)?, transaction, projection, work)?)
+        Ok(stream(
+            self.progressive(k, filter)?,
+            transaction,
+            projection,
+            work,
+        )?)
     }
 
     /// The same snapshot and fail-closed phase contract, using only already
@@ -96,9 +120,17 @@ impl TextSemanticSearch<'_, '_> {
         transaction: &'call Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
-    ) -> Result<impl FusedIterator<Item = HydratedSearchResult<SemanticSearchBatch>> + 'call, HydratedSearchError> {
+    ) -> Result<
+        impl FusedIterator<Item = HydratedSearchResult<SemanticSearchBatch>> + 'call,
+        HydratedSearchError,
+    > {
         let work = prepare(k, 2, budget)?;
-        Ok(stream(self.progressive_with_ann(k, filter, policy)?, transaction, projection, work)?)
+        Ok(stream(
+            self.progressive_with_ann(k, filter, policy)?,
+            transaction,
+            projection,
+            work,
+        )?)
     }
 }
 
@@ -114,9 +146,17 @@ impl SelectedTextSemanticSearch<'_, '_> {
         transaction: &'call Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
-    ) -> Result<impl FusedIterator<Item = HydratedSearchResult<SelectedSemanticBatch>> + 'call, HydratedSearchError> {
+    ) -> Result<
+        impl FusedIterator<Item = HydratedSearchResult<SelectedSemanticBatch>> + 'call,
+        HydratedSearchError,
+    > {
         let work = prepare(k, 2, budget)?;
-        Ok(stream(self.progressive(k, filter)?, transaction, projection, work)?)
+        Ok(stream(
+            self.progressive(k, filter)?,
+            transaction,
+            projection,
+            work,
+        )?)
     }
 
     pub fn progressive_hydrated_with_ann_in_transaction<'call>(
@@ -127,9 +167,17 @@ impl SelectedTextSemanticSearch<'_, '_> {
         transaction: &'call Transaction<'_>,
         projection: PassageProjection,
         budget: HydrationBudget,
-    ) -> Result<impl FusedIterator<Item = HydratedSearchResult<SelectedSemanticBatch>> + 'call, HydratedSearchError> {
+    ) -> Result<
+        impl FusedIterator<Item = HydratedSearchResult<SelectedSemanticBatch>> + 'call,
+        HydratedSearchError,
+    > {
         let work = prepare(k, 2, budget)?;
-        Ok(stream(self.progressive_with_ann(k, filter, policy)?, transaction, projection, work)?)
+        Ok(stream(
+            self.progressive_with_ann(k, filter, policy)?,
+            transaction,
+            projection,
+            work,
+        )?)
     }
 }
 
@@ -139,7 +187,8 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
-    fn expired_stream_never_polls_backend_and_is_permanently_fused() -> Result<(), HydratedSearchError> {
+    fn expired_stream_never_polls_backend_and_is_permanently_fused()
+    -> Result<(), HydratedSearchError> {
         let conn = Connection::open(":memory:").map_err(|_| HydrationError::Database)?;
         let mut transaction = conn.transaction().map_err(|_| HydrationError::Database)?;
         let polled = Cell::new(0);
@@ -152,18 +201,26 @@ mod tests {
         // Deterministic expiry at the real driver boundary, without sleeps or
         // a global clock hook affecting parallel tests.
         stream.work.budget.timeout = Duration::ZERO;
-        assert!(matches!(stream.next(), Some(Err(HydratedSearchError::Hydration(HydrationError::DeadlineExceeded)))));
+        assert!(matches!(
+            stream.next(),
+            Some(Err(HydratedSearchError::Hydration(
+                HydrationError::DeadlineExceeded
+            )))
+        ));
         assert!(stream.next().is_none());
         assert!(stream.next().is_none());
         assert_eq!(polled.get(), 0);
         assert_eq!(stream.size_hint(), (0, Some(0)));
         drop(stream);
-        transaction.rollback().map_err(|_| HydrationError::Rollback)?;
+        transaction
+            .rollback()
+            .map_err(|_| HydrationError::Rollback)?;
         Ok(())
     }
 
     #[test]
-    fn retrieval_error_drops_continuation_without_polling_it_again() -> Result<(), HydratedSearchError> {
+    fn retrieval_error_drops_continuation_without_polling_it_again()
+    -> Result<(), HydratedSearchError> {
         let conn = Connection::open(":memory:").map_err(|_| HydrationError::Database)?;
         let mut transaction = conn.transaction().map_err(|_| HydrationError::Database)?;
         let polled = Cell::new(0);
@@ -171,14 +228,25 @@ mod tests {
             polled.set(polled.get() + 1);
             Some(Err(SemanticReaderError::InvalidCandidate))
         });
-        let mut stream = stream(inner, &transaction, PassageProjection::RawPassagesV2,
-            prepare(1, 2, HydrationBudget::default())?)?;
-        assert!(matches!(stream.next(), Some(Err(HydratedSearchError::Retrieval(SemanticReaderError::InvalidCandidate)))));
+        let mut stream = stream(
+            inner,
+            &transaction,
+            PassageProjection::RawPassagesV2,
+            prepare(1, 2, HydrationBudget::default())?,
+        )?;
+        assert!(matches!(
+            stream.next(),
+            Some(Err(HydratedSearchError::Retrieval(
+                SemanticReaderError::InvalidCandidate
+            )))
+        ));
         assert!(stream.next().is_none());
         assert!(stream.inner.is_none());
         assert_eq!(polled.get(), 1);
         drop(stream);
-        transaction.rollback().map_err(|_| HydrationError::Rollback)?;
+        transaction
+            .rollback()
+            .map_err(|_| HydrationError::Rollback)?;
         Ok(())
     }
 
@@ -191,15 +259,21 @@ mod tests {
             polled.set(polled.get() + 1);
             panic!("injected native continuation panic");
         });
-        let mut stream = stream(inner, &transaction, PassageProjection::RawPassagesV2,
-            prepare(1, 2, HydrationBudget::default())?)?;
+        let mut stream = stream(
+            inner,
+            &transaction,
+            PassageProjection::RawPassagesV2,
+            prepare(1, 2, HydrationBudget::default())?,
+        )?;
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stream.next()));
         assert!(failed.is_err());
         assert!(stream.next().is_none());
         assert_eq!(stream.size_hint(), (0, Some(0)));
         assert_eq!(polled.get(), 1);
         drop(stream);
-        transaction.rollback().map_err(|_| HydrationError::Rollback)?;
+        transaction
+            .rollback()
+            .map_err(|_| HydrationError::Rollback)?;
         Ok(())
     }
 }

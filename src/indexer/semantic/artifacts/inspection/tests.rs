@@ -302,7 +302,10 @@ fn nested_links_are_not_followed_and_referenced_aliases_are_not_reclaimed() -> R
     // WAL, not the scratch helper's deliberately invalid placeholder bytes.
     // Not-ready references are covered independently above; keep this ready.
     fs::copy(&published, &staging)?;
-    fs::rename(wal_path_for(&staging), data.join("retained-fixture-placeholder.wal"))?;
+    fs::rename(
+        wal_path_for(&staging),
+        data.join("retained-fixture-placeholder.wal"),
+    )?;
     let mut writer = VectorIndex::open(&staging)?;
     let vector = writer.vector_at_f32(0)?;
     writer.append("alias-wal-document", &vector)?;
@@ -326,7 +329,13 @@ fn nested_links_are_not_followed_and_referenced_aliases_are_not_reclaimed() -> R
     assert!(staging.is_file() && wal_path_for(&staging).is_file());
     assert_eq!(fs::read(&staging)?, main_before);
     assert_eq!(fs::read(wal_path_for(&staging))?, wal_before);
-    assert!(SemanticManifest::load(data)?.unwrap().quality_tier.unwrap().ready);
+    assert!(
+        SemanticManifest::load(data)?
+            .unwrap()
+            .quality_tier
+            .unwrap()
+            .ready
+    );
     assert_eq!(fs::read(outside.path().join("evidence"))?, b"external");
     Ok(())
 }

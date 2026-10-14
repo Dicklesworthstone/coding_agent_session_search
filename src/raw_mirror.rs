@@ -17,11 +17,11 @@ mod store {
 use std::fmt;
 
 pub use exclusions::RawMirrorSourceExcluded;
-pub use store::*;
 pub use store::policy::{
     RawMirrorAutomaticRetention, RawMirrorCapturePaused, RawMirrorMaintenanceReport,
     RawMirrorRetentionPolicy, maintain_before_index,
 };
+pub use store::*;
 
 /// Capture was switched off by the operator with `CASS_RAW_MIRROR` (GH #506).
 /// Like [`RawMirrorSourceExcluded`], it names no source path or contents.
@@ -103,7 +103,12 @@ pub(crate) fn capture_source_file_with_chunk_policy(
         return Err(RawMirrorCaptureDisabled.into());
     }
     exclusions::ensure_allowed(input.source_path)?;
-    store::policy::capture(input, chunk_threshold_bytes, chunk_size_bytes, RawMirrorRetentionPolicy::from_env()?)
+    store::policy::capture(
+        input,
+        chunk_threshold_bytes,
+        chunk_size_bytes,
+        RawMirrorRetentionPolicy::from_env()?,
+    )
 }
 
 #[cfg(test)]

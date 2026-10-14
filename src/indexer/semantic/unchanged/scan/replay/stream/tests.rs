@@ -5,7 +5,11 @@ use std::io;
 
 fn database(path: &std::path::Path, indexed: bool) -> Result<Connection> {
     let connection = Connection::open(path.to_string_lossy().into_owned())?;
-    let unique = if indexed { ", UNIQUE(conversation_id, idx)" } else { "" };
+    let unique = if indexed {
+        ", UNIQUE(conversation_id, idx)"
+    } else {
+        ""
+    };
     connection.execute(&format!(
         "CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER,
          idx INTEGER, role TEXT, author TEXT, created_at INTEGER, content TEXT{unique})"
@@ -31,15 +35,21 @@ fn native_cursor_stops_before_decoding_later_rows_of_the_same_conversation() -> 
         let error = messages(&connection, 7, &mut |_| {
             delivered += 1;
             Err(Stop.into())
-        }).expect_err("the stop is not successful partial replay");
-        assert!(error.is::<Stop>(), "later decoding replaced consumer error: {error:#}");
+        })
+        .expect_err("the stop is not successful partial replay");
+        assert!(
+            error.is::<Stop>(),
+            "later decoding replaced consumer error: {error:#}"
+        );
         assert_eq!(delivered, 1);
         let error = messages(&connection, 7, &mut |_| Ok(()))
             .expect_err("without the stop, the malformed later row must be observed");
         assert!(error.downcast_ref::<FrankenError>().is_some());
         // Both aborts finish cursor cleanup before we reuse or close the bridge.
         let count: i64 = connection.query_row_map(
-            "SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |row| row.get_typed(0),
+            "SELECT COUNT(*) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
         )?;
         assert_eq!(count, 2);
         connection.close_without_checkpoint()?;
@@ -68,12 +78,19 @@ fn source_roles_envelopes_order_and_full_unicode_text_are_preserved() -> Result<
             )?;
         }
         connection.execute("UPDATE messages SET author = NULL, created_at = NULL WHERE id = 2")?;
-        connection.execute("INSERT INTO messages VALUES (99, 8, 0, 'user', NULL, NULL, 'foreign')")?;
+        connection
+            .execute("INSERT INTO messages VALUES (99, 8, 0, 'user', NULL, NULL, 'foreign')")?;
         connection.execute("PRAGMA query_only = ON")?;
         let mut rows = Vec::new();
-        messages(&connection, 7, &mut |message| { rows.push(message); Ok(()) })?;
+        messages(&connection, 7, &mut |message| {
+            rows.push(message);
+            Ok(())
+        })?;
         assert_eq!(rows.len(), roles.len());
-        assert_eq!(rows[0].content, long, "no lexical prefix/content cap may enter the proof");
+        assert_eq!(
+            rows[0].content, long,
+            "no lexical prefix/content cap may enter the proof"
+        );
         assert_eq!(rows[0].author.as_deref(), Some("writer"));
         assert_eq!(rows[1].author, None);
         assert_eq!(rows[1].created_at, None);
@@ -86,7 +103,10 @@ fn source_roles_envelopes_order_and_full_unicode_text_are_preserved() -> Result<
             assert!(row.extra_json.is_null() && row.snippets.is_empty());
         }
         let mut empty = 0;
-        messages(&connection, 999, &mut |_| { empty += 1; Ok(()) })?;
+        messages(&connection, 999, &mut |_| {
+            empty += 1;
+            Ok(())
+        })?;
         assert_eq!(empty, 0);
         connection.close_without_checkpoint()?;
     }
@@ -102,14 +122,27 @@ fn callback_errors_never_trigger_missing_index_fallback_or_lose_their_type() -> 
         let mut delivered = 0;
         let error = messages(&connection, 7, &mut |_| {
             delivered += 1;
-            Err(io::Error::new(io::ErrorKind::Interrupted,
-                "no such index: sqlite_autoindex_messages_1").into())
-        }).unwrap_err();
-        assert_eq!(delivered, 1, "consumer failures must never replay already delivered rows");
-        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::Interrupted);
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "no such index: sqlite_autoindex_messages_1",
+            )
+            .into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            delivered, 1,
+            "consumer failures must never replay already delivered rows"
+        );
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Interrupted
+        );
         connection.execute("ALTER TABLE messages RENAME TO retained_messages")?;
-        let error = messages(&connection, 7, &mut |_| { delivered += 1; Ok(()) })
-            .expect_err("missing canonical data is not successful empty replay");
+        let error = messages(&connection, 7, &mut |_| {
+            delivered += 1;
+            Ok(())
+        })
+        .expect_err("missing canonical data is not successful empty replay");
         assert!(error.downcast_ref::<FrankenError>().is_some());
         assert_eq!(delivered, 1);
         connection.close_without_checkpoint()?;

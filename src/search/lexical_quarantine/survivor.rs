@@ -20,33 +20,55 @@ pub(super) fn validate_selection(artifact: &Artifact, inventory: &Inventory) -> 
                 && selected.metadata_fingerprint == artifact.metadata_fingerprint
         })
     {
-        return Err(io::Error::other("quarantine is not an eligible member of a complete enabled inventory"));
+        return Err(io::Error::other(
+            "quarantine is not an eligible member of a complete enabled inventory",
+        ));
     }
     Ok(())
 }
 
-pub(super) fn recheck(inventory: &Inventory, now: SystemTime, budget: &mut Budget) -> io::Result<()> {
-    let mut survivors = inventory.artifacts.iter()
+pub(super) fn recheck(
+    inventory: &Inventory,
+    now: SystemTime,
+    budget: &mut Budget,
+) -> io::Result<()> {
+    let mut survivors = inventory
+        .artifacts
+        .iter()
         .filter(|artifact| artifact.disposition == Disposition::RetainNewest);
     let Some(survivor) = survivors.next() else {
         // A sweep containing only empty reservations/shells needs no diagnostic
         // survivor. A file-bearing bundle can never use this exception.
-        return if inventory.artifacts.iter().any(|artifact| artifact.has_evidence) {
-            Err(io::Error::other("quarantine inventory has evidence but no protected survivor"))
+        return if inventory
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.has_evidence)
+        {
+            Err(io::Error::other(
+                "quarantine inventory has evidence but no protected survivor",
+            ))
         } else {
             Ok(())
         };
     };
     if survivors.next().is_some() || !survivor.has_evidence || !survivor.size_complete {
-        return Err(io::Error::other("quarantine inventory has an ambiguous protected survivor"));
+        return Err(io::Error::other(
+            "quarantine inventory has an ambiguous protected survivor",
+        ));
     }
-    let current = observe(&survivor.path, survivor.interrupted_reclaim, now, budget)
-        .map_err(|error| io::Error::other(format!("protected rebuild evidence cannot be rechecked: {error}")))?;
+    let current =
+        observe(&survivor.path, survivor.interrupted_reclaim, now, budget).map_err(|error| {
+            io::Error::other(format!(
+                "protected rebuild evidence cannot be rechecked: {error}"
+            ))
+        })?;
     if !current.has_evidence
         || current.metadata_fingerprint.is_none()
         || current.metadata_fingerprint != survivor.metadata_fingerprint
     {
-        return Err(io::Error::other("protected rebuild evidence changed since inventory; cleanup stopped"));
+        return Err(io::Error::other(
+            "protected rebuild evidence changed since inventory; cleanup stopped",
+        ));
     }
     Ok(())
 }
@@ -56,16 +78,29 @@ mod tests {
     use super::*;
 
     fn lock(root: &Path) -> fs::File {
-        let file = fs::OpenOptions::new().read(true).write(true).create(true)
-            .truncate(false).open(root.join("index-run.lock")).unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("index-run.lock"))
+            .unwrap();
         fs2::FileExt::try_lock_exclusive(&file).unwrap();
         file
     }
 
     fn bundle(root: &Path, suffix: &str, pending: bool) -> PathBuf {
-        let prefix = if pending { RECLAIM_PREFIX } else { QUARANTINE_PREFIX };
+        let prefix = if pending {
+            RECLAIM_PREFIX
+        } else {
+            QUARANTINE_PREFIX
+        };
         let bundle = root.join(format!("{prefix}{suffix}"));
-        let layout = if pending { bundle.join("quarantine") } else { bundle.clone() };
+        let layout = if pending {
+            bundle.join("quarantine")
+        } else {
+            bundle.clone()
+        };
         fs::create_dir_all(layout.join("index")).unwrap();
         fs::write(layout.join("index/MANIFEST"), b"retained failure").unwrap();
         bundle
@@ -82,8 +117,16 @@ mod tests {
     }
 
     fn chosen(plan: &Inventory) -> (&Artifact, &Artifact) {
-        let target = plan.artifacts.iter().find(|a| a.disposition == Disposition::Eligible).unwrap();
-        let survivor = plan.artifacts.iter().find(|a| a.disposition == Disposition::RetainNewest).unwrap();
+        let target = plan
+            .artifacts
+            .iter()
+            .find(|a| a.disposition == Disposition::Eligible)
+            .unwrap();
+        let survivor = plan
+            .artifacts
+            .iter()
+            .find(|a| a.disposition == Disposition::RetainNewest)
+            .unwrap();
         (target, survivor)
     }
 
@@ -98,7 +141,11 @@ mod tests {
         fs::create_dir_all(pending.join("quarantine/index/empty")).unwrap();
         let now = old_now();
         let plan = scan(root.path(), now);
-        let survivor = plan.artifacts.iter().find(|a| a.disposition == Disposition::RetainNewest).unwrap();
+        let survivor = plan
+            .artifacts
+            .iter()
+            .find(|a| a.disposition == Disposition::RetainNewest)
+            .unwrap();
         assert_eq!(survivor.path, evidence);
         let mut budget = Budget::new(Limits::default());
         let mut removed = 0;
@@ -112,7 +159,10 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(!ordinary.exists());
         assert!(!pending.exists());
-        assert_eq!(fs::read(evidence.join("quarantine/index/MANIFEST")).unwrap(), b"retained failure");
+        assert_eq!(
+            fs::read(evidence.join("quarantine/index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
     }
 
     #[test]
@@ -125,10 +175,20 @@ mod tests {
         let plan = scan(root.path(), now);
         let (target, survivor) = chosen(&plan);
         fs::rename(&survivor.path, root.path().join("saved-for-inspection")).unwrap();
-        let error = retention::reclaim_one(target, &plan, now, &mut Budget::new(Limits::default())).unwrap_err();
+        let error = retention::reclaim_one(target, &plan, now, &mut Budget::new(Limits::default()))
+            .unwrap_err();
         assert!(error.to_string().contains("protected rebuild evidence"));
-        assert_eq!(fs::read(target.path.join("index/MANIFEST")).unwrap(), b"retained failure");
-        assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(RECLAIM_PREFIX)));
+        assert_eq!(
+            fs::read(target.path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
+        assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(RECLAIM_PREFIX)
+        }));
     }
 
     #[test]
@@ -140,11 +200,19 @@ mod tests {
         let now = old_now();
         let plan = scan(root.path(), now);
         let (target, survivor) = chosen(&plan);
-        fs::rename(survivor.path.join("index/MANIFEST"), root.path().join("saved-manifest")).unwrap();
+        fs::rename(
+            survivor.path.join("index/MANIFEST"),
+            root.path().join("saved-manifest"),
+        )
+        .unwrap();
         assert!(survivor.path.is_dir());
-        let error = retention::reclaim_one(target, &plan, now, &mut Budget::new(Limits::default())).unwrap_err();
+        let error = retention::reclaim_one(target, &plan, now, &mut Budget::new(Limits::default()))
+            .unwrap_err();
         assert!(error.to_string().contains("protected rebuild evidence"));
-        assert_eq!(fs::read(target.path.join("index/MANIFEST")).unwrap(), b"retained failure");
+        assert_eq!(
+            fs::read(target.path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
     }
 
     #[test]
@@ -156,7 +224,11 @@ mod tests {
         }
         let now = old_now();
         let plan = scan(root.path(), now);
-        let targets: Vec<_> = plan.artifacts.iter().filter(|a| a.disposition == Disposition::Eligible).collect();
+        let targets: Vec<_> = plan
+            .artifacts
+            .iter()
+            .filter(|a| a.disposition == Disposition::Eligible)
+            .collect();
         assert_eq!(targets.len(), 2);
         let survivor = chosen(&plan).1;
         let mut budget = Budget::new(Limits::default());
@@ -164,7 +236,10 @@ mod tests {
         assert!(!targets[0].path.exists());
         fs::rename(&survivor.path, root.path().join("saved-for-inspection")).unwrap();
         assert!(retention::reclaim_one(targets[1], &plan, now, &mut budget).is_err());
-        assert_eq!(fs::read(targets[1].path.join("index/MANIFEST")).unwrap(), b"retained failure");
+        assert_eq!(
+            fs::read(targets[1].path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
     }
 
     #[test]
@@ -181,16 +256,31 @@ mod tests {
         let mut disabled = plan.clone();
         disabled.automatic_retention_enabled = false;
         for refused in [&incomplete, &disabled] {
-            assert!(retention::reclaim_one(target, refused, now, &mut Budget::new(Limits::default())).is_err());
+            assert!(
+                retention::reclaim_one(target, refused, now, &mut Budget::new(Limits::default()))
+                    .is_err()
+            );
         }
-        assert!(retention::reclaim_one(survivor, &plan, now, &mut Budget::new(Limits::default())).is_err());
+        assert!(
+            retention::reclaim_one(survivor, &plan, now, &mut Budget::new(Limits::default()))
+                .is_err()
+        );
         let outside = tempfile::tempdir().unwrap();
         let path = bundle(outside.path(), "000003", false);
         let mut unselected = (*target).clone();
         unselected.path = path.clone();
-        assert!(retention::reclaim_one(&unselected, &plan, now, &mut Budget::new(Limits::default())).is_err());
-        assert_eq!(fs::read(path.join("index/MANIFEST")).unwrap(), b"retained failure");
-        assert_eq!(fs::read(target.path.join("index/MANIFEST")).unwrap(), b"retained failure");
+        assert!(
+            retention::reclaim_one(&unselected, &plan, now, &mut Budget::new(Limits::default()))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
+        assert_eq!(
+            fs::read(target.path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
     }
 
     #[test]
@@ -204,10 +294,19 @@ mod tests {
         let (target, survivor) = chosen(&plan);
         // Each tree has three entries. Five covers the target but cannot
         // complete the survivor; a renewed per-bundle budget would wrongly pass.
-        let mut budget = Budget::new(Limits { tree_entries: 5, ..Default::default() });
+        let mut budget = Budget::new(Limits {
+            tree_entries: 5,
+            ..Default::default()
+        });
         assert!(retention::reclaim_one(target, &plan, now, &mut budget).is_err());
-        assert_eq!(fs::read(target.path.join("index/MANIFEST")).unwrap(), b"retained failure");
-        assert_eq!(fs::read(survivor.path.join("index/MANIFEST")).unwrap(), b"retained failure");
+        assert_eq!(
+            fs::read(target.path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
+        assert_eq!(
+            fs::read(survivor.path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
     }
 
     #[test]
@@ -220,7 +319,13 @@ mod tests {
         let plan = scan(root.path(), now);
         assert!(!plan.artifacts[0].has_evidence);
         assert_eq!(plan.artifacts[0].disposition, Disposition::Eligible);
-        retention::reclaim_one(&plan.artifacts[0], &plan, now, &mut Budget::new(Limits::default())).unwrap();
+        retention::reclaim_one(
+            &plan.artifacts[0],
+            &plan,
+            now,
+            &mut Budget::new(Limits::default()),
+        )
+        .unwrap();
         assert!(!path.exists());
     }
 
@@ -237,8 +342,17 @@ mod tests {
         let plan = scan(root.path(), now);
         let (target, survivor) = chosen(&plan);
         std::os::unix::fs::symlink(outside.path(), survivor.path.join("index/escape")).unwrap();
-        assert!(retention::reclaim_one(target, &plan, now, &mut Budget::new(Limits::default())).is_err());
-        assert_eq!(fs::read(target.path.join("index/MANIFEST")).unwrap(), b"retained failure");
-        assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"outside");
+        assert!(
+            retention::reclaim_one(target, &plan, now, &mut Budget::new(Limits::default()))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(target.path.join("index/MANIFEST")).unwrap(),
+            b"retained failure"
+        );
+        assert_eq!(
+            fs::read(outside.path().join("sentinel")).unwrap(),
+            b"outside"
+        );
     }
 }

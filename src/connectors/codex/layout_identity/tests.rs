@@ -7,15 +7,22 @@ const ID: &str = "776931f0-b259-49f6-9808-771bbfb92bbe";
 const BUDGET: u64 = 1024 * 1024;
 
 fn record(text: &str) -> String {
-    format!("{}\n", json!({"type":"response_item", "payload":{
-        "type":"message", "role":"user", "content":[{"type":"input_text", "text":text}]
-    }}))
+    format!(
+        "{}\n",
+        json!({"type":"response_item", "payload":{
+            "type":"message", "role":"user", "content":[{"type":"input_text", "text":text}]
+        }})
+    )
 }
 
 fn body(id: &str) -> String {
-    format!("{}\n{}", json!({"type":"session_meta", "payload":{
-        "id":id, "timestamp":"2026-10-13T00:00:00Z", "cwd":"/tmp/codex-layout-repro"
-    }}), record("hello from codex"))
+    format!(
+        "{}\n{}",
+        json!({"type":"session_meta", "payload":{
+            "id":id, "timestamp":"2026-10-13T00:00:00Z", "cwd":"/tmp/codex-layout-repro"
+        }}),
+        record("hello from codex")
+    )
 }
 
 fn fixture() -> Result<(tempfile::TempDir, LayoutPair, Receipt)> {
@@ -46,7 +53,10 @@ fn fixture() -> Result<(tempfile::TempDir, LayoutPair, Receipt)> {
 }
 
 fn append(path: &Path, text: &str) -> Result<()> {
-    OpenOptions::new().append(true).open(path)?.write_all(record(text).as_bytes())?;
+    OpenOptions::new()
+        .append(true)
+        .open(path)?
+        .write_all(record(text).as_bytes())?;
     Ok(())
 }
 
@@ -54,9 +64,17 @@ fn append(path: &Path, text: &str) -> Result<()> {
 fn gh524_both_layout_orders_preserve_the_selected_identity_and_accept_appends() -> Result<()> {
     for dated_first in [false, true] {
         let (_root, pair, mut receipt) = fixture()?;
-        receipt.canonical_external_id = if dated_first { pair.dated_id.clone() } else { pair.bare_id.clone() };
+        receipt.canonical_external_id = if dated_first {
+            pair.dated_id.clone()
+        } else {
+            pair.bare_id.clone()
+        };
         let original_id = receipt.canonical_external_id.clone();
-        let (first, second) = if dated_first { (&pair.dated, &pair.flat) } else { (&pair.flat, &pair.dated) };
+        let (first, second) = if dated_first {
+            (&pair.dated, &pair.flat)
+        } else {
+            (&pair.flat, &pair.dated)
+        };
         receipt.admit_path(first, BUDGET, None)?;
         receipt.admit_path(second, BUDGET, None)?;
         append(second, "new searchable message")?;
@@ -83,7 +101,10 @@ fn gh524_conflicting_equal_length_and_appended_branches_are_refused() -> Result<
             receipt.admit_path(&pair.flat, BUDGET, None)?;
             append(&pair.dated, "branch B")?;
         } else {
-            fs::write(&pair.dated, body(ID).replace("hello from codex", "jello from codex"))?;
+            fs::write(
+                &pair.dated,
+                body(ID).replace("hello from codex", "jello from codex"),
+            )?;
         }
         let before = receipt.clone();
         assert!(receipt.admit_path(&pair.dated, BUDGET, None).is_err());
@@ -97,7 +118,14 @@ fn gh524_metadata_conflicts_and_concatenated_sessions_are_refused() -> Result<()
     let (_root, pair, mut receipt) = fixture()?;
     fs::write(&pair.dated, body("876931f0-b259-49f6-9808-771bbfb92bbe"))?;
     assert!(receipt.admit_path(&pair.dated, BUDGET, None).is_err());
-    fs::write(&pair.dated, format!("{}{}", body(ID), body("876931f0-b259-49f6-9808-771bbfb92bbe")))?;
+    fs::write(
+        &pair.dated,
+        format!(
+            "{}{}",
+            body(ID),
+            body("876931f0-b259-49f6-9808-771bbfb92bbe")
+        ),
+    )?;
     assert!(read_snapshot(&pair.dated, &[], BUDGET, None).is_err());
     Ok(())
 }
@@ -176,12 +204,22 @@ fn gh524_receipts_are_source_scoped_atomic_and_round_trip() -> Result<()> {
 }
 
 fn delivery_fixture(pair: &LayoutPair) -> (ScanRoot, NormalizedConversation) {
-    let origin = Origin { source_id: "full-history-plan".into(), kind: SourceKind::Local, host: None };
+    let origin = Origin {
+        source_id: "full-history-plan".into(),
+        kind: SourceKind::Local,
+        host: None,
+    };
     let root = ScanRoot::remote(pair.flat.parent().unwrap().to_owned(), origin, None);
     let conversation = NormalizedConversation {
-        agent_slug: "codex".into(), external_id: Some(pair.dated_id.clone()),
-        title: None, workspace: None, source_path: pair.dated.clone(),
-        started_at: None, ended_at: None, metadata: json!({}), messages: Vec::new(),
+        agent_slug: "codex".into(),
+        external_id: Some(pair.dated_id.clone()),
+        title: None,
+        workspace: None,
+        source_path: pair.dated.clone(),
+        started_at: None,
+        ended_at: None,
+        metadata: json!({}),
+        messages: Vec::new(),
     };
     (root, conversation)
 }
@@ -195,12 +233,22 @@ fn gh524_delivery_uses_the_canonical_id_and_keeps_write_ahead_proof_on_failure()
     append(&pair.dated, "consumer may fail after committing")?;
     let (root, conversation) = delivery_fixture(&pair);
     let ctx = ScanContext::with_roots(data, vec![root.clone()], None);
-    let source = DiscoveredSourceFile::new("codex", &root, pair.dated.clone(), DiscoveredSourceRole::PrimarySessionLog, true).with_fs_metadata();
+    let source = DiscoveredSourceFile::new(
+        "codex",
+        &root,
+        pair.dated.clone(),
+        DiscoveredSourceRole::PrimarySessionLog,
+        true,
+    )
+    .with_fs_metadata();
     let mut seen = None;
-    assert!(deliver(&ctx, &source, conversation.clone(), &mut |conversation| {
-        seen = conversation.external_id;
-        anyhow::bail!("synthetic consumer failure")
-    }).is_err());
+    assert!(
+        deliver(&ctx, &source, conversation.clone(), &mut |conversation| {
+            seen = conversation.external_id;
+            anyhow::bail!("synthetic consumer failure")
+        })
+        .is_err()
+    );
     assert_eq!(seen.as_deref(), Some(pair.bare_id.as_str()));
     let saved = ReceiptLock::load_path(&path)?.unwrap();
     assert!(saved.head.bytes > receipt.head.bytes);
@@ -213,13 +261,25 @@ fn gh524_delivery_uses_the_canonical_id_and_keeps_write_ahead_proof_on_failure()
 fn gh524_other_agents_and_sources_keep_their_original_ids() -> Result<()> {
     let (temp, pair, receipt) = fixture()?;
     let data = temp.path().join("data");
-    ReceiptLock::acquire(receipt_path(&data, &receipt.source_id, &pair.bare_id))?.write(&receipt)?;
+    ReceiptLock::acquire(receipt_path(&data, &receipt.source_id, &pair.bare_id))?
+        .write(&receipt)?;
     let (mut root, mut conversation) = delivery_fixture(&pair);
     for other_agent in [true, false] {
-        if other_agent { conversation.agent_slug = "claude".into(); }
-        else { conversation.agent_slug = "codex".into(); root.origin.source_id = "different-owner".into(); }
+        if other_agent {
+            conversation.agent_slug = "claude".into();
+        } else {
+            conversation.agent_slug = "codex".into();
+            root.origin.source_id = "different-owner".into();
+        }
         let ctx = ScanContext::with_roots(data.clone(), vec![root.clone()], None);
-        let source = DiscoveredSourceFile::new("codex", &root, pair.dated.clone(), DiscoveredSourceRole::PrimarySessionLog, true).with_fs_metadata();
+        let source = DiscoveredSourceFile::new(
+            "codex",
+            &root,
+            pair.dated.clone(),
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
         let expected = conversation.external_id.clone();
         deliver(&ctx, &source, conversation.clone(), &mut |conversation| {
             assert_eq!(conversation.external_id, expected);

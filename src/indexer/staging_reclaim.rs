@@ -500,8 +500,18 @@ mod tests {
         reclaim_orphaned_staging_dirs_for_data_dir(tmp.path(), now);
         let after = crate::search::lexical_quarantine::inspect(tmp.path()).unwrap();
         assert!(after.complete);
-        assert_eq!(after.artifacts.len(), if before.automatic_retention_enabled { 1 } else { 3 });
-        assert_eq!(fs::read(after.artifacts[0].path.join("index/MANIFEST")).unwrap(), b"retained failed rebuild");
+        assert_eq!(
+            after.artifacts.len(),
+            if before.automatic_retention_enabled {
+                1
+            } else {
+                3
+            }
+        );
+        assert_eq!(
+            fs::read(after.artifacts[0].path.join("index/MANIFEST")).unwrap(),
+            b"retained failed rebuild"
+        );
         assert!(live.join("nested/payload.bin").is_file());
     }
 
