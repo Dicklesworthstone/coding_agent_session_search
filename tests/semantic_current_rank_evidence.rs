@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
+use coding_agent_search::franken_sync::compat::TransactionExt;
 use coding_agent_search::franken_sync::{Connection, SqliteValue};
 use coding_agent_search::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use coding_agent_search::search::embedder::Embedder;

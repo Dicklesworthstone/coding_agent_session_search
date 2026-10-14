@@ -1182,3 +1182,103 @@ fn gh494_pending_staged_commit_advances_from_the_candidate_manifest() {
         reconciled
     );
 }
+
+#[test]
+fn gh523_killed_staged_rebuild_resumes_from_its_last_commit_not_its_heartbeat() {
+    let tmp = TempDir::new().unwrap();
+    let live = tmp.path().join("index");
+    let scratch = staged_lexical_rebuild_scratch_path(&live);
+    // A prior live generation sits beside the candidate, as on any host that
+    // already had an index when the rebuild started.
+    let mut prior = TantivyIndex::open_or_create(&live).unwrap();
+    prior.commit().unwrap();
+    drop(prior);
+    let conversation = |id: &str, first_idx: i64, count: i64| {
+        let messages = (first_idx..first_idx + count)
+            .map(|idx| norm_msg(idx, 1_700_000_000_000 + idx))
+            .collect();
+        norm_conv(Some(id), messages)
+    };
+    let new_state = || {
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/fixture/agent_search.db".to_string(),
+                total_conversations: 3,
+                total_messages: 6,
+                storage_fingerprint: "content-v1:3:3:6".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.set_execution_mode(LexicalRebuildExecutionMode::StagedSingleIndex);
+        state
+    };
+    let runtime = LexicalRebuildPipelineRuntimeSnapshot::default();
+
+    // The candidate durably committed conversation 1 (2 documents).
+    let first = conversation("first", 0, 2);
+    let mut candidate = TantivyIndex::open_or_create(&scratch).unwrap();
+    candidate
+        .add_messages_with_conversation_id(&first, &first.messages, Some(1))
+        .unwrap();
+    candidate.commit().unwrap();
+    let mut state = new_state();
+    state.record_pending_commit(Some(1), 1, 2, index_meta_fingerprint(&scratch).unwrap());
+    state.finalize_commit(index_meta_fingerprint(&scratch).unwrap());
+
+    // A heartbeat records progress the writer holds but has not committed,
+    // then `timeout` kills the run before the next commit.
+    let mut heartbeat = state.clone();
+    persist_pending_lexical_rebuild_progress(
+        &live,
+        &scratch,
+        &mut heartbeat,
+        Some(3),
+        3,
+        6,
+        &runtime,
+    )
+    .unwrap();
+    assert_eq!(
+        heartbeat.pending.as_ref().unwrap().base_meta_fingerprint,
+        index_meta_fingerprint(&scratch).unwrap(),
+        "the pending base must describe the directory the next commit writes"
+    );
+    let reconciled = reconcile_pending_lexical_commit(&live, heartbeat).unwrap();
+    assert_eq!(
+        (reconciled.processed_conversations, reconciled.indexed_docs),
+        (1, 2),
+        "uncommitted heartbeat progress must replay, not be promoted"
+    );
+    assert!(reconciled.pending.is_none());
+
+    // A checkpoint an older cass wrote took the base from the live
+    // generation, which always differs from the candidate. It is not promoted
+    // past what the candidate committed either.
+    let mut legacy = state.clone();
+    legacy.record_pending_commit(Some(3), 3, 6, index_meta_fingerprint(&live).unwrap());
+    let reconciled = reconcile_pending_lexical_commit(&live, legacy).unwrap();
+    assert_eq!(
+        (reconciled.processed_conversations, reconciled.indexed_docs),
+        (1, 2)
+    );
+
+    // A commit that did land after its pending record is still promoted.
+    let mut landed = state;
+    persist_pending_lexical_rebuild_progress(&live, &scratch, &mut landed, Some(3), 3, 6, &runtime)
+        .unwrap();
+    let rest = conversation("rest", 2, 4);
+    candidate
+        .add_messages_with_conversation_id(&rest, &rest.messages, Some(3))
+        .unwrap();
+    candidate.commit().unwrap();
+    drop(candidate);
+    let reconciled = reconcile_pending_lexical_commit(&live, landed).unwrap();
+    assert_eq!(
+        (reconciled.processed_conversations, reconciled.indexed_docs),
+        (3, 6)
+    );
+    assert_eq!(
+        reconciled.committed_meta_fingerprint,
+        index_meta_fingerprint(&scratch).unwrap()
+    );
+}

@@ -297,9 +297,10 @@ fn exercise(test_name: &str, trailing_slash: bool, retain_basename: bool) {
             actual_messages[0].3,
             format!("{agent}subtreeprobe {fixture_id} question")
         );
+        // The archive stores MessageRole::Agent as "agent".
         assert_eq!(
             (actual_messages[1].1, actual_messages[1].2.as_str()),
-            (1, "assistant")
+            (1, "agent")
         );
         assert_eq!(actual_messages[1].3, format!("{agent} {fixture_id} answer"));
     }
@@ -320,11 +321,15 @@ fn exercise(test_name: &str, trailing_slash: bool, retain_basename: bool) {
             "--no-daemon",
         ]);
         let result: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(
-            result["hits"].as_array().unwrap().len(),
-            count,
-            "{marker}: {result}"
-        );
+        // Count sessions, not hits: a conversation whose title is its first
+        // question (factory) also matches through that title on its answer.
+        let conversations = result["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["conversation_id"].as_i64().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(conversations.len(), count, "{marker}: {result}");
     }
     run(&["index", "--json"]);
     assert_eq!(

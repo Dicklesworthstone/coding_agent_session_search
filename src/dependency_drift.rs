@@ -88,7 +88,9 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "franken-agent-detection",
         manifest_table: "dependencies",
         manifest_key: "franken-agent-detection",
-        source_kind: "registry",
+        // Cargo.toml pins the GH#520 fix by git rev until a registry release
+        // carries it; switch back to "registry" with that release.
+        source_kind: "git",
         repo_rel: "../franken_agent_detection",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -966,6 +968,21 @@ mod tests {
         let manifest = checked_in_manifest()?;
         for spec in DEPENDENCY_SPECS {
             let pin = manifest_pin(&manifest, spec);
+            if spec.source_kind == "git" {
+                // A git-pinned dependency keeps an exact version beside its
+                // git URL and revision.
+                ensure(
+                    pin.status == "pinned"
+                        && pin.git.is_some()
+                        && pin.rev.is_some()
+                        && pin
+                            .version
+                            .as_deref()
+                            .is_some_and(|value| value.starts_with('=')),
+                    format!("{} must keep its exact git and version pin", spec.name),
+                )?;
+                continue;
+            }
             ensure(
                 spec.source_kind == "registry",
                 format!("{} must report its current registry source", spec.name),

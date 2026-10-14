@@ -6617,6 +6617,7 @@ fn commit_lexical_rebuild_progress(
     let pending_progress_started = perf_profile.as_ref().map(|_| Instant::now());
     persist_pending_lexical_rebuild_progress(
         state_path,
+        content_path,
         rebuild_state,
         next_conversation_id,
         processed_conversations,
@@ -9937,10 +9938,25 @@ fn reconcile_pending_lexical_commit(
     // directory that commit_lexical_rebuild_progress fingerprinted.
     let content_path = lexical_rebuild_resume_content_path(index_path, &state)?;
     let current_meta_fingerprint = index_meta_fingerprint(&content_path)?;
-    if pending_commit_landed(
-        pending.base_meta_fingerprint.as_deref(),
-        current_meta_fingerprint.as_deref(),
-    ) {
+    // A staged candidate's MANIFEST counts what really committed, and that
+    // count decides. A fingerprint cannot: a heartbeat's uncommitted progress
+    // in a checkpoint from an older cass carries the live generation's
+    // fingerprint, which always differs from the candidate's (so it was
+    // promoted, and the resume check then quarantined a candidate that was
+    // only behind its own heartbeat, GH #523), while the terminal checkpoint
+    // is written after the folding commit, so its base already describes the
+    // committed generation. The resume check applies the same count rule.
+    let landed = match (content_path != index_path)
+        .then(|| crate::search::tantivy::searchable_index_live_doc_count(&content_path))
+        .flatten()
+    {
+        Some(live_docs) => u128::from(live_docs) >= pending.indexed_docs as u128,
+        None => pending_commit_landed(
+            pending.base_meta_fingerprint.as_deref(),
+            current_meta_fingerprint.as_deref(),
+        ),
+    };
+    if landed {
         state.finalize_commit(current_meta_fingerprint);
     } else {
         state.clear_pending();
@@ -10114,12 +10130,8 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     processed_conversations: usize,
     indexed_docs: usize,
     runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-    base_meta_fingerprint_override: Option<&str>,
+    base_meta_fingerprint: Option<String>,
 ) -> Result<()> {
-    let base_meta_fingerprint = match base_meta_fingerprint_override {
-        Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
-        None => index_meta_fingerprint(index_path)?,
-    };
     let checkpoint_runtime = runtime.checkpoint_snapshot();
     let current_processed_conversations = state.reported_processed_conversations();
     let current_indexed_docs = state.reported_indexed_docs();
@@ -10161,8 +10173,18 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     persist_lexical_rebuild_state(index_path, state)
 }
 
+/// `index_path` locates the checkpoint; `content_path` is the directory the
+/// next commit writes. After a crash, reconcile_pending_lexical_commit decides
+/// whether the pending commit landed by comparing its base fingerprint with
+/// that same content directory. A staged rebuild commits into its scratch
+/// sibling, so a base taken from `index_path` (the untouched live generation)
+/// always differs: every heartbeat's uncommitted counts were promoted, the
+/// resume check found the candidate short, and each killed run quarantined
+/// its candidate and restarted from zero (GH #523).
+#[allow(clippy::too_many_arguments)]
 fn persist_pending_lexical_rebuild_progress(
     index_path: &Path,
+    content_path: &Path,
     state: &mut LexicalRebuildState,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
@@ -10176,7 +10198,7 @@ fn persist_pending_lexical_rebuild_progress(
         processed_conversations,
         indexed_docs,
         runtime,
-        None,
+        index_meta_fingerprint(content_path)?,
     )
 }
 
@@ -10212,6 +10234,10 @@ fn maybe_persist_staged_lexical_rebuild_progress(
     }
 
     let heartbeat_progress_started = perf_profile.as_ref().map(|_| Instant::now());
+    let base_meta_fingerprint = match base_meta_fingerprint_override {
+        Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
+        None => index_meta_fingerprint(index_path)?,
+    };
     persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         index_path,
         state,
@@ -10219,7 +10245,7 @@ fn maybe_persist_staged_lexical_rebuild_progress(
         processed_conversations,
         indexed_docs,
         runtime,
-        base_meta_fingerprint_override,
+        base_meta_fingerprint,
     )?;
     bump_index_run_lock_progress_if_present(progress_bump);
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), heartbeat_progress_started) {
@@ -27526,6 +27552,7 @@ fn rebuild_tantivy_from_db_once(
                     );
                     persist_pending_lexical_rebuild_progress(
                         &index_path,
+                        &build_path,
                         &mut rebuild_state,
                         last_processed_conversation_id,
                         processed_conversations,
@@ -30959,6 +30986,7 @@ impl ConnectorKind {
             "hermes" => Some(Self::Hermes),
             "codebuff" => Some(Self::Codebuff),
             "pi_durable" => Some(Self::PiDurable),
+            "continue" => Some(Self::Continue),
             _ => None,
         }
     }
@@ -30998,6 +31026,7 @@ impl ConnectorKind {
             Self::Hermes => "hermes",
             Self::Codebuff => "codebuff",
             Self::PiDurable => "pi_durable",
+            Self::Continue => "continue",
         }
     }
 
@@ -31038,6 +31067,7 @@ impl ConnectorKind {
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
             Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
             Self::PiDurable => Box::new(franken_agent_detection::PiDurableConnector::new()),
+            Self::Continue => Box::new(franken_agent_detection::ContinueConnector::new()),
         }
     }
 }
@@ -31237,6 +31267,20 @@ fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
                 .extension()
                 .is_some_and(|extension| extension == "db")))
         && root.path.is_file()
+}
+
+/// Shelley and Devin take an explicit file root as their database and fail the
+/// whole scan on anything else. So `--watch-once <file>` under a directory root
+/// hands them the file only when it is a SQLite database. An unhinted Codex
+/// rollout under a shared configured source used to fail the run (GH #524).
+fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) -> bool {
+    if !matches!(kind, ConnectorKind::Shelley | ConnectorKind::Devin) || !path.is_file() {
+        return true;
+    }
+    let mut header = [0_u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .is_ok_and(|()| &header == b"SQLite format 3\0")
 }
 
 /// FSEvents (macOS) reports a write through a file descriptor that stays open
@@ -32790,6 +32834,8 @@ enum ConnectorKind {
     /// Pi durable-harness stores (franken_agent_detection #28).
     #[serde(rename = "pd", alias = "PiDurable")]
     PiDurable,
+    #[serde(rename = "ct", alias = "Continue")]
+    Continue,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -33216,6 +33262,12 @@ fn classify_paths(
             {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
+                {
+                    continue;
+                }
+                if prefer_explicit_paths
+                    && !is_database_watch_root(*kind, root)
+                    && !explicit_watch_once_file_may_be_database(*kind, p)
                 {
                     continue;
                 }
@@ -63294,6 +63346,39 @@ c.close()
     }
 
     #[test]
+    fn classify_paths_gives_database_connectors_only_sqlite_watch_once_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let rollout =
+            root.join("rollout-2026-10-13T16-20-00-00000000-0000-4000-8000-000000000001.jsonl");
+        std::fs::write(&rollout, b"{}\n").unwrap();
+        let database = root.join("chats.db");
+        std::fs::write(&database, b"SQLite format 3\0rest of the header").unwrap();
+        let roots = vec![
+            (ConnectorKind::Codex, ScanRoot::local(root.clone())),
+            (ConnectorKind::Shelley, ScanRoot::local(root.clone())),
+            (ConnectorKind::Devin, ScanRoot::local(root.clone())),
+        ];
+        let kinds = |path: &PathBuf, explicit: bool| -> Vec<ConnectorKind> {
+            classify_paths(vec![path.clone()], &roots, explicit)
+                .into_iter()
+                .map(|(kind, ..)| kind)
+                .collect()
+        };
+
+        // An unhinted rollout under a shared root reaches Codex only; Shelley
+        // and Devin would open it as their database and fail the run (GH #524).
+        assert_eq!(kinds(&rollout, true), vec![ConnectorKind::Codex]);
+        // A SQLite file under the same root still reaches them.
+        let database_kinds = kinds(&database, true);
+        assert!(database_kinds.contains(&ConnectorKind::Shelley));
+        assert!(database_kinds.contains(&ConnectorKind::Devin));
+        // A live watch event keeps scanning the configured root for every kind.
+        assert_eq!(kinds(&rollout, false).len(), 3);
+    }
+
+    #[test]
     fn classify_paths_keeps_explicit_prime_file_and_rejects_similar_provider_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let session = tmp.path().join(".prime/agent/sessions/chosen.jsonl");
@@ -69327,6 +69412,7 @@ c.close()
 
         persist_pending_lexical_rebuild_progress(
             &index_path,
+            &index_path,
             &mut state,
             Some(6),
             6,
@@ -69413,6 +69499,7 @@ c.close()
 
         persist_pending_lexical_rebuild_progress(
             &index_path,
+            &index_path,
             &mut state,
             Some(6),
             6,
@@ -69479,6 +69566,7 @@ c.close()
         };
 
         persist_pending_lexical_rebuild_progress(
+            &index_path,
             &index_path,
             &mut state,
             Some(5),
@@ -69570,7 +69658,7 @@ c.close()
             5,
             10,
             &runtime,
-            cached_base_meta_fingerprint.as_deref(),
+            cached_base_meta_fingerprint.clone(),
         )
         .unwrap();
 

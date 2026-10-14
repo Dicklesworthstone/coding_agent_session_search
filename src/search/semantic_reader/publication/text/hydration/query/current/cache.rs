@@ -12,7 +12,9 @@ use frankensearch::{ModelCategory, ModelTier};
 pub(super) struct CachedProducer<'request> {
     text: &'request str,
     inner: &'request dyn Embedder,
-    response: OnceLock<IdentityBoundEmbedding>,
+    // Boxed: the identity bundle is large, and CachedProducers holds two of
+    // these inline in its progressive variant.
+    response: OnceLock<Box<IdentityBoundEmbedding>>,
 }
 
 impl<'request> CachedProducer<'request> {
@@ -43,7 +45,7 @@ impl Embedder for CachedProducer<'_> {
             // is private and never given to a parallel inference scheduler.
             let bound = self.inner.embed_bound_sync(text)?;
             bound.validate()?;
-            let _ = self.response.set(bound);
+            let _ = self.response.set(Box::new(bound));
         }
         let bound = self
             .response

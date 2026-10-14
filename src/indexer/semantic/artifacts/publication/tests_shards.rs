@@ -275,7 +275,7 @@ fn healthy_shard_wal_is_pinned_and_failed_sync_is_a_typed_refusal() -> Result<()
 fn not_ready_shards_keep_ownership_without_requiring_valid_data_or_an_ann() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let data = temp.path();
-    let fixture = Fixture::new(data, TierKind::Quality, true)?;
+    let _fixture = Fixture::new(data, TierKind::Quality, true)?;
     let protected_dir = data.join("vector_index/.backfill-reuse-OwnedShard123");
     fs::create_dir(&protected_dir)?;
     let protected = protected_dir.join("candidate.fsvi");
