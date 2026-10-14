@@ -733,6 +733,40 @@ mod retry {
             assert_eq!(backups.len(), 1);
             assert_eq!(fs::read(&backups[0]).unwrap(), CONFIG.as_bytes());
         }
+
+        fn assert_scope_refused(&self, output: &Output, before: &[u8], inode: u64) {
+            assert!(!output.status.success(), "{output:?}");
+            let diagnostics = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for expected in [
+                "Cannot change --hosts",
+                "without --resume",
+                "No remote operations were started",
+                "checkpoint is unchanged",
+            ] {
+                assert!(diagnostics.contains(expected), "{output:?}");
+            }
+            assert!(!diagnostics.contains("Setup Complete"), "{output:?}");
+            assert!(self.transports().is_empty());
+            assert_eq!(fs::read(self.state_path()).unwrap(), before);
+            assert_eq!(fs::symlink_metadata(self.state_path()).unwrap().ino(), inode);
+            assert_eq!(
+                fs::read_dir(self.state_path().parent().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+            let config = self.root.path().join("config/cass/sources.toml");
+            assert_eq!(fs::read(&config).unwrap(), CONFIG.as_bytes());
+            assert_eq!(
+                fs::symlink_metadata(&config).unwrap().ino(),
+                self.config_inode
+            );
+            assert_eq!(fs::read_dir(config.parent().unwrap()).unwrap().count(), 1);
+        }
     }
 
     #[test]
@@ -814,6 +848,72 @@ mod retry {
         // reindexing hosts whose completed work is already on disk.
         fixture.save_initial();
         let output = fixture.run(&["--json", "--skip-sync"]);
+        fixture.assert_configured(&output);
+    }
+
+    #[test]
+    fn setup_resume_changed_host_scope_never_reaches_old_targets() {
+        for (indexing, selection_complete) in [(false, false), (false, true), (true, true)] {
+            for mode in [None, Some("--json"), Some("--dry-run")] {
+                let mut fixture = RetryFixture::new(indexing);
+                if !selection_complete {
+                    fixture.initial.selection_complete = false;
+                    fixture.initial.selected_host_names.clear();
+                    fixture.initial.completed_installs.clear();
+                    fixture.initial.completed_indexes.clear();
+                }
+                fixture.save_initial();
+                let before = fs::read(fixture.state_path()).unwrap();
+                let inode = fs::symlink_metadata(fixture.state_path()).unwrap().ino();
+                let mut flags = vec!["--hosts", HOSTS[2]];
+                flags.extend(mode);
+                for _ in 0..2 {
+                    let output = fixture.run(&flags);
+                    // Previously the new list was ignored after probing; the
+                    // old selection could install/index on .1 or .2 instead.
+                    fixture.assert_scope_refused(&output, &before, inode);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn setup_resume_equivalent_host_scope_preserves_selection_and_successes() {
+        for requested in [
+            vec![HOSTS[2], HOSTS[1], HOSTS[0], HOSTS[2]],
+            vec![HOSTS[1], HOSTS[0], HOSTS[1]],
+        ] {
+            let mut fixture = RetryFixture::new(false);
+            fixture.initial.selected_host_names = vec![HOSTS[0].into(), HOSTS[1].into()];
+            fixture.save_initial();
+            let argument = requested.join(",");
+            let output = fixture.run(&["--json", "--hosts", &argument]);
+            // Accept both the original discovered set and the saved selection.
+            // Neither may expand that selection or repeat completed host .1.
+            fixture.assert_paused(&output, "Installing", true);
+        }
+    }
+
+    #[test]
+    fn setup_resume_scope_refusal_preserves_configuration_retry() {
+        let mut fixture = RetryFixture::new(false);
+        fixture.initial.completed_installs = HOSTS.iter().map(|host| (*host).into()).collect();
+        fixture.initial.completed_indexes = fixture.initial.completed_installs.clone();
+        fixture.save_initial();
+        let before = fs::read(fixture.state_path()).unwrap();
+        let inode = fs::symlink_metadata(fixture.state_path()).unwrap().ino();
+        for requested in [
+            "100.64.0.99",
+            "100.64.0.1,100.64.0.2,100.64.0.3,100.64.0.99",
+            "100.64.0.1,operator@100.64.0.2,100.64.0.3",
+        ] {
+            let output = fixture.run(&["--json", "--hosts", requested, "--skip-sync"]);
+            // Even when no remote install/index is due, do not configure the
+            // old targets, return success or clear their resumable progress.
+            fixture.assert_scope_refused(&output, &before, inode);
+        }
+        let argument = format!("{},{},{},{}", HOSTS[2], HOSTS[0], HOSTS[1], HOSTS[0]);
+        let output = fixture.run(&["--json", "--hosts", &argument, "--skip-sync"]);
         fixture.assert_configured(&output);
     }
 }
