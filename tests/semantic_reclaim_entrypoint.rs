@@ -24,23 +24,25 @@ fn seed(data: &Path) -> Result<()> {
     )?;
     writer.write_record("retained-document", &[1.0, 0.0, 0.0, 0.0])?;
     writer.finish()?;
-    let mut manifest = SemanticManifest::default();
-    manifest.fast_tier = Some(ArtifactRecord {
-        tier: TierKind::Fast,
-        embedder_id: "fnv1a-384".into(),
-        model_revision: "preview-fixture".into(),
-        schema_version: 1,
-        chunking_version: 1,
-        dimension: 4,
-        doc_count: 1,
-        conversation_count: 1,
-        db_fingerprint: "preview-fixture".into(),
-        index_path: relative.into(),
-        size_bytes: fs::metadata(&live)?.len(),
-        started_at_ms: 1,
-        completed_at_ms: 1,
-        ready: false,
-    });
+    let manifest = SemanticManifest {
+        fast_tier: Some(ArtifactRecord {
+            tier: TierKind::Fast,
+            embedder_id: "fnv1a-384".into(),
+            model_revision: "preview-fixture".into(),
+            schema_version: 1,
+            chunking_version: 1,
+            dimension: 4,
+            doc_count: 1,
+            conversation_count: 1,
+            db_fingerprint: "preview-fixture".into(),
+            index_path: relative.into(),
+            size_bytes: fs::metadata(&live)?.len(),
+            started_at_ms: 1,
+            completed_at_ms: 1,
+            ready: false,
+        }),
+        ..Default::default()
+    };
     manifest.save(data)?;
     fs::write(
         root.join(".staging-quality-minilm-384-22222222.fsvi"),
