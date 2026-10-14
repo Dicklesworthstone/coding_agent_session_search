@@ -113,3 +113,43 @@ fn gh514_successful_noop_scan_resets_failed_child_breaker() {
     assert_eq!(state.last_failure, None);
     assert_eq!(state.last_failure_detected_ms, 0);
 }
+
+#[test]
+fn gh514_enrich_freshness_with_source_scan_watermark_suppresses_overdue_scan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).expect("open canonical archive");
+    let indexed = 1_800_000_000_000_i64;
+    let scanned = indexed + 600_000;
+    storage
+        .set_last_scan_ts(scanned)
+        .expect("record source scan");
+    drop(storage);
+
+    let interval = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+    let base_freshness = serde_json::json!({
+        "exists": true,
+        "stale": false,
+        "partial": false,
+        "pending_sessions": 0,
+        "last_indexed_at": indexed,
+    });
+    assert_eq!(
+        catch_up_reason_at(&base_freshness, scanned + 120_000, interval),
+        Some("source-scan-overdue"),
+        "without DB scan watermark enrichment, old last_indexed_at triggers source-scan-overdue"
+    );
+
+    let enriched = enrich_freshness_with_source_scan_watermark(&base_freshness, &db_path)
+        .expect("enrich freshness with canonical last_scan_ts");
+    assert_eq!(
+        catch_up_reason_at(&enriched, scanned + 120_000, interval),
+        None,
+        "enriched freshness honors recent no-op source scan"
+    );
+    assert_eq!(
+        catch_up_reason_at(&enriched, scanned + 300_000, interval),
+        Some("source-scan-overdue"),
+        "once canonical last_scan_ts also ages past interval, source-scan-overdue fires"
+    );
+}

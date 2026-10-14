@@ -252,6 +252,32 @@ pub fn source_scan_completed_at_ms_from_db(db_path: &Path) -> Option<i64> {
         .filter(|value| *value > 0)
 }
 
+/// Inject `source_scan_completed_at_ms` from the canonical database into a
+/// freshness object when absent so `catch_up_reason` and
+/// `last_indexed_at_ms_from_freshness` honor completed no-op source scans
+/// without altering robot schema outputs.
+pub fn enrich_freshness_with_source_scan_watermark(
+    freshness: &serde_json::Value,
+    db_path: &Path,
+) -> Option<serde_json::Value> {
+    if freshness
+        .get("source_scan_completed_at_ms")
+        .is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+    let scan_ms = source_scan_completed_at_ms_from_db(db_path)?;
+    let mut enriched = freshness.clone();
+    if let serde_json::Value::Object(map) = &mut enriched {
+        map.insert(
+            "source_scan_completed_at_ms".to_string(),
+            serde_json::Value::Number(scan_ms.into()),
+        );
+        return Some(enriched);
+    }
+    None
+}
+
 /// Pure source-scan cadence policy. A missing watermark means a scan is due;
 /// zero disables age-triggered scans. Future timestamps are treated as fresh
 /// rather than causing a spawn storm after a wall-clock correction.

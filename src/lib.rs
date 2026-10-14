@@ -23248,7 +23248,7 @@ fn maybe_auto_refresh_index_after_read(
         return None;
     }
     let owned;
-    let freshness = match precomputed {
+    let base_freshness = match precomputed {
         Some(value) => value,
         None => {
             let meta = state_meta_json_for_health(data_dir, db_path, DEFAULT_STALE_THRESHOLD_SECS);
@@ -23256,7 +23256,18 @@ fn maybe_auto_refresh_index_after_read(
             &owned
         }
     };
-    let trigger = background_refresh::catch_up_reason(freshness)?;
+    let mut trigger = background_refresh::catch_up_reason(base_freshness)?;
+    let enriched;
+    let freshness = if trigger == "source-scan-overdue"
+        && let Some(with_scan) =
+            background_refresh::enrich_freshness_with_source_scan_watermark(base_freshness, db_path)
+    {
+        enriched = with_scan;
+        trigger = background_refresh::catch_up_reason(&enriched)?;
+        &enriched
+    } else {
+        base_freshness
+    };
     let outcome = background_refresh::maybe_spawn_background_index_refresh(
         data_dir,
         db_path,
