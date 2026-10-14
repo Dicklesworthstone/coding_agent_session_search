@@ -752,7 +752,10 @@ mod retry {
             assert!(!diagnostics.contains("Setup Complete"), "{output:?}");
             assert!(self.transports().is_empty());
             assert_eq!(fs::read(self.state_path()).unwrap(), before);
-            assert_eq!(fs::symlink_metadata(self.state_path()).unwrap().ino(), inode);
+            assert_eq!(
+                fs::symlink_metadata(self.state_path()).unwrap().ino(),
+                inode
+            );
             assert_eq!(
                 fs::read_dir(self.state_path().parent().unwrap())
                     .unwrap()

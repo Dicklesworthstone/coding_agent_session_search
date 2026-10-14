@@ -1840,7 +1840,12 @@ CASS_VERSION=0.4.2
                     .unwrap();
                 assert_eq!(source.host.as_deref(), Some(name));
                 assert_eq!(source.paths, vec![path]);
-                assert!(source.path_mappings.iter().any(|mapping| mapping.from == home));
+                assert!(
+                    source
+                        .path_mappings
+                        .iter()
+                        .any(|mapping| mapping.from == home)
+                );
                 assert!(source.validate().is_ok());
             }
             let (again, merged_again) = deduplicate_probe_results(deduped.clone());
