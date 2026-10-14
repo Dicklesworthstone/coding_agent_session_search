@@ -210,6 +210,30 @@ fn gh524_delivery_uses_the_canonical_id_and_keeps_write_ahead_proof_on_failure()
 }
 
 #[test]
+fn watch_once_rollout_as_data_dir_is_delivered_unchanged() -> Result<()> {
+    // `cass index --watch-once <rollout>` scans with the rollout file itself as
+    // data_dir; a registry lookup under it failed with ENOTDIR.
+    let (_temp, pair, _receipt) = fixture()?;
+    let (root, conversation) = delivery_fixture(&pair);
+    let ctx = ScanContext::with_roots(pair.dated.clone(), vec![root.clone()], None);
+    let source = DiscoveredSourceFile::new(
+        "codex",
+        &root,
+        pair.dated.clone(),
+        DiscoveredSourceRole::PrimarySessionLog,
+        true,
+    )
+    .with_fs_metadata();
+    let mut delivered = Vec::new();
+    deliver(&ctx, &source, conversation.clone(), &mut |conversation| {
+        delivered.push(conversation.external_id);
+        Ok(())
+    })?;
+    assert_eq!(delivered, vec![conversation.external_id]);
+    Ok(())
+}
+
+#[test]
 fn gh524_other_agents_and_sources_keep_their_original_ids() -> Result<()> {
     let (temp, pair, receipt) = fixture()?;
     let data = temp.path().join("data");

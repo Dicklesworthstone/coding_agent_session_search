@@ -31175,6 +31175,20 @@ fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
         && root.path.is_file()
 }
 
+/// Shelley and Devin take an explicit file root as their database and fail the
+/// whole scan on anything else. So `--watch-once <file>` under a directory root
+/// hands them the file only when it is a SQLite database. An unhinted Codex
+/// rollout under a shared configured source used to fail the run (GH #524).
+fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) -> bool {
+    if !matches!(kind, ConnectorKind::Shelley | ConnectorKind::Devin) || !path.is_file() {
+        return true;
+    }
+    let mut header = [0_u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .is_ok_and(|()| &header == b"SQLite format 3\0")
+}
+
 /// FSEvents (macOS) reports a write through a file descriptor that stays open
 /// only when that descriptor closes, and SQLite keeps a provider's `-wal` open
 /// for the life of its connection, so a running Devin or Shelley's WAL-only
@@ -33152,6 +33166,12 @@ fn classify_paths(
             {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
+                {
+                    continue;
+                }
+                if prefer_explicit_paths
+                    && !is_database_watch_root(*kind, root)
+                    && !explicit_watch_once_file_may_be_database(*kind, p)
                 {
                     continue;
                 }
@@ -63170,6 +63190,39 @@ c.close()
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
         assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
+    }
+
+    #[test]
+    fn classify_paths_gives_database_connectors_only_sqlite_watch_once_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let rollout =
+            root.join("rollout-2026-10-13T16-20-00-00000000-0000-4000-8000-000000000001.jsonl");
+        std::fs::write(&rollout, b"{}\n").unwrap();
+        let database = root.join("chats.db");
+        std::fs::write(&database, b"SQLite format 3\0rest of the header").unwrap();
+        let roots = vec![
+            (ConnectorKind::Codex, ScanRoot::local(root.clone())),
+            (ConnectorKind::Shelley, ScanRoot::local(root.clone())),
+            (ConnectorKind::Devin, ScanRoot::local(root.clone())),
+        ];
+        let kinds = |path: &PathBuf, explicit: bool| -> Vec<ConnectorKind> {
+            classify_paths(vec![path.clone()], &roots, explicit)
+                .into_iter()
+                .map(|(kind, ..)| kind)
+                .collect()
+        };
+
+        // An unhinted rollout under a shared root reaches Codex only; Shelley
+        // and Devin would open it as their database and fail the run (GH #524).
+        assert_eq!(kinds(&rollout, true), vec![ConnectorKind::Codex]);
+        // A SQLite file under the same root still reaches them.
+        let database_kinds = kinds(&database, true);
+        assert!(database_kinds.contains(&ConnectorKind::Shelley));
+        assert!(database_kinds.contains(&ConnectorKind::Devin));
+        // A live watch event keeps scanning the configured root for every kind.
+        assert_eq!(kinds(&rollout, false).len(), 3);
     }
 
     #[test]

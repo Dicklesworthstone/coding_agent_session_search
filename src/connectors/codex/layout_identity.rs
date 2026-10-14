@@ -390,7 +390,13 @@ pub(super) fn deliver(
     mut conversation: NormalizedConversation,
     sink: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    if conversation.agent_slug != "codex" || !ctx.data_dir.join(REGISTRY_DIRECTORY).try_exists()? {
+    // `cass index --watch-once <rollout>` scans with the rollout file itself as
+    // data_dir. Stat'ing a registry under a file fails with ENOTDIR and dropped
+    // every targeted Codex conversation, so only a directory can hold receipts.
+    if conversation.agent_slug != "codex"
+        || !ctx.data_dir.is_dir()
+        || !ctx.data_dir.join(REGISTRY_DIRECTORY).try_exists()?
+    {
         return sink(conversation);
     }
     let Some(name) = source.source_path.file_name().and_then(|name| name.to_str()) else {

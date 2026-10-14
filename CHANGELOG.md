@@ -111,6 +111,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   each followed by `cass index`. The mirror grew 30.1 MB on v0.10.0 and
   1.3 MB with the fix.
 
+- **`cass index --watch-once <file>` no longer fails on a session under a
+  shared configured source.** When the path alone did not tie the file to an
+  agent (a Codex rollout outside `~/.codex`, for example), every connector
+  whose root contained it scanned it. Shelley and Devin open any explicit
+  file as their database, so their scan failed and the run exited 9. They
+  now get such a file only when it is a SQLite database.
+
 - **`cass timeline` and `cass sessions` read `--since`/`--until` the way
   `cass search` does.** Timeline understood only dates, `today`,
   `yesterday` and day or hour offsets, and replaced anything else with its
