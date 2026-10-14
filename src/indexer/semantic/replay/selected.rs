@@ -24,6 +24,66 @@ type Selection = BTreeMap<i64, Vec<MessageKey>>;
 const BODY_SQL: &str = "SELECT id, idx, role, author, created_at, content
     FROM messages WHERE id = ?1 AND conversation_id = ?2 AND idx = ?3";
 
+const HIGH_WATER_SQL: &str = "SELECT id FROM messages
+    WHERE id > ?1 ORDER BY id DESC LIMIT 1";
+const SINCE_SQL: &str = "SELECT id, conversation_id, idx FROM messages
+    WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT ?3";
+
+fn select_since(connection: &Connection, since_message_id: i64) -> Result<Selection> {
+    let mut high_water = None;
+    connection.query_with_params_for_each(
+        HIGH_WATER_SQL,
+        &[SqliteValue::from(since_message_id)],
+        |row| {
+            let id: i64 = row.get_typed(0)?;
+            if id <= since_message_id || high_water.replace(id).is_some() {
+                return Err(FrankenError::Internal("invalid semantic catch-up high water".into()));
+            }
+            Ok(())
+        },
+    ).context("capture canonical semantic catch-up high water")?;
+    let Some(high_water) = high_water else {
+        return Ok(Selection::new());
+    };
+    select_since_through(connection, since_message_id, high_water)
+}
+
+fn select_since_through(
+    connection: &Connection,
+    since_message_id: i64,
+    high_water: i64,
+) -> Result<Selection> {
+    ensure!(high_water > since_message_id, "invalid semantic catch-up range");
+    let mut selected = Selection::new();
+    let mut cursor = since_message_id;
+    while cursor < high_water {
+        let mut count = 0;
+        connection.query_with_params_for_each(
+            SINCE_SQL,
+            &[SqliteValue::from(cursor), SqliteValue::from(high_water),
+                SqliteValue::from(pages::MAX_ROWS as i64)],
+            |row| {
+                let id: i64 = row.get_typed(0)?;
+                if count >= pages::MAX_ROWS || id <= cursor || id > high_water {
+                    return Err(FrankenError::Internal(
+                        "semantic catch-up identity page did not advance within its range".into(),
+                    ));
+                }
+                let parent: i64 = row.get_typed(1)?;
+                let idx: i64 = row.get_typed(2)?;
+                selected.entry(parent).or_default().push(MessageKey { id, idx });
+                cursor = id;
+                count += 1;
+                Ok(())
+            },
+        ).context("page canonical semantic catch-up identities")?;
+        // The captured endpoint must be observed. A disappearing endpoint
+        // cannot turn an incomplete scan into an acknowledged catch-up batch.
+        ensure!(count > 0, "canonical semantic catch-up endpoint disappeared");
+    }
+    Ok(selected)
+}
+
 fn selected_sql(count: usize) -> String {
     let placeholders = (1..=count)
         .map(|n| format!("?{n}"))
@@ -138,5 +198,31 @@ pub(crate) fn packet_embedding_inputs_from_storage_for_message_ids(
     Ok(inputs)
 }
 
+/// Catch up only the raw message-ID delta. A captured high water bounds this
+/// invocation; later appends remain for the next call. This bound is not a
+/// snapshot lease: callers still serialize or snapshot canonical mutations.
+/// Raw progress includes blank/non-embeddable messages, while emitted inputs
+/// keep the existing canonical parent/(idx,id)/passage order.
+pub(crate) fn packet_embedding_inputs_from_storage_since(
+    storage: &FrankenStorage,
+    since_message_id: i64,
+) -> Result<engine::CanonicalIncrementalEmbeddingBatch> {
+    if matches!(dotenvy::var("CASS_SEMANTIC_STREAM_REPLAY").as_deref(), Ok("0")) {
+        return engine::packet_embedding_inputs_from_storage_since(storage, since_message_id);
+    }
+    let selected = select_since(storage.raw(), since_message_id)?;
+    let conversations_in_batch = u64::try_from(selected.len()).unwrap_or(u64::MAX);
+    let (inputs, raw_max_message_id) = project_selection(storage, selected, |parent, key| {
+        load_message(storage.raw(), parent, key)
+    })?;
+    Ok(engine::CanonicalIncrementalEmbeddingBatch {
+        inputs,
+        conversations_in_batch,
+        raw_max_message_id,
+    })
+}
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod since_tests;

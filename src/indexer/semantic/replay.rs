@@ -21,7 +21,10 @@ use std::path::PathBuf;
 mod pages;
 mod selected;
 
-pub(crate) use selected::packet_embedding_inputs_from_storage_for_message_ids;
+pub(crate) use selected::{
+    packet_embedding_inputs_from_storage_for_message_ids,
+    packet_embedding_inputs_from_storage_since,
+};
 
 const PARENT_PAGE_SIZE: usize = 64;
 

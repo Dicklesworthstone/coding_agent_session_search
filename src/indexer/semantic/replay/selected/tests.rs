@@ -4,7 +4,7 @@ use crate::franken_sync::compat::{ConnectionExt, ParamValue};
 use crate::model::types::{Agent, AgentKind, Conversation, MessageRole};
 use std::path::Path;
 
-fn fixture(data: &Path, parents: usize, per_parent: usize) -> Result<FrankenStorage> {
+pub(super) fn fixture(data: &Path, parents: usize, per_parent: usize) -> Result<FrankenStorage> {
     let storage = FrankenStorage::open(&data.join("agent_search.db"))?;
     let agent = storage.ensure_agent(&Agent {
         id: None,
@@ -48,7 +48,7 @@ fn fixture(data: &Path, parents: usize, per_parent: usize) -> Result<FrankenStor
     Ok(storage)
 }
 
-fn coordinates(storage: &FrankenStorage) -> Result<Vec<(i64, i64, i64)>> {
+pub(super) fn coordinates(storage: &FrankenStorage) -> Result<Vec<(i64, i64, i64)>> {
     Ok(storage.raw().query_map_collect(
         "SELECT id, conversation_id, idx FROM messages ORDER BY conversation_id, idx, id",
         &[] as &[ParamValue],
@@ -56,7 +56,7 @@ fn coordinates(storage: &FrankenStorage) -> Result<Vec<(i64, i64, i64)>> {
     )?)
 }
 
-fn signature(inputs: Vec<engine::EmbeddingInput>) -> Vec<(Option<String>, String)> {
+pub(super) fn signature(inputs: Vec<engine::EmbeddingInput>) -> Vec<(Option<String>, String)> {
     inputs.into_iter().map(|input| {
         (engine::semantic_doc_id_for_input(&input), input.content)
     }).collect()
