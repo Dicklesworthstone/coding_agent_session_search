@@ -390,7 +390,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 33 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 34 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` and `~/.codex/archived_sessions` (Rollout JSONL, plain or zstd-compressed `.jsonl.zst`)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -3179,12 +3179,15 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `sources reingest` | Re-ingest an already-synced mirror into the canonical archive without re-running rsync |
 | `sources artifact-manifest` | Build or verify a lexical-artifact evidence manifest for remote exchange |
 
-Two more commands are dispatched before the main parser (so they are absent from `cass --help`, `introspect` and completions); use their own `--help`:
+Five more commands are dispatched before the main parser (registered via `allow_external_subcommands` in `src/main.rs`); use their own `--help`:
 
 | Command | Purpose |
 |---------|---------|
 | `serve --stdio [--mcp] (--data-dir DIR \| --index PATH)` | Persistent search service: reuses one read-only lexical index reader across a stream of newline-delimited JSON requests (or MCP with `--mcp`), with per-request deadlines (`--request-timeout-ms`), cross-process reader admission (`--admission-dir`, `--admission-slots`) and a resident-memory cap (`--max-resident-mib`). Search, status and startup never open the canonical database; `--db` opts in to canonical `view`/`view_batch` requests. Operations: `search`, `semantic_search`, `refine`, `view`, `view_batch`, `status`, `reload`, `unload`, `shutdown`. `search` is lexical; `semantic_search` needs `--semantic-embedder minilm\|multilingual-minilm\|hash` plus `--data-dir` and `--db`, and `refine` needs `--reranker-model PATH` (installed local assets only, never downloaded). See `docs/SEARCH_SERVICE.md` |
 | `archive export\|verify\|search\|view\|import` | Bounded, versioned logical archive of the canonical rows: `export --output FILE --archive-id ID --include-private` streams a read-only snapshot to a new private JSONL file; `verify` checks framing, identities, counts and digest without a database; `search`/`view` read verified message bodies without restoring; `import` restores into a new database and never replaces an existing archive |
+| `codex-layout-migrate [--apply] [--json]` | Plan or apply canonical consolidation of duplicate Codex conversations caused by rollout path layout changes (`sessions/YYYY/MM/DD/...` vs flat rollouts) |
+| `lexical-quarantine [list\|inspect\|prune] [--json]` | Inspect or prune quarantined lexical index generations under `<data-dir>/quarantine/lexical/` |
+| `semantic-reclaim [--apply] [--json]` | Reclaim stale or superseded semantic index artifacts and staging directories |
 
 ### Specialized Validation and Recording Tools
 
@@ -3807,7 +3810,7 @@ opt-level = 3           # Maximum runtime optimization
 
 ### CI Pipeline & Artifacts
 
-The CI pipeline (`.github/workflows/ci.yml`) is defined to run on every PR and push to main. **Note:** the general workflows (CI, Release, Coverage, Benchmarks, Browser Tests, Fuzzing, Install Test, Fresh Clone Build) are currently disabled (`gh workflow list --all` shows `disabled_manually`); only narrow, issue-specific regression workflows run on push. Until CI is re-enabled the full gate (fmt, clippy, lib and integration tests, goldens, UBS) is run by agents through `rch` with `scripts/gate.sh`:
+**Note:** GitHub Actions workflows under `.github/workflows/` are permanently disabled (`NO GH ACTIONS, PERIOD!`); verification runs through `rch` via `scripts/gate.sh` (fmt, clippy `-D warnings`, lib and integration tests, goldens, and UBS scan), and cross-platform builds and releases run through `/dsr` (`dsr health all`, `dsr build`, `dsr release`, `dsr fallback`):
 
 | Job | Purpose | Artifacts |
 |-----|---------|-----------|
