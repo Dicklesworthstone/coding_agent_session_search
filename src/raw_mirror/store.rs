@@ -291,8 +291,12 @@ pub struct RawMirrorPruneReport {
     pub planned_manifest_count: u64,
     pub planned_blob_count: u64,
     pub planned_reclaim_bytes: u64,
+    /// `tmp/capture.*` staging left by captures that were killed or failed
+    /// before publishing; reclaimed only by an unscoped prune.
+    pub planned_staging_count: u64,
     pub applied_manifest_count: u64,
     pub applied_blob_count: u64,
+    pub applied_staging_count: u64,
     pub applied_reclaim_bytes: u64,
     pub audit_log_path: Option<String>,
     /// Preview details omitted from `entries`; aggregate counts still cover the full plan.
@@ -395,8 +399,10 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         planned_manifest_count: 0,
         planned_blob_count: 0,
         planned_reclaim_bytes: 0,
+        planned_staging_count: 0,
         applied_manifest_count: 0,
         applied_blob_count: 0,
+        applied_staging_count: 0,
         applied_reclaim_bytes: 0,
         audit_log_path: None,
         omitted_entry_count: 0,
@@ -773,6 +779,37 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         });
     }
 
+    // Every capture creates its staging dir after taking the mutation lock this
+    // prune holds, and keeps the lock until it publishes or fails, so a staging
+    // dir seen here belongs to a capture that was killed (GH #523). A staging
+    // dir cannot be attributed to a provider or source path, so only an
+    // unscoped prune reclaims it.
+    if !scoped {
+        let staging_cutoff_ms = now.saturating_sub(ABANDONED_STAGING_MIN_AGE_MS);
+        for staging in collect_capture_staging_dirs(&root)? {
+            if staging.contains_symlink || staging.newest_modified_ms > staging_cutoff_ms {
+                continue;
+            }
+            report.planned_staging_count += 1;
+            report.planned_reclaim_bytes = report
+                .planned_reclaim_bytes
+                .saturating_add(staging.size_bytes);
+            if !options.apply && entries.len() == PRUNE_PREVIEW_ENTRY_LIMIT {
+                report.omitted_entry_count += 1;
+                continue;
+            }
+            entries.push(RawMirrorPruneEntry {
+                kind: "staging".to_string(),
+                path: staging.relative_path,
+                blob_blake3: None,
+                manifest_blake3: None,
+                size_bytes: staging.size_bytes,
+                reason: "capture staging abandoned by a killed capture (no capture holds the raw-mirror lock; untouched for 1 h)".to_string(),
+                applied: false,
+            });
+        }
+    }
+
     report.entries = entries;
     if options.apply {
         // A destructive apply is authority-bearing. Re-read every selected
@@ -814,8 +851,12 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         }
         for entry in &report.entries {
             let path = root.join(&entry.path);
-            validate_prune_target_file(&root, &path)
-                .with_context(|| format!("preflight raw mirror prune target {}", path.display()))?;
+            if entry.kind == "staging" {
+                validate_prune_target_staging(&root, &path)
+            } else {
+                validate_prune_target_file(&root, &path)
+            }
+            .with_context(|| format!("preflight raw mirror prune target {}", path.display()))?;
         }
 
         // Record and fsync the exact authority-bearing plan before removing
@@ -851,6 +892,8 @@ fn apply_prune_entries(
                 report.applied_manifest_count = report.applied_manifest_count.saturating_add(1);
             } else if entry.kind == "blob" {
                 report.applied_blob_count = report.applied_blob_count.saturating_add(1);
+            } else if entry.kind == "staging" {
+                report.applied_staging_count = report.applied_staging_count.saturating_add(1);
             }
             report.applied_reclaim_bytes = report
                 .applied_reclaim_bytes
@@ -1166,6 +1209,9 @@ fn validate_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
 
 fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<bool> {
     let path = root.join(&entry.path);
+    if entry.kind == "staging" {
+        return remove_abandoned_capture_staging(root, &path, entry.size_bytes);
+    }
     if !validate_prune_target_file(root, &path)? {
         return Ok(false);
     }
@@ -1242,6 +1288,140 @@ fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<b
 
     fs::remove_file(&path).with_context(|| format!("remove raw mirror file {}", path.display()))?;
     sync_parent_unconditionally(&path)?;
+    Ok(true)
+}
+
+/// Capture staging untouched for this long is reclaimed by an unscoped prune.
+/// The mutation lock already proves no capture owns it; the age is a margin.
+const ABANDONED_STAGING_MIN_AGE_MS: i64 = 60 * 60 * 1000;
+
+struct CaptureStagingDir {
+    relative_path: String,
+    size_bytes: u64,
+    newest_modified_ms: i64,
+    contains_symlink: bool,
+}
+
+/// `capture.<pid>.<nanos>.<nonce>`, the name `unique_capture_temp_dir` gives.
+fn is_capture_staging_name(name: &str) -> bool {
+    let parts = name.split('.').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0] == "capture"
+        && parts[1..]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn collect_capture_staging_dirs(root: &Path) -> Result<Vec<CaptureStagingDir>> {
+    let tmp = root.join("tmp");
+    let metadata = match fs::symlink_metadata(&tmp) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", tmp.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "refusing to prune invalid raw mirror staging directory {}",
+            tmp.display()
+        );
+    }
+    let mut staging = Vec::new();
+    for entry in fs::read_dir(&tmp).with_context(|| format!("read {}", tmp.display()))? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if !is_capture_staging_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let (size_bytes, newest_modified_ms, contains_symlink) = measure_capture_staging(&path)?;
+        staging.push(CaptureStagingDir {
+            relative_path: format!("tmp/{name}"),
+            size_bytes,
+            newest_modified_ms,
+            contains_symlink,
+        });
+    }
+    staging.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(staging)
+}
+
+/// File bytes below `path`, the newest mtime of it or anything in it (an
+/// unknown mtime counts as now), and whether a symlink appears below it.
+fn measure_capture_staging(path: &Path) -> Result<(u64, i64, bool)> {
+    let mut size_bytes = 0_u64;
+    let mut newest_modified_ms = i64::MIN;
+    let mut contains_symlink = false;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let metadata = fs::symlink_metadata(&current)
+            .with_context(|| format!("stat {}", current.display()))?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_ms)
+            .unwrap_or(i64::MAX);
+        newest_modified_ms = newest_modified_ms.max(modified_ms);
+        if metadata.file_type().is_symlink() {
+            contains_symlink = true;
+        } else if metadata.is_dir() {
+            for entry in
+                fs::read_dir(&current).with_context(|| format!("read {}", current.display()))?
+            {
+                pending.push(entry?.path());
+            }
+        } else {
+            size_bytes = size_bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok((size_bytes, newest_modified_ms, contains_symlink))
+}
+
+fn validate_prune_target_staging(root: &Path, path: &Path) -> Result<bool> {
+    if raw_mirror_path_has_symlink_below_root(root, path) {
+        anyhow::bail!(
+            "refusing to prune raw mirror path with a symlinked ancestor {}",
+            path.display()
+        );
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "refusing to prune non-directory raw mirror capture staging {}",
+            path.display()
+        );
+    }
+    Ok(true)
+}
+
+fn remove_abandoned_capture_staging(
+    root: &Path,
+    path: &Path,
+    expected_size_bytes: u64,
+) -> Result<bool> {
+    if !validate_prune_target_staging(root, path)? {
+        return Ok(false);
+    }
+    let (size_bytes, _, contains_symlink) = measure_capture_staging(path)?;
+    if contains_symlink || size_bytes != expected_size_bytes {
+        return Err(anyhow!(
+            "raw mirror capture staging {} changed after preflight: observed {size_bytes} bytes, expected {expected_size_bytes}",
+            path.display()
+        ));
+    }
+    fs::remove_dir_all(path)
+        .with_context(|| format!("remove raw mirror capture staging {}", path.display()))?;
+    sync_parent_unconditionally(path)?;
     Ok(true)
 }
 
@@ -6017,6 +6197,124 @@ mod tests {
         )
         .expect_err("keep-latest 0 would retire every capture");
         assert!(zero.to_string().contains("at least one capture per source"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_reclaims_abandoned_capture_staging_only_unscoped_and_after_an_hour() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = raw_mirror_root(&data_dir);
+        let source = temp.path().join("session.jsonl");
+        fs::write(&source, b"{\"text\":\"kept\"}\n").expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let tmp = root.join("tmp");
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        let staging = |dir: PathBuf, bytes: &[u8], modified: Option<SystemTime>| {
+            fs::create_dir_all(&dir).expect("staging dir");
+            let file = dir.join(".blob.4242.1.0.tmp");
+            fs::write(&file, bytes).expect("staging file");
+            if let Some(modified) = modified {
+                for path in [&file, &dir] {
+                    std::fs::File::open(path)
+                        .expect("open staging entry")
+                        .set_times(fs::FileTimes::new().set_modified(modified))
+                        .expect("backdate staging entry");
+                }
+            }
+            dir
+        };
+        // What a capture killed mid-copy leaves behind.
+        let abandoned = staging(
+            tmp.join("capture.4242.1791900000000000000.7"),
+            b"0123456789",
+            Some(two_hours_ago),
+        );
+        let recent = staging(
+            tmp.join("capture.4243.1791900000000000000.8"),
+            b"young",
+            None,
+        );
+        let unrelated = staging(tmp.join("not-a-capture"), b"other", Some(two_hours_ago));
+        let outside = staging(temp.path().join("outside"), b"outside", Some(two_hours_ago));
+        let link = tmp.join("capture.4244.1791900000000000000.9");
+        symlink(&outside, &link).expect("staging-named symlink");
+
+        let preview = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                keep_latest: Some(1),
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("preview");
+        let planned = preview
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "staging")
+            .map(|entry| (entry.path.as_str(), entry.size_bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            planned,
+            vec![("tmp/capture.4242.1791900000000000000.7", 10)]
+        );
+        assert_eq!(preview.planned_staging_count, 1);
+        assert_eq!(preview.planned_reclaim_bytes, 10);
+        assert!(abandoned.exists(), "a preview removes nothing");
+
+        // Staging cannot be attributed to a provider, so a scoped prune leaves it.
+        let scoped = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                keep_latest: Some(1),
+                providers: vec!["codex".to_string()],
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("scoped apply");
+        assert_eq!(scoped.planned_staging_count, 0);
+        assert!(abandoned.exists());
+
+        let applied = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                keep_latest: Some(1),
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("apply");
+        assert_eq!(applied.applied_staging_count, 1);
+        assert_eq!(applied.applied_reclaim_bytes, 10);
+        assert!(!abandoned.exists());
+        assert!(recent.exists(), "staging written within the hour stays");
+        assert!(
+            unrelated.exists(),
+            "only capture.<pid>.<nanos>.<nonce> names are staging"
+        );
+        assert!(
+            fs::symlink_metadata(&link).is_ok() && outside.join(".blob.4242.1.0.tmp").exists(),
+            "a staging-named symlink is neither followed nor removed"
+        );
+        assert_eq!(
+            read_source_bytes(&data_dir, &captured.manifest_id).expect("published capture"),
+            b"{\"text\":\"kept\"}\n"
+        );
+        let audit = fs::read_to_string(root.join("pruned.jsonl")).expect("prune audit");
+        assert!(audit.contains("\"kind\":\"staging\""));
     }
 
     #[test]

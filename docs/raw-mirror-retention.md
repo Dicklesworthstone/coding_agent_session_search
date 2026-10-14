@@ -63,7 +63,10 @@ A truncation, rewrite or origin mismatch is not proof of preservation. Such old
 copies remain. Nonstandard verification/recovery records, tagged copies,
 unreferenced blobs and abandoned staging evidence are not automatically
 selected. The operator's explicit `cass mirror prune` policy remains separate
-and can authorize more destructive retention than automatic maintenance.
+and can authorize more destructive retention than automatic maintenance. An
+unscoped explicit prune removes `tmp/capture.*` staging left by killed captures
+once nothing has written it for an hour. Under the mirror lock that prune
+holds, no capture can own it.
 
 Before retiring a manifest, its database links are merged into its retained
 successor. The existing pruner records and fsyncs the exact intent before any

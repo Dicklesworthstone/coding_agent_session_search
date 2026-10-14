@@ -10315,10 +10315,18 @@ fn run_mirror_prune(command: MirrorCommand, output_format: Option<RobotFormat>) 
     println!("  Pinned blobs: {}", report.pinned_blob_count);
     println!("  Planned manifests: {}", report.planned_manifest_count);
     println!("  Planned blobs: {}", report.planned_blob_count);
+    println!(
+        "  Planned abandoned capture staging dirs: {}",
+        report.planned_staging_count
+    );
     println!("  Planned reclaim bytes: {}", report.planned_reclaim_bytes);
     if apply {
         println!("  Applied manifests: {}", report.applied_manifest_count);
         println!("  Applied blobs: {}", report.applied_blob_count);
+        println!(
+            "  Applied abandoned capture staging dirs: {}",
+            report.applied_staging_count
+        );
         println!("  Applied reclaim bytes: {}", report.applied_reclaim_bytes);
     }
     if let Some(path) = report.audit_log_path {

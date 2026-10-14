@@ -91,6 +91,15 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`cass mirror prune` reclaims capture staging left by killed captures
+  (#523).** A `cass index` run killed mid-capture (for example by `timeout`)
+  left its `raw-mirror/v1/tmp/capture.*` staging behind, and nothing removed
+  it. One report had 14 GB in 35 such directories. The staging also counted
+  against the capture budget. `cass doctor --cleanup-interrupted-artifacts`
+  only moves these directories into its quarantine, so no space came back. An unscoped prune now lists
+  each one untouched for an hour as a `staging` entry, and `--apply` removes
+  it. The prune holds the mirror lock that every capture holds while staging,
+  so a directory it finds has no live owner.
 - **An appended transcript no longer adds its whole length to the raw
   mirror on every index run (#522).** Transcripts under 8 MiB were captured
   as one new blob whenever they changed, so a session appended to between

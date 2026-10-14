@@ -701,6 +701,14 @@ transcript share their complete chunks with the newest one, so retiring them
 frees only their superseded tail chunks; for a file that was rewritten rather
 than appended to, it also drops the earlier versions.
 
+A capture stages its copy under `raw-mirror/v1/tmp/capture.<pid>.<ts>.<n>` and
+holds the mirror lock until it publishes. A capture that is killed, for example
+by a `timeout` around `cass index`, leaves that directory behind. An unscoped
+`cass mirror prune` (no `--provider` or `--source-path`) takes the same lock, so
+any staging directory it finds is abandoned. The preview lists each one that
+has not been written for an hour, with its size, as a `staging` entry, and
+`--apply` removes it. Staging-named symlinks are not followed.
+
 A pruned capture of a source that is still on disk is copied again by the next
 index run. On a machine whose providers never delete their session files, set
 `CASS_RAW_MIRROR=0` (or `false`, `no`, `off`) to stop capturing altogether.

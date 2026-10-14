@@ -247,7 +247,8 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         pinned_manifest_count: result.protected_manifests,
         pinned_blob_count: references.values().filter(|(_, retained)| *retained).count() as u64,
         planned_manifest_count: selected.len() as u64, planned_blob_count: 0, planned_reclaim_bytes: 0,
-        applied_manifest_count: 0, applied_blob_count: 0, applied_reclaim_bytes: 0,
+        planned_staging_count: 0,
+        applied_manifest_count: 0, applied_blob_count: 0, applied_staging_count: 0, applied_reclaim_bytes: 0,
         audit_log_path: None, omitted_entry_count: 0, entries: Vec::new(),
     };
     for item in &inventory {
