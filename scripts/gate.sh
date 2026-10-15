@@ -321,7 +321,7 @@ run_ubs() {
     else
         echo "gate: acquiring pinned UBS ${expected} in ${tool_dir}"
         curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --max-time 60 --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+            --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
             "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/ubs" \
             --output "$scanner" || return 1
     fi
@@ -334,7 +334,7 @@ run_ubs() {
     # unsupported and exit without scanning anything.
     mkdir -p "$tool_dir/modules" || return 1
     curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-        --max-time 60 --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+        --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
         "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/modules/contract.json" \
         --output "$tool_dir/modules/contract.json" || return 1
     if [ "$(sha256sum "$tool_dir/modules/contract.json" | cut -d' ' -f1)" != "$expected_contract_sha" ]; then
