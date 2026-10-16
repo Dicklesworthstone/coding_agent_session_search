@@ -161,8 +161,9 @@ pub struct AutoRefreshState {
     /// `last_indexed_at`. Reset to zero as soon as any run advances it.
     #[serde(default)]
     pub consecutive_failures: u32,
-    /// The spawn (`last_spawn_ms`) whose failure has already been counted, so
-    /// repeated reads between attempts do not inflate the streak.
+    /// The spawn (`last_spawn_ms`) whose outcome has already been acknowledged:
+    /// either its failure was counted or a successful watermark was observed.
+    /// This also prevents a later stale snapshot from failing a completed run.
     #[serde(default)]
     pub failure_counted_for_spawn_ms: i64,
     /// When the most recent failure was detected; the backoff clock starts
@@ -322,7 +323,9 @@ pub enum BreakerVerdict {
 /// OOM-killed, stall-aborted, or crashed before `last_indexed_at` was written.
 /// Each spawn is counted once. Any watermark at or past the spawn — that child
 /// finishing, a foreground `cass index`, the scheduler — resets the streak.
-/// `None` for the watermark means the caller cannot judge; nothing changes.
+/// Missing or sentinel watermarks cannot judge a new outcome or erase a known
+/// failure: preserve the recorded breaker without mutating its evidence.
+/// Once success is observed, older snapshots cannot fail that same spawn.
 pub fn judge_previous_spawn(
     state: &mut AutoRefreshState,
     last_indexed_at_ms: Option<i64>,
@@ -332,11 +335,12 @@ pub fn judge_previous_spawn(
     if state.last_spawn_ms <= 0 {
         return BreakerVerdict::Closed;
     }
-    let Some(watermark) = last_indexed_at_ms else {
-        return BreakerVerdict::Closed;
+    let Some(watermark) = last_indexed_at_ms.filter(|value| *value > 0) else {
+        return recorded_breaker_verdict(state, now_ms);
     };
     if watermark >= state.last_spawn_ms {
         state.consecutive_failures = 0;
+        state.failure_counted_for_spawn_ms = state.last_spawn_ms;
         state.last_failure = None;
         state.last_failure_detected_ms = 0;
         return BreakerVerdict::Closed;
@@ -355,20 +359,45 @@ pub fn judge_previous_spawn(
             child_log.display()
         ));
     }
+    recorded_breaker_verdict(state, now_ms)
+}
+
+/// Evaluate durable failure evidence independently of metadata availability.
+fn recorded_breaker_verdict(state: &AutoRefreshState, now_ms: i64) -> BreakerVerdict {
     if state.consecutive_failures >= FAILURE_TRIP_THRESHOLD {
         return BreakerVerdict::Tripped;
     }
-    let step = usize::try_from(state.consecutive_failures.saturating_sub(1)).unwrap_or(usize::MAX);
-    let backoff_ms = i64::try_from(FAILURE_BACKOFF_SECS[step.min(FAILURE_BACKOFF_SECS.len() - 1)])
-        .unwrap_or(i64::MAX)
-        .saturating_mul(1000);
-    let elapsed_ms = now_ms.saturating_sub(state.last_failure_detected_ms);
+    if state.consecutive_failures == 0 {
+        return BreakerVerdict::Closed;
+    }
+    let step = usize::try_from(state.consecutive_failures - 1).unwrap_or(usize::MAX);
+    let backoff_ms =
+        i128::from(FAILURE_BACKOFF_SECS[step.min(FAILURE_BACKOFF_SECS.len() - 1)]) * 1000;
+    // A backwards clock step can make elapsed time negative. Widen before
+    // subtracting so neither it nor the round-up overflows at i64 boundaries.
+    let elapsed_ms = i128::from(now_ms) - i128::from(state.last_failure_detected_ms);
     if elapsed_ms >= backoff_ms {
         return BreakerVerdict::Closed;
     }
     let remaining_ms = backoff_ms - elapsed_ms;
     BreakerVerdict::BackedOff {
         remaining_secs: u64::try_from((remaining_ms + 999) / 1000).unwrap_or(u64::MAX),
+    }
+}
+
+/// Keep the scheduler's existing no-watermark full-pass exemption explicit.
+/// Unknown metadata on an ordinary catch-up is not that exemption.
+fn spawn_breaker_verdict(
+    state: &mut AutoRefreshState,
+    full: bool,
+    last_indexed_at_ms: Option<i64>,
+    now_ms: i64,
+    child_log: &Path,
+) -> BreakerVerdict {
+    if full && last_indexed_at_ms.is_none() {
+        BreakerVerdict::Closed
+    } else {
+        judge_previous_spawn(state, last_indexed_at_ms, now_ms, child_log)
     }
 }
 
@@ -655,13 +684,38 @@ pub fn maybe_spawn_background_index_refresh(
     reason: &str,
     last_indexed_at_ms: Option<i64>,
 ) -> AutoRefreshOutcome {
+    refresh_with_watermark_reader(
+        data_dir,
+        db_path,
+        reason,
+        last_indexed_at_ms,
+        AutoRefreshPolicy::from_env(),
+        source_scan_completed_at_ms_from_db,
+    )
+}
+
+/// Check cheap admission before opening the archive. In particular, opting
+/// out must not wait for database recovery, and an active writer must not be
+/// disturbed just to discover that a second index run cannot start.
+fn refresh_with_watermark_reader(
+    data_dir: &Path,
+    db_path: &Path,
+    reason: &str,
+    last_indexed_at_ms: Option<i64>,
+    policy: AutoRefreshPolicy,
+    read_watermark: impl FnOnce(&Path) -> Option<i64>,
+) -> AutoRefreshOutcome {
+    if let Some(outcome) = refresh_admission(data_dir, reason, policy) {
+        return outcome;
+    }
     // A successful no-op scan is still successful catch-up work. Use the
     // canonical scan watermark to reset breaker/cooldown judgement even when
     // no lexical publication advanced `last_indexed_at`.
-    let source_scan_completed_at_ms = source_scan_completed_at_ms_from_db(db_path);
+    let source_scan_completed_at_ms = read_watermark(db_path);
     let effective_watermark = [last_indexed_at_ms, source_scan_completed_at_ms]
         .into_iter()
         .flatten()
+        .filter(|value| *value > 0)
         .max();
     maybe_spawn_with_policy(
         data_dir,
@@ -669,8 +723,24 @@ pub fn maybe_spawn_background_index_refresh(
         reason,
         false,
         effective_watermark,
-        AutoRefreshPolicy::from_env(),
+        policy,
     )
+}
+
+fn refresh_admission(
+    data_dir: &Path,
+    reason: &str,
+    policy: AutoRefreshPolicy,
+) -> Option<AutoRefreshOutcome> {
+    if !policy.enabled {
+        debug!(reason, "auto-refresh disabled via CASS_AUTO_REFRESH");
+        return Some(AutoRefreshOutcome::Disabled);
+    }
+    if crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active {
+        debug!(reason, "auto-refresh skipped: index run already active");
+        return Some(AutoRefreshOutcome::IndexRunActive);
+    }
+    None
 }
 
 /// Same as [`maybe_spawn_background_index_refresh`] but for a *full* pass
@@ -700,13 +770,8 @@ pub fn maybe_spawn_with_policy(
     last_indexed_at_ms: Option<i64>,
     policy: AutoRefreshPolicy,
 ) -> AutoRefreshOutcome {
-    if !policy.enabled {
-        debug!(reason, "auto-refresh disabled via CASS_AUTO_REFRESH");
-        return AutoRefreshOutcome::Disabled;
-    }
-    if crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active {
-        debug!(reason, "auto-refresh skipped: index run already active");
-        return AutoRefreshOutcome::IndexRunActive;
+    if let Some(outcome) = refresh_admission(data_dir, reason, policy) {
+        return outcome;
     }
     if let Err(error) = std::fs::create_dir_all(data_dir) {
         return AutoRefreshOutcome::SpawnFailed {
@@ -732,6 +797,13 @@ pub fn maybe_spawn_with_policy(
         debug!(reason, "auto-refresh skipped: another process is spawning");
         return AutoRefreshOutcome::GuardBusy;
     }
+    // A foreground indexer can acquire ownership after the first snapshot.
+    // Recheck while serialized with other spawners; the child's own writer
+    // lease remains the final authority if ownership changes again later.
+    if let Some(outcome) = refresh_admission(data_dir, reason, policy) {
+        let _ = FileExt::unlock(&guard);
+        return outcome;
+    }
 
     let now = now_ms();
     let mut state = load_state(data_dir);
@@ -747,7 +819,13 @@ pub fn maybe_spawn_with_policy(
     }
     if let Some(current) = state.as_mut() {
         let before = current.clone();
-        let verdict = judge_previous_spawn(current, last_indexed_at_ms, now, &log_path(data_dir));
+        let verdict = spawn_breaker_verdict(
+            current,
+            full,
+            last_indexed_at_ms,
+            now,
+            &log_path(data_dir),
+        );
         if *current != before
             && let Err(error) = save_state(data_dir, current)
         {
@@ -895,6 +973,12 @@ pub struct BackgroundPriority {
 
 #[cfg(test)]
 mod gh514_tests;
+
+#[cfg(test)]
+mod breaker_policy_tests;
+
+#[cfg(test)]
+mod admission_policy_tests;
 
 #[cfg(test)]
 mod tests {
