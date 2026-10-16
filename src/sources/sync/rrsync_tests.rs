@@ -4,14 +4,21 @@ use super::*;
 
 #[test]
 fn rrsync_rejection_admits_only_the_argument_protection_fallback() {
+    // Captured from a real rsync 3.4.1 transfer through stock rrsync -ro.
+    // rrsync reports argv[0], including the executable's absolute path.
     let captured = concat!(
-        "rrsync error: option -s has been disabled on this server.\n",
+        "/usr/bin/rrsync error: option -s has been disabled on this server.\n",
         "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]\n",
-        "rsync error: error in rsync protocol data stream (code 12)\n",
+        "rsync error: error in rsync protocol data stream (code 12) at io.c(232) [Receiver=3.4.1]\n",
     );
     assert!(rsync_arg_protection_remote_rejected(captured));
+    for program in ["rrsync", "/usr/bin/rrsync", "/usr/local/bin/rrsync"] {
+        assert!(rsync_arg_protection_remote_rejected(&format!(
+            "{program} error: option -s has been disabled on this server."
+        )));
+    }
     assert!(rsync_arg_protection_remote_rejected(
-        "  RRSYNC ERROR: OPTION -S HAS BEEN DISABLED ON THIS SERVER.\r\n"
+        "  /USR/BIN/RRSYNC ERROR: OPTION -S HAS BEEN DISABLED ON THIS SERVER.\r\n"
     ));
 }
 
@@ -30,6 +37,12 @@ fn rrsync_rejection_does_not_downgrade_unrelated_policy_or_ssh_failures() {
         "rsync: connection unexpectedly closed (0 bytes received so far)",
         "rsync: change_dir \"option -s has been disabled on this server.\" failed",
         "rrsync error: option -s has been disabled on this server. Permission denied",
+        "/usr/bin/rrsync error: option -s has been disabled on this server. Permission denied",
+        "prefix rrsync error: option -s has been disabled on this server.",
+        "prefix /usr/bin/rrsync error: option -s has been disabled on this server.",
+        "/usr/bin/not-rrsync error: option -s has been disabled on this server.",
+        "/usr/bin/rrsync-other error: option -s has been disabled on this server.",
+        "/bad path/rrsync error: option -s has been disabled on this server.",
     ] {
         assert!(
             !rsync_arg_protection_remote_rejected(diagnostic),

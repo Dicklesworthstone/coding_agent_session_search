@@ -183,7 +183,17 @@ fn rsync_arg_protection_remote_rejected(stderr: &str) -> bool {
         // The existing one-shot retry retains rsync's own path escaping,
         // strict SSH host-key checks, and additive/read-only transfer shape.
         || lower.lines().any(|line| {
-            line.trim() == "rrsync error: option -s has been disabled on this server."
+            // Stock rrsync includes argv[0] (e.g. /usr/bin/rrsync), not
+            // necessarily only its basename. Keep the message anchored and
+            // reject arbitrary prose containing that diagnostic.
+            line.trim()
+                .strip_suffix(" error: option -s has been disabled on this server.")
+                .is_some_and(|program| {
+                    program == "rrsync"
+                        || (program.starts_with('/')
+                            && program.ends_with("/rrsync")
+                            && !program.chars().any(char::is_whitespace))
+                })
         })
 }
 
