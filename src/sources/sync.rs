@@ -177,6 +177,14 @@ fn rsync_arg_protection_remote_rejected(stderr: &str) -> bool {
         || lower.contains("unknown option -- protect-args")
         // BSD/macOS getopt error format (openrsync uses getopt which prints "illegal option"):
         || lower.contains("illegal option -- s")
+        // GH #531: rrsync must inspect server arguments, so it refuses -s
+        // even when both rsync binaries support it. Match the complete
+        // diagnostic, not a generic disabled-option or authentication error.
+        // The existing one-shot retry retains rsync's own path escaping,
+        // strict SSH host-key checks, and additive/read-only transfer shape.
+        || lower.lines().any(|line| {
+            line.trim() == "rrsync error: option -s has been disabled on this server."
+        })
 }
 
 /// Return `true` if the first line of `rsync --version` output indicates
@@ -4764,3 +4772,6 @@ Total transferred file size: 1,234 bytes
         assert_eq!(expanded, path);
     }
 }
+
+#[cfg(test)]
+mod rrsync_tests;
