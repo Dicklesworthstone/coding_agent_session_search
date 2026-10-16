@@ -259,7 +259,11 @@ fn gh530_unreadable_candidate_cannot_supply_count_authority() {
     }
     // Only derived data in this test's candidate is damaged. In particular,
     // never manufacture an expected count from a missing published manifest.
-    fs::remove_file(candidate.join("MANIFEST")).unwrap();
+    // Quill can recover from MANIFEST.prev when MANIFEST is absent.
+    // Corrupt both slots to exercise a genuinely unreadable candidate,
+    // rather than accidentally accepting the engine's valid fallback.
+    fs::write(candidate.join("MANIFEST"), b"invalid-gh530-manifest").unwrap();
+    fs::write(candidate.join("MANIFEST.prev"), b"invalid-gh530-previous").unwrap();
     assert!(validated_searchable_index_summary(&candidate).is_err());
     assert_committed_count(&live, 100);
 }
