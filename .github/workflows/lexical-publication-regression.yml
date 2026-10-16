@@ -6,8 +6,10 @@ on:
       - '.github/workflows/lexical-publication-regression.yml'
       - 'src/indexer/**'
       - 'src/search/quill_bridge.rs'
+      - 'src/search/tantivy.rs'
       - 'src/storage/**'
       - 'tests/e2e_index_resume.rs'
+      - 'tests/gh530_lexical_certification.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -82,7 +84,8 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/lexical-publication-evidence/tests.log"
-          cargo test --locked --lib gh494 -- --nocapture 2>&1 | tee "$log"
+          cargo test --locked --test gh530_lexical_certification -- --nocapture 2>&1 | tee "$log"
+          cargo test --locked --lib gh494 -- --nocapture 2>&1 | tee -a "$log"
           cargo test --locked --lib lexical_publish -- --nocapture 2>&1 | tee -a "$log"
           cargo test --locked --lib quill_bridge -- --nocapture 2>&1 | tee -a "$log"
           cargo test --locked --test e2e_index_resume -- --nocapture 2>&1 | tee -a "$log"
