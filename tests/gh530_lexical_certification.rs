@@ -3,6 +3,7 @@
 //! The native tests isolate committed visibility from input accounting. The CLI
 //! test keeps twenty session files growing while a forced rebuild runs, then
 //! checks that a follow-up ingest recovers every durable source message.
+use coding_agent_search::search::quill_bridge::manifest_live_doc_count;
 use coding_agent_search::search::tantivy::{
     TantivyIndex, index_dir, validated_searchable_index_summary,
 };
@@ -237,10 +238,14 @@ fn gh530_replacements_and_merge_do_not_count_tombstones_as_live_documents() {
         assert_eq!(index.upsert_prebuilt_documents_slice(&revised).unwrap(), 100);
         index.commit().unwrap();
         assert_committed_count(directory.path(), 100);
+        let manifest = manifest_live_doc_count(directory.path()).expect("published Quill manifest");
+        assert_eq!(manifest.live_docs, 100);
     }
     index.add_prebuilt_documents_slice(&documents(100, 73)).unwrap();
     index.commit().unwrap();
     index.force_merge().unwrap();
+    let manifest = manifest_live_doc_count(directory.path()).expect("merged Quill manifest");
+    assert_eq!(manifest.live_docs, 173);
     assert_eq!(pinned.doc_count().unwrap(), 100);
     assert_eq!(index.doc_count().unwrap(), 173);
     drop(index);
