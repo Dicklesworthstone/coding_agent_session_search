@@ -97,7 +97,10 @@ pub struct CodexScanPreflight {
 /// directory root: `franken_agent_detection` includes `.codex/sessions/...` in
 /// the external ID from that shape, while explicit file roots make the ID
 /// relative to `sessions/`. Unreadable or ambiguous roots similarly fall back
-/// so the connector's existing behavior remains the source of truth.
+/// so the connector's existing behavior remains the source of truth. A home
+/// with archived_sessions keeps its directory scope too: archive discovery
+/// owns its distinct cutoff and identity policy. An empty expansion must not
+/// turn an explicit selection into ScanContext's implicit default-home scan.
 #[doc(hidden)]
 #[must_use]
 pub fn preflight_codex_explicit_file_roots(
@@ -118,11 +121,11 @@ pub fn preflight_codex_explicit_file_roots(
         }
 
         match codex_explicit_file_roots_for_root(root, since_ts) {
-            Ok(expanded) => {
+            Ok(expanded) if !expanded.is_empty() => {
                 explicit_file_roots = explicit_file_roots.saturating_add(expanded.len());
                 scan_roots.extend(expanded);
             }
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 fallback_roots = fallback_roots.saturating_add(1);
                 scan_roots.push(root.clone());
             }
@@ -145,6 +148,20 @@ fn codex_explicit_file_roots_for_root(
         return Err(io::Error::other(
             "parent codex roots keep directory scan to preserve external IDs",
         ));
+    }
+
+    // Full-home discovery includes archived_sessions, including old rollouts
+    // moved there without an mtime change. Narrowing that home to active files
+    // would drop the archive and its stable-ID/cutoff rules. Even an unreadable
+    // or dangling archive entry must retain the authoritative directory path.
+    match fs::symlink_metadata(root.path.join("archived_sessions")) {
+        Ok(_) => {
+            return Err(io::Error::other(
+                "codex homes with archives keep directory discovery",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
 
     let sessions = codex_sessions_dir(&root.path);
@@ -207,6 +224,11 @@ fn collect_codex_rollout_files(sessions: &Path, since_ts: Option<i64>) -> io::Re
                 pending_dirs.push(path);
             } else if file_type.is_file()
                 && is_codex_rollout_file(&path)
+                // Match FAD's directory discovery during compression: prefer
+                // the plain representation before applying the time cutoff,
+                // rather than ingesting two snapshots of the same session.
+                && !(franken_agent_detection::connectors::codex::is_compressed_rollout(&path)
+                    && path.with_extension("").is_file())
                 && file_modified_since(&path, since_ts)
             {
                 files.push(path);
@@ -220,6 +242,11 @@ fn collect_codex_rollout_files(sessions: &Path, since_ts: Option<i64>) -> io::Re
 }
 
 fn is_codex_rollout_file(path: &Path) -> bool {
+    // CASS unconditionally enables FAD's codex-zstd reader. Share its filename
+    // recognition so compressed-only histories cannot disappear in preflight.
+    if franken_agent_detection::connectors::codex::is_compressed_rollout(path) {
+        return true;
+    }
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -337,3 +364,6 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
         })
         .collect()
 }
+
+#[cfg(test)]
+mod preflight_tests;
