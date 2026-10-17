@@ -513,7 +513,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "grok" | "grok_bot" => "agent-grok",
         "cline" | "clawdbot" | "kimi" => "agent-gemini",
         "opencode" | "qwen" => "agent-codex",
-        "pi_agent" | "omp" | "factory" | "droid" => "agent-aider",
+        "pi_agent" | "pi_durable" | "omp" | "factory" | "droid" => "agent-aider",
         "openclaw" => "agent-copilot",
         "vibe" | "mistral" => "agent-chatgpt",
         "crush" => "agent-amp",
@@ -553,6 +553,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "cline" => "Cline",
         "opencode" => "OpenCode",
         "pi_agent" => "Pi Agent",
+        "pi_durable" => "Pi Durable",
         "omp" => "Oh My Pi",
         "factory" | "droid" => "Factory",
         "openclaw" => "OpenClaw",
@@ -1612,6 +1613,7 @@ mod tests {
         assert_eq!(agent_css_class("hermes"), "agent-hermes");
         assert_eq!(agent_css_class("goose"), "agent-goose");
         assert_eq!(agent_css_class("shelley"), "agent-aider");
+        assert_eq!(agent_css_class("pi_durable"), "agent-aider");
         for alias in ["grok", "grok_bot", "grok-bot"] {
             assert_eq!(agent_css_class(alias), "agent-grok", "Grok alias {alias:?}");
         }
@@ -1626,6 +1628,7 @@ mod tests {
         assert_eq!(agent_display_name("copilot-cli"), "GitHub Copilot CLI");
         assert_eq!(agent_display_name("opencode"), "OpenCode");
         assert_eq!(agent_display_name("pi_agent"), "Pi Agent");
+        assert_eq!(agent_display_name("pi_durable"), "Pi Durable");
         for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
             assert_eq!(agent_display_name(alias), "Oh My Pi", "OMP alias {alias:?}");
         }

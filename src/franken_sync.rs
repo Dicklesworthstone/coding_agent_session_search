@@ -26,8 +26,15 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
+use fsqlite_types::cx::{CancelReason, LocalCancelRelay};
 
 pub use frankensqlite::{FileIdentity, FrankenError, Row, SqliteValue, fsqlite_vfs, params};
 
@@ -37,6 +44,126 @@ pub use frankensqlite::{FileIdentity, FrankenError, Row, SqliteValue, fsqlite_vf
 
 thread_local! {
     static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+    static CANCELLATION: RefCell<Option<CancellationHandle>> = const { RefCell::new(None) };
+}
+
+/// Cancellation authority for synchronous SQL issued inside an explicit scope.
+///
+/// The caller may request cancellation from its signal/owner thread while a
+/// thread-affine connection is executing. Only engine-derived operation
+/// contexts are cancelled: the connection root and its native runtime remain
+/// available for transaction rollback and close. Every admitted engine future
+/// is still driven to completion, including mandatory cancellation cleanup.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CancellationHandle {
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    active: Mutex<Vec<Arc<LocalCancelRelay>>>,
+}
+
+impl CancellationHandle {
+    /// Latch cancellation and notify every currently admitted SQL operation.
+    /// Registration rechecks the latch, so a request cannot be lost between
+    /// observing the scope and publishing an operation's relay.
+    pub(crate) fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        let active = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Cancellation invokes arbitrary engine/runtime wakers. Never run
+        // them under the registry lock: a woken operation may finish and
+        // unregister immediately on its owning thread.
+        for relay in active {
+            let _ = relay.cancel_local(CancelReason::UserInterrupt);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Activate cancellation for SQL on this thread until the guard drops.
+    /// Nested scopes restore their caller's handle. The guard must stay on
+    /// its originating thread, just like the raw connections it protects.
+    pub(crate) fn enter(&self) -> CancellationScope {
+        let previous = CANCELLATION.with(|slot| slot.replace(Some(self.clone())));
+        CancellationScope {
+            previous,
+            _thread_affine: PhantomData,
+        }
+    }
+
+    fn register(&self, relay: LocalCancelRelay) -> CancellationRegistration {
+        let relay = Arc::new(relay);
+        let cancelled = {
+            let mut active = self
+                .inner
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.push(Arc::clone(&relay));
+            self.is_cancelled()
+        };
+        let registration = CancellationRegistration {
+            handle: self.clone(),
+            relay,
+        };
+        if cancelled {
+            let _ = registration.relay.cancel_local(CancelReason::UserInterrupt);
+        }
+        registration
+    }
+}
+
+pub(crate) struct CancellationScope {
+    previous: Option<CancellationHandle>,
+    _thread_affine: PhantomData<Rc<()>>,
+}
+
+impl Drop for CancellationScope {
+    fn drop(&mut self) {
+        CANCELLATION.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+struct CancellationRegistration {
+    handle: CancellationHandle,
+    relay: Arc<LocalCancelRelay>,
+}
+
+impl Drop for CancellationRegistration {
+    fn drop(&mut self) {
+        self.handle
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|relay| !Arc::ptr_eq(relay, &self.relay));
+    }
+}
+
+/// Refuse new connection admission after a scoped stop has been requested.
+/// Existing constructor futures still run to completion: the engine does
+/// not expose a cancellable bootstrap context on its default runtime.
+fn check_connection_admission() -> Result<(), FrankenError> {
+    if CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(CancellationHandle::is_cancelled)
+    }) {
+        Err(FrankenError::Abort)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn shutdown_driver() -> bool {
@@ -83,8 +210,28 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
+    fn drive_operation<T>(
+        &self,
+        future: impl Future<Output = Result<T, FrankenError>>,
+    ) -> Result<T, FrankenError> {
+        let cancellation = CANCELLATION.with(|slot| slot.borrow().clone());
+        let Some(cancellation) = cancellation else {
+            return drive(future);
+        };
+        if cancellation.is_cancelled() {
+            return Err(FrankenError::Abort);
+        }
+        let (operation, relay) = self.inner.root_cx().create_child_with_local_cancel_relay();
+        let _registration = cancellation.register(relay);
+        let _binding = self.inner.bind_operation_cx(&operation);
+        // Keep polling through cancellation. Dropping a pending engine
+        // future here could abandon a transaction or an in-flight I/O lease.
+        drive(future)
+    }
+
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
+        check_connection_admission()?;
         Ok(Self {
             inner: drive(frankensqlite::Connection::open(path))?,
         })
@@ -95,6 +242,7 @@ impl Connection {
     pub fn open_schema_only_with_wal_index_recovery(
         path: impl Into<String>,
     ) -> Result<Self, FrankenError> {
+        check_connection_admission()?;
         Ok(Self {
             inner: drive(
                 frankensqlite::Connection::open_schema_only_with_wal_index_recovery(path),
@@ -104,6 +252,7 @@ impl Connection {
 
     /// Open an existing database only (never creates), loading the schema.
     pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self, FrankenError> {
+        check_connection_admission()?;
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only(path))?,
         })
@@ -114,6 +263,7 @@ impl Connection {
     pub fn open_existing_schema_only_deferred_fts5(
         path: impl Into<String>,
     ) -> Result<Self, FrankenError> {
+        check_connection_admission()?;
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only_deferred_fts5(path))?,
         })
@@ -127,12 +277,12 @@ impl Connection {
 
     /// Descriptor-bound identity, distinct from a possibly replaced pathname.
     pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
-        drive(self.inner.file_identity())
+        self.drive_operation(self.inner.file_identity())
     }
 
     /// Execute a single SQL statement, returning the affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        drive(self.inner.execute(sql))
+        self.drive_operation(self.inner.execute(sql))
     }
 
     /// Execute a single SQL statement with positional parameters.
@@ -141,17 +291,17 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        drive(self.inner.execute_with_params(sql, params))
+        self.drive_operation(self.inner.execute_with_params(sql, params))
     }
 
     /// Execute a string of semicolon-separated SQL statements.
     pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        drive(self.inner.execute_batch(sql))
+        self.drive_operation(self.inner.execute_batch(sql))
     }
 
     /// Query, returning all rows.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query(sql))
+        self.drive_operation(self.inner.query(sql))
     }
 
     /// Query with positional parameters, returning all rows.
@@ -160,7 +310,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query_with_params(sql, params))
+        self.drive_operation(self.inner.query_with_params(sql, params))
     }
 
     /// Query with positional parameters, streaming rows into `f`.
@@ -173,12 +323,12 @@ impl Connection {
     where
         F: FnMut(&Row) -> Result<(), FrankenError>,
     {
-        drive(self.inner.query_with_params_for_each(sql, params, f))
+        self.drive_operation(self.inner.query_with_params_for_each(sql, params, f))
     }
 
     /// Query, returning exactly one row.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row(sql))
+        self.drive_operation(self.inner.query_row(sql))
     }
 
     /// Query with positional parameters, returning exactly one row.
@@ -187,13 +337,14 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row_with_params(sql, params))
+        self.drive_operation(self.inner.query_row_with_params(sql, params))
     }
 
     /// Prepare a statement for repeated execution.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
         Ok(PreparedStatement {
-            inner: drive(self.inner.prepare(sql))?,
+            inner: self.drive_operation(self.inner.prepare(sql))?,
+            connection: self,
         })
     }
 
@@ -207,7 +358,7 @@ impl Connection {
     /// freelist through a normal write commit. Returns the pages freed. Run
     /// only at a quiescent point: no other writer may be active.
     pub fn repair_orphaned_pages(&self) -> Result<usize, FrankenError> {
-        drive(self.inner.repair_orphaned_pages())
+        self.drive_operation(self.inner.repair_orphaned_pages())
     }
 
     /// Close the connection (rolls back any active transaction, then runs the
@@ -259,17 +410,19 @@ impl Drop for Connection {
 /// Synchronous wrapper over [`frankensqlite::PreparedStatement`].
 pub struct PreparedStatement<'conn> {
     inner: frankensqlite::PreparedStatement<'conn>,
+    connection: &'conn Connection,
 }
 
 impl PreparedStatement<'_> {
     /// Query, returning all rows.
     pub fn query(&self) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query())
+        self.connection.drive_operation(self.inner.query())
     }
 
     /// Query with positional parameters, returning all rows.
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query_with_params(params))
+        self.connection
+            .drive_operation(self.inner.query_with_params(params))
     }
 
     /// Query with positional parameters, streaming rows into `f`.
@@ -281,27 +434,30 @@ impl PreparedStatement<'_> {
     where
         F: FnMut(&Row) -> Result<(), FrankenError>,
     {
-        drive(self.inner.query_with_params_for_each(params, f))
+        self.connection
+            .drive_operation(self.inner.query_with_params_for_each(params, f))
     }
 
     /// Query, returning exactly one row.
     pub fn query_row(&self) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row())
+        self.connection.drive_operation(self.inner.query_row())
     }
 
     /// Query with positional parameters, returning exactly one row.
     pub fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row_with_params(params))
+        self.connection
+            .drive_operation(self.inner.query_row_with_params(params))
     }
 
     /// Execute, returning the affected row count.
     pub fn execute(&self) -> Result<usize, FrankenError> {
-        drive(self.inner.execute())
+        self.connection.drive_operation(self.inner.execute())
     }
 
     /// Execute with positional parameters, returning the affected row count.
     pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize, FrankenError> {
-        drive(self.inner.execute_with_params(params))
+        self.connection
+            .drive_operation(self.inner.execute_with_params(params))
     }
 }
 
@@ -321,6 +477,7 @@ pub mod compat {
     /// Open a database with rusqlite-style open flags (synchronous form of
     /// [`frankensqlite::compat::open_with_flags`]).
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
+        super::check_connection_admission()?;
         Ok(Connection {
             inner: drive(frankensqlite::compat::open_with_flags(path, flags))?,
         })
@@ -405,22 +562,25 @@ pub mod compat {
     /// statement runs (`mark_transaction_cleanup_required` is sync).
     pub struct Transaction<'conn> {
         inner: frankensqlite::compat::Transaction<'conn>,
+        connection: &'conn Connection,
     }
 
     impl Transaction<'_> {
         /// Commit the transaction.
         pub fn commit(&mut self) -> Result<(), FrankenError> {
-            drive(self.inner.commit())
+            self.connection.drive_operation(self.inner.commit())
         }
 
         /// Roll back the transaction explicitly.
         pub fn rollback(&mut self) -> Result<(), FrankenError> {
+            // Explicit rollback is mandatory cleanup, including after the
+            // scope has latched cancellation. It uses the healthy root Cx.
             drive(self.inner.rollback())
         }
 
         /// Execute a SQL statement within this transaction.
         pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-            drive(self.inner.execute(sql))
+            self.connection.drive_operation(self.inner.execute(sql))
         }
 
         /// Execute a SQL statement with positional parameters.
@@ -429,7 +589,8 @@ pub mod compat {
             sql: &str,
             params: &[SqliteValue],
         ) -> Result<usize, FrankenError> {
-            drive(self.inner.execute_with_params(sql, params))
+            self.connection
+                .drive_operation(self.inner.execute_with_params(sql, params))
         }
 
         /// Execute with positional parameters, skipping the internal statement
@@ -439,7 +600,7 @@ pub mod compat {
             sql: &str,
             params: &[SqliteValue],
         ) -> Result<usize, FrankenError> {
-            drive(
+            self.connection.drive_operation(
                 self.inner
                     .execute_with_params_skip_statement_savepoint(sql, params),
             )
@@ -451,12 +612,13 @@ pub mod compat {
             sql: &str,
             params: &[ParamValue],
         ) -> Result<usize, FrankenError> {
-            drive(self.inner.execute_compat(sql, params))
+            self.connection
+                .drive_operation(self.inner.execute_compat(sql, params))
         }
 
         /// Query within this transaction.
         pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-            drive(self.inner.query(sql))
+            self.connection.drive_operation(self.inner.query(sql))
         }
 
         /// Query with positional parameters within this transaction.
@@ -465,7 +627,8 @@ pub mod compat {
             sql: &str,
             params: &[SqliteValue],
         ) -> Result<Vec<Row>, FrankenError> {
-            drive(self.inner.query_with_params(sql, params))
+            self.connection
+                .drive_operation(self.inner.query_with_params(sql, params))
         }
 
         /// Query with `ParamValue` parameters within this transaction.
@@ -474,12 +637,13 @@ pub mod compat {
             sql: &str,
             params: &[ParamValue],
         ) -> Result<Vec<Row>, FrankenError> {
-            drive(self.inner.query_params(sql, params))
+            self.connection
+                .drive_operation(self.inner.query_params(sql, params))
         }
 
         /// Query returning exactly one row within this transaction.
         pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
-            drive(self.inner.query_row(sql))
+            self.connection.drive_operation(self.inner.query_row(sql))
         }
 
         /// Query returning exactly one row with positional parameters.
@@ -488,7 +652,8 @@ pub mod compat {
             sql: &str,
             params: &[SqliteValue],
         ) -> Result<Row, FrankenError> {
-            drive(self.inner.query_row_with_params(sql, params))
+            self.connection
+                .drive_operation(self.inner.query_row_with_params(sql, params))
         }
 
         /// Query returning exactly one row, mapping it with `f`.
@@ -501,7 +666,8 @@ pub mod compat {
         where
             F: FnOnce(&Row) -> Result<T, FrankenError>,
         {
-            drive(self.inner.query_row_map(sql, params, f))
+            self.connection
+                .drive_operation(self.inner.query_row_map(sql, params, f))
         }
 
         /// Query and collect all rows into a `Vec<T>` via `f`.
@@ -514,12 +680,14 @@ pub mod compat {
         where
             F: FnMut(&Row) -> Result<T, FrankenError>,
         {
-            drive(self.inner.query_map_collect(sql, params, f))
+            self.connection
+                .drive_operation(self.inner.query_map_collect(sql, params, f))
         }
 
         /// Execute a string of semicolon-separated SQL statements.
         pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-            drive(self.inner.execute_batch(sql))
+            self.connection
+                .drive_operation(self.inner.execute_batch(sql))
         }
 
         /// Last-inserted rowid within this transaction.
@@ -537,7 +705,8 @@ pub mod compat {
     impl TransactionExt for Connection {
         fn transaction(&self) -> Result<Transaction<'_>, FrankenError> {
             Ok(Transaction {
-                inner: drive(AsyncTransactionExt::transaction(self.as_async()))?,
+                inner: self.drive_operation(AsyncTransactionExt::transaction(self.as_async()))?,
+                connection: self,
             })
         }
     }
@@ -548,7 +717,7 @@ pub mod compat {
 // ---------------------------------------------------------------------------
 
 pub mod migrate {
-    use super::{Connection, FrankenError, drive};
+    use super::{Connection, FrankenError};
 
     pub use frankensqlite::migrate::{Migration, MigrationResult};
 
@@ -576,16 +745,268 @@ pub mod migrate {
 
         /// Run all pending migrations against `conn`.
         pub fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
-            drive(self.inner.run(conn.as_async()))
+            conn.drive_operation(self.inner.run(conn.as_async()))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compat::RowExt;
+    use super::compat::{RowExt, TransactionExt};
     use super::*;
     use asupersync::{Cx, cx::CapMask};
+
+    #[test]
+    fn cancellation_before_open_preserves_files_and_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let existing = directory.path().join("existing.db");
+        let missing = directory.path().join("not-admitted.db");
+        let conn = Connection::open(existing.to_string_lossy())?;
+        conn.execute("CREATE TABLE committed_values(value INTEGER)")?;
+        conn.execute("INSERT INTO committed_values VALUES(7)")?;
+        conn.close()?;
+
+        let cancellation = CancellationHandle::default();
+        cancellation.cancel();
+        {
+            let _scope = cancellation.enter();
+            assert!(matches!(
+                Connection::open(missing.to_string_lossy()),
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                compat::open_with_flags(
+                    missing.to_string_lossy().as_ref(),
+                    compat::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | compat::OpenFlags::SQLITE_OPEN_CREATE,
+                ),
+                Err(FrankenError::Abort)
+            ));
+            assert!(
+                !missing.exists(),
+                "a cancelled open must not create a database"
+            );
+            assert!(matches!(
+                Connection::open_existing_schema_only(existing.to_string_lossy()),
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                Connection::open_existing_schema_only_deferred_fts5(existing.to_string_lossy()),
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                Connection::open_schema_only_with_wal_index_recovery(existing.to_string_lossy()),
+                Err(FrankenError::Abort)
+            ));
+        }
+
+        let reopened = Connection::open(existing.to_string_lossy())?;
+        assert_eq!(
+            reopened
+                .query_row("SELECT value FROM committed_values")?
+                .get_typed::<i64>(0)?,
+            7,
+            "local cancellation must leave the shared runtime and committed data healthy"
+        );
+        reopened.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_scope_is_latched_and_rollback_preserves_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute("CREATE TABLE cancellation_values(value INTEGER)")?;
+        let prepared = conn.prepare("SELECT COUNT(*) FROM cancellation_values")?;
+        let mut transaction = conn.transaction()?;
+        transaction.execute("INSERT INTO cancellation_values VALUES(1)")?;
+        let handle = CancellationHandle::default();
+        handle.cancel();
+        {
+            let _scope = handle.enter();
+            assert!(matches!(conn.query("SELECT 1"), Err(FrankenError::Abort)));
+            assert!(matches!(prepared.query(), Err(FrankenError::Abort)));
+            assert!(matches!(conn.prepare("SELECT 1"), Err(FrankenError::Abort)));
+            assert!(matches!(
+                transaction.execute("INSERT INTO cancellation_values VALUES(2)"),
+                Err(FrankenError::Abort)
+            ));
+            transaction.rollback()?;
+        }
+        drop(transaction);
+        assert_eq!(prepared.query_row()?.get_typed::<i64>(0)?, 0);
+        conn.execute("INSERT INTO cancellation_values VALUES(3)")?;
+        assert_eq!(prepared.query_row()?.get_typed::<i64>(0)?, 1);
+        assert!(handle.inner.active.lock().unwrap().is_empty());
+        drop(prepared);
+        conn.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_scopes_restore_parent_without_cancelling_native_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let conn = Connection::open(":memory:")?;
+        let outer = CancellationHandle::default();
+        let inner = CancellationHandle::default();
+        {
+            let _outer_scope = outer.enter();
+            outer.cancel();
+            {
+                let _inner_scope = inner.enter();
+                assert_eq!(conn.query_row("SELECT 42")?.get_typed::<i64>(0)?, 42);
+            }
+            assert!(matches!(conn.query("SELECT 1"), Err(FrankenError::Abort)));
+        }
+        assert_eq!(conn.query_row("SELECT 43")?.get_typed::<i64>(0)?, 43);
+        assert!(!inner.is_cancelled());
+        conn.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_stops_admitted_busy_writer_and_allows_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "CASS_TEST_SQL_CANCELLATION_CHILD";
+        const TEST_NAME: &str =
+            "franken_sync::tests::cancellation_stops_admitted_busy_writer_and_allows_recovery";
+        if !matches!(std::env::var(CHILD_ENV).as_deref(), Ok("1")) {
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+
+            // A lost engine wake must fail the regression without stranding
+            // its SQL owner thread. Only this supervisor enforces a deadline;
+            // the child keeps driving admitted futures through cleanup.
+            let directory = tempfile::tempdir()?;
+            let log_path = directory.path().join("sql-cancellation.log");
+            let log = std::fs::File::create(&log_path)?;
+            let mut child = Child(
+                std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
+                    .env(CHILD_ENV, "1")
+                    .stdout(log.try_clone()?)
+                    .stderr(log)
+                    .spawn()?,
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(status) = child.0.try_wait()? {
+                    let output = std::fs::read_to_string(&log_path)?;
+                    assert!(
+                        status.success() && output.contains("1 passed"),
+                        "SQL cancellation child failed ({status}):\n{output}"
+                    );
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "SQL cancellation child exceeded 60 seconds:\n{}",
+                        std::fs::read_to_string(&log_path)?
+                    )
+                    .into());
+                }
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+        }
+
+        // Scoped ownership joins the SQL worker even when an earlier setup or
+        // channel operation fails. If engine cleanup itself cannot settle,
+        // the owning supervisor above kills and reaps this entire process.
+        // Keep the archive directory outside the scope closure: on an early
+        // error its locals drop before the scope joins the SQL owner.
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("cancellation.db");
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let blocker = Connection::open(path.to_string_lossy().into_owned())?;
+            blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+            blocker.execute("CREATE TABLE writes(value INTEGER)")?;
+            let handle = CancellationHandle::default();
+            let worker_handle = handle.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (begin_tx, begin_rx) = mpsc::channel();
+            let (pending_tx, pending_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let worker = scope.spawn(move || -> Result<(), String> {
+                let execute = || -> Result<(), Box<dyn std::error::Error>> {
+                    let conn = Connection::open(path.to_string_lossy().into_owned())?;
+                    conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+                    conn.execute("PRAGMA busy_timeout = 10000")?;
+                    ready_tx.send(())?;
+                    begin_rx.recv_timeout(Duration::from_secs(10))?;
+                    let result = {
+                        let _scope = worker_handle.enter();
+                        let mut future =
+                            std::pin::pin!(conn.inner.execute("INSERT INTO writes VALUES(2)"));
+                        let mut reported_pending = false;
+                        conn.drive_operation(std::future::poll_fn(|context| {
+                            let result = future.as_mut().poll(context);
+                            if result.is_pending() && !reported_pending {
+                                reported_pending = true;
+                                let _ = pending_tx.send(());
+                            }
+                            result
+                        }))
+                    };
+                    result_tx.send(result)?;
+                    release_rx.recv_timeout(Duration::from_secs(10))?;
+                    conn.execute("INSERT INTO writes VALUES(3)")?;
+                    conn.close_without_checkpoint()?;
+                    Ok(())
+                };
+                execute().map_err(|error| error.to_string())
+            });
+
+            ready_rx.recv_timeout(Duration::from_secs(10))?;
+            blocker.execute("BEGIN IMMEDIATE")?;
+            blocker.execute("INSERT INTO writes VALUES(1)")?;
+            begin_tx.send(())?;
+            // Prove the real engine future has been polled to Pending before
+            // cancelling. A delayed worker must not satisfy this test through
+            // drive_operation's prelatched rejection without exercising a wake.
+            pending_rx.recv_timeout(Duration::from_secs(10))?;
+            // This wait observes a real contended SQL operation while the writer
+            // above owns its transaction; it does not inject a parked engine task.
+            let premature = result_rx.recv_timeout(Duration::from_millis(100));
+            handle.cancel();
+            let cancelled = match premature {
+                Ok(result) => (false, Ok(result)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    (true, result_rx.recv_timeout(Duration::from_secs(2)))
+                }
+                Err(error) => (false, Err(error)),
+            };
+            // Release the real writer and every handshake before asserting, so a
+            // failing cancellation assertion still lets the worker drain/join.
+            blocker.execute("COMMIT")?;
+            release_tx.send(())?;
+            worker.join().expect("SQL owner thread panicked")?;
+            assert!(cancelled.0, "the second writer must wait for ownership");
+            assert!(
+                matches!(cancelled.1, Ok(Err(FrankenError::Abort))),
+                "cancellation must settle before the 10-second busy timeout: {:?}",
+                cancelled.1
+            );
+            let rows = blocker.query("SELECT value FROM writes ORDER BY value")?;
+            let values = rows
+                .iter()
+                .map(|row| row.get_typed::<i64>(0))
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(values, vec![1, 3], "cancelled writes must never commit");
+            assert!(handle.inner.active.lock().unwrap().is_empty());
+            blocker.close()?;
+            Ok(())
+        })
+    }
 
     #[test]
     fn nested_sql_bridge_restores_full_and_restricted_callers()

@@ -3,9 +3,13 @@
 //! Exact-schema restoration remains the default. Cross-version restoration is
 //! deliberately allowlisted rather than inferred from "compatible-looking" SQL
 //! shapes: data backfills can be semantically required even when columns appear
-//! additive. The first reviewed bridge is storage schema v20 -> v21. Repository
-//! migration fixtures establish that v21 adds the conversation-context index and
-//! advances schema authority while leaving canonical table layouts unchanged.
+//! additive. The reviewed bridges are storage schema v20 and v21 -> v22.
+//! Repository migration fixtures establish what each step adds. v21 adds the
+//! conversation-context index. v22 adds the `forgotten_sources` table, the
+//! `cass forget` tombstones. An archive older than v22 cannot carry rows for
+//! that table, so a migrated archive gets it empty, which is the state an
+//! in-place v21 -> v22 upgrade leaves. Every other canonical table layout is
+//! unchanged.
 //!
 //! The current initializer remains the sole executable schema authority. Archived
 //! `_schema_migrations` rows and `meta.schema_version` are verified as input but
@@ -33,8 +37,13 @@ const MAX_TRIGGER_BYTES: usize = 1024 * 1024;
 const MIGRATIONS_TABLE: &str = "_schema_migrations";
 const META_TABLE: &str = "meta";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const REVIEWED_SOURCE_VERSION: u32 = 20;
-const REVIEWED_TARGET_VERSION: u32 = 21;
+/// Storage schema versions an archive may be migrated from, into
+/// [`REVIEWED_TARGET_VERSION`] only.
+const REVIEWED_SOURCE_VERSIONS: [u32; 2] = [20, 21];
+const REVIEWED_TARGET_VERSION: u32 = 22;
+/// Canonical tables the target added after every reviewed source. A migrated
+/// archive has no rows for them, and they must stay empty.
+const TABLES_ADDED_SINCE_REVIEWED_SOURCES: [&str; 1] = ["forgotten_sources"];
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaMigrationReceipt {
@@ -109,7 +118,7 @@ fn parse_source_version(header: &Header) -> Result<u32> {
 
 fn require_reviewed_transition(source: u32, target: u32) -> Result<()> {
     ensure!(
-        source == REVIEWED_SOURCE_VERSION && target == REVIEWED_TARGET_VERSION,
+        REVIEWED_SOURCE_VERSIONS.contains(&source) && target == REVIEWED_TARGET_VERSION,
         "no reviewed logical-archive migration exists from storage schema {source} to {target}; exact restore or a version-specific migration is required"
     );
     Ok(())
@@ -156,12 +165,26 @@ fn require_reviewed_table_layout(
     connection: &Connection,
     archived: &[Table],
 ) -> Result<Vec<Table>> {
-    let current = export::tables(connection)?;
+    let (added, carried): (Vec<Table>, Vec<Table>) = export::tables(connection)?
+        .into_iter()
+        .partition(|table| TABLES_ADDED_SINCE_REVIEWED_SOURCES.contains(&table.name.as_str()));
     ensure!(
-        archived == current,
-        "reviewed v20 -> v21 migration requires identical canonical table/column/primary-key descriptors; index-only migration does not authorize table drift"
+        archived == carried,
+        "reviewed migration to v{REVIEWED_TARGET_VERSION} requires canonical table/column/primary-key descriptors identical to the current ones, apart from tables added since v21; table drift is not authorized"
     );
-    Ok(current)
+    ensure!(
+        added.len() == TABLES_ADDED_SINCE_REVIEWED_SOURCES.len(),
+        "current schema lacks a table the reviewed migration adds"
+    );
+    for table in &added {
+        let sql = format!("SELECT 1 FROM {} LIMIT 1", export::quoted(&table.name)?);
+        ensure!(
+            connection.query(&sql)?.is_empty(),
+            "table {} added since the archived schema must stay empty in a migrated archive",
+            table.name
+        );
+    }
+    Ok(carried)
 }
 
 fn values(cells: Vec<Cell>) -> Result<Vec<SqliteValue>> {
@@ -269,7 +292,7 @@ fn clear_archived_data(connection: &Connection, archived: &[Table]) -> Result<()
     Ok(())
 }
 
-fn restore_v20<R: BufRead>(
+fn restore_reviewed<R: BufRead>(
     connection: &Connection,
     input: &mut Input<R>,
     inspected: &Inspected,
@@ -332,7 +355,7 @@ fn restore_v20<R: BufRead>(
                     .as_ref()
                     .ok_or_else(|| anyhow!("record {line}: row precedes its table"))?;
                 if table.name == MIGRATIONS_TABLE {
-                    // v20 migration history is input evidence, never current authority.
+                    // Archived migration history is input evidence, never current authority.
                 } else if meta_schema_version_row(table, &cells) {
                     saw_schema_marker = true;
                 } else {
@@ -342,7 +365,7 @@ fn restore_v20<R: BufRead>(
                         .execute_with_params(&values(cells)?)
                         .map_err(|_| {
                             anyhow!(
-                                "record {line}: row does not satisfy the reviewed v21 schema; no destination was published"
+                                "record {line}: row does not satisfy the reviewed v{REVIEWED_TARGET_VERSION} schema; no destination was published"
                             )
                         })?;
                 }
@@ -368,7 +391,7 @@ fn restore_v20<R: BufRead>(
     );
     ensure!(
         saw_schema_marker,
-        "v20 logical archive lacks the schema_version marker required for reviewed migration"
+        "logical archive lacks the schema_version marker required for reviewed migration"
     );
 
     drop(statement);
@@ -681,8 +704,14 @@ fn verify_persisted_projection(
 }
 
 fn migration_receipt(inspected: &Inspected) -> Result<SchemaMigrationReceipt> {
+    let source = parse_source_version(&inspected.header)?;
+    require_reviewed_transition(source, target_version()?)?;
     Ok(SchemaMigrationReceipt {
-        mode: "reviewed_v20_to_v21",
+        mode: match source {
+            20 => "reviewed_v20_to_v22",
+            21 => "reviewed_v21_to_v22",
+            _ => bail!("no reviewed migration mode for storage schema {source}"),
+        },
         from_storage_schema_version: inspected.header.storage_schema_version.clone(),
         to_storage_schema_version: target_version()?.to_string(),
         schema_authority: "current_binary_initializer",
@@ -761,7 +790,7 @@ pub fn import_compatible(
 
     file.seek(SeekFrom::Start(0))?;
     let mut bounded = Input::new(BufReader::new(&mut file));
-    restore_v20(&connection, &mut bounded, &inspected)?;
+    restore_reviewed(&connection, &mut bounded, &inspected)?;
     materialize_candidate(&connection, &candidate)?;
     connection.close()?;
 
@@ -810,14 +839,19 @@ mod tests {
             .collect()
     }
 
+    /// A logical archive labelled `source_version`, exported from a current
+    /// database. Tables the target added after that version are left out,
+    /// as a real archive of that version lacks them, unless
+    /// `carry_added_tables` keeps them (a forged or drifted archive).
     fn versioned_archive(
         root: &Path,
         source_version: u32,
         descriptor_drift: bool,
+        carry_added_tables: bool,
     ) -> Result<PathBuf> {
         ensure!(
             target_version()? == REVIEWED_TARGET_VERSION,
-            "reviewed migration tests require schema v21; update policy before accepting a newer target"
+            "reviewed migration tests require schema v{REVIEWED_TARGET_VERSION}; update policy before accepting a newer target"
         );
         let source = root.join(format!("source-{source_version}.db"));
         let storage = SqliteStorage::open(&source)?;
@@ -852,6 +886,12 @@ mod tests {
         })?)?;
 
         for mut table in export::tables(&connection)? {
+            if !carry_added_tables
+                && source_version < REVIEWED_TARGET_VERSION
+                && TABLES_ADDED_SINCE_REVIEWED_SOURCES.contains(&table.name.as_str())
+            {
+                continue;
+            }
             if descriptor_drift && table.name == "agents" {
                 let removed_offset = table
                     .columns
@@ -940,40 +980,44 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_v20_migration_restores_rows_under_current_v21_authority() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
-        let destination = root.path().join("restored.db");
-        let outcome = import_compatible(&input, &destination, "reviewed-migration", false)?;
-        let receipt = outcome.migration.context("migration receipt missing")?;
-        assert_eq!(receipt.mode, "reviewed_v20_to_v21");
-        assert_eq!(
-            receipt.from_storage_schema_version,
-            REVIEWED_SOURCE_VERSION.to_string()
-        );
-        assert_eq!(
-            receipt.to_storage_schema_version,
-            REVIEWED_TARGET_VERSION.to_string()
-        );
-        assert!(receipt.source_rows_verified);
+    fn reviewed_migrations_restore_rows_under_current_authority() -> Result<()> {
+        for (source, mode) in [(20, "reviewed_v20_to_v22"), (21, "reviewed_v21_to_v22")] {
+            let root = tempfile::tempdir()?;
+            let input = versioned_archive(root.path(), source, false, false)?;
+            let destination = root.path().join("restored.db");
+            let outcome = import_compatible(&input, &destination, "reviewed-migration", false)?;
+            let receipt = outcome.migration.context("migration receipt missing")?;
+            assert_eq!(receipt.mode, mode);
+            assert_eq!(receipt.from_storage_schema_version, source.to_string());
+            assert_eq!(
+                receipt.to_storage_schema_version,
+                REVIEWED_TARGET_VERSION.to_string()
+            );
+            assert!(receipt.source_rows_verified);
 
-        let storage = SqliteStorage::open_readonly(&destination)?;
-        assert_eq!(
-            u32::try_from(storage.schema_version()?)?,
-            REVIEWED_TARGET_VERSION
-        );
-        let row = storage
-            .raw()
-            .query_row("SELECT slug, version FROM agents WHERE slug = 'migration-fixture'")?;
-        assert_eq!(row.get_typed::<String>(0)?, "migration-fixture");
-        assert_eq!(row.get_typed::<Option<String>>(1)?, Some("v20-data".into()));
+            let storage = SqliteStorage::open_readonly(&destination)?;
+            assert_eq!(
+                u32::try_from(storage.schema_version()?)?,
+                REVIEWED_TARGET_VERSION
+            );
+            let row = storage
+                .raw()
+                .query_row("SELECT slug, version FROM agents WHERE slug = 'migration-fixture'")?;
+            assert_eq!(row.get_typed::<String>(0)?, "migration-fixture");
+            assert_eq!(row.get_typed::<Option<String>>(1)?, Some("v20-data".into()));
+            // The table v22 added exists, empty, as an in-place upgrade leaves it.
+            let forgotten = storage
+                .raw()
+                .query_row("SELECT COUNT(*) FROM forgotten_sources")?;
+            assert_eq!(forgotten.get_typed::<i64>(0)?, 0);
+        }
         Ok(())
     }
 
     #[test]
     fn repeated_reviewed_migration_is_read_only_and_reports_unchanged() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
+        let input = versioned_archive(root.path(), 21, false, false)?;
         let destination = root.path().join("restored.db");
         let created = import_compatible(&input, &destination, "reviewed-migration", false)?;
         assert!(created.created);
@@ -988,7 +1032,7 @@ mod tests {
     #[test]
     fn changed_migrated_destination_is_a_conflict_not_an_overwrite() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, false)?;
+        let input = versioned_archive(root.path(), 20, false, false)?;
         let destination = root.path().join("restored.db");
         import_compatible(&input, &destination, "reviewed-migration", false)?;
         let writer = Connection::open(export::path_text(&destination)?)?;
@@ -1003,9 +1047,37 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_index_only_bridge_rejects_canonical_descriptor_drift() -> Result<()> {
+    fn a_row_in_an_added_table_makes_the_migrated_destination_a_conflict() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION, true)?;
+        let input = versioned_archive(root.path(), 21, false, false)?;
+        let destination = root.path().join("restored.db");
+        import_compatible(&input, &destination, "reviewed-migration", false)?;
+        let writer = Connection::open(export::path_text(&destination)?)?;
+        writer.execute(
+            "INSERT INTO forgotten_sources (source_path, size_bytes, mtime_ms, forgotten_at_ms) \
+             VALUES ('/not/from/the/archive.jsonl', 1, 1, 1)",
+        )?;
+        writer.close()?;
+        let before = database_files(&destination);
+        assert!(import_compatible(&input, &destination, "reviewed-migration", true).is_err());
+        assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
+    fn reviewed_bridge_rejects_canonical_descriptor_drift() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = versioned_archive(root.path(), 20, true, false)?;
+        let destination = root.path().join("restored.db");
+        assert!(import_compatible(&input, &destination, "reviewed-migration", false).is_err());
+        assert!(!destination.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn older_archive_carrying_a_table_added_later_is_refused() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = versioned_archive(root.path(), 21, false, true)?;
         let destination = root.path().join("restored.db");
         assert!(import_compatible(&input, &destination, "reviewed-migration", false).is_err());
         assert!(!destination.exists());
@@ -1015,7 +1087,7 @@ mod tests {
     #[test]
     fn unreviewed_older_schema_is_refused_without_publication() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let input = versioned_archive(root.path(), REVIEWED_SOURCE_VERSION - 1, false)?;
+        let input = versioned_archive(root.path(), 19, false, false)?;
         let destination = root.path().join("restored.db");
         assert!(import_compatible(&input, &destination, "reviewed-migration", false).is_err());
         assert!(!destination.exists());
@@ -1025,7 +1097,7 @@ mod tests {
     #[test]
     fn newer_schema_is_refused_without_publication() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let input = versioned_archive(root.path(), REVIEWED_TARGET_VERSION + 1, false)?;
+        let input = versioned_archive(root.path(), REVIEWED_TARGET_VERSION + 1, false, false)?;
         let destination = root.path().join("restored.db");
         assert!(import_compatible(&input, &destination, "reviewed-migration", false).is_err());
         assert!(!destination.exists());

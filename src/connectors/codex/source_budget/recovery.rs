@@ -7,8 +7,10 @@
 use std::cell::Cell;
 use std::fmt;
 use std::io;
+use std::path::Path;
 
 use franken_agent_detection::ScanRoot;
+use franken_agent_detection::connectors::codex::rollout_session_path;
 use serde::Serialize;
 
 use super::{
@@ -95,6 +97,9 @@ impl Failures {
                 Some(io::ErrorKind::NotFound) => "source_missing",
                 Some(io::ErrorKind::PermissionDenied) => "source_unreadable",
                 Some(io::ErrorKind::InvalidData) => "invalid_source_data",
+                // A compressed rollout whose decoded text passed the budget
+                // without declaring its length up front (GH #513).
+                Some(io::ErrorKind::FileTooLarge) => "read_budget_exceeded",
                 _ => "source_read_failed",
             };
             // Retain one original error for typed downcasts and its cause chain.
@@ -176,8 +181,12 @@ fn directory_session_id(source: &DiscoveredSourceFile) -> Option<String> {
         .strip_prefix(source.scan_root.join("sessions"))
         .or_else(|_| source.source_path.strip_prefix(&source.scan_root))
         .ok()
-        .and_then(|relative| relative.with_extension("").to_str().map(str::to_owned))
-        .or_else(|| source.source_path.file_stem()?.to_str().map(str::to_owned))
+        .and_then(|relative| rollout_session_path(relative).to_str().map(str::to_owned))
+        .or_else(|| {
+            rollout_session_path(Path::new(source.source_path.file_name()?))
+                .to_str()
+                .map(str::to_owned)
+        })
 }
 
 fn scan_source(

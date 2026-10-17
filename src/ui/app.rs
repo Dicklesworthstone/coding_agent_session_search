@@ -4252,19 +4252,22 @@ pub struct SwarmStaleStateCounts {
     pub manual_review_required: u64,
 }
 
+/// One `cass swarm status` payload as the cockpit shows it. A count is `None`
+/// when the payload left it null (its provider was not read), and renders as
+/// `?`, never as zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwarmCockpitSnapshot {
     pub status: String,
     pub recommended_action: String,
-    pub ready_count: u64,
-    pub in_progress_count: u64,
-    pub blocked_count: u64,
-    pub active_agent_count: u64,
-    pub active_reservation_count: u64,
-    pub stale_candidate_count: u64,
-    pub proof_gap_count: u64,
+    pub ready_count: Option<u64>,
+    pub in_progress_count: Option<u64>,
+    pub blocked_count: Option<u64>,
+    pub active_agent_count: Option<u64>,
+    pub active_reservation_count: Option<u64>,
+    pub stale_candidate_count: Option<u64>,
+    pub proof_gap_count: Option<u64>,
     pub build_pressure: String,
-    pub stale_state_counts: SwarmStaleStateCounts,
+    pub stale_state_counts: Option<SwarmStaleStateCounts>,
     pub provider_warnings: Vec<String>,
     pub evidence_gaps: Vec<String>,
     pub redaction_applied: bool,
@@ -4275,15 +4278,15 @@ impl Default for SwarmCockpitSnapshot {
         Self {
             status: "unavailable".to_string(),
             recommended_action: "inspect-status".to_string(),
-            ready_count: 0,
-            in_progress_count: 0,
-            blocked_count: 0,
-            active_agent_count: 0,
-            active_reservation_count: 0,
-            stale_candidate_count: 0,
-            proof_gap_count: 0,
+            ready_count: None,
+            in_progress_count: None,
+            blocked_count: None,
+            active_agent_count: None,
+            active_reservation_count: None,
+            stale_candidate_count: None,
+            proof_gap_count: None,
             build_pressure: "unknown".to_string(),
-            stale_state_counts: SwarmStaleStateCounts::default(),
+            stale_state_counts: None,
             provider_warnings: Vec::new(),
             evidence_gaps: Vec::new(),
             redaction_applied: false,
@@ -4337,13 +4340,15 @@ impl SwarmCockpitSnapshot {
             stale_candidate_count: count_value(summary, "stale_candidate_count"),
             proof_gap_count: count_value(summary, "proof_gap_count"),
             build_pressure: string_value(summary, "build_pressure", "unknown"),
-            stale_state_counts: SwarmStaleStateCounts {
-                active: count_value(stale_counts, "active"),
-                recently_quiet: count_value(stale_counts, "recently_quiet"),
-                likely_stale: count_value(stale_counts, "likely_stale"),
-                conflicting_evidence: count_value(stale_counts, "conflicting_evidence"),
-                manual_review_required: count_value(stale_counts, "manual_review_required"),
-            },
+            stale_state_counts: stale_counts.is_object().then(|| SwarmStaleStateCounts {
+                active: count_value(stale_counts, "active").unwrap_or(0),
+                recently_quiet: count_value(stale_counts, "recently_quiet").unwrap_or(0),
+                likely_stale: count_value(stale_counts, "likely_stale").unwrap_or(0),
+                conflicting_evidence: count_value(stale_counts, "conflicting_evidence")
+                    .unwrap_or(0),
+                manual_review_required: count_value(stale_counts, "manual_review_required")
+                    .unwrap_or(0),
+            }),
             provider_warnings,
             evidence_gaps,
             redaction_applied: payload
@@ -4360,6 +4365,11 @@ impl SwarmCockpitSnapshot {
 pub struct SwarmCockpitState {
     pub snapshot: Option<SwarmCockpitSnapshot>,
     pub status: String,
+    /// A background live read is in flight.
+    pub loading: bool,
+    /// The snapshot came from a live provider read, not a placeholder or a
+    /// supplied payload.
+    pub live: bool,
 }
 
 impl SwarmCockpitState {
@@ -4367,15 +4377,19 @@ impl SwarmCockpitState {
         Self {
             snapshot: Some(snapshot),
             status: "cached swarm snapshot".to_string(),
+            loading: false,
+            live: false,
         }
     }
 }
 
-fn count_value(value: &serde_json::Value, key: &str) -> u64 {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
+fn count_value(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(serde_json::Value::as_u64)
+}
+
+/// A cockpit count: `?` when unknown, never a fabricated zero.
+fn swarm_count(count: Option<u64>) -> String {
+    count.map_or_else(|| "?".to_string(), |count| count.to_string())
 }
 
 fn string_value(value: &serde_json::Value, key: &str, fallback: &str) -> String {
@@ -6661,6 +6675,8 @@ impl CassApp {
             PaletteResult::LoadViewSlot(slot) => ftui::Cmd::msg(CassMsg::ViewLoaded(slot)),
             PaletteResult::OpenBulkActions => ftui::Cmd::msg(CassMsg::BulkActionsOpened),
             PaletteResult::ReloadIndex => ftui::Cmd::msg(CassMsg::IndexRefreshRequested),
+            PaletteResult::BookmarkSelectedHit => ftui::Cmd::msg(CassMsg::BookmarkSelectedHit),
+            PaletteResult::OpenSwarm => ftui::Cmd::msg(CassMsg::SwarmEntered),
             PaletteResult::OpenAnalyticsView(target) => {
                 let view = match target {
                     AnalyticsTarget::Dashboard => AnalyticsView::Dashboard,
@@ -7000,7 +7016,8 @@ impl CassApp {
 
         let hint_pairs = [
             (shortcuts::SURFACE_ANALYTICS, "analytics"),
-            (shortcuts::SURFACE_SWARM, "swarm"),
+            // The Swarm tab has no direct key (Alt+W is the workspace
+            // filter); the palette's "Swarm operations cockpit" opens it.
             (shortcuts::SOURCES, "sources"),
             (shortcuts::PALETTE, "palette"),
             (shortcuts::HELP, "help"),
@@ -12895,6 +12912,10 @@ impl CassApp {
                     shortcuts::COPY_CONTENT
                 ),
                 format!(
+                    "{} bookmark the selected hit (`cass bookmarks list` shows them)",
+                    shortcuts::BOOKMARK
+                ),
+                format!(
                     "{} toggle aggregate results stats bar",
                     shortcuts::STATS_BAR
                 ),
@@ -13614,11 +13635,11 @@ impl CassApp {
                 |snapshot| {
                     format!(
                         "ready:{}  agents:{}  reservations:{}  stale:{}  gaps:{}  build:{}",
-                        snapshot.ready_count,
-                        snapshot.active_agent_count,
-                        snapshot.active_reservation_count,
-                        snapshot.stale_candidate_count,
-                        snapshot.proof_gap_count,
+                        swarm_count(snapshot.ready_count),
+                        swarm_count(snapshot.active_agent_count),
+                        swarm_count(snapshot.active_reservation_count),
+                        swarm_count(snapshot.stale_candidate_count),
+                        swarm_count(snapshot.proof_gap_count),
                         snapshot.build_pressure
                     )
                 },
@@ -13631,7 +13652,11 @@ impl CassApp {
         let content_block = Block::new()
             .borders(borders)
             .border_type(border_type)
-            .title("Cached Operations Snapshot")
+            .title(if self.swarm_cockpit.live {
+                "Live Operations Snapshot"
+            } else {
+                "Cached Operations Snapshot"
+            })
             .title_alignment(Alignment::Left)
             .border_style(pane_style.fg(accent))
             .style(pane_style);
@@ -13639,29 +13664,35 @@ impl CassApp {
         content_block.render(vertical[1], frame);
         if render_content && !content_inner.is_empty() {
             let content = if let Some(snapshot) = snapshot {
-                let stale = &snapshot.stale_state_counts;
                 let mut rows = vec![
                     format!(
                         "Queue      ready {} · in-progress {} · blocked {}",
-                        snapshot.ready_count, snapshot.in_progress_count, snapshot.blocked_count
+                        swarm_count(snapshot.ready_count),
+                        swarm_count(snapshot.in_progress_count),
+                        swarm_count(snapshot.blocked_count)
                     ),
                     format!(
                         "Swarm      agents {} · reservations {} · build {}",
-                        snapshot.active_agent_count,
-                        snapshot.active_reservation_count,
+                        swarm_count(snapshot.active_agent_count),
+                        swarm_count(snapshot.active_reservation_count),
                         snapshot.build_pressure
                     ),
-                    format!(
-                        "Stale      active {} · quiet {} · likely {} · conflict {} · manual {}",
-                        stale.active,
-                        stale.recently_quiet,
-                        stale.likely_stale,
-                        stale.conflicting_evidence,
-                        stale.manual_review_required
+                    snapshot.stale_state_counts.as_ref().map_or_else(
+                        || "Stale      unknown (no live coordination evidence)".to_string(),
+                        |stale| {
+                            format!(
+                                "Stale      active {} · quiet {} · likely {} · conflict {} · manual {}",
+                                stale.active,
+                                stale.recently_quiet,
+                                stale.likely_stale,
+                                stale.conflicting_evidence,
+                                stale.manual_review_required
+                            )
+                        },
                     ),
                     format!(
                         "Evidence   gaps {} · redaction {}",
-                        snapshot.proof_gap_count,
+                        swarm_count(snapshot.proof_gap_count),
                         if snapshot.redaction_applied {
                             "applied"
                         } else {
@@ -13714,15 +13745,20 @@ impl CassApp {
             || "swarm cached:none | read-only | Esc back".to_string(),
             |snapshot| {
                 format!(
-                    "swarm {} | action {} | {} back",
+                    "swarm {} | action {} | {} | r refresh | {} back",
                     snapshot.status,
                     snapshot.recommended_action,
+                    self.swarm_cockpit.status,
                     shortcuts::DETAIL_CLOSE
                 )
             },
         );
         let footer_style = snapshot.map_or(text_muted_style, |snapshot| {
-            if snapshot.proof_gap_count > 0 || snapshot.stale_candidate_count > 0 {
+            if snapshot.proof_gap_count.is_some_and(|gaps| gaps > 0)
+                || snapshot
+                    .stale_candidate_count
+                    .is_some_and(|stale| stale > 0)
+            {
                 warning_style
             } else if snapshot.status == "partial" {
                 danger_style
@@ -14445,6 +14481,8 @@ pub enum CassMsg {
     CopyContent,
     /// Copy the current search query to clipboard.
     CopyQuery,
+    /// Save the selected hit to the bookmarks store (`cass bookmarks`).
+    BookmarkSelectedHit,
     /// Open the current result in $EDITOR.
     OpenInEditor,
     /// Open content in nano.
@@ -14700,8 +14738,12 @@ pub enum CassMsg {
     HeatmapMetricCycled { forward: bool },
 
     // -- Swarm operations surface -----------------------------------------
-    /// Switch to the cached swarm operations cockpit surface.
+    /// Switch to the swarm operations cockpit surface.
     SwarmEntered,
+    /// Read the live swarm providers in a background task.
+    SwarmLiveRefreshRequested,
+    /// The background live read finished with this `cass swarm status` payload.
+    SwarmLiveLoaded(Box<serde_json::Value>),
 
     // -- Sources management surface (2noh9.4.9) ----------------------------
     /// Switch to the sources management surface.
@@ -16030,6 +16072,9 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('J') if alt => CassMsg::ToggleJsonView,
                     KeyCode::Char('r') if alt => CassMsg::ResultsRefreshed,
                     KeyCode::Char('b') if alt => CassMsg::BulkActionsOpened,
+                    KeyCode::Char('e') | KeyCode::Char('E') if alt && !ctrl => {
+                        CassMsg::BookmarkSelectedHit
+                    }
                     KeyCode::Char('f') | KeyCode::Char('F') if alt && !ctrl => {
                         CassMsg::GroupingCycled
                     }
@@ -16677,6 +16722,7 @@ impl super::ftui_adapter::Model for CassApp {
                     | CassMsg::CopyContent
                     | CassMsg::OpenInEditor
                     | CassMsg::OpenInNano
+                    | CassMsg::BookmarkSelectedHit
                     | CassMsg::ViewRaw
                     | CassMsg::Tick
                     | CassMsg::MouseEvent { .. }
@@ -16840,6 +16886,7 @@ impl super::ftui_adapter::Model for CassApp {
                     | CassMsg::CopyContent
                     | CassMsg::OpenInEditor
                     | CassMsg::OpenInNano
+                    | CassMsg::BookmarkSelectedHit
                     | CassMsg::ViewRaw
                     | CassMsg::ToolCollapseToggled(_)
                     | CassMsg::ToolExpandAll
@@ -17042,6 +17089,20 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::none();
                 }
                 // Let other messages (analytics-specific, lifecycle, etc.) fall through.
+                _ => {}
+            }
+        }
+
+        // On the swarm surface 'r' re-reads the live providers; other typing
+        // has no search bar to land in.
+        if self.surface == AppSurface::Swarm {
+            match &msg {
+                CassMsg::QueryChanged(text) if text == "r" || text == "R" => {
+                    return self.update(CassMsg::SwarmLiveRefreshRequested);
+                }
+                CassMsg::QueryChanged(_) => {
+                    return ftui::Cmd::none();
+                }
                 _ => {}
             }
         }
@@ -18693,6 +18754,40 @@ impl super::ftui_adapter::Model for CassApp {
                                 .push(Toast::new(format!("Copy failed: {e}"), ToastType::Error));
                         }
                     }
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::BookmarkSelectedHit => {
+                use crate::bookmarks::{BookmarkAddOutcome, BookmarkStore, bookmarks_path_in};
+                use crate::ui::components::toast::{Toast, ToastType};
+                if let Some(hit) = self.selected_hit() {
+                    let bookmark = bookmark_for_hit(hit);
+                    let added = BookmarkStore::open(&bookmarks_path_in(&self.data_dir))
+                        .and_then(|store| store.add_unless_bookmarked(&bookmark));
+                    match added {
+                        Ok(BookmarkAddOutcome::Added(_)) => {
+                            self.status =
+                                format!("Bookmarked {} (cass bookmarks list)", bookmark.title);
+                            self.toast_manager
+                                .push(Toast::new("Bookmarked".to_string(), ToastType::Success));
+                        }
+                        Ok(BookmarkAddOutcome::AlreadyBookmarked) => {
+                            self.status = "Already bookmarked.".to_string();
+                            self.toast_manager.push(Toast::new(
+                                "Already bookmarked".to_string(),
+                                ToastType::Info,
+                            ));
+                        }
+                        Err(e) => {
+                            self.status = format!("Bookmark failed: {e:#}");
+                            self.toast_manager.push(Toast::new(
+                                format!("Bookmark failed: {e}"),
+                                ToastType::Error,
+                            ));
+                        }
+                    }
+                } else {
+                    self.status = "No active result to bookmark.".to_string();
                 }
                 ftui::Cmd::none()
             }
@@ -20845,20 +20940,65 @@ impl super::ftui_adapter::Model for CassApp {
                 };
                 self.clear_loading_context(LoadingContext::Analytics);
                 // Seed the cockpit on first entry so the surface always has
-                // something to render rather than the empty-cache placeholder.
-                // `render_swarm_status_live_partial` is pure (no I/O), so it is
-                // safe to call from the surface-entry path — the bead
-                // (coding_agent_session_search-oh96l.6) forbids heavy doctor
-                // scans, rch, git fetches, and Agent Mail mutations on render.
-                // Subsequent refreshes will land via explicit user action or a
-                // bounded background tick once a live aggregator is wired.
+                // something to render: `render_swarm_status_live_partial` is
+                // pure (no I/O) and marks every measurement unknown. The real
+                // providers are read by the same bounded, read-only collector
+                // as `cass swarm status`, in a background task, never on
+                // render (coding_agent_session_search-oh96l.6 forbids heavy
+                // scans, rch, git fetches and Agent Mail mutations there).
+                // Re-entry keeps the current snapshot; `r` refreshes it.
                 if self.swarm_cockpit.snapshot.is_none() {
                     let payload = crate::render_swarm_status_live_partial();
                     self.swarm_cockpit = SwarmCockpitState::from_snapshot(
                         SwarmCockpitSnapshot::from_status_payload(&payload),
                     );
+                    self.swarm_cockpit.status = "providers not read yet".to_string();
+                    return ftui::Cmd::batch(vec![
+                        transition_cmd,
+                        ftui::Cmd::msg(CassMsg::SwarmLiveRefreshRequested),
+                    ]);
                 }
                 transition_cmd
+            }
+            CassMsg::SwarmLiveRefreshRequested => {
+                if self.swarm_cockpit.loading {
+                    return ftui::Cmd::none();
+                }
+                self.swarm_cockpit.loading = true;
+                self.swarm_cockpit.status = "reading live swarm providers…".to_string();
+                // The repository is the TUI's working directory, as for
+                // `cass swarm status` run from the same place.
+                let repo = std::env::current_dir().ok();
+                let data_dir = self.data_dir.clone();
+                let db_path = self.db_path.clone();
+                #[cfg(not(test))]
+                {
+                    ftui::Cmd::task(move || {
+                        CassMsg::SwarmLiveLoaded(Box::new(crate::render_swarm_status_live_at(
+                            repo.as_deref(),
+                            &data_dir,
+                            &db_path,
+                        )))
+                    })
+                }
+                #[cfg(test)]
+                {
+                    let _ = (repo, data_dir, db_path);
+                    ftui::Cmd::none()
+                }
+            }
+            CassMsg::SwarmLiveLoaded(ref payload) => {
+                let elapsed_ms = payload["_meta"]["elapsed_ms"].as_u64();
+                self.swarm_cockpit = SwarmCockpitState {
+                    snapshot: Some(SwarmCockpitSnapshot::from_status_payload(payload)),
+                    status: elapsed_ms.map_or_else(
+                        || "live providers read".to_string(),
+                        |ms| format!("live providers read in {ms} ms"),
+                    ),
+                    loading: false,
+                    live: true,
+                };
+                ftui::Cmd::none()
             }
 
             // -- Sources management (2noh9.4.9) ----------------------------------
@@ -24256,6 +24396,34 @@ fn actionable_path_for_hit_with_config(config: Option<&SourcesConfig>, hit: &Sea
     source.rewrite_path_for_agent(&hit.source_path, agent)
 }
 
+/// The bookmark the TUI saves for a hit: the same fields `cass bookmarks add`
+/// stores, keyed by the hit's indexed source path and line. An untitled hit
+/// takes the first snippet line, then the source file name.
+fn bookmark_for_hit(hit: &SearchHit) -> crate::bookmarks::Bookmark {
+    let title = trimmed_non_empty(hit.title.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            hit.snippet
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            Path::new(&hit.source_path).file_name().map_or_else(
+                || hit.source_path.clone(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        });
+    let mut bookmark =
+        crate::bookmarks::Bookmark::new(title, &hit.source_path, &hit.agent, &hit.workspace)
+            .with_snippet(&hit.snippet);
+    if let Some(line) = hit.line_number {
+        bookmark = bookmark.with_line(line);
+    }
+    bookmark
+}
+
 // =========================================================================
 // Tests
 // =========================================================================
@@ -26211,10 +26379,28 @@ mod tests {
             PaletteResult::Screenshot(ScreenshotTarget::Text),
             PaletteResult::ToggleMacroRecording,
             PaletteResult::OpenSources,
+            PaletteResult::OpenSwarm,
             PaletteResult::Noop,
         ] {
             let _ = app.palette_result_to_cmd(r);
         }
+    }
+
+    /// f0cjq: the Swarm tab has no direct key, so the palette is its keyboard
+    /// route: the default actions list it, and choosing it switches surface.
+    #[test]
+    fn palette_swarm_entry_opens_the_swarm_surface() {
+        let entry = default_actions()
+            .into_iter()
+            .find(|item| matches!(item.action, PaletteAction::OpenSwarm))
+            .expect("the palette lists the swarm cockpit");
+        assert_eq!(entry.label, "Swarm operations cockpit");
+
+        let mut app = CassApp::default();
+        let cmd = app.palette_result_to_cmd(entry.action.dispatch());
+        assert!(matches!(cmd, ftui::Cmd::Msg(CassMsg::SwarmEntered)));
+        let _ = app.update(CassMsg::SwarmEntered);
+        assert_eq!(app.surface, AppSurface::Swarm);
     }
 
     #[test]
@@ -33827,6 +34013,90 @@ not jsonl",
 
         let copied = take_test_clipboard().expect("clipboard payload");
         assert_eq!(copied, "Fallback title");
+    }
+
+    /// b3woj: the bookmark key and palette action save the selected hit to the
+    /// same store `cass bookmarks` reads, under the TUI's data dir; a second
+    /// press keeps one row and says so.
+    #[test]
+    fn bookmark_selected_hit_saves_once_to_the_data_dir_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut app = app_with_hits(2);
+        app.data_dir = dir.path().to_path_buf();
+        app.panes[0].hits[0].line_number = Some(7);
+        let expected_path = app.panes[0].hits[0].source_path.clone();
+
+        let _ = app.update(CassMsg::BookmarkSelectedHit);
+        let store =
+            crate::bookmarks::BookmarkStore::open(&crate::bookmarks::bookmarks_path_in(dir.path()))
+                .unwrap();
+        let saved = store.list(None).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].source_path, expected_path);
+        assert_eq!(saved[0].line_number, Some(7));
+        assert!(!saved[0].title.is_empty());
+        assert!(app.status.starts_with("Bookmarked"), "{}", app.status);
+
+        let _ = app.update(CassMsg::BookmarkSelectedHit);
+        assert_eq!(store.count().unwrap(), 1, "a second press adds no row");
+        assert_eq!(app.status, "Already bookmarked.");
+    }
+
+    /// Enter on a result opens the detail modal, whose router drops every
+    /// message it does not list. Alt+E must still bookmark from there, with
+    /// or without the in-detail find bar (the PTY journey caught this).
+    #[test]
+    fn bookmark_selected_hit_works_from_the_open_detail_modal() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+        for find_active in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut app = app_with_hits(1);
+            app.data_dir = dir.path().to_path_buf();
+            app.show_detail_modal = true;
+            if find_active {
+                app.detail_find = Some(DetailFindState::default());
+                app.input_mode = InputMode::DetailFind;
+            }
+
+            let alt_e =
+                Event::Key(KeyEvent::new(KeyCode::Char('e')).with_modifiers(Modifiers::ALT));
+            let _ = app.update(CassMsg::from(alt_e));
+
+            let store = crate::bookmarks::BookmarkStore::open(
+                &crate::bookmarks::bookmarks_path_in(dir.path()),
+            )
+            .unwrap();
+            assert_eq!(store.count().unwrap(), 1, "find_active={find_active}");
+            assert!(
+                app.status.starts_with("Bookmarked"),
+                "find_active={find_active}: {}",
+                app.status
+            );
+            assert!(app.show_detail_modal, "bookmarking keeps the modal open");
+        }
+    }
+
+    #[test]
+    fn bookmark_without_a_selected_hit_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut app = CassApp::default();
+        app.data_dir = dir.path().to_path_buf();
+        let _ = app.update(CassMsg::BookmarkSelectedHit);
+        assert_eq!(app.status, "No active result to bookmark.");
+        assert!(!crate::bookmarks::bookmarks_path_in(dir.path()).exists());
+    }
+
+    #[test]
+    fn event_mapping_alt_e_maps_to_bookmark_selected_hit() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('e')).with_modifiers(Modifiers::ALT));
+        assert!(matches!(CassMsg::from(event), CassMsg::BookmarkSelectedHit));
+        // A plain 'e' still edits the query.
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('e')));
+        assert!(!matches!(
+            CassMsg::from(plain),
+            CassMsg::BookmarkSelectedHit
+        ));
     }
 
     #[test]
@@ -43152,6 +43422,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert!(
             text.contains(shortcuts::COPY_CONTENT),
             "Should reference copy content"
+        );
+        assert!(
+            text.contains(shortcuts::BOOKMARK),
+            "Should reference the bookmark key"
         );
         assert!(
             text.contains("clear agent filter"),

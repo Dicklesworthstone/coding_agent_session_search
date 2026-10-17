@@ -40,7 +40,9 @@ use std::path::{Path, PathBuf};
 use crate::franken_sync::compat::{ConnectionExt, OpenFlags, open_with_flags};
 use serde::{Deserialize, Serialize};
 
-use crate::connectors::{DiscoveredSourceFile, NormalizedConversation, ScanContext};
+use crate::connectors::{
+    DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation, ScanContext, ScanRoot,
+};
 
 /// Stable schema version for the connector-ingest diagnostic wire format.
 pub const CONNECTOR_INGEST_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
@@ -97,9 +99,17 @@ pub enum IngestFailureKind {
     FilenameAssumptionViolated,
     /// The source path exists but could not be read (permissions / I/O).
     UnreadableSource,
+    /// The connector failed on content it could not interpret (an unsupported
+    /// record shape or value); no I/O error caused it, so permissions and
+    /// retries do not help (GH #511).
+    UnparseableSource,
     /// The source is larger than the connector's per-source read budget, so it
     /// was not indexed; raising the budget admits it on the next run.
     SourceOverReadBudget,
+    /// The store uses a layout or format version this build's connector does
+    /// not read (a newer Pi durable schema, a Pi Session Store V2 sidecar).
+    /// It was not indexed from that store, and the store is left untouched.
+    UnsupportedStoreFormat,
 }
 
 impl IngestFailureKind {
@@ -114,7 +124,9 @@ impl IngestFailureKind {
             IngestFailureKind::KeychainUnavailable => "keychain-unavailable",
             IngestFailureKind::FilenameAssumptionViolated => "filename-assumption-violated",
             IngestFailureKind::UnreadableSource => "unreadable-source",
+            IngestFailureKind::UnparseableSource => "unparseable-source",
             IngestFailureKind::SourceOverReadBudget => "source-over-read-budget",
+            IngestFailureKind::UnsupportedStoreFormat => "unsupported-store-format",
         }
     }
 }
@@ -194,6 +206,10 @@ pub struct ConnectorIngestDiagnostic {
     pub canonical_id: Option<String>,
     /// What went wrong.
     pub failure_kind: IngestFailureKind,
+    /// The connector's own explanation, when it gives one (e.g. the format
+    /// version it found and the one it reads). Never message content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     /// How serious it is.
     pub severity: IngestSeverity,
     /// Whether retrying later may succeed (e.g. a transient lock).
@@ -280,6 +296,16 @@ fn classify_kind(
             SourceIngestDisposition::Skipped,
             format!("{provider} source path could not be read; check permissions, then re-index"),
         ),
+        IngestFailureKind::UnparseableSource => (
+            IngestSeverity::Error,
+            false, // the same bytes fail the same way
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} could not interpret a source's content (not a permissions or I/O \
+                 problem); indexing_stats.connectors[].error names the record. Report its shape \
+                 so the connector can parse it, then re-index"
+            ),
+        ),
         IngestFailureKind::SourceOverReadBudget => (
             IngestSeverity::Error,
             true, // a larger budget admits it on the next run
@@ -288,6 +314,17 @@ fn classify_kind(
                 "{provider} session file is larger than the per-source read budget and was not \
                  indexed; raise the budget (Codex: CASS_CODEX_MAX_SOURCE_BYTES, up to 1073741824 \
                  bytes), then re-index"
+            ),
+        ),
+        IngestFailureKind::UnsupportedStoreFormat => (
+            IngestSeverity::Warning,
+            false, // the same build reads the same store the same way
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} found a store in a format or location this cass build does not \
+                 read; nothing was indexed from that store and it was not modified. detail names \
+                 the format and what admits it (a cass release whose connector reads it, or \
+                 indexing on the store's own host), then re-index"
             ),
         ),
     }
@@ -309,6 +346,7 @@ pub fn classify(
         external_id: None,
         canonical_id: None,
         failure_kind: kind,
+        detail: None,
         severity,
         retryable,
         disposition,
@@ -322,6 +360,77 @@ fn classify_path(
     kind: IngestFailureKind,
 ) -> ConnectorIngestDiagnostic {
     classify(provider, source_path.to_string_lossy().as_ref(), kind)
+}
+
+/// Recognize backend error messages, not arbitrary occurrences of lock words
+/// in source paths or parser context. Typed causes take precedence below.
+fn is_database_lock_message(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    [
+        "database is locked",
+        "database is busy",
+        "database table is locked",
+        "database schema is locked",
+        "sqlite_busy",
+        "sqlite_busy_recovery",
+        "sqlite_busy_snapshot",
+        "sqlite_busy_timeout",
+        "sqlite_locked",
+        "sqlite_locked_sharedcache",
+        "sqlite_locked_vtab",
+    ]
+    .iter()
+    .any(|&prefix| {
+        lower.strip_prefix(prefix).is_some_and(|suffix| {
+            let suffix = suffix.trim_start();
+            suffix.is_empty() || suffix.starts_with(':') || suffix.starts_with('(')
+        })
+    })
+}
+
+fn connector_scan_failure_kind(error: &anyhow::Error) -> IngestFailureKind {
+    use crate::franken_sync::FrankenError;
+
+    if let Some(io) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        return if matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ResourceBusy
+        ) {
+            IngestFailureKind::SourceLocked
+        } else {
+            IngestFailureKind::UnreadableSource
+        };
+    }
+    // A parser may quote source content that itself names a lock. Its type
+    // proves this is still a content failure, regardless of that message.
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+    {
+        return IngestFailureKind::UnparseableSource;
+    }
+    let database_locked = error.chain().any(|cause| {
+        cause.downcast_ref::<FrankenError>().is_some_and(|error| {
+            matches!(
+                error,
+                FrankenError::Busy
+                    | FrankenError::BusyRecovery
+                    | FrankenError::BusySnapshot { .. }
+                    | FrankenError::DatabaseLocked { .. }
+                    | FrankenError::LockFailed { .. }
+                    | FrankenError::WriteConflict { .. }
+                    | FrankenError::SerializationFailure { .. }
+            )
+        })
+    });
+    if database_locked || is_database_lock_message(&error.root_cause().to_string()) {
+        IngestFailureKind::SourceLocked
+    } else {
+        IngestFailureKind::UnparseableSource
+    }
 }
 
 impl ConnectorIngestDiagnostic {
@@ -345,6 +454,12 @@ impl ConnectorIngestDiagnostic {
     ) -> Self {
         self.external_id = Some(external_id.into());
         self.canonical_id = Some(canonical_id.into());
+        self
+    }
+
+    /// Attach the connector's own explanation.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
         self
     }
 }
@@ -446,18 +561,45 @@ pub struct ConnectorIngestRun {
     provider: String,
     sources: BTreeMap<PathBuf, ObservedSource>,
     diagnostics: Vec<ConnectorIngestDiagnostic>,
+    /// The scan context's data dir, for the single-store contexts below.
+    scan_data_dir: PathBuf,
+    /// Each discovered Pi durable store as a single-store scan root carrying
+    /// its discovery provenance. [`Self::finish`] asks the connector why a
+    /// store that yielded no conversation was not read.
+    durable_stores: Vec<ScanRoot>,
 }
 
 impl ConnectorIngestRun {
     /// Inspect discovered sources for failure modes that upstream connectors
-    /// otherwise log-and-skip: malformed JSONL, locked Cursor databases, and
-    /// encrypted ChatGPT directories unavailable to this scan.
+    /// otherwise log-and-skip: malformed JSONL, locked Cursor databases,
+    /// encrypted ChatGPT directories unavailable to this scan, and Pi stores
+    /// in formats the Pi connector does not read.
     pub fn begin(
         provider: &str,
         data_dir: &Path,
         ctx: &ScanContext,
         sources: &[DiscoveredSourceFile],
     ) -> Self {
+        let durable_stores = if provider == "pi_durable" {
+            sources
+                .iter()
+                .filter(|source| {
+                    matches!(
+                        source.role,
+                        DiscoveredSourceRole::PrimarySessionLog
+                            | DiscoveredSourceRole::SqliteDatabase
+                    )
+                })
+                .map(|source| {
+                    let mut root = ScanRoot::local(source.source_path.clone());
+                    root.origin = source.origin.clone();
+                    root.platform = source.platform;
+                    root
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut run = Self {
             provider: provider.to_string(),
             sources: sources
@@ -473,6 +615,8 @@ impl ConnectorIngestRun {
                 })
                 .collect(),
             diagnostics: Vec::new(),
+            scan_data_dir: ctx.data_dir.clone(),
+            durable_stores,
         };
         for source in sources {
             run.inspect_jsonl(data_dir, &source.source_path);
@@ -483,7 +627,23 @@ impl ConnectorIngestRun {
         if provider == "chatgpt" {
             run.inspect_chatgpt_encrypted_directories(ctx, sources);
         }
+        if provider == "pi_agent" {
+            run.inspect_unsupported_pi_stores(ctx);
+        }
         run
+    }
+
+    /// Sources the scan skipped because the source ledger shows them
+    /// unchanged since they were indexed. They count as indexed, and
+    /// [`Self::finish`] does not re-read them.
+    pub fn observe_reused_sources(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if let Some(source) = self.sources.get_mut(&path)
+                && source.disposition == SourceIngestDisposition::Discovered
+            {
+                source.disposition = SourceIngestDisposition::Indexed;
+            }
+        }
     }
 
     /// Record and harden one successfully parsed conversation.
@@ -527,9 +687,7 @@ impl ConnectorIngestRun {
 
     /// Attach a scan-level error without converting it into a fake success.
     pub fn observe_scan_error(&mut self, source_path: &Path, error: impl std::fmt::Display) {
-        let error = error.to_string();
-        let lower = error.to_ascii_lowercase();
-        let kind = if lower.contains("locked") || lower.contains("busy") {
+        let kind = if is_database_lock_message(&error.to_string()) {
             IngestFailureKind::SourceLocked
         } else {
             IngestFailureKind::UnreadableSource
@@ -568,11 +726,63 @@ impl ConnectorIngestRun {
             }
             return;
         }
-        self.observe_scan_error(fallback_path, error);
+        // Codebuff retains bounded typed failures for independently scanned
+        // inputs. Classify EACH cause at its recorded path, not the first cause
+        // at a fallback root. Never parse paths or copy payloads from Display.
+        if self.provider == "codebuff"
+            && crate::connectors::codebuff::CodebuffConnector::for_each_source_failure(
+                error,
+                |path, cause| {
+                    let mut diagnostic =
+                        classify_path(&self.provider, path, connector_scan_failure_kind(cause));
+                    let state = self
+                        .sources
+                        .entry(path.to_path_buf())
+                        .or_insert(ObservedSource {
+                            disposition: SourceIngestDisposition::Discovered,
+                            malformed: false,
+                        });
+                    // An observation can fail after delivery. Do not erase
+                    // content that this run already observed for that source.
+                    if matches!(
+                        state.disposition,
+                        SourceIngestDisposition::Indexed
+                            | SourceIngestDisposition::PartiallyIndexed
+                    ) {
+                        diagnostic.disposition = SourceIngestDisposition::PartiallyIndexed;
+                    }
+                    state.disposition = diagnostic.disposition;
+                    self.diagnostics.push(diagnostic);
+                },
+            )
+        {
+            return;
+        }
+        // GH #511: FAD's top message includes the failing path. Classify the
+        // cause, so a project called "busy" cannot turn a parse or permission
+        // failure into a retryable database lock.
+        let diagnostic = classify_path(
+            &self.provider,
+            fallback_path,
+            connector_scan_failure_kind(error),
+        );
+        self.sources.insert(
+            fallback_path.to_path_buf(),
+            ObservedSource {
+                disposition: diagnostic.disposition,
+                malformed: false,
+            },
+        );
+        self.diagnostics.push(diagnostic);
     }
 
+    /// Close the scope. Each Pi durable store that yielded no conversation
+    /// and was not reused is asked once why, so an unsupported schema or an
+    /// unreadable store is reported rather than counted as an empty source.
+    /// Stores that yielded conversations are not read again.
     #[must_use]
-    pub fn finish(self) -> ConnectorIngestReport {
+    pub fn finish(mut self) -> ConnectorIngestReport {
+        self.inspect_unproductive_durable_stores();
         let mut summary = ProviderIngestSummary::default();
         for source in self.sources.values() {
             summary.record(source.disposition);
@@ -581,6 +791,71 @@ impl ConnectorIngestRun {
             provider: self.provider,
             summary,
             diagnostics: self.diagnostics,
+        }
+    }
+
+    fn inspect_unproductive_durable_stores(&mut self) {
+        let connector = franken_agent_detection::PiDurableConnector::new();
+        for root in std::mem::take(&mut self.durable_stores) {
+            let unproductive = self
+                .sources
+                .get(&root.path)
+                .is_some_and(|source| source.disposition == SourceIngestDisposition::Discovered);
+            if !unproductive {
+                continue;
+            }
+            let ctx = ScanContext::with_roots(self.scan_data_dir.clone(), vec![root], None);
+            for found in connector.store_diagnostics(&ctx) {
+                let kind = match found.code {
+                    "unsupported_version"
+                    | "sqlite_support_not_compiled"
+                    | "remote_sqlite_unsupported" => IngestFailureKind::UnsupportedStoreFormat,
+                    "unreadable" => IngestFailureKind::UnreadableSource,
+                    // A file that is not a durable store, or a note on a store
+                    // that was read; inspect_jsonl reports torn and malformed
+                    // commit lines itself.
+                    _ => continue,
+                };
+                let diagnostic = classify_path(&self.provider, &found.path, kind)
+                    .with_detail(format!("{}: {}", found.code, found.detail));
+                if let Some(source) = self.sources.get_mut(&found.path) {
+                    source.disposition = diagnostic.disposition;
+                }
+                self.diagnostics.push(diagnostic);
+            }
+        }
+    }
+
+    fn inspect_unsupported_pi_stores(&mut self, ctx: &ScanContext) {
+        for store in
+            crate::connectors::pi_agent::PiAgentConnector::new().unsupported_store_diagnostics(ctx)
+        {
+            let detail = match store.store_format {
+                "session_store_v2" => {
+                    "session_store_v2: Pi Session Store V2 sidecars are not read; a JSONL \
+                     transcript beside one is indexed and may lag it"
+                }
+                "sqlite_sessions" => {
+                    "sqlite_sessions: Pi SQLite sessions under a remote root are not read, \
+                     because a synced database and its WAL are not one snapshot; index them on \
+                     their own host"
+                }
+                other => other,
+            };
+            let diagnostic = classify_path(
+                &self.provider,
+                &store.path,
+                IngestFailureKind::UnsupportedStoreFormat,
+            )
+            .with_detail(detail);
+            self.sources.insert(
+                store.path,
+                ObservedSource {
+                    disposition: diagnostic.disposition,
+                    malformed: false,
+                },
+            );
+            self.diagnostics.push(diagnostic);
         }
     }
 
@@ -680,9 +955,9 @@ impl ConnectorIngestRun {
             connection.query_row_map("SELECT 1 FROM sqlite_master LIMIT 1", &[], |_row| Ok(()))
         });
         if let Err(error) = probe {
-            let lower = error.to_string().to_ascii_lowercase();
-            if lower.contains("locked") || lower.contains("busy") {
-                self.observe_scan_error(path, error);
+            let error = anyhow::Error::new(error);
+            if connector_scan_failure_kind(&error) == IngestFailureKind::SourceLocked {
+                self.observe_connector_scan_error(path, &error);
             }
         }
     }
@@ -747,7 +1022,7 @@ impl ConnectorIngestRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::{Connector, DiscoveredSourceRole, ScanRoot};
+    use crate::connectors::Connector;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -924,7 +1199,9 @@ mod tests {
             IngestFailureKind::KeychainUnavailable,
             IngestFailureKind::FilenameAssumptionViolated,
             IngestFailureKind::UnreadableSource,
+            IngestFailureKind::UnparseableSource,
             IngestFailureKind::SourceOverReadBudget,
+            IngestFailureKind::UnsupportedStoreFormat,
         ];
         let destructive = ["rm ", "--delete", "--purge", "reset", "drop ", "rm -rf"];
         for kind in kinds {
@@ -1079,6 +1356,7 @@ mod tests {
             IngestFailureKind::KeychainUnavailable,
             IngestFailureKind::FilenameAssumptionViolated,
             IngestFailureKind::UnreadableSource,
+            IngestFailureKind::UnparseableSource,
             IngestFailureKind::TruncatedSession,
             IngestFailureKind::SourceOverReadBudget,
         ];
@@ -1092,6 +1370,7 @@ mod tests {
                 "keychain-unavailable",
                 "filename-assumption-violated",
                 "unreadable-source",
+                "unparseable-source",
                 "truncated-session",
                 "source-over-read-budget"
             ])
@@ -1116,6 +1395,7 @@ mod tests {
                 "filename-assumption-violated",
             ),
             (IngestFailureKind::UnreadableSource, "unreadable-source"),
+            (IngestFailureKind::UnparseableSource, "unparseable-source"),
             (IngestFailureKind::TruncatedSession, "truncated-session"),
             (
                 IngestFailureKind::SourceOverReadBudget,
@@ -1318,6 +1598,385 @@ mod tests {
         let value = serde_json::to_value(crate::indexer::IndexingStats::default())?;
         verify_eq!(value["connector_summary"], json!({}));
         verify_eq!(value["connector_diagnostics"], json!([]));
+        Ok(())
+    }
+
+    /// A Codex scan that stopped only because rollouts exceeded the read budget
+    /// is diagnosed per rejected rollout with the setting that admits it, even
+    /// through added context; it used to read as one "unreadable, check
+    /// permissions" entry naming the cass data directory. An I/O failure keeps
+    /// the unreadable entry.
+    #[test]
+    fn codex_over_budget_scan_error_is_diagnosed_per_rollout_not_as_the_data_dir() -> TestResult {
+        let error = crate::connectors::codex::over_budget_scan_error(&[(
+            "/codex/sessions/rollout-big.jsonl",
+            200 * 1024 * 1024,
+        )])
+        .context("scanning codex");
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+
+        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/data"), &error);
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::SourceOverReadBudget
+        );
+        verify_eq!(diagnostic.source_path, "/codex/sessions/rollout-big.jsonl");
+        verify!(
+            diagnostic
+                .safe_next_action
+                .contains("CASS_CODEX_MAX_SOURCE_BYTES")
+        );
+        verify_eq!(report.summary.skipped, 1);
+
+        let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
+        let disk_gone = anyhow::Error::new(std::io::Error::other("disk went away"));
+        run.observe_connector_scan_error(Path::new("/data"), &disk_gone);
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        verify_eq!(report.diagnostics[0].source_path, "/data");
+        Ok(())
+    }
+
+    /// GH #511: a connector that read a source but rejected a record value
+    /// ("invalid shared CLI timestamp at record 0", with context and no I/O
+    /// cause) is unparseable, not unreadable: no permissions advice, not
+    /// retryable on the same bytes, at the root it scanned. An I/O cause still
+    /// reads as unreadable and a lock as locked.
+    #[test]
+    fn content_failures_are_unparseable_and_io_failures_stay_unreadable() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let root = Path::new("/home/me/.config/manicode");
+        let parse_error = anyhow::anyhow!("premature end of input")
+            .context("invalid shared CLI timestamp at record 0");
+
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(root, &parse_error);
+        let report = run.finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::UnparseableSource
+        );
+        verify_eq!(diagnostic.source_path, root.display().to_string());
+        verify!(!diagnostic.retryable);
+        verify_eq!(diagnostic.disposition, SourceIngestDisposition::Skipped);
+        verify!(!diagnostic.safe_next_action.contains("check permissions"));
+        verify!(
+            diagnostic
+                .safe_next_action
+                .contains("indexing_stats.connectors[].error")
+        );
+        verify_eq!(report.summary.skipped, 1);
+
+        let denied = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+        .context("reading chat-messages.json");
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(root, &denied);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        verify!(report.diagnostics[0].retryable);
+
+        let locked = anyhow::anyhow!("database is locked").context("scanning state.vscdb");
+        let mut run = ConnectorIngestRun::begin("cursor", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/cursor"), &locked);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::SourceLocked
+        );
+        Ok(())
+    }
+
+    /// FAD 0.3.5 includes the failing transcript path in its top message.
+    /// Project names are not evidence of a database lock, even when a host
+    /// has flattened the contextual error into one display string.
+    #[test]
+    fn gh511_project_names_cannot_turn_parse_failures_into_locks() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        for project in ["a-busy-project", "unlocked-project"] {
+            let transcript = PathBuf::from("/home/me/.config/manicode/projects")
+                .join(project)
+                .join("chats/2026-03-21T17-14-03.768Z/chat-messages.json");
+            let parse_error =
+                serde_json::from_str::<serde_json::Value>(r#"[{"id":"user-1774113351457""#)
+                    .expect_err("truncated native transcript must fail JSON parsing");
+            let error = anyhow::Error::new(parse_error)
+                .context("invalid Codebuff / Freebuff transcript JSON");
+            let summary = format!("{}: {error:#}", transcript.display());
+            let error = error.context(summary.clone());
+            for error in [error, anyhow::anyhow!(summary)] {
+                let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+                run.observe_connector_scan_error(&transcript, &error);
+                let report = run.finish();
+                verify_eq!(report.diagnostics.len(), 1);
+                let diagnostic = &report.diagnostics[0];
+                verify_eq!(
+                    diagnostic.failure_kind,
+                    IngestFailureKind::UnparseableSource
+                );
+                verify_eq!(diagnostic.source_path, transcript.display().to_string());
+                verify!(!diagnostic.retryable);
+                verify_eq!(report.summary.skipped, 1);
+                verify_eq!(report.summary.locked, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh511_permission_errors_under_busy_paths_stay_unreadable() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let transcript = Path::new(
+            "/home/me/.config/manicode/projects/a-busy-project/chats/unlocked/chat-messages.json",
+        );
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let summary = format!("{}: {error:#}", transcript.display());
+        let error = error.context(summary);
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(transcript, &error);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        verify!(report.diagnostics[0].retryable);
+        verify_eq!(report.summary.skipped, 1);
+        verify_eq!(report.summary.locked, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh511_json_error_content_cannot_claim_a_database_lock() -> TestResult {
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let error = <serde_json::Error as serde::de::Error>::custom("database is locked");
+        let error =
+            anyhow::Error::new(error).context("invalid Codebuff / Freebuff transcript JSON");
+        let mut run = ConnectorIngestRun::begin("codebuff", Path::new("/data"), &ctx, &[]);
+        run.observe_connector_scan_error(Path::new("/codebuff/chat-messages.json"), &error);
+        let report = run.finish();
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnparseableSource
+        );
+        verify!(!report.diagnostics[0].retryable);
+        verify_eq!(report.summary.locked, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh511_database_lock_causes_remain_retryable() -> TestResult {
+        use crate::franken_sync::FrankenError;
+
+        let ctx = ScanContext::local_default(PathBuf::from("/data"), None);
+        let path = Path::new("/cursor/state.vscdb");
+        for error in [
+            anyhow::Error::new(FrankenError::Busy),
+            anyhow::Error::new(FrankenError::BusyRecovery),
+            anyhow::Error::new(FrankenError::BusySnapshot {
+                conflicting_pages: "12".to_string(),
+            }),
+            anyhow::Error::new(FrankenError::DatabaseLocked {
+                path: path.to_path_buf(),
+            }),
+            anyhow::Error::new(FrankenError::LockFailed {
+                detail: "F_SETLK contention".to_string(),
+            }),
+            anyhow::anyhow!("database is locked (SQLITE_BUSY)"),
+            anyhow::anyhow!("database is busy (recovery in progress)"),
+            anyhow::anyhow!("database table is locked"),
+            anyhow::anyhow!("SQLITE_BUSY"),
+            anyhow::anyhow!("SQLITE_BUSY_SNAPSHOT"),
+            anyhow::anyhow!("SQLITE_LOCKED"),
+            anyhow::anyhow!("SQLITE_LOCKED_SHAREDCACHE"),
+        ] {
+            let error = error.context("reading /cursor/state.vscdb");
+            let mut run = ConnectorIngestRun::begin("cursor", Path::new("/data"), &ctx, &[]);
+            run.observe_connector_scan_error(path, &error);
+            let report = run.finish();
+            verify_eq!(
+                report.diagnostics[0].failure_kind,
+                IngestFailureKind::SourceLocked
+            );
+            verify!(report.diagnostics[0].retryable);
+            verify_eq!(report.summary.locked, 1);
+        }
+        Ok(())
+    }
+
+    /// A Pi durable JSONL store whose one commit marker declares `format`.
+    fn durable_jsonl_store(
+        dir: &Path,
+        format: i64,
+    ) -> std::io::Result<(ScanRoot, DiscoveredSourceFile)> {
+        std::fs::create_dir_all(dir)?;
+        let main = dir.join("main.jsonl");
+        std::fs::write(
+            &main,
+            format!("{{\"type\":\"commit\",\"format\":{format},\"seq\":1,\"writes\":[]}}\n"),
+        )?;
+        let root = ScanRoot::local(dir.to_path_buf());
+        let source = DiscoveredSourceFile::new(
+            "pi_durable",
+            &root,
+            main,
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        );
+        Ok((root, source))
+    }
+
+    #[test]
+    fn a_durable_store_in_an_unsupported_format_is_reported_not_counted_empty() -> TestResult {
+        let temp = tempdir()?;
+        let (root, source) = durable_jsonl_store(temp.path(), 2)?;
+        let main = source.source_path.display().to_string();
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let report = ConnectorIngestRun::begin("pi_durable", temp.path(), &ctx, &[source]).finish();
+        verify_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::UnsupportedStoreFormat
+        );
+        verify_eq!(diagnostic.provider, "pi_durable");
+        verify_eq!(diagnostic.source_path, main);
+        let detail = diagnostic.detail.as_deref().unwrap_or_default();
+        verify!(
+            detail.starts_with("unsupported_version: ") && detail.contains("format"),
+            "{detail}"
+        );
+        verify_eq!(report.summary.skipped, 1);
+        verify_eq!(report.summary.discovered, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_readable_durable_store_without_conversations_is_not_reported() -> TestResult {
+        let temp = tempdir()?;
+        let (root, source) = durable_jsonl_store(temp.path(), 1)?;
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let report = ConnectorIngestRun::begin("pi_durable", temp.path(), &ctx, &[source]).finish();
+        verify!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        verify_eq!(report.summary.discovered, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reused_and_productive_durable_stores_are_not_read_again() -> TestResult {
+        // Both stores would be reported if read: their format is unsupported.
+        let temp = tempdir()?;
+        let (reused_root, reused) = durable_jsonl_store(&temp.path().join("reused"), 2)?;
+        let (productive_root, productive) =
+            durable_jsonl_store(&temp.path().join("productive"), 2)?;
+        let ctx = ScanContext::with_roots(
+            temp.path().to_path_buf(),
+            vec![reused_root, productive_root],
+            None,
+        );
+        let mut run = ConnectorIngestRun::begin(
+            "pi_durable",
+            temp.path(),
+            &ctx,
+            &[reused.clone(), productive.clone()],
+        );
+        run.observe_reused_sources([reused.source_path]);
+        let mut conversation = NormalizedConversation {
+            agent_slug: "pi_durable".into(),
+            external_id: Some("lead".into()),
+            title: None,
+            workspace: None,
+            source_path: productive.source_path,
+            started_at: None,
+            ended_at: None,
+            metadata: json!({}),
+            messages: Vec::new(),
+        };
+        run.observe_conversation(&mut conversation);
+        let report = run.finish();
+        verify!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        verify_eq!(report.summary.indexed, 2);
+        Ok(())
+    }
+
+    fn v2_sidecar(agent_dir: &Path) -> std::io::Result<PathBuf> {
+        // One component at a time: the diagnostic's path comes from a walk,
+        // which spells Windows separators as `\`.
+        let sidecar = agent_dir
+            .join("sessions")
+            .join("--work--")
+            .join("2026-01-01T00-00-00-000Z_0123abcd.v2");
+        std::fs::create_dir_all(&sidecar)?;
+        std::fs::write(sidecar.join("manifest.json"), "{}")?;
+        Ok(sidecar)
+    }
+
+    #[test]
+    fn a_pi_session_store_v2_sidecar_is_reported() -> TestResult {
+        let temp = tempdir()?;
+        let agent_dir = temp.path().join("copied-home/.pi/agent");
+        let sidecar = v2_sidecar(&agent_dir)?;
+        let ctx = ScanContext::with_roots(
+            temp.path().to_path_buf(),
+            vec![ScanRoot::local(agent_dir)],
+            None,
+        );
+        let report = ConnectorIngestRun::begin("pi_agent", temp.path(), &ctx, &[]).finish();
+        verify_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+        let diagnostic = &report.diagnostics[0];
+        verify_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::UnsupportedStoreFormat
+        );
+        verify_eq!(diagnostic.source_path, sidecar.display().to_string());
+        verify!(
+            diagnostic
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("session_store_v2: ")),
+            "{:?}",
+            diagnostic.detail
+        );
+        verify_eq!(report.summary.skipped, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_v2_sidecar_in_an_omp_store_is_not_reported_as_pi() -> TestResult {
+        let temp = tempdir()?;
+        let agent_dir = temp.path().join("copied-home/.omp/agent");
+        v2_sidecar(&agent_dir)?;
+        let ctx = ScanContext::with_roots(
+            temp.path().to_path_buf(),
+            vec![ScanRoot::local(agent_dir)],
+            None,
+        );
+        // Pi's own permissive detection does claim it.
+        verify_eq!(
+            franken_agent_detection::PiAgentConnector::new()
+                .unsupported_store_diagnostics(&ctx)
+                .len(),
+            1
+        );
+        let report = ConnectorIngestRun::begin("pi_agent", temp.path(), &ctx, &[]).finish();
+        verify!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
         Ok(())
     }
 }

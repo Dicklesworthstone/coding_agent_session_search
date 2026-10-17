@@ -1581,10 +1581,12 @@ pub(crate) fn capture_source_file_with_chunk_policy(
     chunk_threshold_bytes: u64,
     chunk_size_bytes: usize,
 ) -> Result<RawMirrorCaptureRecord> {
-    if matches!(input.provider, "shelley" | "grok_bot") {
+    if matches!(input.provider, "shelley" | "grok_bot" | "pi_durable") {
         // These providers co-locate chat with credentials, approval payloads,
-        // or application configuration. The parser's chat allowlist must not
-        // be bypassed by preserving the entire source container.
+        // or application configuration (Pi durable stores: system prompts,
+        // agent instructions, task checkpoints and application documents).
+        // The parser's chat allowlist must not be bypassed by preserving the
+        // entire source container.
         // Keep this check before filesystem access and mirror initialization.
         return Err(anyhow!(
             "disabled_sensitive_container: {} source files cannot be raw-mirrored",
@@ -3592,7 +3594,7 @@ mod tests {
         let bytes = br#"{"schemaVersion":1,"value":{"entries":[{"kind":"secret-request","content":"excluded-secret"}]}}"#;
         fs::write(&source, bytes).unwrap();
         let modified = fs::metadata(&source).unwrap().modified().unwrap();
-        for provider in ["grok_bot", "shelley"] {
+        for provider in ["grok_bot", "shelley", "pi_durable"] {
             for source_path in [&source, &temp.path().join("missing.blob")] {
                 let result = capture_source_file(RawMirrorCaptureInput {
                     data_dir: &data_dir,

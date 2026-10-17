@@ -13,12 +13,37 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexSet};
 
+use crate::indexer::memoization::MemoRetentionBudget;
+
 /// Placeholder inserted where a secret was found.
 const REDACTED: &str = "[REDACTED]";
+
+/// One allowance shared by every production redactor, including Rayon workers
+/// inside a giant conversation. Entry-count overrides cannot multiply this
+/// retained-value ceiling. This measures String buffer capacity, not process
+/// RSS, map metadata, allocator retention, or caller-owned output strings.
+const REDACTION_RETAINED_VALUE_BYTES: usize = 64 * 1024 * 1024;
+static REDACTION_RETENTION: Lazy<Arc<MemoRetentionBudget>> =
+    Lazy::new(|| MemoRetentionBudget::new(REDACTION_RETAINED_VALUE_BYTES));
+
+/// The resident-memory sampler is the only production policy writer. It uses
+/// its already-hysteretic byte allowance, not CPU load, to shrink retained
+/// values. No per-message OS probes or new sampler thread are introduced.
+pub(super) fn update_redaction_retention_limit(inflight_byte_allowance: usize) {
+    apply_redaction_retention_limit(&REDACTION_RETENTION, inflight_byte_allowance);
+}
+
+fn apply_redaction_retention_limit(
+    retention: &MemoRetentionBudget,
+    inflight_byte_allowance: usize,
+) {
+    retention.set_limit(inflight_byte_allowance.min(REDACTION_RETAINED_VALUE_BYTES));
+}
 
 /// Return whether a JSON object key names a credential-bearing field.
 ///
@@ -404,9 +429,9 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// content + metadata blob. Salvage replays, repeated assistant
 /// boilerplate, and historical re-ingest all feed identical content
 /// through the regex engine over and over. This wrapper keys
-/// [`ContentAddressedMemoCache`] on the input bytes plus the algorithm
-/// fingerprint so repeated content stops paying the regex cost while a
-/// pattern bump invalidates every prior entry transparently.
+/// [`crate::indexer::memoization::ContentAddressedMemoCache`] on the input
+/// bytes plus the algorithm fingerprint so repeated content stops paying the
+/// regex cost while a pattern bump invalidates every prior entry transparently.
 ///
 /// Prefilter-first scope (redaction-perf campaign, xu3jq): the cache is
 /// consulted only for inputs whose RegexSet prefilter reports at least
@@ -421,8 +446,8 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// contract byte-for-byte: see
 /// `memoizing_redactor_matches_uncached_for_arbitrary_input` for the
 /// equivalence gate. When the cache is hit, the recorded value is
-/// returned directly; on miss, the legacy regex path runs and the
-/// result is inserted under the content+algorithm key.
+/// returned directly; on miss, the legacy regex path runs. Retention is
+/// optional: byte-pressure refusal never skips or truncates redaction.
 ///
 /// `MemoizingRedactor` is `pub(crate)` so the live persist path can
 /// adopt it without leaking the memoization vocabulary into public
@@ -431,52 +456,69 @@ pub fn redaction_algorithm_fingerprint() -> String {
 pub(crate) struct MemoizingRedactor {
     text_cache: crate::indexer::memoization::ContentAddressedMemoCache<String>,
     algorithm_fingerprint: String,
+    retention: Arc<MemoRetentionBudget>,
+    last_retention_limit: usize,
 }
 
 #[allow(dead_code)]
 impl MemoizingRedactor {
-    /// Default cache capacity for typical refresh batches. Sized to
-    /// cover a few thousand distinct message bodies before LRU
-    /// eviction kicks in.
+    /// Default per-owner entry ceiling. Production owners additionally share
+    /// REDACTION_RETAINED_VALUE_BYTES, regardless of their number or capacity.
     pub(crate) const DEFAULT_CAPACITY: usize = 4096;
 
-    /// Byte ceiling for memoizing a single input (xu3jq round 3).
-    /// Candidate-bearing inputs larger than this are redacted directly
-    /// and never enter the cache: caching them would pin up to
-    /// `capacity x input_size` of message bodies in memory (the
-    /// original giant-rollout incident ran the host into swap), while
-    /// the hit-rate on multi-hundred-KB distinct tool outputs is ~0.
-    /// 64 KiB bounds worst-case cache value memory at
-    /// ~4096 x 64KiB = 256 MiB and still covers every capped codex
-    /// message body (128 KiB content cap applies upstream, but titles,
-    /// metadata blobs, and extra_json strings are typically far
-    /// smaller).
+    /// Inputs above this size bypass memoization entirely. Smaller inputs
+    /// still need byte admission for their actual owned output buffer; this
+    /// per-input cutoff alone is not an aggregate cache-memory bound.
     pub(crate) const MAX_MEMOIZED_INPUT_BYTES: usize = 64 * 1024;
 
+    /// Explicit isolated cache for callers such as equivalence tests and the
+    /// fuzz adapter. Live persistence workers use new(), sharing one allowance.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::with_retention_budget(
+            capacity,
+            MemoRetentionBudget::new(REDACTION_RETAINED_VALUE_BYTES),
+        )
+    }
+
+    fn with_retention_budget(capacity: usize, retention: Arc<MemoRetentionBudget>) -> Self {
         Self {
-            text_cache: crate::indexer::memoization::ContentAddressedMemoCache::with_capacity(
+            text_cache: crate::indexer::memoization::ContentAddressedMemoCache::with_retention_budget(
                 capacity,
+                Arc::clone(&retention),
+                String::capacity,
             ),
             algorithm_fingerprint: redaction_algorithm_fingerprint(),
+            last_retention_limit: retention.limit(),
+            retention,
         }
     }
 
     pub(crate) fn new() -> Self {
-        Self::with_capacity(Self::configured_capacity())
+        Self::with_retention_budget(Self::configured_capacity(), Arc::clone(&REDACTION_RETENTION))
     }
 
-    /// Resolve the memo-cache capacity, honoring the optional
-    /// `CASS_REDACT_MEMO_CAPACITY` override (#291). On a very large,
-    /// subagent-heavy corpus the 4096 default thrashes ~one eviction per
-    /// insert; operators can raise the ceiling to cut that churn. A `0`,
-    /// empty, or unparseable value falls back to the default.
+    /// Resolve the per-owner entry ceiling, honoring the optional
+    /// `CASS_REDACT_MEMO_CAPACITY` override (#291). Raising it never bypasses
+    /// the shared byte allowance. A `0`, empty, or unparseable value falls
+    /// back to the default.
     pub(crate) fn configured_capacity() -> usize {
         dotenvy::var("CASS_REDACT_MEMO_CAPACITY")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(Self::DEFAULT_CAPACITY)
+    }
+
+    /// One atomic read on the usual path; no key hashing, cache lookup, OS
+    /// probe or LRU traversal unless the memory allowance changed. Check even
+    /// empty/clean inputs so a previously warm cache can shed retained values
+    /// when the rest of a transcript contains no more secret candidates.
+    fn refresh_retention_limit(&mut self) {
+        let limit = self.retention.limit();
+        if limit != self.last_retention_limit {
+            self.last_retention_limit = limit;
+            self.text_cache.trim_to_budget();
+        }
     }
 
     pub(crate) fn algorithm_fingerprint(&self) -> &str {
@@ -488,10 +530,9 @@ impl MemoizingRedactor {
     }
 
     /// Memoized counterpart to [`redact_text`]. Returns an owned String
-    /// (not Cow) because caching forces a copy on first compute anyway,
-    /// and downstream callers (`map_to_internal`) immediately call
-    /// `.into_owned()` regardless. Skipping the Cow indirection keeps
-    /// the cached-hit path branchless.
+    /// (not Cow) because downstream callers (`map_to_internal`) immediately
+    /// call `.into_owned()` regardless. Cache admission is independent of
+    /// producing this output: a refused retained copy changes no source byte.
     ///
     /// Each cache decision emits a structured `tracing` event so
     /// operators can audit hit / miss / insert / evict / quarantine
@@ -516,6 +557,7 @@ impl MemoizingRedactor {
         String,
         Vec<crate::indexer::memoization::MemoCacheAuditRecord>,
     ) {
+        self.refresh_retention_limit();
         // Empty fast-path matches the uncached contract and bypasses
         // the cache entirely (see memoizing_redactor_empty_input_skips_cache).
         if input.is_empty() {
@@ -592,12 +634,9 @@ impl MemoizingRedactor {
     }
 
     /// Quarantine a cached entry: subsequent lookups will return
-    /// [`MemoLookup::Quarantined`] (handled by `redact_text` as a
-    /// fallthrough to the direct regex path) instead of the cached
-    /// value. The reason is preserved for operator inspection. Used
-    /// when telemetry detects a poisoned redaction (e.g. unexpected
-    /// regex behavior under a hot pattern bump that the algorithm
-    /// fingerprint didn't catch).
+    /// [`crate::indexer::memoization::MemoLookup::Quarantined`] (handled by
+    /// `redact_text` as a fallthrough to the direct regex path) instead of the
+    /// cached value. Memory pressure never lifts a quarantine.
     pub(crate) fn quarantine(&mut self, input: &str, reason: impl Into<String>) {
         if input.is_empty() {
             return;
@@ -640,6 +679,12 @@ impl MemoizingRedactor {
                 live_entries = audit.stats.live_entries,
                 evictions_capacity = audit.stats.evictions_capacity,
                 "redact memo eviction"
+            ),
+            MemoCacheEvent::BudgetBypass => tracing::debug!(
+                target: "cass::redact::memo",
+                algorithm = %audit.key.algorithm,
+                live_entries = audit.stats.live_entries,
+                "redact memo byte allowance refused retention; full redaction preserved"
             ),
             MemoCacheEvent::Invalidate => tracing::warn!(
                 target: "cass::redact::memo",
@@ -1786,5 +1831,117 @@ mod tests {
         // Empty input quarantine is a no-op.
         redactor.quarantine("", "ignored");
         assert_eq!(redactor.stats().quarantined, 1);
+    }
+
+    #[test]
+    fn redaction_workers_share_retention_without_changing_parallel_output() {
+        let first = MemoizingRedactor::new();
+        let second = MemoizingRedactor::new();
+        assert!(Arc::ptr_eq(&first.retention, &second.retention));
+        assert!(Arc::ptr_eq(&first.retention, &REDACTION_RETENTION));
+
+        let budget = MemoRetentionBudget::new(64 * 1024);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let budget = Arc::clone(&budget);
+                scope.spawn(move || {
+                    let mut redactor = MemoizingRedactor::with_retention_budget(
+                        4096,
+                        Arc::clone(&budget),
+                    );
+                    for round in 0..16 {
+                        let input = format!(
+                            "worker {worker} message {round} {} password=hunter2hunter2",
+                            "unicode λ padding ".repeat(1024),
+                        );
+                        assert!(input.len() < MemoizingRedactor::MAX_MEMOIZED_INPUT_BYTES);
+                        let expected = redact_text_reference(&input).into_owned();
+                        assert_eq!(redactor.redact_text(&input), expected);
+                        assert_eq!(redactor.redact_text(&input), expected);
+                        assert!(budget.used() <= 64 * 1024);
+                    }
+                });
+            }
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn redaction_retention_pressure_releases_values_on_clean_input_and_recovers() {
+        let budget = MemoRetentionBudget::new(16 * 1024);
+        let mut redactor = MemoizingRedactor::with_retention_budget(16, Arc::clone(&budget));
+        let input = format!("{} password=hunter2hunter2", "padding ".repeat(256));
+        let expected = redact_text_reference(&input).into_owned();
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.stats().hits, 1);
+        assert!(budget.used() > 0);
+
+        apply_redaction_retention_limit(&budget, 0);
+        let (clean, audit) = redactor.redact_text_with_audit("ordinary clean text");
+        assert_eq!(clean, "ordinary clean text");
+        assert!(audit.is_empty());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(redactor.stats().live_entries, 0);
+        assert_eq!(redactor.stats().hits, 1);
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(budget.used(), 0);
+
+        apply_redaction_retention_limit(&budget, usize::MAX);
+        assert_eq!(budget.limit(), REDACTION_RETAINED_VALUE_BYTES);
+        assert_eq!(budget.used(), 0, "growth does not restore evicted values");
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.stats().hits, 1, "the old value must be recomputed");
+        assert_eq!(redactor.redact_text(&input), expected);
+        assert_eq!(redactor.stats().hits, 2);
+    }
+
+    #[test]
+    fn redaction_retention_bypass_never_bypasses_secret_redaction() {
+        use crate::indexer::memoization::MemoCacheEvent;
+        let budget = MemoRetentionBudget::new(8);
+        let mut redactor = MemoizingRedactor::with_retention_budget(16, Arc::clone(&budget));
+        let input = "Bearer abcdefghijklmnopqrstuvwxyz1234";
+        for _ in 0..2 {
+            let (output, audit) = redactor.redact_text_with_audit(input);
+            assert_eq!(output, REDACTED);
+            assert_eq!(output, redact_text_reference(input));
+            assert_eq!(audit.len(), 2);
+            assert_eq!(audit[0].event, MemoCacheEvent::Miss);
+            assert_eq!(audit[1].event, MemoCacheEvent::BudgetBypass);
+            assert!(!audit[1].changed);
+            assert_eq!(budget.used(), 0);
+        }
+        assert_eq!(redactor.stats().inserts, 0);
+        assert_eq!(redactor.stats().hits, 0);
+        assert_eq!(redactor.stats().misses, 2);
+    }
+
+    #[test]
+    fn redaction_retention_pressure_preserves_quarantine_and_nested_json() {
+        use crate::indexer::memoization::MemoCacheEvent;
+        let budget = MemoRetentionBudget::new(64 * 1024);
+        let mut redactor = MemoizingRedactor::with_retention_budget(16, Arc::clone(&budget));
+        let input = "line password=hunter2hunter2 trailing text";
+        redactor.redact_text(input);
+        redactor.quarantine(input, "retain quarantine through memory pressure");
+        apply_redaction_retention_limit(&budget, 0);
+        let value = json!({
+            "line": input,
+            "history": [input, "clean λ", null, 42],
+            "password": "opaque-short-value", // ubs:ignore — synthetic redaction fixture.
+            "api_key=abcdefgh12345678": "first", // ubs:ignore — synthetic collision fixture.
+            "password=abcdefgh12345678": "second", // ubs:ignore — synthetic collision fixture.
+            "[REDACTED]#2": "preexisting",
+        });
+        assert_eq!(redactor.redact_json(&value), redact_json(&value));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(redactor.stats().quarantined, 1);
+        apply_redaction_retention_limit(&budget, 4096);
+        let (output, audit) = redactor.redact_text_with_audit(input);
+        assert_eq!(output, redact_text_reference(input));
+        assert_eq!(audit.len(), 1);
+        assert!(matches!(audit[0].event, MemoCacheEvent::Quarantine { .. }));
+        assert_eq!(budget.used(), 0);
     }
 }

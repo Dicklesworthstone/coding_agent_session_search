@@ -1,4 +1,6 @@
+mod archive_lease;
 pub mod background_refresh;
+mod checkpoint_deadline;
 pub(crate) mod lexical_generation;
 mod lexical_publish;
 pub mod lexical_reconcile;
@@ -11,6 +13,8 @@ pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
+#[cfg(test)]
+mod source_ledger_tests;
 pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
@@ -275,6 +279,28 @@ fn should_skip_active_session_source(
         "skipping session source that appears to be actively written"
     );
     true
+}
+
+/// GH #486 / bead 0f1k0: `CASS_EXCLUDE_PATHS` covers every connector. The
+/// Claude Code, Codex, Codebuff and Pi readers skip an excluded file before
+/// parsing it, but the other connectors read every source they find, so each
+/// conversation is checked here before it is counted, stored or indexed. The
+/// policy is the one raw-mirror capture applies: whole path components, a
+/// relative entry taken from the working directory, aliases of an existing
+/// directory resolved on both sides, and an unusable policy excluding
+/// everything. Scan watermarks are already held while exclusions are set
+/// (`scan_watermark_preservation_active`), so a skipped source is picked up
+/// once its exclusion is removed.
+fn should_skip_excluded_source(source_path: &Path) -> bool {
+    let excluded =
+        crate::connectors::codex::path_policy::ScanExclusions::from_env().excludes(source_path);
+    if excluded {
+        tracing::debug!(
+            source_path = %source_path.display(),
+            "skipping a conversation whose source CASS_EXCLUDE_PATHS excludes"
+        );
+    }
+    excluded
 }
 
 /// Whether `CASS_SKIP_SUBAGENTS` is enabled (#292). Subagent transcripts
@@ -1169,6 +1195,10 @@ pub(crate) const INDEX_PHASE_ANALYTICS_REBUILD: usize = 10;
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
     pub stop_requested: AtomicBool,
+    /// Cancellation of an admitted preparation query is relayed to the
+    /// engine's operation context. Its owner still drains the query and
+    /// rollback before releasing storage or the index-run lock.
+    storage_cancellation: crate::franken_sync::CancellationHandle,
     pub total: AtomicUsize,
     pub current: AtomicUsize,
     /// #332: monotonic work-liveness tick. Producer threads bump it once per
@@ -1314,9 +1344,17 @@ impl std::fmt::Display for IndexInterrupted {
 
 impl std::error::Error for IndexInterrupted {}
 
+/// A connector rejected a source after any successfully parsed neighbors were
+/// committed. Keep the original cause without confusing its path with an
+/// archive storage failure at the CLI boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("one or more watch source scans failed; completed conversations were retained")]
+pub(crate) struct ConnectorScanFailure(#[source] anyhow::Error);
+
 impl IndexingProgress {
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
+        self.storage_cancellation.cancel();
     }
 
     pub fn stop_requested(&self) -> bool {
@@ -3004,15 +3042,79 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && opts.db_path.exists()
 }
 
+enum ReadonlyRebuildBoundary {
+    Rebuild,
+    ArchiveWrite,
+}
+
+/// Only these typed failures identify derived state that the ordinary reader
+/// is allowed to repair. In particular, a malformed archive must still fail a
+/// search-triggered probe before it creates maintenance artifacts (GH #436).
+fn readonly_rebuild_needs_archive_recovery(db_path: &Path, error: &anyhow::Error) -> bool {
+    use crate::franken_sync::FrankenError;
+
+    let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<FrankenError>())
+    else {
+        return false;
+    };
+    match error {
+        FrankenError::BusyRecovery => true,
+        FrankenError::DatabaseCorrupt { detail } => {
+            detail.contains("conflicting virtual-table entries") && detail.contains("fts_messages")
+        }
+        FrankenError::CannotOpen { .. } => {
+            let Ok(canonical_db_path) = archive_lease::canonical_database_path(db_path) else {
+                return false;
+            };
+            if !canonical_db_path.is_file() {
+                return false;
+            }
+            let mut wal_path = canonical_db_path.into_os_string();
+            wal_path.push("-wal");
+            fs::symlink_metadata(Path::new(&wal_path))
+                .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 32)
+        }
+        _ => false,
+    }
+}
+
+fn open_readonly_rebuild_storage(
+    db_path: &Path,
+    before_recovery: impl FnOnce() -> Result<()>,
+) -> Result<FrankenStorage> {
+    // This first attempt is an observation, not another 30-second recovery
+    // wait. A recovery-capable open can proceed only after writer admission.
+    match FrankenStorage::open_strict_readonly_with_timeout(db_path, Duration::ZERO) {
+        Ok(storage) => Ok(storage),
+        Err(error) if readonly_rebuild_needs_archive_recovery(db_path, &error) => {
+            before_recovery()?;
+            let canonical_db_path = archive_lease::canonical_database_path(db_path)?;
+            FrankenStorage::open_readonly(&canonical_db_path).with_context(|| {
+                format!(
+                    "opening canonical rebuild reader after admitted recovery for {} (strict read: {error:#})",
+                    db_path.display()
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn try_readonly_canonical_force_rebuild(
     opts: &IndexOptions,
     progress_bump: &Arc<AtomicI64>,
+    mut before_boundary: impl FnMut(ReadonlyRebuildBoundary) -> Result<()>,
 ) -> Result<bool> {
     if !should_try_readonly_canonical_force_rebuild(opts) {
         return Ok(false);
     }
 
-    let storage = FrankenStorage::open_readonly(&opts.db_path).with_context(|| {
+    let storage = open_readonly_rebuild_storage(&opts.db_path, || {
+        before_boundary(ReadonlyRebuildBoundary::ArchiveWrite)
+    })
+    .with_context(|| {
         format!(
             "opening canonical database read-only for force rebuild: {}",
             opts.db_path.display()
@@ -3054,6 +3156,7 @@ fn try_readonly_canonical_force_rebuild(
     );
 
     ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    before_boundary(ReadonlyRebuildBoundary::Rebuild)?;
     let rebuild_start = Instant::now();
     let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
         &opts.db_path,
@@ -3085,7 +3188,12 @@ fn try_readonly_canonical_force_rebuild(
     // `cass health` report stale forever even though the lexical index is
     // freshly rebuilt. performed_scan=false so last_scan_ts is preserved.
     let now_ms = FrankenStorage::now_millis();
-    match FrankenStorage::open_writer(&opts.db_path) {
+    // The rebuild above is read-only and remains useful with an unwritable
+    // archive directory. Its optional watermark write needs the same archive
+    // lease as every other writer, including when another data dir owns it.
+    match before_boundary(ReadonlyRebuildBoundary::ArchiveWrite)
+        .and_then(|()| FrankenStorage::open_writer(&opts.db_path))
+    {
         Ok(writer) => {
             let write_result = writer.set_last_indexed_at(now_ms);
             match writer.close() {
@@ -3357,6 +3465,10 @@ fn lexical_rebuild_db_state_matches_legacy(
 struct IndexRunLockGuard {
     // Keep the file handle alive for the lifetime of the lock.
     file: File,
+    // The data-dir lock protects derived assets; this separate pathname lease
+    // excludes writers using the same archive with another --data-dir. It is
+    // declared last among lock handles so data-dir metadata is cleared first.
+    archive_write_lease: Option<archive_lease::ArchiveWriteLease>,
     _path: PathBuf,
     started_at_ms: i64,
     updated_at_ms: i64,
@@ -3385,6 +3497,9 @@ struct IndexRunLockGuard {
     /// in that case.
     last_progress_at_ms_atomic: Arc<AtomicI64>,
     db_path: PathBuf,
+    // Keep the original filesystem spelling for delayed writer admission.
+    // Lexically normalizing `..` before resolving symlinks changes identity.
+    archive_path: PathBuf,
     job_id: String,
     job_kind: SearchMaintenanceJobKind,
     metadata_write_lock: Arc<Mutex<()>>,
@@ -3401,6 +3516,13 @@ impl Drop for IndexRunLockGuard {
 }
 
 impl IndexRunLockGuard {
+    fn acquire_archive_write_lease(&mut self) -> Result<()> {
+        if self.archive_write_lease.is_none() {
+            self.archive_write_lease = Some(acquire_archive_write_lease(&self.archive_path)?);
+        }
+        Ok(())
+    }
+
     fn write_metadata(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
         self.write_metadata_with_phase(mode, mode.as_lock_value())
     }
@@ -6972,6 +7094,36 @@ impl LexicalRebuildState {
     }
 }
 
+/// Contention on the canonical maintenance lock is an admission outcome, not
+/// an embedding or storage failure. Keep it typed so the daemon can retain an
+/// accepted job for retry without interpreting an arbitrary error message.
+#[derive(Debug, thiserror::Error)]
+#[error("another cass index process already holds {}", lock_path.display())]
+struct IndexRunBusy {
+    lock_path: PathBuf,
+}
+
+fn acquire_archive_write_lease(db_path: &Path) -> Result<archive_lease::ArchiveWriteLease> {
+    match archive_lease::ArchiveWriteLease::try_acquire(db_path).with_context(|| {
+        format!(
+            "acquiring canonical archive writer lease for {}",
+            db_path.display()
+        )
+    })? {
+        archive_lease::ArchiveLeaseAttempt::Acquired(lease) => Ok(lease),
+        archive_lease::ArchiveLeaseAttempt::Busy(lock_path) => {
+            Err(IndexRunBusy { lock_path }.into())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveAdmission {
+    Writable,
+    DataDirOnly,
+}
+
+#[cfg(test)]
 fn acquire_index_run_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -6990,6 +7142,22 @@ fn acquire_index_run_lock_with_job_kind(
     db_path: &Path,
     mode: SearchMaintenanceMode,
     job_kind: SearchMaintenanceJobKind,
+) -> Result<IndexRunLockGuard> {
+    acquire_index_run_lock_with_archive_admission(
+        data_dir,
+        db_path,
+        mode,
+        job_kind,
+        ArchiveAdmission::Writable,
+    )
+}
+
+fn acquire_index_run_lock_with_archive_admission(
+    data_dir: &Path,
+    db_path: &Path,
+    mode: SearchMaintenanceMode,
+    job_kind: SearchMaintenanceJobKind,
+    archive_admission: ArchiveAdmission,
 ) -> Result<IndexRunLockGuard> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
@@ -7010,10 +7178,7 @@ fn acquire_index_run_lock_with_job_kind(
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            anyhow::bail!(
-                "another cass index process already holds {}",
-                lock_path.display()
-            );
+            return Err(IndexRunBusy { lock_path }.into());
         }
         Err(std::fs::TryLockError::Error(err)) => {
             return Err(err)
@@ -7021,9 +7186,31 @@ fn acquire_index_run_lock_with_job_kind(
         }
     }
 
+    let archive_path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving the archive writer path")?
+            .join(db_path)
+    };
+    // Do not publish this attempt as an active owner until both leases are
+    // held. If archive admission fails, dropping `file` releases the data-dir
+    // lock without changing either owner's metadata or opening the database.
+    let archive_write_lease = match archive_admission {
+        ArchiveAdmission::Writable => Some(acquire_archive_write_lease(&archive_path)?),
+        ArchiveAdmission::DataDirOnly => None,
+    };
+    let db_path = archive_write_lease.as_ref().map_or_else(
+        || {
+            archive_lease::canonical_database_path(&archive_path)
+                .unwrap_or_else(|_| archive_path.clone())
+        },
+        |lease| lease.database_path().to_path_buf(),
+    );
     let now_ms = FrankenStorage::now_millis();
     let mut guard = IndexRunLockGuard {
         file,
+        archive_write_lease,
         _path: lock_path,
         started_at_ms: now_ms,
         updated_at_ms: now_ms,
@@ -7036,7 +7223,8 @@ fn acquire_index_run_lock_with_job_kind(
         // payload. Seed with `now_ms` so a stall-detector that fires
         // before the first bump cannot false-positive on `0`.
         last_progress_at_ms_atomic: Arc::new(AtomicI64::new(now_ms)),
-        db_path: crate::normalize_path_identity(db_path),
+        db_path,
+        archive_path,
         job_id: String::new(),
         job_kind,
         metadata_write_lock: Arc::new(Mutex::new(())),
@@ -7464,10 +7652,7 @@ fn lexical_rebuild_initial_commit_interval_messages() -> usize {
 }
 
 fn lexical_rebuild_commit_interval_message_bytes() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES")
         .unwrap_or(512 * 1024 * 1024)
 }
 
@@ -7521,10 +7706,7 @@ fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
     // the writer path even after prep parallelism improved. Scale the default
     // with the writer-thread hint while still capping at `page_size` so we
     // never fetch beyond what's been paged from the conversations table.
-    dotenvy::var("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS")
         .unwrap_or_else(|| {
             lexical_rebuild_default_batch_fetch_conversation_limit(
                 page_size,
@@ -7611,16 +7793,170 @@ fn lexical_rebuild_configured_worker_parallelism_for_available(
     )
 }
 
-fn lexical_rebuild_worker_parallelism() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_WORKERS")
-        .ok()
+/// GH #483: a named set of lexical-rebuild settings for `cass index
+/// --rebuild-profile`. A profile only supplies values for knobs the operator
+/// left unset: an explicit positive `CASS_TANTIVY_REBUILD_*` value still wins,
+/// and the responsiveness governor can still lower the result. It adds no
+/// second pipeline; it is the documented environment recipe under one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LexicalRebuildProfile {
+    /// The host-sized defaults.
+    #[default]
+    Default,
+    /// The single-core, low-memory recipe for a wedged or memory-starved
+    /// archive: one worker, one page-prep thread, a one-page channel, 64
+    /// conversations per fetch and a durable commit every 64 MiB of text.
+    Bounded,
+}
+
+impl LexicalRebuildProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bounded => "bounded",
+        }
+    }
+
+    /// The knobs this profile sets, by their environment variable names.
+    pub fn settings(self) -> &'static [(&'static str, usize)] {
+        match self {
+            Self::Default => &[],
+            Self::Bounded => &[
+                ("CASS_TANTIVY_REBUILD_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", 1),
+                ("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", 64),
+                (
+                    "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
+                    64 * 1024 * 1024,
+                ),
+            ],
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Bounded,
+            _ => Self::Default,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Bounded => 1,
+        }
+    }
+}
+
+static LEXICAL_REBUILD_PROFILE: AtomicU8 = AtomicU8::new(0);
+
+/// Select the rebuild profile for this process. `cass index` calls it once,
+/// before any rebuild setting is read.
+pub fn set_lexical_rebuild_profile(profile: LexicalRebuildProfile) {
+    LEXICAL_REBUILD_PROFILE.store(profile.to_u8(), Ordering::Relaxed);
+}
+
+pub fn lexical_rebuild_profile() -> LexicalRebuildProfile {
+    LexicalRebuildProfile::from_u8(LEXICAL_REBUILD_PROFILE.load(Ordering::Relaxed))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalRebuildSettingSource {
+    Env,
+    Profile,
+}
+
+impl LexicalRebuildSettingSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Profile => "profile",
+        }
+    }
+}
+
+/// An explicit positive environment value wins; otherwise the profile's
+/// value; `None` leaves the knob at its computed default.
+fn resolve_lexical_rebuild_setting(
+    env_value: Option<&str>,
+    profile: LexicalRebuildProfile,
+    name: &str,
+) -> Option<(usize, LexicalRebuildSettingSource)> {
+    if let Some(value) = env_value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            lexical_rebuild_configured_worker_parallelism_for_available(
-                lexical_rebuild_available_parallelism(),
-            )
+    {
+        return Some((value, LexicalRebuildSettingSource::Env));
+    }
+    profile
+        .settings()
+        .iter()
+        .find(|(setting, _)| *setting == name)
+        .map(|&(_, value)| (value, LexicalRebuildSettingSource::Profile))
+}
+
+fn lexical_rebuild_setting(name: &str) -> Option<usize> {
+    resolve_lexical_rebuild_setting(
+        dotenvy::var(name).ok().as_deref(),
+        lexical_rebuild_profile(),
+        name,
+    )
+    .map(|(value, _)| value)
+}
+
+/// What `cass index --json` reports under `rebuild_profile`: the selected
+/// profile, where each of its knobs came from, and the settings a lexical
+/// rebuild in this process would run with (after the governor).
+pub fn lexical_rebuild_profile_report() -> serde_json::Value {
+    lexical_rebuild_profile_report_for(
+        lexical_rebuild_profile(),
+        |name| dotenvy::var(name).ok(),
+        &lexical_rebuild_pipeline_settings_snapshot(),
+    )
+}
+
+fn lexical_rebuild_profile_report_for(
+    profile: LexicalRebuildProfile,
+    env: impl Fn(&str) -> Option<String>,
+    effective: &LexicalRebuildPipelineSettingsSnapshot,
+) -> serde_json::Value {
+    let settings: Vec<serde_json::Value> = profile
+        .settings()
+        .iter()
+        .filter_map(|&(name, _)| {
+            let (value, source) =
+                resolve_lexical_rebuild_setting(env(name).as_deref(), profile, name)?;
+            Some(serde_json::json!({
+                "env": name,
+                "value": value,
+                "source": source.as_str(),
+            }))
         })
+        .collect();
+    serde_json::json!({
+        "name": profile.as_str(),
+        "settings": settings,
+        "effective": {
+            "workers": effective.workers,
+            "page_prep_workers": effective.page_prep_workers,
+            "staged_shard_builders": effective.staged_shard_builders,
+            "staged_merge_workers": effective.staged_merge_workers,
+            "tantivy_writer_threads": effective.tantivy_writer_threads,
+            "pipeline_channel_size": effective.pipeline_channel_size,
+            "steady_batch_fetch_conversations": effective.steady_batch_fetch_conversations,
+            "steady_commit_every_message_bytes": effective.steady_commit_every_message_bytes,
+            "pipeline_max_message_bytes_in_flight": effective.pipeline_max_message_bytes_in_flight,
+        },
+    })
+}
+
+fn lexical_rebuild_worker_parallelism() -> usize {
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_WORKERS").unwrap_or_else(|| {
+        lexical_rebuild_configured_worker_parallelism_for_available(
+            lexical_rebuild_available_parallelism(),
+        )
+    })
 }
 
 fn build_lexical_rebuild_worker_pool() -> Result<Option<ThreadPool>> {
@@ -8743,6 +9079,42 @@ fn lexical_rebuild_runtime_pipeline_budget_snapshot(
     )
 }
 
+/// GH #496: the message bytes one prepared page may hold, for the first
+/// durable slice and for steady state, derived by the same budget path the
+/// live rebuild uses (the commit-bytes interval, clamped to an equal share
+/// of the in-flight budget). `status` reports both so a memory cap's effect
+/// on page prep is visible, not only on the in-flight total.
+pub(crate) fn lexical_rebuild_page_fetch_message_bytes(
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> (usize, usize) {
+    let page_bytes = |conversations, messages, message_bytes, commit_conversations| {
+        lexical_rebuild_runtime_pipeline_budget_snapshot(
+            conversations,
+            messages,
+            message_bytes,
+            settings.pipeline_channel_size,
+            commit_conversations,
+            messages,
+            message_bytes,
+        )
+        .batch_fetch_message_bytes_limit
+    };
+    (
+        page_bytes(
+            settings.startup_batch_fetch_conversations,
+            settings.startup_commit_every_messages,
+            settings.startup_commit_every_message_bytes,
+            settings.startup_commit_every_conversations,
+        ),
+        page_bytes(
+            settings.steady_batch_fetch_conversations,
+            settings.steady_commit_every_messages,
+            settings.steady_commit_every_message_bytes,
+            settings.steady_commit_every_conversations,
+        ),
+    )
+}
+
 fn bounded_lexical_rebuild_page_reservation_limits(
     configured_batch_fetch_message_bytes_limit: usize,
     max_message_bytes_in_flight: usize,
@@ -8786,10 +9158,7 @@ fn lexical_rebuild_content_bounded_page_conversation_limit(
 }
 
 fn lexical_rebuild_pipeline_channel_size() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE")
         // Two slots left the ordered page producer spending ~5s stalled on
         // sink handoff after the final-frontier publish work moved out of the
         // critical path. Four keeps the queue explicitly bounded while giving
@@ -8822,10 +9191,7 @@ fn lexical_rebuild_page_prep_worker_parallelism() -> usize {
 }
 
 fn lexical_rebuild_page_prep_worker_parallelism_configured() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    lexical_rebuild_setting("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
         .unwrap_or_else(|| {
             // Keep page-prep fanout bounded and conservative, but decouple it
             // from the tiny ordered pipeline channel. The channel size limits
@@ -9168,13 +9534,96 @@ pub(crate) fn verify_published_lexical_doc_count(
             )
         })?;
     if summary.docs != indexed_docs {
-        return Err(anyhow::anyhow!(
-            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader only \
-             sees {}; refusing to certify the generation (GH #457)",
-            summary.docs
-        ));
+        return Err(LexicalDocCountMismatch {
+            publish_mode: publish_mode.to_owned(),
+            counted: indexed_docs,
+            observed: summary.docs,
+        }
+        .into());
     }
     Ok(())
+}
+
+/// GH #457: a fresh reader serves a different number of live documents than
+/// the run counted. Typed so a resumed run can tell a candidate it can never
+/// certify from one it could not open.
+#[derive(Debug)]
+pub(crate) struct LexicalDocCountMismatch {
+    publish_mode: String,
+    counted: usize,
+    observed: usize,
+}
+
+impl std::fmt::Display for LexicalDocCountMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} lexical rebuild published {} docs but a fresh reader sees {}; refusing to \
+             certify the generation (GH #457)",
+            self.publish_mode, self.counted, self.observed
+        )
+    }
+}
+
+impl std::error::Error for LexicalDocCountMismatch {}
+
+/// GH #494: a resumed candidate failed certification, was retained, and the
+/// live checkpoint now restarts from zero. The caller rebuilds once.
+#[derive(Debug)]
+struct ResumedLexicalCandidateRetained {
+    quarantine: PathBuf,
+}
+
+impl std::fmt::Display for ResumedLexicalCandidateRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the resumed lexical candidate cannot be certified; retained it in {} and \
+             rebuilding from zero (GH #494)",
+            self.quarantine.display()
+        )
+    }
+}
+
+/// GH #494: a resumed staged candidate whose live documents disagree with the
+/// count its checkpoint carried after the replay can never be certified by
+/// resuming it again. The resume check catches an EOF checkpoint before the
+/// replay; a surplus in the committed prefix, which the #440 upsert window
+/// never revisits, surfaces only here. Retain the candidate with the
+/// checkpoint that could not certify it, and reset the live checkpoint so even
+/// an interrupted retry replays from zero. If retention fails, the original
+/// refusal stands and nothing is retried.
+fn retain_uncertifiable_resumed_candidate(
+    index_path: &Path,
+    candidate: &Path,
+    rebuild_state: &LexicalRebuildState,
+    db_state: &LexicalRebuildDbState,
+    refusal: anyhow::Error,
+) -> anyhow::Error {
+    let retained = (|| -> Result<PathBuf> {
+        let quarantine = lexical_publish::quarantine_incomplete_candidate(candidate)?;
+        persist_lexical_rebuild_state(&quarantine, rebuild_state)?;
+        persist_lexical_rebuild_state(
+            index_path,
+            &LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE),
+        )?;
+        Ok(quarantine)
+    })();
+    match retained {
+        Ok(quarantine) => {
+            tracing::warn!(
+                quarantine_path = %quarantine.display(),
+                counted_docs = rebuild_state.indexed_docs,
+                error = %format!("{refusal:#}"),
+                "resumed lexical candidate failed certification; retained it and rebuilding from zero (GH #494)"
+            );
+            refusal.context(ResumedLexicalCandidateRetained { quarantine })
+        }
+        Err(retain_error) => refusal.context(format!(
+            "could not retain the uncertifiable resumed lexical candidate, so it was not \
+             rebuilt: {retain_error:#}"
+        )),
+    }
 }
 
 /// GH #457: a run must not certify a hollow generation. Every full rebuild
@@ -9914,6 +10363,8 @@ fn storage_semantic_identity_tier(tier: SemanticTierKind) -> SemanticIdentityTie
 fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
     if embedder_id == "fnv1a-384" {
         "hash".to_string()
+    } else if crate::search::external_embedder::is_external_identity(embedder_id) {
+        embedder_id.to_owned()
     } else {
         crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
             .and_then(crate::search::model_download::ModelManifest::for_embedder)
@@ -10180,16 +10631,25 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 /// single conversation regardless of corpus size. Only called on the
 /// sparse-looking branch (observed already below the cheap raw upper bound), so
 /// the extra scan is paid lazily.
-fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
+///
+/// This scans the live conversations with an id above `after_conversation_id`
+/// in id order, adding to `expected_docs`, so an interrupted scan can resume
+/// (GH #381). `after_conversation(id, docs)` runs once each conversation is
+/// counted; an error from it stops the scan.
+fn expected_live_lexical_doc_count_after(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    mut expected_docs: usize,
+    mut after_conversation: impl FnMut(i64, usize) -> Result<()>,
+) -> Result<usize> {
     let conversation_ids: Vec<i64> = storage
         .raw()
         .query_map_collect(
-            "SELECT id FROM conversations",
-            &[] as &[ParamValue],
+            "SELECT id FROM conversations WHERE id > ?1 ORDER BY id",
+            &[ParamValue::from(after_conversation_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
-    let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
         // Stream: a long conversation is classified message by message, never
         // held whole (bgn6s removed the per-conversation cap that bounded it).
@@ -10200,13 +10660,34 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
             }
             Ok(true)
         })?;
+        after_conversation(conversation_id, expected_docs)?;
     }
     Ok(expected_docs)
 }
 
-/// GH #461: sidecar next to the rebuild checkpoint memoizing the
-/// noise-adjusted expected doc count for one canonical content identity.
+/// The whole-archive count in one uninterrupted pass: the reference the
+/// memoized, delta and resumed counts must equal.
+#[cfg(test)]
+fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
+    expected_live_lexical_doc_count_after(storage, 0, 0, |_, _| Ok(()))
+}
+
+/// GH #461: sidecar memoizing the noise-adjusted expected doc count for one
+/// canonical content identity (see [`expected_lexical_docs_cache_path`]).
 const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
+
+/// The memo describes the canonical database, not a lexical generation, so it
+/// lives beside the generation directory rather than inside it. Every lexical
+/// publish exchanges that directory: a memo kept inside was discarded by each
+/// rebuild, and the next run re-read every message in the archive to recreate
+/// it (GH #381: 900 s in `watch_startup:count_total_messages` on a 28 GB
+/// archive).
+fn expected_lexical_docs_cache_path(index_path: &Path) -> Option<PathBuf> {
+    index_path
+        .parent()
+        .map(|parent| parent.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE))
+}
+
 /// 2: counts under the per-message cap (bgn6s). A v1 memo counted a long
 /// conversation's messages past its first 8 MiB as noise and must be recounted.
 const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 2;
@@ -10278,14 +10759,29 @@ fn expected_live_lexical_doc_count_delta(
     cached: &ExpectedLexicalDocsCache,
     current: &ExpectedLexicalDocsIdentity,
 ) -> Result<Option<usize>> {
-    let old = &cached.identity;
+    if !expected_lexical_docs_identity_is_pure_append(storage, &cached.identity, current)? {
+        return Ok(None);
+    }
+    let appended =
+        expected_appended_lexical_docs(storage, cached.identity.max_message_id, |_| true)?;
+    Ok(Some(cached.expected_docs.saturating_add(appended)))
+}
+
+/// Whether the archive changed from `old` to `current` only by appended rows:
+/// no conversation or message was deleted (both totals grew by exactly the
+/// rows beyond the old maxima) and the content cap is unchanged.
+fn expected_lexical_docs_identity_is_pure_append(
+    storage: &FrankenStorage,
+    old: &ExpectedLexicalDocsIdentity,
+    current: &ExpectedLexicalDocsIdentity,
+) -> Result<bool> {
     if old.content_cap_bytes != current.content_cap_bytes
         || current.max_message_id < old.max_message_id
         || current.max_conversation_id < old.max_conversation_id
         || current.total_conversations < old.total_conversations
         || current.total_messages < old.total_messages
     {
-        return Ok(None);
+        return Ok(false);
     }
     let new_conversations = count_exact(
         storage,
@@ -10297,11 +10793,19 @@ fn expected_live_lexical_doc_count_delta(
         "SELECT COUNT(*) FROM messages WHERE id > ?1",
         old.max_message_id,
     )?;
-    if old.total_conversations.checked_add(new_conversations) != Some(current.total_conversations)
-        || old.total_messages.checked_add(new_messages) != Some(current.total_messages)
-    {
-        return Ok(None);
-    }
+    Ok(
+        old.total_conversations.checked_add(new_conversations) == Some(current.total_conversations)
+            && old.total_messages.checked_add(new_messages) == Some(current.total_messages),
+    )
+}
+
+/// Expected docs among the messages with an id above `after_message_id` whose
+/// live conversation satisfies `include`.
+fn expected_appended_lexical_docs(
+    storage: &FrankenStorage,
+    after_message_id: i64,
+    include: impl Fn(i64) -> bool,
+) -> Result<usize> {
     // The per-message cap makes every message's classification independent of
     // every other, so only the rows appended since the memo need classifying:
     // a rowid-range scan over them, never a JOIN (fsqlite's join path used to
@@ -10311,7 +10815,7 @@ fn expected_live_lexical_doc_count_delta(
         .raw()
         .query_map_collect(
             "SELECT DISTINCT conversation_id FROM messages WHERE id > ?1",
-            &[ParamValue::from(old.max_message_id)],
+            &[ParamValue::from(after_message_id)],
             |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations touched since the expected lexical docs memo")?;
@@ -10319,7 +10823,7 @@ fn expected_live_lexical_doc_count_delta(
     // indexed): one point lookup per touched conversation, resolved before the
     // row stream so no query runs inside its callback.
     let mut live_conversations = HashSet::with_capacity(touched.len());
-    for conversation_id in touched {
+    for conversation_id in touched.into_iter().filter(|id| include(*id)) {
         let live: i64 = storage
             .raw()
             .query_row_map(
@@ -10332,9 +10836,9 @@ fn expected_live_lexical_doc_count_delta(
             live_conversations.insert(conversation_id);
         }
     }
-    let mut expected_docs = cached.expected_docs;
+    let mut expected_docs = 0usize;
     storage.for_each_lexical_rebuild_message_after_id(
-        old.max_message_id,
+        after_message_id,
         |conversation_id, message| {
             let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
             if live_conversations.contains(&conversation_id)
@@ -10348,11 +10852,207 @@ fn expected_live_lexical_doc_count_delta(
             Ok(())
         },
     )?;
-    Ok(Some(expected_docs))
+    Ok(expected_docs)
 }
 
-/// [`expected_live_lexical_doc_count`] without re-reading the whole archive on
-/// every run (GH #461). The full per-conversation content scan ran at index
+/// GH #381 (ntxs1): where an interrupted full expected-docs scan stopped. It
+/// sits beside the memo; a completed scan removes it.
+const EXPECTED_LEXICAL_DOCS_PARTIAL_FILE: &str = ".expected-lexical-docs.partial.json";
+/// How often a full scan saves its position: an interruption loses at most
+/// this much reading.
+const EXPECTED_LEXICAL_DOCS_PARTIAL_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExpectedLexicalDocsPartial {
+    schema_version: u32,
+    db_path: String,
+    /// The archive the cursor and count describe.
+    identity: ExpectedLexicalDocsIdentity,
+    /// Every live conversation with an id at or below this one is counted.
+    last_conversation_id: i64,
+    expected_docs: usize,
+}
+
+/// The saved position of a running or interrupted full expected-docs scan,
+/// read without opening the database, so `cass status --json` shows a long
+/// first scan moving across runs (GH #381, ntxs1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ExpectedLexicalDocsScanPosition {
+    /// Every live conversation with an id at or below this one is counted.
+    pub(crate) last_conversation_id: i64,
+    /// The highest conversation id when the position was saved.
+    pub(crate) max_conversation_id: i64,
+    pub(crate) expected_docs_so_far: usize,
+    /// When the position was saved (the file's mtime).
+    pub(crate) saved_at_ms: Option<i64>,
+}
+
+/// The position file beside the lexical index at `index_path`, if it belongs
+/// to `db_path` and the current memo schema. The next scan resumes from it
+/// when the archive is unchanged or only grew, and starts over otherwise.
+pub(crate) fn expected_lexical_docs_scan_position(
+    index_path: &Path,
+    db_path: &Path,
+) -> Option<ExpectedLexicalDocsScanPosition> {
+    let path = expected_lexical_docs_cache_path(index_path)?
+        .with_file_name(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+    let partial: ExpectedLexicalDocsPartial =
+        serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if partial.schema_version != EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
+        || !lexical_rebuild_db_paths_match(&partial.db_path, &db_path.to_string_lossy())
+    {
+        return None;
+    }
+    let saved_at_ms = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
+    Some(ExpectedLexicalDocsScanPosition {
+        last_conversation_id: partial.last_conversation_id,
+        max_conversation_id: partial.identity.max_conversation_id,
+        expected_docs_so_far: partial.expected_docs,
+        saved_at_ms,
+    })
+}
+
+fn write_expected_lexical_docs_sidecar<T: serde::Serialize>(path: &Path, payload: &T) {
+    let Some(file_name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return;
+    };
+    let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+    let written = serde_json::to_vec(payload)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| fs::write(&tmp_path, bytes))
+        .and_then(|()| fs::rename(&tmp_path, path));
+    if let Err(err) = written {
+        tracing::debug!(error = %err, path = %path.display(), "expected lexical docs sidecar write skipped");
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+/// The full expected-docs count, resumable (GH #381, ntxs1). The first full
+/// scan reads every message; on a 28 GB archive it outlived the caller's
+/// 900 s timeout, and an interrupted scan kept nothing, so the next run
+/// started over and never finished. The scan now saves its cursor and count
+/// at `partial_path` every few seconds. A later run continues from there:
+/// as-is when the archive is unchanged, or after counting the rows appended to
+/// already-counted conversations when the archive only grew. Any other change
+/// (a deletion, a cap change) starts over.
+fn expected_live_lexical_doc_count_resumable(
+    storage: &FrankenStorage,
+    partial_path: Option<&Path>,
+    db_path: &str,
+    current: &ExpectedLexicalDocsIdentity,
+    progress: Option<&IndexingProgress>,
+) -> Result<usize> {
+    expected_live_lexical_doc_count_resumable_with(
+        storage,
+        partial_path,
+        db_path,
+        current,
+        progress,
+        EXPECTED_LEXICAL_DOCS_PARTIAL_SAVE_INTERVAL,
+        |_| Ok(()),
+    )
+}
+
+fn expected_live_lexical_doc_count_resumable_with(
+    storage: &FrankenStorage,
+    partial_path: Option<&Path>,
+    db_path: &str,
+    current: &ExpectedLexicalDocsIdentity,
+    progress: Option<&IndexingProgress>,
+    save_interval: Duration,
+    mut on_conversation: impl FnMut(i64) -> Result<()>,
+) -> Result<usize> {
+    if let Some(progress) = progress {
+        progress.check_stop()?;
+    }
+    let saved = partial_path
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsPartial>(&raw).ok())
+        .filter(|partial| {
+            partial.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
+                && lexical_rebuild_db_paths_match(&partial.db_path, db_path)
+        });
+    let (resume_after, resume_docs) = match saved {
+        Some(partial) if partial.identity == *current => {
+            (partial.last_conversation_id, partial.expected_docs)
+        }
+        Some(partial)
+            if expected_lexical_docs_identity_is_pure_append(
+                storage,
+                &partial.identity,
+                current,
+            )? =>
+        {
+            // Conversations above the cursor are read whole below, appended
+            // rows included; rows appended to the ones already counted are not
+            // in the saved count yet.
+            let cursor = partial.last_conversation_id;
+            let appended = expected_appended_lexical_docs(
+                storage,
+                partial.identity.max_message_id,
+                |conversation_id| conversation_id <= cursor,
+            )?;
+            (cursor, partial.expected_docs.saturating_add(appended))
+        }
+        _ => (0, 0),
+    };
+    if resume_after > 0 {
+        tracing::info!(
+            resume_after_conversation_id = resume_after,
+            expected_docs_so_far = resume_docs,
+            "resuming the interrupted expected lexical docs scan (GH #381)"
+        );
+    }
+    let mut last_save = Instant::now();
+    let expected_docs = expected_live_lexical_doc_count_after(
+        storage,
+        resume_after,
+        resume_docs,
+        |conversation_id, expected_docs| {
+            if let Some(progress) = progress {
+                // The stall watchdog reads activity, not phase counters.
+                progress.tick_activity();
+            }
+            let observed = on_conversation(conversation_id);
+            let stop = progress.map_or(Ok(()), IndexingProgress::check_stop);
+            if let Some(path) = partial_path
+                && (stop.is_err() || last_save.elapsed() >= save_interval)
+            {
+                write_expected_lexical_docs_sidecar(
+                    path,
+                    &ExpectedLexicalDocsPartial {
+                        schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+                        db_path: db_path.to_string(),
+                        identity: current.clone(),
+                        last_conversation_id: conversation_id,
+                        expected_docs,
+                    },
+                );
+                tracing::info!(
+                    last_conversation_id = conversation_id,
+                    max_conversation_id = current.max_conversation_id,
+                    expected_docs_so_far = expected_docs,
+                    "expected lexical docs scan position saved (GH #381)"
+                );
+                last_save = Instant::now();
+            }
+            observed?;
+            stop
+        },
+    )?;
+    if let Some(path) = partial_path {
+        // The memo the caller writes next supersedes the partial count.
+        let _ = fs::remove_file(path);
+    }
+    Ok(expected_docs)
+}
+
+/// The expected doc count ([`expected_live_lexical_doc_count_after`]) without
+/// re-reading the whole archive on every run (GH #461). The full per-conversation content scan ran at index
 /// startup and again at the post-run checkpoint refresh on any archive whose
 /// sink drops tool-acks or empty messages, i.e. on essentially every
 /// incremental run; a 16 MB incremental run read 9.4 GB. The count is served
@@ -10365,16 +11065,31 @@ fn expected_live_lexical_doc_count_cached(
     index_path: &Path,
     db_path: &str,
     total_messages: usize,
+    progress: Option<&IndexingProgress>,
 ) -> Result<usize> {
     let current = expected_lexical_docs_identity(storage, total_messages)?;
-    let cache_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
-    let cached = fs::read(&cache_path)
-        .ok()
+    let cache_path = expected_lexical_docs_cache_path(index_path)
+        .filter(|path| path.parent().is_some_and(Path::is_dir));
+    let partial_path = cache_path
+        .as_deref()
+        .map(|path| path.with_file_name(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE));
+    let cached = cache_path
+        .as_deref()
+        .and_then(|path| fs::read(path).ok())
         .and_then(|raw| serde_json::from_slice::<ExpectedLexicalDocsCache>(&raw).ok())
         .filter(|cached| {
             cached.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
                 && lexical_rebuild_db_paths_match(&cached.db_path, db_path)
         });
+    let full_scan = || {
+        expected_live_lexical_doc_count_resumable(
+            storage,
+            partial_path.as_deref(),
+            db_path,
+            &current,
+            progress,
+        )
+    };
     let (expected_docs, delta_generations, source) = match cached {
         Some(cached) if cached.identity == current => {
             return Ok(cached.expected_docs);
@@ -10382,10 +11097,10 @@ fn expected_live_lexical_doc_count_cached(
         Some(cached) if cached.delta_generations < EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS => {
             match expected_live_lexical_doc_count_delta(storage, &cached, &current)? {
                 Some(expected) => (expected, cached.delta_generations + 1, "delta"),
-                None => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+                None => (full_scan()?, 0, "full"),
             }
         }
-        _ => (expected_live_lexical_doc_count(storage)?, 0, "full"),
+        _ => (full_scan()?, 0, "full"),
     };
     tracing::debug!(
         expected_lexical_docs = expected_docs,
@@ -10393,26 +11108,17 @@ fn expected_live_lexical_doc_count_cached(
         delta_generations,
         "expected lexical doc count recomputed"
     );
-    if index_path.is_dir() {
-        let payload = ExpectedLexicalDocsCache {
-            schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
-            db_path: db_path.to_string(),
-            identity: current,
-            expected_docs,
-            delta_generations,
-        };
-        let tmp_path = index_path.join(format!(
-            "{EXPECTED_LEXICAL_DOCS_CACHE_FILE}.{}.tmp",
-            std::process::id()
-        ));
-        let written = serde_json::to_vec(&payload)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| fs::write(&tmp_path, bytes))
-            .and_then(|()| fs::rename(&tmp_path, &cache_path));
-        if let Err(err) = written {
-            tracing::debug!(error = %err, "expected lexical docs cache write skipped");
-            let _ = fs::remove_file(&tmp_path);
-        }
+    if let Some(cache_path) = cache_path {
+        write_expected_lexical_docs_sidecar(
+            &cache_path,
+            &ExpectedLexicalDocsCache {
+                schema_version: EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION,
+                db_path: db_path.to_string(),
+                identity: current,
+                expected_docs,
+                delta_generations,
+            },
+        );
     }
     Ok(expected_docs)
 }
@@ -12437,6 +13143,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
             index_path,
             &db_state.db_path,
             total_messages,
+            None,
         )?
     };
     if observed_tantivy_docs != expected_docs {
@@ -13708,6 +14415,9 @@ struct StreamingBatchSender<'a> {
     content_bytes: usize,
     retained_bytes: usize,
     byte_reservation: usize,
+    /// Sources skipped because the source ledger shows them unchanged, for
+    /// the scope's ingest report.
+    reused_sources: Vec<PathBuf>,
 }
 
 fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_name: &'static str) {
@@ -13740,48 +14450,71 @@ fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String
 }
 
 fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            let observation = serde_json::json!({
-            "path":path,"size":metadata.len(),
-            "mtime_ns":metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos().to_string(),
-            });
-            #[cfg(unix)]
-            let observation = {
-                use std::os::unix::fs::MetadataExt;
-                let mut observation = observation;
-                observation["device"] = serde_json::json!(metadata.dev());
-                observation["inode"] = serde_json::json!(metadata.ino());
-                observation["ctime"] = serde_json::json!([metadata.ctime(), metadata.ctime_nsec()]);
-                observation
-            };
-            Some(observation)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Some(serde_json::json!({"path":path,"absent":true}))
-        }
-        Err(_) => None,
-    }
+    crate::connectors::source_dependencies::observation::file_observation(path)
 }
 
 fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
-    let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
-        return false;
-    };
-    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
-        return false;
+    crate::connectors::source_dependencies::observation::ledger_matches(
+        observation,
+        &source.source_path,
+        source_folder_is_dependency(source),
+        env!("CASS_SOURCE_INGEST_CONTRACT"),
+    )
+}
+
+/// A connector capability, not an inference from this scan's sidecar list.
+fn source_folder_is_dependency(source: &DiscoveredSourceFile) -> bool {
+    crate::connectors::source_dependencies::source_dependency_policy(&source.provider_slug)
+        .observes_parent_directory()
+}
+
+fn source_parent_observation(source: &DiscoveredSourceFile) -> Option<serde_json::Value> {
+    if source_folder_is_dependency(source) {
+        source
+            .source_path
+            .parent()
+            .and_then(source_file_observation)
+    } else {
+        None
     }
-    if saved["primary"] != source_file_observation(&source.source_path).unwrap_or_default() {
-        return false;
+}
+
+/// Capture the reconstruction dependencies after a source finishes parsing.
+/// Folder growth must not withhold a self-contained source's durable marker,
+/// but changes to the primary or any declared sidecar must still withhold it.
+fn source_observations_after_scan(
+    source: &DiscoveredSourceFile,
+    sidecars: &[DiscoveredSourceFile],
+    primary_before: Option<&serde_json::Value>,
+    parent_before: Option<&serde_json::Value>,
+    dependencies_before: &HashMap<PathBuf, serde_json::Value>,
+) -> Option<(serde_json::Value, Vec<serde_json::Value>)> {
+    let primary = source_file_observation(&source.source_path)?;
+    if primary["absent"].as_bool() == Some(true)
+        || Some(&primary) != primary_before
+        || source.fs_metadata_changed()
+    {
+        return None;
     }
-    let Some(files) = saved["dependencies"].as_array() else {
-        return false;
-    };
-    files.iter().all(|file| {
-        file["path"]
-            .as_str()
-            .is_some_and(|path| source_file_observation(Path::new(path)).as_ref() == Some(file))
-    })
+    let mut dependencies = Vec::new();
+    if source_folder_is_dependency(source) {
+        let parent = source_parent_observation(source)?;
+        if Some(&parent) != parent_before {
+            return None;
+        }
+        dependencies.push(parent);
+    }
+    for sidecar in sidecars {
+        if sidecar.fs_metadata_changed() {
+            return None;
+        }
+        let observation = source_file_observation(&sidecar.source_path)?;
+        if dependencies_before.get(&sidecar.source_path) != Some(&observation) {
+            return None;
+        }
+        dependencies.push(observation);
+    }
+    Some((primary, dependencies))
 }
 
 /// Keep only the final bounded batch until the connector certifies a source.
@@ -13808,14 +14541,24 @@ fn scan_with_durable_source_boundaries(
     let filtered = std::cell::Cell::new(false);
     let before = std::cell::RefCell::new(None);
     let primary_before = std::cell::RefCell::new(None);
-    let dependencies_before: HashMap<_, _> = connector
-        .discover_source_files(&ctx)?
-        .into_iter()
-        .filter_map(|source| {
-            source_file_observation(&source.source_path)
-                .map(|observation| (source.source_path, observation))
-        })
-        .collect();
+    // A self-contained parser cannot consult sidecars. Avoid a second full
+    // inventory and stat/JSON map solely to prove the absence of dependencies.
+    // Unexpected completion sidecars remain unobserved and withhold the marker.
+    // Other and unknown connector registrations keep the discovery-time guard.
+    let dependencies_before = if crate::connectors::source_dependencies::source_dependency_policy(
+        sender.borrow().connector_name,
+    )
+    .observes_parent_directory()
+    {
+        crate::connectors::source_dependencies::observation::DependencyObservations::capture(
+            connector
+                .discover_source_files(&ctx)?
+                .into_iter()
+                .map(|source| source.source_path),
+        )
+    } else {
+        Default::default()
+    };
     let flush_error = std::cell::RefCell::new(None);
     let mut should_scan = |source: &DiscoveredSourceFile| {
         if config
@@ -13829,11 +14572,21 @@ fn scan_with_durable_source_boundaries(
             *flush_error.borrow_mut() = Some(error);
             return false;
         }
-        filtered.set(scan_path_exclusions_active());
-        *before.borrow_mut() = source
-            .source_path
-            .parent()
-            .and_then(source_file_observation);
+        // Some connectors exclude complete source files before this hook. An
+        // unrelated exclusion does not make an admitted transcript partial.
+        // Keep conservative behavior for unknown/partial-source filters; the
+        // prepare callback below still withholds any actually filtered source.
+        filtered.set(
+            scan_path_exclusions_active()
+                && !crate::connectors::source_dependencies::can_reuse_with_path_exclusions(
+                    sender.borrow().connector_name,
+                    &source.provider_slug,
+                ),
+        );
+        // The connector may already have selected its sidecars by this hook.
+        // Use the pre-discovery parent, not a later snapshot that could bless
+        // an untracked sidecar appearing between discovery and admission.
+        *before.borrow_mut() = dependencies_before.parent_for(&source.source_path).cloned();
         *primary_before.borrow_mut() = source_file_observation(&source.source_path);
         let skip = env!("CASS_SOURCE_INGEST_REUSE") == "true"
             && !filtered.get()
@@ -13842,6 +14595,12 @@ fn scan_with_durable_source_boundaries(
                 .get(&source_ledger_key(source, &ctx))
                 .is_some_and(|saved| source_ledger_matches(saved, source));
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
+        if skip {
+            sender
+                .borrow_mut()
+                .reused_sources
+                .push(source.source_path.clone());
+        }
         !skip
     };
     let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
@@ -13855,30 +14614,15 @@ fn scan_with_durable_source_boundaries(
         {
             return sender.borrow_mut().flush();
         }
-        let Some(primary) = source_file_observation(&completion.source.source_path) else {
+        let Some((primary, dependencies)) = source_observations_after_scan(
+            &completion.source,
+            &completion.required_sidecars,
+            primary_before.borrow().as_ref(),
+            before.borrow().as_ref(),
+            &dependencies_before.files,
+        ) else {
             return sender.borrow_mut().flush();
         };
-        if Some(&primary) != primary_before.borrow().as_ref() {
-            return sender.borrow_mut().flush();
-        }
-        let parent = completion
-            .source
-            .source_path
-            .parent()
-            .and_then(source_file_observation);
-        if parent.is_none() || parent != *before.borrow() {
-            return sender.borrow_mut().flush();
-        }
-        let mut dependencies = vec![parent.expect("checked parent")];
-        for sidecar in &completion.required_sidecars {
-            let Some(observation) = source_file_observation(&sidecar.source_path) else {
-                return sender.borrow_mut().flush();
-            };
-            if dependencies_before.get(&sidecar.source_path) != Some(&observation) {
-                return sender.borrow_mut().flush();
-            }
-            dependencies.push(observation);
-        }
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
             key: source_ledger_key(&completion.source, &ctx),
             observation: serde_json::json!({"primary":primary,"dependencies":dependencies,
@@ -13931,6 +14675,7 @@ impl<'a> StreamingBatchSender<'a> {
             content_bytes: 0,
             retained_bytes: 0,
             byte_reservation: 0,
+            reused_sources: Vec::new(),
         }
     }
 
@@ -14276,7 +15021,9 @@ fn spawn_connector_producer(
                         active_source_skipped = true;
                         return Ok(None);
                     }
-                    if should_skip_subagent(&conversation) {
+                    if should_skip_subagent(&conversation)
+                        || should_skip_excluded_source(&conversation.source_path)
+                    {
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
@@ -14328,14 +15075,21 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
+                    // Name the root the connector scanned, not the cass data
+                    // dir (GH #511).
+                    let scanned_root = fallback_roots
+                        .first()
+                        .map_or(ctx.data_dir.as_path(), |root| root.path.as_path());
+                    ingest_diagnostics.observe_connector_scan_error(scanned_root, &e);
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
-                        error: e.to_string(),
+                        error: format!("{e:#}"),
                     });
                 }
             }
+            ingest_diagnostics
+                .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
             record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
         }
 
@@ -14388,7 +15142,9 @@ fn spawn_connector_producer(
                         active_source_skipped = true;
                         return Ok(None);
                     }
-                    if should_skip_subagent(&conversation) {
+                    if should_skip_subagent(&conversation)
+                        || should_skip_excluded_source(&conversation.source_path)
+                    {
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
@@ -14468,10 +15224,12 @@ fn spawn_connector_producer(
                     );
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
-                        error: format!("remote scan failed for {}: {}", root.path.display(), e),
+                        error: format!("remote scan failed for {}: {e:#}", root.path.display()),
                     });
                 }
             }
+            ingest_diagnostics
+                .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
             record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
         }
 
@@ -15114,6 +15872,9 @@ fn run_streaming_consumer(
                             "preserving this connector's scan watermark while allowing unrelated connectors to advance"
                         );
                     }
+                    if scan_start_ts.is_some() && !connector_watermark_safe {
+                        record_scan_contract_with_watermark_held(storage, connector_name, true);
+                    }
                 } else if !effective_scan_succeeded {
                     ingest_outcome.scan_had_errors = true;
                 }
@@ -15733,42 +16494,46 @@ fn run_batch_index_with_connector_factories(
                         active_source_filter.as_ref(),
                     );
                     active_source_skipped |= preparse_active_source_skipped;
-                    match conn.scan(&ctx) {
-                        Ok(mut local_convs) => {
-                            let local_origin = Origin::local();
-                            let conversations_before_active_filter = local_convs.len();
-                            local_convs.retain(|conv| {
-                                !should_skip_active_session_source(
-                                    active_source_filter.as_ref(),
-                                    SourceKind::Local,
-                                    &conv.source_path,
-                                )
-                            });
-                            active_source_skipped |=
-                                local_convs.len() < conversations_before_active_filter;
-                            local_convs.retain(|conv| !should_skip_subagent(conv));
-                            for conversation in &mut local_convs {
-                                ingest_diagnostics.observe_conversation(conversation);
-                            }
-                            for conv in &mut local_convs {
-                                prepare_conversation_for_ingest(
-                                    &data_dir,
-                                    name,
-                                    &local_origin,
-                                    None,
-                                    conv,
-                                );
-                            }
-                            convs.extend(local_convs);
+                    let local_origin = Origin::local();
+                    // GH #511: the callback can yield good chats before
+                    // reporting another transcript's failure. Keep those
+                    // chats and retain the failure to hold the watermark.
+                    if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                        if should_skip_active_session_source(
+                            active_source_filter.as_ref(),
+                            SourceKind::Local,
+                            &conversation.source_path,
+                        ) {
+                            active_source_skipped = true;
+                            return Ok(());
                         }
-                        Err(e) => {
-                            // Note: agent was counted as discovered but scan failed
-                            // This is acceptable as detection succeeded (agent exists)
-                            scan_succeeded = false;
-                            ingest_diagnostics.observe_connector_scan_error(&ctx.data_dir, &e);
-                            scan_errors.push(e.to_string());
-                            tracing::warn!("scan failed for {}: {}", name, e);
+                        if should_skip_subagent(&conversation)
+                            || should_skip_excluded_source(&conversation.source_path)
+                        {
+                            return Ok(());
                         }
+                        ingest_diagnostics.observe_conversation(&mut conversation);
+                        prepare_conversation_for_ingest(
+                            &data_dir,
+                            name,
+                            &local_origin,
+                            None,
+                            &mut conversation,
+                        );
+                        convs.push(conversation);
+                        Ok(())
+                    }) {
+                        // Note: agent was counted as discovered but scan failed
+                        // This is acceptable as detection succeeded (agent exists)
+                        scan_succeeded = false;
+                        // Name the root the connector scanned, not the
+                        // cass data dir (GH #511).
+                        let scanned_root = fallback_roots
+                            .first()
+                            .map_or(ctx.data_dir.as_path(), |root| root.path.as_path());
+                        ingest_diagnostics.observe_connector_scan_error(scanned_root, &e);
+                        scan_errors.push(format!("{e:#}"));
+                        tracing::warn!("scan failed for {}: {}", name, e);
                     }
                     record_connector_ingest_report(
                         progress_ref,
@@ -15808,48 +16573,43 @@ fn run_batch_index_with_connector_factories(
                             active_source_filter.as_ref(),
                         );
                         active_source_skipped |= preparse_active_source_skipped;
-                        match conn.scan(&ctx) {
-                            Ok(mut remote_convs) => {
-                                let conversations_before_active_filter = remote_convs.len();
-                                remote_convs.retain(|conv| {
-                                    !should_skip_active_session_source(
-                                        active_source_filter.as_ref(),
-                                        root.origin.kind,
-                                        &conv.source_path,
-                                    )
-                                });
-                                active_source_skipped |=
-                                    remote_convs.len() < conversations_before_active_filter;
-                                remote_convs.retain(|conv| !should_skip_subagent(conv));
-                                for conversation in &mut remote_convs {
-                                    ingest_diagnostics.observe_conversation(conversation);
-                                }
-                                for conv in &mut remote_convs {
-                                    prepare_conversation_for_ingest(
-                                        &data_dir,
-                                        name,
-                                        &root.origin,
-                                        Some(root),
-                                        conv,
-                                    );
-                                }
-                                convs.extend(remote_convs);
+                        if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                            if should_skip_active_session_source(
+                                active_source_filter.as_ref(),
+                                root.origin.kind,
+                                &conversation.source_path,
+                            ) {
+                                active_source_skipped = true;
+                                return Ok(());
                             }
-                            Err(e) => {
-                                scan_succeeded = false;
-                                ingest_diagnostics
+                            if should_skip_subagent(&conversation)
+                                || should_skip_excluded_source(&conversation.source_path)
+                            {
+                                return Ok(());
+                            }
+                            ingest_diagnostics.observe_conversation(&mut conversation);
+                            prepare_conversation_for_ingest(
+                                &data_dir,
+                                name,
+                                &root.origin,
+                                Some(root),
+                                &mut conversation,
+                            );
+                            convs.push(conversation);
+                            Ok(())
+                        }) {
+                            scan_succeeded = false;
+                            ingest_diagnostics
                                 .observe_connector_scan_error(&root.path, &e);
-                                scan_errors.push(format!(
-                                    "remote scan failed for {}: {}",
-                                    root.path.display(),
-                                    e
-                                ));
-                                tracing::warn!(
-                                    connector = name,
-                                    root = %root.path.display(),
-                                    "remote scan failed: {e}"
-                                );
-                            }
+                            scan_errors.push(format!(
+                                "remote scan failed for {}: {e:#}",
+                                root.path.display(),
+                            ));
+                            tracing::warn!(
+                                connector = name,
+                                root = %root.path.display(),
+                                "remote scan failed: {e}"
+                            );
                         }
                         record_connector_ingest_report(
                             progress_ref,
@@ -16002,6 +16762,9 @@ fn run_batch_index_with_connector_factories(
                 path_exclusions_active = scan_path_exclusions_active(),
                 "preserving this completed batch connector's watermark while allowing unrelated connectors to advance"
             );
+            if persistence_completed && scan_start_ts.is_some() {
+                record_scan_contract_with_watermark_held(storage, pending.name, !opts.watch);
+            }
         }
         tracing::info!(
             connector = pending.name,
@@ -16094,22 +16857,23 @@ fn connector_local_scan_since_ts_map(
     connector_factories
         .iter()
         .map(|(name, _)| {
-            let (connector_last_scan_ts, connector_has_conversations) = connector_states
-                .get(*name)
-                .copied()
-                .unwrap_or((None, false));
+            let state = connector_states.get(*name).copied().unwrap_or_default();
             // OMP is newly split from the legacy Pi Agent identity. The
             // archive upgrade can legitimately create `omp` rows before the
             // dedicated connector has ever completed a scan; do one full OMP
             // scan until its own watermark exists so older profile/XDG roots
             // are not skipped by the global Pi-era cutoff.
-            let local_since_ts = if *name == "omp" && connector_last_scan_ts.is_none() {
+            let local_since_ts = if *name == "omp" && state.last_scan_ts.is_none() {
+                None
+            } else if state.scan_contract_pending {
+                // A source form this build reads can predate any cutoff (GH
+                // #513: compressed Codex rollouts keep old modification times).
                 None
             } else {
                 connector_local_scan_since_ts_from_state(
                     fallback_since_ts,
-                    connector_last_scan_ts,
-                    connector_has_conversations,
+                    state.last_scan_ts,
+                    state.has_conversations,
                 )
             };
             Ok((
@@ -16118,6 +16882,32 @@ fn connector_local_scan_since_ts_map(
             ))
         })
         .collect()
+}
+
+/// A successful scan under a connector's current scan contract read every
+/// source form the contract names, even when path exclusions or a skipped
+/// active source withheld its watermark (whose write otherwise records the
+/// contract). Without this such a connector would never get a cutoff again.
+fn record_scan_contract_with_watermark_held(
+    storage: &FrankenStorage,
+    connector_name: &str,
+    defer_checkpoints: bool,
+) {
+    if crate::storage::sqlite::connector_scan_contract(connector_name).is_none() {
+        return;
+    }
+    if let Err(error) = persist::with_ephemeral_writer(
+        storage,
+        defer_checkpoints,
+        "recording connector scan contract",
+        |writer| writer.record_connector_scan_contract(connector_name),
+    ) {
+        tracing::warn!(
+            connector = connector_name,
+            error = %error,
+            "connector scan contract save failed; the next run scans this connector without a cutoff again"
+        );
+    }
 }
 
 fn explicit_scan_root_since_ts(
@@ -16260,6 +17050,45 @@ fn run_index_inner(
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
+    let progress = opts.progress.clone();
+    let result = run_index_with_storage_ownership(
+        opts,
+        event_channel,
+        local_connector_roots,
+        mirror_source_ids,
+    );
+    // Some archive diagnostics intentionally turn engine errors into reason
+    // strings. Once the owner has drained, a requested stop must not escape
+    // as a spurious corruption or migration failure merely because an Abort
+    // lost its concrete type while passing through those diagnostics.
+    if progress
+        .as_ref()
+        .is_some_and(|progress| progress.stop_requested())
+    {
+        if let Err(error) = &result {
+            tracing::debug!(error = %error, "index owner drained after cancellation");
+        }
+        return Err(IndexInterrupted.into());
+    }
+    result
+}
+
+fn run_index_with_storage_ownership(
+    opts: IndexOptions,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+    local_connector_roots: LocalConnectorRootsOverride,
+    mirror_source_ids: Option<Vec<String>>,
+) -> Result<()> {
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.check_stop()?;
+    }
+    // Preparation includes SQL between the named breadcrumbs as well as
+    // inside them. Keep one scope until actual scan/rebuild work is admitted;
+    // that work retains the existing finish-current-batch stop contract.
+    let mut storage_cancellation_scope = opts
+        .progress
+        .as_ref()
+        .map(|progress| progress.storage_cancellation.enter());
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     if let Some(warning) = dotenvy::var("CASS_EXCLUDE_PATHS")
         .ok()
@@ -16290,6 +17119,29 @@ fn run_index_inner(
     } else {
         maintenance_job_kind_for_mode(initial_lock_mode)
     };
+    // Ordinary writers must own both the data dir and canonical archive
+    // before even an integrity probe can pin a snapshot. The narrow readonly
+    // force-rebuild path can consume an unwritable archive; it acquires the
+    // archive lease before any recovery write, its optional watermark write,
+    // or a writable preparation fallback for an empty archive.
+    let archive_admission = if should_try_readonly_canonical_force_rebuild(&opts) {
+        ArchiveAdmission::DataDirOnly
+    } else {
+        ArchiveAdmission::Writable
+    };
+    let mut index_run_lock = acquire_index_run_lock_with_archive_admission(
+        &opts.data_dir,
+        &opts.db_path,
+        initial_lock_mode,
+        job_kind,
+        archive_admission,
+    )?;
+    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
+        opts.data_dir.clone(),
+        index_run_lock_heartbeat_interval(),
+        Arc::clone(&index_run_lock.metadata_write_lock),
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
+    );
     // i6upe: refuse to rebuild ON TOP of a malformed canonical archive.
     // Every index mode reads the canonical DB (`--force-rebuild` performs a
     // READONLY authoritative rebuild from it), so indexing a corrupt archive
@@ -16312,18 +17164,6 @@ fn run_index_inner(
             opts.db_path.display()
         ));
     }
-    let mut index_run_lock = acquire_index_run_lock_with_job_kind(
-        &opts.data_dir,
-        &opts.db_path,
-        initial_lock_mode,
-        job_kind,
-    )?;
-    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
-        opts.data_dir.clone(),
-        index_run_lock_heartbeat_interval(),
-        Arc::clone(&index_run_lock.metadata_write_lock),
-        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
-    );
     // GH#324: reclaim staging debris stranded by previous hard-crashed runs
     // now that we hold the exclusive index-run lock, and BEFORE the
     // disk-headroom preflight below — otherwise a crash/restart loop's own
@@ -16399,6 +17239,12 @@ fn run_index_inner(
     });
     macro_rules! preflight_phase {
         ($phase:expr) => {{
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.check_stop()?;
+                if storage_cancellation_scope.is_none() {
+                    storage_cancellation_scope = Some(progress.storage_cancellation.enter());
+                }
+            }
             let phase_visible = preflight_breadcrumb_visible(initial_lock_mode, $phase);
             let timeout_enforced = initial_lock_mode == SearchMaintenanceMode::WatchStartup;
             if timeout_enforced {
@@ -16432,6 +17278,9 @@ fn run_index_inner(
     macro_rules! complete_preflight_phase {
         () => {{
             preflight_state.exit();
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.check_stop()?;
+            }
             bump_index_run_lock_progress_atomic(&progress_bump);
         }};
     }
@@ -16442,6 +17291,10 @@ fn run_index_inner(
     // These are not watch-startup steps, so the preflight watchdog ignores them.
     macro_rules! work_phase {
         ($phase:expr) => {{
+            drop(storage_cancellation_scope.take());
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.check_stop()?;
+            }
             if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
                 tracing::debug!(
                     phase = $phase,
@@ -16503,6 +17356,7 @@ fn run_index_inner(
                 preflight_phase!("watch_startup:fts_shadow_viability");
                 preflight_fts_shadow_before_lexical_readers(&opts.db_path)?;
                 complete_preflight_phase!();
+                work_phase!("lexical:rebuild");
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
@@ -16535,10 +17389,24 @@ fn run_index_inner(
             }
         }
     }
-    if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+    if try_readonly_canonical_force_rebuild(&opts, &progress_bump, |boundary| {
+        match boundary {
+            ReadonlyRebuildBoundary::Rebuild => work_phase!("lexical:rebuild"),
+            ReadonlyRebuildBoundary::ArchiveWrite => {
+                if let Some(progress) = opts.progress.as_ref() {
+                    progress.check_stop()?;
+                }
+                index_run_lock.acquire_archive_write_lease()?;
+            }
+        }
+        Ok(())
+    })? {
         return Ok(());
     }
 
+    // An empty canonical archive makes the readonly force-rebuild probe
+    // decline. Its writable fallback must not bypass cross-data-dir admission.
+    index_run_lock.acquire_archive_write_lease()?;
     preflight_phase!("watch_startup:open_storage");
     // GH #374: a full rebuild must classify an existing canonical archive on
     // a strictly read-only connection before `open_storage_for_index`. That
@@ -17454,6 +18322,7 @@ fn run_index_inner(
                         &index_path,
                         &opts.db_path.to_string_lossy(),
                         canonical_messages,
+                        opts.progress.as_deref(),
                     )?
                 } else {
                     canonical_messages
@@ -19014,6 +19883,19 @@ fn run_index_inner(
         // Clone detector for the callback
         let detector_clone = stale_detector.clone();
 
+        if watch_once_mode {
+            if opts.watch {
+                // Explicit paths still run once when combined with --watch.
+                // Preserve the already-published Watch mode while admitting
+                // the callback under its finish-current-batch contract.
+                drop(storage_cancellation_scope.take());
+                if let Some(progress) = opts.progress.as_ref() {
+                    progress.check_stop()?;
+                }
+            } else {
+                work_phase!("index:scan");
+            }
+        }
         let watch_result = watch_sources(
             opts.watch_once_paths.clone(),
             watch_roots.clone(),
@@ -19289,37 +20171,24 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
     // GH #382 / g3zyo: bounded. On an archive whose frankensqlite writable path
     // loops (the disowned-page reclaim sweep rescans the WAL per ledger page)
     // this checkpoint never returned, so every index run hung *after* a
-    // successful publish and every stale-on-read refresh died here. The publish
-    // is durable before this point and an un-truncated WAL costs the next
-    // opener a replay, never data — so a checkpoint that outlives its budget is
-    // reported and skipped rather than waited on forever.
+    // successful publish. The publish is durable before this point, but a
+    // still-running checkpoint cannot be left behind when writer ownership
+    // is released. The existing deadline now ends the process with exit 70;
+    // the next owner recovers the committed WAL normally.
     let timeout = final_wal_checkpoint_timeout();
-    let worker_context = context.to_string();
-    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), timeout, move |path| {
-        run_final_wal_checkpoint(path, &worker_context)
+    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), timeout, context, |path| {
+        run_final_wal_checkpoint(path, context)
     }) {
         AbortWalCheckpointAttempt::Finished(Ok(_outcome)) => Ok(()),
         AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!(
             "final WAL checkpoint after {context} failed: {error}"
         )),
-        AbortWalCheckpointAttempt::TimedOut => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                context,
-                timeout_secs = timeout.as_secs(),
-                "final WAL checkpoint exceeded its budget and was left for the next opener; \
-                 if this repeats on a large archive the writable open is looping on the WAL \
-                 (GH #382): back up the archive and its sidecars, then checkpoint it with \
-                 stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)"
-            );
-            Ok(())
-        }
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+        AbortWalCheckpointAttempt::DeadlineUnavailable(error) => {
             tracing::warn!(
                 db_path = %db_path.display(),
                 context,
                 %error,
-                "final WAL checkpoint worker was unavailable; the WAL is left for the next opener"
+                "final WAL checkpoint deadline timer was unavailable; the WAL is left for the next opener"
             );
             Ok(())
         }
@@ -19329,8 +20198,8 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
 /// Wall-clock budget for the index run's final `wal_checkpoint(TRUNCATE)`
 /// (GH #382 / g3zyo). `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS` overrides
 /// the 900 s default, which stays below the finalize stall abort (1800 s) so
-/// a looping checkpoint is skipped truthfully instead of turning into an
-/// exit-70 abort; `0` falls back to the default rather than disabling the bound.
+/// the checkpoint's own exit-70 deadline fires before the broader finalize
+/// watchdog; `0` falls back to the default rather than disabling the bound.
 fn final_wal_checkpoint_timeout() -> Duration {
     const DEFAULT_SECS: u64 = 900;
     let secs = dotenvy::var("CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS")
@@ -19377,49 +20246,46 @@ enum FinalWalCheckpointOutcome {
     },
 }
 
-/// Outcome of the separately supervised checkpoint attempted immediately
-/// before a watchdog-forced process exit.
+/// Outcome of a checkpoint with an owned terminal deadline. A timeout cannot
+/// return: doing so would release ownership with a database operation alive.
 #[derive(Debug)]
 enum AbortWalCheckpointAttempt {
     Finished(Result<FinalWalCheckpointOutcome, String>),
-    TimedOut,
-    WorkerUnavailable(String),
+    DeadlineUnavailable(String),
 }
 
 const ABORT_WAL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run the pre-abort checkpoint on a disposable worker and wait only for the
-/// supplied deadline. The watchdog is supervising a process whose indexer
-/// thread is already proven wedged; running another database open/checkpoint
-/// synchronously on the watchdog thread can block behind that same owner and
-/// defeat the promised bounded exit.
+/// Keep checkpoint open, SQL and close on the caller thread. An owned timer
+/// preserves the existing deadline, including for a constructor that does not
+/// expose operation cancellation. Timeout is terminal for this process; the
+/// helper never returns while a detached writer could outlive its caller's
+/// leases. This also protects nonterminal streaming-cancellation callers.
 fn run_bounded_abort_wal_checkpoint<F>(
     db_path: PathBuf,
     timeout: Duration,
+    context: &str,
     checkpoint: F,
 ) -> AbortWalCheckpointAttempt
 where
-    F: FnOnce(&Path) -> Result<FinalWalCheckpointOutcome> + Send + 'static,
+    F: FnOnce(&Path) -> Result<FinalWalCheckpointOutcome>,
 {
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let _worker = match std::thread::Builder::new()
-        .name("cass-abort-wal-checkpoint".to_string())
-        .spawn(move || {
-            let result = checkpoint(&db_path).map_err(|err| format!("{err:#}"));
-            let _ = result_tx.send(result);
-        }) {
-        Ok(worker) => worker,
-        Err(err) => return AbortWalCheckpointAttempt::WorkerUnavailable(err.to_string()),
-    };
-
-    match result_rx.recv_timeout(timeout) {
+    let diagnostic = serde_json::json!({
+        "success": false,
+        "code": 70,
+        "kind": "wal-checkpoint-timeout",
+        "retryable": true,
+        "db_path": db_path,
+        "context": context,
+        "deadline_ms": timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+        "message": "WAL checkpoint exceeded its deadline; terminating the process before releasing archive ownership. Committed rows remain in the database/WAL for the next run to recover.",
+    })
+    .to_string();
+    match checkpoint_deadline::run(timeout, diagnostic, || {
+        checkpoint(&db_path).map_err(|error| format!("{error:#}"))
+    }) {
         Ok(result) => AbortWalCheckpointAttempt::Finished(result),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => AbortWalCheckpointAttempt::TimedOut,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            AbortWalCheckpointAttempt::WorkerUnavailable(
-                "checkpoint worker exited without reporting an outcome".to_string(),
-            )
-        }
+        Err(error) => AbortWalCheckpointAttempt::DeadlineUnavailable(error.to_string()),
     }
 }
 
@@ -19454,14 +20320,14 @@ fn classify_final_wal_checkpoint(
 /// skips destructors — so the canonical WAL is never checkpointed and a killed
 /// run leaves a multi-GB orphaned `*.db-wal` behind a tiny `*.db` (the #296
 /// symptom). This opens a *fresh, independent* frankensqlite connection to the
-/// canonical DB file (the wedged storage handle's workers are parked, but the
-/// file itself is checkpointable through a new connection) and runs
+/// canonical DB file and runs
 /// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
-/// SQLite. The fresh checkpoint itself is supervised from a disposable thread
-/// and gets only [`ABORT_WAL_CHECKPOINT_TIMEOUT`]: the still-live wedged writer
+/// SQLite. The fresh checkpoint stays on this calling thread and gets only
+/// [`ABORT_WAL_CHECKPOINT_TIMEOUT`]: the still-live wedged writer
 /// can otherwise block the fresh open/checkpoint indefinitely and turn the
-/// watchdog's promised exit into another hang. Everything is best-effort; a
-/// failure or timeout is logged and swallowed so the abort still proceeds.
+/// watchdog's promised exit into another hang. Ordinary errors remain
+/// best-effort; timeout terminates the whole process rather than returning
+/// with an independent archive writer still alive.
 /// Stale index-run locks are already reaped on the next startup by
 /// `read_search_maintenance_snapshot` (flock-based), so this focuses on the
 /// WAL.
@@ -19484,6 +20350,7 @@ fn best_effort_abort_wal_checkpoint_for_db(db_path: &Path) {
     match run_bounded_abort_wal_checkpoint(
         db_path.to_path_buf(),
         ABORT_WAL_CHECKPOINT_TIMEOUT,
+        "stall abort",
         |path| run_final_wal_checkpoint(path, "stall abort"),
     ) {
         AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed)) => {
@@ -19515,18 +20382,11 @@ fn best_effort_abort_wal_checkpoint_for_db(db_path: &Path) {
                 "best-effort WAL checkpoint before stall abort failed; the WAL may remain uncheckpointed until the next clean run"
             );
         }
-        AbortWalCheckpointAttempt::TimedOut => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                timeout_ms = ABORT_WAL_CHECKPOINT_TIMEOUT.as_millis(),
-                "best-effort WAL checkpoint before stall abort exceeded its deadline; proceeding with the bounded exit and preserving the WAL for recovery"
-            );
-        }
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+        AbortWalCheckpointAttempt::DeadlineUnavailable(error) => {
             tracing::warn!(
                 db_path = %db_path.display(),
                 %error,
-                "best-effort WAL checkpoint worker was unavailable before stall abort; proceeding with the bounded exit"
+                "best-effort WAL checkpoint deadline timer was unavailable; leaving the WAL for the next opener"
             );
         }
     }
@@ -19547,33 +20407,29 @@ pub(crate) const CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV: &str = "CASS_TEST_WAL_CHE
 /// [`checkpoint_wal_truncate`] with a wall-clock deadline (GH #382, bead
 /// g3zyo). On the owner-scale archive with a 200 MB WAL, frankensqlite's
 /// writable open never returns, which turned `cass doctor --fix` into an
-/// infinite hang. The checkpoint runs on the same disposable worker as the
-/// stall-abort checkpoint; if it has not finished by `deadline`, the caller
-/// gets an error that names the shape and the out-of-band remedy instead of
-/// waiting forever. The worker is left to finish or die with the process — it
-/// cannot be cancelled, and the callers are short-lived CLI commands.
+/// infinite hang. The checkpoint stays on the caller thread, under its own
+/// canonical archive lease. If it exceeds `deadline`, exit 70 preserves the
+/// ownership boundary; returning a report while a detached writer remained
+/// alive would let another maintenance command enter the same archive.
 pub(crate) fn checkpoint_wal_truncate_with_deadline(
     db_path: &Path,
     context: &str,
     deadline: Duration,
 ) -> Result<bool> {
-    let worker_context = context.to_string();
-    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), deadline, move |path| {
-        run_final_wal_checkpoint(path, &worker_context)
+    // The doctor caller owns its separate repair lock, but that does not
+    // serialize against a writer using another data directory. Admission must
+    // be nonblocking here: an index owner may itself be awaiting that doctor
+    // lock, so waiting for its archive lease would invert the lock order.
+    let _archive_write_lease = acquire_archive_write_lease(db_path)?;
+    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), deadline, context, |path| {
+        run_final_wal_checkpoint(path, context)
     }) {
         AbortWalCheckpointAttempt::Finished(Ok(outcome)) => {
             Ok(matches!(outcome, FinalWalCheckpointOutcome::Completed))
         }
         AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!("{error}")),
-        AbortWalCheckpointAttempt::TimedOut => Err(anyhow::anyhow!(
-            "WAL checkpoint did not complete within {} s; on a large archive this means the \
-             writable open is looping on the WAL (GH #382): back up {} and its -wal/-shm \
-             sidecars, then checkpoint with stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)",
-            deadline.as_secs(),
-            db_path.display()
-        )),
-        AbortWalCheckpointAttempt::WorkerUnavailable(error) => Err(anyhow::anyhow!(
-            "WAL checkpoint worker was unavailable after {context}: {error}"
+        AbortWalCheckpointAttempt::DeadlineUnavailable(error) => Err(anyhow::anyhow!(
+            "WAL checkpoint deadline timer was unavailable after {context}: {error}"
         )),
     }
 }
@@ -21904,23 +22760,36 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     // while another process locks a freshly created file at the same path,
     // yielding two concurrent exclusive "holders". Keeping the file
     // immortal once created is what makes the flock sound; instead we avoid
-    // creating it when the repair cannot possibly proceed. Opening the DB
-    // read-only without the lock is already done by every observation path
-    // (search itself, `read_search_maintenance_snapshot`, status/health).
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    // creating it when the repair cannot possibly proceed. The initial probe
+    // is strictly read-only; a recognized recovery-required state must acquire
+    // and retain both writer leases before using a recovery-capable reader.
+    let mut recovery_guard = None;
+    let probed_storage = open_readonly_rebuild_storage(db_path, || {
+        recovery_guard = Some(acquire_search_maintenance_mutation_lock(
+            data_dir,
+            db_path,
+            SearchMaintenanceJobKind::LexicalRefresh,
+        )?);
+        Ok(())
+    })
+    .with_context(|| {
         format!(
             "opening database to repair lexical index for search: {}",
             db_path.display()
         )
     })?;
 
-    let index_run_lock = acquire_index_run_lock(data_dir, db_path, SearchMaintenanceMode::Index)?;
-    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
-        data_dir.to_path_buf(),
-        index_run_lock_heartbeat_interval(),
-        Arc::clone(&index_run_lock.metadata_write_lock),
-        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
-    );
+    let index_run_lock = match recovery_guard {
+        Some(guard) => guard,
+        None => acquire_search_asset_mutation_lock(
+            data_dir,
+            db_path,
+            SearchMaintenanceJobKind::LexicalRefresh,
+        )?,
+    };
+    // Declare the reader after the combined guard so every error path closes
+    // storage before joining the heartbeat and releasing either lease.
+    let storage = probed_storage;
     // GH#324: this repair path also stages under the index root; sweep
     // debris from previous crashed runs while we hold the exclusive lock.
     staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
@@ -21974,7 +22843,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         data_dir,
         total_conversations,
         progress,
-        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
+        index_run_lock.progress_atomic(),
     )?;
     Ok(SearchLexicalRepairOutcome {
         indexed_docs: rebuild.indexed_docs,
@@ -22730,7 +23599,9 @@ fn spawn_lexical_rebuild_packet_producer(
                 let _ = tx.send(LexicalRebuildPipelineMessage::Error(format!("{error:#}")));
             };
 
-            let mut storage = match FrankenStorage::open_readonly(&db_path) {
+            // Preparation owns any recovery writes. Worker readers cannot
+            // acquire an independent recovery writer during a readonly build.
+            let mut storage = match FrankenStorage::open_strict_readonly(&db_path) {
                 Ok(storage) => storage,
                 Err(err) => {
                     send_error(err.context(format!(
@@ -23472,7 +24343,8 @@ fn lexical_post_run_maintenance_skipped_for_test() -> bool {
 /// (`CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS`, default 1), write a
 /// sentinel describing the authority/checkpoint gap the commit just opened
 /// and park so the test can SIGKILL the run inside that window. Unset in
-/// production: an absent sentinel path returns immediately.
+/// production: an absent sentinel path returns immediately. A release path
+/// lets process tests resume the real commit without a timing-dependent sleep.
 fn maybe_pause_lexical_rebuild_after_commit_for_kill(
     state_path: &Path,
     checkpoint_indexed_docs: usize,
@@ -23513,7 +24385,24 @@ fn maybe_pause_lexical_rebuild_after_commit_for_kill(
             sentinel_path.display()
         )
     })?;
-    thread::sleep(Duration::from_millis(sleep_ms));
+    if let Some(release_path) = dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_RELEASE")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+    {
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_millis(sleep_ms);
+        while !release_path.exists() {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                anyhow::bail!(
+                    "lexical rebuild commit rendezvous was not released within {sleep_ms} ms"
+                );
+            };
+            thread::park_timeout(remaining.min(Duration::from_millis(10)));
+        }
+    } else {
+        thread::sleep(Duration::from_millis(sleep_ms));
+    }
     Ok(())
 }
 
@@ -25530,6 +26419,42 @@ fn rebuild_tantivy_from_db_with_options(
     options: LexicalRebuildStartupOptions,
     progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
+    match rebuild_tantivy_from_db_once(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress.clone(),
+        options,
+        progress_bump.clone(),
+    ) {
+        // GH #494: the retained candidate's checkpoint now starts at zero, so
+        // this pass is not resumed and cannot be retried again.
+        Err(error)
+            if error
+                .downcast_ref::<ResumedLexicalCandidateRetained>()
+                .is_some() =>
+        {
+            rebuild_tantivy_from_db_once(
+                db_path,
+                data_dir,
+                total_conversations,
+                progress,
+                options,
+                progress_bump,
+            )
+        }
+        outcome => outcome,
+    }
+}
+
+fn rebuild_tantivy_from_db_once(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    options: LexicalRebuildStartupOptions,
+    progress_bump: Option<Arc<AtomicI64>>,
+) -> Result<LexicalRebuildOutcome> {
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let prep_started = Instant::now();
     let mut prep_step_started = Instant::now();
@@ -25560,7 +26485,7 @@ fn rebuild_tantivy_from_db_with_options(
         *step_started = Instant::now();
     };
 
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
         format!(
             "opening database for Tantivy rebuild: {}",
             db_path.display()
@@ -25825,6 +26750,19 @@ fn rebuild_tantivy_from_db_with_options(
                 u128::from(live_docs) >= rebuild_state.indexed_docs as u128,
                 "resumed lexical candidate contains {live_docs} documents, but its checkpoint \
                  requires {} committed documents",
+                rebuild_state.indexed_docs
+            );
+            // A surplus is reconciled only by replaying the identities behind
+            // it through the #440 upsert window. With the cursor at EOF nothing
+            // is replayed, so the candidate keeps the surplus and the finalize
+            // count check (GH #457) refuses it; a refused finalize leaves this
+            // same EOF checkpoint, so every later run would repeat the refusal.
+            anyhow::ensure!(
+                rebuild_state.processed_conversations < total_conversations
+                    || u128::from(live_docs) == rebuild_state.indexed_docs as u128,
+                "resumed lexical candidate contains {live_docs} documents, more than the {} its \
+                 checkpoint counted, and the checkpoint is at the end of the archive, so no \
+                 replay can reconcile the difference",
                 rebuild_state.indexed_docs
             );
             Ok(())
@@ -26810,10 +27748,27 @@ fn rebuild_tantivy_from_db_with_options(
     })?;
     // Refuse an unreadable/hollow candidate before it can replace a usable
     // live generation. Reopen and validate the actual live path again after swap.
-    publication.run("validate_candidate", || {
+    if let Err(refusal) = publication.run("validate_candidate", || {
         crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
         verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
-    })?;
+    }) {
+        // GH #494: only a resumed staged candidate whose count disagrees is
+        // rebuilt. A from-zero build that miscounts is a defect to report, and
+        // a candidate building in the live tree is never moved aside.
+        if resumed_from_checkpoint
+            && staged_build_path.is_some()
+            && refusal.downcast_ref::<LexicalDocCountMismatch>().is_some()
+        {
+            return Err(retain_uncertifiable_resumed_candidate(
+                &index_path,
+                &build_path,
+                &rebuild_state,
+                &db_state,
+                refusal,
+            ));
+        }
+        return Err(refusal);
+    }
 
     // GH #440: indexed_docs omits hard-noise messages from the committed
     // prefix, so prefix docs + newly streamed rows is not an exact canonical
@@ -27593,13 +28548,16 @@ fn ingest_watch_batch_with_oom_split_inner(
     };
 
     match batch_result {
-        Ok(batch_outcome) => Ok(WatchIngestBatchOutcome {
-            batch_outcome,
-            processed_conversations: convs.len(),
-            quarantined_conversations: 0,
-            deferred_conversations: 0,
-            max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
-        }),
+        Ok(batch_outcome) => {
+            clear_watch_nomem_deferrals(data_dir, convs);
+            Ok(WatchIngestBatchOutcome {
+                batch_outcome,
+                processed_conversations: convs.len(),
+                quarantined_conversations: 0,
+                deferred_conversations: 0,
+                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+            })
+        }
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
             let split_at = convs.len() / 2;
             tracing::warn!(
@@ -27723,15 +28681,40 @@ fn ingest_watch_batch_with_oom_split_inner(
                         None => !small_conversation,
                     };
                     if !should_quarantine {
-                        tracing::warn!(
-                            agent = %conv.agent_slug,
-                            external_id = conv.external_id.as_deref().unwrap_or(""),
-                            source_path = %conv.source_path.display(),
+                        // GH#510: back off instead of replaying this on every
+                        // tick, and warn only on the 1st, 2nd, 4th, 8th, ...
+                        // deferral rather than once per tick.
+                        let deferral = record_watch_nomem_deferral(
+                            data_dir,
+                            conv,
                             indexed_text_bytes,
-                            real_memory_pressure = ?real_pressure,
-                            error = %solo_error,
-                            "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
+                            FrankenStorage::now_millis(),
                         );
+                        let retry_in_secs = deferral
+                            .next_retry_at_ms
+                            .saturating_sub(deferral.last_deferred_at_ms)
+                            / 1_000;
+                        if deferral.deferrals.is_power_of_two() {
+                            tracing::warn!(
+                                agent = %conv.agent_slug,
+                                external_id = conv.external_id.as_deref().unwrap_or(""),
+                                source_path = %conv.source_path.display(),
+                                indexed_text_bytes,
+                                real_memory_pressure = ?real_pressure,
+                                deferrals = deferral.deferrals,
+                                retry_in_secs,
+                                error = %solo_error,
+                                "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) with backoff (#298, GH#510). An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger; `cass quarantine list --json` lists deferred conversations"
+                            );
+                        } else {
+                            tracing::debug!(
+                                agent = %conv.agent_slug,
+                                source_path = %conv.source_path.display(),
+                                deferrals = deferral.deferrals,
+                                retry_in_secs,
+                                "watch conversation deferred again after bounded-allocation NoMem (GH#510)"
+                            );
+                        }
                         if let Some(progress) = progress {
                             progress.current.fetch_add(1, Ordering::Relaxed);
                         }
@@ -27906,6 +28889,155 @@ fn watch_oom_real_pressure_reserve_bytes() -> u64 {
 fn watch_oom_under_real_memory_pressure() -> Option<bool> {
     let available = responsiveness::available_memory_bytes()?;
     Some(available <= watch_oom_real_pressure_reserve_bytes())
+}
+
+/// GH#510: a bounded-guard NoMem that recurs deterministically is deferred,
+/// never quarantined (#298/#364). The deferral holds the watch watermark, so
+/// without a ledger every tick replays the batch split, the solo retry and the
+/// deferral forever. The ledger records each deferral and the next time the
+/// conversation may be attempted again.
+pub(crate) const WATCH_NOMEM_DEFERRALS_FILE: &str = "watch_nomem_deferrals.json";
+const WATCH_NOMEM_DEFERRAL_BASE_BACKOFF_MS: i64 = 60_000;
+const WATCH_NOMEM_DEFERRAL_MAX_BACKOFF_MS: i64 = 3_600_000;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WatchNomemDeferrals {
+    #[serde(default)]
+    pub(crate) entries: BTreeMap<String, WatchNomemDeferral>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WatchNomemDeferral {
+    pub(crate) agent: String,
+    pub(crate) source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_id: Option<String>,
+    pub(crate) deferrals: u32,
+    pub(crate) first_deferred_at_ms: i64,
+    pub(crate) last_deferred_at_ms: i64,
+    pub(crate) next_retry_at_ms: i64,
+    pub(crate) indexed_text_bytes: usize,
+}
+
+impl WatchNomemDeferrals {
+    pub(crate) fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join("quarantine").join(WATCH_NOMEM_DEFERRALS_FILE)
+    }
+
+    /// A missing or unreadable ledger is empty: losing it costs one more
+    /// attempt per conversation, never a conversation.
+    pub(crate) fn load(data_dir: &Path) -> Self {
+        fs::read(Self::path(data_dir))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, data_dir: &Path) {
+        let path = Self::path(data_dir);
+        if let Err(error) = write_json_pretty_atomically(&path, self) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to persist the watch NoMem deferral ledger; deferred conversations retry on the next tick"
+            );
+        }
+    }
+}
+
+fn watch_nomem_deferral_key(conv: &NormalizedConversation) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        conv.agent_slug,
+        conv.source_path.display(),
+        conv.external_id.as_deref().unwrap_or("")
+    )
+}
+
+/// 1 min after the first deferral, doubling up to 1 h.
+fn watch_nomem_deferral_backoff_ms(deferrals: u32) -> i64 {
+    let doublings = deferrals.saturating_sub(1).min(16);
+    WATCH_NOMEM_DEFERRAL_BASE_BACKOFF_MS
+        .saturating_mul(1_i64 << doublings)
+        .min(WATCH_NOMEM_DEFERRAL_MAX_BACKOFF_MS)
+}
+
+/// Count one more deferral of `conv` and schedule its next attempt.
+fn record_watch_nomem_deferral(
+    data_dir: &Path,
+    conv: &NormalizedConversation,
+    indexed_text_bytes: usize,
+    now_ms: i64,
+) -> WatchNomemDeferral {
+    let mut ledger = WatchNomemDeferrals::load(data_dir);
+    let entry = ledger
+        .entries
+        .entry(watch_nomem_deferral_key(conv))
+        .or_insert_with(|| WatchNomemDeferral {
+            agent: conv.agent_slug.clone(),
+            source_path: conv.source_path.display().to_string(),
+            external_id: conv.external_id.clone(),
+            deferrals: 0,
+            first_deferred_at_ms: now_ms,
+            last_deferred_at_ms: now_ms,
+            next_retry_at_ms: now_ms,
+            indexed_text_bytes,
+        });
+    entry.deferrals = entry.deferrals.saturating_add(1);
+    entry.last_deferred_at_ms = now_ms;
+    entry.indexed_text_bytes = indexed_text_bytes;
+    entry.next_retry_at_ms =
+        now_ms.saturating_add(watch_nomem_deferral_backoff_ms(entry.deferrals));
+    let recorded = entry.clone();
+    ledger.save(data_dir);
+    recorded
+}
+
+/// Forget deferrals for conversations that just ingested.
+fn clear_watch_nomem_deferrals(data_dir: &Path, convs: &[NormalizedConversation]) {
+    if !WatchNomemDeferrals::path(data_dir).exists() {
+        return;
+    }
+    let mut ledger = WatchNomemDeferrals::load(data_dir);
+    let before = ledger.entries.len();
+    for conv in convs {
+        ledger.entries.remove(&watch_nomem_deferral_key(conv));
+    }
+    if ledger.entries.len() != before {
+        ledger.save(data_dir);
+    }
+}
+
+/// Hold back conversations still inside their deferral backoff and return
+/// how many were held. The caller counts them as deferred, so the watch
+/// watermark stays where it is and they are scanned again later.
+fn retain_watch_conversations_past_nomem_backoff(
+    data_dir: &Path,
+    convs: &mut Vec<NormalizedConversation>,
+    now_ms: i64,
+) -> usize {
+    if !WatchNomemDeferrals::path(data_dir).exists() {
+        return 0;
+    }
+    let ledger = WatchNomemDeferrals::load(data_dir);
+    if ledger.entries.is_empty() {
+        return 0;
+    }
+    let before = convs.len();
+    convs.retain(|conv| {
+        ledger
+            .entries
+            .get(&watch_nomem_deferral_key(conv))
+            .is_none_or(|entry| entry.next_retry_at_ms <= now_ms)
+    });
+    let held = before - convs.len();
+    if held > 0 {
+        tracing::debug!(
+            held,
+            "watch conversations are waiting out their NoMem deferral backoff (GH#510)"
+        );
+    }
+    held
 }
 
 fn error_message_is_exact_out_of_memory(message: &str) -> bool {
@@ -28733,6 +29865,9 @@ pub struct ConversationIngestQuarantineSummary {
     pub schema_version: i64,
     pub status: String,
     pub quarantined_conversations: usize,
+    /// Conversations the watcher keeps deferring after a bounded-guard NoMem
+    /// (GH#510): never quarantined, but missing from search until one ingests.
+    pub deferred_conversations: usize,
     pub recent_quarantined_conversations: usize,
     pub recent_window_seconds: i64,
     pub circuit_breaker_limit: usize,
@@ -28839,6 +29974,9 @@ pub fn conversation_ingest_quarantine_summary(
     let recent_quarantined_conversations = recent_keys.len();
     let circuit_breaker_active =
         circuit_breaker_limit > 0 && recent_quarantined_conversations >= circuit_breaker_limit;
+    // GH#510: deferred conversations are counted but leave `status` alone;
+    // they are retried on a backoff and are not a quarantine.
+    let deferred_conversations = WatchNomemDeferrals::load(data_dir).entries.len();
     ConversationIngestQuarantineSummary {
         schema_version: POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
         status: if circuit_breaker_active {
@@ -28849,6 +29987,7 @@ pub fn conversation_ingest_quarantine_summary(
             "ok".to_string()
         },
         quarantined_conversations,
+        deferred_conversations,
         recent_quarantined_conversations,
         recent_window_seconds,
         circuit_breaker_limit,
@@ -28860,10 +29999,16 @@ pub fn conversation_ingest_quarantine_summary(
                 "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
                     .to_string(),
             )
+        } else if quarantined_conversations > 0 {
+            Some(
+                "Run `cass quarantine list --json` to see which conversations are excluded and whether `cass quarantine retry` can re-ingest them."
+                    .to_string(),
+            )
         } else {
-            (quarantined_conversations > 0).then(|| {
-                "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
-                    .to_string()
+            (deferred_conversations > 0).then(|| {
+                format!(
+                    "{deferred_conversations} conversation(s) are deferred by the watcher after repeated bounded-allocation NoMem and are missing from search until they ingest; `cass quarantine list --json` lists them. An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger."
+                )
             })
         },
     }
@@ -28873,7 +30018,7 @@ pub fn conversation_ingest_quarantine_summary(
 /// gone (so a retry could never succeed). The poison JSONL records carry the
 /// `source_path`; if a record has a path that no longer exists, that
 /// conversation is source-missing.
-fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
+pub(crate) fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
     let quarantine_dir = data_dir.join("quarantine");
     let mut missing = BTreeSet::new();
     for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
@@ -29157,7 +30302,20 @@ pub(crate) struct SearchMaintenanceMutationGuard {
 }
 
 impl SearchMaintenanceMutationGuard {
-    fn mark_progress(&self) {
+    fn new(data_dir: &Path, lock: IndexRunLockGuard) -> Self {
+        let heartbeat = IndexRunLockHeartbeat::start(
+            data_dir.to_path_buf(),
+            index_run_lock_heartbeat_interval(),
+            Arc::clone(&lock.metadata_write_lock),
+            Arc::clone(&lock.last_progress_at_ms_atomic),
+        );
+        Self {
+            _heartbeat: heartbeat,
+            lock,
+        }
+    }
+
+    pub(crate) fn mark_progress(&self) {
         bump_index_run_lock_progress_atomic(&self.lock.last_progress_at_ms_atomic);
     }
 
@@ -29189,6 +30347,20 @@ pub(crate) fn acquire_semantic_backfill_lock(
     )
 }
 
+/// Try to admit a daemon embedding job through the same writer ownership as
+/// standalone indexing. A busy archive leaves the queued job intact; all
+/// other failures retain their original error and context.
+pub(crate) fn try_acquire_semantic_backfill_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<Option<SearchMaintenanceMutationGuard>> {
+    match acquire_semantic_backfill_lock(data_dir, db_path) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(error) if error.downcast_ref::<IndexRunBusy>().is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn acquire_search_maintenance_mutation_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -29200,16 +30372,26 @@ pub(crate) fn acquire_search_maintenance_mutation_lock(
         SearchMaintenanceMode::Index,
         job_kind,
     )?;
-    let heartbeat = IndexRunLockHeartbeat::start(
-        data_dir.to_path_buf(),
-        index_run_lock_heartbeat_interval(),
-        Arc::clone(&lock.metadata_write_lock),
-        Arc::clone(&lock.last_progress_at_ms_atomic),
-    );
-    Ok(SearchMaintenanceMutationGuard {
-        _heartbeat: heartbeat,
-        lock,
-    })
+    Ok(SearchMaintenanceMutationGuard::new(data_dir, lock))
+}
+
+/// Admit maintenance that only changes data-dir assets, such as HNSW output
+/// or quarantine metadata. Callers must not open canonical storage through a
+/// recovery-capable reader or a writer while holding only this guard. Keeping
+/// this narrow path allows derived-asset work with an unwritable archive.
+pub(crate) fn acquire_search_asset_mutation_lock(
+    data_dir: &Path,
+    db_path: &Path,
+    job_kind: SearchMaintenanceJobKind,
+) -> Result<SearchMaintenanceMutationGuard> {
+    let lock = acquire_index_run_lock_with_archive_admission(
+        data_dir,
+        db_path,
+        SearchMaintenanceMode::Index,
+        job_kind,
+        ArchiveAdmission::DataDirOnly,
+    )?;
+    Ok(SearchMaintenanceMutationGuard::new(data_dir, lock))
 }
 
 /// Operator-facing bounded quarantine retry (#292 ask #3, `cass quarantine
@@ -29396,11 +30578,25 @@ fn should_force_watch_solo_retry_oom() -> bool {
     false
 }
 
+// Test-only ingest OOM injection. These are thread-local, not process env
+// vars: libtest runs every test on its own thread while others run beside it,
+// and `#[serial]` only orders tests that are themselves `#[serial]`. An env
+// var set by one test injected OOMs into unrelated ingests running at the same
+// time, which then inserted nothing (bead xicw9). Non-watch and incremental
+// ingest run on the thread that called them, so a fault set here reaches
+// exactly the calling test's ingest and nobody else's.
+#[cfg(test)]
+std::thread_local! {
+    static NON_WATCH_INGEST_TEST_OOM_MIN_CONVS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static INCREMENTAL_LEXICAL_UPDATE_TEST_OOM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 fn should_inject_non_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
-    dotenvy::var("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+    NON_WATCH_INGEST_TEST_OOM_MIN_CONVS
+        .with(std::cell::Cell::get)
         .is_some_and(|min| min > 0 && convs.len() >= min)
 }
 
@@ -29584,6 +30780,7 @@ impl ConnectorKind {
             "crush" => Some(Self::Crush),
             "hermes" => Some(Self::Hermes),
             "codebuff" => Some(Self::Codebuff),
+            "pi_durable" => Some(Self::PiDurable),
             _ => None,
         }
     }
@@ -29622,6 +30819,7 @@ impl ConnectorKind {
             Self::Crush => "crush",
             Self::Hermes => "hermes",
             Self::Codebuff => "codebuff",
+            Self::PiDurable => "pi_durable",
         }
     }
 
@@ -29660,7 +30858,8 @@ impl ConnectorKind {
             Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
-            Self::Codebuff => Box::new(franken_agent_detection::CodebuffConnector::new()),
+            Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
+            Self::PiDurable => Box::new(franken_agent_detection::PiDurableConnector::new()),
         }
     }
 }
@@ -29862,6 +31061,65 @@ fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
         && root.path.is_file()
 }
 
+/// FSEvents (macOS) reports a write through a file descriptor that stays open
+/// only when that descriptor closes, and SQLite keeps a provider's `-wal` open
+/// for the life of its connection, so a running Devin or Shelley's WAL-only
+/// commits never arrive as events there (s1nqh). Poll each database root's
+/// directory at the watch interval as well, queueing only the database and its
+/// sidecars. The native watcher stays authoritative: a poll error is logged,
+/// never escalated to a full-root rescan.
+fn database_root_poller(
+    roots: &[(ConnectorKind, ScanRoot)],
+    interval: Duration,
+    backlog: Arc<Mutex<WatchEventBacklog>>,
+    rescan: Arc<AtomicBool>,
+    wake: Sender<()>,
+) -> Option<notify::PollWatcher> {
+    let databases: Vec<&Path> = roots
+        .iter()
+        .filter(|(kind, root)| is_database_watch_root(*kind, root))
+        .map(|(_, root)| root.path.as_path())
+        .collect();
+    if databases.is_empty() {
+        return None;
+    }
+    let files: HashSet<PathBuf> = databases
+        .iter()
+        .flat_map(|database| {
+            let [wal, shm] = database_sidecar_paths(database);
+            [database.to_path_buf(), wal, shm]
+        })
+        .collect();
+    let directories: BTreeSet<&Path> = databases
+        .iter()
+        .map(|database| database.parent().unwrap_or(database))
+        .collect();
+    let mut poller = match notify::PollWatcher::new(
+        move |result: notify::Result<notify::Event>| match result {
+            Ok(mut event) => {
+                event.paths.retain(|path| files.contains(path));
+                enqueue_watch_notification(Ok(event), &backlog, &rescan, &wake);
+            }
+            Err(error) => tracing::debug!(%error, "database root poll failed"),
+        },
+        notify::Config::default().with_poll_interval(interval),
+    ) {
+        Ok(poller) => poller,
+        Err(error) => {
+            tracing::warn!(%error, "failed to start polling database roots");
+            return None;
+        }
+    };
+    for directory in directories {
+        if let Err(error) = poller.watch(directory, RecursiveMode::NonRecursive) {
+            tracing::warn!("failed to poll {}: {}", directory.display(), error);
+        } else {
+            tracing::info!("polling {} for database commits", directory.display());
+        }
+    }
+    Some(poller)
+}
+
 fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
     if matches!(kind, ConnectorKind::Devin | ConnectorKind::Shelley) {
         // Database providers filter by activity time, which can precede
@@ -29902,6 +31160,13 @@ where
     let notification_rescan = Arc::new(AtomicBool::new(false));
     let backlog_for_watcher = Arc::clone(&notification_backlog);
     let rescan_for_watcher = Arc::clone(&notification_rescan);
+    let _database_poller = database_root_poller(
+        &roots,
+        Duration::from_secs(watch_interval_secs.max(1)),
+        Arc::clone(&notification_backlog),
+        Arc::clone(&notification_rescan),
+        wake.clone(),
+    );
 
     let mut watcher = recommended_watcher(move |result| {
         enqueue_watch_notification(result, &backlog_for_watcher, &rescan_for_watcher, &wake);
@@ -30198,6 +31463,7 @@ fn reindex_paths_with_semantic_delta(
     }
 
     let mut total_indexed = 0usize;
+    let mut first_source_scan_error = None;
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
@@ -30307,20 +31573,52 @@ fn reindex_paths_with_semantic_delta(
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
-        let mut convs = match conn.scan(&ctx) {
-            Ok(c) => c,
-            Err(e) => {
-                ingest_diagnostics.observe_connector_scan_error(&root.path, &e);
-                tracing::debug!(
-                    "watch scan failed for {:?} at {}: {}",
-                    kind,
-                    root.path.display(),
-                    e
+        let mut convs = Vec::new();
+        let scan_error = match conn.scan_with_callback(&ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        }) {
+            Ok(()) => None,
+            Err(error) => {
+                ingest_diagnostics.observe_connector_scan_error(&root.path, &error);
+                let message = format!("{error:#}");
+                tracing::warn!(
+                    ?kind,
+                    scan_root = %root.path.display(),
+                    "watch scan failed: {message}"
                 );
-                Vec::new()
+                first_source_scan_error.get_or_insert(error);
+                Some(message)
             }
         };
         let scan_ms = scan_start.elapsed().as_millis() as u64;
+        // Publish the source error before persistence can fail for a separate
+        // reason, including the all-bad case that has no ingest phase below.
+        let failed_stats_index = if let Some(error) = &scan_error
+            && let Some(progress) = &opts.progress
+            && let Ok(mut stats) = progress.stats.lock()
+        {
+            stats.scan_had_errors = true;
+            stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+            let index = stats.connectors.len();
+            stats.connectors.push(ConnectorStats {
+                name: kind.slug().to_string(),
+                conversations: 0,
+                messages: 0,
+                scan_ms,
+                error: Some(error.clone()),
+            });
+            if !stats
+                .agents_discovered
+                .iter()
+                .any(|name| name == kind.slug())
+            {
+                stats.agents_discovered.push(kind.slug().to_string());
+            }
+            Some(index)
+        } else {
+            None
+        };
 
         let pre_active_filter_count = convs.len();
         convs.retain(|conv| {
@@ -30341,9 +31639,12 @@ fn reindex_paths_with_semantic_delta(
         }
         let preserve_this_watch_watermark = preserve_watch_watermark
             || preparse_active_source_skipped
-            || active_sources_skipped > 0;
+            || active_sources_skipped > 0
+            || scan_error.is_some();
 
-        convs.retain(|conv| !should_skip_subagent(conv));
+        convs.retain(|conv| {
+            !should_skip_subagent(conv) && !should_skip_excluded_source(&conv.source_path)
+        });
 
         for conversation in &mut convs {
             ingest_diagnostics.observe_conversation(conversation);
@@ -30360,9 +31661,25 @@ fn reindex_paths_with_semantic_delta(
                 conv,
             );
         }
-        if !explicit_watch_once {
-            sort_watch_conversations_for_watermark(&mut convs);
-        }
+        // Watermark order for live watch; a total order (watermark, path,
+        // external id) for every batch, so canonical ids never depend on the
+        // filesystem's directory order (connectors walk unsorted).
+        sort_watch_conversations_for_watermark(&mut convs);
+
+        // GH#510: a conversation whose bounded-guard NoMem keeps recurring
+        // waits out its deferral backoff instead of re-running the split, solo
+        // retry and deferral on every tick. It counts as deferred so the
+        // watermark stays held for it. An explicit --watch-once is an
+        // operator's retry and is never held back.
+        let nomem_backoff_held = if explicit_watch_once {
+            0
+        } else {
+            retain_watch_conversations_past_nomem_backoff(
+                &opts.data_dir,
+                &mut convs,
+                FrankenStorage::now_millis(),
+            )
+        };
 
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
@@ -30392,6 +31709,18 @@ fn reindex_paths_with_semantic_delta(
         // `last_indexed_at`, and must not trigger downstream optimize/merge.
         // See issue #194.
         if conv_count == 0 {
+            if scan_error.is_some() {
+                // A later successful sibling may advance the shared provider
+                // watermark. Keep this source eligible for an unfiltered retry
+                // even when it had no valid conversation to publish today.
+                let storage = storage
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                persist_watch_lexical_replay_debt(
+                    &storage,
+                    &WatchLexicalReplayDebt::for_root(kind, &root),
+                )?;
+            }
             continue;
         }
 
@@ -30402,7 +31731,7 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
-        let mut deferred_conversations = 0usize;
+        let mut deferred_conversations = nomem_backoff_held;
         let mut lexical_replay_deferred = false;
         {
             let storage = storage
@@ -30559,6 +31888,10 @@ fn reindex_paths_with_semantic_delta(
                     tracing::warn!(
                         "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
                     );
+                } else if scan_error.is_some() {
+                    tracing::warn!(
+                        "skipping watch last_indexed_at update after incomplete source scan"
+                    );
                 } else {
                     persist::with_ephemeral_writer(
                         &storage,
@@ -30568,11 +31901,18 @@ fn reindex_paths_with_semantic_delta(
                     )?;
                 }
 
+                // Conversations are sorted by watermark, so a clean later
+                // chunk must not advance past an earlier (or backed-off)
+                // deferred one, which would drop it from every later scan:
+                // the cumulative deferral count gates this. Quarantined
+                // conversations keep the per-chunk gate: they have no backoff,
+                // so holding the watermark for them would re-attempt them on
+                // every tick.
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
                     && !lexical_replay_deferred
                     && chunk_outcome.quarantined_conversations == 0
-                    && chunk_outcome.deferred_conversations == 0
+                    && deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
@@ -30589,7 +31929,7 @@ fn reindex_paths_with_semantic_delta(
                     tracing::debug!(
                         ?kind,
                         active_sources_skipped,
-                        "preserving partial watch watermark because scan exclusions or active source skips are active"
+                        "preserving partial watch watermark because a source failed or was excluded"
                     );
                 }
             }
@@ -30619,17 +31959,24 @@ fn reindex_paths_with_semantic_delta(
                 .first()
                 .map(|conv| conv.agent_slug.clone())
                 .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
-            stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+            if failed_stats_index.is_none() {
+                stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+            }
             stats.index_ms = stats.index_ms.saturating_add(index_ms);
             stats.total_conversations = stats.total_conversations.saturating_add(conv_count);
             stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
-            stats.connectors.push(ConnectorStats {
+            let connector_stats = ConnectorStats {
                 name: connector_name.clone(),
                 conversations: conv_count,
                 messages: inserted_messages,
                 scan_ms,
-                error: None,
-            });
+                error: scan_error,
+            };
+            if let Some(index) = failed_stats_index {
+                stats.connectors[index] = connector_stats;
+            } else {
+                stats.connectors.push(connector_stats);
+            }
             if !stats
                 .agents_discovered
                 .iter()
@@ -30683,7 +32030,7 @@ fn reindex_paths_with_semantic_delta(
             tracing::info!(
                 ?kind,
                 active_sources_skipped,
-                "preserving final watch watermark because scan exclusions or active source skips are active"
+                "preserving final watch watermark because a source failed or was excluded"
             );
         }
     }
@@ -30691,7 +32038,10 @@ fn reindex_paths_with_semantic_delta(
     // Reset phase to idle if progress exists
     reset_progress_to_idle(opts.progress.as_ref());
 
-    Ok(total_indexed)
+    match first_source_scan_error {
+        Some(error) => Err(ConnectorScanFailure(error).into()),
+        None => Ok(total_indexed),
+    }
 }
 
 fn explicit_watch_once_root_unchanged_after_last_index(
@@ -30764,10 +32114,14 @@ fn explicit_watch_once_root_unchanged_after_last_index(
 
 const WATCH_LEXICAL_REPLAY_DEBT_PREFIX: &str = "watch_lexical_replay_v1:";
 
-/// One connector's selected source may have canonical rows newer than its
-/// published lexical documents. Shared scan roots serve several connectors;
-/// completing one connector must not discharge another connector's debt.
-/// Keep this separate from archive-wide rebuild state.
+/// One connector's selected source needs an unfiltered retry: it may have
+/// canonical rows newer than its published lexical documents, or a failed
+/// scan that left some source content unread. Failed scans retain this marker
+/// even when no conversation parsed, so a successful sibling cannot hide an
+/// older repaired source by advancing the shared provider watermark.
+/// Shared scan roots serve several connectors; completing one connector must
+/// not discharge another connector's debt. Keep this separate from archive-wide
+/// rebuild state.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct WatchLexicalReplayDebt {
     connector: ConnectorKind,
@@ -31255,6 +32609,9 @@ enum ConnectorKind {
     /// Shared Codebuff / Freebuff (Manicode) CLI history (GH #423).
     #[serde(rename = "bf", alias = "Codebuff")]
     Codebuff,
+    /// Pi durable-harness stores (franken_agent_detection #28).
+    #[serde(rename = "pd", alias = "PiDurable")]
+    PiDurable,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -31624,6 +32981,20 @@ fn classify_paths(
             }
         })
         .collect();
+    // A live watch keeps scanning the root as configured, but its events can
+    // arrive in either spelling: macOS FSEvents reports canonical paths
+    // (/private/var/... for a root under /var, the target of a symlinked
+    // root), inotify reports them as watched. Match the canonical spelling
+    // too, or every event under such a root is dropped.
+    let alternate_root_paths: Vec<Option<PathBuf>> = roots
+        .iter()
+        .map(|(_, root)| {
+            (!prefer_explicit_paths)
+                .then(|| std::fs::canonicalize(&root.path).ok())
+                .flatten()
+                .filter(|canonical| canonical != &root.path)
+        })
+        .collect();
 
     for requested in paths {
         let hinted_kind = prefer_explicit_paths
@@ -31657,16 +33028,22 @@ fn classify_paths(
             // transcript, so retain only the deepest root per connector and
             // source provenance. Distinct sources remain distinct scans.
             let mut matching_roots: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
-            for ((kind, root), match_root_path) in roots.iter().zip(&match_root_paths) {
+            for (((kind, root), match_root_path), alternate_root_path) in roots
+                .iter()
+                .zip(&match_root_paths)
+                .zip(&alternate_root_paths)
+            {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
                 {
                     continue;
                 }
-                if p.starts_with(match_root_path)
-                    || (is_database_watch_root(*kind, root)
-                        && database_sidecar_paths(match_root_path).contains(p))
-                {
+                let under = |candidate: &PathBuf| {
+                    p.starts_with(candidate)
+                        || (is_database_watch_root(*kind, root)
+                            && database_sidecar_paths(candidate).contains(p))
+                };
+                if under(match_root_path) || alternate_root_path.as_ref().is_some_and(under) {
                     if let Some(index) =
                         matching_roots
                             .iter()
@@ -32208,7 +33585,7 @@ fn capture_connector_sources_before_parse(
         Err(error) => {
             tracing::warn!(
                 provider,
-                error = %error,
+                error = %format_args!("{error:#}"),
                 "provider source discovery failed; falling back to legacy explicit-root preparse capture"
             );
             for root in fallback_roots {
@@ -32220,12 +33597,29 @@ fn capture_connector_sources_before_parse(
                     active_source_filter,
                 );
             }
-            (Vec::new(), Some(error.to_string()))
+            (Vec::new(), Some(error))
         }
     };
     let mut run = ConnectorIngestRun::begin(provider, data_dir, ctx, &observed_sources);
     if let Some(error) = discovery_error {
-        run.observe_scan_error(&ctx.data_dir, &error);
+        // GH #511: discovery can fail before any transcript is returned. Keep
+        // its I/O cause and the failed directory instead of blaming CASS's own
+        // output directory. WalkDir names the precise operation when possible.
+        let source_path = error
+            .chain()
+            .find_map(|cause| {
+                cause
+                    .downcast_ref::<walkdir::Error>()
+                    .and_then(walkdir::Error::path)
+            })
+            .or_else(|| {
+                fallback_roots
+                    .first()
+                    .or_else(|| ctx.scan_roots.first())
+                    .map(|root| root.path.as_path())
+            })
+            .unwrap_or_else(|| Path::new("(source root unavailable)"));
+        run.observe_connector_scan_error(source_path, &error);
     }
     (run, active_source_skipped)
 }
@@ -32248,6 +33642,9 @@ fn capture_discovered_source_file_before_parse(
     provider: &str,
     source: &crate::connectors::DiscoveredSourceFile,
 ) {
+    if !crate::raw_mirror::capture_enabled() {
+        return;
+    }
     if let Err(reason) = validate_discovered_source_path(source) {
         tracing::warn!(
             provider,
@@ -32424,6 +33821,9 @@ fn capture_scan_root_file_before_parse(
     if should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path) {
         return true;
     }
+    if !crate::raw_mirror::capture_enabled() {
+        return false;
+    }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
         provider,
@@ -32457,6 +33857,11 @@ fn capture_scan_root_file_before_parse(
 }
 
 fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
+    // GH #506: CASS_RAW_MIRROR=off leaves the conversation without raw-mirror
+    // metadata; the archive rows are written as usual.
+    if !crate::raw_mirror::capture_enabled() {
+        return;
+    }
     if should_skip_raw_mirror_capture_for_logical_source(&conv.source_path) {
         tracing::debug!(
             agent = %conv.agent_slug,
@@ -33108,7 +34513,7 @@ pub mod persist {
                 fault.set(Some(WatchLexicalTestFault::PublicationAfter(remaining - 1)));
                 false
             }
-            _ => dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_ok(),
+            _ => super::INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get),
         })
     }
 
@@ -34645,7 +36050,11 @@ pub mod persist {
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
-        prepare_codebuff_message_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
+        prepare_codebuff_canonical_repair(
+            storage,
+            Some(t_index.path()),
+            std::slice::from_ref(conv),
+        )?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
@@ -34708,7 +36117,11 @@ pub mod persist {
         let total_started = Instant::now();
         let db_started = Instant::now();
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
-        prepare_codebuff_message_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
+        prepare_codebuff_canonical_repair(
+            storage,
+            Some(t_index.path()),
+            std::slice::from_ref(conv),
+        )?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
@@ -34862,10 +36275,11 @@ pub mod persist {
                 continue;
             }
             let (source_id, _) = extract_provenance(&conv.metadata);
-            if !storage.cursor_workspace_repair_needed(
+            if !storage.provider_workspace_repair_needed(
                 &conv.agent_slug,
                 &source_id,
                 conv.external_id.as_deref(),
+                &conv.source_path,
                 conv.workspace.as_deref(),
                 &conv.metadata,
             )? {
@@ -34890,22 +36304,34 @@ pub mod persist {
         Ok(())
     }
 
-    fn prepare_codebuff_message_repair(
+    fn prepare_codebuff_canonical_repair(
         storage: &FrankenStorage,
         index_path: Option<&Path>,
         convs: &[NormalizedConversation],
     ) -> Result<()> {
         for conv in convs.iter().filter(|conv| conv.agent_slug == "codebuff") {
-            if !storage.codebuff_message_revisions_needed(&map_to_internal(conv))? {
+            let (source_id, _) = extract_provenance(&conv.metadata);
+            if !storage.codebuff_message_revisions_needed(&map_to_internal(conv))?
+                && !storage.provider_workspace_repair_needed(
+                    &conv.agent_slug,
+                    &source_id,
+                    conv.external_id.as_deref(),
+                    &conv.source_path,
+                    conv.workspace.as_deref(),
+                    &conv.metadata,
+                )?
+            {
                 continue;
             }
-            let index_path = index_path
-                .context("Codebuff message revision requires the canonical index directory")?;
+            let index_path = index_path.context(
+                "Codebuff message revision or workspace change requires the canonical index directory",
+            )?;
             let db_path = storage.database_path()?;
-            // An in-place revision leaves COUNT/MAX unchanged. Revoke lexical
-            // authority before committing canonical rows, so a failed publish
-            // followed by an unchanged source replay still rebuilds from SQLite.
-            // This repair mode needs no archive-wide count for admission.
+            // An in-place revision or a run-state workspace change leaves
+            // COUNT/MAX unchanged. Revoke lexical authority before committing
+            // canonical rows, so a failed publish followed by an unchanged
+            // source replay still rebuilds from SQLite. This repair mode needs
+            // no archive-wide count for admission.
             let mut state = super::LexicalRebuildState::new(
                 super::deferred_lexical_rebuild_db_state(&db_path, 0),
                 super::LEXICAL_REBUILD_PAGE_SIZE,
@@ -35166,9 +36592,12 @@ pub mod persist {
             let is_last = index == last_part;
             // An inline rebuild replays each touched conversation in full from
             // the canonical rows (streamed in bounded chunks); replaying it
-            // after every slice would be quadratic. Earlier parts only store
-            // rows and the final part's replay covers every slice.
-            let part_strategy = if !is_last
+            // after every slice would be quadratic. A giant conversation's
+            // earlier slices only store rows, and its final slice replays the
+            // whole conversation. A part replays only its own conversations,
+            // so runs of ordinary conversations, and a final slice that is not
+            // the batch's last part, keep the inline rebuild.
+            let part_strategy = if matches!(part, Part::Slice { finishes: None, .. })
                 && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan
             {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
@@ -35265,7 +36694,7 @@ pub mod persist {
             let canonical_index_path = raw_mirror_data_dir
                 .map(crate::search::tantivy::index_dir)
                 .transpose()?;
-            prepare_codebuff_message_repair(
+            prepare_codebuff_canonical_repair(
                 storage,
                 canonical_index_path
                     .as_deref()
@@ -36538,6 +37967,98 @@ pub mod persist {
                     assert_eq!(stored(&resumed), expected, "{label}: resumed");
                     assert_eq!(resumed_docs, whole_docs, "{label}: resumed");
                     assert_eq!(outcomes[1].inserted_messages, 29, "{label}: resumed");
+                }
+            }
+        }
+
+        /// An inline rebuild of one batch that holds a giant conversation must
+        /// index every conversation in the batch, not only those in its last
+        /// part: the ordinary runs around the giant one, and a giant
+        /// conversation whose final slice is not the batch's last part.
+        #[test]
+        #[serial]
+        fn sliced_inline_rebuild_batch_indexes_every_conversation() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _begin = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let limits = PersistSliceLimits {
+                messages: 7,
+                content_bytes: usize::MAX,
+            };
+            let conversation =
+                |dir: &std::path::Path, name: &str, count: i64| NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(format!("batch-{name}")),
+                    title: Some(format!("Batch {name}")),
+                    workspace: Some(dir.join("workspace")),
+                    source_path: dir.join(format!("rollout-{name}.jsonl")),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_000 + (count - 1) * 1000),
+                    metadata: serde_json::Value::Null,
+                    messages: (0..count)
+                        .map(|idx| NormalizedMessage {
+                            idx,
+                            role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
+                            author: None,
+                            created_at: Some(1_700_000_000_000 + idx * 1000),
+                            content: format!("{name}mark{idx}z batch text {idx}"),
+                            extra: serde_json::json!({"uuid": format!("{name}-{idx}")}),
+                            snippets: Vec::new(),
+                            invocations: Vec::new(),
+                        })
+                        .collect(),
+                };
+            let dir = tempfile::TempDir::new().unwrap();
+            let before = conversation(dir.path(), "before", 3);
+            let giant = conversation(dir.path(), "giant", 50);
+            let after = conversation(dir.path(), "after", 3);
+            assert!(!should_slice_conversation(&before, limits));
+            assert!(should_slice_conversation(&giant, limits));
+            for (label, batch) in [
+                (
+                    "surrounded",
+                    vec![before.clone(), giant.clone(), after.clone()],
+                ),
+                ("giant-first", vec![giant.clone(), after.clone()]),
+                ("giant-last", vec![before.clone(), giant.clone()]),
+            ] {
+                let root = dir.path().join(label);
+                std::fs::create_dir_all(&root).unwrap();
+                let storage = create_franken_db(&root.join("agent_search.db"));
+                let index_path = root.join("index");
+                let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+                let outcome = persist_conversations_batched_sliced(
+                    &storage,
+                    Some(&mut index),
+                    &batch,
+                    LexicalPopulationStrategy::InlineRebuildFromScan,
+                    false,
+                    false,
+                    Some(&root),
+                    PersistHeartbeat::NONE,
+                    None,
+                    limits,
+                )
+                .unwrap();
+                index.commit().unwrap();
+                let messages: usize = batch.iter().map(|conv| conv.messages.len()).sum();
+                assert_eq!(outcome.inserted_messages, messages, "{label}");
+                assert_eq!(
+                    tantivy_doc_count(&mut index),
+                    messages as u64,
+                    "{label}: every stored message is indexed"
+                );
+                drop(index);
+                let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+                for conv in &batch {
+                    for message in [&conv.messages[0], &conv.messages[conv.messages.len() - 1]] {
+                        let marker = message.content.split_whitespace().next().unwrap();
+                        let hits = client
+                            .search(marker, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                            .unwrap();
+                        assert_eq!(hits.len(), 1, "{label}: {marker}");
+                    }
                 }
             }
         }
@@ -41111,6 +42632,79 @@ mod tests {
         EnvGuard { key, previous }
     }
 
+    /// Restores the one ingest OOM injection it set on this thread when dropped.
+    enum IngestTestOomGuard {
+        NonWatch(Option<usize>),
+        Lexical(bool),
+    }
+
+    impl Drop for IngestTestOomGuard {
+        fn drop(&mut self) {
+            match *self {
+                Self::NonWatch(previous) => {
+                    NON_WATCH_INGEST_TEST_OOM_MIN_CONVS.with(|cell| cell.set(previous));
+                }
+                Self::Lexical(previous) => {
+                    INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(|cell| cell.set(previous));
+                }
+            }
+        }
+    }
+
+    /// Make non-watch ingest on THIS thread fail with a typed OOM for any batch
+    /// of at least `min_convs` conversations.
+    fn inject_non_watch_ingest_test_oom(min_convs: usize) -> IngestTestOomGuard {
+        IngestTestOomGuard::NonWatch(
+            NON_WATCH_INGEST_TEST_OOM_MIN_CONVS.with(|cell| cell.replace(Some(min_convs))),
+        )
+    }
+
+    /// Make incremental lexical updates on THIS thread fail with an OOM.
+    fn inject_incremental_lexical_update_test_oom() -> IngestTestOomGuard {
+        IngestTestOomGuard::Lexical(
+            INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(|cell| cell.replace(true)),
+        )
+    }
+
+    /// xicw9: an ingest OOM injected by one test must not reach an ingest
+    /// running on another test's thread. With the old process-env injection,
+    /// the spawned thread below saw the fault and a concurrent
+    /// `streaming_configured_scan_roots_ignore_global_watermark` inserted
+    /// nothing.
+    #[test]
+    fn ingest_test_oom_injection_is_scoped_to_the_injecting_thread() {
+        let convs = vec![norm_conv(
+            Some("oom-scope"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        )];
+        let guard = inject_non_watch_ingest_test_oom(1);
+        let lexical_guard = inject_incremental_lexical_update_test_oom();
+        assert!(should_inject_non_watch_ingest_test_oom(&convs));
+        assert!(INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get));
+
+        let other_convs = convs.clone();
+        let (other_non_watch, other_lexical) = std::thread::spawn(move || {
+            (
+                should_inject_non_watch_ingest_test_oom(&other_convs),
+                INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get),
+            )
+        })
+        .join()
+        .expect("probe thread");
+        assert!(!other_non_watch, "non-watch OOM leaked to another thread");
+        assert!(!other_lexical, "lexical OOM leaked to another thread");
+
+        assert!(
+            !should_inject_non_watch_ingest_test_oom(&[]),
+            "a batch smaller than the minimum is not failed"
+        );
+        drop(lexical_guard);
+        assert!(!INCREMENTAL_LEXICAL_UPDATE_TEST_OOM.with(std::cell::Cell::get));
+        assert!(should_inject_non_watch_ingest_test_oom(&convs));
+        drop(guard);
+        assert!(!should_inject_non_watch_ingest_test_oom(&convs));
+    }
+
     #[test]
     fn active_session_recent_write_detection_is_watch_opt_in() {
         let tmp = TempDir::new().expect("tempdir");
@@ -41441,6 +43035,361 @@ mod tests {
         );
 
         drop(guard);
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_semantic_admission_preserves_owner_and_releases_heartbeat() -> Result<()> {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        let lexical = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        let original = read_search_maintenance_snapshot(tmp.path());
+        assert!(original.active);
+        assert!(try_acquire_semantic_backfill_lock(tmp.path(), &db_path)?.is_none());
+        let contended = read_search_maintenance_snapshot(tmp.path());
+        assert_eq!(contended.job_id, original.job_id);
+        assert_eq!(contended.last_progress_at_ms, original.last_progress_at_ms);
+        drop(lexical);
+
+        let semantic = try_acquire_semantic_backfill_lock(tmp.path(), &db_path)?
+            .context("semantic job must be admitted after the lexical owner drains")?;
+        assert!(
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index).is_err()
+        );
+        let active = read_search_maintenance_snapshot(tmp.path());
+        assert!(active.active);
+        assert_eq!(
+            active.job_kind,
+            Some(SearchMaintenanceJobKind::SemanticRebuild)
+        );
+        drop(semantic);
+
+        let after = read_search_maintenance_snapshot(tmp.path());
+        assert!(!after.active);
+        assert!(after.job_id.is_none());
+        assert!(
+            read_index_run_lock_metadata_for_test(&tmp.path().join("index-run.lock"))?.is_empty()
+        );
+        let _next = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+
+        // Permission/path errors must not be mistaken for a busy owner and
+        // silently put accepted daemon work into an endless retry queue.
+        let not_a_directory = tmp.path().join("not-a-directory");
+        fs::write(&not_a_directory, b"preserve")?;
+        assert!(try_acquire_semantic_backfill_lock(&not_a_directory, &db_path).is_err());
+        assert_eq!(fs::read(&not_a_directory)?, b"preserve");
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_archive_admission_serializes_different_data_directories() -> Result<()> {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+
+        for archive_exists in [false, true] {
+            let tmp = TempDir::new()?;
+            let db_path = tmp.path().join("archive.db");
+            if archive_exists {
+                fs::write(&db_path, b"canonical bytes")?;
+            }
+            let first_data = tmp.path().join("first");
+            let second_data = tmp.path().join("second");
+            let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            let original = read_search_maintenance_snapshot(&first_data);
+            let lease_path = archive_lease::ArchiveWriteLease::path(&db_path)?;
+            assert_eq!(db_path.exists(), archive_exists);
+            assert_eq!(fs::metadata(&lease_path)?.len(), 0);
+
+            let error =
+                acquire_index_run_lock(&second_data, &db_path, SearchMaintenanceMode::Index)
+                    .expect_err("a different data directory must not admit the same archive");
+            assert_eq!(
+                error.downcast_ref::<IndexRunBusy>().unwrap().lock_path,
+                lease_path,
+            );
+            assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+            assert!(
+                read_index_run_lock_metadata_for_test(&second_data.join("index-run.lock"))?
+                    .is_empty()
+            );
+            assert!(!read_search_maintenance_snapshot(&second_data).active);
+            assert_eq!(
+                read_search_maintenance_snapshot(&first_data).job_id,
+                original.job_id
+            );
+
+            // Creating the database while its first owner is admitted must not
+            // switch the lease key from the missing-leaf path to a new inode.
+            if !archive_exists {
+                fs::write(&db_path, b"canonical bytes")?;
+                assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+            }
+            drop(owner);
+            let successor = try_acquire_semantic_backfill_lock(&second_data, &db_path)?
+                .context("the next data directory must acquire the released archive")?;
+            assert!(read_search_maintenance_snapshot(&second_data).active);
+            assert!(!read_search_maintenance_snapshot(&first_data).active);
+            assert_eq!(fs::metadata(&lease_path)?.len(), 0);
+            assert_eq!(fs::read(&db_path)?, b"canonical bytes");
+            drop(successor);
+            assert!(!read_search_maintenance_snapshot(&second_data).active);
+            assert!(
+                read_index_run_lock_metadata_for_test(&second_data.join("index-run.lock"))?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_archive_admission_releases_partial_admission_and_keeps_archives_independent()
+    -> Result<()> {
+        let tmp = TempDir::new()?;
+        let first_data = tmp.path().join("first");
+        let second_data = tmp.path().join("second");
+        let first_db = tmp.path().join("first.db");
+        let second_db = tmp.path().join("second.db");
+        let first = acquire_semantic_backfill_lock(&first_data, &first_db)?;
+        assert!(try_acquire_semantic_backfill_lock(&second_data, &first_db)?.is_none());
+
+        // The failed archive attempt must release its preliminary data-dir
+        // lock; an unrelated archive can then use that data dir immediately.
+        let second = acquire_semantic_backfill_lock(&second_data, &second_db)?;
+        assert!(try_acquire_semantic_backfill_lock(&first_data, &second_db)?.is_none());
+        drop(second);
+        drop(first);
+
+        let blocked_parent = tmp.path().join("not-a-directory");
+        fs::write(&blocked_parent, b"preserve")?;
+        let error =
+            try_acquire_semantic_backfill_lock(&second_data, &blocked_parent.join("archive.db"))
+                .err()
+                .context("an archive path error must remain an error, not deferred work")?;
+        assert!(!error.is::<IndexRunBusy>());
+        assert_eq!(fs::read(blocked_parent)?, b"preserve");
+        let _retry = acquire_semantic_backfill_lock(&second_data, &second_db)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_archive_admission_unifies_symlink_spellings_before_and_after_creation() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        for archive_exists in [false, true] {
+            let tmp = TempDir::new()?;
+            let archive_dir = tmp.path().join("archives");
+            fs::create_dir(&archive_dir)?;
+            let alias_dir = tmp.path().join("alias");
+            symlink(&archive_dir, &alias_dir)?;
+            let db_path = archive_dir.join("archive.db");
+            if archive_exists {
+                fs::write(&db_path, b"preserve")?;
+            }
+            let first_data = tmp.path().join("first");
+            let second_data = tmp.path().join("second");
+            let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            let lease_path = archive_lease::ArchiveWriteLease::path(&db_path)?;
+            let before = fs::metadata(&lease_path)?;
+            assert!(
+                try_acquire_semantic_backfill_lock(&second_data, &alias_dir.join("archive.db"))?
+                    .is_none()
+            );
+            if archive_exists {
+                let alias_file = tmp.path().join("archive-link.db");
+                symlink(&db_path, &alias_file)?;
+                assert!(try_acquire_semantic_backfill_lock(&second_data, &alias_file)?.is_none());
+            }
+            drop(owner);
+            let retry =
+                acquire_semantic_backfill_lock(&second_data, &alias_dir.join("archive.db"))?;
+            let after = fs::metadata(&lease_path)?;
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(after.len(), 0);
+            drop(retry);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_archive_admission_resolves_symlinks_before_parent_components() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        for archive_exists in [false, true] {
+            let tmp = TempDir::new()?;
+            let lexical_parent = tmp.path().join("lexical-parent");
+            let archive_parent = tmp.path().join("actual-parent");
+            fs::create_dir(&lexical_parent)?;
+            fs::create_dir_all(archive_parent.join("child"))?;
+            symlink(archive_parent.join("child"), lexical_parent.join("link"))?;
+            let db_path = archive_parent.join("archive.db");
+            let spelling = lexical_parent.join("link/../archive.db");
+            if archive_exists {
+                fs::write(&db_path, b"canonical bytes")?;
+            }
+            let first_data = tmp.path().join("first");
+            let second_data = tmp.path().join("second");
+            let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            assert!(try_acquire_semantic_backfill_lock(&second_data, &spelling)?.is_none());
+
+            // Delayed writer admission from a readonly rebuild must preserve
+            // exactly the same OS path semantics as immediate admission.
+            let mut readonly = acquire_index_run_lock_with_archive_admission(
+                &second_data,
+                &spelling,
+                SearchMaintenanceMode::Index,
+                SearchMaintenanceJobKind::LexicalRefresh,
+                ArchiveAdmission::DataDirOnly,
+            )?;
+            assert!(
+                readonly
+                    .acquire_archive_write_lease()
+                    .expect_err("the readonly upgrade must respect the canonical owner")
+                    .is::<IndexRunBusy>()
+            );
+            if !archive_exists {
+                fs::write(&spelling, b"canonical bytes")?;
+            }
+            assert_eq!(fs::canonicalize(&spelling)?, fs::canonicalize(&db_path)?);
+            drop(owner);
+            readonly.acquire_archive_write_lease()?;
+            assert!(try_acquire_semantic_backfill_lock(&first_data, &db_path)?.is_none());
+            assert!(
+                !lexical_parent
+                    .join("archive.db.cass-index-run.lock")
+                    .exists()
+            );
+            drop(readonly);
+            let _retry = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+            assert_eq!(fs::read(&db_path)?, b"canonical bytes");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_archive_admission_unifies_dangling_leaf_targets_and_creates_missing_parents()
+    -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("new/nested/archive.db");
+        let spelling = tmp.path().join("archive-link.db");
+        symlink("new/nested/archive.db", &spelling)?;
+        let first_data = tmp.path().join("first");
+        let second_data = tmp.path().join("second");
+        let owner = acquire_semantic_backfill_lock(&first_data, &spelling)?;
+        assert!(db_path.parent().unwrap().is_dir());
+        assert!(!db_path.exists(), "admission must not create the archive");
+        assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+        fs::write(&spelling, b"created through the original dangling link")?;
+        assert!(try_acquire_semantic_backfill_lock(&second_data, &db_path)?.is_none());
+        assert_eq!(
+            archive_lease::ArchiveWriteLease::path(&spelling)?,
+            archive_lease::ArchiveWriteLease::path(&db_path)?,
+        );
+        drop(owner);
+        let successor = acquire_semantic_backfill_lock(&second_data, &db_path)?;
+        assert!(try_acquire_semantic_backfill_lock(&first_data, &spelling)?.is_none());
+        drop(successor);
+
+        let cycle_a = tmp.path().join("cycle-a.db");
+        let cycle_b = tmp.path().join("cycle-b.db");
+        symlink(&cycle_b, &cycle_a)?;
+        symlink(&cycle_a, &cycle_b)?;
+        let error = try_acquire_semantic_backfill_lock(&first_data, &cycle_a)
+            .err()
+            .context("unresolvable symlinks must fail without claiming a different archive")?;
+        assert!(!error.is::<IndexRunBusy>());
+        assert!(
+            read_index_run_lock_metadata_for_test(&first_data.join("index-run.lock"))?.is_empty()
+        );
+        let _retry = acquire_semantic_backfill_lock(&first_data, &spelling)?;
+        assert_eq!(
+            fs::read(&db_path)?,
+            b"created through the original dangling link"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_writer_admission_precedes_archive_preparation() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        let original = b"an archive being initialized by its existing owner";
+        fs::write(&db_path, original)?;
+        let _owner = acquire_semantic_backfill_lock(tmp.path(), &db_path)?;
+        let snapshot = crate::search::asset_state::read_search_maintenance_snapshot(tmp.path());
+        let result = run_index_with_local_connector_roots(
+            IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path: db_path.clone(),
+                data_dir: tmp.path().to_path_buf(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "hash".to_string(),
+                progress: Some(Arc::new(IndexingProgress::default())),
+                watch_interval_secs: 30,
+            },
+            HashMap::new(),
+            None,
+        );
+        assert!(
+            result
+                .expect_err("a contender must not inspect another owner's archive")
+                .is::<IndexRunBusy>()
+        );
+        assert_eq!(fs::read(&db_path)?, original);
+        assert!(!tmp.path().join("index").exists());
+        assert_eq!(
+            crate::search::asset_state::read_search_maintenance_snapshot(tmp.path()).job_id,
+            snapshot.job_id,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_stop_before_preparation_preserves_archive_and_does_not_claim_writer() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir)?;
+        let db_path = data_dir.join("agent_search.db");
+        // An already-cancelled invocation must not even probe or migrate its
+        // archive. A sentinel makes an accidental open fail unmistakably.
+        let original = b"archive not to be opened by a cancelled invocation";
+        fs::write(&db_path, original)?;
+        let progress = Arc::new(IndexingProgress::default());
+        progress.request_stop();
+        let result = run_index_with_local_connector_roots(
+            IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "hash".to_string(),
+                progress: Some(progress),
+                watch_interval_secs: 30,
+            },
+            HashMap::new(),
+            None,
+        );
+        assert!(
+            result
+                .expect_err("cancelled index must stop")
+                .is::<IndexInterrupted>()
+        );
+        assert_eq!(fs::read(db_path)?, original);
+        assert!(!data_dir.join("index-run.lock").exists());
+        assert!(!data_dir.join("index").exists());
         Ok(())
     }
 
@@ -45296,6 +47245,164 @@ mod tests {
             responsiveness::effective_worker_count(3).max(1)
         );
         assert_eq!(snapshot.pipeline_max_message_bytes_in_flight, 777777);
+    }
+
+    /// GH #483: an explicit positive environment value beats the profile, the
+    /// profile beats the computed default, and a knob the profile does not
+    /// name keeps its default.
+    #[test]
+    fn rebuild_profile_settings_resolve_env_over_profile_over_default() {
+        use LexicalRebuildProfile::{Bounded, Default as HostSized};
+        use LexicalRebuildSettingSource::{Env, Profile};
+        const WORKERS: &str = "CASS_TANTIVY_REBUILD_WORKERS";
+        assert_eq!(
+            resolve_lexical_rebuild_setting(None, Bounded, WORKERS),
+            Some((1, Profile))
+        );
+        assert_eq!(
+            resolve_lexical_rebuild_setting(None, HostSized, WORKERS),
+            None
+        );
+        for profile in [Bounded, HostSized] {
+            assert_eq!(
+                resolve_lexical_rebuild_setting(Some("3"), profile, WORKERS),
+                Some((3, Env))
+            );
+        }
+        // Values the readers always ignored stay ignored; the profile fills in.
+        for ignored in ["0", "abc", "-2", ""] {
+            assert_eq!(
+                resolve_lexical_rebuild_setting(Some(ignored), Bounded, WORKERS),
+                Some((1, Profile)),
+                "{ignored:?}"
+            );
+            assert_eq!(
+                resolve_lexical_rebuild_setting(Some(ignored), HostSized, WORKERS),
+                None
+            );
+        }
+        assert_eq!(
+            resolve_lexical_rebuild_setting(
+                None,
+                Bounded,
+                "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES"
+            ),
+            None
+        );
+        assert!(HostSized.settings().is_empty());
+        assert_eq!(
+            Bounded.settings(),
+            &[
+                ("CASS_TANTIVY_REBUILD_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", 1),
+                ("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", 1),
+                ("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", 64),
+                ("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", 64 << 20),
+            ]
+        );
+    }
+
+    struct RebuildProfileGuard;
+
+    impl Drop for RebuildProfileGuard {
+        fn drop(&mut self) {
+            set_lexical_rebuild_profile(LexicalRebuildProfile::Default);
+        }
+    }
+
+    /// GH #483: the bounded profile reaches every reader the live rebuild
+    /// uses, including the settings derived from the worker count, and the
+    /// `cass index --json` report names where each value came from.
+    #[test]
+    #[serial]
+    fn bounded_rebuild_profile_drives_the_live_settings_and_its_report() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let _cleared: Vec<EnvGuard> = [
+            "CASS_TANTIVY_REBUILD_WORKERS",
+            "CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS",
+            "CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE",
+            "CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS",
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+            "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
+            "CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS",
+            "CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS",
+        ]
+        .into_iter()
+        .map(unset_env_var)
+        .collect();
+        let _profile = RebuildProfileGuard;
+
+        let default = lexical_rebuild_pipeline_settings_snapshot();
+        assert_eq!(
+            default.workers,
+            lexical_rebuild_configured_worker_parallelism_for_available(
+                lexical_rebuild_available_parallelism()
+            ),
+            "the default profile keeps host-sized workers"
+        );
+        assert_eq!(default.pipeline_channel_size, 4);
+
+        set_lexical_rebuild_profile(LexicalRebuildProfile::Bounded);
+        let bounded = lexical_rebuild_pipeline_settings_snapshot();
+        assert_eq!(bounded.workers, 1);
+        assert_eq!(
+            bounded.page_prep_workers,
+            responsiveness::effective_worker_count(1).max(1)
+        );
+        assert_eq!(bounded.pipeline_channel_size, 1);
+        assert_eq!(bounded.steady_batch_fetch_conversations, 64);
+        assert_eq!(bounded.startup_batch_fetch_conversations, 32);
+        assert_eq!(bounded.steady_commit_every_message_bytes, 64 << 20);
+        assert_eq!(bounded.startup_commit_every_message_bytes, 64 << 20);
+        assert_eq!(
+            bounded.pipeline_max_message_bytes_in_flight,
+            responsiveness::effective_inflight_byte_limit(2 * (64 << 20)).max(1),
+            "one page in the channel plus one at the sink"
+        );
+        assert_eq!(
+            lexical_rebuild_staged_shard_builder_parallelism_configured(),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(1)
+        );
+        assert_eq!(
+            lexical_rebuild_staged_merge_worker_parallelism_configured(),
+            1
+        );
+
+        let report = lexical_rebuild_profile_report();
+        assert_eq!(report["name"], "bounded");
+        assert_eq!(report["settings"].as_array().map(Vec::len), Some(5));
+        assert!(
+            report["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|setting| setting["source"] == "profile"),
+            "{report}"
+        );
+        assert_eq!(report["effective"]["workers"], 1);
+        assert_eq!(report["effective"]["pipeline_channel_size"], 1);
+
+        // An explicit operator value still wins under the profile.
+        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "2");
+        assert_eq!(lexical_rebuild_pipeline_settings_snapshot().workers, 2);
+        let report = lexical_rebuild_profile_report();
+        let workers = report["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|setting| setting["env"] == "CASS_TANTIVY_REBUILD_WORKERS")
+            .unwrap();
+        assert_eq!(workers["value"], 2);
+        assert_eq!(workers["source"], "env");
+        assert_eq!(report["effective"]["workers"], 2);
+        assert_eq!(report["effective"]["pipeline_channel_size"], 1);
+
+        set_lexical_rebuild_profile(LexicalRebuildProfile::Default);
+        let report = lexical_rebuild_profile_report();
+        assert_eq!(report["name"], "default");
+        assert_eq!(report["settings"], serde_json::json!([]));
     }
 
     #[test]
@@ -49666,6 +51773,38 @@ mod tests {
     }
 
     #[test]
+    fn gh515_stop_before_preflight_never_opens_archive() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("not-started");
+        let progress = Arc::new(IndexingProgress::default());
+        progress.request_stop();
+        let error = run_index_with_local_connector_roots(
+            IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path: data_dir.join("agent_search.db"),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "hash".to_string(),
+                progress: Some(progress),
+                watch_interval_secs: 30,
+            },
+            HashMap::new(),
+            None,
+        )
+        .expect_err("an already-cancelled run must stop before preflight");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert!(
+            !data_dir.exists(),
+            "cancellation must not create an archive or acquire the indexing lock"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_json_includes_rebuild_pipeline_runtime_metrics() {
         let progress = IndexingProgress::default();
         progress.phase.store(2, Ordering::Relaxed);
@@ -50249,7 +52388,7 @@ mod tests {
     #[test]
     #[serial]
     fn streaming_consumer_defers_lexical_oom_without_quarantining_persisted_conversation() {
-        let _oom_guard = set_env("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM", "1");
+        let _oom_guard = inject_incremental_lexical_update_test_oom();
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -50312,7 +52451,7 @@ mod tests {
     #[test]
     #[serial]
     fn streaming_consumer_quarantines_single_non_watch_oom_and_dedupes_record() {
-        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _oom_guard = inject_non_watch_ingest_test_oom(1);
         // #298: this test models a *genuinely* poisoned conversation, so the
         // small-conversation plausibility gate must be disabled — otherwise a
         // tiny fixture conversation is deferred instead of quarantined.
@@ -50404,7 +52543,7 @@ mod tests {
     #[serial]
     fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
         for source_completion in [false, true] {
-            let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+            let oom_guard = inject_non_watch_ingest_test_oom(1);
             // Pin the pressure probe to "never real pressure" so the size gate is
             // what decides, deterministically, on any host.
             let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
@@ -50890,27 +53029,169 @@ mod tests {
         Ok(())
     }
 
-    /// #422: a watchdog-confirmed wedge must still terminate even when the
-    /// fresh checkpoint attempt blocks behind the wedged writer. Before the
-    /// checkpoint was separately supervised, this pre-exit cleanup could
-    /// itself hang forever and nullify the watchdog's abort guarantee.
+    /// Checkpoint SQL stays under its caller's ownership. Every timeout
+    /// process is owned and reaped by this test; no delayed worker can escape.
     #[test]
-    fn abort_wal_checkpoint_wait_is_bounded_when_the_worker_blocks() {
-        let started = Instant::now();
-        let attempt = run_bounded_abort_wal_checkpoint(
-            PathBuf::from("unused-by-planted-blocking-checkpoint"),
-            Duration::from_millis(5),
-            |_| {
-                std::thread::sleep(Duration::from_secs(1));
-                Ok(FinalWalCheckpointOutcome::Completed)
-            },
-        );
+    fn gh515_checkpoint_deadline_preserves_ownership_through_return_unwind_and_timeout()
+    -> Result<()> {
+        const CHILD: &str = "CASS_TEST_GH515_CHECKPOINT_CHILD";
+        const ROOT: &str = "CASS_TEST_GH515_CHECKPOINT_ROOT";
+        const TEST: &str = "indexer::tests::gh515_checkpoint_deadline_preserves_ownership_through_return_unwind_and_timeout";
+        if let Ok(mode) = dotenvy::var(CHILD) {
+            let root = PathBuf::from(dotenvy::var(ROOT)?);
+            let db_path = root.join("archive.db");
+            let _owner = acquire_semantic_backfill_lock(&root.join("owner"), &db_path)?;
+            fs::write(root.join("ready"), b"owned")?;
+            let ready_deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("go").exists() {
+                anyhow::ensure!(
+                    Instant::now() < ready_deadline,
+                    "supervisor did not release child"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let caller = std::thread::current().id();
+            let local = std::rc::Rc::new(std::cell::Cell::new(0));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_bounded_abort_wal_checkpoint(
+                    db_path,
+                    Duration::from_millis(50),
+                    "unit deadline",
+                    |_| {
+                        assert_eq!(std::thread::current().id(), caller);
+                        local.set(1);
+                        match mode.as_str() {
+                            "timeout" => std::thread::sleep(Duration::from_secs(3)),
+                            "panic" => panic!("planted checkpoint panic"),
+                            "error" => anyhow::bail!("planted checkpoint error"),
+                            "complete" => {}
+                            _ => anyhow::bail!("unknown checkpoint child mode"),
+                        }
+                        Ok(FinalWalCheckpointOutcome::Completed)
+                    },
+                )
+            }));
+            match mode.as_str() {
+                "complete" => assert!(matches!(
+                    result,
+                    Ok(AbortWalCheckpointAttempt::Finished(Ok(_)))
+                )),
+                "error" => assert!(matches!(
+                    result,
+                    Ok(AbortWalCheckpointAttempt::Finished(Err(_)))
+                )),
+                "panic" => assert!(result.is_err()),
+                _ => anyhow::bail!("a timed-out checkpoint returned to its owner"),
+            }
+            assert_eq!(
+                local.get(),
+                1,
+                "the real caller-thread closure must execute"
+            );
+            fs::write(root.join("returned"), b"timer joined")?;
+            // A forgotten timer must not kill an already-returned owner later.
+            std::thread::sleep(Duration::from_millis(150));
+            return Ok(());
+        }
 
-        assert!(matches!(attempt, AbortWalCheckpointAttempt::TimedOut));
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "checkpoint supervision must return at its own deadline, not wait for the blocked worker"
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for mode in ["complete", "error", "panic", "timeout"] {
+            let tmp = TempDir::new()?;
+            let root = tmp.path();
+            let db_path = root.join("archive.db");
+            fs::write(&db_path, b"canonical bytes")?;
+            let stderr_path = root.join("stderr");
+            let mut child = Child(
+                std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, mode)
+                    .env(ROOT, root)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::from(File::create(&stderr_path)?))
+                    .spawn()?,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("ready").exists() {
+                anyhow::ensure!(
+                    child.0.try_wait()?.is_none(),
+                    "checkpoint child exited before admission"
+                );
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "checkpoint child did not acquire ownership"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                try_acquire_semantic_backfill_lock(&root.join("contender"), &db_path)?.is_none()
+            );
+            fs::write(root.join("go"), b"run")?;
+            let status = loop {
+                if let Some(status) = child.0.try_wait()? {
+                    break status;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "checkpoint child did not stop");
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            if mode == "timeout" {
+                assert_eq!(
+                    status.code(),
+                    Some(70),
+                    "{}",
+                    fs::read_to_string(&stderr_path)?
+                );
+                assert!(!root.join("returned").exists());
+                let stderr = fs::read_to_string(&stderr_path)?;
+                let event = stderr
+                    .lines()
+                    .find_map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .filter(|value| value["kind"] == "wal-checkpoint-timeout")
+                    })
+                    .context("checkpoint timeout must emit the structured failure")?;
+                assert_eq!(event["success"], false);
+                assert_eq!(event["code"], 70);
+                assert_eq!(event["retryable"], true);
+                assert_eq!(event["deadline_ms"], 50);
+                assert_eq!(event["context"], "unit deadline");
+            } else {
+                assert!(status.success(), "{}", fs::read_to_string(&stderr_path)?);
+                assert!(root.join("returned").exists());
+            }
+            let _retry = acquire_semantic_backfill_lock(&root.join("contender"), &db_path)?;
+            assert_eq!(fs::read(&db_path)?, b"canonical bytes");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_doctor_checkpoint_refuses_busy_archive_before_timer_or_open() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        fs::write(&db_path, b"archive must not be opened")?;
+        let owner_data = tmp.path().join("owner");
+        let owner = acquire_semantic_backfill_lock(&owner_data, &db_path)?;
+        let before = crate::search::asset_state::read_search_maintenance_snapshot(&owner_data);
+        let error =
+            checkpoint_wal_truncate_with_deadline(&db_path, "doctor --fix", Duration::from_secs(5))
+                .expect_err("doctor checkpoint must respect another archive writer");
+        assert!(error.is::<IndexRunBusy>(), "{error:#}");
+        assert_eq!(fs::read(&db_path)?, b"archive must not be opened");
+        assert_eq!(
+            crate::search::asset_state::read_search_maintenance_snapshot(&owner_data).job_id,
+            before.job_id,
         );
+        drop(owner);
+        let _retry = acquire_semantic_backfill_lock(&tmp.path().join("next"), &db_path)?;
+        Ok(())
     }
 
     /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked
@@ -51553,6 +53834,40 @@ mod tests {
                 Some(input)
             );
         }
+        Ok(())
+    }
+
+    /// GH #513: compressed Codex rollouts keep old modification times, so an
+    /// archive whose Codex watermark predates the contract scans Codex
+    /// without a cutoff until a scan under the contract succeeds.
+    #[test]
+    fn a_pending_codex_scan_contract_lifts_only_the_codex_cutoff() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("contract.sqlite"))?;
+        let watermark = 1_700_001_000_500;
+        storage.set_connector_last_scan_ts("claude", watermark)?;
+        // The Codex watermark an older build wrote, without the contract.
+        storage.raw().execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            &[
+                ParamValue::from("last_scan_ts:connector:codex"),
+                ParamValue::from(watermark.to_string()),
+            ],
+        )?;
+        let factories = get_connector_factories()
+            .into_iter()
+            .filter(|(name, _)| matches!(*name, "codex" | "claude"))
+            .collect::<Vec<_>>();
+        assert_eq!(factories.len(), 2);
+
+        let cutoffs = connector_local_scan_since_ts_map(&storage, Some(watermark), &factories)?;
+        assert_eq!(cutoffs["codex"], None, "the backlog needs an uncut scan");
+        assert_eq!(cutoffs["claude"], Some(watermark - 1));
+
+        // A succeeded scan whose watermark was held back still settles it.
+        record_scan_contract_with_watermark_held(&storage, "codex", false);
+        let cutoffs = connector_local_scan_since_ts_map(&storage, Some(watermark), &factories)?;
+        assert_eq!(cutoffs["codex"], Some(watermark - 1));
         Ok(())
     }
 
@@ -53036,7 +55351,7 @@ mod tests {
             Some(scan_start_ts),
             "batch mode must persist each safe connector watermark only after its rows commit"
         );
-        let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let oom_guard = inject_non_watch_ingest_test_oom(1);
         let _pressure_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let next_scan_ts = scan_start_ts + 1;
         let deferred = run_batch_index_with_connector_factories(
@@ -55040,6 +57355,268 @@ mod tests {
     }
 
     #[test]
+    fn gh515_readonly_recovery_classification_rejects_unrelated_open_failures() -> Result<()> {
+        use crate::franken_sync::FrankenError;
+
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        fs::write(&db_path, b"canonical bytes")?;
+        let cannot_open: anyhow::Error = FrankenError::CannotOpen {
+            path: db_path.clone(),
+        }
+        .into();
+        assert!(!readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &cannot_open
+        ));
+        let wal_path = tmp.path().join("archive.db-wal");
+        fs::write(&wal_path, [0; 32])?;
+        assert!(!readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &cannot_open
+        ));
+        fs::write(&wal_path, [0; 33])?;
+        assert!(readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &cannot_open
+        ));
+        for error in [
+            FrankenError::Busy,
+            FrankenError::DatabaseCorrupt {
+                detail: "malformed canonical B-tree".into(),
+            },
+            FrankenError::DatabaseCorrupt {
+                detail: "conflicting virtual-table entries for another_table".into(),
+            },
+            FrankenError::NotADatabase {
+                path: db_path.clone(),
+            },
+        ] {
+            assert!(!readonly_rebuild_needs_archive_recovery(
+                &db_path,
+                &error.into()
+            ));
+        }
+        assert!(readonly_rebuild_needs_archive_recovery(
+            &db_path,
+            &FrankenError::DatabaseCorrupt {
+                detail: "conflicting virtual-table entries for fts_messages".into(),
+            }
+            .into(),
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh515_readonly_rebuilds_survive_unavailable_archive_write_admission() -> Result<()> {
+        let _ignore_sources = ignore_sources_config();
+        for busy_owner in [false, true] {
+            let tmp = TempDir::new()?;
+            let data_dir = tmp.path().join("rebuilt");
+            let db_path = tmp.path().join("archive.db");
+            let storage = FrankenStorage::open(&db_path)?;
+            seed_lexical_rebuild_fixture(&storage);
+            storage.set_last_indexed_at(123)?;
+            storage.close()?;
+            let lease_path = archive_lease::ArchiveWriteLease::path(&db_path)?;
+            let owner = if busy_owner {
+                Some(acquire_semantic_backfill_lock(
+                    &tmp.path().join("writer"),
+                    &db_path,
+                )?)
+            } else {
+                // A directory makes lease creation fail even when the test
+                // runs as root. No archive write lease can be acquired here.
+                fs::create_dir(&lease_path)?;
+                None
+            };
+            let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+            opts.force_rebuild = true;
+            opts.db_path = db_path.clone();
+            opts.progress = Some(Arc::new(IndexingProgress::default()));
+            run_index_with_local_connector_roots(opts, HashMap::new(), None)?;
+            assert_eq!(live_tantivy_doc_count(&index_dir(&data_dir)?)?, Some(4));
+            let search_data_dir = tmp.path().join("search-repair");
+            let repair = repair_lexical_index_from_canonical_db_for_search(
+                &db_path,
+                &search_data_dir,
+                None,
+            )?;
+            assert_eq!(repair.indexed_docs, 4);
+            assert_eq!(
+                live_tantivy_doc_count(&index_dir(&search_data_dir)?)?,
+                Some(4)
+            );
+            let storage = FrankenStorage::open_strict_readonly(&db_path)?;
+            assert_eq!(count_total_messages_exact(&storage)?, 4);
+            assert_eq!(storage.get_last_indexed_at()?, Some(123));
+            assert_eq!(
+                storage.raw().query_row_map(
+                    "PRAGMA integrity_check",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed::<String>(0)
+                )?,
+                "ok"
+            );
+            assert!(storage.raw().query("PRAGMA foreign_key_check")?.is_empty());
+            storage.close_without_checkpoint()?;
+            assert!(
+                !crate::search::asset_state::read_search_maintenance_snapshot(&data_dir).active
+            );
+            assert_eq!(lease_path.is_file(), busy_owner);
+            drop(owner);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh515_readonly_recovery_requires_archive_admission_and_retries_after_release() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        // Generate two real SQLite WAL generations, then retain the old SHM
+        // beside the new WAL. The fixture process exits; recovery ownership
+        // below belongs entirely to the real CASS admission and storage code.
+        let script = r#"
+import pathlib, shutil, sqlite3, sys
+p = pathlib.Path(sys.argv[1])
+seed = str(p) + '.seed'
+c = sqlite3.connect(seed)
+c.executescript('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(n INTEGER); INSERT INTO t VALUES(10);')
+old = pathlib.Path(seed + '-shm').read_bytes()
+c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+c.execute('INSERT INTO t VALUES(20)')
+c.commit()
+current = pathlib.Path(seed + '-shm').read_bytes()
+assert old[32:40] != current[32:40]
+for suffix in ['', '-wal']:
+    shutil.copyfile(seed + suffix, str(p) + suffix)
+pathlib.Path(str(p) + '-shm').write_bytes(old)
+c.close()
+"#;
+        let fixture = std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(&db_path)
+            .output()
+            .context("Python sqlite3 is required for the real stale-WAL-index fixture")?;
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let fingerprint = |suffix: &str| -> Result<(Vec<u8>, SystemTime)> {
+            let mut path = db_path.as_os_str().to_os_string();
+            path.push(suffix);
+            Ok((fs::read(&path)?, fs::metadata(&path)?.modified()?))
+        };
+        let main_before = fingerprint("")?;
+        let wal_before = fingerprint("-wal")?;
+        let shm_before = fingerprint("-shm")?;
+        let first_data = tmp.path().join("first");
+        let second_data = tmp.path().join("second");
+        let owner = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+        let mut recovery_guard = None;
+        let started = Instant::now();
+        let error = open_readonly_rebuild_storage(&db_path, || {
+            recovery_guard = Some(acquire_search_maintenance_mutation_lock(
+                &second_data,
+                &db_path,
+                SearchMaintenanceJobKind::LexicalRefresh,
+            )?);
+            Ok(())
+        })
+        .err()
+        .context("a stale WAL index must not recover outside archive ownership")?;
+        assert!(error.is::<IndexRunBusy>(), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(recovery_guard.is_none());
+        assert_eq!(fingerprint("")?, main_before);
+        assert_eq!(fingerprint("-wal")?, wal_before);
+        assert_eq!(fingerprint("-shm")?, shm_before);
+        assert!(
+            read_index_run_lock_metadata_for_test(&second_data.join("index-run.lock"))?.is_empty()
+        );
+        drop(owner);
+
+        let started = Instant::now();
+        let storage = open_readonly_rebuild_storage(&db_path, || {
+            recovery_guard = Some(acquire_search_maintenance_mutation_lock(
+                &second_data,
+                &db_path,
+                SearchMaintenanceJobKind::LexicalRefresh,
+            )?);
+            Ok(())
+        })?;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(recovery_guard.is_some());
+        assert!(try_acquire_semantic_backfill_lock(&first_data, &db_path)?.is_none());
+        assert_eq!(
+            storage
+                .raw()
+                .query_row_map("SELECT sum(n) FROM t", &[] as &[ParamValue], |row| {
+                    row.get_typed::<i64>(0)
+                })?,
+            30
+        );
+        storage.close_without_checkpoint()?;
+        assert_eq!(fingerprint("")?, main_before);
+        assert_eq!(fingerprint("-wal")?, wal_before);
+        drop(recovery_guard);
+        FrankenStorage::open_strict_readonly(&db_path)?.close_without_checkpoint()?;
+        let _retry = acquire_semantic_backfill_lock(&first_data, &db_path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh515_empty_readonly_force_rebuild_acquires_archive_before_writable_fallback() -> Result<()>
+    {
+        let _ignore_sources = ignore_sources_config();
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("archive.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        storage.set_last_indexed_at(123)?;
+        storage.close()?;
+        let owner = acquire_semantic_backfill_lock(&tmp.path().join("writer"), &db_path)?;
+        let data_dir = tmp.path().join("contender");
+        let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+        opts.force_rebuild = true;
+        opts.db_path = db_path.clone();
+        opts.progress = Some(Arc::new(IndexingProgress::default()));
+        let error = run_index_with_local_connector_roots(opts.clone(), HashMap::new(), None)
+            .expect_err("empty readonly probe must not bypass the existing archive writer");
+        assert!(error.is::<IndexRunBusy>());
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        assert_eq!(count_total_messages_exact(&storage)?, 0);
+        assert_eq!(storage.get_last_indexed_at()?, Some(123));
+        storage.close_without_checkpoint()?;
+        assert!(!crate::search::asset_state::read_search_maintenance_snapshot(&data_dir).active);
+        drop(owner);
+        run_index_with_local_connector_roots(opts, HashMap::new(), None)?;
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        assert_eq!(count_total_messages_exact(&storage)?, 0);
+        assert!(
+            storage
+                .get_last_indexed_at()?
+                .is_some_and(|timestamp| timestamp > 123)
+        );
+        assert_eq!(
+            storage
+                .raw()
+                .query_row_map("PRAGMA integrity_check", &[] as &[ParamValue], |row| row
+                    .get_typed::<String>(
+                    0
+                ))?,
+            "ok"
+        );
+        assert!(storage.raw().query("PRAGMA foreign_key_check")?.is_empty());
+        storage.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
     fn absent_explicit_watch_once_paths_skip_heavy_index_setup() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -55397,10 +57974,11 @@ mod tests {
                 &index_path,
                 &db,
                 count_total_messages_exact(&storage).unwrap(),
+                None,
             )
             .unwrap()
         };
-        let sidecar_path = index_path.join(EXPECTED_LEXICAL_DOCS_CACHE_FILE);
+        let sidecar_path = expected_lexical_docs_cache_path(&index_path).unwrap();
         let sidecar = || {
             serde_json::from_slice::<ExpectedLexicalDocsCache>(&fs::read(&sidecar_path).unwrap())
                 .unwrap()
@@ -55431,15 +58009,21 @@ mod tests {
             "appends take the delta path"
         );
 
-        // Negative: an insertion before retained messages cannot be a delta.
+        // Text is capped per message (bgn6s, 938bf986), so a row inserted
+        // before retained messages changes no other message's truncation or
+        // noise class and is still an exact delta. The memo's first design
+        // capped text per conversation and had to recount here.
         insert(conversation_id, 55, "user", "inserted mid-conversation");
         assert_eq!(cached(), full());
-        assert_eq!(sidecar().delta_generations, 0, "mid-insertion must recount");
+        assert_eq!(
+            sidecar().delta_generations,
+            2,
+            "a mid-conversation insertion is an exact delta under the per-message cap"
+        );
 
-        // Negative: a deletion cannot be explained by appends.
         insert(conversation_id, 70, "user", "one more append");
         assert_eq!(cached(), full());
-        assert_eq!(sidecar().delta_generations, 1);
+        assert_eq!(sidecar().delta_generations, 3);
 
         // Orphaned rows are never indexed: an appended message whose
         // conversation row does not exist must not count, and it is still an
@@ -55449,7 +58033,7 @@ mod tests {
         assert_eq!(cached(), full());
         assert_eq!(
             sidecar().delta_generations,
-            2,
+            4,
             "an orphan append still takes the delta path"
         );
         storage
@@ -55461,6 +58045,270 @@ mod tests {
             .unwrap();
         assert_eq!(cached(), full());
         assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
+    }
+
+    /// GH #381 (ntxs1): an interrupted full expected-docs scan resumes from its
+    /// saved cursor instead of starting over, and still lands on exactly the
+    /// full count: unchanged, after pure appends (rows appended to an
+    /// already-counted conversation are added; conversations above the cursor
+    /// are read whole), and never after a deletion, which restarts the scan.
+    #[test]
+    fn gh381_interrupted_expected_docs_scan_resumes_exactly() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("gh381-resume.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        let db = db_path.to_string_lossy().into_owned();
+        let partial_path = dir.path().join(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+        // The generation directory whose parent holds the scan sidecars.
+        let index_path = dir.path().join("index-generation");
+        let ids: Vec<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT id FROM conversations ORDER BY id",
+                &[] as &[ParamValue],
+                |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 2, "the fixture seeds two conversations");
+        let (first, second) = (ids[0], ids[1]);
+        let insert = |conversation_id: i64, idx: i64, role: &str, content: &str| {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, ?3, ?4)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(idx),
+                        ParamValue::from(role.to_string()),
+                        ParamValue::from(content.to_string()),
+                    ],
+                )
+                .unwrap();
+        };
+        let current = || {
+            expected_lexical_docs_identity(&storage, count_total_messages_exact(&storage).unwrap())
+                .unwrap()
+        };
+        let full = || expected_live_lexical_doc_count(&storage).unwrap();
+        // Interrupt right after the first conversation, as a watchdog kill
+        // would; the position was saved first (interval zero).
+        let interrupted_scan = || {
+            let result = expected_live_lexical_doc_count_resumable_with(
+                &storage,
+                Some(&partial_path),
+                &db,
+                &current(),
+                None,
+                Duration::ZERO,
+                |_| Err(anyhow::anyhow!("interrupted")),
+            );
+            assert!(result.is_err());
+            let partial: ExpectedLexicalDocsPartial =
+                serde_json::from_slice(&fs::read(&partial_path).unwrap()).unwrap();
+            assert_eq!(partial.last_conversation_id, first);
+            // Status reads the same position, and only for this database.
+            let position = expected_lexical_docs_scan_position(&index_path, &db_path)
+                .expect("status sees the saved scan position");
+            assert_eq!(
+                (
+                    position.last_conversation_id,
+                    position.max_conversation_id,
+                    position.expected_docs_so_far
+                ),
+                (first, second, partial.expected_docs)
+            );
+            assert!(position.saved_at_ms.is_some());
+            assert_eq!(
+                expected_lexical_docs_scan_position(&index_path, &dir.path().join("other.db")),
+                None,
+                "another archive's position is not this one's"
+            );
+        };
+        let finishing_scan = || {
+            let mut visited = Vec::new();
+            let count = expected_live_lexical_doc_count_resumable_with(
+                &storage,
+                Some(&partial_path),
+                &db,
+                &current(),
+                None,
+                Duration::ZERO,
+                |conversation_id| {
+                    visited.push(conversation_id);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(
+                !partial_path.exists(),
+                "a completed scan removes its partial"
+            );
+            assert_eq!(
+                expected_lexical_docs_scan_position(&index_path, &db_path),
+                None
+            );
+            (count, visited)
+        };
+        insert(first, 50, "user", "   ");
+
+        // Unchanged archive: only the conversation after the cursor is read.
+        interrupted_scan();
+        assert_eq!(finishing_scan(), (full(), vec![second]));
+
+        // Pure appends after the interruption: below the cursor (one indexed,
+        // one noise) and above it. The resumed count still matches a full scan.
+        interrupted_scan();
+        insert(first, 60, "assistant", "appended below the cursor");
+        insert(first, 61, "tool", "");
+        insert(second, 60, "assistant", "appended above the cursor");
+        assert_eq!(finishing_scan(), (full(), vec![second]));
+
+        // A deletion below the cursor invalidates the partial: start over.
+        interrupted_scan();
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM messages WHERE conversation_id = ?1 AND idx = 60",
+                &[ParamValue::from(first)],
+            )
+            .unwrap();
+        assert_eq!(finishing_scan(), (full(), vec![first, second]));
+    }
+
+    #[test]
+    fn gh515_stop_during_expected_docs_scan_saves_cursor_before_returning() -> Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("stop-count.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        seed_lexical_rebuild_fixture(&storage);
+        let db = db_path.to_string_lossy().into_owned();
+        let partial_path = dir.path().join(EXPECTED_LEXICAL_DOCS_PARTIAL_FILE);
+        let identity =
+            expected_lexical_docs_identity(&storage, count_total_messages_exact(&storage)?)?;
+        let full_count = expected_live_lexical_doc_count(&storage)?;
+        let ids: Vec<i64> = storage.raw().query_map_collect(
+            "SELECT id FROM conversations ORDER BY id",
+            &[] as &[ParamValue],
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
+        )?;
+        assert_eq!(ids.len(), 2);
+        let progress = IndexingProgress::default();
+        let mut visited = Vec::new();
+        let error = expected_live_lexical_doc_count_resumable_with(
+            &storage,
+            Some(&partial_path),
+            &db,
+            &identity,
+            Some(&progress),
+            Duration::MAX,
+            |conversation_id| {
+                visited.push(conversation_id);
+                progress.request_stop();
+                Ok(())
+            },
+        )
+        .expect_err("stop must interrupt the preflight scan at its next conversation boundary");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert_eq!(visited, vec![ids[0]], "no next conversation may be read");
+        let partial: ExpectedLexicalDocsPartial =
+            serde_json::from_slice(&fs::read(&partial_path)?)?;
+        assert_eq!(partial.last_conversation_id, ids[0]);
+        assert!(partial.expected_docs > 0);
+
+        let mut resumed = Vec::new();
+        let count = expected_live_lexical_doc_count_resumable_with(
+            &storage,
+            Some(&partial_path),
+            &db,
+            &identity,
+            None,
+            Duration::MAX,
+            |conversation_id| {
+                resumed.push(conversation_id);
+                Ok(())
+            },
+        )?;
+        assert_eq!(resumed, vec![ids[1]]);
+        assert_eq!(
+            count, full_count,
+            "resumption must agree with the full count"
+        );
+        assert!(!partial_path.exists());
+        Ok(())
+    }
+
+    /// GH #381: the expected-docs memo describes the canonical database, so a
+    /// lexical publish (which exchanges the generation directory) must not
+    /// discard it. Otherwise the first run after every rebuild re-reads every
+    /// message in the archive. A planted sentinel that is still served after
+    /// a real from-zero rebuild and publish proves no full scan was owed.
+    #[test]
+    #[serial_test::serial]
+    fn gh381_expected_lexical_docs_memo_survives_lexical_publication() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("gh381.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        drop(storage);
+        rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        let db = db_path.to_string_lossy().into_owned();
+        let cached = || {
+            let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+            expected_live_lexical_doc_count_cached(
+                &storage,
+                &index_path,
+                &db,
+                count_total_messages_exact(&storage).unwrap(),
+                None,
+            )
+            .unwrap()
+        };
+        let full =
+            expected_live_lexical_doc_count(&FrankenStorage::open_readonly(&db_path).unwrap())
+                .unwrap();
+        assert_eq!(cached(), full);
+        let sidecar_path = expected_lexical_docs_cache_path(&index_path).unwrap();
+        assert!(
+            !sidecar_path.starts_with(&index_path),
+            "the memo must live outside the generation directory a publish exchanges"
+        );
+        let mut planted: ExpectedLexicalDocsCache =
+            serde_json::from_slice(&fs::read(&sidecar_path).unwrap()).unwrap();
+        planted.expected_docs = 999_999;
+        fs::write(&sidecar_path, serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        // Drop the completed checkpoint so the next rebuild starts from zero,
+        // builds off-live and publishes by exchanging the generation directory.
+        clear_lexical_rebuild_state(&index_path).unwrap();
+        let retained_backups = || -> std::collections::BTreeSet<std::ffi::OsString> {
+            fs::read_dir(
+                index_path
+                    .parent()
+                    .unwrap()
+                    .join(".lexical-publish-backups"),
+            )
+            .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+            .unwrap_or_default()
+        };
+        let backups_before = retained_backups();
+        let rebuilt = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        assert!(rebuilt.exact_checkpoint_persisted);
+        assert_eq!(
+            retained_backups().difference(&backups_before).count(),
+            1,
+            "the rebuild must have exchanged the generation directory and retained the prior one"
+        );
+
+        assert_eq!(
+            cached(),
+            999_999,
+            "an unchanged canonical identity is served from the memo after publication"
+        );
     }
 
     /// #439: the fallback-FTS shadow maintenance must report liveness per
@@ -59886,6 +62734,99 @@ mod tests {
         assert_eq!(classified[0].1.path, profile_root);
     }
 
+    /// A live watch must match an event in the canonical spelling of its root:
+    /// macOS FSEvents reports /private/var/... for a root under /var, and the
+    /// target path for a symlinked root, so `cass index --watch` on macOS
+    /// dropped every such event. The scan still uses the configured root, so
+    /// source paths keep the spelling a full scan records.
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_live_watch_matches_a_symlinked_root_by_its_canonical_path() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-sessions");
+        let session = real.join("rollout-2026-10-06T12-00-00.jsonl");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let linked = tmp.path().join("linked-sessions");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let roots = vec![(ConnectorKind::Codex, ScanRoot::local(linked.clone()))];
+
+        // The event arrives under the symlink's target, as FSEvents reports it.
+        let event = std::fs::canonicalize(&session).unwrap();
+        let classified = classify_paths(vec![event], &roots, false);
+        assert_eq!(classified.len(), 1, "{classified:?}");
+        assert_eq!(classified[0].1.path, linked, "scan the configured root");
+
+        // A path under neither spelling is not claimed.
+        let outside = tmp.path().join("elsewhere.jsonl");
+        std::fs::write(&outside, b"{}\n").unwrap();
+        assert!(classify_paths(vec![outside], &roots, false).is_empty());
+    }
+
+    /// s1nqh: FSEvents reports nothing for a provider's WAL commits while the
+    /// provider keeps the `-wal` open, so the database root is also polled.
+    #[test]
+    fn database_root_poller_queues_held_open_wal_writes_and_ignores_neighbours() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let database = tmp.path().join("sessions.db");
+        std::fs::write(&database, b"database").unwrap();
+        let neighbour = tmp.path().join("notes.txt");
+        std::fs::write(&neighbour, b"before").unwrap();
+        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, woken) = bounded(1);
+
+        let directory_root = vec![(
+            ConnectorKind::Codex,
+            ScanRoot::local(tmp.path().to_path_buf()),
+        )];
+        assert!(
+            database_root_poller(
+                &directory_root,
+                Duration::from_millis(50),
+                Arc::clone(&backlog),
+                Arc::clone(&rescan),
+                wake.clone(),
+            )
+            .is_none(),
+            "only database roots are polled"
+        );
+
+        let roots = vec![(ConnectorKind::Devin, ScanRoot::local(database.clone()))];
+        let _poller = database_root_poller(
+            &roots,
+            Duration::from_millis(50),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake,
+        )
+        .expect("a database root is polled");
+        std::thread::sleep(Duration::from_millis(300));
+
+        std::fs::write(&neighbour, b"after, and longer").unwrap();
+        let [wal, _shm] = database_sidecar_paths(&database);
+        let mut provider = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal)
+            .unwrap();
+        provider.write_all(b"commit frame").unwrap();
+        provider.sync_all().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !backlog.lock().unwrap().paths.contains(&wal) {
+            assert!(Instant::now() < deadline, "the WAL commit was never queued");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(woken.try_recv().is_ok(), "the watch loop is woken");
+        let queued = backlog.lock().unwrap().paths.clone();
+        assert!(!queued.contains(&neighbour), "{queued:?}");
+        assert!(!rescan.load(Ordering::Acquire));
+        drop(provider);
+    }
+
     #[test]
     fn classify_paths_keeps_distinct_source_provenance_for_one_mirror_path() {
         let tmp = TempDir::new().unwrap();
@@ -60486,6 +63427,133 @@ mod tests {
             .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(message_count, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn gh515_targeted_watch_once_finishes_admitted_batch_after_stop() -> Result<()> {
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        struct StopOnWatchScan {
+            progress: Arc<IndexingProgress>,
+            observed: Arc<AtomicBool>,
+        }
+
+        #[derive(Default)]
+        struct WatchScanVisitor(bool);
+
+        impl Visit for WatchScanVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" && value == "watch_once_scan" {
+                    self.0 = true;
+                }
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, format!("{value:?}").trim_matches('"'));
+            }
+        }
+
+        impl<S: Subscriber> Layer<S> for StopOnWatchScan {
+            fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+                let mut visitor = WatchScanVisitor::default();
+                event.record(&mut visitor);
+                if visitor.0 && !self.observed.swap(true, Ordering::SeqCst) {
+                    // This event follows the real connector scan. Stop is
+                    // requested after work admission, before that selected
+                    // batch's canonical and lexical writes finish.
+                    self.progress.request_stop();
+                }
+            }
+        }
+
+        for watch in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let data_dir = tmp.path().join("cass-data");
+            let session = tmp
+                .path()
+                .join(".codex/sessions/rollout-gh515-watch-stop.jsonl");
+            write_semantic_watch_once_codex_session(&session, "gh515-watch-stop", "initial")?;
+            let mut opts = semantic_watch_once_opts(
+                &data_dir,
+                &session,
+                Arc::new(IndexingProgress::default()),
+            );
+            opts.semantic = false;
+            opts.watch = watch;
+            run_index(opts.clone(), None)?;
+
+            let marker = "gh515admittedtargetedbatch";
+            write_semantic_watch_once_codex_session(&session, "gh515-watch-stop", marker)?;
+            // Make this a changed source without depending on filesystem
+            // timestamp resolution or a scheduling delay between runs.
+            fs::File::options().write(true).open(&session)?.set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(2)),
+            )?;
+            let progress = Arc::new(IndexingProgress::default());
+            opts.progress = Some(Arc::clone(&progress));
+            let observed = Arc::new(AtomicBool::new(false));
+            let subscriber = Registry::default().with(StopOnWatchScan {
+                progress,
+                observed: Arc::clone(&observed),
+            });
+            let result =
+                tracing::subscriber::with_default(subscriber, || run_index(opts.clone(), None));
+            assert!(
+                observed.load(Ordering::SeqCst),
+                "targeted scan was not admitted"
+            );
+            let error = result.expect_err("the admitted stop must remain an interrupted result");
+            assert!(
+                error.downcast_ref::<IndexInterrupted>().is_some(),
+                "{error:#}"
+            );
+
+            let storage = FrankenStorage::open(&opts.db_path)?;
+            let committed = watch_lexical_canonical_rows(&storage);
+            assert_eq!(committed.len(), 2);
+            assert!(committed.iter().all(|row| row.3.contains(marker)));
+            assert_eq!(
+                storage.raw().query_row_map(
+                    "SELECT COUNT(*) FROM meta WHERE key LIKE 'watch_lexical_replay_v1:%'",
+                    &[],
+                    |row| row.get_typed::<i64>(0),
+                )?,
+                0,
+                "the admitted batch must finish lexical publication and clear its recovery debt"
+            );
+            storage.close()?;
+            let index_path = index_dir(&data_dir)?;
+            let published = watch_lexical_search_ids(&index_path, marker);
+            assert_eq!(published.len(), 2);
+            assert!(fs::read(data_dir.join("index-run.lock"))?.is_empty());
+
+            opts.progress = Some(Arc::new(IndexingProgress::default()));
+            run_index(opts.clone(), None)?;
+            let recovered = FrankenStorage::open(&opts.db_path)?;
+            assert_eq!(watch_lexical_canonical_rows(&recovered), committed);
+            assert_eq!(
+                recovered
+                    .raw()
+                    .query_row_map("PRAGMA integrity_check", &[], |row| {
+                        row.get_typed::<String>(0)
+                    })?,
+                "ok"
+            );
+            assert!(
+                recovered
+                    .raw()
+                    .query("PRAGMA foreign_key_check")?
+                    .is_empty()
+            );
+            recovered.close()?;
+            assert_eq!(watch_lexical_search_ids(&index_path, marker), published);
+            assert!(fs::read(data_dir.join("index-run.lock"))?.is_empty());
+        }
+        Ok(())
     }
 
     fn write_semantic_watch_once_codex_session(path: &Path, id: &str, marker: &str) -> Result<()> {
@@ -61883,6 +64951,212 @@ mod tests {
         );
     }
 
+    /// GH#510: a deterministic bounded-guard NoMem used to re-run the split,
+    /// the solo retry and the deferral on every watch tick forever. A
+    /// deferred conversation now waits out an exponential backoff (counted in
+    /// a ledger) without an ingest attempt, keeps the watermark held, and is
+    /// forgotten once it ingests.
+    #[test]
+    #[serial]
+    fn watch_reindex_backs_off_a_repeatedly_deferred_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-backoff");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-oom-defer-backoff.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-oom-defer-backoff","messages":[{{"role":"user","text":"back off","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+        let tick = || {
+            reindex_paths(
+                &opts,
+                vec![amp_file.clone()],
+                &roots,
+                &state,
+                &storage,
+                &t_index,
+                &index_path,
+                false,
+            )
+            .unwrap()
+        };
+        let only_entry = || {
+            let ledger = WatchNomemDeferrals::load(&data_dir);
+            assert_eq!(ledger.entries.len(), 1, "one deferred conversation");
+            ledger.entries.into_values().next().unwrap()
+        };
+        let expire_backoff = || {
+            let mut ledger = WatchNomemDeferrals::load(&data_dir);
+            for entry in ledger.entries.values_mut() {
+                entry.next_retry_at_ms = 0;
+            }
+            ledger.save(&data_dir);
+        };
+
+        // Tick 1: attempted, deferred, scheduled one minute out.
+        assert_eq!(tick(), 1);
+        let first = only_entry();
+        assert_eq!(first.deferrals, 1);
+        assert_eq!(first.next_retry_at_ms - first.last_deferred_at_ms, 60_000);
+        assert!(load_watch_state(&data_dir).is_empty());
+
+        // Tick 2, inside the backoff: no ingest attempt. An attempt would
+        // NoMem again under the injection and count a second deferral.
+        assert_eq!(tick(), 0, "a backed-off conversation is not ingested");
+        assert_eq!(only_entry(), first, "no attempt inside the backoff");
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "the watermark stays held for a backed-off conversation"
+        );
+
+        // Backoff elapsed: attempted again, and the backoff doubles.
+        expire_backoff();
+        assert_eq!(tick(), 1);
+        let second = only_entry();
+        assert_eq!(second.deferrals, 2);
+        assert_eq!(second.first_deferred_at_ms, first.first_deferred_at_ms);
+        assert_eq!(
+            second.next_retry_at_ms - second.last_deferred_at_ms,
+            120_000
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "backoff never turns a bounded-guard NoMem into a quarantine"
+        );
+
+        // The trigger goes away: the next attempt ingests, the ledger forgets
+        // the conversation and the watermark advances.
+        drop(solo_oom_guard);
+        drop(oom_guard);
+        expire_backoff();
+        assert_eq!(tick(), 1);
+        assert!(WatchNomemDeferrals::load(&data_dir).entries.is_empty());
+        assert!(
+            load_watch_state(&data_dir).contains_key(&ConnectorKind::Amp),
+            "the watermark advances once the deferred conversation ingests"
+        );
+    }
+
+    /// GH#510: status/health surface watcher deferrals through the ingest
+    /// quarantine summary without calling them a quarantine.
+    #[test]
+    #[serial]
+    fn ingest_quarantine_summary_counts_watch_nomem_deferrals() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("deferral-summary");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let deferral = |source: &str| WatchNomemDeferral {
+            agent: "amp".to_string(),
+            source_path: source.to_string(),
+            external_id: None,
+            deferrals: 3,
+            first_deferred_at_ms: 1_700_000_000_000,
+            last_deferred_at_ms: 1_700_000_100_000,
+            next_retry_at_ms: 1_700_000_340_000,
+            indexed_text_bytes: 525,
+        };
+        let empty = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(empty.deferred_conversations, 0);
+        assert!(empty.recommended_action.is_none());
+
+        let mut ledger = WatchNomemDeferrals::default();
+        ledger
+            .entries
+            .insert("a".to_string(), deferral("/logs/a.json"));
+        ledger
+            .entries
+            .insert("b".to_string(), deferral("/logs/b.json"));
+        ledger.save(&data_dir);
+        let deferred = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(deferred.deferred_conversations, 2);
+        assert_eq!(deferred.quarantined_conversations, 0);
+        assert_eq!(deferred.status, "ok", "a deferral is not a quarantine");
+        let action = deferred
+            .recommended_action
+            .expect("deferrals get an action");
+        assert!(
+            action.starts_with("2 conversation(s) are deferred"),
+            "{action}"
+        );
+        assert!(action.contains("cass quarantine list --json"), "{action}");
+
+        // A real quarantine keeps its own action; the deferral count stays.
+        let mut state = crate::indexer::quarantine::QuarantineState::default();
+        state.entries.insert(
+            "conv-q::v1".to_string(),
+            crate::indexer::quarantine::QuarantineRecord {
+                first_attempt_at: chrono::Utc::now(),
+                last_attempt_at: chrono::Utc::now(),
+                attempt_count: 1,
+                last_reason: "ingest_oom".to_string(),
+                cass_version_at_quarantine: None,
+            },
+        );
+        state.save(&data_dir).unwrap();
+        let both = conversation_ingest_quarantine_summary(&data_dir);
+        assert_eq!(both.deferred_conversations, 2);
+        assert_eq!(both.status, "degraded");
+        assert!(
+            both.recommended_action
+                .as_deref()
+                .is_some_and(|action| action.starts_with("Run `cass quarantine list --json`")),
+            "{:?}",
+            both.recommended_action
+        );
+    }
+
+    #[test]
+    fn watch_nomem_deferral_backoff_doubles_to_one_hour() {
+        let backoffs: Vec<i64> = (1..=8).map(watch_nomem_deferral_backoff_ms).collect();
+        assert_eq!(
+            backoffs,
+            [
+                60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000, 3_600_000
+            ]
+        );
+        assert_eq!(watch_nomem_deferral_backoff_ms(u32::MAX), 3_600_000);
+    }
+
     /// #364 gate: a *large* conversation whose solo isolate-retry also OOMs
     /// must still be deferred — not quarantined — when the host reports ample
     /// available memory. Ample memory proves the typed NoMem is a
@@ -62096,7 +65370,7 @@ mod tests {
         std::fs::create_dir_all(&xdg).unwrap();
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
-        let _lexical_oom_guard = set_env("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM", "1");
+        let _lexical_oom_guard = inject_incremental_lexical_update_test_oom();
 
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -66650,6 +69924,12 @@ mod tests {
         assert!(
             !sidecar_path.exists(),
             "GH #436: a failed read-path repair must not leave index-run.lock.meta behind"
+        );
+        assert!(
+            !archive_lease::ArchiveWriteLease::path(&db_path)
+                .unwrap()
+                .exists(),
+            "an unopenable archive must not create an archive writer lease"
         );
     }
 

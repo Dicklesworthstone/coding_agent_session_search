@@ -11,6 +11,7 @@ import {
   getConversationsByTimeRange,
   getRecentConversations,
   getStatistics,
+  normalizeSearchTimeRange,
   searchConversations,
 } from "./database.js";
 import { parseRouteIdSegment } from "./router.js";
@@ -40,6 +41,7 @@ function createEmptySearchFilters() {
 // Module state
 let currentQuery = "";
 let currentFilters = createEmptySearchFilters();
+let currentFilterError = null;
 let currentSearchMode = "auto"; // 'auto', 'prose', or 'code'
 let currentResults = [];
 let currentPage = 0;
@@ -129,19 +131,6 @@ function focusResultCardAtIndex(index, align = "start") {
   return true;
 }
 
-function parseTimestampFilterValue(value) {
-  if (value === undefined || value === null || value === "") {
-    return null;
-  }
-
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(numeric)) {
-    return null;
-  }
-
-  return numeric;
-}
-
 function calculateTimeFilterRange(value) {
   const now = Date.now();
   const day = 24 * 60 * 60 * 1000;
@@ -156,7 +145,10 @@ function calculateTimeFilterRange(value) {
     case "year":
       return { since: now - 365 * day, until: now, timePreset: value };
     default:
-      return createEmptySearchFilters();
+      if (value === "" || value === null) {
+        return createEmptySearchFilters();
+      }
+      throw new RangeError("Unknown time filter");
   }
 }
 
@@ -165,39 +157,33 @@ function normalizeRouteFilters(routeSearch = {}) {
     routeSearch.agent === undefined || routeSearch.agent === null || routeSearch.agent === ""
       ? null
       : String(routeSearch.agent);
-  const timePreset =
-    typeof routeSearch.timePreset === "string" && routeSearch.timePreset !== ""
-      ? routeSearch.timePreset
-      : typeof routeSearch.time === "string" && routeSearch.time !== ""
-        ? routeSearch.time
-        : null;
-
-  if (
-    timePreset === "today" ||
-    timePreset === "week" ||
-    timePreset === "month" ||
-    timePreset === "year"
-  ) {
-    return {
-      agent,
-      ...calculateTimeFilterRange(timePreset),
-    };
+  const presets = ["today", "week", "month", "year", "custom"];
+  const suppliedPresets = [routeSearch.timePreset, routeSearch.time]
+    .filter((value) => value !== undefined && value !== null && value !== "");
+  if (suppliedPresets.some((value) => !presets.includes(value))) {
+    throw new RangeError("Unknown time filter; use today, week, month, year or custom");
   }
+  if (new Set(suppliedPresets).size > 1) {
+    throw new RangeError("Conflicting time and timePreset filters");
+  }
+  const timePreset = suppliedPresets[0] ?? null;
+  const { since, until } = normalizeSearchTimeRange(routeSearch.since, routeSearch.until);
+  const hasBounds = since !== null || until !== null;
 
-  const since = parseTimestampFilterValue(routeSearch.since);
-  const until = parseTimestampFilterValue(routeSearch.until);
-  if (since !== null && until !== null && since > until) {
-    return {
-      ...createEmptySearchFilters(),
-      agent,
-    };
+  // Explicit bounds are authoritative, including snapshots returned by
+  // getSearchState(). Never overwrite them with a recalculated relative range.
+  if (timePreset && timePreset !== "custom" && !hasBounds) {
+    return { agent, ...calculateTimeFilterRange(timePreset) };
+  }
+  if (timePreset === "custom" && !hasBounds) {
+    throw new RangeError("A custom time filter needs a since or until bound");
   }
 
   return {
     agent,
     since,
     until,
-    timePreset: since !== null || until !== null ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,
+    timePreset: hasBounds ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,
   };
 }
 
@@ -599,7 +585,12 @@ function updateSearchModeIndicator(query) {
  * Update time filter values
  */
 function updateTimeFilter(value) {
+  // The custom option represents existing route bounds, not "All time".
+  if (value === SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE) {
+    return;
+  }
   const nextFilters = calculateTimeFilterRange(value);
+  currentFilterError = null;
   currentFilters.since = nextFilters.since;
   currentFilters.until = nextFilters.until;
   currentFilters.timePreset = nextFilters.timePreset;
@@ -650,6 +641,11 @@ async function handleSearch(query) {
  * Filtering and ordering stay in SQL. Only the current page is retained.
  */
 function readSearchPage(page) {
+  // Query/agent/mode edits must not turn a rejected route into an
+  // unrestricted search. Only a corrected route/time selection can clear it.
+  if (currentFilterError) {
+    throw new RangeError(currentFilterError);
+  }
   const limit = SEARCH_CONFIG.PAGE_SIZE + 1;
   const offset = page * SEARCH_CONFIG.PAGE_SIZE;
   if (currentQuery) {
@@ -722,7 +718,11 @@ async function loadSearchPage(page, focusResults = false) {
       return;
     }
     console.error("[Search] Search error:", error);
-    showError("Search failed. Please try again.");
+    showError(
+      error instanceof SyntaxError || error instanceof RangeError
+        ? error.message
+        : "Search failed. Please try again.",
+    );
   } finally {
     if (isCurrentSearchEpoch(epoch)) {
       isSearching = false;
@@ -1155,12 +1155,33 @@ export async function setSearchRoute(routeSearch = {}, options = {}) {
     return;
   }
 
-  clearTimeout(searchTimeout);
-  currentFilters = normalizeRouteFilters(routeSearch);
-  syncFilterControls();
-
+  // Cancel old page work before validation, including the failure path.
+  invalidateSearchResults();
   const normalizedQuery = (routeSearch.query ?? routeSearch.q ?? "").toString();
   elements.searchInput.value = normalizedQuery;
+  currentQuery = normalizedQuery.trim();
+  try {
+    currentFilters = normalizeRouteFilters(routeSearch);
+    currentFilterError = null;
+  } catch (error) {
+    if (!(error instanceof RangeError)) {
+      throw error;
+    }
+    currentFilterError = error.message;
+    currentFilters = {
+      ...createEmptySearchFilters(),
+      // Correcting a bad time range must not also discard the agent filter.
+      agent: routeSearch.agent === undefined || routeSearch.agent === null || routeSearch.agent === ""
+        ? null
+        : String(routeSearch.agent),
+      timePreset: SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE,
+    };
+    syncFilterControls();
+    updateSearchModeIndicator(currentQuery);
+    showError(currentFilterError);
+    return;
+  }
+  syncFilterControls();
 
   if (runSearch) {
     await handleSearch(normalizedQuery);
@@ -1180,6 +1201,7 @@ export function clearSearch(options = {}) {
   invalidateSearchResults();
   currentQuery = "";
   currentFilters = createEmptySearchFilters();
+  currentFilterError = null;
   currentSearchMode = "auto";
 
   if (elements.searchInput) {
@@ -1217,6 +1239,7 @@ export function getSearchState() {
   return {
     query: currentQuery,
     filters: { ...currentFilters },
+    filterError: currentFilterError,
     searchMode: currentSearchMode,
     resultCount: currentResults.length,
     page: currentPage + 1,

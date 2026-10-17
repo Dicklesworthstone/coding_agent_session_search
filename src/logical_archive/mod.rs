@@ -1,6 +1,6 @@
 //! Explicit logical-archive commands. Kept outside the ordinary search startup
 //! path. Only explicit import flags opt into canonical-only lexical rebuilding
-//! or the reviewed v20 -> v21 schema migration; export and verification never do so.
+//! or the reviewed v20/v21 -> v22 schema migration; export and verification never do so.
 
 mod codec;
 mod export;
@@ -108,8 +108,9 @@ enum Operation {
         /// reviewed migration-projection match. This never grants overwrite permission.
         #[arg(long)]
         if_identical: bool,
-        /// Permit only the reviewed storage-schema v20 -> v21 migration. The
-        /// canonical table/column/primary-key descriptors must be identical.
+        /// Permit only the reviewed storage-schema v20 or v21 -> v22 migration.
+        /// Canonical table/column/primary-key descriptors must match the current
+        /// ones, apart from v22's `forgotten_sources`, which is created empty.
         #[arg(long)]
         allow_compatible_schema: bool,
         /// Rebuild lexical search from the restored DB, without scanning providers.
@@ -196,6 +197,27 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
         return (5, "logical-archive-integrity", false);
     }
     (9, "logical-archive-error", false)
+}
+
+/// The `archive` subcommand tree, for the main CLI's help and command
+/// schemas. This parser's root-level globals (`--db`, `--data-dir`, `--json`)
+/// are copied onto the subcommand unbuilt. Building this root first instead
+/// adds clap's own `help` subcommand (a duplicate under the main CLI) and
+/// freezes the subtree, so the main CLI's propagated `--robot-format` stays
+/// unbuilt and `cass help archive` panics inside clap.
+pub fn clap_commands() -> Vec<clap::Command> {
+    use clap::CommandFactory;
+    let root = Cli::command();
+    let globals: Vec<clap::Arg> = root
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .cloned()
+        .collect();
+    root.find_subcommand("archive")
+        .cloned()
+        .map(|archive| archive.args(globals))
+        .into_iter()
+        .collect()
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {

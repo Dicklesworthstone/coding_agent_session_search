@@ -340,6 +340,232 @@ fn gh494_legacy_cursor_without_its_generation_replays_instead_of_guessing() {
     gh494_missing_staged_generation_replays_canonical_content(false, true);
 }
 
+/// GH #494 retest: a refused finalize leaves its staged candidate with an EOF
+/// checkpoint. When the candidate holds MORE documents than that checkpoint
+/// counted, no replay remains to reconcile them, so resuming it can only end
+/// in the same GH #457 count refusal on every later run. The resume must
+/// retain the candidate and rebuild from zero instead. An EOF checkpoint whose
+/// count matches its candidate still resumes into publication.
+fn gh494_eof_resume_with_candidate_count(surplus: bool) {
+    #[cfg(windows)]
+    const DISK_FULL: i32 = 112;
+    #[cfg(not(windows))]
+    const DISK_FULL: i32 = libc::ENOSPC;
+
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("db.sqlite");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    ensure_fts_schema(&storage);
+    seed_lexical_rebuild_fixture(&storage);
+    drop(storage);
+    let index_path = index_dir(&data_dir).unwrap();
+    let old_messages = (0..3)
+        .map(|idx| {
+            let mut message = norm_msg(idx, 1_700_000_000_000 + idx);
+            message.content = format!("priorgenerationneedle {idx}");
+            message
+        })
+        .collect();
+    let old_conversation = norm_conv(Some("prior-generation"), old_messages);
+    let mut old = TantivyIndex::open_or_create(&index_path).unwrap();
+    old.add_messages_with_conversation_id(&old_conversation, &old_conversation.messages, Some(900))
+        .unwrap();
+    old.commit().unwrap();
+    drop(old);
+
+    // A complete staged candidate whose publication is refused at the swap.
+    #[cfg(target_os = "linux")]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+        DISK_FULL,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+        DISK_FULL,
+    );
+    rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
+        .expect_err("the first publication must reach the injected refusal");
+    drop(fault);
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    assert_eq!(gh494_query_count(&scratch, "fixture"), 4);
+    let mut interrupted = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert!(!interrupted.completed);
+    // The terminal commit's progress may still be a pending commit, which
+    // the next run promotes; the reporter's refused state was exactly that.
+    assert_eq!(
+        interrupted.reported_processed_conversations(),
+        2,
+        "cursor at EOF"
+    );
+    assert_eq!(interrupted.reported_indexed_docs(), 4);
+    if surplus {
+        // The reporter's state: the candidate holds every document, and the
+        // carried checkpoint counted fewer of them.
+        match interrupted.pending.as_mut() {
+            Some(pending) => pending.indexed_docs = 3,
+            None => interrupted.indexed_docs = 3,
+        }
+        persist_lexical_rebuild_state(&index_path, &interrupted).unwrap();
+    }
+    let candidate_manifest = fs::read(scratch.join("MANIFEST")).unwrap();
+
+    let rebuilt = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    assert_eq!(rebuilt.indexed_docs, 4);
+    assert_eq!(rebuilt.observed_conversations, 2);
+    assert_eq!(gh494_query_count(&index_path, "fixture"), 4);
+    assert_eq!(gh494_query_count(&index_path, "priorgenerationneedle"), 0);
+    let completed = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert!(completed.completed);
+    assert_eq!(completed.indexed_docs, 4);
+    let quarantines: Vec<_> = fs::read_dir(index_path.parent().unwrap())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lexical-rebuild-quarantine-")
+        })
+        .collect();
+    if !surplus {
+        assert!(
+            quarantines.is_empty(),
+            "a matching EOF checkpoint resumes its candidate; it is not discarded"
+        );
+        return;
+    }
+    assert_eq!(quarantines.len(), 1);
+    let retained = load_lexical_rebuild_state(&quarantines[0].path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.indexed_docs, 3);
+    assert_eq!(retained.processed_conversations, 2);
+    assert!(!retained.completed);
+    assert_eq!(
+        fs::read(quarantines[0].path().join("index").join("MANIFEST")).unwrap(),
+        candidate_manifest,
+        "the refused candidate is retained byte-for-byte"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_eof_resume_with_a_surplus_rebuilds_instead_of_repeating_the_count_refusal() {
+    gh494_eof_resume_with_candidate_count(true);
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_eof_resume_with_a_matching_count_publishes_its_candidate() {
+    gh494_eof_resume_with_candidate_count(false);
+}
+
+/// GH #494, the mid-run half: the reporter's first refused run resumed a
+/// checkpoint short of EOF and was refused at validate_candidate only after
+/// replaying the rest of the archive (516 s). Its candidate held documents in
+/// the committed prefix that the checkpoint never counted. The #440 upsert
+/// window reconciles only replayed identities, so no resume could certify
+/// that candidate. The EOF resume check cannot see this case before the
+/// replay. The refusal must retain the candidate with the checkpoint that
+/// failed and rebuild from zero in the same run, not exit and leave the
+/// rebuild to the next run.
+#[test]
+#[serial_test::serial]
+fn gh494_mid_run_resume_with_an_uncounted_prefix_rebuilds_in_the_same_run() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("db.sqlite");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    ensure_fts_schema(&storage);
+    seed_lexical_rebuild_fixture(&storage);
+    let first_conversation_id =
+        resolve_legacy_lexical_rebuild_conversation_id_from_offset(&storage, 1)
+            .unwrap()
+            .expect("the fixture's first conversation");
+    drop(storage);
+    rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    let index_path = index_dir(&data_dir).unwrap();
+    let mut checkpoint = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert_eq!(checkpoint.indexed_docs, 4);
+    assert_eq!(checkpoint.processed_conversations, 2);
+
+    // An interrupted staged candidate that already holds every document
+    // (two per conversation), with a checkpoint whose cursor stops after the
+    // first conversation and counts only one of that conversation's two.
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    fs::create_dir(&scratch).unwrap();
+    for entry in walkdir::WalkDir::new(&index_path).min_depth(1) {
+        let entry = entry.unwrap();
+        let target = scratch.join(entry.path().strip_prefix(&index_path).unwrap());
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(target).unwrap();
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+    fs::write(scratch.join("failure-evidence"), "uncounted-prefix").unwrap();
+    checkpoint.completed = false;
+    checkpoint.pending = None;
+    checkpoint.committed_offset = 1;
+    checkpoint.committed_conversation_id = Some(first_conversation_id);
+    checkpoint.processed_conversations = 1;
+    checkpoint.indexed_docs = 1;
+    checkpoint.execution_mode = Some(LexicalRebuildExecutionMode::StagedSingleIndex);
+    persist_lexical_rebuild_state(&index_path, &checkpoint).unwrap();
+
+    let rebuilt = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
+        .expect("an uncertifiable mid-run candidate is rebuilt from zero in the same run");
+    assert_eq!(rebuilt.observed_conversations, 2);
+    assert_eq!(rebuilt.indexed_docs, 4);
+    let completed = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert!(completed.completed);
+    assert_eq!(completed.processed_conversations, 2);
+    assert_eq!(completed.indexed_docs, 4);
+    verify_published_lexical_doc_count(&index_path, 4, "gh494 rebuilt publication").unwrap();
+    assert_eq!(gh494_query_count(&index_path, "fixture"), 4);
+
+    let quarantines: Vec<_> = fs::read_dir(index_path.parent().unwrap())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lexical-rebuild-quarantine-")
+        })
+        .collect();
+    assert_eq!(
+        quarantines.len(),
+        1,
+        "exactly the refused candidate must be retained"
+    );
+    let quarantine = quarantines[0].path();
+    assert_eq!(
+        fs::read(quarantine.join("index").join("failure-evidence")).unwrap(),
+        b"uncounted-prefix"
+    );
+    let retained = load_lexical_rebuild_state(&quarantine).unwrap().unwrap();
+    assert!(!retained.completed);
+    assert_eq!(
+        retained.processed_conversations, 2,
+        "the candidate was refused after its replay reached EOF"
+    );
+    assert!(
+        retained.indexed_docs < 4,
+        "the quarantine keeps the count that could not certify the candidate: {}",
+        retained.indexed_docs
+    );
+
+    // A plain rerun reuses the certified generation instead of refusing again.
+    let rerun = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+    assert_eq!(rerun.indexed_docs, 4);
+    assert!(!rerun.exact_checkpoint_persisted);
+}
+
 #[test]
 #[serial_test::serial]
 fn gh494_explicit_live_resume_ignores_unrelated_scratch_generation() {

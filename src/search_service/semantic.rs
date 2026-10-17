@@ -141,19 +141,18 @@ impl FileStamp {
 }
 
 fn same_metadata(left: &Metadata, right: &Metadata) -> bool {
-    if left.len() != right.len() || left.modified().ok() != right.modified().ok() {
-        return false;
-    }
+    let same_contents = left.len() == right.len() && left.modified().ok() == right.modified().ok();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
-            != (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
-        {
-            return false;
-        }
+        same_contents
+            && (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
+                == (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
     }
-    true
+    #[cfg(not(unix))]
+    {
+        same_contents
+    }
 }
 
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {

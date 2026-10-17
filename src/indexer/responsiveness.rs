@@ -39,6 +39,8 @@
 //! [`user_idle_gate`]. That gate is deliberately *not* consulted by foreground
 //! indexing: a human who typed `cass index` wants it to run now.
 
+mod resident;
+
 use std::collections::VecDeque;
 use std::sync::{
     Arc, LazyLock, Mutex,
@@ -862,6 +864,9 @@ pub(crate) struct GovernorTelemetry {
     /// and the quantiles the conformal policy is emitting for each
     /// signal × severity pairing.
     pub calibration: Option<CalibrationTelemetry>,
+    /// Live resident-memory observation, absent before the sampler has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<resident::MemoryTelemetry>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -1406,6 +1411,7 @@ impl Governor {
 
     fn run(&self) {
         loop {
+            resident::sample(&self.cfg);
             self.step_once();
             thread::sleep(self.cfg.tick);
         }
@@ -1567,6 +1573,7 @@ impl Governor {
             last_reason,
             recent_decisions: recent,
             calibration,
+            memory: resident::telemetry(),
         }
     }
 }
@@ -1593,7 +1600,9 @@ pub(crate) fn current_capacity_pct() -> u32 {
     }
     let g = GOVERNOR.clone();
     g.ensure_started();
-    g.current_capacity.load(Ordering::Relaxed)
+    g.current_capacity
+        .load(Ordering::Relaxed)
+        .min(resident::capacity_pct())
 }
 
 pub(crate) fn disabled_via_env() -> bool {
@@ -1613,7 +1622,11 @@ pub(crate) fn effective_worker_count(desired: usize) -> usize {
 /// producer-side in-flight byte budgets.
 pub(crate) fn effective_inflight_byte_limit(desired_bytes: usize) -> usize {
     let g = GOVERNOR.clone();
-    scale_inflight_byte_limit(desired_bytes, current_capacity_pct(), &g.cfg)
+    resident::limit_inflight_bytes(scale_inflight_byte_limit(
+        desired_bytes,
+        current_capacity_pct(),
+        &g.cfg,
+    ))
 }
 
 /// Return the configured governor policy without starting the background
@@ -1653,6 +1666,7 @@ pub(crate) fn telemetry_snapshot_passive() -> GovernorTelemetry {
         last_reason: None,
         recent_decisions: Vec::new(),
         calibration,
+        memory: resident::telemetry(),
     }
 }
 
@@ -1723,18 +1737,32 @@ fn cgroup_memory_budget(
     // cgroup v1 reports "no limit" as a page-rounded i64::MAX.
     const V1_UNLIMITED_FLOOR: u64 = 1 << 62;
     let mut tightest: Option<CgroupMemoryBudget> = None;
-    let mut consider = |limit: u64, usage: u64, inactive_file: u64| {
+    let mut consider = |limit: u64, usage: u64, inactive_file: u64, limit_level: String| {
         let headroom = limit
             .saturating_sub(usage.saturating_sub(inactive_file))
             .min(limit);
-        let level = CgroupMemoryBudget { limit, headroom };
-        tightest = Some(match tightest {
-            Some(current) => CgroupMemoryBudget {
-                limit: current.limit.min(level.limit),
-                headroom: current.headroom.min(level.headroom),
+        tightest = Some(match tightest.take() {
+            // The walk runs leaf to root, so on a tie the deeper level keeps
+            // the attribution.
+            Some(current) if current.limit <= limit => CgroupMemoryBudget {
+                headroom: current.headroom.min(headroom),
+                ..current
             },
-            None => level,
+            Some(current) => CgroupMemoryBudget {
+                limit,
+                headroom: current.headroom.min(headroom),
+                limit_level,
+            },
+            None => CgroupMemoryBudget {
+                limit,
+                headroom,
+                limit_level,
+            },
         });
+    };
+    let level_name = |version: &str, base: &std::path::Path, level: &std::path::Path| {
+        let relative = level.strip_prefix(base).unwrap_or(level);
+        format!("{version}:/{}", relative.display())
     };
     for line in proc_self_cgroup.lines() {
         let mut fields = line.splitn(3, ':');
@@ -1760,7 +1788,12 @@ fn cgroup_memory_budget(
                 if let Some(limit) = number(read(level.join("memory.max"))) {
                     let usage = number(read(level.join("memory.current"))).unwrap_or(0);
                     let inactive = stat_field(read(level.join("memory.stat")), "inactive_file");
-                    consider(limit, usage, inactive.unwrap_or(0));
+                    consider(
+                        limit,
+                        usage,
+                        inactive.unwrap_or(0),
+                        level_name("cgroup_v2", &base, &level),
+                    );
                 }
             } else if let Some(limit) = number(read(level.join("memory.limit_in_bytes")))
                 && limit < V1_UNLIMITED_FLOOR
@@ -1769,7 +1802,12 @@ fn cgroup_memory_budget(
                 let stat = read(level.join("memory.stat"));
                 let inactive = stat_field(stat.clone(), "total_inactive_file")
                     .or_else(|| stat_field(stat, "inactive_file"));
-                consider(limit, usage, inactive.unwrap_or(0));
+                consider(
+                    limit,
+                    usage,
+                    inactive.unwrap_or(0),
+                    level_name("cgroup_v1", &base, &level),
+                );
             }
             if level == base || !level.pop() || !level.starts_with(&base) {
                 break;
@@ -1780,10 +1818,13 @@ fn cgroup_memory_budget(
 }
 
 #[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CgroupMemoryBudget {
     limit: u64,
     headroom: u64,
+    /// The level whose `memory.max` / `memory.limit_in_bytes` is `limit`,
+    /// e.g. `cgroup_v2:/user.slice/app.scope`.
+    limit_level: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -1817,24 +1858,67 @@ pub(crate) fn available_memory_bytes() -> Option<u64> {
 }
 
 pub(crate) fn total_memory_bytes() -> Option<u64> {
+    memory_total().map(|total| total.effective_bytes)
+}
+
+/// GH #496: the memory total budgets are sized from, the host total it was
+/// clamped from, and what set it. `status` reports all three, so an operator
+/// can see whether a `MemoryMax` or container limit actually reached this
+/// process instead of inferring it from derived budgets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", test)),
+    allow(dead_code)
+)]
+pub(crate) struct MemoryTotal {
+    pub(crate) effective_bytes: u64,
+    pub(crate) host_bytes: u64,
+    /// `host`, or the cgroup level whose limit is below the host total
+    /// (`cgroup_v2:/<path>` or `cgroup_v1:/<path>`).
+    pub(crate) limit_source: String,
+}
+
+pub(crate) fn memory_total() -> Option<MemoryTotal> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
         let host = proc_kib_field_bytes(&meminfo, "MemTotal:")?;
-        Some(current_cgroup_memory_budget().map_or(host, |budget| host.min(budget.limit)))
+        Some(clamp_memory_total(host, current_cgroup_memory_budget()))
     }
     #[cfg(target_os = "macos")]
     {
         let mut command = std::process::Command::new("sysctl");
         command.args(["-n", "hw.memsize"]);
-        bounded_telemetry_stdout(command)?
+        let host = bounded_telemetry_stdout(command)?
             .trim()
             .parse::<u64>()
-            .ok()
+            .ok()?;
+        Some(MemoryTotal {
+            effective_bytes: host,
+            host_bytes: host,
+            limit_source: "host".to_owned(),
+        })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn clamp_memory_total(host: u64, budget: Option<CgroupMemoryBudget>) -> MemoryTotal {
+    match budget {
+        Some(budget) if budget.limit < host => MemoryTotal {
+            effective_bytes: budget.limit,
+            host_bytes: host,
+            limit_source: budget.limit_level,
+        },
+        _ => MemoryTotal {
+            effective_bytes: host,
+            host_bytes: host,
+            limit_source: "host".to_owned(),
+        },
     }
 }
 
@@ -2046,6 +2130,10 @@ mod tests {
             .expect("a limited ancestor must produce a budget");
         assert_eq!(budget.limit, 10 * GIB);
         assert_eq!(budget.headroom, 8 * GIB, "10 - (3 - 1 reclaimable) GiB");
+        assert_eq!(
+            budget.limit_level, "cgroup_v2:/user.slice",
+            "the unlimited leaf must not take the slice's attribution"
+        );
 
         // A tighter leaf wins over the slice.
         let root = cgroup_fixture(&[
@@ -2059,9 +2147,58 @@ mod tests {
             budget,
             CgroupMemoryBudget {
                 limit: 2 * GIB,
-                headroom: GIB
+                headroom: GIB,
+                limit_level: "cgroup_v2:/user.slice/app.scope".to_owned(),
             }
         );
+
+        // The tightest headroom can sit at a different level from the
+        // tightest limit; the attribution follows the limit.
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", &format!("{}\n", 10 * GIB)),
+            ("user.slice/memory.current", &format!("{}\n", 9 * GIB)),
+            ("user.slice/app.scope/memory.max", &format!("{}\n", 4 * GIB)),
+            ("user.slice/app.scope/memory.current", "0\n"),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice/app.scope\n", root.path()).unwrap();
+        assert_eq!(
+            budget,
+            CgroupMemoryBudget {
+                limit: 4 * GIB,
+                headroom: GIB,
+                limit_level: "cgroup_v2:/user.slice/app.scope".to_owned(),
+            }
+        );
+    }
+
+    /// GH #496: `status` must say what set the memory total. A limit at or
+    /// above the host total changes nothing and is not named as the source.
+    #[test]
+    fn memory_total_names_the_cgroup_level_only_when_it_is_below_the_host() {
+        const GIB: u64 = 1 << 30;
+        let budget = |limit: u64| CgroupMemoryBudget {
+            limit,
+            headroom: limit,
+            limit_level: "cgroup_v2:/user.slice/run-r1.scope".to_owned(),
+        };
+        assert_eq!(
+            clamp_memory_total(64 * GIB, Some(budget(16 * GIB))),
+            MemoryTotal {
+                effective_bytes: 16 * GIB,
+                host_bytes: 64 * GIB,
+                limit_source: "cgroup_v2:/user.slice/run-r1.scope".to_owned(),
+            }
+        );
+        for unconstrained in [Some(budget(64 * GIB)), Some(budget(128 * GIB)), None] {
+            assert_eq!(
+                clamp_memory_total(64 * GIB, unconstrained),
+                MemoryTotal {
+                    effective_bytes: 64 * GIB,
+                    host_bytes: 64 * GIB,
+                    limit_source: "host".to_owned(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -2112,6 +2249,7 @@ mod tests {
         .unwrap();
         assert_eq!(budget.limit, 512 * MIB);
         assert_eq!(budget.headroom, 312 * MIB);
+        assert_eq!(budget.limit_level, "cgroup_v1:/docker/abc");
     }
 
     /// macOS load-average parser is pure so it runs on Linux CI too.

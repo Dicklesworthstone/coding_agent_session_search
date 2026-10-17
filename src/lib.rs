@@ -465,7 +465,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
-        /// Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy
+        /// Embedder for semantic indexing (hash, minilm, multilingual-minilm, external); defaults to semantic policy
         #[arg(long)]
         embedder: Option<String>,
 
@@ -504,6 +504,18 @@ pub enum Commands {
         /// indexed.
         #[arg(long, default_value_t = false)]
         background: bool,
+
+        /// Lexical-rebuild settings preset (GH #483). `bounded` is the
+        /// single-core, low-memory recipe for a wedged or memory-starved
+        /// archive: one rebuild worker and one page-prep thread, a one-page
+        /// pipeline, 64 conversations per fetch and a durable commit every
+        /// 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still
+        /// wins over the preset. Applies to any lexical rebuild this run
+        /// performs (`--full`, or resuming an interrupted rebuild); it never
+        /// changes what gets indexed. `--json` reports the values used under
+        /// `rebuild_profile`.
+        #[arg(long, value_enum, default_value_t = RebuildProfileArg::Default)]
+        rebuild_profile: RebuildProfileArg,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -628,7 +640,7 @@ pub enum Commands {
         // ==========================================================================
         /// Embedding model to use for semantic search.
         /// Available models depend on what's been downloaded.
-        /// Use `cass models --list` to see available options.
+        /// `cass models status --json` lists them.
         #[arg(long)]
         model: Option<String>,
 
@@ -638,7 +650,7 @@ pub enum Commands {
         rerank: bool,
 
         /// Reranker model to use (requires --rerank).
-        /// Use `cass models --list` to see available options.
+        /// Defaults to `ms-marco`, the only registered reranker.
         #[arg(long)]
         reranker: Option<String>,
 
@@ -1190,8 +1202,9 @@ pub enum Commands {
         robot_triage: bool,
 
         /// Show what `--fix` would change vs the current state. Read-only.
-        /// Optional `<REF>` compares against a prior run-id instead.
-        #[arg(long, hide = true)]
+        /// Optional `<REF>` compares against a prior run-id instead; with no
+        /// value it compares the current state, as robot-docs documents.
+        #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "current")]
         diff: Option<String>,
 
         /// Quarantine doctor runs older than `<ISO8601>`. Renames into
@@ -2611,7 +2624,7 @@ pub enum ModelsCommand {
         /// Semantic tier to backfill: fast or quality
         #[arg(long, default_value = "fast")]
         tier: String,
-        /// Embedder implementation: hash, minilm, or multilingual-minilm
+        /// Embedder implementation: hash, minilm, multilingual-minilm, or opt-in external
         #[arg(long)]
         embedder: Option<String>,
         /// Maximum canonical conversations to process in this batch
@@ -2840,6 +2853,25 @@ pub enum AgentsAction {
         /// Agent slug to re-enable
         agent: String,
     },
+}
+
+/// `cass index --rebuild-profile` (GH #483).
+#[derive(Copy, Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum RebuildProfileArg {
+    /// Host-sized defaults
+    #[default]
+    Default,
+    /// Single-core, low-memory rebuild for a wedged or memory-starved archive
+    Bounded,
+}
+
+impl From<RebuildProfileArg> for indexer::LexicalRebuildProfile {
+    fn from(profile: RebuildProfileArg) -> Self {
+        match profile {
+            RebuildProfileArg::Default => Self::Default,
+            RebuildProfileArg::Bounded => Self::Bounded,
+        }
+    }
 }
 
 /// Time bucketing for analytics aggregation.
@@ -5271,6 +5303,44 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
     ));
 }
 
+/// `cass robot-docs doctor` documents the doctor run-history surface as verbs
+/// (`cass doctor ls`, `undo <run-id>`, `diff [<ref>]`, `gc --before <ts>`,
+/// `capabilities`), but `doctor` takes them as flags, so every documented
+/// spelling failed with "unexpected argument". Map `rest[1]` onto its flag and
+/// return the correction note, or `None` when `rest[1]` is not such a verb.
+/// `gc` without `--before` becomes a bare `--gc-before`, so clap reports the
+/// missing value instead of running a plain doctor check.
+fn rewrite_doctor_history_verb(rest: &mut Vec<String>) -> Option<String> {
+    let verb = rest.get(1)?.to_ascii_lowercase();
+    let flag = match verb.as_str() {
+        "ls" => "--ls",
+        "undo" => "--undo",
+        "diff" => "--diff",
+        "explain" => "--explain",
+        "watch" => "--watch",
+        "capabilities" => "--emit-capabilities",
+        "gc" => {
+            rest.remove(1);
+            if let Some(before) = rest.iter_mut().find(|arg| *arg == "--before") {
+                *before = "--gc-before".to_string();
+            } else if let Some(before) = rest.iter_mut().find(|arg| arg.starts_with("--before=")) {
+                *before = before.replacen("--before=", "--gc-before=", 1);
+            } else {
+                rest.insert(1, "--gc-before".to_string());
+            }
+            return Some(
+                "'doctor gc --before <ts>' → 'doctor --gc-before <ts>' (doctor run-history GC)"
+                    .to_string(),
+            );
+        }
+        _ => return None,
+    };
+    rest[1] = flag.to_string();
+    Some(format!(
+        "'doctor {verb}' → 'doctor {flag}' (doctor run-history surface)"
+    ))
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -5300,6 +5370,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 22. **Current-session shorthand**: `current --json` → `sessions --current --json`
 /// 23. **Structured help recovery**: `help search --json` → `robot-docs commands`
 /// 24. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 25. **Doctor run-history verbs**: `doctor ls|undo|diff|gc --before|capabilities` → flags
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -6003,6 +6074,13 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             "'doctor archive-normalize' → 'doctor --archive-normalize' (fingerprinted additive archive metadata normalization)"
                 .into(),
         );
+    }
+    if rest
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
+        && let Some(correction) = rewrite_doctor_history_verb(&mut rest)
+    {
+        corrections.push(correction);
     }
     if rest
         .first()
@@ -6812,6 +6890,78 @@ mod canonical_top_level_command_tests {
         }
     }
 
+    /// `cass robot-docs doctor` documents the run-history surface as verbs;
+    /// every spelling it shows must parse to the matching doctor flag, the
+    /// flag spellings must keep working, and a malformed or unknown verb must
+    /// still be a usage error rather than a plain doctor run.
+    #[test]
+    fn doctor_history_verbs_parse_as_robot_docs_document_them() {
+        let doctor = |args: &[&str]| {
+            let (normalized, _) = normalize_args(args.iter().map(ToString::to_string).collect());
+            Cli::try_parse_from(normalized)
+                .ok()
+                .and_then(|cli| cli.command)
+        };
+        assert!(matches!(
+            doctor(&["cass", "doctor", "ls", "--json"]),
+            Some(Commands::Doctor { ls: true, .. })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "undo", "latest", "--json"]),
+            Some(Commands::Doctor { undo: Some(id), .. }) if id == "latest"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "diff", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "current"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "diff", "run-a..run-b", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "run-a..run-b"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "gc", "--before", "2026-01-01T00:00:00Z", "--yes", "--json"]),
+            Some(Commands::Doctor { gc_before: Some(before), yes: true, .. })
+                if before == "2026-01-01T00:00:00Z"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "gc", "--before=2026-01-01T00:00:00Z", "--yes"]),
+            Some(Commands::Doctor { gc_before: Some(before), yes: true, .. })
+                if before == "2026-01-01T00:00:00Z"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "capabilities", "--json"]),
+            Some(Commands::Doctor {
+                emit_capabilities: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "explain", "latest", "--json"]),
+            Some(Commands::Doctor { explain: Some(id), .. }) if id == "latest"
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "watch", "--watch-iterations", "1"]),
+            Some(Commands::Doctor {
+                watch: true,
+                watch_iterations: 1,
+                ..
+            })
+        ));
+        // The flag spellings keep working.
+        assert!(matches!(
+            doctor(&["cass", "doctor", "--ls", "--json"]),
+            Some(Commands::Doctor { ls: true, .. })
+        ));
+        assert!(matches!(
+            doctor(&["cass", "doctor", "--diff", "--json"]),
+            Some(Commands::Doctor { diff: Some(reference), .. }) if reference == "current"
+        ));
+        // `gc` without `--before` must not become a plain doctor run.
+        assert!(doctor(&["cass", "doctor", "gc", "--yes", "--json"]).is_none());
+        // An unknown verb is still a usage error.
+        assert!(doctor(&["cass", "doctor", "frobnicate", "--json"]).is_none());
+    }
+
     /// Behavioral pin for the #367 repro: the robot flag must not turn a
     /// recognized subcommand into a search query.
     #[test]
@@ -7048,10 +7198,18 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
         Err(err) => {
             // Let clap handle help/version natively (exit 0, print to stdout)
             use clap::error::ErrorKind;
-            if matches!(
-                err.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            ) {
+            let is_display = |kind: ErrorKind| {
+                matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion)
+            };
+            // Help renders from the whole tree: the root help then lists the
+            // binary-dispatched subcommands (serve, archive), and `cass help
+            // serve`, an unknown subcommand to this CLI alone, shows its help.
+            if let Err(full) = cli_command().try_get_matches_from(&normalized_args)
+                && is_display(full.kind())
+            {
+                full.exit();
+            }
+            if is_display(err.kind()) {
                 err.exit();
             }
 
@@ -7586,8 +7744,11 @@ async fn execute_cli(
                     no_progress_events,
                     robot_trace_ingest,
                     background,
+                    rebuild_profile,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
+                    // Before any rebuild setting is read in this process.
+                    indexer::set_lexical_rebuild_profile(rebuild_profile.into());
                     if let Some(conversation_id) = reconcile_conversation {
                         return run_lexical_reconcile_cli(
                             cli.db.clone(),
@@ -8615,11 +8776,11 @@ async fn execute_cli(
 
             match command {
                 Commands::Completions { shell } => {
-                    let mut cmd = Cli::command();
+                    let mut cmd = cli_command();
                     clap_complete::generate(shell, &mut cmd, "cass", &mut std::io::stdout());
                 }
                 Commands::Man => {
-                    let cmd = Cli::command();
+                    let cmd = cli_command();
                     let man = clap_mangen::Man::new(cmd);
                     man.render(&mut std::io::stdout())
                         .map_err(|e| CliError::unknown(format!("failed to render man: {e}")))?;
@@ -9432,12 +9593,15 @@ fn run_quarantine_retry_command(
     Ok(())
 }
 
-/// Build the deterministic per-entry JSON view used by both `list` and the
-/// `clear` plan. Each entry reports its conversation_id, schema version,
-/// attempt count, last reason, the wall-clock timestamps, and whether it is
-/// retry-eligible under the current binary (version-stale/legacy).
-fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+/// Build the deterministic `cass quarantine list` rows: the structured state
+/// merged with the poison ledgers. Each entry reports its conversation_id,
+/// schema version, attempt count, last reason, the wall-clock timestamps, and
+/// whether it is retry-eligible under the current binary (version-stale/legacy).
+fn quarantine_list_entries(
+    data_dir: &Path,
+) -> anyhow::Result<Vec<crate::search::quarantine_status::QuarantineListEntry>> {
     use crate::indexer::quarantine::QuarantineState;
+    use crate::search::quarantine_status::QuarantineListEntry;
     let state = QuarantineState::load_for_operator(data_dir)
         .map_err(|error| anyhow::anyhow!("loading quarantine state for operator list: {error}"))?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -9445,16 +9609,16 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
         .iter()
         .map(|(key, record)| {
             let identity = (key.conversation_id.clone(), i64::from(key.schema_version));
-            let entry = serde_json::json!({
-                "conversation_id": key.conversation_id,
-                "schema_version": key.schema_version,
-                "attempt_count": record.attempt_count,
-                "last_reason": record.last_reason,
-                "first_attempt_at": record.first_attempt_at.to_rfc3339(),
-                "last_attempt_at": record.last_attempt_at.to_rfc3339(),
-                "cass_version_at_quarantine": record.cass_version_at_quarantine,
-                "retry_eligible": record.is_version_stale_for_retry(current_version),
-            });
+            let entry = QuarantineListEntry {
+                conversation_id: key.conversation_id,
+                schema_version: i64::from(key.schema_version),
+                attempt_count: record.attempt_count,
+                last_reason: record.last_reason.clone(),
+                first_attempt_at: Some(record.first_attempt_at.to_rfc3339()),
+                last_attempt_at: Some(record.last_attempt_at.to_rfc3339()),
+                cass_version_at_quarantine: record.cass_version_at_quarantine.clone(),
+                retry_eligible: record.is_version_stale_for_retry(current_version),
+            };
             (identity, entry)
         })
         .collect::<BTreeMap<_, _>>();
@@ -9488,19 +9652,20 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(1);
         let retry_eligible = cass_version != Some(current_version);
-        let poison_entry = serde_json::json!({
-            "conversation_id": identity.0.clone(),
-            "schema_version": identity.1,
-            "attempt_count": attempt_count,
-            "last_reason": record
+        let poison_entry = QuarantineListEntry {
+            conversation_id: identity.0.clone(),
+            schema_version: identity.1,
+            attempt_count,
+            last_reason: record
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("ingest-out-of-memory"),
-            "first_attempt_at": first_attempt_at,
-            "last_attempt_at": last_attempt_at,
-            "cass_version_at_quarantine": cass_version,
-            "retry_eligible": retry_eligible,
-        });
+                .unwrap_or("ingest-out-of-memory")
+                .to_string(),
+            first_attempt_at,
+            last_attempt_at,
+            cass_version_at_quarantine: cass_version.map(str::to_string),
+            retry_eligible,
+        };
 
         match entries.entry(identity) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -9508,19 +9673,13 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let existing = entry.get_mut();
-                let existing_attempt_count = existing
-                    .get("attempt_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                if attempt_count > existing_attempt_count {
-                    existing["attempt_count"] = serde_json::json!(attempt_count);
-                }
+                existing.attempt_count = existing.attempt_count.max(attempt_count);
                 if !retry_eligible {
                     // Cross-surface saves are best-effort. If either surface
                     // records a retry under this binary, do not falsely offer
                     // the key as retry-eligible because the other is stale.
-                    existing["cass_version_at_quarantine"] = serde_json::json!(current_version);
-                    existing["retry_eligible"] = serde_json::json!(false);
+                    existing.cass_version_at_quarantine = Some(current_version.to_string());
+                    existing.retry_eligible = false;
                 }
             }
         }
@@ -9534,7 +9693,7 @@ fn run_quarantine_list(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let entries = quarantine_entries_json(&data_dir).map_err(|err| CliError {
+    let entries = quarantine_list_entries(&data_dir).map_err(|err| CliError {
         code: 9,
         kind: "quarantine",
         message: format!("quarantine list failed: {err:#}"),
@@ -9542,6 +9701,18 @@ fn run_quarantine_list(
         retryable: false,
     })?;
     let summary = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
+    let status = crate::search::quarantine_status::quarantine_status(
+        &entries,
+        env!("CARGO_PKG_VERSION"),
+        &crate::indexer::quarantine_source_missing_ids(&data_dir),
+    );
+    // GH#510: conversations the watcher keeps deferring after a bounded-guard
+    // NoMem are not quarantined, but they are missing from search until one
+    // ingests.
+    let deferred: Vec<_> = crate::indexer::WatchNomemDeferrals::load(&data_dir)
+        .entries
+        .into_values()
+        .collect();
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -9557,7 +9728,9 @@ fn run_quarantine_list(
             "quarantined_conversations": entries.len(),
             "circuit_breaker_active": summary.circuit_breaker_active,
             "recommended_action": summary.recommended_action,
+            "status": status,
             "entries": entries,
+            "deferred": deferred,
         });
         return output_structured_value(payload, fmt);
     }
@@ -9565,6 +9738,22 @@ fn run_quarantine_list(
     println!("CASS Conversation Quarantine");
     println!("============================");
     println!();
+    if !deferred.is_empty() {
+        println!(
+            "Deferred by the watcher after repeated NoMem (not quarantined): {}",
+            deferred.len()
+        );
+        for entry in &deferred {
+            println!(
+                "  {} ({}, deferrals={})",
+                entry.source_path, entry.agent, entry.deferrals
+            );
+        }
+        println!(
+            "  An FSQLITE_PAGE_BUFFER_MAX above the database size removes the common trigger."
+        );
+        println!();
+    }
     if entries.is_empty() {
         println!("No quarantined conversations.");
         return Ok(());
@@ -9573,30 +9762,21 @@ fn run_quarantine_list(
     if summary.circuit_breaker_active {
         println!("Circuit breaker: ACTIVE (a recent burst of quarantines tripped the breaker)");
     }
+    println!("{}", status.eligibility_reason);
+    for (cause, count) in &status.by_cause {
+        println!("  {count:>6}  {cause}");
+    }
     println!();
     for entry in &entries {
         println!(
             "  {} (schema v{}, attempts={}, retry_eligible={})",
-            entry
-                .get("conversation_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<unknown>"),
-            entry
-                .get("schema_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("attempt_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("retry_eligible")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            entry.conversation_id, entry.schema_version, entry.attempt_count, entry.retry_eligible,
         );
-        if let Some(reason) = entry.get("last_reason").and_then(|v| v.as_str()) {
-            println!("      reason: {reason}");
-        }
+        println!("      reason: {}", entry.last_reason);
+    }
+    if let Some(next) = &status.next_safe_command {
+        println!();
+        println!("Next: {next}");
     }
     Ok(())
 }
@@ -9610,8 +9790,16 @@ fn run_quarantine_clear(
     use crate::indexer::quarantine::{QuarantineKey, QuarantineState};
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    // Clearing quarantine changes only the ledgers under the data directory;
+    // unlike retrying a quarantined source, it never writes the archive.
     let _mutation_guard = apply
-        .then(|| crate::indexer::acquire_quarantine_mutation_lock(&data_dir))
+        .then(|| {
+            crate::indexer::acquire_search_asset_mutation_lock(
+                &data_dir,
+                &data_dir.join("agent_search.db"),
+                crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+            )
+        })
         .transpose()
         .map_err(|err| quarantine_apply_cli_error("clear", err))?;
     let mut state = QuarantineState::load_for_operator(&data_dir)
@@ -11468,7 +11656,7 @@ fn run_swarm_lint(
         let collection = set.collect_required();
         render_swarm_lint_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_lint_live_partial(bead)
+        render_swarm_lint_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11525,7 +11713,7 @@ fn run_swarm_evidence(
         let collection = set.collect_required();
         render_swarm_evidence_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_evidence_live_partial(bead)
+        render_swarm_evidence_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11581,7 +11769,7 @@ fn run_swarm_proof_debt(
         let collection = set.collect_required();
         render_swarm_proof_debt_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_proof_debt_live_partial(bead)
+        render_swarm_proof_debt_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11643,7 +11831,7 @@ fn run_swarm_failure_patterns(
             bead,
         )
     } else {
-        render_swarm_failure_patterns_live_partial(bead)
+        render_swarm_failure_patterns_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -12262,11 +12450,10 @@ fn swarm_fixture_privacy_probe(path: &Path) -> CliResult<Option<serde_json::Valu
         .cloned())
 }
 
-/// Produce a swarm-status payload reflecting the current "no live providers
-/// are wired yet" reality. Pure-function, allocation-only — no I/O — so it
-/// is safe to call from the TUI surface-entry path. Used by the TUI's
-/// `CassMsg::SwarmEntered` handler to seed the cockpit on first entry
-/// when no cached snapshot has been supplied yet.
+/// The swarm-status placeholder the TUI cockpit shows on first entry, before
+/// its background live read ([`render_swarm_status_live_at`]) lands: every
+/// provider unread and every measurement unknown. Pure-function,
+/// allocation-only — no I/O — so it is safe on the surface-entry path.
 pub fn render_swarm_status_live_partial() -> serde_json::Value {
     use crate::swarm_status::{
         REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
@@ -12280,70 +12467,31 @@ pub fn render_swarm_status_live_partial() -> serde_json::Value {
                 SwarmSourceSnapshot::unavailable(
                     provider,
                     format!("live:{}", provider.fixture_key()),
-                    "live-provider-unimplemented",
-                    format!(
-                        "live provider {provider} is not wired yet; fixture-backed status is available"
-                    ),
+                    "live-provider-not-read",
+                    format!("live provider {provider} has not been read yet"),
                 )
             })
             .collect(),
     };
 
-    render_swarm_status_payload(
-        "live",
-        "Live swarm status with unavailable providers",
-        &collection,
-        None,
-        true,
-    )
-}
-
-/// CLI-only collection; the TUI's initial model must remain allocation-only.
-fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
-    use crate::swarm_status::{
-        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmProviderName, SwarmProviderStatus,
-        SwarmSourceCollection, SwarmSourceSnapshot,
-    };
-    let started = std::time::Instant::now();
-    let data_dir = resolve_data_dir(&None, cli.db.as_ref());
-    let db_path = cli
-        .db
-        .clone()
-        .unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let collection = match std::env::current_dir() {
-        Ok(repo) => {
-            crate::swarm_status::collect_live_swarm_sources(&repo, Some((&data_dir, &db_path)))
-        }
-        Err(_) => SwarmSourceCollection {
-            snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-                .iter()
-                .copied()
-                .map(|name| {
-                    SwarmSourceSnapshot::unavailable(
-                        name,
-                        format!("live:{name}"),
-                        "working-directory-unavailable",
-                        "Cannot identify the current repository",
-                    )
-                })
-                .collect(),
-        },
-    };
     let mut payload = render_swarm_status_payload(
         "live",
-        "Bounded live source collection",
+        "Live swarm status before the first provider read",
         &collection,
         None,
         true,
     );
-    payload["_meta"]["generated_at_ms"] = serde_json::json!(
-        std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
-    payload["_meta"]["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
-    // Empty arrays remain iterable, but unknown measurements are never zero.
+    null_unavailable_swarm_summary_fields(&mut payload, &collection);
+    payload
+}
+
+/// Empty arrays remain iterable, but unknown measurements are never zero:
+/// blank the summary fields an unavailable provider would have measured.
+fn null_unavailable_swarm_summary_fields(
+    payload: &mut serde_json::Value,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+) {
+    use crate::swarm_status::{SwarmProviderName, SwarmProviderStatus};
     for (provider, fields) in [
         (
             SwarmProviderName::Beads,
@@ -12372,6 +12520,88 @@ fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
             }
         }
     }
+}
+
+/// The bounded live provider collection every `swarm` read surface shares:
+/// the current repository's git and Beads state, Agent Mail metadata,
+/// process pressure, proof evidence and passive CASS health. The TUI's
+/// initial model must remain allocation-only; its cockpit runs this from a
+/// background task ([`render_swarm_status_live_at`]).
+fn collect_swarm_sources_live(cli: &Cli) -> crate::swarm_status::SwarmSourceCollection {
+    let (data_dir, db_path) = swarm_live_archive_paths(cli);
+    collect_swarm_sources_live_at(std::env::current_dir().ok().as_deref(), &data_dir, &db_path)
+}
+
+fn swarm_live_archive_paths(cli: &Cli) -> (PathBuf, PathBuf) {
+    let data_dir = resolve_data_dir(&None, cli.db.as_ref());
+    let db_path = cli
+        .db
+        .clone()
+        .unwrap_or_else(|| data_dir.join("agent_search.db"));
+    (data_dir, db_path)
+}
+
+fn collect_swarm_sources_live_at(
+    repo: Option<&Path>,
+    data_dir: &Path,
+    db_path: &Path,
+) -> crate::swarm_status::SwarmSourceCollection {
+    use crate::swarm_status::{
+        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
+    };
+    match repo {
+        Some(repo) => {
+            crate::swarm_status::collect_live_swarm_sources(repo, Some((data_dir, db_path)))
+        }
+        None => SwarmSourceCollection {
+            snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
+                .iter()
+                .copied()
+                .map(|name| {
+                    SwarmSourceSnapshot::unavailable(
+                        name,
+                        format!("live:{name}"),
+                        "working-directory-unavailable",
+                        "Cannot identify the current repository",
+                    )
+                })
+                .collect(),
+        },
+    }
+}
+
+fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
+    let (data_dir, db_path) = swarm_live_archive_paths(cli);
+    render_swarm_status_live_at(std::env::current_dir().ok().as_deref(), &data_dir, &db_path)
+}
+
+/// `cass swarm status --json`'s live payload for the repository at `repo`
+/// (`None`: unknown, every repository provider is unavailable) and the CASS
+/// archive at `data_dir`/`db_path`. Read-only and bounded; the TUI cockpit
+/// runs it from a background task, never on render.
+pub fn render_swarm_status_live_at(
+    repo: Option<&Path>,
+    data_dir: &Path,
+    db_path: &Path,
+) -> serde_json::Value {
+    use crate::swarm_status::{SwarmProviderName, SwarmProviderStatus};
+    let started = std::time::Instant::now();
+    let collection = collect_swarm_sources_live_at(repo, data_dir, db_path);
+    let mut payload = render_swarm_status_payload(
+        "live",
+        "Bounded live source collection",
+        &collection,
+        None,
+        true,
+    );
+    payload["_meta"]["generated_at_ms"] = serde_json::json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    payload["_meta"]["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+    null_unavailable_swarm_summary_fields(&mut payload, &collection);
     payload["beads"]["graph"] = serde_json::Value::Null;
     // Exported tracker state and missing coordination cannot authorize a claim
     // or classify an owner's work as stale.
@@ -12502,29 +12732,9 @@ fn render_swarm_work_packet_fixture(
     render_swarm_work_packet_from_status(&status, bead_filter)
 }
 
-fn render_swarm_lint_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    use crate::swarm_status::{REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection};
-
-    let collection = SwarmSourceCollection {
-        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-            .iter()
-            .copied()
-            .map(swarm_lint_live_unavailable_snapshot)
-            .collect(),
-    };
-
+fn render_swarm_lint_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    let collection = collect_swarm_sources_live(cli);
     render_swarm_lint_payload("live", &collection, None, bead_filter, true)
-}
-
-fn swarm_lint_live_unavailable_snapshot(
-    provider: crate::swarm_status::SwarmProviderName,
-) -> crate::swarm_status::SwarmSourceSnapshot {
-    crate::swarm_status::SwarmSourceSnapshot::unavailable(
-        provider,
-        format!("live:{}", provider.fixture_key()),
-        "live-provider-unimplemented",
-        format!("live provider {provider} is not wired yet; fixture-backed lint is available"),
-    )
 }
 
 fn render_swarm_lint_fixture(
@@ -12542,31 +12752,11 @@ fn render_swarm_lint_fixture(
     )
 }
 
-fn render_swarm_evidence_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    use crate::swarm_status::{
-        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
-    };
-
-    let collection = SwarmSourceCollection {
-        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
-            .iter()
-            .copied()
-            .map(|provider| {
-                SwarmSourceSnapshot::unavailable(
-                    provider,
-                    format!("live:{}", provider.fixture_key()),
-                    "live-provider-unimplemented",
-                    format!(
-                        "live provider {provider} is not wired yet; fixture-backed evidence is available"
-                    ),
-                )
-            })
-            .collect(),
-    };
-
+fn render_swarm_evidence_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    let collection = collect_swarm_sources_live(cli);
     render_swarm_evidence_payload(
         "live",
-        "Live swarm evidence with unavailable providers",
+        "Bounded live source collection",
         &collection,
         None,
         bead_filter,
@@ -12590,8 +12780,8 @@ fn render_swarm_evidence_fixture(
     )
 }
 
-fn render_swarm_proof_debt_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(bead_filter))
+fn render_swarm_proof_debt_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(cli, bead_filter))
 }
 
 fn render_swarm_proof_debt_fixture(
@@ -12611,8 +12801,11 @@ fn render_swarm_proof_debt_fixture(
     render_swarm_proof_debt_from_evidence(evidence)
 }
 
-fn render_swarm_failure_patterns_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    let evidence = render_swarm_evidence_live_partial(bead_filter);
+fn render_swarm_failure_patterns_live_partial(
+    cli: &Cli,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let evidence = render_swarm_evidence_live_partial(cli, bead_filter);
     render_swarm_failure_patterns_from_evidence(evidence, Vec::new())
 }
 
@@ -20795,15 +20988,21 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
         return None;
     }
 
-    match open_franken_cli_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT) {
-        Ok(conn) => {
+    // This observation also runs before a read-only force rebuild has archive
+    // writer admission. It must never repair WAL or schema state on open.
+    match crate::storage::sqlite::FrankenStorage::open_strict_readonly_with_timeout(
+        db_path,
+        STATE_DB_OPEN_TIMEOUT,
+    ) {
+        Ok(storage) => {
+            let conn = storage.into_raw();
             let (integrity, detail) = probe_state_db_integrity(|sql| {
                 use crate::franken_sync::compat::RowExt;
                 franken_query_row_map_retry(&conn, sql, &[], |row| {
                     row.get_typed::<i64>(0).map(|_| ())
                 })
             });
-            let _ = close_franken_cli_read_db(conn, db_path, reason);
+            let _ = close_franken_cli_read_db_without_checkpoint(conn, db_path, reason);
             match integrity {
                 Some(StateDbIntegrity::Corrupt) => {
                     Some(detail.unwrap_or_else(|| "corruption-class read failure".to_owned()))
@@ -20811,12 +21010,13 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
                 _ => None,
             }
         }
-        Err(err) if !err.retryable => {
-            let lower = err.message.to_ascii_lowercase();
+        Err(err) if !crate::storage::sqlite::retryable_franken_anyhow(&err) => {
+            let message = format!("{err:#}");
+            let lower = message.to_ascii_lowercase();
             (lower.contains("malformed")
                 || lower.contains("disk image")
                 || lower.contains("not a database"))
-            .then_some(err.message)
+            .then_some(message)
         }
         Err(_) => None,
     }
@@ -21614,6 +21814,149 @@ fn index_unsupported_quill_writer_admission_cli_error(chain: &str) -> CliError {
 mod index_error_mapping_tests {
     use super::*;
 
+    fn idempotency_test_bundle_bytes(db_path: &Path) -> Vec<Option<Vec<u8>>> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let mut path = db_path.as_os_str().to_owned();
+                path.push(suffix);
+                match std::fs::read(Path::new(&path)) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("reading cache fixture {path:?}: {error}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gh515_idempotency_lookup_never_creates_or_expires_archive_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path().join("data");
+        let db_path = temp.path().join("archive-parent/archive.db");
+        assert_eq!(read_index_idempotency_cache(&db_path, "missing", 0), None);
+        assert!(!db_path.parent().unwrap().exists());
+
+        std::fs::create_dir_all(db_path.parent().unwrap())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy())?;
+        conn.execute("CREATE TABLE archive_identity (content TEXT)")?;
+        conn.execute("INSERT INTO archive_identity VALUES ('keep this archive')")?;
+        conn.close()?;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        assert_eq!(read_index_idempotency_cache(&db_path, "missing", 0), None);
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        assert!(!data_dir.exists());
+        assert!(!db_path.parent().unwrap().join("doctor").exists());
+
+        let payload = serde_json::json!({"success": true, "messages": 1});
+        store_index_idempotency_result(&data_dir, &db_path, "expired", 7, &payload, 0)?;
+        store_index_idempotency_result(&data_dir, &db_path, "live", 7, &payload, 100)?;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        let now_ms = 24 * 60 * 60 * 1000;
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "expired", now_ms),
+            None
+        );
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "unknown", now_ms),
+            None
+        );
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "live", now_ms),
+            Some(("7".to_string(), payload.to_string()))
+        );
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        let storage = crate::storage::sqlite::FrankenStorage::open_strict_readonly(&db_path)?;
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT COUNT(*) FROM idempotency_keys")?
+                .get_typed::<i64>(0)?,
+            2,
+            "TTL lookup must leave expired rows for an admitted cache writer"
+        );
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT content FROM archive_identity")?
+                .get_typed::<String>(0)?,
+            "keep this archive"
+        );
+        storage.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn gh515_idempotency_persistence_obeys_archive_owner_and_recovers() -> Result<()> {
+        use crate::search::asset_state::SearchMaintenanceJobKind;
+
+        let temp = tempfile::tempdir()?;
+        let owner_data = temp.path().join("owner-data");
+        let cache_data = temp.path().join("cache-data");
+        let db_path = temp.path().join("archive.db");
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy())?;
+        conn.execute("CREATE TABLE archive_identity (content TEXT)")?;
+        conn.execute("INSERT INTO archive_identity VALUES ('keep this archive')")?;
+        conn.close()?;
+        let payload = serde_json::json!({"success": true, "messages": 1});
+        let owner = crate::indexer::acquire_search_maintenance_mutation_lock(
+            &owner_data,
+            &db_path,
+            SearchMaintenanceJobKind::SemanticRebuild,
+        )?;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        assert!(
+            store_index_idempotency_result(&cache_data, &db_path, "expired", 7, &payload, 0)
+                .is_err()
+        );
+        assert_eq!(read_index_idempotency_cache(&db_path, "expired", 0), None);
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        assert!(std::fs::read(cache_data.join("index-run.lock"))?.is_empty());
+        drop(owner);
+
+        store_index_idempotency_result(&cache_data, &db_path, "expired", 7, &payload, 0)?;
+        store_index_idempotency_result(&cache_data, &db_path, "live", 7, &payload, 100)?;
+        let owner = crate::indexer::acquire_search_maintenance_mutation_lock(
+            &owner_data,
+            &db_path,
+            SearchMaintenanceJobKind::SemanticRebuild,
+        )?;
+        let now_ms = 24 * 60 * 60 * 1000;
+        let before = idempotency_test_bundle_bytes(&db_path);
+        assert!(
+            store_index_idempotency_result(&cache_data, &db_path, "retry", 7, &payload, now_ms)
+                .is_err()
+        );
+        assert_eq!(idempotency_test_bundle_bytes(&db_path), before);
+        drop(owner);
+
+        store_index_idempotency_result(&cache_data, &db_path, "retry", 7, &payload, now_ms)?;
+        assert_eq!(
+            read_index_idempotency_cache(&db_path, "retry", now_ms),
+            Some(("7".to_string(), payload.to_string()))
+        );
+        assert!(std::fs::read(cache_data.join("index-run.lock"))?.is_empty());
+        let storage = crate::storage::sqlite::FrankenStorage::open_strict_readonly(&db_path)?;
+        let keys = storage.raw().query_map_collect(
+            "SELECT key FROM idempotency_keys ORDER BY key",
+            &[],
+            |row| row.get_typed::<String>(0),
+        )?;
+        assert_eq!(keys, ["live", "retry"]);
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT content FROM archive_identity")?
+                .get_typed::<String>(0)?,
+            "keep this archive"
+        );
+        for row in storage.raw().query("PRAGMA integrity_check")? {
+            assert_eq!(row.get_typed::<String>(0)?, "ok");
+        }
+        storage.close_without_checkpoint()?;
+        Ok(())
+    }
+
     #[test]
     fn index_idempotency_cache_rejects_non_objects_and_preserves_valid_results() {
         for invalid in [
@@ -22407,6 +22750,17 @@ fn state_meta_json_inner(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
+        // GH #496: the per-page byte budget page prep fetches against.
+        let (startup_page_bytes, steady_page_bytes) =
+            crate::indexer::lexical_rebuild_page_fetch_message_bytes(&lexical_rebuild_pipeline);
+        pipeline.insert(
+            "startup_page_fetch_message_bytes".to_string(),
+            serde_json::json!(startup_page_bytes),
+        );
+        pipeline.insert(
+            "steady_page_fetch_message_bytes".to_string(),
+            serde_json::json!(steady_page_bytes),
+        );
         let runtime_value = lexical_rebuild_pipeline_runtime
             .map(|runtime| {
                 let queue_capacity = lexical_rebuild_pipeline.pipeline_channel_size;
@@ -22667,7 +23021,19 @@ fn state_meta_json_inner(
             "processed_conversations": lexical.processed_conversations,
             "total_conversations": lexical.total_conversations,
             "indexed_docs": lexical.indexed_docs,
-            "pipeline": lexical_rebuild_pipeline_json
+            "pipeline": lexical_rebuild_pipeline_json,
+            // GH #381 (ntxs1): where a running or interrupted full
+            // expected-docs scan stands; the next index run resumes it
+            // when the archive is unchanged or only grew. Null otherwise.
+            "expected_docs_scan": crate::indexer::expected_lexical_docs_scan_position(&index_path, db_path)
+                .map(|position| serde_json::json!({
+                    "last_conversation_id": position.last_conversation_id,
+                    "max_conversation_id": position.max_conversation_id,
+                    "expected_docs_so_far": position.expected_docs_so_far,
+                    "saved_at": position.saved_at_ms
+                        .and_then(chrono::DateTime::from_timestamp_millis)
+                        .map(|saved| saved.to_rfc3339()),
+                }))
         },
         "semantic": {
             "status": semantic.status,
@@ -22772,9 +23138,19 @@ fn state_meta_json_inner(
     if let Some(detail) = fallback_fts_repair_pending
         && let Some(index) = state.get_mut("index").and_then(|v| v.as_object_mut())
     {
+        // GH #495: a shadow retired as not viable over the message bound keeps
+        // this marker to say why it is absent, but that is a settled state:
+        // `doctor --rebuild-canonical-fts` plans nothing for it. Only other
+        // markers describe a repair that is still pending.
+        let retired =
+            crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable(&detail);
         index.insert(
             "fallback_fts_repair".to_string(),
-            serde_json::json!({ "pending": true, "detail": detail }),
+            serde_json::json!({
+                "pending": !retired,
+                "retired_not_viable": retired,
+                "detail": detail,
+            }),
         );
     }
     // zn1xn F4: surface a persistent lexical-repair deferral streak additively —
@@ -26627,6 +27003,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "                    Tune with --progress-interval-ms N (250..60000, default 2000),".to_string(),
             "                    disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.".to_string(),
             "                    Add --robot-trace-ingest for per-batch wall_ms, batch_msgs, and duplicate-lookup counters on stderr.".to_string(),
+            "                    Add --rebuild-profile bounded for a single-core, low-memory lexical rebuild of a wedged or".to_string(),
+            "                    memory-starved archive; explicit CASS_TANTIVY_REBUILD_* values still win, and --json".to_string(),
+            "                    reports the values used under rebuild_profile.".to_string(),
             "                    From another shell: `cass status --json` shows live progress.".to_string(),
             "  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]"
                 .to_string(),
@@ -26640,6 +27019,12 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).".to_string(),
             "    --binary-only     Report the same archive-readiness verdict but exit 0 unless the executable itself fails; use selftest to avoid archive access.".to_string(),
             "  cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.".to_string(),
+            "  cass serve --stdio (--index DIR | --data-dir DIR) [--mcp]".to_string(),
+            "                    Keep read-only search readers open for a stream of JSON requests: repeated queries skip".to_string(),
+            "                    reopening and re-verifying the index (docs/SEARCH_SERVICE.md). Semantic search is opt-in.".to_string(),
+            "  cass archive export|verify|search|view|import [--json]".to_string(),
+            "                    Logical canonical backup as private JSONL: export a snapshot, verify it without a DB,".to_string(),
+            "                    search or view its bodies, or restore into a NEW database (docs/LOGICAL_ARCHIVE.md).".to_string(),
             "  cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.".to_string(),
             "                    doctor JSON includes source_inventory; missing upstream provider files are".to_string(),
             "                    source coverage/prune-risk warnings, not proof that archived cass rows are lost.".to_string(),
@@ -26734,6 +27119,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES=<N>  refuse the unbounded V14 legacy-FTS teardown on archives above N bytes (default 536870912; 0 disables the refusal)".to_string(),
             "  CASS_DEFER_ANALYTICS_UPDATES=1             defer derived analytics writes during indexing; a pending legacy OMP rebuild resumes on a later run with this unset".to_string(),
             "  CASS_STORAGE_PROBE_TIMEOUT_MS=<N>        budget for the dedicated typed storage probes on status/search/doctor (default 100; clamped 10..10000) — widen on slow hosts where schema/contention classification times out to `unchecked`".to_string(),
+            "  CASS_RAW_MIRROR=0                        stop copying session files into the raw mirror (default on); indexing continues, doctor reports raw_mirror_capture_disabled".to_string(),
             "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
@@ -26797,7 +27183,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Pack vs search: use search to explore/paginate/aggregate candidates; use pack once you need a bounded handoff artifact.".to_string(),
             "  Pack vs export-html: export-html creates a complete browsable session archive; pack creates a token-budgeted evidence bundle.".to_string(),
             "  Pack vs doctor/status: status/health report readiness before a handoff; doctor diagnoses or repairs derived assets and is not a summarizer.".to_string(),
-            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical, privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
+            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical (realized.fallback_reason names the cause; pack_enrichment_unavailable means pack itself selects evidence lexically), privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
             "  Pack budgets: tune --max-tokens, --max-evidence, --max-sessions, --max-excerpt-chars, and --fields summary/minimal to fit the recipient context.".to_string(),
             "  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.".to_string(),
             "  Quick history: use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id --limit 5 --max-tokens 2000 --timeout 2000.".to_string(),
@@ -27426,6 +27812,7 @@ const fn semantic_daemon_policy(daemon: bool, no_daemon: bool) -> SemanticDaemon
     }
 }
 
+#[cfg(any(unix, test))]
 fn compose_verified_daemon_embedder_or_local(
     daemon: Arc<dyn crate::search::daemon_client::DaemonClient>,
     embedder: Arc<dyn crate::search::embedder::Embedder>,
@@ -30871,13 +31258,16 @@ fn configure_bounded_search_semantics(
         .and_then(|value| {
             if value.trim().eq_ignore_ascii_case("hash") {
                 Some("hash")
+            } else if crate::search::embedder_registry::selects_external(Some(&value)) {
+                Some("external")
             } else {
                 crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
             }
         });
     let requested_model = semantic_opts.model.as_deref().or(env_model);
     if let Some(model_name) = semantic_opts.model.as_deref()
-        && let Err(error) = registry.validate(model_name)
+        && let Err(error) =
+            crate::search::embedder_registry::validate_selection(&data_dir, model_name)
     {
         return Err(CliError {
             code: 15,
@@ -31681,6 +32071,8 @@ fn run_cli_search(
             .and_then(|value| {
                 if value.trim().eq_ignore_ascii_case("hash") {
                     Some("hash")
+                } else if crate::search::embedder_registry::selects_external(Some(&value)) {
+                    Some("external")
                 } else {
                     crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
                 }
@@ -31691,7 +32083,8 @@ fn run_cli_search(
     let requested_model = semantic_opts.model.as_deref().or(env_model);
     if semantic_requested
         && let Some(model_name) = semantic_opts.model.as_deref()
-        && let Err(error) = registry.validate(model_name)
+        && let Err(error) =
+            crate::search::embedder_registry::validate_selection(&data_dir, model_name)
     {
         return Err(CliError {
             code: 15,
@@ -32308,6 +32701,8 @@ fn run_cli_search(
             }
             #[cfg(not(unix))]
             {
+                // Only the Unix daemon reranks with the search's embedder.
+                let _ = daemon_embedder_id_for_rerank;
                 local_reranker
             }
         } else {
@@ -32717,8 +33112,11 @@ fn run_cli_search(
     };
 
     // uojcg.7.1: explain an empty search filtered to one workspace. The probes
-    // run only on that empty path, inside the remaining robot budget.
+    // run only on that empty path, inside the remaining robot budget. An empty
+    // page past the last match (`--offset` beyond the total) is not an empty
+    // search, so the total must be zero too.
     let zero_result_diagnosis = if display_result.hits.is_empty()
+        && total_matches == 0
         && filters.workspaces.len() == 1
         && !skipped_sections.iter().any(|section| section == "search")
     {
@@ -33651,6 +34049,9 @@ fn run_cli_pack(
         limits: limits.clone(),
         search_mode: search_mode_label(mode_meta.realized).to_string(),
         fallback_mode: mode_meta.fallback_tier.map(str::to_string),
+        fallback_reason: mode_meta
+            .semantic_fallback_reason()
+            .map(|reason| reason.code().to_string()),
         semantic_joined: mode_meta.semantic_refinement(),
         freshness_policy,
         freshness_window_seconds,
@@ -39510,6 +39911,10 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         "source_coverage" => {
             if message.contains("sole-copy") {
                 DoctorAnomaly::UpstreamSourcePruned
+            } else if message.contains("CASS_RAW_MIRROR") {
+                // GH #506: an operator setting reduces coverage, like
+                // CASS_EXCLUDE_PATHS; nothing about the archive is unsafe.
+                DoctorAnomaly::ConfigExclusionRisk
             } else {
                 DoctorAnomaly::SourceAuthorityUnsafe
             }
@@ -44259,6 +44664,9 @@ struct DoctorCoverageRiskSummary {
     current_source_newer_than_archive_count: usize,
     raw_mirror_db_link_count: usize,
     sole_copy_warning_count: usize,
+    /// `CASS_RAW_MIRROR` turned raw capture off (GH #506): archive rows
+    /// without a raw copy are then expected rather than a backfill gap.
+    raw_mirror_capture_disabled: bool,
     recommended_action: String,
 }
 
@@ -46394,7 +46802,7 @@ fn doctor_risk_level_for_reports(
         return "high";
     }
     if coverage_risk.missing_current_source_count > 0
-        || coverage_risk.db_without_raw_mirror_count > 0
+        || doctor_unmirrored_rows_are_a_gap(coverage_risk)
         || checks.iter().any(|check| {
             matches!(
                 check.data_loss_risk,
@@ -50200,7 +50608,11 @@ fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorA
         &raw_mirror_backfill,
         &sole_copy_warnings,
     );
-    let coverage_risk = doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len());
+    let coverage_risk = doctor_coverage_risk_summary(
+        &coverage_summary,
+        sole_copy_warnings.len(),
+        !crate::raw_mirror::capture_enabled(),
+    );
     let source_authority =
         build_doctor_source_authority_report(db_path, &source_inventory, &raw_mirror);
     let coverage =
@@ -51650,14 +52062,15 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         source_path.as_deref(),
     );
 
-    if matches!(provider.as_str(), "shelley" | "grok_bot") {
+    if matches!(provider.as_str(), "shelley" | "grok_bot" | "pi_durable") {
         receipt.action = "disabled_sensitive_container".to_string();
         receipt.warnings.push(
-            if provider == "shelley" {
-                "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path."
-            } else {
-                "Grok Bot replicas mix chat with secret and approval payloads. Raw mirror capture and linking are disabled; index the original local replica directly with CASS_GROK_BOT_DATA_ROOT."
-            }.to_string(),
+            match provider.as_str() {
+                "shelley" => "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path.",
+                "grok_bot" => "Grok Bot replicas mix chat with secret and approval payloads. Raw mirror capture and linking are disabled; index the original local replica directly with CASS_GROK_BOT_DATA_ROOT.",
+                _ => "Pi durable stores keep system prompts, agent instructions, task checkpoints and application documents alongside conversations. Raw mirror capture and linking are disabled; index the original store directly (default <agent dir>/experimental/durable-sessions, agent dir from PI_CODING_AGENT_DIR) or a local source path.",
+            }
+            .to_string(),
         );
         return receipt;
     }
@@ -51788,6 +52201,17 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
                 .as_deref()
                 .unwrap_or("source content hash unavailable")
         ));
+        return receipt;
+    }
+
+    if !crate::raw_mirror::capture_enabled() {
+        // GH #506: the operator turned capture off. The source is capturable,
+        // so this is neither a projection-only row nor a failure.
+        receipt.action = "capture_disabled".to_string();
+        receipt.warnings.push(
+            "raw mirror capture is off (CASS_RAW_MIRROR); doctor does not copy the live source file"
+                .to_string(),
+        );
         return receipt;
     }
 
@@ -52287,6 +52711,8 @@ fn build_doctor_coverage_summary(
             || source_inventory.unknown_mapping_count > 0;
     let recommended_action = if !sole_copy_warnings.is_empty() {
         "Back up the cass data directory and avoid source-session rebuilds that reduce archive coverage.".to_string()
+    } else if db_without_raw_mirror_count > 0 && !crate::raw_mirror::capture_enabled() {
+        "Raw mirror capture is off (CASS_RAW_MIRROR), so these archive rows have no raw copy by design; if a provider deletes a session file, the archive DB holds the only copy. Unset CASS_RAW_MIRROR and run 'cass doctor --fix --json' to restore raw-mirror coverage.".to_string()
     } else if db_without_raw_mirror_count > 0 {
         "Run 'cass doctor --fix --json' to add raw-mirror coverage for eligible live source files."
             .to_string()
@@ -52497,9 +52923,12 @@ fn build_doctor_coverage_comparison_gate(
 fn doctor_coverage_risk_summary(
     coverage_summary: &DoctorCoverageSummary,
     sole_copy_warning_count: usize,
+    raw_mirror_capture_disabled: bool,
 ) -> DoctorCoverageRiskSummary {
     let status = if sole_copy_warning_count > 0 {
         "sole_copy_risk"
+    } else if coverage_summary.db_without_raw_mirror_count > 0 && raw_mirror_capture_disabled {
+        "raw_mirror_capture_disabled"
     } else if coverage_summary.db_without_raw_mirror_count > 0 {
         "raw_mirror_backfill_available"
     } else if coverage_summary.mirror_without_db_link_count > 0 {
@@ -52522,6 +52951,7 @@ fn doctor_coverage_risk_summary(
             .current_source_newer_than_archive_count,
         raw_mirror_db_link_count: coverage_summary.raw_mirror_db_link_count,
         sole_copy_warning_count,
+        raw_mirror_capture_disabled,
         recommended_action: coverage_summary.recommended_action.clone(),
     }
 }
@@ -52535,6 +52965,7 @@ fn doctor_fast_coverage_risk_unchecked(db_exists: bool) -> DoctorCoverageRiskSum
             "not_initialized".to_string()
         },
         confidence_tier: "unchecked".to_string(),
+        raw_mirror_capture_disabled: !crate::raw_mirror::capture_enabled(),
         recommended_action: if db_exists {
             "Run 'cass doctor --json' for source coverage and sole-copy analysis.".to_string()
         } else {
@@ -52592,6 +53023,7 @@ fn doctor_summary_coverage_state(coverage_risk: &DoctorCoverageRiskSummary) -> &
         "not_initialized" => "not_initialized",
         "sole_copy_risk" => "sole_copy_risk",
         "raw_mirror_backfill_available" => "raw_mirror_backfill_available",
+        "raw_mirror_capture_disabled" => "raw_mirror_capture_disabled",
         "raw_mirror_unlinked" => "raw_mirror_unlinked",
         "current_sources_newer_than_archive" => "current_sources_newer_than_archive",
         status if status.starts_with("unchecked") => "not_checked",
@@ -52617,18 +53049,26 @@ fn doctor_summary_source_mirror_state(coverage_risk: &DoctorCoverageRiskSummary)
     }
 }
 
+/// Archive rows lacking a raw copy that doctor could still capture. With
+/// capture switched off (GH #506) they are the operator's choice, reported as
+/// low risk rather than as a coverage gap.
+fn doctor_unmirrored_rows_are_a_gap(coverage_risk: &DoctorCoverageRiskSummary) -> bool {
+    coverage_risk.db_without_raw_mirror_count > 0 && !coverage_risk.raw_mirror_capture_disabled
+}
+
 fn doctor_summary_risk_level(coverage_risk: &DoctorCoverageRiskSummary) -> &'static str {
     if coverage_risk.status == "sole_copy_risk" {
         "high"
     } else if coverage_risk.confidence_tier == "unchecked" {
         "unknown"
     } else if coverage_risk.missing_current_source_count > 0
-        || coverage_risk.db_without_raw_mirror_count > 0
+        || doctor_unmirrored_rows_are_a_gap(coverage_risk)
         || coverage_risk.db_projection_only_count > 0
     {
         "medium"
     } else if coverage_risk.mirror_without_db_link_count > 0
         || coverage_risk.current_source_newer_than_archive_count > 0
+        || coverage_risk.db_without_raw_mirror_count > 0
     {
         "low"
     } else {
@@ -52645,7 +53085,7 @@ fn doctor_summary_health_class(
         "repair-blocked"
     } else if coverage_risk.status == "sole_copy_risk"
         || coverage_risk.missing_current_source_count > 0
-        || coverage_risk.db_without_raw_mirror_count > 0
+        || doctor_unmirrored_rows_are_a_gap(coverage_risk)
         || coverage_risk.db_projection_only_count > 0
     {
         "degraded-archive-risk"
@@ -60567,7 +61007,11 @@ fn build_doctor_baseline_snapshot(
         &raw_mirror_backfill,
         &sole_copy_warnings,
     );
-    let coverage_risk = doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len());
+    let coverage_risk = doctor_coverage_risk_summary(
+        &coverage_summary,
+        sole_copy_warnings.len(),
+        !crate::raw_mirror::capture_enabled(),
+    );
     let source_authority =
         build_doctor_source_authority_report(db_path, &source_inventory, &raw_mirror);
     let storage_pressure = collect_doctor_storage_pressure(data_dir, db_path);
@@ -79333,7 +79777,7 @@ paths = ["~/.claude/projects"]
         assert_eq!(summary.latest_started_at_ms, Some(1_700_000_000_000));
         assert!(summary.coverage_reducing_live_source_rebuild_refused);
 
-        let risk = doctor_coverage_risk_summary(&summary, sole_copy_warnings.len());
+        let risk = doctor_coverage_risk_summary(&summary, sole_copy_warnings.len(), false);
         assert_eq!(risk.status, "sole_copy_risk");
         assert_eq!(risk.sole_copy_warning_count, 1);
         assert_eq!(risk.raw_mirror_db_link_count, 1);
@@ -79365,9 +79809,68 @@ paths = ["~/.claude/projects"]
                 ..DoctorCoverageSummary::default()
             },
             0,
+            false,
         );
         assert_eq!(mirror_only_risk.status, "raw_mirror_unlinked");
         assert_eq!(mirror_only_risk.mirror_without_db_link_count, 1);
+    }
+
+    /// GH #506: with capture switched off, archive rows without a raw copy are
+    /// disclosed as the operator's choice (low risk, not a degraded archive),
+    /// while a sole copy still reports high risk.
+    #[test]
+    fn gh506_capture_disabled_unmirrored_rows_are_disclosed_not_a_gap() {
+        let unmirrored = DoctorCoverageSummary {
+            confidence_tier: "archive_db_without_raw_mirror".to_string(),
+            archive_conversation_count: 3,
+            db_without_raw_mirror_count: 3,
+            recommended_action: "inspect".to_string(),
+            ..DoctorCoverageSummary::default()
+        };
+
+        let enabled = doctor_coverage_risk_summary(&unmirrored, 0, false);
+        assert_eq!(enabled.status, "raw_mirror_backfill_available");
+        assert!(!enabled.raw_mirror_capture_disabled);
+        assert_eq!(doctor_summary_risk_level(&enabled), "medium");
+        assert_eq!(
+            doctor_summary_health_class(&enabled, None, true),
+            "degraded-archive-risk"
+        );
+        assert_eq!(doctor_risk_level_for_reports(&enabled, &[]), "medium");
+
+        let disabled = doctor_coverage_risk_summary(&unmirrored, 0, true);
+        assert_eq!(disabled.status, "raw_mirror_capture_disabled");
+        assert!(disabled.raw_mirror_capture_disabled);
+        assert_eq!(
+            doctor_summary_coverage_state(&disabled),
+            "raw_mirror_capture_disabled"
+        );
+        assert_eq!(
+            doctor_summary_source_mirror_state(&disabled),
+            "archive_rows_without_raw_mirror"
+        );
+        assert_eq!(doctor_summary_risk_level(&disabled), "low");
+        assert_eq!(
+            doctor_summary_health_class(&disabled, None, true),
+            "healthy"
+        );
+        assert_eq!(doctor_risk_level_for_reports(&disabled, &[]), "none");
+
+        // The switch does not hide a sole copy or a missing source.
+        let sole_copy = doctor_coverage_risk_summary(
+            &DoctorCoverageSummary {
+                missing_current_source_count: 1,
+                ..unmirrored.clone()
+            },
+            1,
+            true,
+        );
+        assert_eq!(sole_copy.status, "sole_copy_risk");
+        assert_eq!(doctor_summary_risk_level(&sole_copy), "high");
+        assert_eq!(
+            doctor_summary_health_class(&sole_copy, None, true),
+            "degraded-archive-risk"
+        );
     }
 
     fn doctor_test_source_authority_report() -> DoctorSourceAuthorityReport {
@@ -80413,7 +80916,7 @@ paths = ["~/.claude/projects"]
         std::fs::write(&source_path, bytes).unwrap();
         let before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
         let mut cache = HashMap::new();
-        for provider in ["shelley", "grok_bot"] {
+        for provider in ["shelley", "grok_bot", "pi_durable"] {
             for origin in ["local", "ssh"] {
                 for apply in [false, true] {
                     let candidate = DoctorRawMirrorBackfillCandidate {
@@ -80440,10 +80943,10 @@ paths = ["~/.claude/projects"]
                     assert!(!receipt.raw_source_captured);
                     assert!(!receipt.raw_mirror_db_linked);
                     assert!(!receipt.db_projection_only);
-                    let variable = if provider == "shelley" {
-                        "CASS_SHELLEY_DB"
-                    } else {
-                        "CASS_GROK_BOT_DATA_ROOT"
+                    let variable = match provider {
+                        "shelley" => "CASS_SHELLEY_DB",
+                        "grok_bot" => "CASS_GROK_BOT_DATA_ROOT",
+                        _ => "PI_CODING_AGENT_DIR",
                     };
                     assert!(
                         receipt
@@ -84806,6 +85309,15 @@ fn probe_daemon_runtime_for_diagnostics(
     }
 }
 
+/// The status/health warning for conversations the watcher keeps deferring
+/// after a bounded-guard NoMem (GH#510). They are not quarantined, but they are
+/// missing from search until one ingests.
+fn watch_nomem_deferral_warning(deferred_conversations: u64) -> String {
+    format!(
+        "{deferred_conversations} conversation(s) are deferred by the watcher after repeated bounded-allocation NoMem and are missing from search until they ingest; `cass quarantine list --json` lists them"
+    )
+}
+
 fn run_status(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -84979,8 +85491,16 @@ fn run_status(
         ));
     } else if quarantined_conversations > 0 {
         warnings.push(format!(
-            "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; search remains usable for the rest of the archive"
+            "{quarantined_conversations} conversation(s) are excluded from search after ingest quarantine; search remains usable for the rest of the archive, and `cass quarantine list --json` names them and says whether a retry can help"
         ));
+    }
+    let deferred_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("deferred_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if deferred_conversations > 0 {
+        warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
@@ -85079,7 +85599,7 @@ fn run_status(
         Some(format!(
             "Run 'cass index' to refresh the index{pending_msg}"
         ))
-    } else if quarantined_conversations > 0 {
+    } else if quarantined_conversations > 0 || deferred_conversations > 0 {
         ingest_quarantine_recommended_action
     } else {
         semantic_recommended_action(&state, not_initialized)
@@ -85308,6 +85828,18 @@ fn run_status(
                 _ => println!("  Rebuild progress: in progress"),
             }
         }
+        if let Some(scan) = state
+            .get("rebuild")
+            .and_then(|rebuild| rebuild.get("expected_docs_scan"))
+            .filter(|scan| !scan.is_null())
+        {
+            println!(
+                "  Coverage scan: counted through conversation id {} of {} ({} docs so far); the next index run resumes it if the archive only grew",
+                scan["last_conversation_id"],
+                scan["max_conversation_id"],
+                scan["expected_docs_so_far"]
+            );
+        }
         if index_empty_with_messages {
             println!("  Warning: index has 0 documents but database has messages");
             println!("  Run 'cass index --full' to populate the search index");
@@ -85388,6 +85920,13 @@ fn run_status(
         println!();
         println!(
             "Warning: {quarantined_conversations} conversation(s) quarantined after ingest OOM"
+        );
+    }
+    if deferred_conversations > 0 {
+        println!();
+        println!(
+            "Warning: {}",
+            watch_nomem_deferral_warning(deferred_conversations)
         );
     }
 
@@ -86397,8 +86936,16 @@ fn run_health(
         ));
     } else if quarantined_conversations > 0 {
         warnings.push(format!(
-            "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; lexical search remains usable for non-quarantined sessions"
+            "{quarantined_conversations} conversation(s) are excluded from search after ingest quarantine; lexical search remains usable for the rest, and `cass quarantine list --json` names them and says whether a retry can help"
         ));
+    }
+    let deferred_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("deferred_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if deferred_conversations > 0 {
+        warnings.push(watch_nomem_deferral_warning(deferred_conversations));
     }
 
     let db_degraded = db_exists && !db_opened;
@@ -86438,7 +86985,9 @@ fn run_health(
         // GH #457: mirror run_status — name the repair, not the generic
         // stale advice, so the operator knows why the run will rebuild.
         Some(HOLLOW_INDEX_RECOMMENDED_ACTION.to_string())
-    } else if ingest_quarantine_critical || (healthy && quarantined_conversations > 0) {
+    } else if ingest_quarantine_critical
+        || (healthy && (quarantined_conversations > 0 || deferred_conversations > 0))
+    {
         ingest_quarantine_recommended_action
     } else if !healthy {
         Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
@@ -87305,12 +87854,46 @@ mod cli_read_db_tests {
             Some(&serde_json::Value::Bool(true)),
             "a persisted marker must surface as fallback_fts_repair.pending=true"
         );
+        assert_eq!(
+            pending.pointer("/index/fallback_fts_repair/retired_not_viable"),
+            Some(&serde_json::Value::Bool(false)),
+            "a half-built shadow is not a retirement"
+        );
         assert!(
             pending
                 .pointer("/index/fallback_fts_repair/detail")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|d| d.contains("corrupt %_data record")),
             "the detail must carry the failure reason"
+        );
+
+        // GH #495: the marker a not-viable retirement leaves behind says why the
+        // shadow is absent; status must not call that settled state pending.
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .record_fallback_fts_repair_pending(Some(
+                    &crate::storage::sqlite::fts_shadow_not_viable_detail(256_396, 100_000),
+                ))
+                .expect("record retirement marker");
+            drop(storage);
+        }
+        let retired = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert_eq!(
+            retired.pointer("/index/fallback_fts_repair/pending"),
+            Some(&serde_json::Value::Bool(false)),
+            "a settled retirement is not a pending repair: {retired}"
+        );
+        assert_eq!(
+            retired.pointer("/index/fallback_fts_repair/retired_not_viable"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            retired
+                .pointer("/index/fallback_fts_repair/detail")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|d| d.contains("settled state, not a pending repair")),
+            "the retirement keeps its reason"
         );
 
         {
@@ -88020,6 +88603,52 @@ mod cli_read_db_tests {
         assert_eq!(resolve_semantic_index_embedder(Some("hash")), "hash");
     }
 
+    /// GH #381 (ntxs1): status shows where an interrupted expected-docs scan
+    /// stopped, from the position file such a run leaves beside the index,
+    /// and nothing for a position file that belongs to another archive.
+    #[test]
+    #[serial]
+    fn state_meta_json_reports_interrupted_expected_docs_scan_position() {
+        let (temp, db_path) = seed_cli_db();
+        let index_root = temp.path().join("index");
+        std::fs::create_dir_all(&index_root).expect("index root");
+        let partial_path = index_root.join(".expected-lexical-docs.partial.json");
+        // The on-disk shape an interrupted scan saves (memo schema 2).
+        let write_partial = |db: &Path| {
+            let partial = serde_json::json!({
+                "schema_version": 2,
+                "db_path": db.display().to_string(),
+                "identity": {
+                    "total_conversations": 9,
+                    "max_conversation_id": 9,
+                    "max_message_id": 40,
+                    "total_messages": 40,
+                    "content_cap_bytes": 8_388_608
+                },
+                "last_conversation_id": 4,
+                "expected_docs": 17
+            });
+            std::fs::write(&partial_path, serde_json::to_vec(&partial).unwrap())
+                .expect("write scan position");
+        };
+
+        write_partial(&db_path);
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        let scan = &state["rebuild"]["expected_docs_scan"];
+        assert_eq!(scan["last_conversation_id"].as_i64(), Some(4), "{scan}");
+        assert_eq!(scan["max_conversation_id"].as_i64(), Some(9), "{scan}");
+        assert_eq!(scan["expected_docs_so_far"].as_u64(), Some(17), "{scan}");
+        assert!(scan["saved_at"].is_string(), "{scan}");
+
+        write_partial(&temp.path().join("another-archive.db"));
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert!(
+            state["rebuild"]["expected_docs_scan"].is_null(),
+            "{}",
+            state["rebuild"]
+        );
+    }
+
     #[test]
     #[serial]
     fn state_meta_json_reports_lexical_rebuild_pipeline_settings() {
@@ -88144,6 +88773,18 @@ mod cli_read_db_tests {
         assert_eq!(
             pipeline["pipeline_max_message_bytes_in_flight"].as_u64(),
             Some(888888)
+        );
+        // GH #496: a page holds at most an equal share of the in-flight
+        // budget across the channel slots plus the sink (888888 / 5): the
+        // steady 610000-byte commit interval is clamped, the 61000-byte
+        // startup one is not.
+        assert_eq!(
+            pipeline["startup_page_fetch_message_bytes"].as_u64(),
+            Some(61000)
+        );
+        assert_eq!(
+            pipeline["steady_page_fetch_message_bytes"].as_u64(),
+            Some(888888 / 5)
         );
         assert_eq!(pipeline["runtime"], serde_json::Value::Null);
     }
@@ -92164,7 +92805,11 @@ pub(crate) fn run_doctor_impl(
         );
         risk
     } else {
-        doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len())
+        doctor_coverage_risk_summary(
+            &coverage_summary,
+            sole_copy_warnings.len(),
+            !crate::raw_mirror::capture_enabled(),
+        )
     };
     if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
         add_check!(
@@ -92180,6 +92825,21 @@ pub(crate) fn run_doctor_impl(
             format!(
                 "Source coverage ledger found {} sole-copy warning(s); live-source rebuilds that reduce coverage are refused",
                 sole_copy_warnings.len()
+            ),
+            false
+        );
+    } else if coverage_summary.db_without_raw_mirror_count > 0
+        && !crate::raw_mirror::capture_enabled()
+    {
+        // GH #506: say plainly what the operator's switch gives up; doctor
+        // --fix cannot add raw copies while capture is off.
+        add_check!(
+            "source_coverage",
+            "warn",
+            format!(
+                "Raw mirror capture is off (CASS_RAW_MIRROR): {} DB row(s) have no raw copy, so a session file its provider deletes survives only in the archive DB ({} raw mirror manifest(s) lack DB links)",
+                coverage_summary.db_without_raw_mirror_count,
+                coverage_summary.mirror_without_db_link_count
             ),
             false
         );
@@ -94904,6 +95564,45 @@ fn run_context(
     Ok(())
 }
 
+/// The binary's compiled completed-source reuse policy (GH#426). Reuse is
+/// compiled in only when every dependency in the build's `Cargo.lock` has a
+/// registry or git source: a local path dependency or `[patch]` can change a
+/// parser without changing the lockfile, so such a build reparses every
+/// source on every incremental run. Release binaries have it enabled.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SourceIngestReuseCapability {
+    pub enabled: bool,
+    /// The first unpinned package that disabled reuse; `None` when enabled.
+    pub disabled_by: Option<String>,
+}
+
+impl SourceIngestReuseCapability {
+    fn compiled() -> Self {
+        let blocker = env!("CASS_SOURCE_INGEST_REUSE_BLOCKER");
+        Self {
+            enabled: env!("CASS_SOURCE_INGEST_REUSE") == "true",
+            disabled_by: (!blocker.is_empty()).then(|| blocker.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_ingest_reuse_capability_tests {
+    use super::SourceIngestReuseCapability;
+
+    /// The compiled policy and its reason never disagree: reuse is on exactly
+    /// when build.rs found no unpinned package to blame, and the reason field
+    /// is always present so agents can branch on it.
+    #[test]
+    fn compiled_reuse_policy_names_a_blocker_exactly_when_disabled() {
+        let policy = SourceIngestReuseCapability::compiled();
+        assert_eq!(policy.enabled, policy.disabled_by.is_none(), "{policy:?}");
+        let json = serde_json::to_value(&policy).unwrap();
+        assert!(json.get("disabled_by").is_some(), "{json}");
+        assert_eq!(json["enabled"], policy.enabled);
+    }
+}
+
 /// Capabilities response for agent introspection.
 /// Provides static information about CLI features, versions, and limits.
 #[derive(Debug, Clone, Serialize)]
@@ -94919,6 +95618,9 @@ pub struct CapabilitiesResponse {
     /// Commit date (`YYYY-MM-DD`) of `build_commit`; `"unknown"` when built
     /// without git metadata.
     pub build_commit_date: String,
+    /// Whether this binary skips re-parsing sources it already ingested
+    /// completely (GH#426). Decided at build time.
+    pub source_ingest_reuse: SourceIngestReuseCapability,
     /// API contract version (bumped on breaking changes)
     pub api_version: u32,
     /// Human-readable contract identifier
@@ -95486,6 +96188,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_DEFER_ANALYTICS_UPDATES",
             Some("0"),
             "Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset.",
+        ),
+        env_var_capability(
+            "CASS_RAW_MIRROR",
+            Some("1"),
+            "Raw-mirror capture of session source files. Set 0, false, no or off to stop copying sources whose provider keeps its own history; existing captures stay until `cass mirror prune`, indexing is unaffected, and doctor reports raw_mirror_capture_disabled because a file its provider deletes then survives only in the archive DB.",
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH",
@@ -96085,6 +96792,7 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
         build_commit_date: option_env!("CASS_BUILD_COMMIT_DATE")
             .unwrap_or("unknown")
             .to_string(),
+        source_ingest_reuse: SourceIngestReuseCapability::compiled(),
         api_version: 1,
         contract_version: CONTRACT_VERSION.to_string(),
         features: vec![
@@ -96161,6 +96869,10 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
             "Build commit: {} ({})",
             response.build_commit, response.build_commit_date
         );
+    }
+    match &response.source_ingest_reuse.disabled_by {
+        None => println!("Completed-source reuse: on"),
+        Some(blocker) => println!("Completed-source reuse: off ({blocker})"),
     }
     println!();
     println!("Features:");
@@ -97000,14 +97712,47 @@ fn extract_formula_version(body: &str) -> Option<String> {
     None
 }
 
+/// Builds the clap trees of the subcommands the `cass` binary dispatches
+/// before [`parse_cli`] (`serve`, `archive`; see src/main.rs).
+static EXTERNAL_SUBCOMMANDS: std::sync::OnceLock<fn() -> Vec<Command>> = std::sync::OnceLock::new();
+
+/// Called by the `cass` binary so help, completions, the man page,
+/// `capabilities` and `introspect` describe the subcommands it parses itself.
+/// Parsing is unchanged: the binary still dispatches them first.
+pub fn register_external_subcommands(build: fn() -> Vec<Command>) {
+    let _ = EXTERNAL_SUBCOMMANDS.set(build);
+}
+
+fn external_subcommands() -> Vec<Command> {
+    EXTERNAL_SUBCOMMANDS
+        .get()
+        .map(|build| build())
+        .unwrap_or_default()
+}
+
+/// The whole `cass` command tree: this crate's CLI plus the registered
+/// binary-dispatched subcommands.
+fn cli_command() -> Command {
+    Cli::command().subcommands(external_subcommands())
+}
+
 /// Build command schemas for all CLI commands
 fn build_command_schemas() -> Vec<CommandSchema> {
     let root = Cli::command();
     let global_robot_format = root
         .get_arguments()
         .find(|arg| arg.get_id().as_str() == "robot_format");
+    // The binary parses its registered subcommands with their own parsers,
+    // which do not accept this CLI's global --robot-format: list only their
+    // own arguments.
+    let external = external_subcommands();
     root.get_subcommands()
         .map(|cmd| command_schema_from_clap(cmd, global_robot_format))
+        .chain(
+            external
+                .iter()
+                .map(|cmd| command_schema_from_clap(cmd, None)),
+        )
         .collect()
 }
 
@@ -97222,6 +97967,7 @@ fn response_schema_ingest_quarantine() -> serde_json::Value {
             "schema_version": { "type": "integer" },
             "status": { "type": "string" },
             "quarantined_conversations": { "type": "integer" },
+            "deferred_conversations": { "type": "integer" },
             "recent_quarantined_conversations": { "type": "integer" },
             "recent_window_seconds": { "type": "integer" },
             "circuit_breaker_limit": { "type": "integer" },
@@ -97348,6 +98094,16 @@ fn response_schema_rebuild_state() -> serde_json::Value {
                 "type": "object",
                 "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                 "additionalProperties": true
+            },
+            "expected_docs_scan": {
+                "type": ["object", "null"],
+                "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                "properties": {
+                    "last_conversation_id": { "type": "integer" },
+                    "max_conversation_id": { "type": "integer" },
+                    "expected_docs_so_far": { "type": "integer" },
+                    "saved_at": { "type": ["string", "null"] }
+                }
             }
         }
     })
@@ -97594,8 +98350,10 @@ fn response_schema_topology_budget() -> serde_json::Value {
                     "numa_nodes": { "type": "integer" },
                     "llc_groups": { "type": "integer" },
                     "smt_threads_per_core": { "type": "integer" },
-                    "memory_total_bytes": { "type": ["integer", "null"] },
-                    "memory_available_bytes": { "type": ["integer", "null"] }
+                    "memory_total_bytes": { "type": ["integer", "null"], "description": "Memory budgets are sized from: the host total clamped to the tightest cgroup limit on this process's chain" },
+                    "memory_available_bytes": { "type": ["integer", "null"] },
+                    "host_memory_total_bytes": { "type": ["integer", "null"], "description": "The host's own total before any cgroup limit" },
+                    "memory_limit_source": { "type": ["string", "null"], "description": "What set memory_total_bytes: host, or cgroup_v2:/<path> / cgroup_v1:/<path> for the level whose limit is below the host total" }
                 }
             },
             "reserved_core_policy": {
@@ -98253,7 +99011,7 @@ fn response_schema_doctor_v2_summary(surface: &'static str) -> serde_json::Value
                 "archive_coverage_state",
                 serde_json::json!({
                     "type": "string",
-                    "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+                    "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
                 }),
             ),
             (
@@ -99458,6 +100216,10 @@ fn response_schema_doctor_coverage_risk() -> serde_json::Value {
             "current_source_newer_than_archive_count": { "type": "integer" },
             "raw_mirror_db_link_count": { "type": "integer" },
             "sole_copy_warning_count": { "type": "integer" },
+            "raw_mirror_capture_disabled": {
+                "type": "boolean",
+                "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
+            },
             "recommended_action": { "type": "string" }
         }
     })
@@ -100667,6 +101429,10 @@ fn response_schema_pack() -> serde_json::Value {
                 "properties": {
                     "search_mode": { "type": "string" },
                     "fallback_mode": { "type": ["string", "null"] },
+                    "fallback_reason": {
+                        "type": ["string", "null"],
+                        "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason; pack_enrichment_unavailable means pack itself selects evidence lexically). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
+                    },
                     "semantic_joined": { "type": "boolean" },
                     "candidate_count": { "type": "integer" },
                     "selected_evidence_count": { "type": "integer" },
@@ -101242,6 +102008,13 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "crate_version": { "type": "string" },
                 "build_commit": { "type": "string" },
                 "build_commit_date": { "type": "string" },
+                "source_ingest_reuse": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "disabled_by": { "type": ["string", "null"] }
+                    }
+                },
                 "api_version": { "type": "integer" },
                 "contract_version": { "type": "string" },
                 "features": { "type": "array", "items": { "type": "string" } },
@@ -101444,6 +102217,38 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "quarantined_conversations": { "type": "integer" },
                 "lexical_update_deferred": { "type": "boolean" },
                 "indexing_stats": response_schema_opaque_object(),
+                "rebuild_profile": {
+                    "type": "object",
+                    "description": "--rebuild-profile echo (GH #483): the selected preset, where each of its knobs came from, and the lexical-rebuild settings this process would use after the responsiveness governor at report time",
+                    "properties": {
+                        "name": { "type": "string", "description": "default | bounded" },
+                        "settings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "env": { "type": "string" },
+                                    "value": { "type": "integer" },
+                                    "source": { "type": "string", "description": "profile, or env when an explicit environment value overrides the preset" }
+                                }
+                            }
+                        },
+                        "effective": {
+                            "type": "object",
+                            "properties": {
+                                "workers": { "type": "integer" },
+                                "page_prep_workers": { "type": "integer" },
+                                "staged_shard_builders": { "type": "integer" },
+                                "staged_merge_workers": { "type": "integer" },
+                                "tantivy_writer_threads": { "type": "integer" },
+                                "pipeline_channel_size": { "type": "integer" },
+                                "steady_batch_fetch_conversations": { "type": "integer" },
+                                "steady_commit_every_message_bytes": { "type": "integer" },
+                                "pipeline_max_message_bytes_in_flight": { "type": "integer" }
+                            }
+                        }
+                    }
+                },
                 "error": { "type": ["string", "null"] }
             }
         }),
@@ -105240,12 +106045,18 @@ fn index_worker_thread_builder() -> std::thread::Builder {
         .stack_size(INDEX_WORKER_STACK_SIZE_BYTES)
 }
 
+/// Maximum time for an indexing worker to reach a safe boundary after a signal.
+const INDEX_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Poll cancel-safe Asupersync signal streams from the existing CLI progress
-/// loop. Signal delivery only requests a stop; the index worker owns draining
-/// the current batch, durable completion records and its indexing lock.
+/// loop. The first signal lets the index worker drain its current batch; a
+/// repeated signal or an expired grace period ends a worker that cannot reach
+/// a cancellation checkpoint (GH #515).
 struct IndexShutdownSignals {
     streams: Vec<(asupersync::signal::Signal, i32)>,
     received: Option<i32>,
+    received_at: Option<Instant>,
+    repeated: bool,
 }
 
 impl IndexShutdownSignals {
@@ -105262,6 +106073,8 @@ impl IndexShutdownSignals {
         Ok(Self {
             streams,
             received: None,
+            received_at: None,
+            repeated: false,
         })
     }
 
@@ -105272,16 +106085,71 @@ impl IndexShutdownSignals {
         for (signal, code) in &mut self.streams {
             let mut receive = std::pin::pin!(signal.recv());
             if matches!(receive.as_mut().poll(&mut context), Poll::Ready(Some(()))) {
-                self.received.get_or_insert(*code);
+                if self.received.is_some() {
+                    self.repeated = true;
+                } else {
+                    self.received = Some(*code);
+                    self.received_at = Some(Instant::now());
+                }
             }
         }
         self.received
     }
 
     fn poll(&mut self, progress: &indexer::IndexingProgress) {
-        if self.poll_exit_code().is_some() {
+        let already_received = self.received.is_some();
+        if let Some(code) = self.poll_exit_code() {
             progress.request_stop();
+            if !already_received {
+                tracing::info!(
+                    exit_code = code,
+                    grace_secs = INDEX_SHUTDOWN_GRACE.as_secs(),
+                    "index shutdown requested; draining current work before exit"
+                );
+            }
         }
+    }
+
+    /// Only call while the worker is still running. A worker that drained in
+    /// time follows the ordinary joined-result path, which also preserves the
+    /// signal's exit code when its last batch happened to finish successfully.
+    fn abort_if_needed(&self, elapsed_ms: u128) {
+        let (Some(code), Some(received_at)) = (self.received, self.received_at) else {
+            return;
+        };
+        let reason = if self.repeated {
+            "a second shutdown signal was received".to_string()
+        } else if received_at.elapsed() >= INDEX_SHUTDOWN_GRACE {
+            format!(
+                "the index worker did not stop within {} seconds",
+                INDEX_SHUTDOWN_GRACE.as_secs()
+            )
+        } else {
+            return;
+        };
+        let error = CliError {
+            code,
+            kind: CliErrorKind::Index.kind_str(),
+            message: format!("index interrupted: {reason}; exiting without waiting for the worker"),
+            hint: Some(
+                "Committed work and the database WAL are retained. Rerun the same index command to resume from committed source observations."
+                    .to_string(),
+            ),
+            retryable: true,
+        };
+        // A closed stderr must not panic and divert forced cancellation into
+        // unwinding before the process exit releases the worker's locks.
+        {
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "{}", cli_error_json_payload(&error, elapsed_ms));
+            let _ = stderr.flush();
+        }
+        // The worker may be blocked inside a storage operation. Opening a new
+        // connection or waiting for destructors here can block on that same
+        // operation and swallow SIGTERM again. Exit releases its OS locks;
+        // committed WAL frames remain available to the next indexing run.
+        std::process::exit(code);
     }
 }
 
@@ -107778,6 +108646,81 @@ fn cached_index_payload(result_json: &str, key: &str) -> Option<serde_json::Valu
     Some(serde_json::Value::Object(payload))
 }
 
+fn read_index_idempotency_cache(
+    db_path: &Path,
+    key: &str,
+    now_ms: i64,
+) -> Option<(String, String)> {
+    // Lookup precedes index admission. A missing or unavailable cache is a
+    // miss: never create its table, expire rows, repair storage, or wait for
+    // another archive owner before the indexer can report typed contention.
+    let storage = crate::storage::sqlite::FrankenStorage::open_strict_readonly_with_timeout(
+        db_path,
+        Duration::ZERO,
+    )
+    .ok()?;
+    let conn = storage.into_raw();
+    let cached = conn
+        .execute("PRAGMA busy_timeout = 0;")
+        .and_then(|_| conn.query_row_map(
+            "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
+            crate::franken_sync::params![key, now_ms],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        ))
+        .ok();
+    let _ = close_franken_cli_read_db_without_checkpoint(
+        conn,
+        db_path,
+        "checking index idempotency cache",
+    );
+    cached
+}
+
+fn store_index_idempotency_result(
+    data_dir: &Path,
+    db_path: &Path,
+    key: &str,
+    params_hash: u64,
+    payload: &serde_json::Value,
+    now_ms: i64,
+) -> Result<()> {
+    use crate::franken_sync::compat::TransactionExt;
+
+    let result_json = serde_json::to_string(payload)?;
+    let hash_str = params_hash.to_string();
+    let expires_ms = now_ms + 24 * 60 * 60 * 1000;
+    // The indexing worker has already joined and released its ownership.
+    // Reacquire both asset and archive admission for this short cache write;
+    // a newly admitted daemon/indexer must keep its ownership undisturbed.
+    let _mutation_guard = crate::indexer::acquire_search_maintenance_mutation_lock(
+        data_dir,
+        db_path,
+        crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+    )?;
+    with_frankensqlite_connection(db_path, "storing index idempotency result", |conn| {
+        let mut transaction = conn.transaction()?;
+        transaction.execute(
+            "CREATE TABLE IF NOT EXISTS idempotency_keys (
+                key TEXT PRIMARY KEY,
+                params_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+        )?;
+        transaction.execute_compat(
+            "DELETE FROM idempotency_keys WHERE expires_at <= ?1",
+            crate::franken_sync::params![now_ms],
+        )?;
+        transaction.execute_compat(
+            "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            crate::franken_sync::params![key, hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+        )?;
+        transaction.commit()
+    })?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -107800,7 +108743,6 @@ fn run_index_with_data(
     mut captured_result: Option<&mut Option<serde_json::Value>>,
     mirror_source_ids: Option<Vec<String>>,
 ) -> CliResult<()> {
-    use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
     if background {
@@ -107872,47 +108814,21 @@ fn run_index_with_data(
         robot_trace_ingest.hash(&mut hasher);
         mirror_source_ids.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
+        // Only a non-default profile enters the hash, so keys cached before
+        // --rebuild-profile existed keep matching their default-profile runs.
+        let rebuild_profile = indexer::lexical_rebuild_profile();
+        if rebuild_profile != indexer::LexicalRebuildProfile::Default {
+            rebuild_profile.as_str().hash(&mut hasher);
+        }
         hasher.finish()
     };
 
     // Check for cached idempotency result
     if let Some(key) = &idempotency_key {
-        let cached = with_frankensqlite_connection(
-            &db_path,
-            "checking index idempotency cache",
-            |conn| {
-                if let Err(e) = conn.execute(
-                    "CREATE TABLE IF NOT EXISTS idempotency_keys (
-                        key TEXT PRIMARY KEY,
-                        params_hash TEXT NOT NULL,
-                        result_json TEXT NOT NULL,
-                        created_at INTEGER NOT NULL,
-                        expires_at INTEGER NOT NULL
-                    )",
-                ) {
-                    tracing::warn!("Failed to create idempotency_keys table: {e}");
-                }
+        let cached =
+            read_index_idempotency_cache(&db_path, key, chrono::Utc::now().timestamp_millis());
 
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                if let Err(e) = conn.execute_compat(
-                    "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-                    crate::franken_sync::params![now_ms],
-                ) {
-                    tracing::warn!("Failed to clean expired idempotency keys: {e}");
-                }
-
-                let cached: Option<(String, String)> = conn
-                    .query_row_map(
-                        "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                        crate::franken_sync::params![key.as_str(), now_ms],
-                        |r: &crate::franken_sync::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
-                    )
-                    .ok();
-                Ok(cached)
-            },
-        );
-
-        if let Ok(Some((stored_hash, result_json))) = cached {
+        if let Some((stored_hash, result_json)) = cached {
             if stored_hash == params_hash.to_string() {
                 // A syntactically valid scalar or array is not an index result.
                 // Treat damaged cache entries as misses in every output mode.
@@ -108142,6 +109058,7 @@ fn run_index_with_data(
             if index_handle.is_finished() {
                 break;
             }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
 
             let phase = index_progress.phase.load(Ordering::Relaxed);
             let total = index_progress.total.load(Ordering::Relaxed);
@@ -108277,6 +109194,7 @@ fn run_index_with_data(
             if index_handle.is_finished() {
                 break;
             }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
 
             let phase = index_progress.phase.load(Ordering::Relaxed);
             let total = index_progress.total.load(Ordering::Relaxed);
@@ -108389,6 +109307,7 @@ fn run_index_with_data(
             if index_handle.is_finished() {
                 break;
             }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
 
             let phase_code = index_progress.phase.load(Ordering::Relaxed);
             let elapsed_ms = start.elapsed().as_millis();
@@ -108437,6 +109356,10 @@ fn run_index_with_data(
                 .semantic_aware(semantic);
         while !index_handle.is_finished() {
             shutdown_signals.poll(&index_progress);
+            if index_handle.is_finished() {
+                break;
+            }
+            shutdown_signals.abort_if_needed(start.elapsed().as_millis());
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
             {
@@ -108465,6 +109388,13 @@ fn run_index_with_data(
                     hint: Some("Rerun the same index command to resume from committed source observations.".into()),
                     retryable: true,
                 };
+            }
+            if e.downcast_ref::<indexer::ConnectorScanFailure>().is_some()
+                && let Err(error) = index_result::require_complete_scan(true, &[])
+            {
+                // The source error and its path remain in connector stats.
+                // A project named "busy" is not canonical-storage contention.
+                return error;
             }
             let chain = e
                 .chain()
@@ -108585,6 +109515,8 @@ fn run_index_with_data(
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
             }
+            // A stalled or failed bounded run should still say what it used.
+            payload["rebuild_profile"] = indexer::lexical_rebuild_profile_report();
             if emit_progress_events {
                 let mut event = payload.clone();
                 if let serde_json::Value::Object(ref mut m) = event {
@@ -108643,6 +109575,7 @@ fn run_index_with_data(
             "messages": messages,
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
+            "rebuild_profile": indexer::lexical_rebuild_profile_report(),
         });
 
         // Add structured indexing stats if available (T7.4)
@@ -108660,34 +109593,17 @@ fn run_index_with_data(
             payload["idempotency_key"] = serde_json::json!(key);
             payload["cached"] = serde_json::json!(false);
 
-            if let Err(e) = with_frankensqlite_connection(
+            if let Err(e) = store_index_idempotency_result(
+                &data_dir,
                 &db_path,
-                "storing index idempotency result",
-                |conn| {
-                    // On a first run the data directory may not exist when
-                    // cache lookup runs. Indexing creates it, so initialize
-                    // the cache here as well before persisting the result.
-                    conn.execute(
-                        "CREATE TABLE IF NOT EXISTS idempotency_keys (
-                            key TEXT PRIMARY KEY,
-                            params_hash TEXT NOT NULL,
-                            result_json TEXT NOT NULL,
-                            created_at INTEGER NOT NULL,
-                            expires_at INTEGER NOT NULL
-                        )",
-                    )?;
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
-                    let result_json = serde_json::to_string(&payload).unwrap_or_default();
-                    let hash_str = params_hash.to_string();
-                    conn.execute_compat(
-                        "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        crate::franken_sync::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
-                    )?;
-                    Ok(())
-                },
+                key,
+                params_hash,
+                &payload,
+                chrono::Utc::now().timestamp_millis(),
             ) {
-                tracing::warn!("Failed to store idempotency key: {e}");
+                // Persistence is best-effort, including typed index-busy when
+                // a new writer starts after the completed indexing worker.
+                tracing::warn!("Failed to store idempotency key: {e:#}");
             }
         }
 
@@ -118590,6 +119506,53 @@ struct SourcesDoctorOutput<'a> {
     health: &'a crate::source_doctor_health::SourceDoctorReport,
     diagnostics: &'a [SourceDiagnostics],
     budget: &'a crate::robot_budget_envelope::BudgetBlock,
+    /// Problems in `sources.toml` itself that no per-host probe can see.
+    config_validation: &'a crate::sources::config_validation::SourceConfigValidation,
+}
+
+/// Bead uojcg.8.5: validate the parsed source configuration against this
+/// host. The validator is pure; this gathers its environment signals: the
+/// sync transports on PATH, an interrupted `sources setup` (its checkpoint is
+/// removed on completion) and `.sources.toml.tmp.*` files an interrupted
+/// config write left beside the config. `disabled_agents` names are not
+/// checked: they accept aliases (`claude_code`) that raw connector names would
+/// misreport as unknown.
+fn sources_doctor_config_validation(
+    config: &crate::sources::config::SourcesConfig,
+) -> crate::sources::config_validation::SourceConfigValidation {
+    use crate::sources::config_validation::{ConfigValidationContext, validate_sources_config};
+    let on_path = |tool: &str| {
+        let file = if cfg!(target_os = "windows") {
+            format!("{tool}.exe")
+        } else {
+            tool.to_string()
+        };
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&file).is_file()))
+    };
+    let orphaned_temp_files = crate::sources::config::SourcesConfig::config_path()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".sources.toml.tmp")
+                })
+                .count()
+        });
+    let ctx = ConfigValidationContext {
+        rsync_available: on_path("rsync"),
+        scp_available: on_path("scp"),
+        setup_in_progress: matches!(crate::sources::SetupState::load(), Ok(Some(_))),
+        orphaned_temp_files,
+        known_agents: Vec::new(),
+    };
+    validate_sources_config(config, &ctx)
 }
 
 const SOURCE_DOCTOR_FIXTURE_MAX_BYTES: usize = 16 * 1024;
@@ -118923,6 +119886,8 @@ fn run_sources_doctor(
         return Ok(());
     }
 
+    let config_validation = sources_doctor_config_validation(&config);
+
     // Filter sources if specified
     let sources_to_check: Vec<_> = config
         .sources
@@ -119196,6 +120161,7 @@ fn run_sources_doctor(
             health: &health_report,
             diagnostics: &all_diagnostics,
             budget: &budget,
+            config_validation: &config_validation,
         };
         println!(
             "{}",
@@ -119267,6 +120233,22 @@ fn run_sources_doctor(
                 println!("Next bounded probe: {next}");
             }
         }
+        if !config_validation.issues.is_empty() {
+            use crate::sources::config_validation::ConfigIssueSeverity;
+            println!();
+            println!("{}", "Configuration".bold());
+            for issue in &config_validation.issues {
+                let icon = match issue.severity {
+                    ConfigIssueSeverity::Error => "✗".red(),
+                    ConfigIssueSeverity::Warning => "⚠".yellow(),
+                    ConfigIssueSeverity::Info => "ℹ".cyan(),
+                };
+                println!("  {icon} {}", issue.detail);
+                if let Some(command) = issue.safe_next_command.as_deref() {
+                    println!("    {}: {command}", "Next".cyan());
+                }
+            }
+        }
     }
 
     // Set exit code based on results
@@ -119274,6 +120256,7 @@ fn run_sources_doctor(
     if total_failed > 0
         || health_report.summary.unhealthy > 0
         || health_report.summary.unreached > 0
+        || config_validation.has_errors()
     {
         std::process::exit(1);
     }
@@ -122535,23 +123518,26 @@ fn run_models_build_hnsw(
     } else {
         let db_path = data_dir.join("agent_search.db");
         Some(
-            crate::indexer::acquire_semantic_backfill_lock(&data_dir, &db_path).map_err(
-                |error| {
-                    let rendered = format!("{error:#}");
-                    if error_chain_indicates_active_cass_index(&rendered) {
-                        return active_index_run_details(&data_dir, &db_path)
-                            .map(|details| details.to_cli_error())
-                            .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
-                    }
-                    CliError {
-                        code: 5,
-                        kind: CliErrorKind::Storage.kind_str(),
-                        message: format!("Failed to acquire HNSW maintenance lock: {rendered}"),
-                        hint: Some("Check permissions under the cass data directory".into()),
-                        retryable: true,
-                    }
-                },
-            )?,
+            crate::indexer::acquire_search_asset_mutation_lock(
+                &data_dir,
+                &db_path,
+                crate::search::asset_state::SearchMaintenanceJobKind::SemanticRebuild,
+            )
+            .map_err(|error| {
+                let rendered = format!("{error:#}");
+                if error_chain_indicates_active_cass_index(&rendered) {
+                    return active_index_run_details(&data_dir, &db_path)
+                        .map(|details| details.to_cli_error())
+                        .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
+                }
+                CliError {
+                    code: 5,
+                    kind: CliErrorKind::Storage.kind_str(),
+                    message: format!("Failed to acquire HNSW maintenance lock: {rendered}"),
+                    hint: Some("Check permissions under the cass data directory".into()),
+                    retryable: true,
+                }
+            })?,
         )
     };
     let mut manifest = SemanticManifest::load(&data_dir)
@@ -122814,6 +123800,9 @@ fn resolve_semantic_index_embedder(raw: Option<&str>) -> String {
     {
         return "hash".to_string();
     }
+    if crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder)) {
+        return "external".to_string();
+    }
     let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
         &policy.quality_tier_embedder,
     ) else {
@@ -122860,14 +123849,33 @@ fn run_models_backfill(
             fmt
         }
     });
-    let mut shutdown = IndexShutdownSignals::new(true).map_err(|error| CliError {
+    let shutdown = IndexShutdownSignals::new(true).map_err(|error| CliError {
         code: 5,
         kind: CliErrorKind::SemanticBackfill.kind_str(),
         message: format!("Failed to install backfill shutdown signals: {error}"),
         hint: None,
         retryable: true,
     })?;
-    let mut retained = RetainedBackfillModel::default();
+    // The HTTP provider polls the same signal streams before/after each request.
+    // There is no detached listener or inference worker retaining the archive lock.
+    let shutdown = std::sync::Arc::new(std::sync::Mutex::new(shutdown));
+    let exit_code = || {
+        shutdown
+            .lock()
+            .map_or(Some(130), |mut signals| signals.poll_exit_code())
+    };
+    let cancelled: crate::search::external_embedder::CancelCheck = {
+        let shutdown = std::sync::Arc::clone(&shutdown);
+        std::sync::Arc::new(move || {
+            shutdown
+                .lock()
+                .map_or(true, |mut signals| signals.poll_exit_code().is_some())
+        })
+    };
+    let mut retained = RetainedBackfillModel {
+        cancelled: Some(cancelled),
+        ..RetainedBackfillModel::default()
+    };
     let mut attempted = 0u32;
     let mut completed = 0u32;
     let mut last_report = None;
@@ -122877,7 +123885,7 @@ fn run_models_backfill(
     loop {
         // A received signal stops at a durable batch boundary. Each completed
         // helper call has already dropped its archive, manifest and lock.
-        if let Some(code) = shutdown.poll_exit_code() {
+        if let Some(code) = exit_code() {
             failure = Some(CliError {
                 code,
                 kind: CliErrorKind::SemanticBackfill.kind_str(),
@@ -122919,12 +123927,24 @@ fn run_models_backfill(
                     && made_progress;
                 last_report = Some(report);
                 // Still honor a signal delivered during the final batch.
-                if !continue_backfill && shutdown.poll_exit_code().is_none() {
+                if !continue_backfill && exit_code().is_none() {
                     break;
                 }
             }
-            Err(error) if last_report.is_none() => return Err(error),
             Err(error) => {
+                let error = match exit_code() {
+                    Some(code) => CliError {
+                        code,
+                        kind: CliErrorKind::SemanticBackfill.kind_str(),
+                        message: "Semantic backfill cancelled; unfinished HTTP batch was not checkpointed".into(),
+                        hint: Some("Rerun the command to resume from the last durable checkpoint".into()),
+                        retryable: true,
+                    },
+                    None => error,
+                };
+                if last_report.is_none() && !matches!(error.code, 130 | 143) {
+                    return Err(error);
+                }
                 failure = Some(error);
                 break;
             }
@@ -123005,6 +124025,7 @@ fn run_models_backfill(
 struct RetainedBackfillModel {
     indexer: Option<crate::indexer::semantic::SemanticIndexer>,
     initializations: u32,
+    cancelled: Option<crate::search::external_embedder::CancelCheck>,
 }
 
 fn run_models_backfill_batch(
@@ -123056,7 +124077,19 @@ fn run_models_backfill_batch(
             TierKind::Fast => "hash".to_string(),
             TierKind::Quality => resolve_semantic_index_embedder(None),
         });
-    let embedder_valid = embedder_type == "hash"
+    let external = crate::search::embedder_registry::selects_external(Some(&embedder_type));
+    if external && tier != TierKind::Quality {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: "External embeddings require --tier quality; the fast tier remains local"
+                .into(),
+            hint: Some("Use --tier quality --embedder external".into()),
+            retryable: false,
+        });
+    }
+    let embedder_valid = external
+        || embedder_type == "hash"
         || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
             .is_some();
     if !embedder_valid {
@@ -123065,7 +124098,7 @@ fn run_models_backfill_batch(
             kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
             hint: Some(
-                "Use --embedder hash, --embedder minilm (alias fastembed), or --embedder multilingual-minilm"
+                "Use --embedder hash, --embedder minilm (alias fastembed), --embedder multilingual-minilm, or --tier quality --embedder external"
                     .into(),
             ),
             retryable: false,
@@ -123129,24 +124162,62 @@ fn run_models_backfill_batch(
             }
         })?;
 
+    // Direct --scheduled commands must preserve ownership too, not just workers
+    // launched by the nightly parent. Read strictly under the maintenance lock
+    // before provider preflight or a storage open can have side effects. Reuse
+    // the admitted snapshot below so a concurrent change cannot become a newly
+    // authorized checkpoint after preflight; the artifact lease revalidates it.
+    let scheduled_manifest = if scheduled
+        || matches!(
+            std::env::var(crate::indexer::semantic::SCHEDULE_PRESERVE_CHECKPOINT).as_deref(),
+            Ok("1")
+        ) {
+        Some(
+            crate::indexer::semantic::load_scheduled_checkpoint(
+                &data_dir,
+                tier,
+                &embedder_type,
+                retained.indexer.as_ref().map(|indexer| indexer.embedder_id()),
+            )
+            .map_err(|error| CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: format!("Scheduled semantic checkpoint admission failed: {error:#}"),
+                hint: Some(
+                    "Resume the checkpoint's original tier/provider, or explicitly rebuild in the foreground; scheduled work never replaces a foreign checkpoint".into(),
+                ),
+                retryable: false,
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Refuse unavailable models before opening the archive: even a current-
     // schema storage open can change its shared-memory sidecar. Keep model
     // admission inside the maintenance lock so index-busy retains precedence.
     let RetainedBackfillModel {
         indexer: retained_indexer,
         initializations: model_initializations,
+        cancelled,
     } = retained;
     let indexer = match retained_indexer {
         Some(indexer) => indexer,
         vacant => vacant.insert({
             let indexer =
-                SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
+                SemanticIndexer::new_with_cancel(
+                    &embedder_type,
+                    Some(&data_dir),
+                    cancelled.clone().unwrap_or_else(|| std::sync::Arc::new(|| false)),
+                ).map_err(|e| CliError {
                     code: 20,
                     kind: CliErrorKind::Model.kind_str(),
                     message: format!(
                         "Failed to initialize semantic embedder '{embedder_type}': {e}"
                     ),
-                    hint: Some(if embedder_type == "fastembed" {
+                    hint: Some(if external {
+                        "Check CASS_EXTERNAL_EMBEDDINGS consent and CASS_EXTERNAL_EMBEDDING_* configuration; no local provider is substituted".into()
+                    } else if embedder_type == "fastembed" {
                         "Run 'cass models install -y' or retry with --embedder hash".into()
                     } else {
                         "Use --embedder hash or install the selected embedder model".into()
@@ -123175,7 +124246,15 @@ fn run_models_backfill_batch(
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
-    let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
+    // A corrupt external ledger is not permission to discard durable progress.
+    let mut manifest = if let Some(manifest) = scheduled_manifest {
+        Ok(manifest)
+    } else if external {
+        SemanticManifest::load(&data_dir).map(Option::unwrap_or_default)
+    } else {
+        SemanticManifest::load_or_default(&data_dir)
+    }
+    .map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::SemanticManifest.kind_str(),
         message: format!("Failed to load semantic manifest: {e}"),
@@ -123186,7 +124265,11 @@ fn run_models_backfill_batch(
         crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
             .and_then(ModelManifest::for_embedder)
             .unwrap_or_else(ModelManifest::minilm_v2);
-    let model_revision = if embedder_type == "hash" {
+    let model_revision = if external {
+        // Bound to this retained provider's endpoint/model/dimension/revision,
+        // never the local MiniLM manifest or a later environment reread.
+        indexer.embedder_id().to_owned()
+    } else if embedder_type == "hash" {
         "hash".to_string()
     } else {
         model_manifest.revision.clone()

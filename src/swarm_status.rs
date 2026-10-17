@@ -175,6 +175,14 @@ fn run_swarm_observer(
         .filter(|remaining| !remaining.is_zero())
         .ok_or("live provider deadline exceeded")?;
     let executable = std::env::current_exe().map_err(|_| "CASS executable unavailable")?;
+    // Only re-execute the real `cass` binary. Under `cargo test`, current_exe() is the
+    // libtest harness, which reads `swarm <subcommand>` as test-name filters: it re-runs
+    // the swarm tests, which spawn the observer again, recursively. Each child gets its
+    // own process group, so the parent's deadline kill never reaches the grandchildren
+    // (2026-10-08 an rch worker ran ~2.5 CPU-days of these orphans in 5h).
+    if executable.file_stem().and_then(|stem| stem.to_str()) != Some("cass") {
+        return Err("CASS executable unavailable".to_string());
+    }
     let mut command = Command::new(executable);
     command.args(["swarm", subcommand]);
     for (flag, path) in paths {
@@ -206,19 +214,18 @@ const MAX_PROOF_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PROOF_MANIFEST_ROWS: usize = 128;
 
 fn same_proof_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    if left.len() != right.len() || left.modified().ok() != right.modified().ok() {
-        return false;
-    }
+    let same_contents = left.len() == right.len() && left.modified().ok() == right.modified().ok();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
-            != (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
-        {
-            return false;
-        }
+        same_contents
+            && (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
+                == (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
     }
-    true
+    #[cfg(not(unix))]
+    {
+        same_contents
+    }
 }
 
 /// Read only the canonical manifest. Never follow artifact/log references or
@@ -1826,6 +1833,20 @@ mod tests {
             assert_eq!(snapshot.status, SwarmProviderStatus::Unavailable);
             assert!(snapshot.payload.is_null());
         }
+        assert_eq!(
+            fs::read_dir(dir.path()).expect("directory intact").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn swarm_observer_never_reexecutes_a_non_cass_binary() {
+        // current_exe() is this test harness; spawning it would recurse through the
+        // swarm tests instead of running a CASS observer.
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let error = run_swarm_observer(dir.path(), "observe-evidence", &[], Instant::now())
+            .expect_err("the test harness is not the cass binary");
+        assert_eq!(error, "CASS executable unavailable");
         assert_eq!(
             fs::read_dir(dir.path()).expect("directory intact").count(),
             0

@@ -14,27 +14,120 @@
 //! expensive derivation work without risking stale or cross-version
 //! reuse.
 //!
-//! This module lands only the vocabulary: a key that combines a stable
-//! content hash with an algorithm + version fingerprint, a bounded LRU
-//! cache with structured audit logging for hit/miss/evict/quarantine,
-//! and unit tests that pin the invariants. The actual wiring into the
-//! rebuild pipeline ships in a follow-up slice once the
-//! ConversationPacket contract (ibuuh.32) is migrated and the hot
-//! derivations are factored through it.
+//! Keys combine a stable content hash with an algorithm/version fingerprint.
+//! Entry-count LRU limits remain available for small fixed-size values. Large
+//! owned values can additionally share a byte allowance across cache owners;
+//! a lease lives exactly as long as its cached value. Shrinking the allowance
+//! stops new admission immediately and active owners shed their oldest values.
+//! This bounds accounted value storage, not allocator arenas or process RSS.
 //!
 //! Invariants the types enforce:
 //! - Memo keys always combine content hash AND `(algorithm,
 //!   algorithm_version)`, so a version bump of any derivation
 //!   automatically invalidates its prior cache entries — silent stale
 //!   cross-version reuse is impossible by construction.
-//! - Quarantined entries stay resident but are never served; the audit
-//!   log records why quarantine happened so an operator can inspect.
-//! - Evictions are driven only by a bounded entry budget. Callers pick
-//!   the budget; no hidden global cache exists.
+//! - Quarantined keys are never served; their reasons survive cache pressure
+//!   until the caller explicitly collects the quarantine metadata.
+//! - Entry and byte pressure evict reusable results only. A refused insertion
+//!   does not change the already-computed result returned by the caller.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
+
+/// Shared allowance for retained value buffers, not an allocator/RSS quota.
+/// The caller supplies each owned value's weight (for String, its capacity).
+/// Keys, map buckets, quarantine metadata and caller-owned clones are outside
+/// this quantity; the independent entry limit still applies to each cache.
+#[derive(Debug)]
+pub(crate) struct MemoRetentionBudget {
+    limit: AtomicUsize,
+    used: AtomicUsize,
+}
+
+impl MemoRetentionBudget {
+    pub(crate) fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(limit),
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// Existing owners may still hold more than a newly lowered limit. They
+    /// release those values on their next cache operation or on Drop; no new
+    /// reservation may use the excess, and raising a limit allocates nothing.
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Release);
+    }
+
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<MemoRetentionLease> {
+        let mut used = self.used();
+        loop {
+            let limit = self.limit();
+            let next = used.checked_add(bytes)?;
+            if limit == 0 || next > limit {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let lease = MemoRetentionLease {
+                        budget: Arc::clone(self),
+                        bytes,
+                    };
+                    // A pressure update may race admission. Give back this
+                    // reservation if the lowered allowance is already visible.
+                    // A later update is handled like every existing lease.
+                    if self.limit() == 0 || self.used() > self.limit() {
+                        return None;
+                    }
+                    return Some(lease);
+                }
+                Err(current) => used = current,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MemoRetentionLease {
+    budget: Arc<MemoRetentionBudget>,
+    bytes: usize,
+}
+
+impl Drop for MemoRetentionLease {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+struct MemoEntry<V> {
+    value: V,
+    lease: Option<MemoRetentionLease>,
+}
+
+impl<V> MemoEntry<V> {
+    fn retained_bytes(&self) -> usize {
+        self.lease.as_ref().map_or(0, |lease| lease.bytes)
+    }
+}
 
 /// Stable content fingerprint. The producer is responsible for
 /// computing this from the canonical packet content; keeping it as
@@ -100,6 +193,9 @@ pub(crate) enum MemoCacheEvent {
     Miss,
     Insert,
     Evict { reason: MemoEvictReason },
+    /// The computed result was not retained because its shared byte allowance
+    /// could not admit it. This is not a redaction/derivation failure.
+    BudgetBypass,
     Quarantine { reason: String },
     Invalidate,
 }
@@ -122,6 +218,8 @@ pub(crate) enum MemoEvictReason {
     /// Evicted because the cache reached `max_entries` and the entry
     /// was the least-recently-used.
     CapacityLru,
+    /// Evicted to fit the shared retained-value byte allowance.
+    ValueByteBudget,
     /// Evicted because the producer called `invalidate_key`.
     Invalidated,
 }
@@ -133,6 +231,7 @@ pub(crate) struct MemoCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub inserts: u64,
+    /// Includes both entry-count and retained-value byte capacity evictions.
     pub evictions_capacity: u64,
     pub invalidations: u64,
     pub quarantined: u64,
@@ -170,9 +269,8 @@ pub(crate) struct MemoQuarantineSummary {
 }
 
 /// Bounded in-memory content-addressed cache. Keyed on `MemoKey` and
-/// driven by LRU eviction when `max_entries` is reached. Quarantined
-/// entries stay resident (so an operator can inspect them) but never
-/// serve a hit.
+/// driven by LRU eviction when `max_entries` or its optional shared value-byte
+/// allowance is reached. Quarantined keys retain their reason, not the value.
 ///
 /// Recency bookkeeping (redaction-perf campaign, xu3jq round 2): a
 /// monotonic clock assigns each entry a recency sequence; `lru_order`
@@ -187,26 +285,79 @@ pub(crate) struct MemoQuarantineSummary {
 #[derive(Debug)]
 pub(crate) struct ContentAddressedMemoCache<V: Clone> {
     max_entries: usize,
-    entries: HashMap<MemoKey, V>,
+    entries: HashMap<MemoKey, MemoEntry<V>>,
     quarantined: HashMap<MemoKey, String>,
     lru_order: BTreeMap<u64, MemoKey>,
     lru_seq: HashMap<MemoKey, u64>,
     lru_clock: u64,
     stats: MemoCacheStats,
+    retention: Option<Arc<MemoRetentionBudget>>,
+    value_bytes: fn(&V) -> usize,
+    retained_bytes: usize,
 }
 
 impl<V: Clone> ContentAddressedMemoCache<V> {
     pub(crate) fn with_capacity(max_entries: usize) -> Self {
-        let cap = max_entries.max(1);
         Self {
-            max_entries: cap,
-            entries: HashMap::with_capacity(cap),
+            max_entries: max_entries.max(1),
+            // Capacity is an admission ceiling, not a request to allocate all
+            // buckets up front. Large configuration overrides remain lazy.
+            entries: HashMap::new(),
             quarantined: HashMap::new(),
             lru_order: BTreeMap::new(),
-            lru_seq: HashMap::with_capacity(cap),
+            lru_seq: HashMap::new(),
             lru_clock: 0,
             stats: MemoCacheStats::default(),
+            retention: None,
+            value_bytes: |_| 0,
+            retained_bytes: 0,
         }
+    }
+
+    pub(crate) fn with_retention_budget(
+        max_entries: usize,
+        retention: Arc<MemoRetentionBudget>,
+        value_bytes: fn(&V) -> usize,
+    ) -> Self {
+        Self {
+            retention: Some(retention),
+            value_bytes,
+            ..Self::with_capacity(max_entries)
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Shed this owner's oldest reusable results until the shared allowance
+    /// is met or this owner is empty. Idle peer owners retain their leases;
+    /// their bytes still prevent new admission and are released on use/Drop.
+    /// Quarantine records are deliberately not collected under pressure.
+    pub(crate) fn trim_to_budget(&mut self) -> usize {
+        let Some(retention) = self.retention.as_ref().map(Arc::clone) else {
+            return 0;
+        };
+        let mut evicted = 0;
+        while (retention.limit() == 0 || retention.used() > retention.limit())
+            && self.evict_lru()
+        {
+            evicted += 1;
+        }
+        if evicted > 0 {
+            // Removing values alone leaves the hash tables' old allocations.
+            // Only a pressure-driven trim pays to release unused buckets.
+            self.entries.shrink_to_fit();
+            self.lru_seq.shrink_to_fit();
+            tracing::debug!(
+                evicted,
+                retained_value_bytes = self.retained_bytes,
+                shared_value_bytes = retention.used(),
+                value_byte_limit = retention.limit(),
+                "memo cache released values under memory pressure"
+            );
+        }
+        evicted
     }
 
     pub(crate) fn get(&mut self, key: &MemoKey) -> MemoLookup<V> {
@@ -217,6 +368,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         &mut self,
         key: &MemoKey,
     ) -> (MemoLookup<V>, MemoCacheAuditRecord) {
+        self.trim_to_budget();
         if let Some(reason) = self.quarantined.get(key) {
             let lookup = MemoLookup::Quarantined {
                 reason: reason.clone(),
@@ -232,11 +384,11 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             return (lookup, audit);
         }
         match self.entries.get(key) {
-            Some(value) => {
-                let v = value.clone();
+            Some(entry) => {
+                let value = entry.value.clone();
                 self.touch(key);
                 self.stats.hits = self.stats.hits.saturating_add(1);
-                let lookup = MemoLookup::Hit { value: v };
+                let lookup = MemoLookup::Hit { value };
                 let audit = self.audit_record(
                     MemoCacheOperation::Lookup,
                     key.clone(),
@@ -263,48 +415,103 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
     }
 
     pub(crate) fn insert_with_audit(&mut self, key: MemoKey, value: V) -> MemoCacheAuditRecord {
-        if self.quarantined.contains_key(&key) {
-            // Insertion silently downgraded to noop: never overwrite a
-            // quarantined entry. The caller should lift the quarantine
-            // explicitly before re-inserting.
-            let reason = self
-                .quarantined
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| "quarantined".to_owned());
+        let trimmed = self.trim_to_budget() > 0;
+        if let Some(reason) = self.quarantined.get(&key) {
             return self.audit_record(
                 MemoCacheOperation::Insert,
-                key,
-                MemoCacheEvent::Quarantine { reason },
+                key.clone(),
+                MemoCacheEvent::Quarantine {
+                    reason: reason.clone(),
+                },
                 false,
             );
         }
-        let mut evicted = false;
-        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
-            // Victim = smallest recency sequence (least recently used).
-            if let Some((&victim_seq, _)) = self.lru_order.iter().next()
-                && let Some(victim) = self.lru_order.remove(&victim_seq)
-            {
-                self.entries.remove(&victim);
-                self.lru_seq.remove(&victim);
-                evicted = true;
+        let bytes = (self.value_bytes)(&value);
+        // Release a replaced value's lease before reserving its successor.
+        // If that successor cannot fit, the old result must not remain under
+        // a key the caller has explicitly replaced.
+        let replaced = self.remove_entry(&key);
+        let mut eviction_reason = trimmed.then_some(MemoEvictReason::ValueByteBudget);
+        let lease = if let Some(retention) = self.retention.as_ref().map(Arc::clone) {
+            let limit = retention.limit();
+            // Do not evict unrelated hot entries for an oversized value or
+            // when even reclaiming this entire owner cannot provide room.
+            let peer_bytes = retention.used().saturating_sub(self.retained_bytes);
+            if limit == 0 || bytes > limit.saturating_sub(peer_bytes) {
+                return self.audit_record(
+                    MemoCacheOperation::Insert,
+                    key,
+                    MemoCacheEvent::BudgetBypass,
+                    trimmed || replaced,
+                );
             }
-        }
-        // Re-insert OR fresh-insert both take the newest recency slot.
-        let audit_key = key.clone();
-        self.touch_or_track(&key);
-        self.entries.insert(key, value);
-        self.stats.inserts = self.stats.inserts.saturating_add(1);
-        self.stats.live_entries = self.entries.len() as u64;
-        let event = if evicted {
-            self.stats.evictions_capacity = self.stats.evictions_capacity.saturating_add(1);
-            MemoCacheEvent::Evict {
-                reason: MemoEvictReason::CapacityLru,
+            loop {
+                if let Some(lease) = retention.reserve(bytes) {
+                    break Some(lease);
+                }
+                if !self.evict_lru() {
+                    return self.audit_record(
+                        MemoCacheOperation::Insert,
+                        key,
+                        MemoCacheEvent::BudgetBypass,
+                        trimmed || replaced || eviction_reason.is_some(),
+                    );
+                }
+                eviction_reason = Some(MemoEvictReason::ValueByteBudget);
             }
         } else {
-            MemoCacheEvent::Insert
+            None
         };
+        while self.entries.len() >= self.max_entries {
+            if !self.evict_lru() {
+                // Internal recency state is maintained with every entry. Do
+                // not exceed the admission bound if that invariant is lost.
+                return self.audit_record(
+                    MemoCacheOperation::Insert,
+                    key,
+                    MemoCacheEvent::BudgetBypass,
+                    trimmed || replaced || eviction_reason.is_some(),
+                );
+            }
+            eviction_reason.get_or_insert(MemoEvictReason::CapacityLru);
+        }
+        let audit_key = key.clone();
+        self.touch_or_track(&key);
+        let entry = MemoEntry { value, lease };
+        // Each addition has already reserved these bytes in the shared
+        // checked counter; this owner's subset therefore cannot overflow.
+        self.retained_bytes += entry.retained_bytes();
+        self.entries.insert(key, entry);
+        self.stats.inserts = self.stats.inserts.saturating_add(1);
+        self.stats.live_entries = self.entries.len() as u64;
+        let event = eviction_reason.map_or(MemoCacheEvent::Insert, |reason| {
+            MemoCacheEvent::Evict { reason }
+        });
         self.audit_record(MemoCacheOperation::Insert, audit_key, event, true)
+    }
+
+    /// Remove one value and all of its recency state. Its lease releases on
+    /// this path, capacity eviction, quarantine, replacement and cache Drop.
+    fn remove_entry(&mut self, key: &MemoKey) -> bool {
+        self.untrack(key);
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
+        };
+        self.retained_bytes -= entry.retained_bytes();
+        drop(entry);
+        self.stats.live_entries = self.entries.len() as u64;
+        true
+    }
+
+    fn evict_lru(&mut self) -> bool {
+        let Some((_, key)) = self.lru_order.pop_first() else {
+            return false;
+        };
+        if !self.remove_entry(&key) {
+            return false;
+        }
+        self.stats.evictions_capacity = self.stats.evictions_capacity.saturating_add(1);
+        true
     }
 
     pub(crate) fn invalidate(&mut self, key: &MemoKey) -> bool {
@@ -312,11 +519,9 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
     }
 
     pub(crate) fn invalidate_with_audit(&mut self, key: &MemoKey) -> MemoCacheAuditRecord {
-        let removed = self.entries.remove(key).is_some();
-        self.untrack(key);
+        let removed = self.remove_entry(key);
         if removed {
             self.stats.invalidations = self.stats.invalidations.saturating_add(1);
-            self.stats.live_entries = self.entries.len() as u64;
         }
         self.audit_record(
             MemoCacheOperation::Invalidate,
@@ -337,9 +542,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
     ) -> MemoCacheAuditRecord {
         let reason = reason.into();
         let previous_reason = self.quarantined.get(&key).cloned();
-        let had_entry = self.entries.contains_key(&key);
-        self.entries.remove(&key);
-        self.untrack(&key);
+        let had_entry = self.remove_entry(&key);
         let newly_quarantined = !self.quarantined.contains_key(&key);
         self.quarantined.insert(key.clone(), reason.clone());
         if newly_quarantined {
@@ -567,6 +770,10 @@ mod tests {
             Just(MemoCacheEvent::Evict {
                 reason: MemoEvictReason::Invalidated,
             }),
+            Just(MemoCacheEvent::Evict {
+                reason: MemoEvictReason::ValueByteBudget,
+            }),
+            Just(MemoCacheEvent::BudgetBypass),
             ".{0,96}".prop_map(|reason| MemoCacheEvent::Quarantine { reason }),
             Just(MemoCacheEvent::Invalidate),
         ]
@@ -1162,5 +1369,187 @@ mod tests {
         assert!(json.contains("\"operation\":\"quarantine\""));
         assert!(json.contains("\"entry_capacity\":3"));
         Ok(())
+    }
+
+    #[test]
+    fn retained_bytes_limit_values_before_the_entry_count_limit() {
+        let budget = MemoRetentionBudget::new(8);
+        let mut bounded = ContentAddressedMemoCache::with_retention_budget(
+            16,
+            Arc::clone(&budget),
+            String::capacity,
+        );
+        let mut incumbent = ContentAddressedMemoCache::with_capacity(16);
+        for label in [b"a", b"b", b"c"] {
+            let k = key(label, "lex", "v1");
+            bounded.insert(k.clone(), "1234".to_owned());
+            incumbent.insert(k, "1234".to_owned());
+        }
+        assert_eq!(incumbent.stats().live_entries, 3);
+        assert_eq!(bounded.stats().live_entries, 2);
+        assert_eq!(bounded.retained_bytes(), 8);
+        assert_eq!(budget.used(), 8);
+        assert!(matches!(bounded.get(&key(b"a", "lex", "v1")), MemoLookup::Miss));
+        assert!(matches!(bounded.get(&key(b"b", "lex", "v1")), MemoLookup::Hit { .. }));
+        assert!(matches!(bounded.get(&key(b"c", "lex", "v1")), MemoLookup::Hit { .. }));
+    }
+
+    #[test]
+    fn retained_bytes_count_allocated_capacity_and_preserve_hot_lru_values() {
+        let budget = MemoRetentionBudget::new(64);
+        let mut cache = ContentAddressedMemoCache::with_retention_budget(
+            16,
+            Arc::clone(&budget),
+            String::capacity,
+        );
+        for label in [b"a", b"b"] {
+            let mut value = String::with_capacity(32);
+            value.push('x');
+            cache.insert(key(label, "lex", "v1"), value);
+        }
+        assert_eq!(budget.used(), 64, "short text can own a much larger buffer");
+        cache.get(&key(b"a", "lex", "v1"));
+        let event = cache.insert(key(b"c", "lex", "v1"), "c".repeat(32));
+        assert_eq!(event, MemoCacheEvent::Evict { reason: MemoEvictReason::ValueByteBudget });
+        assert!(matches!(cache.get(&key(b"b", "lex", "v1")), MemoLookup::Miss));
+        assert!(matches!(cache.get(&key(b"a", "lex", "v1")), MemoLookup::Hit { .. }));
+        assert_eq!(budget.used(), 64);
+    }
+
+    #[test]
+    fn shared_retention_does_not_multiply_with_cache_owners_and_drop_releases_it() {
+        let budget = MemoRetentionBudget::new(12);
+        let mut first = ContentAddressedMemoCache::with_retention_budget(
+            16, Arc::clone(&budget), String::capacity,
+        );
+        let mut second = ContentAddressedMemoCache::with_retention_budget(
+            16, Arc::clone(&budget), String::capacity,
+        );
+        first.insert(key(b"a", "lex", "v1"), "12345678".to_owned());
+        assert_eq!(second.insert(key(b"b", "lex", "v1"), "12345678".to_owned()), MemoCacheEvent::BudgetBypass);
+        assert_eq!(budget.used(), 8);
+        assert_eq!(second.stats().inserts, 0);
+        assert!(matches!(first.get(&key(b"a", "lex", "v1")), MemoLookup::Hit { .. }));
+        drop(first);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(second.insert(key(b"b", "lex", "v1"), "12345678".to_owned()), MemoCacheEvent::Insert);
+        assert_eq!(budget.used(), 8);
+        drop(second);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn retained_bytes_replacement_invalidation_and_quarantine_release_exactly_once() {
+        let budget = MemoRetentionBudget::new(16);
+        let mut cache = ContentAddressedMemoCache::with_retention_budget(
+            2, Arc::clone(&budget), String::capacity,
+        );
+        let a = key(b"a", "lex", "v1");
+        let b = key(b"b", "lex", "v1");
+        cache.insert(a.clone(), "a".repeat(8));
+        cache.insert(b.clone(), "b".repeat(8));
+        cache.insert(a.clone(), "a".repeat(4));
+        assert_eq!(budget.used(), 12);
+        cache.quarantine(b.clone(), "retain this reason");
+        assert_eq!(budget.used(), 4);
+        assert!(cache.invalidate(&a));
+        assert_eq!(budget.used(), 0);
+        assert!(!cache.invalidate(&a));
+        assert_eq!(budget.used(), 0);
+        assert!(matches!(cache.insert(b.clone(), "new".into()), MemoCacheEvent::Quarantine { .. }));
+        budget.set_limit(0);
+        cache.trim_to_budget();
+        assert!(matches!(cache.get(&b), MemoLookup::Quarantined { .. }));
+        assert_eq!(cache.quarantine_inspection_items()[0].reason, "retain this reason");
+        drop(cache);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn retained_bytes_oversized_replacement_never_leaves_the_old_value_or_evicts_peers() {
+        let budget = MemoRetentionBudget::new(8);
+        let mut cache = ContentAddressedMemoCache::with_retention_budget(
+            16, Arc::clone(&budget), String::capacity,
+        );
+        let a = key(b"a", "lex", "v1");
+        let b = key(b"b", "lex", "v1");
+        cache.insert(a.clone(), "old".into());
+        cache.insert(b.clone(), "hot".into());
+        let audit = cache.insert_with_audit(a.clone(), "oversized replacement".into());
+        assert_eq!(audit.event, MemoCacheEvent::BudgetBypass);
+        assert!(audit.changed);
+        assert!(matches!(cache.get(&a), MemoLookup::Miss));
+        assert!(matches!(cache.get(&b), MemoLookup::Hit { value } if value == "hot"));
+        assert_eq!(budget.used(), 3);
+        let fresh = cache.insert_with_audit(key(b"c", "lex", "v1"), "also oversized".into());
+        assert_eq!(fresh.event, MemoCacheEvent::BudgetBypass);
+        assert!(!fresh.changed);
+        assert_eq!(cache.stats().evictions_capacity, 0);
+    }
+
+    #[test]
+    fn retained_bytes_pressure_shrink_and_recovery_do_not_resurrect_evicted_values() {
+        let budget = MemoRetentionBudget::new(16);
+        let mut cache = ContentAddressedMemoCache::with_retention_budget(
+            16, Arc::clone(&budget), String::capacity,
+        );
+        for label in [b"a", b"b", b"c", b"d"] {
+            cache.insert(key(label, "lex", "v1"), "1234".into());
+        }
+        budget.set_limit(4);
+        assert_eq!(cache.trim_to_budget(), 3);
+        assert_eq!(budget.used(), 4);
+        assert!(matches!(cache.get(&key(b"d", "lex", "v1")), MemoLookup::Hit { .. }));
+        budget.set_limit(0);
+        assert_eq!(cache.trim_to_budget(), 1);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(cache.insert(key(b"e", "lex", "v1"), String::new()), MemoCacheEvent::BudgetBypass);
+        budget.set_limit(16);
+        assert_eq!(budget.used(), 0, "raising an allowance cannot allocate or resurrect values");
+        assert!(matches!(cache.get(&key(b"d", "lex", "v1")), MemoLookup::Miss));
+        assert_eq!(cache.insert(key(b"e", "lex", "v1"), "1234".into()), MemoCacheEvent::Insert);
+    }
+
+    #[test]
+    fn retained_bytes_counter_refuses_overflow_and_zero_budget_without_allocating() {
+        let budget = MemoRetentionBudget::new(usize::MAX);
+        let lease = budget.reserve(usize::MAX).expect("the entire numeric allowance fits");
+        assert!(budget.reserve(1).is_none());
+        assert_eq!(budget.used(), usize::MAX);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+        budget.set_limit(0);
+        assert!(budget.reserve(0).is_none());
+        assert!(budget.reserve(1).is_none());
+        let cache: ContentAddressedMemoCache<String> = ContentAddressedMemoCache::with_retention_budget(
+            usize::MAX, Arc::clone(&budget), String::capacity,
+        );
+        assert_eq!(cache.entries.capacity(), 0);
+        assert_eq!(cache.lru_seq.capacity(), 0);
+    }
+
+    #[test]
+    fn shared_retention_reservations_are_bounded_under_concurrent_cache_churn() {
+        let budget = MemoRetentionBudget::new(128);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let budget = Arc::clone(&budget);
+                scope.spawn(move || {
+                    let mut cache = ContentAddressedMemoCache::with_retention_budget(
+                        8, Arc::clone(&budget), String::capacity,
+                    );
+                    for round in 0..128 {
+                        let k = key(format!("{worker}:{round}").as_bytes(), "lex", "v1");
+                        cache.insert(k.clone(), "x".repeat(16));
+                        assert!(budget.used() <= 128);
+                        cache.get(&k);
+                        if round % 3 == 0 {
+                            cache.invalidate(&k);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(budget.used(), 0, "every worker's Drop releases its retained values");
     }
 }

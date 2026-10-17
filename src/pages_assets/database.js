@@ -595,30 +595,248 @@ function isCodeQuery(query) {
 }
 
 /**
- * Escape query for FTS5 MATCH
- * Wraps each term in double-quotes and escapes internal quotes
+ * Compile the viewer's query language to a bound FTS5 MATCH expression.
+ *
+ * Bare terms are ANDed; quotes preserve a phrase and a trailing * requests a
+ * token prefix. Uppercase AND/OR and binary NOT support grouping with
+ * parentheses (NOT > AND > OR). `a AND NOT b` is also accepted. Standalone
+ * negation has no positive FTS candidate set and is rejected, not dropped.
+ * Quote operator words to search them literally; double a quote inside a
+ * quoted phrase. Other punctuation, paths and column-looking text stay data,
+ * never raw FTS syntax. Attached call parentheses such as foo() stay literal.
+ *
+ * The byte-independent input, token and nesting limits bound parser work on
+ * pasted queries. Invalid syntax is surfaced through the UI's search error
+ * path instead of silently broadening the search or pretending there are no
+ * matches. No term is ever interpolated into SQL.
  * @param {string} query - Search query
- * @returns {string} Escaped query safe for FTS5
+ * @returns {string} Escaped, precedence-preserving expression safe for FTS5
  */
 function escapeFts5Query(query) {
-  return query
-    .split(/\s+/)
-    .filter((t) => t.length > 0)
-    .map((t) => `"${t.replace(/"/g, '""')}"`)
-    .join(" ");
+  if (typeof query !== "string") {
+    throw new TypeError("Search query must be a string");
+  }
+  if (query.length > 4096) {
+    throw new RangeError("Search query exceeds the 4096-character limit");
+  }
+
+  const tokens = [];
+  const operators = new Set(["AND", "OR", "NOT"]);
+  const whitespace = /\s/;
+  let position = 0;
+  while (position < query.length) {
+    const character = query[position];
+    if (whitespace.test(character)) {
+      position += 1;
+      continue;
+    }
+    if (tokens.length >= 128) {
+      throw new RangeError("Search query exceeds the 128-token limit");
+    }
+    if (character === "(" || character === ")") {
+      tokens.push({ kind: character });
+      position += 1;
+      continue;
+    }
+
+    let text = "";
+    let quoted = false;
+    let prefix = false;
+    if (character === '"') {
+      quoted = true;
+      position += 1;
+      let closed = false;
+      while (position < query.length) {
+        const next = query[position++];
+        if (next !== '"') {
+          text += next;
+        } else if (query[position] === '"') {
+          text += '"';
+          position += 1;
+        } else {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) {
+        throw new SyntaxError("Unterminated quoted phrase");
+      }
+      if (!text.trim()) {
+        throw new SyntaxError("Quoted search phrases must not be empty");
+      }
+      if (query[position] === "*") {
+        prefix = true;
+        position += 1;
+      }
+      if (position < query.length && !whitespace.test(query[position]) && query[position] !== ")") {
+        throw new SyntaxError("Separate a quoted phrase from the next term with a space");
+      }
+    } else {
+      let attachedDepth = 0;
+      while (position < query.length && !whitespace.test(query[position])) {
+        const next = query[position];
+        if (next === '"') {
+          // Quotes inside a bare code token are literal, as they were before
+          // phrase support; only a leading quote opens a phrase.
+          text += next;
+        } else if (next === "(") {
+          if (operators.has(text)) {
+            break;
+          }
+          attachedDepth += 1;
+          text += next;
+        } else if (next === ")") {
+          if (attachedDepth === 0) {
+            break;
+          }
+          attachedDepth -= 1;
+          text += next;
+        } else {
+          text += next;
+        }
+        position += 1;
+      }
+      if (text.endsWith("*")) {
+        prefix = true;
+        text = text.slice(0, -1);
+        if (!text || text.includes("*")) {
+          throw new SyntaxError("A prefix search needs a term followed by a single *");
+        }
+      }
+    }
+    tokens.push(
+      !quoted && !prefix && operators.has(text)
+        ? { kind: text }
+        : { kind: "term", value: `"${text.replace(/"/g, '""')}"${prefix ? "*" : ""}` },
+    );
+  }
+  if (tokens.length === 0) {
+    return "";
+  }
+
+  let cursor = 0;
+  const peek = () => tokens[cursor]?.kind;
+  // Render only necessary grouping. Wrapping each link in a long AND chain
+  // would overflow FTS5's parser stack even within our token budget.
+  const combine = (left, operator, right) => {
+    const precedence = { OR: 1, AND: 2, NOT: 3 }[operator];
+    const lhs = left.precedence < precedence ? `(${left.value})` : left.value;
+    const rhs = right.precedence < precedence ||
+      (operator === "NOT" && right.precedence === precedence)
+      ? `(${right.value})` : right.value;
+    return { value: `${lhs} ${operator} ${rhs}`, precedence };
+  };
+
+  function primary(depth) {
+    const token = tokens[cursor++];
+    if (token?.kind === "term") {
+      return { value: token.value, precedence: 4 };
+    }
+    if (token?.kind === "(") {
+      if (depth >= 16) {
+        throw new RangeError("Search groups exceed the 16-level nesting limit");
+      }
+      const expression = disjunction(depth + 1);
+      if (peek() !== ")") {
+        throw new SyntaxError("Missing closing parenthesis in search query");
+      }
+      cursor += 1;
+      return expression;
+    }
+    if (token?.kind === "NOT") {
+      throw new SyntaxError("NOT needs a positive term on its left, such as error NOT timeout");
+    }
+    throw new SyntaxError("Expected a search term or quoted phrase");
+  }
+
+  function exclusion(depth) {
+    let expression = primary(depth);
+    while (peek() === "NOT" || (peek() === "AND" && tokens[cursor + 1]?.kind === "NOT")) {
+      cursor += peek() === "AND" ? 2 : 1;
+      expression = combine(expression, "NOT", primary(depth));
+    }
+    return expression;
+  }
+
+  function conjunction(depth) {
+    let expression = exclusion(depth);
+    while (peek() === "AND" || peek() === "term" || peek() === "(") {
+      if (peek() === "AND") {
+        cursor += 1;
+      }
+      expression = combine(expression, "AND", exclusion(depth));
+    }
+    return expression;
+  }
+
+  function disjunction(depth) {
+    let expression = conjunction(depth);
+    while (peek() === "OR") {
+      cursor += 1;
+      expression = combine(expression, "OR", conjunction(depth));
+    }
+    return expression;
+  }
+
+  const expression = disjunction(0);
+  if (cursor !== tokens.length) {
+    throw new SyntaxError("Unexpected closing parenthesis in search query");
+  }
+  return expression.value;
 }
 
-function normalizeTimestampFilterValue(value) {
+function normalizeTimestampFilterValue(value, bound) {
   if (value === undefined || value === null || value === "") {
     return null;
   }
 
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(numeric)) {
-    return null;
+  const invalid = () => new RangeError(
+    `${bound} must be a non-negative integer timestamp in milliseconds or a valid YYYY-MM-DD date`,
+  );
+  let numeric;
+  if (typeof value === "number") {
+    numeric = value;
+  } else if (typeof value === "string") {
+    const text = value.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+      // Date.parse can normalize impossible dates (for example February 30).
+      // Check the round trip, and use UTC so links do not change across zones.
+      numeric = Date.parse(`${text}T00:00:00.000Z`);
+      if (!Number.isFinite(numeric) || new Date(numeric).toISOString().slice(0, 10) !== text) {
+        throw invalid();
+      }
+      if (bound === "until") {
+        numeric += 24 * 60 * 60 * 1000 - 1;
+      }
+    } else if (/^\d+$/.test(text)) {
+      numeric = Number(text);
+    } else {
+      throw invalid();
+    }
+  } else {
+    // Number(true), Number([]), etc. are not timestamp validation.
+    throw invalid();
   }
-
+  if (!Number.isSafeInteger(numeric) || numeric < 0) {
+    throw invalid();
+  }
   return numeric;
+}
+
+/**
+ * Validate optional, inclusive archive time bounds without silently dropping
+ * a supplied filter. Numeric strings are decimal milliseconds. Date-only
+ * strings mean the beginning of the UTC day for since, and its end for until.
+ * Shared by direct database queries and browser search routes.
+ * @returns {{since: number|null, until: number|null}}
+ */
+export function normalizeSearchTimeRange(since = null, until = null) {
+  const start = normalizeTimestampFilterValue(since, "since");
+  const end = normalizeTimestampFilterValue(until, "until");
+  if (start !== null && end !== null && start > end) {
+    throw new RangeError("since must not be later than until");
+  }
+  return { since: start, until: end };
 }
 
 /**
@@ -633,8 +851,8 @@ function normalizeTimestampFilterValue(value) {
  * @param {number} [options.offset=0] - Result offset for pagination
  * @param {string|null} [options.agent=null] - Filter by agent name
  * @param {SearchMode} [options.searchMode='auto'] - Search mode: 'auto', 'prose', or 'code'
- * @param {number|string|null} [options.since=null] - Earliest conversation start timestamp (ms)
- * @param {number|string|null} [options.until=null] - Latest conversation start timestamp (ms)
+ * @param {number|string|null} [options.since=null] - Earliest conversation start timestamp (ms or YYYY-MM-DD)
+ * @param {number|string|null} [options.until=null] - Latest conversation start timestamp (ms or YYYY-MM-DD)
  * @returns {Array<Object>} Search results
  */
 export function searchConversations(query, options = {}) {
@@ -647,8 +865,9 @@ export function searchConversations(query, options = {}) {
     until = null,
   } = options;
   validatePagination(limit, offset);
+  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
 
-  // Escape query for FTS5
+  // Parse and escape the query before preparing any database statement.
   const escapedQuery = escapeFts5Query(query);
   if (!escapedQuery) {
     return [];
@@ -689,13 +908,11 @@ export function searchConversations(query, options = {}) {
     params.push(agent);
   }
 
-  const sinceTimestamp = normalizeTimestampFilterValue(since);
   if (sinceTimestamp !== null) {
     sql += " AND c.started_at >= ?";
     params.push(sinceTimestamp);
   }
 
-  const untilTimestamp = normalizeTimestampFilterValue(until);
   if (untilTimestamp !== null) {
     sql += " AND c.started_at <= ?";
     params.push(untilTimestamp);
@@ -715,13 +932,14 @@ export function searchConversations(query, options = {}) {
  * Get conversations by agent
  * @param {string} agent - Agent name
  * @param {number} limit - Maximum results
- * @param {number|string|null} since - Earliest conversation start timestamp (ms)
- * @param {number|string|null} until - Latest conversation start timestamp (ms)
+ * @param {number|string|null} since - Earliest conversation start timestamp (ms or YYYY-MM-DD)
+ * @param {number|string|null} until - Latest conversation start timestamp (ms or YYYY-MM-DD)
  * @param {number} offset - Number of matching conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
 export function getConversationsByAgent(agent, limit = 50, since = null, until = null, offset = 0) {
   validatePagination(limit, offset);
+  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
   let sql = `
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
@@ -729,13 +947,11 @@ export function getConversationsByAgent(agent, limit = 50, since = null, until =
     `;
   const params = [agent];
 
-  const sinceTimestamp = normalizeTimestampFilterValue(since);
   if (sinceTimestamp !== null) {
     sql += " AND started_at >= ?";
     params.push(sinceTimestamp);
   }
 
-  const untilTimestamp = normalizeTimestampFilterValue(until);
   if (untilTimestamp !== null) {
     sql += " AND started_at <= ?";
     params.push(untilTimestamp);
@@ -773,25 +989,24 @@ export function getConversationsByWorkspace(workspace, limit = 50, offset = 0) {
 
 /**
  * Get conversations by time range (either bound may be omitted)
- * @param {number|string|null} since - Start timestamp (ms)
+ * @param {number|string|null} since - Start timestamp (ms or YYYY-MM-DD)
  * @param {number} limit - Maximum results (0-1000)
  * @param {number} offset - Number of matching conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
 export function getConversationsByTimeRange(since, until, limit = 50, offset = 0) {
   validatePagination(limit, offset);
+  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
   let sql = `
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
         WHERE 1 = 1
     `;
   const params = [];
-  const sinceTimestamp = normalizeTimestampFilterValue(since);
   if (sinceTimestamp !== null) {
     sql += " AND started_at >= ?";
     params.push(sinceTimestamp);
   }
-  const untilTimestamp = normalizeTimestampFilterValue(until);
   if (untilTimestamp !== null) {
     sql += " AND started_at <= ?";
     params.push(untilTimestamp);
@@ -891,6 +1106,7 @@ export default {
   getConversation,
   getConversationMessages,
   searchConversations,
+  normalizeSearchTimeRange,
   detectSearchMode,
   getConversationsByAgent,
   getConversationsByWorkspace,

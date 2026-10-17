@@ -4,6 +4,8 @@
 //! This module provides re-export stubs plus the CASS-specific wrappers used by
 //! every connector factory exposed to the indexer.
 
+pub(crate) mod source_dependencies;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -238,6 +240,7 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
+pub mod codebuff;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
@@ -269,6 +272,10 @@ fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
 }
 
+fn codebuff_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(codebuff::CodebuffConnector::new())
+}
+
 fn omp_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(omp::OmpConnector::new())
 }
@@ -294,21 +301,39 @@ fn copilot_connector_factory() -> Box<dyn Connector + Send> {
 /// OpenClaw passes through its native-store WAL and state-directory adapter.
 /// Copilot passes through a detection widening that also recognises VS Code's
 /// native chat stores, which the upstream scanner reads but never detected.
+/// Codebuff delegates parsing to FAD while adding per-transcript checkpoints.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
+    get_connector_registrations()
+        .into_iter()
+        .map(|registration| (registration.name, registration.factory))
+        .collect()
+}
+
+/// Runtime factories and their explicit source-dependency capabilities.
+pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::ConnectorRegistration> {
+    use source_dependencies::ConnectorRegistration;
+
     franken_agent_detection::get_connector_factories()
         .into_iter()
         .map(|(name, factory)| {
-            let factory = match name {
-                "claude" => claude_connector_factory as ConnectorFactory,
-                "codex" => codex_connector_factory as ConnectorFactory,
-                "omp" => omp_connector_factory as ConnectorFactory,
-                "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
-                "grok_bot" => grok_bot_connector_factory as ConnectorFactory,
-                "copilot" => copilot_connector_factory as ConnectorFactory,
-                _ => factory,
+            let mut registration = match name {
+                "claude" => {
+                    ConnectorRegistration::new(name, claude_connector_factory)
+                        .with_source_capability::<claude_code::ClaudeCodeConnector>("claude_code")
+                }
+                "codex" => ConnectorRegistration::new(name, codex_connector_factory)
+                    .with_source_capability::<codex::CodexConnector>("codex"),
+                "codebuff" => ConnectorRegistration::new(name, codebuff_connector_factory)
+                    .with_source_capability::<codebuff::CodebuffConnector>("codebuff"),
+                "omp" => ConnectorRegistration::new(name, omp_connector_factory),
+                "pi_agent" => ConnectorRegistration::new(name, pi_agent_connector_factory),
+                "grok_bot" => ConnectorRegistration::new(name, grok_bot_connector_factory),
+                "copilot" => ConnectorRegistration::new(name, copilot_connector_factory),
+                _ => ConnectorRegistration::new(name, factory),
             };
-            (name, openclaw::with_wal_freshness(name, factory))
+            registration.factory = openclaw::with_wal_freshness(name, registration.factory);
+            registration
         })
         .collect()
 }

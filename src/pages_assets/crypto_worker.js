@@ -13,6 +13,13 @@ let activeUnlockGeneration = 0;
 let activeDecryptGeneration = 0;
 let argon2LoadPromise = null;
 
+// Only one full plaintext database may be owned by the decrypt pipeline.
+// A superseding request replaces the one waiting job, not a promise-chain queue.
+// Non-cancellable WebCrypto/decompression keeps the active slot until cleanup.
+let activeDatabaseJob = null;
+let pendingDatabaseJob = null;
+const DATABASE_CHUNK_DOWNLOAD_TIMEOUT_MS = 120_000;
+
 const MAX_ARCHIVE_CHUNK_SIZE = 32 * 1024 * 1024;
 const MAX_ARCHIVE_CHUNKS = 0xffffffff;
 // The viewer materializes the full plaintext database and a WASM copy. Bound
@@ -103,7 +110,7 @@ function clearCurrentDek() {
 
 function beginUnlockAttempt() {
   activeUnlockGeneration += 1;
-  activeDecryptGeneration += 1;
+  invalidateDecryptAttempts();
   clearCurrentDek();
   return activeUnlockGeneration;
 }
@@ -121,12 +128,28 @@ function ensureCurrentUnlockAttempt(generation) {
 
 function beginDecryptAttempt() {
   invalidateUnlockAttempts();
-  activeDecryptGeneration += 1;
+  invalidateDecryptAttempts();
   return activeDecryptGeneration;
 }
 
 function invalidateDecryptAttempts() {
   activeDecryptGeneration += 1;
+  const reason = new Error("Database decryption request was superseded");
+  if (activeDatabaseJob) {
+    activeDatabaseJob.controller.abort(reason);
+    // Already copied plaintext need not remain readable while a crypto promise
+    // drains. Every continuation checks the generation before using this buffer.
+    if (activeDatabaseJob.dbBytes?.byteLength) {
+      activeDatabaseJob.dbBytes.fill(0);
+    }
+  }
+  if (pendingDatabaseJob) {
+    const pending = pendingDatabaseJob;
+    pendingDatabaseJob = null;
+    pending.requestDek.fill(0);
+    pending.cfg = null;
+    pending.reject(reason);
+  }
 }
 
 function ensureCurrentDecryptAttempt(generation) {
@@ -387,12 +410,54 @@ async function unwrapDek(kek, slot, exportId) {
 }
 
 /**
- * Handle database decryption
+ * Admit a database decryption without multiplying full-archive allocations.
+ * A waiting request owns only validated metadata and its 32-byte key.
  */
 async function handleDecryptDatabase(dekBase64, cfg, requestId) {
   const generation = beginDecryptAttempt();
   validateSupportedPayloadFormat(cfg);
   const requestDek = base64ToArray(dekBase64);
+  if (requestDek.byteLength !== 32) {
+    requestDek.fill(0);
+    throw new Error("Invalid data encryption key length");
+  }
+  return new Promise((resolve, reject) => {
+    pendingDatabaseJob = {
+      generation, cfg, requestId, requestDek, resolve, reject,
+      controller: new AbortController(),
+      dbBytes: null,
+    };
+    startNextDatabaseJob();
+  });
+}
+
+function startNextDatabaseJob() {
+  if (activeDatabaseJob || !pendingDatabaseJob) return;
+  const job = pendingDatabaseJob;
+  pendingDatabaseJob = null;
+  activeDatabaseJob = job;
+  // Never race the complete job against cancellation: WebCrypto cannot be
+  // cancelled, and releasing its slot early recreates overlapping allocations.
+  void runDatabaseJob(job);
+}
+
+async function runDatabaseJob(job) {
+  try {
+    await decryptDatabase(job);
+    job.resolve();
+  } catch (error) {
+    job.reject(error);
+  } finally {
+    job.requestDek.fill(0);
+    job.cfg = null;
+    job.dbBytes = null;
+    activeDatabaseJob = null;
+    startNextDatabaseJob();
+  }
+}
+
+async function decryptDatabase(job) {
+  const { generation, cfg, requestId, requestDek, controller } = job;
   let dbBytes = null;
   let baseNonce = null;
   let exportId = null;
@@ -404,7 +469,9 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
     const totalChunks = payload.chunk_count;
     baseNonce = base64ToArray(cfg.base_nonce);
     exportId = base64ToArray(cfg.export_id);
+    ensureCurrentDecryptAttempt(generation);
     dbBytes = new Uint8Array(payload.total_plaintext_size);
+    job.dbBytes = dbBytes;
 
     self.postMessage({ type: "PROGRESS", phase: "Decrypting...", percent: 0, requestId });
 
@@ -433,15 +500,11 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
       let chunkNonce = null;
       let aad = null;
       try {
-        const response = await fetch(chunkUrl);
-        ensureCurrentDecryptAttempt(generation);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch chunk ${i}: ${response.status}`);
-        }
-        encryptedChunk = await readResponseBytesBounded(
-          response,
+        encryptedChunk = await fetchDatabaseChunk(
+          chunkUrl,
           maxCiphertextChunkSize(payload.chunk_size),
           `encrypted chunk ${i}`,
+          controller.signal,
         );
         ensureCurrentDecryptAttempt(generation);
         totalCiphertext += encryptedChunk.byteLength;
@@ -913,28 +976,115 @@ async function decompressDeflate(compressed, maximumOutputBytes) {
   return concatenateAndZeroChunks(chunks);
 }
 
-async function readResponseBytesBounded(response, maximumBytes, label) {
-  if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) {
-    throw new Error(`${label} has an invalid download limit`);
+// Cancel best-effort without awaiting an arbitrary underlying-source promise.
+// A stalled cancel must not retain the full plaintext database indefinitely.
+function cancelStreamQuietly(stream, reason) {
+  try {
+    Promise.resolve(stream?.cancel(reason)).catch(() => {});
+  } catch {
+    // Closed, errored or already locked by a different consumer.
   }
-  const contentLengthHeader = response.headers?.get?.("content-length");
-  if (contentLengthHeader && /^\d+$/.test(contentLengthHeader)) {
-    const contentLength = Number(contentLengthHeader);
-    if (!Number.isSafeInteger(contentLength) || contentLength > maximumBytes) {
-      throw new Error(`${label} exceeds the ${maximumBytes}-byte download limit`);
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason || new Error("Database download cancelled");
+  }
+}
+
+// Only I/O waits use this race. Late I/O values are disposed, and every late
+// rejection is observed. Cryptography and decompression keep their admission.
+function awaitAbortableIO(operation, signal, disposeLate) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(signal.reason || new Error("Database download cancelled"));
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
     }
-  }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve().then(() => {
+      throwIfAborted(signal);
+      return operation();
+    }).then((value) => {
+      if (settled) {
+        try {
+          disposeLate?.(value);
+        } catch {
+          // The request already failed; cleanup cannot replace its outcome.
+        }
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(value);
+    }, (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
+  });
+}
 
-  if (!response.body?.getReader) {
-    throw new Error(`${label} cannot be read safely without streaming response support`);
+async function fetchDatabaseChunk(url, maximumBytes, label, signal) {
+  throwIfAborted(signal);
+  const transfer = new AbortController();
+  const forwardAbort = () => transfer.abort(signal.reason);
+  signal.addEventListener("abort", forwardAbort, { once: true });
+  const timeout = setTimeout(() => {
+    transfer.abort(new Error(`${label} download timed out; check the connection and retry`));
+  }, DATABASE_CHUNK_DOWNLOAD_TIMEOUT_MS);
+  let response = null;
+  try {
+    response = await awaitAbortableIO(
+      () => fetch(url, { signal: transfer.signal }),
+      transfer.signal,
+      (late) => cancelStreamQuietly(late?.body, "superseded download"),
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch ${label}: ${response.status}`);
+    }
+    return await readResponseBytesBounded(response, maximumBytes, label, transfer.signal);
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener("abort", forwardAbort);
+    // Also covers an HTTP failure or abort between headers and body admission.
+    cancelStreamQuietly(response?.body, "database chunk transfer finished");
+    transfer.abort();
   }
+}
 
-  const reader = response.body.getReader();
+async function readResponseBytesBounded(response, maximumBytes, label, signal = null) {
+  let reader = null;
   const chunks = [];
   let totalLength = 0;
   try {
+    throwIfAborted(signal);
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) {
+      throw new Error(`${label} has an invalid download limit`);
+    }
+    const contentLengthHeader = response.headers?.get?.("content-length");
+    if (contentLengthHeader && /^\d+$/.test(contentLengthHeader)) {
+      const contentLength = Number(contentLengthHeader);
+      if (!Number.isSafeInteger(contentLength) || contentLength > maximumBytes) {
+        throw new Error(`${label} exceeds the ${maximumBytes}-byte download limit`);
+      }
+    }
+    if (!response.body?.getReader) {
+      throw new Error(`${label} cannot be read safely without streaming response support`);
+    }
+    reader = response.body.getReader();
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await awaitAbortableIO(
+        () => reader.read(), signal, (late) => late?.value?.fill?.(0),
+      );
       if (done) break;
       if (!(value instanceof Uint8Array)) {
         throw new Error(`${label} returned an invalid response chunk`);
@@ -947,18 +1097,19 @@ async function readResponseBytesBounded(response, maximumBytes, label) {
       totalLength = nextLength;
       chunks.push(value);
     }
+    throwIfAborted(signal);
     return concatenateAndZeroChunks(chunks);
   } catch (error) {
-    for (const chunk of chunks) {
-      chunk.fill(0);
-    }
+    cancelStreamQuietly(reader || response.body, error?.message || String(error));
+    throw error;
+  } finally {
+    for (const chunk of chunks) chunk.fill(0);
     chunks.length = 0;
     try {
-      await reader.cancel(error?.message || String(error));
+      reader?.releaseLock();
     } catch {
-      // The response stream may already be closed or errored.
+      // Preserve the original outcome if the reader has already been released.
     }
-    throw error;
   }
 }
 
