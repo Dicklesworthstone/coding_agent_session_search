@@ -463,15 +463,9 @@ fn gh494_eof_resume_with_a_matching_count_publishes_its_candidate() {
     gh494_eof_resume_with_candidate_count(false);
 }
 
-/// GH #494, the mid-run half: the reporter's first refused run resumed a
-/// checkpoint short of EOF and was refused at validate_candidate only after
-/// replaying the rest of the archive (516 s). Its candidate held documents in
-/// the committed prefix that the checkpoint never counted. The #440 upsert
-/// window reconciles only replayed identities, so no resume could certify
-/// that candidate. The EOF resume check cannot see this case before the
-/// replay. The refusal must retain the candidate with the checkpoint that
-/// failed and rebuild from zero in the same run, not exit and leave the
-/// rebuild to the next run.
+/// GH #494 / #530: an uncounted committed prefix cannot be repaired by
+/// replaying suffix identities. Reject it before replay, retain its untouched
+/// generation and original cursor, and perform one clean replay in this run.
 #[test]
 #[serial_test::serial]
 fn gh494_mid_run_resume_with_an_uncounted_prefix_rebuilds_in_the_same_run() {
@@ -508,6 +502,7 @@ fn gh494_mid_run_resume_with_an_uncounted_prefix_rebuilds_in_the_same_run() {
         }
     }
     fs::write(scratch.join("failure-evidence"), "uncounted-prefix").unwrap();
+    let candidate_manifest = fs::read(scratch.join("MANIFEST")).unwrap();
     checkpoint.completed = false;
     checkpoint.pending = None;
     checkpoint.committed_offset = 1;
@@ -551,13 +546,14 @@ fn gh494_mid_run_resume_with_an_uncounted_prefix_rebuilds_in_the_same_run() {
     let retained = load_lexical_rebuild_state(&quarantine).unwrap().unwrap();
     assert!(!retained.completed);
     assert_eq!(
-        retained.processed_conversations, 2,
-        "the candidate was refused after its replay reached EOF"
+        retained.processed_conversations, 1,
+        "the ambiguous prefix must be refused before replaying the suffix"
     );
-    assert!(
-        retained.indexed_docs < 4,
-        "the quarantine keeps the count that could not certify the candidate: {}",
-        retained.indexed_docs
+    assert_eq!(retained.indexed_docs, 1);
+    assert_eq!(
+        fs::read(quarantine.join("index").join("MANIFEST")).unwrap(),
+        candidate_manifest,
+        "resume validation must not modify the refused generation"
     );
 
     // A plain rerun reuses the certified generation instead of refusing again.

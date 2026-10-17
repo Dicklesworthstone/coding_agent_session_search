@@ -26943,27 +26943,21 @@ fn rebuild_tantivy_from_db_once(
     // checkpoint with the previous run's accounting still captured in locals.
     if !restart_from_zero && !will_use_atomic_staged_publish {
         let resume_check = (|| -> Result<()> {
-            crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
-            let live_docs = crate::search::tantivy::searchable_index_live_doc_count(&build_path)
-                .context("resumed lexical candidate has no observable document count")?;
+            // GH #530: pending commit reconciliation above accounts for an
+            // exactly landed commit before this check. Any remaining count gap
+            // makes this prefix ambiguous, even when its cursor is short of EOF.
+            // Upserting the suffix cannot remove an uncounted prefix identity or
+            // a foreign document, and waiting for terminal certification wastes
+            // another pass through the suffix on every interrupted retry.
+            // Inspect one validated reader, without opening a writer or changing
+            // the expected count to whatever the candidate happens to contain.
+            let summary = crate::search::tantivy::validated_searchable_index_summary(&build_path)?;
             anyhow::ensure!(
-                u128::from(live_docs) >= rebuild_state.indexed_docs as u128,
-                "resumed lexical candidate contains {live_docs} documents, but its checkpoint \
-                 requires {} committed documents",
-                rebuild_state.indexed_docs
-            );
-            // A surplus is reconciled only by replaying the identities behind
-            // it through the #440 upsert window. With the cursor at EOF nothing
-            // is replayed, so the candidate keeps the surplus and the finalize
-            // count check (GH #457) refuses it; a refused finalize leaves this
-            // same EOF checkpoint, so every later run would repeat the refusal.
-            anyhow::ensure!(
-                rebuild_state.processed_conversations < total_conversations
-                    || u128::from(live_docs) == rebuild_state.indexed_docs as u128,
-                "resumed lexical candidate contains {live_docs} documents, more than the {} its \
-                 checkpoint counted, and the checkpoint is at the end of the archive, so no \
-                 replay can reconcile the difference",
-                rebuild_state.indexed_docs
+                summary.docs == rebuild_state.indexed_docs,
+                "resumed lexical candidate contains {} documents but its reconciled checkpoint \
+                 requires exactly {}; refusing ambiguous prefix before replay",
+                summary.docs,
+                rebuild_state.indexed_docs,
             );
             Ok(())
         })();
