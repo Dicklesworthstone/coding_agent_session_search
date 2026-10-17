@@ -640,3 +640,188 @@ test("virtual result pointer and keyboard activation each select exactly once", 
     [1, 1],
   ]);
 });
+
+// Workspace feature coverage: production controller + production SQL. The
+// existing DOM/VirtualList doubles do not establish browser layout behavior.
+test("workspace UI lists distinct full paths and preserves unknown literal route selections", async (t) => {
+  const f = await searchFixture(t);
+  const control = f.element("workspace-filter");
+  assert.deepEqual(control.options.map((option) => option.value), ["", "/one", "/two"]);
+  assert.equal(control.options[1].textContent, "/one");
+  const workspace = '/elsewhere/<img src=x onerror=alert(1)>?&#🔑';
+  await f.run(() => f.search.setSearchRoute({ query: "needle", workspace }));
+  assert.equal(control.value, workspace);
+  const option = control.options.find((entry) => entry.value === workspace);
+  assert.equal(option.textContent, workspace);
+  assert.ok(!option.innerHTML.includes("<img"), "workspace labels must be text, not HTML");
+  assert.equal(f.search.getSearchState().filters.workspace, workspace);
+  assert.equal(f.search.getSearchState().resultCount, 0);
+  assert.deepEqual(f.resultIds(), []);
+  assert.ok(f.queries.at(-1).params.includes(workspace));
+  await f.run(() => f.search.setSearchRoute({ query: "needle", workspace }));
+  assert.equal(control.options.filter((entry) => entry.value === workspace).length, 1);
+});
+
+test("workspace UI intersects text, agent and dates before paginating browsing and both FTS modes", async (t) => {
+  const f = await searchFixture(t, 137);
+  for (const query of ["", "needle", "search_target"]) {
+    await f.run(() => f.search.setSearchRoute({ query, workspace: "/one", since: 1000, until: 1000 }));
+    const all = [...f.resultIds()];
+    while (f.search.getSearchState().hasNextPage) {
+      await f.click("search-next-page");
+      all.push(...f.resultIds());
+    }
+    const expected = Array.from({ length: 69 }, (_, i) => 2 * i + 1);
+    assert.deepEqual(all, query ? expected : expected.reverse());
+    const state = f.search.getSearchState();
+    assert.equal(state.filters.workspace, "/one");
+    assert.equal(state.page, 2);
+    assert.ok(state.resultCount <= 50);
+    await f.run(() => f.search.setSearchRoute({ query, workspace: "/one", agent: "claude" }));
+    assert.equal(f.search.getSearchState().resultCount, 0, "workspace and agent must intersect, not union");
+  }
+  const queries = f.queries.filter((query) => query.sql.includes("LIMIT"));
+  assert.ok(queries.every((query) => query.rows <= 51 && query.params.at(-2) === 51));
+  assert.ok(queries.every((query) => query.sql.includes("c.workspace = ?")));
+});
+
+test("workspace edits reset pagination and cancel pending input debounce without discarding time scope", async (t) => {
+  const f = await searchFixture(t);
+  await f.run(() => f.search.setSearchRoute({ query: "needle", workspace: "/one", since: 1000, until: 1000 }));
+  await f.click("search-next-page");
+  assert.equal(f.search.getSearchState().page, 2);
+  f.element("search-input").value = "search_target";
+  f.element("search-input").emit("input");
+  f.element("workspace-filter").value = "/two";
+  f.element("workspace-filter").emit("change");
+  await f.timers.advance();
+  const before = f.queries.length;
+  await f.timers.advance(500);
+  const state = f.search.getSearchState();
+  assert.equal(f.queries.length, before, "obsolete debounce must not execute another query");
+  assert.equal(state.page, 1);
+  assert.equal(state.query, "search_target");
+  assert.equal(state.filters.workspace, "/two");
+  assert.equal(state.filters.since, 1000);
+  assert.equal(state.filters.until, 1000);
+  assert.deepEqual(f.resultIds(), Array.from({ length: 50 }, (_, i) => 2 * i + 2));
+  assert.equal(f.queries.at(-1).params.at(-1), 0);
+});
+
+test("workspace selection survives query edits and unrelated filter changes", async (t) => {
+  const f = await searchFixture(t);
+  await f.run(() => f.search.setSearchRoute({ query: "needle", workspace: "/one" }));
+  await f.run(() => f.search.setSearchQuery("search_target"));
+  assert.equal(f.search.getSearchState().filters.workspace, "/one");
+  f.element("agent-filter").value = "claude";
+  f.element("agent-filter").emit("change");
+  await f.timers.advance();
+  assert.equal(f.search.getSearchState().filters.workspace, "/one");
+  assert.equal(f.search.getSearchState().resultCount, 0);
+  f.element("time-filter").value = "";
+  f.element("time-filter").emit("change");
+  await f.timers.advance();
+  assert.equal(f.search.getSearchState().filters.workspace, "/one");
+  assert.equal(f.search.getSearchState().filters.agent, "claude");
+  assert.equal(f.search.getSearchState().resultCount, 0);
+  f.element("workspace-filter").value = "";
+  f.element("workspace-filter").emit("change");
+  await f.timers.advance();
+  assert.equal(f.search.getSearchState().filters.workspace, null);
+  assert.deepEqual(f.resultIds(), Array.from({ length: 50 }, (_, i) => 2 * i + 2));
+});
+
+test("workspace and agent survive invalid date routes until the time control is corrected", async (t) => {
+  const f = await searchFixture(t);
+  const before = f.queries.length;
+  await f.run(() => f.search.setSearchRoute({
+    query: "needle", workspace: "/one", agent: "codex", since: "2026-02-30",
+  }));
+  assert.equal(f.queries.length, before);
+  assert.match(f.element("results-list").innerHTML, /role="alert"/);
+  assert.equal(f.element("workspace-filter").value, "/one");
+  await f.run(() => f.search.setSearchQuery("search_target"));
+  assert.equal(f.queries.length, before, "query edits must not clear an invalid route's time guard");
+  f.element("time-filter").value = "";
+  f.element("time-filter").emit("change");
+  await f.timers.advance();
+  const state = f.search.getSearchState();
+  assert.equal(state.filterError, null);
+  assert.equal(state.filters.workspace, "/one");
+  assert.equal(state.filters.agent, "codex");
+  assert.equal(state.resultCount, 50);
+  assert.deepEqual(f.resultIds(), Array.from({ length: 50 }, (_, i) => 2 * i + 1));
+});
+
+test("workspace routes reject malformed identities without silently running an unscoped query", async (t) => {
+  const f = await searchFixture(t);
+  const before = f.queries.length;
+  for (const workspace of ['x\0y', '\ud800', 'x'.repeat(4097)]) {
+    await f.run(() => f.search.setSearchRoute({ query: "needle", workspace }));
+    assert.equal(f.queries.length, before);
+    assert.equal(f.search.getSearchState().resultCount, 0);
+    assert.equal(f.search.getSearchState().filters.workspace, workspace);
+    assert.match(f.element("results-list").innerHTML, /Workspace/);
+  }
+  f.element("workspace-filter").value = "/two";
+  f.element("workspace-filter").emit("change");
+  await f.timers.advance();
+  assert.equal(f.search.getSearchState().resultCount, 50);
+  assert.ok(f.resultIds().every((id) => id % 2 === 0));
+});
+
+test("workspace changes and archive lock supersede pending pages before SQL or stale announcements", async (t) => {
+  const f = await searchFixture(t);
+  await f.run(() => f.search.setSearchRoute({ query: "needle", workspace: "/one" }));
+  const before = f.queries.length;
+  f.element("search-next-page").click();
+  const latest = f.search.setSearchRoute({ query: "needle", workspace: "/two" });
+  await f.timers.advance();
+  await latest;
+  assert.equal(f.queries.length, before + 1);
+  assert.equal(f.search.getSearchState().page, 1);
+  assert.ok(f.resultIds().every((id) => id % 2 === 0));
+  const beforeLock = f.queries.length;
+  f.element("search-next-page").click();
+  f.search.clearSearch({ reloadRecent: false });
+  await f.timers.advance(1000);
+  assert.equal(f.queries.length, beforeLock);
+  assert.equal(f.search.getSearchState().filters.workspace, null);
+  assert.equal(f.element("workspace-filter").value, "");
+  assert.equal(f.element("results-list").innerHTML, "");
+  assert.equal(f.element("search-announcer").textContent, "");
+  assert.equal(f.search.getSearchState().resultCount, 0);
+});
+
+test("workspace shared routes round-trip exact identities through the real router and controller", async (t) => {
+  const f = await searchFixture(t);
+  const routerSource = await readFile(new URL("../src/pages_assets/router.js", import.meta.url), "utf8");
+  const routerModule = new vm.SourceTextModule(routerSource, {
+    context: vm.createContext({ URLSearchParams, console }),
+  });
+  await routerModule.link(() => { throw new Error("router has no static dependencies"); });
+  await routerModule.evaluate();
+  const router = routerModule.namespace;
+  const parser = new router.Router({ autoInit: false });
+  for (const workspace of ["/one", String.raw`C:\work\project`, " /a'_%?&#🔑 ", "/missing"]) {
+    const filters = { workspace, agent: "codex", since: 0, until: 1000 };
+    const path = router.buildSearchPath("needle", filters);
+    assert.ok(!path.includes("#"), "workspace fragment characters must be encoded");
+    const route = router.parseSearchParams(parser._parseHash(path));
+    assert.equal(route.workspace, workspace);
+    assert.equal(route.since, "0");
+    assert.equal(route.until, "1000");
+    await f.run(() => f.search.setSearchRoute(route));
+    const state = f.search.getSearchState();
+    assert.equal(state.filters.workspace, workspace);
+    assert.equal(f.element("workspace-filter").value, workspace);
+    assert.equal(router.buildSearchPath(state.query, state.filters), path);
+    assert.equal(state.resultCount, workspace === "/one" ? 50 : 0);
+  }
+  const relativePath = router.buildSearchPath("needle", { workspace: "/one", timePreset: "week" });
+  assert.equal(router.parseSearchParams(parser._parseHash(relativePath)).workspace, "/one");
+  await f.run(() => f.search.setSearchRoute(router.parseSearchParams(parser._parseHash(relativePath))));
+  assert.equal(f.search.getSearchState().filters.workspace, "/one");
+  assert.equal(router.buildSearchPath("needle", { workspace: null }), "/search?q=needle");
+  assert.equal(router.parseSearchParams(parser._parseHash("/search?q=needle")).workspace, null);
+});

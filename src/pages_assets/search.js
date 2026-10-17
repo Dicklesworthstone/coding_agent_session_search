@@ -7,9 +7,7 @@
 
 import {
   detectSearchMode,
-  getConversationsByAgent,
-  getConversationsByTimeRange,
-  getRecentConversations,
+  getConversations,
   getStatistics,
   normalizeSearchTimeRange,
   searchConversations,
@@ -32,6 +30,7 @@ const SEARCH_CONFIG = {
 function createEmptySearchFilters() {
   return {
     agent: null,
+    workspace: null,
     since: null,
     until: null,
     timePreset: null,
@@ -59,6 +58,7 @@ const elements = {
   searchModeToggle: null,
   searchModeIndicator: null,
   agentFilter: null,
+  workspaceFilter: null,
   timeFilter: null,
   resultsContainer: null,
   resultsList: null,
@@ -157,6 +157,10 @@ function normalizeRouteFilters(routeSearch = {}) {
     routeSearch.agent === undefined || routeSearch.agent === null || routeSearch.agent === ""
       ? null
       : String(routeSearch.agent);
+  const workspace =
+    routeSearch.workspace === undefined || routeSearch.workspace === null || routeSearch.workspace === ""
+      ? null
+      : String(routeSearch.workspace);
   const presets = ["today", "week", "month", "year", "custom"];
   const suppliedPresets = [routeSearch.timePreset, routeSearch.time]
     .filter((value) => value !== undefined && value !== null && value !== "");
@@ -173,7 +177,7 @@ function normalizeRouteFilters(routeSearch = {}) {
   // Explicit bounds are authoritative, including snapshots returned by
   // getSearchState(). Never overwrite them with a recalculated relative range.
   if (timePreset && timePreset !== "custom" && !hasBounds) {
-    return { agent, ...calculateTimeFilterRange(timePreset) };
+    return { agent, workspace, ...calculateTimeFilterRange(timePreset) };
   }
   if (timePreset === "custom" && !hasBounds) {
     throw new RangeError("A custom time filter needs a since or until bound");
@@ -181,6 +185,7 @@ function normalizeRouteFilters(routeSearch = {}) {
 
   return {
     agent,
+    workspace,
     since,
     until,
     timePreset: hasBounds ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,
@@ -209,6 +214,23 @@ function syncAgentFilterControl() {
   }
 
   elements.agentFilter.value = agent;
+}
+
+function syncWorkspaceFilterControl() {
+  const control = elements.workspaceFilter;
+  if (!control) {
+    return;
+  }
+  const workspace = currentFilters.workspace;
+  // A link may name a workspace absent from this export. Keep that exact
+  // selection visible and return no matches; never substitute "All".
+  if (workspace && !Array.from(control.options).some((option) => option.value === workspace)) {
+    const option = document.createElement("option");
+    option.value = workspace;
+    option.textContent = workspace;
+    control.appendChild(option);
+  }
+  control.value = workspace || "";
 }
 
 function syncTimeFilterControl() {
@@ -241,6 +263,7 @@ function syncTimeFilterControl() {
 
 function syncFilterControls() {
   syncAgentFilterControl();
+  syncWorkspaceFilterControl();
   syncTimeFilterControl();
 }
 
@@ -317,6 +340,13 @@ function renderSearchUI() {
                 </div>
 
                 <div class="filter-group">
+                    <label for="workspace-filter">Workspace</label>
+                    <select id="workspace-filter" class="filter-select" aria-label="Filter by exact workspace path">
+                        <option value="">All workspaces</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
                     <label for="time-filter">Time</label>
                     <select id="time-filter" class="filter-select">
                         <option value="">All time</option>
@@ -363,6 +393,7 @@ function cacheElements() {
   elements.searchModeToggle = document.getElementById("search-mode-toggle");
   elements.searchModeIndicator = document.getElementById("search-mode-indicator");
   elements.agentFilter = document.getElementById("agent-filter");
+  elements.workspaceFilter = document.getElementById("workspace-filter");
   elements.timeFilter = document.getElementById("time-filter");
   elements.resultsContainer = elements.container.querySelector(".search-results");
   elements.resultsList = document.getElementById("results-list");
@@ -406,6 +437,13 @@ function setupEventListeners() {
   // Agent filter
   elements.agentFilter.addEventListener("change", (e) => {
     currentFilters.agent = e.target.value || null;
+    handleSearch(elements.searchInput.value);
+  });
+
+  // Workspace changes invalidate pending work and reset the page through
+  // the same handler as query edits. No filtering of a truncated result page.
+  elements.workspaceFilter.addEventListener("change", (e) => {
+    currentFilters.workspace = e.target.value || null;
     handleSearch(elements.searchInput.value);
   });
 
@@ -532,6 +570,20 @@ async function populateFilters() {
         elements.agentFilter.appendChild(option);
       });
     }
+    // Full stored paths disambiguate identically named projects on different
+    // hosts. Render as text, not HTML, and retain an unknown route selection.
+    const known = new Set(Array.from(elements.workspaceFilter.options, (option) => option.value));
+    for (const workspace of (stats.workspaces || []).filter((path) => typeof path === "string" && path).sort()) {
+      if (known.has(workspace)) {
+        continue;
+      }
+      known.add(workspace);
+      const option = document.createElement("option");
+      option.value = workspace;
+      option.textContent = workspace;
+      elements.workspaceFilter.appendChild(option);
+    }
+    syncWorkspaceFilterControl();
   } catch (error) {
     console.error("[Search] Failed to populate filters:", error);
   }
@@ -646,38 +698,19 @@ function readSearchPage(page) {
   if (currentFilterError) {
     throw new RangeError(currentFilterError);
   }
-  const limit = SEARCH_CONFIG.PAGE_SIZE + 1;
-  const offset = page * SEARCH_CONFIG.PAGE_SIZE;
+  const options = {
+    limit: SEARCH_CONFIG.PAGE_SIZE + 1,
+    offset: page * SEARCH_CONFIG.PAGE_SIZE,
+    agent: currentFilters.agent,
+    workspace: currentFilters.workspace,
+    since: currentFilters.since,
+    until: currentFilters.until,
+  };
   if (currentQuery) {
-    return searchConversations(currentQuery, {
-      limit,
-      offset,
-      agent: currentFilters.agent,
-      searchMode: currentSearchMode,
-      since: currentFilters.since,
-      until: currentFilters.until,
-    });
+    return searchConversations(currentQuery, { ...options, searchMode: currentSearchMode });
   }
 
-  let results;
-  if (currentFilters.agent) {
-    results = getConversationsByAgent(
-      currentFilters.agent,
-      limit,
-      currentFilters.since,
-      currentFilters.until,
-      offset,
-    );
-  } else if (currentFilters.since !== null || currentFilters.until !== null) {
-    results = getConversationsByTimeRange(
-      currentFilters.since,
-      currentFilters.until,
-      limit,
-      offset,
-    );
-  } else {
-    results = getRecentConversations(limit, offset);
-  }
+  const results = getConversations(options);
 
   return results.map((conv) => ({
     conversation_id: conv.id,
@@ -1170,10 +1203,13 @@ export async function setSearchRoute(routeSearch = {}, options = {}) {
     currentFilterError = error.message;
     currentFilters = {
       ...createEmptySearchFilters(),
-      // Correcting a bad time range must not also discard the agent filter.
+      // Correcting a bad time range must not discard the other filters.
       agent: routeSearch.agent === undefined || routeSearch.agent === null || routeSearch.agent === ""
         ? null
         : String(routeSearch.agent),
+      workspace: routeSearch.workspace === undefined || routeSearch.workspace === null || routeSearch.workspace === ""
+        ? null
+        : String(routeSearch.workspace),
       timePreset: SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE,
     };
     syncFilterControls();

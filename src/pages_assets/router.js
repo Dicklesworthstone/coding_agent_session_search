@@ -367,6 +367,10 @@ export function buildSearchPath(query = "", filters = {}) {
     params.set("agent", filters.agent);
   }
 
+  if (hasExplicitFilterValue(filters.workspace)) {
+    params.set("workspace", filters.workspace);
+  }
+
   if (hasExplicitFilterValue(filters.timePreset) && filters.timePreset !== "custom") {
     params.set("time", filters.timePreset);
   } else {
@@ -392,6 +396,7 @@ export function parseSearchParams(route) {
   return {
     query: route.query.q || "",
     agent: route.query.agent || null,
+    workspace: route.query.workspace || null,
     timePreset: route.query.time || null,
     since: route.query.since || null,
     until: route.query.until || null,
