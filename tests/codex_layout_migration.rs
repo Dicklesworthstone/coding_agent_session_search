@@ -163,6 +163,11 @@ impl Fixture {
         serde_json::from_slice(&output).unwrap()
     }
 
+    /// Counts hits whose message content holds `needle`. Every message
+    /// document also carries its conversation's title (here the first
+    /// message), so a later message of the same conversation matches the
+    /// first marker through the title alone; a duplicate conversation would
+    /// instead add a second content hit.
     fn search(&self, needle: &str, count: usize) -> Value {
         let output = self
             .command(false)
@@ -182,7 +187,17 @@ impl Fixture {
             .stdout
             .clone();
         let report: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(report["hits"].as_array().unwrap().len(), count, "{report}");
+        let content_hits = report["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|hit| {
+                hit["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(needle))
+            })
+            .count();
+        assert_eq!(content_hits, count, "{report}");
         report
     }
 
