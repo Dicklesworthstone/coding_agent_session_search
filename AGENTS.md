@@ -191,29 +191,39 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 **Dependency source contract:**
 
-Dependency update (2026-09-19): Cargo.toml and Cargo.lock pin the entire
-SQLite family, including `fsqlite-types`, at `=0.4.4`, with Asupersync `=0.5.0`.
-All 25 SQLite packages are published and non-yanked; the v0.4.4 tag points to
-`9d3d98778a372aba95d76d05c5c974ac0238c96a`. FAD `=0.3.0` is also published.
-Frankensearch `=0.6.1` now resolves from crates.io alongside FAD `=0.3.0`.
-The regenerated lockfile contains all 20 SQLite packages used by CASS at 0.4.4.
-Registry resolution and selected consumer checks have passed; full runtime
-qualification and the strict UBS gate remain pending. Do not publish a
-release candidate until those gates pass.
+Dependency update (2026-10-04): Cargo.toml and Cargo.lock pin the entire
+SQLite family, including `fsqlite-types`, at `=0.4.9`, with Asupersync `=0.5.0`.
+All 26 public SQLite packages are published at 0.4.9 (replacing the withdrawn
+0.4.8); the v0.4.9 tag points to `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`.
+FAD `=0.3.8` accepts the family.
+The lockfile resolves the 20 SQLite packages used by CASS at 0.4.9.
+Full runtime qualification and the strict UBS gate remain pending. Do not
+publish a release candidate until those gates pass.
 SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
-(GH#477); upstream recovery, compiler, and package gates passed. CASS consumer
-runtime qualification remains pending.
-The published SQLite 0.4.1 includes the GH#462 reserved-page WAL repair, but
-damaged-archive recovery remains unproven. SQLite 0.4.4 adds durable
-pending-freelist repairs. The strict family guard requires uniform 0.4.4
-registry versions.
+(GH#477). The published SQLite 0.4.1 includes the GH#462 reserved-page WAL
+repair, but damaged-archive recovery remains unproven. SQLite 0.4.4 adds
+durable pending-freelist repairs; 0.4.6 stops a live B-tree page from being
+freed and granted again across a WAL generation (bd-b5vmw) and fixes the
+lost-index-entry race (bd-11sz4). 0.4.7 keeps index entries whole in large
+multi-row INSERTs (register writes past 65,535 were dropped since February:
+bd-2eebi), fixes the serialized-DDL index race (bd-4iaoi), lets the
+deferred-FTS5 repair open bind the GH#503 legacy shadow autoindex (cbd0b98dc;
+`doctor --rebuild-canonical-fts` now repairs that catalog in place), bounds
+the published-page plane (ad3f23ca9, bead 5s1la) and stops a connection's
+first `sqlite_master` query from reading the whole file (ec4956420, k2k20).
+CASS skipped 0.4.7 because its strict read-only opens spent ~30 s on a stale
+WAL index (0853f5e8e). 0.4.9 refuses that index promptly again (48c6cf6b2) and
+lets the first write after stock SQLite opened the archive read-only
+establish the WAL generation instead of failing `BusyRecovery` on every later
+commit (frankensqlite GH#443, 4b48c95d8; cass GH#509/#508).
+The strict family guard requires uniform 0.4.9 registry versions.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.4` (tag v0.4.4 = `9d3d98778a372aba95d76d05c5c974ac0238c96a`); `build.rs` refuses a mixed family. Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477) and 0.4.4's durable pending-freelist repairs. CASS runtime qualification of 0.4.4 is pending. Known defect: a long-lived connection can be left refusing every BEGIN after other connections commit (2l1b0.75) |
-| `franken-agent-detection` | crates.io `=0.3.3` (indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
+| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.9` (tag v0.4.9 = `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`); `build.rs` refuses a mixed family. Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded published-page plane (5s1la) and first-`sqlite_master` full-file read fix (k2k20), and 0.4.9's prompt stale-WAL-index refusal (48c6cf6b2) and stock-empty-WAL-index first-write fix (4b48c95d8, cass GH#509). CASS runtime qualification of 0.4.9 is pending. 0.4.6 included upstream's likely fix (fd8c16a94) for a long-lived connection left refusing every BEGIN (2l1b0.75, frankensqlite GH#429), not yet verified on the owner-archive scenario; the legacy OMP analytics phase keeps its own fresh writer regardless |
+| `franken-agent-detection` | crates.io `=0.3.8`, features `pi-durable` and `pi-sqlite` (the `pi_durable` connector for Pi's durable-harness stores, FAD#28; `pi_agent_rust` SQLite sessions; Pi compaction/branch provenance, FAD#27) and `codex-zstd` (reads Codex rollouts compressed to `rollout-*.jsonl.zst` by Codex's `local_thread_store_compression`, with the id of their plain form, GH#513; indexes native Codebuff transcripts, whose timestamps are a locale time of day, with each instant taken from the message ID, and keeps indexing a store's other chats when one transcript does not parse, GH#511; indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486, and resolves `..`, relative and symlink-alias spellings of an entry, 0f1k0; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x requires) |
-| `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.4`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.3.4 is a hotfix published from tag `frankensearch-quill-v0.3.4`: 0.3.2 (frankensearch-v0.6.1 + the GH#499 tombstone-domain fix), plus 0.3.3's standard CASS Boolean grammar (NOT > AND > OR, parentheses), plus the union seek_danger fix (a disjunction under a conjunction lost matches on concat-merged segments). The next quill release from frankensearch main must be >= 0.3.5 and must carry both (frankensearch#56, and the union issue linked there) |
+| `frankensearch` | crates.io `=0.7.1` (tag `crates-v0.7.1`), resolving `frankensearch-quill 0.4.0`, `frankensearch-rerank 0.5.0`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.4.0 is the first main-branch release after the 0.3.4 hotfix and carries all three of its fixes: the GH#499 live-doc numeric scoring, the standard CASS Boolean grammar (NOT > AND > OR, parentheses; frankensearch#56) and the union seek_danger fix (a disjunction under a conjunction lost matches on concat-merged segments). It also verifies snapshot segments concurrently on open (GH#501; up to 8 threads, the same bytes are still hashed), builds snippets only for returned hits, and skips a read-only reopen when nothing was published. The CASS schema hash is unchanged (`v9-quill`), so the upgrade does not rebuild the lexical index |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
@@ -313,7 +323,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **Current state:** the general workflows (`CI`, Release, Coverage, Benchmarks, Browser Tests, Fuzzing, Install Test, Fresh Clone Build) are `disabled_manually`; only narrow issue-specific regression workflows run on push, and none of them is a merge gate. Until CI is re-enabled this gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
+Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **GitHub Actions is permanently off** (owner, 2026-10-09: "NO GH ACTIONS, PERIOD!!! EVER!!! we ONLY ever use /dsr"). Nothing under `.github/workflows/` runs: do not add or edit a workflow as a verification lane, and never make a bead's closure wait on a workflow run. Windows and macOS proof comes from the dsr build hosts (`dsr health all`), releases from `dsr build` / `dsr release` / `dsr fallback`. This gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
 
 **Local pre-flight before pushing:**
 
@@ -329,7 +339,7 @@ ubs $(git diff --name-only --cached)
 
 If a known-acceptable warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
 
-The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file when the workflow is enabled. Local installs should match.
+The pinned UBS version lives in `.github/workflows/ubs-version.txt`. Local installs should match.
 
 ---
 
@@ -404,19 +414,14 @@ Use `FrankenConnectionManager` for concurrent access:
 
 ## E2E Browser Tests
 
-**IMPORTANT:** E2E browser tests (Playwright) should only be run on GitHub Actions CI, NOT locally.
+**IMPORTANT:** Do not run the E2E browser tests (Playwright) on the shared development machine.
 
-Running browser tests locally:
+Running browser tests there:
 - Consumes significant system resources (spawns browser instances)
 - Can freeze or slow down the development machine
-- May have different results than CI due to environment differences
+- May have different results than a clean host due to environment differences
 
-**Push to a branch and let GitHub Actions run the tests.** The CI workflow in `.github/workflows/browser-tests.yml` handles:
-- Installing browsers
-- Running tests in parallel across Chromium, Firefox, and WebKit
-- Uploading test artifacts and reports
-
-If you need to debug a specific test, use `test.only()` and run a single spec file, but prefer CI for full test runs.
+GitHub Actions is permanently off, so `.github/workflows/browser-tests.yml` never runs: pushing a branch does not run them. Run browser specs on a dsr build host, one spec file at a time while debugging (`test.only()`), and name the host in the receipt.
 
 ---
 
@@ -672,9 +677,10 @@ cass robot-docs guide         # LLM-optimized docs
 | Codebuff / Freebuff | FAD `codebuff` (feature `codebuff`) | Manicode chat JSON |
 | Devin CLI | FAD `devin` (feature `devin`) | SQLite (`sessions.db`) |
 | Shelley | FAD `shelley` (feature `shelley`) | SQLite |
+| Pi Durable | FAD `pi_durable` (SQLite stores with feature `pi-durable`) | SQLite / JSONL commit log |
 | Kiro CLI | FAD `kiro` | event-log JSONL + JSON snapshot |
 
-All 32 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
+All 33 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
 
 ### HTML Export (Robot Mode)
 

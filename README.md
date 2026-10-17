@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Prime Agent, Oh My Pi, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Muse Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, and Kiro CLI into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Pi Durable, Prime Agent, Oh My Pi, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Muse Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, and Kiro CLI into a single, searchable timeline.
 
 <div align="center">
 
@@ -113,7 +113,7 @@ a long JSONL record in an agent prompt.
 - Crash recovery is automatic: a crash between the atomic swap and the retain-rename is handled by `recover_or_finalize_interrupted_lexical_publish_backup` at the start of the next lexical publish or rebuild (not at process startup), which moves any orphaned canonical sidecar (`.<name>.publish-in-progress.bak`) into `.lexical-publish-backups/` before the next publish lands.
 
 **Quarantine, GC, and the doctor/diag surface**
-- Corrupt or failed-validation assets are quarantined rather than auto-deleted. `cass diag --json --quarantine` enumerates every quarantined artifact (failed seed bundles, retained publish backups, quarantined lexical generations) with `size_bytes`, `age_seconds`, `safe_to_gc`, and a human-readable `gc_reason`. The `safe_to_gc` flag is **advisory** — it reflects retention policy + cleanup dry-run eligibility and is not wired to any automatic deletion path.
+- Corrupt or failed-validation assets are quarantined rather than auto-deleted. `cass diag --json --quarantine` enumerates every quarantined derived artifact (failed seed bundles, retained publish backups, quarantined lexical generations; conversations excluded at ingest are listed by `cass quarantine list --json`) with `size_bytes`, `age_seconds`, `safe_to_gc`, and a human-readable `gc_reason`. The `safe_to_gc` flag is **advisory** — it reflects retention policy + cleanup dry-run eligibility and is not wired to any automatic deletion path.
 - `cass doctor --json` surfaces the same quarantine summary plus `checks[]` status for every diagnostic the tool runs. Without `--fix`, doctor is read-only (`auto_fix_applied=false`, `auto_fix_actions=[]`, `issues_fixed=0`); with `--fix` it applies only the repairs whose dry-run plans are proven safe (currently: Track A analytics rebuild, Track B rollup rebuild via `rebuild_token_daily_stats` when the `token_usage` ledger is intact).
 - Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit derived-asset rebuild (`cass models backfill` or an index refresh recommended by `cass health --json`) supersedes it.
 - A derived (SQLite fallback) FTS repair that fails **identically on 5 consecutive `cass index` runs** escalates from a warning to a non-zero exit ([#434](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/434)): the counter persists in `<data_dir>/index/.fts-repair-failure-streak.json`, watch daemons log the escalation instead of exiting, and any run whose repair succeeds — or fails differently — resets it. Canonical rows and the Tantivy index are unaffected; run `cass doctor --rebuild-canonical-fts --yes --json` for the explicit repair.
@@ -390,8 +390,8 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 32 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
-- **Codex**: `~/.codex/sessions` (Rollout JSONL)
+Ingests history from 33 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+- **Codex**: `~/.codex/sessions` and `~/.codex/archived_sessions` (Rollout JSONL, plain or zstd-compressed `.jsonl.zst`)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
 - **Claude Code**: `~/.claude/projects` (Session JSONL), plus macOS Desktop metadata sidecars under
@@ -404,7 +404,8 @@ Ingests history from 32 local agent connectors, normalizing them into a unified 
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
-- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
+- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content; `pi_agent_rust` SQLite sessions too)
+- **Pi Durable (`pi_durable`)**: Pi's experimental durable harness (`@earendil-works/pi-durable`). SQLite stores at `<agent dir>/experimental/durable-sessions/<cwd-hash>/<ms>-<uuid>/session.sqlite` (agent dir `PI_CODING_AGENT_DIR` or `~/.pi/agent`); JSONL commit-log stores under explicit roots. Each conversation in a store (lead, forks, task-owned children) is its own conversation. System prompts, task checkpoints and application documents are never indexed, and the stores are not raw-mirrored
 - **Prime Agent (`prime_agent`)**: `~/.prime/agent/sessions/<session-id>.jsonl` (versions 1–3). Indexes the active branch with omission counts for abandoned siblings; preserves thinking, tool results and context summaries. Overrides, in precedence order: `PRIME_AGENT_SESSION_DIR`, legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `PRIME_AGENT_CODING_AGENT_DIR` (with `/sessions` appended). Prime retains its own agent identity.
 - **Oh My Pi (`omp`)**: OMP v18's default `~/.omp/agent/sessions`, named profiles under `~/.omp/profiles/<name>/agent/sessions`, XDG stores under `$XDG_DATA_HOME/omp`, and explicit OMP-only archive roots via `CASS_OMP_DATA_ROOT` (pi-family JSONL, including per-session sub-agent transcripts)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
@@ -688,6 +689,14 @@ confirmed result.
 Use `--provider opencode` and/or `--source-path '*/opencode.db'` with an age
 or size rule to target one source without retiring unrelated captures.
 Repeated providers are alternatives; a source-path glob further narrows them.
+
+A pruned capture of a source that is still on disk is copied again by the next
+index run. On a machine whose providers never delete their session files, set
+`CASS_RAW_MIRROR=0` (or `false`, `no`, `off`) to stop capturing altogether.
+Indexing and search are unchanged, and existing captures stay until you prune
+them. `cass doctor` reports `raw_mirror_capture_disabled` and warns about what is
+given up: a session file its provider later deletes survives only in the
+archive DB.
 With a selector, `--max-size` measures unique blobs in that selection. Shared
 blobs still referenced outside it and orphan blobs without source provenance
 remain protected. The JSON plan records the selectors and `scope_blob_bytes`.
@@ -1022,7 +1031,9 @@ cass search "error" --robot --robot-meta --days 7 | jq '._meta.effective'
 #     "filters": { "agents": [], "workspaces": [], "source": "all", "sessions_from_paths": null },
 #     "auto_corrections": [] }              // each argv correction, worded like its stderr note
 #   `cass pack "error" --json` carries the same object for the search it ran in
-#   its own `_meta.effective` ("command": "pack", and no search-only "daemon").
+#   its own `_meta.effective` ("command": "pack", and no search-only "daemon"),
+#   with home-directory paths, private hosts and secrets redacted like the rest
+#   of the pack (the db_path above reads "[REDACTED_PATH]/agent_search.db").
 
 # Per-hit trust verdict (advisory; --robot-meta only)
 cass search "error" --robot --robot-meta
@@ -1126,8 +1137,10 @@ cass swarm lint --json --bead coding_agent_session_search-example
 cass swarm dependency-drift --json
 ```
 
-`swarm status` and `swarm work-packet` collect bounded read-only Git state and
-Beads exports when run from the repository root without a fixture. Git uses
+`swarm status`, `swarm work-packet`, `swarm lint`, `swarm evidence`,
+`swarm proof-debt` and `swarm failure-patterns` collect the same bounded
+read-only Git state and Beads exports when run from the repository root
+without a fixture. Git uses
 porcelain-v2 with optional locks disabled. Beads uses `br 0.6.x --no-db`, so its
 JSONL snapshot is explicitly partial: unexported database changes may exist.
 Recheck Beads and reservations before claiming work. Child commands share a
@@ -1148,8 +1161,9 @@ pages are refused. The total reservation count remains unknown; source metadata
 reports only the observed active count. Activity and expiry use
 the observation time. Task descriptions, reservation reasons and message bodies
 are omitted. These observations do not authorize claims or establish proof.
-CASS evidence remains unwired. `swarm lint` still uses the placeholder
-live snapshot. Fixture selection (`--fixture <file>` or `--fixture-dir <dir>
+CASS evidence remains unwired. Live lint marks itself partial and adds an
+`agent-mail-unavailable` advisory whenever Agent Mail messages are not
+collected. Fixture selection (`--fixture <file>` or `--fixture-dir <dir>
 --fixture-id <id>`) retains deterministic behavior; `swarm dependency-drift`
 also has a live path.
 
@@ -1158,6 +1172,14 @@ pressure, cass health/status, and proof references. Stale candidates are
 advisory only: coordinate through Beads and Agent Mail before reopening,
 force-releasing, or taking over work. Suggested commands are robot-safe
 templates, not automatic actions.
+
+The TUI's Swarm tab shows the same live payload for the directory the TUI was
+started in. Open it from the command palette (`Ctrl+P`, "Swarm operations
+cockpit") or by clicking its tab; it has no direct key. Entering the tab
+starts one background read with this collector;
+until it lands, every count shows as `?`. Counts of providers that could not
+be read stay `?`, never zero. `r` reads again. Rendering never runs a provider
+read.
 
 `swarm dependency-drift` reads `Cargo.toml` and optional sibling checkouts to
 report manifest pins, local HEAD/dirty state, strict validation commands, and
@@ -1530,6 +1552,7 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 | `--idempotency-key KEY` | Safe retries: same key + params returns cached result (24h TTL) |
 | `--json` | JSON output with stats |
 | `--gc` | Reclaim merge-retired lexical segment files and exit: runs the engine's grace-period garbage sweep (a folded segment file is unlinked only once no published MANIFEST generation has referenced it for 300 s) and reports files/bytes reclaimed. Every incremental `cass index` performs the same sweep at open; `doctor --json` reports the reclaimable bytes under `storage_pressure.full_rebuild_readiness` (GH #453) |
+| `--rebuild-profile bounded` | Run any lexical rebuild in this invocation as a single-core, low-memory rebuild for a wedged or memory-starved archive: one rebuild worker, one page-prep thread, a one-page pipeline, 64 conversations per fetch and a durable commit every 64 MiB of text (the *Lexical Rebuild Tuning* recipe below under one name). An explicit `CASS_TANTIVY_REBUILD_*` value still wins over the preset, and the responsiveness governor can still lower it. `--json` reports `rebuild_profile`: each preset knob with `source` `profile` or `env`, and the effective settings. It never changes what is indexed. Default: `default` (host-sized) (GH #483) |
 
 When `health --json` or `status --json` reports `index.status: "hollow"`, the
 live Quill generation serves fewer than half the documents certified by its
@@ -1874,6 +1897,7 @@ palette and is preserved with ranking and filters in saved views.
 | `Ctrl+Y` | Copy path |
 | `Alt+Y` | Copy snippet |
 | `Ctrl+Shift+C` | Copy content |
+| `Alt+E` | Bookmark the selected hit (`cass bookmarks list` shows bookmarks) |
 | `Ctrl+E` | Open the export modal |
 | `Ctrl+Shift+E` | Export Markdown immediately |
 | `Alt+U` / `Alt+N` / `Alt+I` | Update banner: upgrade now / show release notes / skip this version |
@@ -2447,7 +2471,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 32 coding-agent connectors (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Prime Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, Kiro CLI); `cass capabilities --json` lists them as `connectors`.
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 33 coding-agent connectors (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Pi Durable, Prime Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build, Grok Bot, Codebuff/Freebuff, Devin CLI, Shelley, Kiro CLI); `cass capabilities --json` lists them as `connectors`.
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation. cass turns on the engine's concurrent mode (`PRAGMA fsqlite.concurrent_mode = ON`), so a plain `BEGIN` runs as `BEGIN CONCURRENT`. Indexing still has one writer at a time, because `index-run.lock` admits a single indexer. `BEGIN IMMEDIATE` appears only in the daemon job queue and in logical-archive import/migrate. An experimental opt-in parallel persist path (`CASS_INDEXER_BEGIN_CONCURRENT=1`, off by default) exists but is not the default.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -2814,7 +2838,7 @@ Each file system event is routed to the appropriate connector:
 
 ```
 ~/.claude/projects/foo.jsonl  → ClaudeCodeConnector
-~/.codex/sessions/rollout-*.jsonl → CodexConnector
+~/.codex/sessions/rollout-*.jsonl[.zst] → CodexConnector
 ~/.aider.chat.history.md → AiderConnector
 ```
 
@@ -2833,6 +2857,7 @@ The global `last_scan_ts` and `last_indexed_at` watermarks live in the SQLite `m
 - **File-level filtering only**: When a file is modified, the entire file is re-scanned
 - **1-second mtime slack**: Accounts for filesystem timestamp granularity
 - **No per-message filtering**: Prevents data loss when new messages are appended
+- **Completed-source reuse is a build-time property**: a source that was fully ingested and has not changed is skipped, but only in builds whose `Cargo.lock` resolves every dependency from a registry or git source. A build with a local path dependency or `[patch]` reparses every source on every incremental run. `cass capabilities --json` reports which applies as `source_ingest_reuse.{enabled,disabled_by}` (GH #426). Release binaries have it on.
 
 ### Codex Token Backfill
 
@@ -2921,7 +2946,14 @@ cass completions powershell >> $PROFILE
 
 - **CPU**: any x86_64 or ARM64 processor. Semantic search runs on a pure-Rust inference backend (frankensearch/native) with runtime-dispatched SIMD — NEON on Apple Silicon, AVX2/FMA when present on x86, SSE2/scalar fallback otherwise — so there is no AVX requirement and no `SIGILL` hazard (the historical ONNX Runtime dependency was removed in cass#308).
 - **OS**: Linux, macOS, or Windows
-- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine. The install script probes the host's glibc (`ldd --version`) before downloading a Linux prebuilt binary and falls back to build-from-source with a warning when it is older than 2.38; `--from-source` forces that route, and `--artifact-url` bypasses the probe for an explicitly chosen artifact.
+- **Linux glibc**: Pre-built Linux binaries require **glibc 2.28+**: Debian 10+, Ubuntu 20.04+, RHEL/Rocky/Alma 8+, Amazon Linux 2023. They are cross-built against a pinned 2.28 floor (`cargo zigbuild --target <arch>-unknown-linux-gnu.2.28`). On the v0.10.0 artifacts, `objdump -p cass` shows `GLIBC_2.28` for both amd64 and arm64. Older systems (e.g. Ubuntu 18.04 with glibc 2.27) should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. The install script checks the host's glibc (`ldd --version`) before downloading a Linux prebuilt binary. If it is older than 2.28, the script warns and builds from source instead. `--from-source` forces that route, and `--artifact-url` skips the check for an artifact you choose.
+- **`sqlite3` command-line tool (optional)**: four repairs run the stock `sqlite3` binary:
+  - the duplicate FTS schema-row repair, which some opens of an older archive run;
+  - recovering a historical bundle during salvage;
+  - importing that recovered bundle;
+  - the staged FTS metadata scrub.
+
+  Without `sqlite3` on `PATH`, only these repairs fail, with an error that names the missing tool.
 - **Disk**: Sufficient space for the search index (varies with session history size)
 
 ---
@@ -2996,6 +3028,7 @@ cass
     - `Ctrl+X`: Toggle selection on current item (`Ctrl+M` opens the detail modal, like `Enter`).
     - `Alt+B`: Bulk actions menu (when items selected).
     - `Ctrl+Y` / `Alt+Y` / `Ctrl+Shift+C`: Copy file path / snippet / content to clipboard.
+    - `Alt+E`: Bookmark the selected hit (same store as `cass bookmarks`; a second press keeps one bookmark).
     - `/`: Find text within detail pane; `Enter` advances matches; `n`/`N` cycle contextual session hits; `Esc` closes the modal.
     - `Ctrl+Shift+R`: Trigger manual re-index (refresh search results).
     - `Ctrl+Shift+Del`: Reset TUI state (clear history, filters, layout).
@@ -3088,7 +3121,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `introspect` | Full API schema: commands, arguments, response shapes |
 | `swarm status --json` | Read-only shared-repo operations snapshot across Beads, Agent Mail metadata, git, build pressure, cass readiness, and proof refs |
 | `swarm work-packet --json` | Advisory one-agent packet with readiness, suggested reservations, verification commands, and closeout checklist; it does not claim or reserve |
-| `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps. Only fixture input (`--fixture`, `--fixture-dir --fixture-id`) is linted today; the live path reports every provider `live-provider-unimplemented` and finds nothing |
+| `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps. Without a fixture it lints the repository's live Git, Beads, Agent Mail and evidence providers (the same bounded collection as `swarm status`); `--fixture`, `--fixture-dir --fixture-id` lint recorded input |
 | `swarm dependency-drift --json` | Read-only sibling dependency sentinel for Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations |
 | `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
@@ -3113,7 +3146,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `support-bundle` | Assemble a redacted, share-safe recovery/support evidence bundle |
 | `state` | Quick state/health check (alias of `status`) |
 | `onboarding` | Read-only first-run source onboarding + readiness wizard; `--json` for scripts, never launches the TUI |
-| `quarantine` | Inspect and manage the conversation-ingest quarantine (`list` / `clear`) |
+| `quarantine` | Inspect and manage the conversation-ingest quarantine: `list` (each excluded conversation, plus a `status` grouping by cause, version and retry eligibility with the next command), `retry` (bounded re-ingest plan; `--apply` runs it), `clear` |
 | `forget` | Prune already-indexed conversations by source-path glob; dry-run by default, `--apply` to commit. Deletes the canonical rows, then rebuilds FTS, analytics and the lexical index. Semantic vectors are not rewritten, so explicit semantic search then reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` re-embeds from the canonical rows; no surface returns forgotten messages. `dedup --apply` and `sources agents exclude` behave the same way. It removes indexed copies, not source files: forget records each source's size and modification time, so an unchanged source stays forgotten across `cass index`, `--full` and rescans triggered by other sessions, but if its agent appends to it the whole conversation is indexed again. A store that keeps many sessions in one file (a SQLite database) counts as changed when any of its sessions changes. Delete or move the file to keep it out for good. The raw mirror keeps its verbatim capture of the source; once the source is gone, `cass mirror prune --older-than 0s --safety-hold-down 0s --source-path '<glob>' --apply` removes that capture too (a source still on disk is captured again by the next scan). A `cass serve` session opened before the forget keeps its pinned snapshot until `reload`; the TUI drops forgotten hits on its next search. If the lexical rebuild fails, forget exits 5 (`lexical-rebuild`) and `cass index --full` finishes the purge |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
@@ -3498,7 +3531,7 @@ Update check state is stored in `update_state.json` in the data directory:
 
 - **Cache debug**: set `CASS_DEBUG_CACHE_METRICS=1` to emit cache hit/miss/shortfall/reload stats via tracing (debug level).
 
-- **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to skip during source discovery and parsing. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed.
+- **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to keep out of the archive: no conversation from an excluded source is stored, indexed or raw-mirrored, whichever connector found it. The Claude Code, Codex, Codebuff and Pi readers skip an excluded file without opening it; other connectors read it, and cass discards its conversations before storing anything. Entries match whole path components (`sess` does not exclude `sessions`), a relative entry is taken from the working directory, and symlinks and other aliases of an existing directory are resolved on both sides, so a `..`, symlinked or (on Windows) differently-cased spelling of a directory excludes it too. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed.
 - **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.
@@ -3513,6 +3546,7 @@ Update check state is stored in `update_state.json` in the data directory:
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
 | `CASS_OUTPUT_FORMAT` | unset | `json`, `jsonl`, `compact`, `sessions` or `toon` makes robot output the default, as if `--robot-format` were given |
 | `CASS_SSH_CONFIG` | unset | SSH config file passed as `ssh -F <path>` for remote sources (cass also sets `BatchMode=yes` and `StrictHostKeyChecking=yes`) |
+| `CASS_RAW_MIRROR` | `1` | Raw-mirror capture of session source files into `raw-mirror/v1/`. `0`, `false`, `no` or `off` stops capturing (GH #506). Indexing is unchanged, and existing captures stay until `cass mirror prune`. Doctor reports `raw_mirror_capture_disabled`, because a file its provider deletes then survives only in the archive DB. |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `536870912` | Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available |
@@ -3543,7 +3577,7 @@ Update check state is stored in `update_state.json` in the data directory:
 | `CASS_NO_COLOR` | unset | Force monochrome TUI output |
 | `NO_COLOR` | unset | Honored by TUI only when `CASS_RESPECT_NO_COLOR=1` |
 | `CASS_RESPECT_NO_COLOR` | unset | Make TUI inherit global `NO_COLOR` |
-| **Lexical Rebuild Tuning** ([#483](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/483)) | | These bound the full/resumed lexical (Quill) rebuild that `cass index --full` and stale-on-read repair run. Defaults are sized from the host; the responsiveness governor below can only lower them. A single-core, low-memory profile for a wedged or memory-starved archive is `CASS_TANTIVY_REBUILD_WORKERS=1 CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS=1 CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE=1 CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=64 CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES=67108864 cass index --full --json`. The rebuild checkpoints to `.lexical-rebuild-state.json` at every durable commit and resumes from it on the next run; the connector scan phase has no equivalent per-file ledger yet ([#426](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/426)). |
+| **Lexical Rebuild Tuning** ([#483](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/483)) | | These bound the full/resumed lexical (Quill) rebuild that `cass index --full` and stale-on-read repair run. Defaults are sized from the host; the responsiveness governor below can only lower them. A single-core, low-memory profile for a wedged or memory-starved archive is `cass index --full --rebuild-profile bounded --json`, which is the same as `CASS_TANTIVY_REBUILD_WORKERS=1 CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS=1 CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE=1 CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=64 CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES=67108864 cass index --full --json`; any of those variables you set explicitly overrides the preset's value. Quill's per-thread writer heap is sized separately, by `CASS_TANTIVY_MAX_WRITER_THREADS` (memory-aware by default); set it to `1` as well for the smallest footprint. The rebuild checkpoints to `.lexical-rebuild-state.json` at every durable commit and resumes from it on the next run; the connector scan phase has no equivalent per-file ledger yet ([#426](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/426)). |
 | `CASS_TANTIVY_REBUILD_WORKERS` | cores − reserved, clamped to 1..=64 | Writer/shard-builder threads for the lexical rebuild. Reserved cores default to 0 (1 core), 1 (2–4 cores), 2 (5–15 cores), else `cores/8` clamped to 2..=8; override the reservation with `CASS_TANTIVY_REBUILD_RESERVED_CORES` |
 | `CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS` | `ceil(workers / 2)` clamped to 2..=8 (`1` when workers is 1) | Threads that fetch and prepare conversation pages ahead of the writers. `1` serializes page prep |
 | `CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS` | `max(512, writer_threads × 128)`, capped at the 1024-conversation page | Conversations per SQL message-fetch chunk (the unit of writer feeding). Lower it to cap peak RSS on archives with very large conversations |
@@ -3607,37 +3641,46 @@ Update check state is stored in `update_state.json` in the data directory:
 ## Dependency Source Contract
 
 The manifests and lockfile pin the entire SQLite family used by CASS (including
-`fsqlite-types`) at `=0.4.4`, with `asupersync =0.5.0`.
+`fsqlite-types`) at `=0.4.9`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
-archive. `franken-agent-detection =0.3.3` is published. SQLite `0.4.2` adds
-explicit derived WAL-index recovery for read-only opens (GH#477); its
-upstream recovery, compiler, and package gates passed. All 25 SQLite packages
-are now published at 0.4.4, which adds durable pending-freelist repairs.
-As of September 19, `frankensearch =0.6.1` resolves from crates.io, and the
-regenerated lockfile includes all 20 SQLite packages used by CASS at 0.4.4.
-Registry resolution and selected consumer checks have passed; full runtime
-qualification and the strict UBS gate remain pending. Selected checks do not
-qualify a release or prove recovery of a damaged archive.
-The candidate must not be released until the remaining gates pass.
+archive. `franken-agent-detection =0.3.8` is published and accepts the 0.4.9
+family. SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only
+opens (GH#477) and 0.4.4 adds durable pending-freelist repairs. 0.4.6 stops a
+live B-tree page from being freed and granted again across a WAL generation
+(`page N is referenced multiple times`, bd-b5vmw) and fixes a lost-index-entry
+race (bd-11sz4). 0.4.7 keeps index entries whole in large multi-row INSERTs
+(bd-2eebi), fixes a schema change inside an explicit `BEGIN IMMEDIATE`/`EXCLUSIVE`
+missing rows that another same-process connection autocommits concurrently
+(bd-4iaoi), lets `cass doctor --rebuild-canonical-fts` open and rebuild the
+GH#503 legacy `fts_messages_config` shadow catalog, bounds the shared page
+plane, and stops a connection's first `sqlite_master` query from reading the
+whole database file. CASS skipped 0.4.7 because its strict read-only opens
+spent about 30 s on a stale WAL index. All 26 public SQLite packages are
+published at 0.4.9 (which replaces the withdrawn 0.4.8): it refuses that stale
+index promptly again, and the first write after stock SQLite opened the archive
+read-only now establishes the WAL generation instead of failing
+`BusyRecovery` on every later commit (GH#509).
+The lockfile resolves the 20 SQLite packages CASS uses at 0.4.9.
+Full runtime qualification and the strict UBS gate remain pending, and no
+release of this pin proves recovery of an already damaged archive.
 The build guard enforces the reviewed
-uniform SQLite 0.4.4 versions, a single resolution per package, and registry sources.
-The September 17 FrankenSearch publication blocker is resolved.
+uniform SQLite 0.4.9 versions, a single resolution per package, and registry sources.
 
 `cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. No active dependency or patch currently resolves from git. Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.4` (tag v0.4.4 = `9d3d98778a372aba95d76d05c5c974ac0238c96a`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477) and 0.4.4's durable pending-freelist repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
-| `franken-agent-detection` | crates.io `=0.3.3` |
+| `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.9` (tag v0.4.9 = `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`). Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
+| `franken-agent-detection` | crates.io `=0.3.8`, features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
-| `frankensearch` | crates.io `=0.6.1`, resolving `frankensearch-quill 0.3.4` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, published from the `frankensearch-quill-v0.3.4` hotfix tag), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
+| `frankensearch` | crates.io `=0.7.1`, resolving `frankensearch-quill 0.4.0` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, plus concurrent segment verification on open for GH #501), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
 **Build-time validation**
 - `build.rs` validates every named dependency contract against its exact registry requirement, package name, enabled features, and `default-features` policy. It also rejects git/revision fields for these registry-only contracts.
-- The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.4` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
+- The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.9` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
 - Enable optional sibling-manifest validation with `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. For sibling checkouts that are present, this verifies package names, versions, and required features before you switch to local path overrides; registry-only contracts do not require a particular sibling branch or clean worktree.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 

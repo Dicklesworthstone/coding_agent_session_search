@@ -25,11 +25,233 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
+| [v0.10.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0) | 2026-10-01 | Leaked-page doctor repair, robot search/pack interpretation echoes, `CASS_RAW_MIRROR=0`, OpenCode 2.x and mid-turn Claude Code prompts indexed, giant-conversation slicing, WAL-only watch-once and forget-tombstone fixes |
 | [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-25 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64. Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages, large-archive index and FTS repair fixes |
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
 ## [Unreleased]
+
+### Added
+
+- **`cass index --rebuild-profile bounded` (#483).** One flag now runs the
+  documented single-core, low-memory lexical rebuild for a wedged or
+  memory-starved archive: one rebuild worker, one page-prep thread, a
+  one-page pipeline, 64 conversations per fetch and a durable commit every
+  64 MiB of text. An explicit `CASS_TANTIVY_REBUILD_*` value still wins over
+  the preset. `cass index --json` reports `rebuild_profile`: each preset
+  knob with its source (`profile` or `env`), and the effective rebuild
+  settings.
+
+- **Pi durable-harness conversations are indexed (franken_agent_detection
+  #28).** Stores written by Pi's experimental durable harness
+  (`@earendil-works/pi-durable`) were invisible to cass. With
+  franken_agent_detection 0.3.7 the new `pi_durable` connector reads them:
+  - SQLite stores at
+    `<agent dir>/experimental/durable-sessions/<cwd-hash>/<ms>-<uuid>/session.sqlite`,
+    with the agent dir from `PI_CODING_AGENT_DIR` or `~/.pi/agent`;
+  - JSONL commit-log stores under explicit roots.
+
+  Each conversation in a store, whether the lead, a fork or a task-owned
+  child, is its own conversation. Only committed state is read.
+  System prompts, task checkpoints and application documents are never
+  indexed, and like Shelley and Grok Bot stores, these stores are not
+  raw-mirrored, because doing so would copy the parts cass deliberately
+  leaves out.
+
+  A store cass cannot read is reported instead of looking empty: `cass index
+  --json` lists it under `indexing_stats.connector_diagnostics` with kind
+  `unsupported-store-format` (a durable schema or format version newer than
+  the connector reads, or a Pi Session Store V2 sidecar) or
+  `unreadable-source`, and a `detail` naming the version found.
+
+  The same release also:
+  - indexes `pi_agent_rust` SQLite sessions;
+  - keeps Pi and Oh My Pi compaction summaries, custom messages, shell runs
+    and branch provenance (franken_agent_detection #27).
+
+- **`cass status` says whether a memory limit reached cass (#496).**
+  `topology_budget.topology` now reports `host_memory_total_bytes` and
+  `memory_limit_source`, next to the cgroup-clamped `memory_total_bytes`.
+  The source is `host`, or the cgroup level whose limit applies (for
+  example `cgroup_v2:/user.slice/run-r1.scope`). Before this, a run under
+  `systemd-run -p MemoryMax=16G` that landed outside the scope looked the
+  same as one inside it.
+
+### Fixed
+
+- **`CASS_EXCLUDE_PATHS` now keeps excluded sessions out of the index for
+  every connector.** Only the Claude Code, Codex, Codebuff and Pi readers
+  consulted the variable. For Gemini, Cursor, OpenCode, Aider and the other
+  connectors, an excluded session was withheld from the raw mirror but still
+  stored in the database and searchable, and `cass index` exited 0. Even for
+  Claude Code and Pi, an entry given through a symlink, a `..` path or a
+  relative path was not applied (and on Windows, neither was a
+  differently-cased spelling of a directory). cass now drops every
+  conversation whose source an exclusion covers before anything is stored,
+  using the same rules as the raw mirror: whole path components, a relative
+  entry taken from the working directory, and aliases of an existing
+  directory resolved on both sides. franken_agent_detection 0.3.8 applies
+  those rules in the Claude Code, Codex and Pi readers, which therefore no
+  longer read such files at all.
+
+- **A Codebuff chat's workspace follows its `run-state.json`.** Re-indexing a
+  chat whose project root changed (a full or incremental run, or
+  `cass index --watch-once` on the sidecar or the chat directory) re-read
+  the new root but kept the workspace from the chat's first import, in the
+  archive and in search. The archive now takes the new workspace, moves the
+  chat's analytics with it and rebuilds the lexical index, as it already
+  did for Cursor agent sessions. A chat whose `run-state.json` is missing or
+  unreadable keeps the workspace it had, and so does a chat seen again
+  through another store's path.
+
+- **On macOS, `cass index --watch` picks up new Devin and Shelley messages
+  while the app is running.** FSEvents reports a write to a file that stays
+  open only when the file is closed, and SQLite keeps its write-ahead log
+  open for as long as the app runs, so a commit that touched only the
+  `-wal` file was never noticed. The live watch now also checks each
+  database and its `-wal`/`-shm` files once per watch interval.
+
+- **Codex sessions compressed to `.jsonl.zst` are indexed (#513).** Codex's
+  `local_thread_store_compression` replaces a finished session's
+  `rollout-*.jsonl` with `rollout-*.jsonl.zst`. cass found only `.jsonl` and
+  `.json` rollouts, so a session compressed before cass first saw it was
+  never indexed, while `cass index` still reported success (the reporter had
+  20 of 1,609 sessions). franken-agent-detection 0.3.6 (`codex-zstd`) reads
+  them, and cass's enrichment pass reads the same decoded text. A compressed
+  session keeps the id of its plain form, so a session indexed before Codex
+  compressed it is not added again. Compressed files keep the plain file's old
+  modification time, which an incremental scan skips, so the first index run
+  on this version scans Codex with no cutoff; unchanged files already in the
+  index are still skipped. Decoded text is held to `CASS_CODEX_MAX_SOURCE_BYTES`
+  (100 MiB by default), and a larger session is reported as over the read
+  budget instead of being indexed short.
+- **A resumed full rebuild that cannot certify its document count rebuilds
+  in the same run (#494).** When a resumed candidate held documents its
+  checkpoint never counted, `cass index --full` replayed the rest of the
+  archive and then exited 9 at `validate_candidate`, and later runs resumed
+  the refused end-of-archive checkpoint into the same refusal. A resume at
+  the end of the archive now checks the count before replaying, and a
+  resume that is refused after replaying keeps the candidate under
+  `.lexical-rebuild-quarantine-*` with the count that failed and rebuilds
+  from zero in the same invocation. A from-zero rebuild whose count is
+  wrong is still refused. The refusal no longer says "only sees" when the
+  reader sees more documents than were counted.
+- **Native Codebuff history indexes, and a connector that cannot parse a
+  source says so (#511).** Codebuff writes each message's
+  `timestamp` as a locale time of day such as "01:15 PM".
+  franken-agent-detection 0.3.3 required a full timestamp, so no native
+  Codebuff transcript was indexed. 0.3.4 takes each message's instant from
+  the `Date.now()` milliseconds in its ID and never guesses a date or zone
+  from the time of day. 0.3.5 keeps indexing a store's other chats when one
+  transcript does not parse, and the failure names that transcript.
+  Separately, every connector scan that failed on
+  content was reported as `unreadable-source` with "check permissions",
+  naming cass's own data directory. It is now `unparseable-source`, not
+  retryable on unchanged bytes, at the connector's scan root. I/O failures
+  stay `unreadable-source` and locks stay `source-locked`.
+- **`cass schedule` no longer reports a failing index run as lock contention
+  (#509).** Every exit 7 from the index step was reported as "another index
+  run already holds the index lock; skipped this cycle". That included a
+  canonical database that kept failing with `BusyRecovery` while no other
+  process held the lock, so a permanently failing schedule looked like a
+  benign skip. The step now claims lock contention only when the child
+  reports another index run holding the lock. A busy database is reported
+  as such, with the child's error message, and an exit 7 without a message
+  claims no cause.
+- **`cass index` keeps committing after another tool reads the archive
+  read-only (#509).** With fsqlite 0.4.6, a stock SQLite read-only query on
+  an archive whose WAL was empty left a WAL-index header the old writer
+  could not accept. Every later `cass index` then failed with
+  `BusyRecovery` until the `-shm` file was moved aside. cass now builds on
+  frankensqlite 0.4.9 (tag v0.4.9, `1eacdbe0`), which accepts that header.
+  `frankensqlite_compat_gates` reproduces the sequence: cass write,
+  checkpoint, stock read-only query, three cass commits. It fails on 0.4.6
+  and passes on 0.4.9. 0.4.7 was skipped because of its read-only
+  regression; 0.4.9 contains that fix.
+- **`cass doctor` repairs a 0.6.24-era archive with the #434 autoindex
+  signature in place (#503).** The engine repair for the missing FTS5
+  shadow autoindex ships in frankensqlite 0.4.9, so doctor now offers it.
+- **Doctor run-history verbs parse as documented.** `cass doctor ls`,
+  `undo`, `diff`, `explain`, `watch`, `capabilities` and
+  `gc --before <ts>` are what `cass robot-docs` documents. They failed with
+  "unexpected argument"; they now map to the doctor flags and the mapping
+  is reported on stderr. `cass search --help` no longer points at the
+  nonexistent `cass models --list`.
+- **Health points quarantined conversations at a command that lists them.**
+  `search_completeness.next_command` in health, status and
+  `search --robot-meta` sent agents to `cass diag --json --quarantine`.
+  That command inventories derived assets and never names a conversation.
+  It now points at `cass quarantine list --json`. That list gains a `status`
+  grouping by cause, version and retry eligibility, with `retryable_now`
+  and a next command. The next command is `cass quarantine retry --json`
+  only when a retry can help: a row whose source file is gone does not
+  count.
+- **`cass quarantine retry` recommends the command that applies its plan.**
+  After a dry run it recommended `cass index`, a whole-archive rescan that
+  retries only index-ingest OOM records. It now recommends
+  `cass quarantine retry --apply --json` with the same `--max-attempts` and
+  `--force-irreducible` options.
+- **A conversation the watcher keeps deferring after a bounded-guard NoMem
+  backs off (#510).** Every watch tick re-ran the batch split, the solo
+  retry and the deferral for it, holding a core for hours and writing
+  hundreds of MB of identical warnings. A deferral is now counted and
+  retried after 1 minute, doubling to at most 1 hour. The warning repeats
+  on the 1st, 2nd, 4th, 8th... deferral and names `FSQLITE_PAGE_BUFFER_MAX`.
+  `cass quarantine list` shows deferred conversations, which are still
+  never quarantined. `cass status` and `cass health` report their count as
+  `ingest_quarantine.deferred_conversations` and name them in `warnings`;
+  human `cass status` prints the same warning. A clean later batch also no
+  longer advances the watch watermark past an earlier deferred one.
+- **The quarantine warning no longer calls every quarantine irreducible.**
+  `status` and `health` said quarantined conversations followed an
+  "irreducible ingest OOM", but each entry carries retry eligibility and a
+  retry can help. The warning now points at `cass quarantine list --json`,
+  which says whether it can.
+- **An interrupted expected-docs scan resumes (#381).** On a large archive
+  the first noise-adjusted document count could outlive a caller's
+  timeout, and the next run started over. The scan now saves its position
+  every few seconds and continues from it if the archive has only grown
+  since. It also reports activity to the stall watchdog. `cass status
+  --json` and `cass health --json` show the saved position under
+  `rebuild.expected_docs_scan`, and human `cass status` prints it as a
+  "Coverage scan" line, so a timeout-wrapped caller can see it advance.
+
+### Added
+
+- **Bookmark the selected result from the TUI.** `Alt+E`, or "Bookmark
+  selected result" in the command palette, saves the selected hit to the
+  store `cass bookmarks list` reads. Pressing it again on the same line
+  reports "Already bookmarked" instead of adding a duplicate.
+- **`cass capabilities` reports whether the binary reuses completed sources
+  (#426).** `source_ingest_reuse` gives `enabled` and, when it is off,
+  `disabled_by`: the first dependency without a registry or git source,
+  which is what turns completed-source reuse off at build time.
+
+### Changed
+
+- **`swarm lint`, `evidence`, `proof-debt` and `failure-patterns` read the
+  live repository.** Outside fixtures they reported every provider as
+  `live-provider-unimplemented` and found nothing. They now share the live
+  Git, Beads, RCH, Agent Mail and health collection that `swarm status`
+  uses.
+- **The TUI's Swarm tab reads that live collection.** It used to show a
+  placeholder with every provider "not wired yet" and every count 0.
+  Entering the tab now starts one background read, `r` reads again, and a
+  count whose provider could not be read shows `?` instead of 0.
+- **frankensearch 0.7.1 / frankensearch-quill 0.4.0.** This is the first
+  main-branch quill release after the 0.3.4 hotfix, and it keeps that
+  hotfix's grammar, union and date-filter fixes. Snapshot segments are
+  verified concurrently on open, which shortens the per-search
+  verification #501 measured; every segment is still hashed. Snippets are
+  built only for returned hits. The CASS index schema is unchanged, so the
+  upgrade does not rebuild the lexical index.
+- **`cass sources doctor` checks sources.toml itself.** It now reports a
+  missing `rsync`/`scp`, an interrupted setup and leftover
+  `.sources.toml.tmp*` files as `config_validation`. Validation errors make
+  it exit 1.
+
+## [v0.10.0] -- 2026-10-01
 
 ### Added
 
@@ -64,8 +286,123 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   what chose it, the resolved time window, the parsed filters, the query
   grouping and the argv auto-corrections. Pack's own `query.filters` was
   always empty, so a pack gave no way to check the filters it applied.
+- **`CASS_RAW_MIRROR=0` turns raw-mirror capture off (#506).** `0`, `false`,
+  `no` or `off` stops copying session source files into `raw-mirror/v1/`, so
+  a `cass mirror prune` is no longer undone by the next index run. Indexing
+  is unchanged, and existing captures stay until they are pruned. Doctor
+  reports `raw_mirror_capture_disabled` as the operator's choice rather than
+  a fault: a file its provider later deletes survives only in the archive
+  database (e0213341).
+- **An empty search filtered to one workspace says why.** `--workspace` is
+  matched exactly, so a trailing slash, a case difference or a moved checkout
+  returned zero hits that read like "nothing matches". When such a search
+  finds nothing, cass checks the indexed workspace paths and probes the query
+  once without the filter, within the remaining robot budget. Robot output
+  carries `zero_result_diagnosis`: the verdict, ranked candidate workspaces
+  and a suggested rerun (31eb05e1).
 
 ### Fixed
+
+- **An index run that rebuilds the lexical index no longer drops the
+  conversations batched around a giant one.** When a run rebuilt the index
+  inline (a missing or replaced index, without `--full`) and one batch held a
+  conversation large enough to persist in slices (37675c69), only the
+  conversations in the batch's last part were indexed. Ordinary conversations
+  before the giant one, or the giant one itself when ordinary conversations
+  followed it, were stored but never searchable, and `cass status` stayed
+  stale until a `--full` rebuild. Only the giant conversation's earlier slices
+  now skip the lexical replay; its final slice replays the whole conversation.
+- **`cass pack` redacts its `_meta.effective` echo.** The new echo of what the
+  pack's search ran (raw query, query grouping, database path, workspace
+  filters) bypassed the strict redaction the rest of the pack applies, so a
+  secret or a home-directory path in the query came back verbatim there.
+  Every string in it is now redacted and counted like the rest of the
+  envelope.
+- **`zero_result_diagnosis` no longer explains a page past the last hit.** A
+  `--workspace` search with `--offset` beyond its matches returned an empty
+  page that was diagnosed as "the workspace has no match" next to a nonzero
+  `total_matches`. The diagnosis now requires the search itself to be empty.
+- **`cargo fmt --check` is clean again** on the lexical reconcile code
+  (baeaf43c).
+- **OpenCode 2.x sessions are indexed (#504).** franken-agent-detection
+  0.3.3 reads OpenCode's `session_v2` and `session_message` tables, so
+  sessions stored only there are no longer skipped. A session migrated from
+  1.x is indexed once, not twice (6d75777e).
+- **`cass pack` says why it used lexical evidence (#507).** A default pack
+  reported `fallback_mode: "lexical"` with no cause, even when direct
+  semantic search worked. Pack selects evidence lexically, so the fallback is
+  by design. `realized.fallback_reason` now carries the typed cause
+  (`pack_enrichment_unavailable`, with the same codes as search's
+  `_meta.semantic_fallback_reason`). A fallback that arrives without a cause
+  is flagged `semantic_fallback_reason_unreported`. The recommended action
+  no longer suggests installing a model that would not change the result.
+  An explicit `--mode lexical` pack reports no fallback (ae2c0cc2).
+- **`sources setup --tailscale` skips Mullvad exit nodes (#505).** Automatic
+  discovery probed Mullvad exit nodes as SSH hosts. Peers tagged
+  `tag:mullvad-exit-node` or under Mullvad's DNS suffix are now excluded
+  before probing, and a resumed setup refreshes an unfinished peer list
+  instead of replaying the unfiltered one (3a48d211).
+- **`cass index --watch-once` sees commits that exist only in a SQLite
+  source's WAL (#502).** With an OpenClaw writer held open and autocheckpoint
+  off, a new message lands only in `openclaw-agent.sqlite-wal`. A targeted
+  watch-once on the database or on its `-wal` compared only the main file's
+  mtime, exited 0 and read nothing. It now checks the WAL too (b4206781).
+- **Codex rollouts above 100 MiB index again when
+  `CASS_CODEX_MAX_SOURCE_BYTES` allows them.** franken-agent-detection 0.3.1
+  capped its rollout reader at 100 MiB regardless of the cass policy. cass
+  now hands the reader its resolved budget (1fc07269). A rollout over the
+  budget is reported as `source-over-read-budget` with its own path and the
+  setting to raise. The previous report blamed the cass data directory and
+  suggested checking permissions (c7c67ef6).
+- **A giant conversation is persisted in bounded slices.** A conversation
+  over 16,384 messages or 32 MiB of content is written as consecutive
+  transactions and lexical updates. It used to be one transaction and one
+  batch, with memory growing with the whole conversation. On a machine
+  already swapping, a 1 GiB Codex rollout's persist outlived the index
+  watchdog (exit 70) (37675c69, fb195d0d, acccf050, 81f14db8).
+- **Index runs on large archives stop dying at startup and at the end.**
+  Counting the conversations touched since the last run joined every message
+  row, content included: 25+ minutes at startup on an 8.3M-message archive,
+  and a watchdog kill (exit 70) after ingest had finished. It now reads a
+  rowid range of the new messages (95b8e91d).
+- **The one-time legacy analytics rebuild no longer loads the whole archive
+  into memory.** An archive writer's point lookups and a table-existence
+  check each made the engine read every page of the file. On a 16 GB archive
+  copy the token-rollup stage went from 17.3 GB to 1.1 GB (3c8b35e9,
+  0871c89d, 15248979, 9c830c01).
+- **`cass status` reports the memory limit the process runs under (#496).**
+  The topology planner read host RAM even under a cgroup limit such as
+  `systemd-run -p MemoryMax=16G`, and sized caches for memory the process
+  could not use. It now uses the same cgroup-aware probes as the indexer
+  (71759163).
+- **Logical archives from v0.9.0 (schema v21) and v20 restore into the
+  current schema again.** Schema v22 (`forgotten_sources`, for `cass forget`)
+  broke `cass archive import --allow-compatible-schema`: the only reviewed
+  bridge was v20 -> v21, so both older versions were refused. The reviewed
+  bridges are now v20 and v21 -> v22. The archive's canonical tables must
+  match the current schema apart from `forgotten_sources`, which is created
+  empty as an in-place upgrade creates it. An old archive that carries that
+  table is refused, and so is a later identical retry onto a destination
+  where it gained rows. Receipts name the mode: `reviewed_v20_to_v22` or
+  `reviewed_v21_to_v22`.
+- **`cass status` no longer calls a retired FTS shadow a pending repair
+  (#495).** Over `CASS_FTS_SHADOW_MAX_MESSAGES`, the SQL-fallback shadow is
+  retired as not viable, and doctor plans nothing more for it. `status`
+  still reported `index.fallback_fts_repair.pending: true`, although its own
+  detail said "settled state, not a pending repair". It now reports
+  `pending: false` with `retired_not_viable: true` and keeps the detail.
+  Other markers (a suspended or budget-stopped shadow repair) still report
+  `pending: true`.
+- **A missing `sqlite3` CLI is named.** The paths that still run the external
+  `sqlite3` tool (duplicate schema-row repair, historical-bundle recovery,
+  FTS metadata scrub) failed with a bare "No such file or directory" on hosts
+  without it. The error now names the missing tool and what needed it
+  (2ed4da16).
+- **FrankenSQLite 0.4.6: a live B-tree page can no longer be freed and handed
+  out again.** Across a WAL generation, the engine could free a page still in
+  use and grant it again, the corruption `integrity_check` reports as `page N
+  is referenced multiple times`. A concurrent schema change could also build
+  an index from a snapshot that missed a peer's rows (e69c1414).
 
 - **Long sessions are searchable past their first 8 MiB.** The lexical
   index capped each conversation's text at 8 MiB in total, so every message
@@ -132,6 +469,38 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `--full` repaired it. The incremental preflight now sees that the canonical
   archive holds fewer conversations than the lexical generation was
   certified against and rebuilds it from the canonical rows.
+
+### Known open at release
+
+- `ann_shards::wal_tests` (3 tests) are still red at this release, as at
+  v0.9.0: the fixtures carry a non-native graph sidecar
+  (`SidecarNotNative`), tracked on 962e8. The module is unchanged since
+  v0.9.0. The rest of the lib suite (7,930 tests) and the gated integration
+  targets (`cli_robot`, `bookmarks_cli`, `search_metamorphic`,
+  `pages_bundle`) and goldens pass at the release commit.
+- `cass index --semantic` reads each conversation whole: 938bf986 lifted the
+  8 MiB per-conversation text cap so lexical indexing covers every message
+  of a long session, and the semantic batch fetch now inherits that. On an
+  archive with a very large conversation (hundreds of MiB of text), a
+  semantic pass holds that whole conversation in memory at once. No data is
+  lost; a bounded semantic fetch is follow-up work.
+- The strict whole-file UBS scan of the files changed since v0.9.0 is still
+  red, as the README's dependency source contract records ("strict UBS gate
+  ... pending"); none of its sampled critical findings is in this release's
+  own changes.
+
+### Dependencies
+
+- `dirs` 6 -> 7 (its only breaking change is Windows `preference_dir`, which
+  cass does not call), plus semver-compatible lockfile updates: bloomfilter
+  3.0.2, clap 4.6.7, clap_complete 4.6.11, flate2 1.1.10, lru 0.18.5, rand
+  0.10.3, rustls 0.23.45, smallvec 1.16.2, thiserror 2.0.21, which 8.0.6,
+  xxhash-rust 0.8.19.
+- Held back on purpose: the SQLite family stays at `=0.4.6` (0.4.7 regresses
+  strict read-only opens; see 0450b116), and FrankenTUI stays at `=0.5.0`
+  (0.7.0 removes `ColorProfile` and the `TerminalCapabilities` color fields
+  the TUI uses, and turns BOCPD resize coalescing on by default; that port is
+  its own change).
 
 ## [v0.9.0] -- 2026-09-25
 
