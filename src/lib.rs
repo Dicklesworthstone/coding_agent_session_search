@@ -31940,9 +31940,7 @@ fn run_cli_search(
     let mut session_paths_timed_out = false;
 
     let mut filters = SearchFilters::default();
-    if !agents.is_empty() {
-        filters.agents = HashSet::from_iter(agents.iter().cloned());
-    }
+    filters.agents = normalize_agent_filters(agents)?.into_iter().collect();
     if !workspaces.is_empty() {
         filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
     }
@@ -33861,6 +33859,7 @@ fn run_cli_pack(
     use crate::sources::provenance::SourceFilter;
 
     let start_time = Instant::now();
+    let normalized_agents = normalize_agent_filters(agents)?;
     let query = query.trim();
     if query.is_empty() {
         return Err(CliError {
@@ -33924,9 +33923,7 @@ fn run_cli_pack(
     }
 
     let mut filters = SearchFilters::default();
-    if !agents.is_empty() {
-        filters.agents = HashSet::from_iter(agents.iter().cloned());
-    }
+    filters.agents = normalized_agents.into_iter().collect();
     if !workspaces.is_empty() {
         filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
     }
@@ -36605,6 +36602,122 @@ fn search_effective_interpretation(
         );
     }
     effective
+}
+
+/// Resolve user-facing agent names to the slugs stored in the archive.
+/// Validate against the connector registry, not this machine's installed agents,
+/// so a valid filter stays valid for remote archives and empty local datasets.
+fn normalize_agent_filters(agents: &[String]) -> CliResult<Vec<String>> {
+    if agents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut known = capabilities_connector_names();
+    // Timeline and imported legacy data use this identity for missing agents.
+    known.push("unknown".to_string());
+    known.sort_unstable();
+    known.dedup();
+
+    let mut resolved = Vec::with_capacity(agents.len());
+    for raw in agents {
+        let key = crate::sources::config::agent_name_key(raw);
+        let candidate = match key.as_str() {
+            "claude" => "claude_code",
+            "oh_my_pi" | "ohmypi" => "omp",
+            "open_claw" => "openclaw",
+            other => other,
+        };
+        let Some(agent) = known
+            .iter()
+            .find(|slug| slug.replace('-', "_") == candidate)
+        else {
+            let suggestion = known
+                .iter()
+                .map(|slug| (slug, strsim::levenshtein(candidate, slug)))
+                .filter(|(_, distance)| !candidate.is_empty() && *distance <= 3)
+                .min_by_key(|(_, distance)| *distance)
+                .map(|(slug, _)| format!("Did you mean '{slug}'? "))
+                .unwrap_or_default();
+            return Err(CliError {
+                code: 2,
+                kind: CliErrorKind::UnknownAgent.kind_str(),
+                message: format!("unknown agent filter {raw:?}"),
+                hint: Some(format!(
+                    "{suggestion}Known agents: {}. Run 'cass capabilities --json' to list connectors.",
+                    known.join(", ")
+                )),
+                retryable: false,
+            });
+        };
+        if !resolved.contains(agent) {
+            resolved.push(agent.clone());
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod agent_filter_tests {
+    use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn agent_filter_aliases_resolve_to_archive_slugs() {
+        let filters = names(&[
+            " Claude-Code ",
+            "claude",
+            "Claude_Code",
+            "CODEX",
+            "pi-agent",
+            "Oh-My-Pi",
+            "ohmypi",
+            "open-claw",
+            "Open_Claw",
+            "UNKNOWN",
+        ]);
+        assert_eq!(
+            normalize_agent_filters(&filters).unwrap(),
+            names(&[
+                "claude_code",
+                "codex",
+                "pi_agent",
+                "omp",
+                "openclaw",
+                "unknown"
+            ])
+        );
+        assert!(normalize_agent_filters(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_filter_every_advertised_connector_round_trips() {
+        for slug in capabilities_connector_names() {
+            let spellings = vec![slug.clone(), slug.to_ascii_uppercase().replace('_', "-")];
+            assert_eq!(normalize_agent_filters(&spellings).unwrap(), vec![slug]);
+        }
+    }
+
+    #[test]
+    fn agent_filter_unknown_values_fail_without_broadening_the_scope() {
+        for filters in [
+            names(&[""]),
+            names(&["  "]),
+            names(&["claud_code"]),
+            names(&["claude_code", "claud_code"]),
+            names(&["claud_code", "codex"]),
+            names(&["未登録"]),
+        ] {
+            let error = normalize_agent_filters(&filters).unwrap_err();
+            assert_eq!(error.code, 2);
+            assert_eq!(error.kind, CliErrorKind::UnknownAgent.kind_str());
+            assert!(!error.retryable);
+            assert!(error.hint.as_deref().unwrap().contains("Known agents:"));
+        }
+        let error = normalize_agent_filters(&names(&["claud_code"])).unwrap_err();
+        assert!(error.hint.as_deref().unwrap().contains("claude_code"));
+    }
 }
 
 /// Which input chose the canonical database path, for `_meta.effective`.
@@ -119326,6 +119439,8 @@ fn run_timeline(
     use chrono::{Local, TimeZone, Utc};
     use std::collections::HashMap;
 
+    let agents = normalize_agent_filters(agents)?;
+
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
@@ -119372,10 +119487,8 @@ fn run_timeline(
     let db_path = analytics_db_path(data_dir, db_override.as_ref());
     let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
-    // LEFT JOIN + COALESCE on agents so timeline reporting doesn't silently
-    // drop legacy conversations with NULL agent_id.  Agent filter becomes
-    // an EXISTS guard against the agents table so it works with the
-    // correlated lookup rather than a joined column.
+    // LEFT JOIN + COALESCE keeps legacy conversations with NULL agent_id.
+    // Filter on the same projected identity so --agent unknown includes them.
     let mut sql = String::from(
         "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, c.title, c.started_at, c.ended_at, c.source_path,
                 0 as message_count, COALESCE(c.source_id, 'local') as source_id, c.origin_host, s.kind as origin_kind
@@ -119388,9 +119501,7 @@ fn run_timeline(
     let mut params: Vec<ParamValue> = vec![start_ts.into(), end_ts.into()];
 
     if !agents.is_empty() {
-        sql.push_str(
-            " AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (",
-        );
+        sql.push_str(" AND COALESCE(a.slug, 'unknown') IN (");
         for (i, agent) in agents.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
@@ -119398,7 +119509,7 @@ fn run_timeline(
             sql.push_str(&format!("?{}", params.len() + 1));
             params.push(agent.clone().into());
         }
-        sql.push_str("))");
+        sql.push(')');
     }
 
     // Source filter (P3.2)

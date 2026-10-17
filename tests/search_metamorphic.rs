@@ -487,6 +487,108 @@ fn agent_filters_keep_exactly_their_sessions() -> TestResult {
     Ok(())
 }
 
+/// GH#532: aliases must preserve both the actual result set and the echoed
+/// effective scope. Repeated aliases cannot turn an agent union into all data.
+#[test]
+fn agent_filter_aliases_preserve_hits_and_effective_scope() -> TestResult {
+    let corpus = corpus();
+    let term = TERMS[0];
+    let all = corpus.with_term(term);
+    let expected: BTreeSet<usize> = all
+        .intersection(&corpus.by_agent("claude_code"))
+        .copied()
+        .collect();
+    assert!(!expected.is_empty() && expected != all);
+    for alias in ["claude", "claude-code", "Claude_Code", " CLAUDE-CODE "] {
+        let (hits, meta) = corpus.search_with_meta(term, &["--agent", alias])?;
+        assert_same(&format!("{term} --agent {alias}"), &hits, &expected)?;
+        assert_eq!(
+            meta["effective"]["filters"]["agents"],
+            json!(["claude_code"])
+        );
+    }
+
+    let (hits, meta) = corpus.search_with_meta(
+        term,
+        &[
+            "--agent",
+            "claude",
+            "--agent",
+            "claude-code",
+            "--agent",
+            "CODEX",
+        ],
+    )?;
+    assert_same("canonicalized agent union", &hits, &all)?;
+    assert_eq!(
+        meta["effective"]["filters"]["agents"],
+        json!(["claude_code", "codex"])
+    );
+    Ok(())
+}
+
+/// An invalid scope must fail before opening or refreshing an archive, even
+/// when the request also includes a valid agent or only asks for a dry run.
+#[test]
+fn agent_filter_typos_fail_before_archive_access_on_all_retrieval_commands() -> TestResult {
+    let root = tempfile::TempDir::new()?;
+    let data_dir = root.path().join("missing-archive");
+    for args in [
+        vec!["search", "kiwiword", "--robot"],
+        vec!["search", "kiwiword", "--robot", "--dry-run"],
+        vec!["pack", "kiwiword", "--robot"],
+        vec!["timeline", "--robot"],
+    ] {
+        for agents in [
+            vec!["claud_code"],
+            vec!["claude_code", "claud_code"],
+            vec!["claud_code", "codex"],
+        ] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_cass"));
+            cmd.current_dir(root.path())
+                .env("HOME", root.path())
+                .env("CASS_DATA_DIR", &data_dir)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env("RUST_LOG", "error")
+                .env_remove("CASS_DB_PATH")
+                .args(&args)
+                .arg("--data-dir")
+                .arg(&data_dir);
+            for agent in &agents {
+                cmd.args(["--agent", agent]);
+            }
+            let output = cmd.output()?;
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{args:?} {agents:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{args:?} {agents:?} emitted a success payload"
+            );
+            let payload: Value = serde_json::from_slice(&output.stderr)?;
+            assert_eq!(payload["error"]["kind"], "unknown-agent");
+            assert_eq!(payload["error"]["code"], 2);
+            assert_eq!(payload["error"]["retryable"], false);
+            assert!(
+                payload["error"]["hint"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("claude_code")
+            );
+            assert!(
+                !data_dir.exists(),
+                "{args:?} {agents:?} created the archive directory"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// README documents NOT > AND > OR precedence and parentheses (2l1b0.52).
 /// The legacy grammar bound OR tighter than AND and read parentheses as word
 /// characters, so the mixed cases here fail on 71759163; they include the

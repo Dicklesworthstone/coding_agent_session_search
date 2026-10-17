@@ -236,13 +236,7 @@ fn scan_source(
         if let Some(id) = &directory_id {
             conversation.external_id.clone_from(id);
         }
-        crate::connectors::codex::layout_identity::deliver(
-            ctx,
-            source,
-            conversation,
-            on_conversation,
-        )
-        .inspect_err(|_| consumer_failed.set(true))
+        on_conversation(conversation).inspect_err(|_| consumer_failed.set(true))
     };
     let mut guarded = SourceScanHooks {
         should_scan_source: Some(&mut before),

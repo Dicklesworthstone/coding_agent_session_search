@@ -204,8 +204,13 @@ fn timeline_agent_and_source_filters_compose_without_dropping_zero_counts() {
     fixture(root.path());
     let cases: Vec<(Vec<&str>, Vec<i64>)> = vec![
         (vec!["--agent", "claude_code"], vec![8, 4, 2]),
+        (vec!["--agent", "claude-code"], vec![8, 4, 2]),
+        (vec!["--agent", "Claude_Code"], vec![8, 4, 2]),
+        (vec!["--agent", "claude"], vec![8, 4, 2]),
         (vec!["--agent", "codex"], vec![5, 10, 3]),
-        (vec!["--agent", "missing"], vec![]),
+        (vec!["--agent", "aider"], vec![]),
+        (vec!["--agent", "unknown"], vec![11, 7]),
+        (vec!["--agent", "unknown", "--source", "local"], vec![7]),
         (vec!["--source", "local"], vec![10, 7, 3, 2]),
         (vec!["--source", "remote"], vec![5, 11, 8, 4]),
         (vec!["--source", "work"], vec![4]),

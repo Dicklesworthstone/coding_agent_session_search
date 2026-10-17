@@ -189,7 +189,11 @@ fn gh521_filters_counts_nulls_and_grouping_preserve_the_timeline_contract() {
     let cases: &[(&[&str], &[i64])] = &[
         (&[], &[7, 10, 6, 5, 4, 3, 2]),
         (&["--agent", "claude_code"], &[7, 5, 4, 2]),
+        (&["--agent", "claude-code"], &[7, 5, 4, 2]),
+        (&["--agent", "Claude_Code"], &[7, 5, 4, 2]),
+        (&["--agent", "claude"], &[7, 5, 4, 2]),
         (&["--agent", "codex"], &[6, 3]),
+        (&["--agent", "unknown"], &[10]),
         (
             &["--agent", "claude_code", "--agent", "codex"],
             &[7, 6, 5, 4, 3, 2],
@@ -200,7 +204,7 @@ fn gh521_filters_counts_nulls_and_grouping_preserve_the_timeline_contract() {
         (&["--source", "user@remote"], &[6]),
         (&["--agent", "claude_code", "--source", "local"], &[7, 4, 2]),
         (&["--agent", "codex", "--source", "backup"], &[]),
-        (&["--agent", "does-not-exist"], &[]),
+        (&["--agent", "aider"], &[]),
     ];
     for grouping in ["none", "hour", "day"] {
         for (flags, expected) in cases {

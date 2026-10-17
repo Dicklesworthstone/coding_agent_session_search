@@ -292,6 +292,10 @@ pub mod vibe;
 /// Constructor function used by the runtime connector registry.
 pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
 
+/// Runtime factories that can retain the receiving archive's state directory.
+pub(crate) type ArchiveConnectorFactory =
+    Box<dyn Fn() -> Box<dyn Connector + Send> + Send + Sync>;
+
 fn claude_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(claude_code::ClaudeCodeConnector::new())
 }
@@ -340,6 +344,27 @@ pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     get_connector_registrations()
         .into_iter()
         .map(|registration| (registration.name, registration.factory))
+        .collect()
+}
+
+/// Bind production connectors to their receiving archive while preserving the
+/// discovery registry and independently injected test factories.
+pub(crate) fn get_connector_factories_for_archive(
+    data_dir: &Path,
+) -> Vec<(&'static str, ArchiveConnectorFactory)> {
+    get_connector_factories()
+        .into_iter()
+        .map(|(name, factory)| {
+            let data_dir = data_dir.to_path_buf();
+            let bound: ArchiveConnectorFactory = Box::new(move || {
+                if name == "codex" {
+                    Box::new(codex::CodexConnector::new().with_archive_data_dir(&data_dir))
+                } else {
+                    factory()
+                }
+            });
+            (name, bound)
+        })
         .collect()
 }
 
