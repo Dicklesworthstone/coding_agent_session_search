@@ -101,6 +101,11 @@
       "found": false
     },
     {
+      "name": "pi_durable",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "prime_agent",
       "path": "(not detected)",
       "found": false

@@ -3,6 +3,10 @@
   "crate_version": "[VERSION]",
   "build_commit": "[BUILD_COMMIT]",
   "build_commit_date": "[BUILD_COMMIT_DATE]",
+  "source_ingest_reuse": {
+    "enabled": true,
+    "disabled_by": null
+  },
   "api_version": 1,
   "contract_version": "1",
   "features": [
@@ -54,6 +58,7 @@
     "factory",
     "openclaw",
     "antigravity",
+    "pi_durable",
     "prime_agent",
     "kimi",
     "kiro",
@@ -338,7 +343,7 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy",
+          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm, external); defaults to semantic policy",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -406,6 +411,18 @@
           "enum_values": [
             "true",
             "false"
+          ]
+        },
+        {
+          "name": "rebuild-profile",
+          "description": "Lexical-rebuild settings preset (GH #483). `bounded` is the single-core, low-memory recipe for a wedged or memory-starved archive: one rebuild worker and one page-prep thread, a one-page pipeline, 64 conversations per fetch and a durable commit every 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still wins over the preset. Applies to any lexical rebuild this run performs (`--full`, or resuming an interrupted rebuild); it never changes what gets indexed. `--json` reports the values used under `rebuild_profile`",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "default",
+          "enum_values": [
+            "default",
+            "bounded"
           ]
         },
         {
@@ -755,7 +772,7 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. `cass models status --json` lists them",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -773,7 +790,7 @@
         },
         {
           "name": "reranker",
-          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "description": "Reranker model to use (requires --rerank). Defaults to `ms-marco`, the only registered reranker",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -3503,6 +3520,134 @@
         }
       ],
       "has_json_output": true
+    },
+    {
+      "name": "serve",
+      "description": "Reuse read-only search readers for a stream of JSON requests. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "arguments": [
+        {
+          "name": "index",
+          "description": "Published lexical index directory, instead of --data-dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Select the compiled lexical index beneath this explicit data directory. Resolves the path only; never opens or repairs the canonical database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "stdio",
+          "description": "Use newline-delimited JSON requests and responses on standard I/O",
+          "arg_type": "flag",
+          "required": true,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "mcp",
+          "description": "Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "db",
+          "description": "Opt in to canonical view requests against this fixed read-only archive. Search, status and startup still never open the database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "reranker-model",
+          "description": "Opt in to candidate-only refinement with this installed local reranker. Never downloads files; ordinary search, startup and status stay model-free",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "semantic-embedder",
+          "description": "Opt in to retained semantic/hybrid retrieval using installed assets. Requires explicit --data-dir and --db; ordinary search stays lexical",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "minilm",
+            "multilingual-minilm",
+            "hash"
+          ]
+        },
+        {
+          "name": "request-timeout-ms",
+          "description": "Whole-request deadline, from first frame byte through response flush. Expiry exits the worker with code 124; idle sessions are not timed out",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "30000"
+        },
+        {
+          "name": "admission-dir",
+          "description": "Shared local control directory for nonblocking cross-process reader admission. Writes only pool metadata; never place this directory inside a search index",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "admission-slots",
+          "description": "Maximum reader-owning processes sharing the same admission directory",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "max-resident-mib",
+          "description": "Terminate this worker with exit 126 when sampled resident memory exceeds this many MiB. Sampling includes idle readers; it is not a kernel-enforced allocation limit",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "4096"
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "archive",
+      "description": "Export, verify or restore a bounded, versioned logical canonical archive",
+      "arguments": [
+        {
+          "name": "db",
+          "description": "Existing canonical archive. Export never creates or repairs this file",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Explicit canonical archive directory (also accepts CASS_DATA_DIR)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Receipts are JSON regardless of this compatibility flag",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "exit_codes": [
@@ -3783,6 +3928,11 @@
       "name": "CASS_DEFER_ANALYTICS_UPDATES",
       "default": "0",
       "description": "Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset."
+    },
+    {
+      "name": "CASS_RAW_MIRROR",
+      "default": "1",
+      "description": "Raw-mirror capture of session source files. Set 0, false, no or off to stop copying sources whose provider keeps its own history; existing captures stay until `cass mirror prune`, indexing is unaffected, and doctor reports raw_mirror_capture_disabled because a file its provider deletes then survives only in the archive DB."
     },
     {
       "name": "CASS_AUTO_REFRESH",

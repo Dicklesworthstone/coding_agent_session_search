@@ -1327,6 +1327,47 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
         source_path
     );
     assert_eq!(citation["verified"], true);
+
+    // GH #507: pack selects evidence lexically. A default (hybrid-preferred)
+    // request reports that fallback with its cause; an explicit lexical
+    // request is not a fallback at all.
+    let warnings: Vec<&str> = json["_meta"]["warnings"]
+        .as_array()
+        .expect("pack warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let realized = &json["realized"];
+    if extra_args
+        .windows(2)
+        .any(|pair| pair == ["--mode", "lexical"])
+    {
+        assert_eq!(realized["search_mode"], "lexical", "{json}");
+        assert!(realized["fallback_mode"].is_null(), "{json}");
+        assert!(realized["fallback_reason"].is_null(), "{json}");
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.starts_with("semantic_fallback")),
+            "{json}"
+        );
+    } else {
+        assert_eq!(realized["fallback_mode"], "lexical", "{json}");
+        assert_eq!(
+            realized["fallback_reason"], "pack_enrichment_unavailable",
+            "{json}"
+        );
+        assert!(warnings.contains(&"semantic_fallback_lexical"), "{json}");
+        assert!(
+            !warnings.contains(&"semantic_fallback_reason_unreported"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn pack_explicit_lexical_mode_is_not_reported_as_a_fallback() {
+    assert_pack_command_returns_evidence("pack", &["--mode", "lexical"]);
 }
 
 #[test]
@@ -3736,9 +3777,13 @@ fn introspect_commands_match_clap_subcommands() {
             .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
             .collect();
 
+        // The binary also registers the two subcommands it dispatches before
+        // the main CLI parses (src/main.rs).
+        let mut expected = clap_commands;
+        expected.extend(["serve".to_string(), "archive".to_string()]);
         assert_eq!(
-            clap_commands, introspect_commands,
-            "introspect should list exactly the Clap subcommands"
+            expected, introspect_commands,
+            "introspect should list exactly the Clap subcommands plus serve and archive"
         );
 
         // Ensure no help/version pseudo-args leak into schemas
@@ -3751,6 +3796,82 @@ fn introspect_commands_match_clap_subcommands() {
                 "help/version flags should be hidden in introspect"
             );
         }
+    });
+}
+
+/// coding_agent_session_search-8fr1g: the binary parses `serve` and `archive`
+/// before the main CLI, so help, capabilities, introspect and robot-docs never
+/// listed them. They now come from their real parsers, with real arguments.
+#[test]
+fn binary_dispatched_serve_and_archive_are_discoverable() {
+    run_on_large_stack(|| {
+        let introspect = fetch_introspect_json();
+        let serve = find_command(&introspect, "serve");
+        for arg in ["index", "data-dir", "stdio"] {
+            find_arg(serve, arg);
+        }
+        let archive = find_command(&introspect, "archive");
+        // --db, --data-dir and --json are globals on the archive parser's root.
+        for arg in ["db", "data-dir", "json"] {
+            find_arg(archive, arg);
+        }
+        assert_eq!(archive["has_json_output"], true, "{archive}");
+        // Their own parsers reject the main CLI's global --robot-format, so
+        // the schemas must not offer it.
+        for command in [serve, archive] {
+            assert!(
+                command["arguments"]
+                    .as_array()
+                    .expect("arguments")
+                    .iter()
+                    .all(|arg| arg["name"] != "robot-format"),
+                "{command}"
+            );
+        }
+
+        let stdout = |args: &[&str]| -> String {
+            let mut cmd = base_cmd();
+            cmd.args(args);
+            String::from_utf8_lossy(&cmd.assert().success().get_output().stdout).into_owned()
+        };
+        let capabilities: Value =
+            serde_json::from_str(stdout(&["capabilities", "--json"]).trim()).expect("JSON");
+        let names: HashSet<&str> = capabilities["commands"]
+            .as_array()
+            .expect("commands array")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(
+            names.contains("serve") && names.contains("archive"),
+            "{names:?}"
+        );
+
+        let help = stdout(&["--help"]);
+        for name in ["serve", "archive"] {
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{name} "))),
+                "--help must list {name}:\n{help}"
+            );
+        }
+        // `cass help <name>` reaches the main CLI, which alone does not know them.
+        for name in ["serve", "archive"] {
+            let help = stdout(&["help", name]);
+            assert!(help.contains(&format!("cass {name}")), "{help}");
+        }
+        // clap_complete's bash script routes each subcommand with a
+        // `<parent>,<name>)` case label.
+        let completions = stdout(&["completions", "bash"]);
+        assert!(
+            completions.contains("cass,serve)") && completions.contains("cass,archive)"),
+            "bash completions must offer serve and archive"
+        );
+        let docs = stdout(&["robot-docs", "commands"]);
+        assert!(
+            docs.contains("cass serve --stdio") && docs.contains("cass archive export"),
+            "{docs}"
+        );
     });
 }
 
@@ -5779,14 +5900,15 @@ fn pack_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
     assert_eq!(effective["query"], "hello OR world tool");
     assert_eq!(effective["query_structure"], "hello OR (world AND tool)");
     assert_eq!(effective["query_recoveries"], serde_json::json!([]));
-    assert_eq!(
-        effective["db_path"].as_str(),
-        Some(
-            Path::new(data_dir)
-                .join("agent_search.db")
-                .to_str()
-                .ok_or("non-utf8 path")?
-        )
+    // Pack redacts private paths in `_meta.effective` like the rest of its
+    // envelope, so a temp dir under a home directory is echoed redacted.
+    let db_path = Path::new(data_dir).join("agent_search.db");
+    let db_path = db_path.to_str().ok_or("non-utf8 path")?;
+    let echoed = effective["db_path"].as_str().ok_or("db_path missing")?;
+    assert!(
+        echoed == db_path
+            || (echoed.contains("[REDACTED_PATH]") && echoed.ends_with("agent_search.db")),
+        "db_path is the data dir's database, verbatim or redacted: {effective}"
     );
     assert_eq!(effective["db_path_source"], "--data-dir");
     // 2026-01-01T00:00:00Z.
@@ -6561,9 +6683,14 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         return Err(format!("mkfifo failed with status {mkfifo:?}").into());
     }
 
+    // Nothing writes the FIFO, so a pack that waits on it never exits and the
+    // harness kills it at this timeout (a failed status below). The timeout
+    // is deliberately generous: it also covers process launch, which pack
+    // cannot control and which stalled for seconds in dyld on a macOS host
+    // (bead d32jo). Pack's own bound is checked on its budget clock instead.
     let started = std::time::Instant::now();
     let output = base_cmd()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(30))
         .args([
             "pack",
             "hello",
@@ -6578,12 +6705,10 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
         .args(["--data-dir"])
         .arg(data_dir.path())
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack waited for the blocking sessions FIFO".into());
-    }
+    let wall = started.elapsed();
     if !output.status.success() {
         return Err(format!(
-            "FIFO-scoped pack failed: status={:?}; stderr={}",
+            "FIFO-scoped pack failed (a kill at the harness timeout means pack waited for the blocking sessions FIFO): status={:?}; wall={wall:?}; stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         )
@@ -6592,6 +6717,15 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
 
     let payload: Value = serde_json::from_slice(&output.stdout)?;
     let budget = &payload["budget"];
+    let pack_elapsed_ms = budget["elapsed_ms"]
+        .as_u64()
+        .ok_or_else(|| format!("pack FIFO budget omitted elapsed_ms: {budget}"))?;
+    if pack_elapsed_ms >= 1_500 {
+        return Err(format!(
+            "pack waited for the blocking sessions FIFO: budget.elapsed_ms={pack_elapsed_ms} for a 120 ms budget (wall={wall:?})"
+        )
+        .into());
+    }
     let skipped = budget["skipped_sections"]
         .as_array()
         .ok_or("pack FIFO skipped_sections is not an array")?;
@@ -7322,18 +7456,20 @@ fn introspect_matches_golden_contract_structure() {
             .iter()
             .filter_map(|c| c["name"].as_str())
             .collect();
+        // Plus the two subcommands the binary dispatches itself (src/main.rs).
         let clap_cmd = Cli::command();
-        let expected_cmd_names: HashSet<_> = clap_cmd
+        let mut expected_cmd_names: HashSet<_> = clap_cmd
             .get_subcommands()
             .map(|command| command.get_name().to_string())
             .collect();
+        expected_cmd_names.extend(["serve".to_string(), "archive".to_string()]);
         assert_eq!(
             actual_cmd_names,
             expected_cmd_names
                 .iter()
                 .map(String::as_str)
                 .collect::<HashSet<_>>(),
-            "command names should match clap"
+            "command names should match clap plus serve and archive"
         );
     });
 }
@@ -9413,4 +9549,43 @@ fn workspace_filtered_empty_search_explains_the_filter() {
         unrelated["zero_result_diagnosis"]["diagnosis"], "workspace_not_indexed",
         "{unrelated}"
     );
+}
+
+/// A page past the last match of a correctly filtered search is empty, but the
+/// search is not: it carries no `zero_result_diagnosis`, which used to claim
+/// the workspace had no match next to a nonzero `total_matches`.
+#[test]
+fn workspace_filtered_search_past_its_last_page_is_not_diagnosed() {
+    const INDEXED: &str = "/data/projects/coding_agent_session_search";
+    let data_dir = shared_search_demo_data();
+    let out = base_cmd()
+        .args([
+            "search",
+            "hello",
+            "--json",
+            "--limit",
+            "3",
+            "--offset",
+            "1000",
+            "--workspace",
+            INDEXED,
+            "--data-dir",
+            data_dir,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let page: Value = serde_json::from_slice(&out.stdout).expect("search JSON");
+    assert!(
+        page["hits"].as_array().expect("hits array").is_empty(),
+        "{page}"
+    );
+    assert!(
+        page["total_matches"]
+            .as_u64()
+            .is_some_and(|total| total > 0),
+        "{page}"
+    );
+    assert!(page.get("zero_result_diagnosis").is_none(), "{page}");
 }

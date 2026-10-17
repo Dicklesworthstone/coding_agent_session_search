@@ -63,6 +63,9 @@ commands:
                     Tune with --progress-interval-ms N (250..60000, default 2000),
                     disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.
                     Add --robot-trace-ingest for per-batch wall_ms, batch_msgs, and duplicate-lookup counters on stderr.
+                    Add --rebuild-profile bounded for a single-core, low-memory lexical rebuild of a wedged or
+                    memory-starved archive; explicit CASS_TANTIVY_REBUILD_* values still win, and --json
+                    reports the values used under rebuild_profile.
                     From another shell: `cass status --json` shows live progress.
   cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]
   cass capabilities [--json]   First-stop self-description: workflows, mistake recoveries, commands, flags, exit codes, env vars, limits.
@@ -71,6 +74,12 @@ commands:
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
     --binary-only     Report the same archive-readiness verdict but exit 0 unless the executable itself fails; use selftest to avoid archive access.
   cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.
+  cass serve --stdio (--index DIR | --data-dir DIR) [--mcp]
+                    Keep read-only search readers open for a stream of JSON requests: repeated queries skip
+                    reopening and re-verifying the index (docs/SEARCH_SERVICE.md). Semantic search is opt-in.
+  cass archive export|verify|search|view|import [--json]
+                    Logical canonical backup as private JSONL: export a snapshot, verify it without a DB,
+                    search or view its bodies, or restore into a NEW database (docs/LOGICAL_ARCHIVE.md).
   cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.
                     doctor JSON includes source_inventory; missing upstream provider files are
                     source coverage/prune-risk warnings, not proof that archived cass rows are lost.

@@ -711,7 +711,7 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy",
+          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm, external); defaults to semantic policy",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -779,6 +779,18 @@
           "enum_values": [
             "true",
             "false"
+          ]
+        },
+        {
+          "name": "rebuild-profile",
+          "description": "Lexical-rebuild settings preset (GH #483). `bounded` is the single-core, low-memory recipe for a wedged or memory-starved archive: one rebuild worker and one page-prep thread, a one-page pipeline, 64 conversations per fetch and a durable commit every 64 MiB of text. An explicit CASS_TANTIVY_REBUILD_* value still wins over the preset. Applies to any lexical rebuild this run performs (`--full`, or resuming an interrupted rebuild); it never changes what gets indexed. `--json` reports the values used under `rebuild_profile`",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "default",
+          "enum_values": [
+            "default",
+            "bounded"
           ]
         },
         {
@@ -1128,7 +1140,7 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. `cass models status --json` lists them",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -1146,7 +1158,7 @@
         },
         {
           "name": "reranker",
-          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "description": "Reranker model to use (requires --rerank). Defaults to `ms-marco`, the only registered reranker",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -3876,6 +3888,134 @@
         }
       ],
       "has_json_output": true
+    },
+    {
+      "name": "serve",
+      "description": "Reuse read-only search readers for a stream of JSON requests. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "arguments": [
+        {
+          "name": "index",
+          "description": "Published lexical index directory, instead of --data-dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Select the compiled lexical index beneath this explicit data directory. Resolves the path only; never opens or repairs the canonical database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "stdio",
+          "description": "Use newline-delimited JSON requests and responses on standard I/O",
+          "arg_type": "flag",
+          "required": true,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "mcp",
+          "description": "Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "db",
+          "description": "Opt in to canonical view requests against this fixed read-only archive. Search, status and startup still never open the database",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "reranker-model",
+          "description": "Opt in to candidate-only refinement with this installed local reranker. Never downloads files; ordinary search, startup and status stay model-free",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "semantic-embedder",
+          "description": "Opt in to retained semantic/hybrid retrieval using installed assets. Requires explicit --data-dir and --db; ordinary search stays lexical",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "minilm",
+            "multilingual-minilm",
+            "hash"
+          ]
+        },
+        {
+          "name": "request-timeout-ms",
+          "description": "Whole-request deadline, from first frame byte through response flush. Expiry exits the worker with code 124; idle sessions are not timed out",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "30000"
+        },
+        {
+          "name": "admission-dir",
+          "description": "Shared local control directory for nonblocking cross-process reader admission. Writes only pool metadata; never place this directory inside a search index",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "admission-slots",
+          "description": "Maximum reader-owning processes sharing the same admission directory",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "max-resident-mib",
+          "description": "Terminate this worker with exit 126 when sampled resident memory exceeds this many MiB. Sampling includes idle readers; it is not a kernel-enforced allocation limit",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "4096"
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "archive",
+      "description": "Export, verify or restore a bounded, versioned logical canonical archive",
+      "arguments": [
+        {
+          "name": "db",
+          "description": "Existing canonical archive. Export never creates or repairs this file",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Explicit canonical archive directory (also accepts CASS_DATA_DIR)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Receipts are JSON regardless of this compatibility flag",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "response_schemas": {
@@ -4269,6 +4409,20 @@
         },
         "build_commit_date": {
           "type": "string"
+        },
+        "source_ingest_reuse": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "disabled_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
         },
         "api_version": {
           "type": "integer"
@@ -8286,6 +8440,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -19646,7 +19804,7 @@
         },
         "archive_coverage_state": {
           "type": "string",
-          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
         },
         "source_mirror_state": {
           "type": "string",
@@ -27557,7 +27715,7 @@
         },
         "archive_coverage_state": {
           "type": "string",
-          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
         },
         "source_mirror_state": {
           "type": "string",
@@ -28971,7 +29129,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -29267,6 +29425,10 @@
             "sole_copy_warning_count": {
               "type": "integer"
             },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
+            },
             "recommended_action": {
               "type": "string"
             }
@@ -29342,6 +29504,9 @@
               "type": "string"
             },
             "quarantined_conversations": {
+              "type": "integer"
+            },
+            "deferred_conversations": {
               "type": "integer"
             },
             "recent_quarantined_conversations": {
@@ -29839,6 +30004,30 @@
                   "type": "object",
                   "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                   "additionalProperties": true
+                },
+                "expected_docs_scan": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                  "properties": {
+                    "last_conversation_id": {
+                      "type": "integer"
+                    },
+                    "max_conversation_id": {
+                      "type": "integer"
+                    },
+                    "expected_docs_so_far": {
+                      "type": "integer"
+                    },
+                    "saved_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
                 }
               }
             },
@@ -30153,6 +30342,9 @@
                   "type": "string"
                 },
                 "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "deferred_conversations": {
                   "type": "integer"
                 },
                 "recent_quarantined_conversations": {
@@ -30497,6 +30689,66 @@
         "indexing_stats": {
           "type": "object",
           "additionalProperties": true
+        },
+        "rebuild_profile": {
+          "type": "object",
+          "description": "--rebuild-profile echo (GH #483): the selected preset, where each of its knobs came from, and the lexical-rebuild settings this process would use after the responsiveness governor at report time",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "default | bounded"
+            },
+            "settings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "env": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "integer"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "profile, or env when an explicit environment value overrides the preset"
+                  }
+                }
+              }
+            },
+            "effective": {
+              "type": "object",
+              "properties": {
+                "workers": {
+                  "type": "integer"
+                },
+                "page_prep_workers": {
+                  "type": "integer"
+                },
+                "staged_shard_builders": {
+                  "type": "integer"
+                },
+                "staged_merge_workers": {
+                  "type": "integer"
+                },
+                "tantivy_writer_threads": {
+                  "type": "integer"
+                },
+                "pipeline_channel_size": {
+                  "type": "integer"
+                },
+                "steady_batch_fetch_conversations": {
+                  "type": "integer"
+                },
+                "steady_commit_every_message_bytes": {
+                  "type": "integer"
+                },
+                "pipeline_max_message_bytes_in_flight": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
         },
         "error": {
           "type": [
@@ -31197,6 +31449,13 @@
                 "string",
                 "null"
               ]
+            },
+            "fallback_reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason; pack_enrichment_unavailable means pack itself selects evidence lexically). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
             },
             "semantic_joined": {
               "type": "boolean"
@@ -32626,6 +32885,30 @@
                       "type": "object",
                       "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                       "additionalProperties": true
+                    },
+                    "expected_docs_scan": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                      "properties": {
+                        "last_conversation_id": {
+                          "type": "integer"
+                        },
+                        "max_conversation_id": {
+                          "type": "integer"
+                        },
+                        "expected_docs_so_far": {
+                          "type": "integer"
+                        },
+                        "saved_at": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      }
                     }
                   }
                 },
@@ -32940,6 +33223,9 @@
                       "type": "string"
                     },
                     "quarantined_conversations": {
+                      "type": "integer"
+                    },
+                    "deferred_conversations": {
                       "type": "integer"
                     },
                     "recent_quarantined_conversations": {
@@ -33878,6 +34164,30 @@
               "type": "object",
               "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
               "additionalProperties": true
+            },
+            "expected_docs_scan": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+              "properties": {
+                "last_conversation_id": {
+                  "type": "integer"
+                },
+                "max_conversation_id": {
+                  "type": "integer"
+                },
+                "expected_docs_so_far": {
+                  "type": "integer"
+                },
+                "saved_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
             }
           }
         },
@@ -34328,6 +34638,9 @@
             "quarantined_conversations": {
               "type": "integer"
             },
+            "deferred_conversations": {
+              "type": "integer"
+            },
             "recent_quarantined_conversations": {
               "type": "integer"
             },
@@ -34460,13 +34773,28 @@
                   "type": [
                     "integer",
                     "null"
-                  ]
+                  ],
+                  "description": "Memory budgets are sized from: the host total clamped to the tightest cgroup limit on this process's chain"
                 },
                 "memory_available_bytes": {
                   "type": [
                     "integer",
                     "null"
                   ]
+                },
+                "host_memory_total_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "description": "The host's own total before any cgroup limit"
+                },
+                "memory_limit_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "What set memory_total_bytes: host, or cgroup_v2:/<path> / cgroup_v1:/<path> for the level whose limit is below the host total"
                 }
               }
             },
@@ -34918,7 +35246,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -35213,6 +35541,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -35973,6 +36305,30 @@
               "type": "object",
               "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
               "additionalProperties": true
+            },
+            "expected_docs_scan": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+              "properties": {
+                "last_conversation_id": {
+                  "type": "integer"
+                },
+                "max_conversation_id": {
+                  "type": "integer"
+                },
+                "expected_docs_so_far": {
+                  "type": "integer"
+                },
+                "saved_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
             }
           }
         },
@@ -36423,6 +36779,9 @@
             "quarantined_conversations": {
               "type": "integer"
             },
+            "deferred_conversations": {
+              "type": "integer"
+            },
             "recent_quarantined_conversations": {
               "type": "integer"
             },
@@ -36555,13 +36914,28 @@
                   "type": [
                     "integer",
                     "null"
-                  ]
+                  ],
+                  "description": "Memory budgets are sized from: the host total clamped to the tightest cgroup limit on this process's chain"
                 },
                 "memory_available_bytes": {
                   "type": [
                     "integer",
                     "null"
                   ]
+                },
+                "host_memory_total_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "description": "The host's own total before any cgroup limit"
+                },
+                "memory_limit_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "What set memory_total_bytes: host, or cgroup_v2:/<path> / cgroup_v1:/<path> for the level whose limit is below the host total"
                 }
               }
             },
@@ -37017,7 +37391,7 @@
             },
             "archive_coverage_state": {
               "type": "string",
-              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_capture_disabled (CASS_RAW_MIRROR is off), raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
             },
             "source_mirror_state": {
               "type": "string",
@@ -37312,6 +37686,10 @@
             },
             "sole_copy_warning_count": {
               "type": "integer"
+            },
+            "raw_mirror_capture_disabled": {
+              "type": "boolean",
+              "description": "CASS_RAW_MIRROR turned raw capture off: new session files are not copied into the raw mirror, so archive rows without a raw copy are expected and a file its provider deletes survives only in the archive DB."
             },
             "recommended_action": {
               "type": "string"
@@ -38079,6 +38457,30 @@
                   "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                   "additionalProperties": true
                 },
+                "expected_docs_scan": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Saved position of a running or interrupted full expected-docs scan; the next index run resumes it when the archive is unchanged or only grew.",
+                  "properties": {
+                    "last_conversation_id": {
+                      "type": "integer"
+                    },
+                    "max_conversation_id": {
+                      "type": "integer"
+                    },
+                    "expected_docs_so_far": {
+                      "type": "integer"
+                    },
+                    "saved_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
                 "inspected": {
                   "type": "boolean"
                 }
@@ -38535,6 +38937,9 @@
                   "type": "string"
                 },
                 "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "deferred_conversations": {
                   "type": "integer"
                 },
                 "recent_quarantined_conversations": {

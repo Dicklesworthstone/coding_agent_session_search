@@ -367,13 +367,13 @@ fn search_on_uninitialized_data_dir_fails_closed() -> Result<(), String> {
 }
 
 /// Test-isolation leak guard: with an isolated HOME/XDG and NO `--data-dir`
-/// and NO `CASS_DATA_DIR`, the resolved data dir must fall under the fake
+/// and NO `CASS_DATA_DIR`, the resolved data dir must fall under the temporary
 /// HOME, never the operator's real home — otherwise a "default" run would
 /// scan the real ~500k-session corpus. `default_data_dir()` echoes the literal
 /// `XDG_DATA_HOME` we set, so a lexical prefix check is exact here.
 #[test]
 #[serial]
-fn isolated_default_resolution_stays_under_fake_home() -> Result<(), String> {
+fn isolated_default_resolution_stays_under_temp_home() -> Result<(), String> {
     let home = temp_data_dir("15_6_iso_home");
     let mut cmd = isolated_cass(&home)?;
     cmd.arg("health").arg("--json");

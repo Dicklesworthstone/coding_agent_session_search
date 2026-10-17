@@ -2797,6 +2797,233 @@ fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget()
     }
 }
 
+/// GH #483: `cass index --full --rebuild-profile bounded` runs the documented
+/// single-core, low-memory rebuild on a skewed corpus (one long conversation
+/// ahead of many small ones), indexes every message, reports the settings it
+/// used and where each came from, and leaves both kinds of conversation
+/// searchable. An explicit `CASS_TANTIVY_REBUILD_*` value still beats the
+/// preset; the default run reports no preset values; an unknown preset is a
+/// usage error.
+///
+/// No-claim: this proves the preset reaches the live rebuild on a tiny
+/// corpus. It does not measure peak RSS or wall time on the reporter's 504K
+/// message archive, and resume after SIGTERM is the source-ledger's contract.
+#[test]
+#[serial]
+fn gh483_bounded_rebuild_profile_indexes_a_skewed_corpus_and_reports_its_settings() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let codex_root = data_dir.join(".codex").join("sessions");
+    fs::create_dir_all(&codex_root).unwrap();
+
+    let write_session = |name: &str, session_id: &str, turns: &[(String, String)]| {
+        let mut sample = serde_json::to_string(&serde_json::json!({
+            "timestamp": "2025-09-30T15:42:34.559Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": "/test/workspace", "cli_version": "0.42.0"}
+        }))
+        .unwrap();
+        sample.push('\n');
+        for (user, assistant) in turns {
+            for (role, kind, text) in [
+                ("user", "input_text", user),
+                ("assistant", "text", assistant),
+            ] {
+                sample.push_str(
+                    &serde_json::to_string(&serde_json::json!({
+                        "timestamp": "2025-09-30T15:42:36.190Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": role,
+                            "content": [{"type": kind, "text": text}]
+                        }
+                    }))
+                    .unwrap(),
+                );
+                sample.push('\n');
+            }
+        }
+        fs::write(codex_root.join(name), sample).unwrap();
+    };
+    let giant_turns: Vec<(String, String)> = (0..600)
+        .map(|turn| {
+            (
+                format!("gh483 giant question {turn} about the wedged archive"),
+                format!("gh483 giant answer {turn}"),
+            )
+        })
+        .chain(std::iter::once((
+            "gh483 giant late needle".to_string(),
+            "gh483 giant closing answer".to_string(),
+        )))
+        .collect();
+    write_session("rollout-giant.jsonl", "gh483-giant", &giant_turns);
+    for small in 0..40 {
+        write_session(
+            &format!("rollout-small-{small:02}.jsonl"),
+            &format!("gh483-small-{small:02}"),
+            &[(
+                format!("gh483 small marker {small:02}"),
+                format!("gh483 small reply {small:02}"),
+            )],
+        );
+    }
+    let expected_messages = 2 * giant_turns.len() + 2 * 40;
+
+    let index = |extra_env: &[(&str, &str)], profile: Option<&str>| {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.env("CODEX_HOME", data_dir.join(".codex"));
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.args([
+            "index",
+            "--full",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--json",
+            "--no-progress-events",
+        ]);
+        if let Some(profile) = profile {
+            cmd.args(["--rebuild-profile", profile]);
+        }
+        let output = cmd
+            .timeout(std::time::Duration::from_secs(600))
+            .output()
+            .expect("run cass index");
+        assert!(
+            output.status.success(),
+            "index --full {profile:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("index json")
+    };
+    let settings_by_env = |report: &serde_json::Value| {
+        report["rebuild_profile"]["settings"]
+            .as_array()
+            .expect("settings array")
+            .iter()
+            .map(|setting| {
+                (
+                    setting["env"].as_str().unwrap().to_string(),
+                    (
+                        setting["value"].as_u64().unwrap(),
+                        setting["source"].clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    let bounded = index(&[], Some("bounded"));
+    assert_eq!(bounded["conversations"], 41, "{bounded}");
+    assert_eq!(bounded["messages"], expected_messages, "{bounded}");
+    let profile = &bounded["rebuild_profile"];
+    assert_eq!(profile["name"], "bounded");
+    let settings = settings_by_env(&bounded);
+    assert_eq!(settings.len(), 5, "{profile}");
+    for (env, expected) in [
+        ("CASS_TANTIVY_REBUILD_WORKERS", 1),
+        ("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", 1),
+        ("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", 1),
+        ("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", 64),
+        ("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", 64 << 20),
+    ] {
+        assert_eq!(
+            settings.get(env),
+            Some(&(expected, serde_json::json!("profile"))),
+            "{env}: {profile}"
+        );
+    }
+    let effective = &profile["effective"];
+    assert_eq!(effective["workers"], 1, "{profile}");
+    assert_eq!(effective["page_prep_workers"], 1, "{profile}");
+    assert_eq!(effective["staged_merge_workers"], 1, "{profile}");
+    assert_eq!(effective["pipeline_channel_size"], 1, "{profile}");
+    assert_eq!(
+        effective["steady_batch_fetch_conversations"], 64,
+        "{profile}"
+    );
+    assert_eq!(
+        effective["steady_commit_every_message_bytes"],
+        64 << 20,
+        "{profile}"
+    );
+
+    for needle in ["gh483 giant late needle", "gh483 small marker 37"] {
+        let output = base_cmd(tmp.path())
+            .env("CODEX_HOME", data_dir.join(".codex"))
+            .args([
+                "search",
+                needle,
+                "--json",
+                "--mode",
+                "lexical",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run cass search");
+        assert!(
+            output.status.success(),
+            "search {needle:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hits = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .expect("search json")["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            hits.iter().any(|hit| hit["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(needle))),
+            "no hit for {needle:?} after the bounded rebuild: {hits:?}"
+        );
+    }
+
+    // An explicit operator value beats the preset, and says so.
+    let overridden = index(&[("CASS_TANTIVY_REBUILD_WORKERS", "2")], Some("bounded"));
+    assert_eq!(overridden["messages"], expected_messages);
+    let settings = settings_by_env(&overridden);
+    assert_eq!(
+        settings.get("CASS_TANTIVY_REBUILD_WORKERS"),
+        Some(&(2, serde_json::json!("env")))
+    );
+    assert_eq!(
+        settings.get("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE"),
+        Some(&(1, serde_json::json!("profile")))
+    );
+    assert_eq!(overridden["rebuild_profile"]["effective"]["workers"], 2);
+
+    // Without the flag nothing is preset.
+    let default = index(&[], None);
+    assert_eq!(default["messages"], expected_messages);
+    assert_eq!(default["rebuild_profile"]["name"], "default");
+    assert_eq!(
+        default["rebuild_profile"]["settings"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        default["rebuild_profile"]["effective"]["pipeline_channel_size"],
+        4
+    );
+
+    base_cmd(tmp.path())
+        .args([
+            "index",
+            "--full",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--json",
+            "--rebuild-profile",
+            "tiny",
+        ])
+        .assert()
+        .code(2);
+}
+
 /// GH #439 / WS-B.2c: the post-publish fallback-FTS repair runs after the
 /// lexical generation is published, in phase 0, and used to emit no liveness
 /// signal — so the stall watchdog killed healthy `cass index --full` runs on
@@ -3734,9 +3961,16 @@ fn assert_gh413_fts_shadow_bound(legacy_checkpoint: bool) {
         .expect("status after the drop");
     let status_json: serde_json::Value =
         serde_json::from_slice(&status.stdout).expect("status --json output is JSON");
+    // GH #495: the drop over the bound is a settled retirement. Status keeps
+    // the reason but does not report it as a pending repair.
     let pending = &status_json["index"]["fallback_fts_repair"];
     assert_eq!(
         pending["pending"],
+        serde_json::json!(false),
+        "a retired shadow is not a pending repair: {status_json}"
+    );
+    assert_eq!(
+        pending["retired_not_viable"],
         serde_json::json!(true),
         "status must carry the dropped-shadow marker: {status_json}"
     );
@@ -3888,16 +4122,13 @@ fn gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats() {
     );
 }
 
-/// GH #382 / g3zyo: the index run's final `wal_checkpoint(TRUNCATE)` is bounded.
-/// On an archive whose frankensqlite writable path loops, that checkpoint never
-/// returned and every run hung after a successful publish. Positive observable:
-/// with the checkpoint parked past a 1 s budget the run still exits 0 within
-/// seconds and leaves the WAL sidecar in place (non-empty) for the next opener;
-/// a plain `cass index` afterwards, unparked, truncates it. Planted negative:
-/// the unparked run truncating the sidecar is what proves the parked run really
-/// skipped the checkpoint rather than never issuing one. No-claim: this proves
-/// the bound, not that the engine no longer loops (that is frankensqlite
-/// 8d012706a, consumed with its release).
+/// GH #382 / #515: final checkpoint timeout must end the process that still
+/// owns the writable operation. Returning success used to detach its thread
+/// and release maintenance admission while that writer could continue. The
+/// same 1 s budget now exits 70 with a checkpoint-timeout diagnostic; durable
+/// messages remain intact and a separate unparked index can recover immediately.
+/// This deliberately changes the old timeout-success contract. A successful
+/// checkpoint still exits 0 and truncates the WAL as before.
 #[test]
 fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let tmp = TempDir::new().unwrap();
@@ -3905,6 +4136,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     seed_fts_liveness_sessions(home);
+    let db_path = data_dir.join("agent_search.db");
     let wal_path = data_dir.join("agent_search.db-wal");
 
     let started = std::time::Instant::now();
@@ -3919,6 +4151,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
         ])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Discrimination by wall clock: a full run of this fixture takes up
         // to ~30 s on a loaded debug-build fleet worker, so the park is 60 s
         // against a 1 s budget — a run that waited for the parked checkpoint
@@ -3931,12 +4164,62 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let elapsed = started.elapsed();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "a final checkpoint that outlives its budget must not fail the run (GH #382); \
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "a timed-out checkpoint must terminate its writer before releasing admission; \
          status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
+    let timeout = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|value| value["kind"] == "wal-checkpoint-timeout")
+        .unwrap_or_else(|| panic!("no checkpoint-timeout envelope on stderr:\n{stderr}"));
+    assert_eq!(timeout["success"], false, "{timeout}");
+    assert_eq!(timeout["code"], 70, "{timeout}");
+    assert_eq!(timeout["retryable"], true, "{timeout}");
+    assert_eq!(timeout["context"], "index run", "{timeout}");
+    assert_eq!(timeout["deadline_ms"], 1_000, "{timeout}");
+    assert!(
+        !coding_agent_search::search::asset_state::read_search_maintenance_snapshot(&data_dir)
+            .active,
+        "a reaped checkpoint owner must not retain active indexing admission"
+    );
+    let archive_contents = || {
+        use coding_agent_search::franken_sync::compat::{
+            ConnectionExt, OpenFlags, RowExt, open_with_flags,
+        };
+
+        let connection =
+            open_with_flags(&db_path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("strictly read the durable archive after checkpoint process exit");
+        let messages = connection
+            .query_map_collect(
+                "SELECT content FROM messages ORDER BY content",
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .expect("canonical messages");
+        for row in connection.query("PRAGMA integrity_check").unwrap() {
+            assert_eq!(row.get_typed::<String>(0).unwrap(), "ok");
+        }
+        assert!(
+            connection
+                .query("PRAGMA foreign_key_check")
+                .unwrap()
+                .is_empty()
+        );
+        connection.close_without_checkpoint().unwrap();
+        messages
+    };
+    let expected_messages = [
+        "fts liveness alpha",
+        "fts liveness alpha_response",
+        "fts liveness beta",
+        "fts liveness beta_response",
+    ];
+    assert_eq!(archive_contents(), expected_messages);
     let parked_elapsed = elapsed;
     // A WAL that still carries frames is larger than its 32-byte header; a
     // truncated one (frankensqlite keeps the header on TRUNCATE) is exactly 32.
@@ -3944,7 +4227,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     let wal_bytes_after_parked_run = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
     assert!(
         wal_bytes_after_parked_run > WAL_HEADER_BYTES,
-        "the skipped checkpoint must leave the WAL frames for the next opener; \
+        "the interrupted checkpoint must leave the WAL frames for the next opener; \
          wal_bytes={wal_bytes_after_parked_run}\nstderr={stderr}"
     );
 
@@ -3954,6 +4237,7 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
         .args(["index", "--json", "--no-progress-events", "--data-dir"])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .output()
         .expect("run a plain cass index without the park");
     let plain_elapsed = started.elapsed();
@@ -3961,6 +4245,12 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
         output.status.success(),
         "the next plain run must succeed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(archive_contents(), expected_messages);
+    assert!(
+        fs::read(data_dir.join("index-run.lock"))
+            .unwrap()
+            .is_empty()
     );
     // The bound, measured against the same worker's load: a run that waited
     // for the 60 s park would take at least the plain run plus 60 s; a
