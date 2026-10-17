@@ -79,7 +79,8 @@ fn restricted_readonly_transfer() {
 
     let temp = tempfile::TempDir::new().expect("restricted transfer tempdir");
     let restricted = temp.path().join("restricted");
-    let source = restricted.join(".claude/projects");
+    // Exercise escaping in the remote operand, not only names in the file list.
+    let source = restricted.join(".claude/project's sessions");
     std::fs::create_dir_all(&source).expect("create restricted session directory");
     std::fs::write(source.join("session.jsonl"), b"{\"message\":\"initial\"}\n")
         .expect("write session");
@@ -102,7 +103,7 @@ fn restricted_readonly_transfer() {
         quote_remote_shell_path(adapter.to_str().expect("UTF-8 adapter path")),
         quote_remote_shell_path(restricted.to_str().expect("UTF-8 restricted path")),
     );
-    let remote = remote_spec_for_rsync("fixture", "/.claude/projects/");
+    let remote = remote_spec_for_rsync("fixture", "/.claude/project's sessions/");
 
     for protection in [
         RsyncArgProtection::SecludedArgs,
@@ -141,10 +142,58 @@ fn restricted_readonly_transfer() {
             .expect("write local-only file");
         let unchanged = transfer(RsyncArgProtection::None);
         assert!(unchanged.status.success());
+        let stats = parse_rsync_stats(&String::from_utf8_lossy(&unchanged.stdout));
+        assert_eq!((stats.files_transferred, stats.bytes_transferred), (0, 0));
+
+        let mut appended = std::fs::read(source.join("session.jsonl")).unwrap();
+        appended.extend_from_slice(b"{\"message\":\"appended\"}\n");
+        std::fs::write(source.join("session.jsonl"), &appended).expect("append session");
+        let updated = transfer(RsyncArgProtection::None);
+        assert!(
+            updated.status.success(),
+            "repeated restricted sync failed: {}",
+            String::from_utf8_lossy(&updated.stderr)
+        );
+        assert_eq!(
+            std::fs::read(destination.join("session.jsonl")).unwrap(),
+            appended
+        );
         assert_eq!(
             std::fs::read(destination.join("local-only.jsonl")).unwrap(),
             b"retain me",
             "fallback must retain additive sync semantics"
+        );
+    }
+}
+
+/// Set inherited defaults on a child test process, never on the parallel test
+/// runner. The fixture then calls the production run_rsync_command builder.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires real rsync and rrsync executables on PATH"]
+fn restricted_transfer_ignores_inherited_argument_defaults() {
+    for protect_args in ["1", "2"] {
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "sources::sync::rrsync_tests::restricted_readonly_transfer",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RSYNC_PROTECT_ARGS", protect_args)
+            .env("RSYNC_OLD_ARGS", "1")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("run restricted transfer fixture with inherited defaults");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "inherited argument defaults broke restricted sync: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed;"),
+            "the exact restricted transfer fixture must actually run: {stdout}"
         );
     }
 }
