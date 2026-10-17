@@ -17,6 +17,7 @@ import {
   checkMemoryPressure,
   getConversation,
   getMemoryUsage,
+  queryAll,
 } from "./database.js";
 import { copyTextToClipboard } from "./share.js";
 import { VariableHeightVirtualList } from "./virtual-list.js";
@@ -119,6 +120,7 @@ export function initConversationViewer(container, backCallback) {
  * @param {number|null} highlightMessageId - Message ID to highlight/scroll to
  */
 export async function loadConversation(conversationId, highlightMessageId = null) {
+  readyCopy = null;
   const loadId = ++activeConversationLoadId;
   try {
     let conversation;
@@ -544,6 +546,7 @@ function appendAttachmentsToMessage(messageElement, message) {
 }
 
 function handleArchiveLock() {
+  readyCopy = null;
   activeConversationLoadId += 1;
   currentMessages.dispose?.();
   for (const cached of loadedConversations.values()) {
@@ -786,59 +789,218 @@ function scrollToMessage(messageId) {
   }, 100);
 }
 
-/**
- * Copy conversation to clipboard
- */
-async function copyConversation() {
-  if (!currentConversation) return;
+// Copy is all-or-error: never label a truncated transcript as a complete copy.
+// These limits bound hydrated text and formatting, not SQLite work for a single
+// huge value, total WASM memory, or copies retained by the browser/OS clipboard.
+const COPY_MAX_BYTES = 8 * 1024 * 1024;
+const COPY_MAX_MESSAGES = 100_000;
+let activeCopy = null;
+let readyCopy = null;
 
-  const loadId = activeConversationLoadId;
-  try {
-    if (!currentMessages.length) return;
-    // Full traversal is explicit here; browsing never hydrates all bodies.
-    const text = formatConversationAsText(currentConversation, currentMessages);
-    const copied = await copyTextToClipboard(text);
-    if (loadId !== activeConversationLoadId) {
-      return;
-    }
-    if (!copied) {
-      throw new Error("Clipboard copy failed");
-    }
-    showCopyFeedback("Copied!");
-  } catch (error) {
-    if (loadId !== activeConversationLoadId) {
-      return;
-    }
-    console.error("[Conversation] Copy failed:", error);
-    showCopyFeedback("Copy failed");
+class ConversationCopyLimit extends Error {
+  constructor(message = "Copy limit: 8 MiB") {
+    super(message);
   }
 }
 
+/** Copy one current view, without concurrent whole-transcript preparations. */
+async function copyConversation() {
+  if (!currentConversation || activeCopy?.loadId === activeConversationLoadId) return;
+  const operation = { loadId: activeConversationLoadId };
+  const conversation = currentConversation;
+  const messages = currentMessages;
+  const copyBtn = document.getElementById("copy-btn");
+  activeCopy = operation;
+  const isCurrent = () => activeCopy === operation && operation.loadId === activeConversationLoadId
+    && currentConversation === conversation && currentMessages === messages;
+  try {
+    if (!messages.length) return;
+    if (copyBtn) {
+      copyBtn.dataset.defaultLabel ||= copyBtn.innerHTML;
+      if (copyFeedbackTimeoutId !== null) {
+        clearTimeout(copyFeedbackTimeoutId);
+        copyFeedbackTimeoutId = null;
+      }
+      copyBtn.disabled = true;
+      copyBtn.textContent = "Preparing copy…";
+    }
+    let copied;
+    if (readyCopy?.loadId === operation.loadId && readyCopy.conversation === conversation
+        && readyCopy.messages === messages) {
+      // Legacy fallback requires a NEW user gesture, not an asynchronous
+      // execCommand retry after preparation exhausted transient activation.
+      const text = readyCopy.text;
+      readyCopy = null;
+      copied = await copyTextToClipboard(text, { isCurrent });
+    } else {
+      readyCopy = null;
+      const prepared = formatConversationAsText(conversation, messages, isCurrent);
+      let writing = null;
+      const clipboard = globalThis.navigator?.clipboard;
+      if (typeof clipboard?.write === "function" && typeof globalThis.ClipboardItem === "function") {
+        // Start the request synchronously in the click handler. WebKit requires
+        // a user gesture; promise-backed ClipboardItem data may arrive later.
+        // No transcript bytes are supplied unless preparation AND currency
+        // checks succeed. Already-supplied clipboard data cannot be retracted.
+        const data = prepared.then(text => {
+          if (!isCurrent()) throw new Error("Conversation copy cancelled");
+          return new Blob([text], { type: "text/plain" });
+        });
+        // A constructor/permission failure may leave the browser not observing
+        // its data promise. Still handle cancellation/size errors on that path.
+        void data.catch(() => {});
+        try {
+          writing = Promise.resolve(clipboard.write([
+            new ClipboardItem({ "text/plain": data }),
+          ])).then(() => true, () => false);
+        } catch {
+          writing = Promise.resolve(false);
+        }
+      }
+      const text = await prepared;
+      if (!isCurrent()) return;
+      copied = writing ? await writing : false;
+      if (!isCurrent()) return;
+      if (!copied) {
+        // Keep only this bounded result. Navigation, a new load or archive lock
+        // clears it. Never start another clipboard operation without a click.
+        readyCopy = { loadId: operation.loadId, conversation, messages, text };
+        showCopyFeedback("Ready — click to copy");
+        return;
+      }
+    }
+    if (!isCurrent()) return;
+    if (!copied) throw new Error("Clipboard copy failed");
+    showCopyFeedback("Copied!");
+  } catch (error) {
+    if (!isCurrent()) return;
+    console.error("[Conversation] Copy failed:", error);
+    showCopyFeedback(error instanceof ConversationCopyLimit ? error.message : "Copy failed");
+  } finally {
+    if (isCurrent() && copyBtn) copyBtn.disabled = false;
+    if (activeCopy === operation) activeCopy = null;
+  }
+}
+
+// Both passes use the viewer's NULL-first (idx, id) ordering, with bounded
+// keyset windows rather than OFFSET rescans or a transcript-sized ID list.
+function readCopyPage(conversationId, cursor, limit, withContent, byteLimit) {
+  const ranges = cursor === null ? [["", []]] : cursor.idx === null ? [
+    [" AND idx IS NULL AND id > ?", [cursor.id]],
+    [" AND idx IS NOT NULL", []],
+  ] : [[" AND (idx, id) > (?, ?)", [cursor.idx, cursor.id]]];
+  const columns = withContent
+    ? `, CASE role WHEN 'user' THEN 'User' WHEN 'assistant' THEN 'Assistant'
+         WHEN 'agent' THEN 'Assistant' WHEN 'system' THEN 'System'
+         WHEN 'tool' THEN 'Tool' ELSE 'Unknown' END AS copy_role,
+         CASE WHEN content IS NULL THEN ''
+           WHEN typeof(content) = 'text' AND length(CAST(content AS BLOB)) <= ?
+           THEN content ELSE NULL END AS copy_content`
+    : ", length(CAST(content AS BLOB)) AS content_bytes, typeof(content) AS content_type";
+  const rows = [];
+  for (const [condition, parameters] of ranges) {
+    if (rows.length === limit) break;
+    rows.push(...queryAll(
+      `SELECT id, idx${columns} FROM messages WHERE conversation_id = ?${condition}
+       ORDER BY idx ASC, id ASC LIMIT ?`,
+      [...(withContent ? [byteLimit] : []), conversationId, ...parameters, limit - rows.length],
+    ));
+  }
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.id) || row.id <= 0 ||
+        (row.idx !== null && !Number.isSafeInteger(row.idx))) {
+      throw new Error("Invalid message identity or ordering in conversation copy");
+    }
+  }
+  return rows;
+}
+
 /**
- * Format conversation as plain text
+ * Preflight size without hydrating bodies, then format bounded body pages.
+ * Yield actual macrotasks between pages so lock/navigation can cancel both
+ * passes. The owning message source checks database lifecycle on every page.
+ * The readonly export must remain immutable; this is not a writer snapshot.
  */
-function formatConversationAsText(conv, messages) {
-  const lines = [
+async function formatConversationAsText(conv, messages, isCurrent = () => true) {
+  const check = () => {
+    if (!isCurrent()) {
+      const error = new Error("Conversation copy cancelled");
+      error.name = "AbortError";
+      throw error;
+    }
+    // Accessing length also rejects disposed sources or a replaced database.
+    return messages.length;
+  };
+  const pause = async () => {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    if (check() !== total) throw new Error("Conversation changed while preparing copy");
+  };
+  const total = check();
+  if (!Number.isSafeInteger(conv.id) || conv.id <= 0 ||
+      !Number.isSafeInteger(total) || total < 0) {
+    throw new Error("Invalid conversation copy identity or message count");
+  }
+  if (total > COPY_MAX_MESSAGES) throw new ConversationCopyLimit("Copy limit: 100k messages");
+  const metadataUnits = [conv.title, conv.agent, conv.workspace]
+    .reduce((sum, value) => sum + (typeof value === "string" ? value.length : 0), 0);
+  if (metadataUnits > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+  const encoder = new TextEncoder();
+  const header = [
     `# ${conv.title || "Untitled conversation"}`,
     `Agent: ${conv.agent}`,
     `Date: ${formatDate(conv.started_at)}`,
     conv.workspace ? `Workspace: ${conv.workspace}` : "",
-    "",
-    "---",
-    "",
-  ];
+    "", "---", "",
+  ].join("\n");
+  let used = encoder.encode(header).byteLength;
+  // 32 covers each fixed role label and all per-message separators. This is
+  // conservative admission; the exact final UTF-8 length is checked below.
+  let estimate = used + total * 32;
+  if (estimate > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+  await pause();
+  for (let visited = 0, cursor = null; visited < total;) {
+    const limit = Math.min(128, total - visited);
+    const rows = readCopyPage(conv.id, cursor, limit, false, 0);
+    if (rows.length !== limit) throw new Error("Conversation changed while measuring copy");
+    for (const row of rows) {
+      const bytes = row.content_type === "null" ? 0 : row.content_bytes;
+      if (!["text", "null"].includes(row.content_type) || !Number.isSafeInteger(bytes) || bytes < 0) {
+        throw new Error("Invalid message content in conversation copy");
+      }
+      estimate += bytes;
+      if (estimate > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+    }
+    cursor = rows.at(-1);
+    visited += rows.length;
+    await pause();
+  }
 
-  messages.forEach((msg) => {
-    const role = msg.role === "user" ? "User" : "Assistant";
-    lines.push(`## ${role}:`);
-    lines.push("");
-    lines.push(msg.content);
-    lines.push("");
-    lines.push("---");
-    lines.push("");
-  });
-
-  return lines.filter((line) => line !== null).join("\n");
+  const parts = [header];
+  try {
+    for (let visited = 0, cursor = null; visited < total;) {
+      const limit = Math.min(32, total - visited);
+      // CASE refuses oversized values BEFORE returning their text to JS, even
+      // if a nonstandard caller altered the database after the size pass.
+      const rows = readCopyPage(conv.id, cursor, limit, true, COPY_MAX_BYTES - used);
+      if (rows.length !== limit) throw new Error("Conversation changed while reading copy");
+      for (const row of rows) {
+        if (typeof row.copy_content !== "string") throw new ConversationCopyLimit();
+        const part = `\n## ${row.copy_role}:\n\n${row.copy_content}\n\n---\n`;
+        used += encoder.encode(part).byteLength;
+        if (used > COPY_MAX_BYTES) throw new ConversationCopyLimit();
+        parts.push(part);
+      }
+      cursor = rows.at(-1);
+      visited += rows.length;
+      await pause();
+    }
+    check();
+    return parts.join("");
+  } finally {
+    // Drop retained references promptly on failure/cancellation. JS strings
+    // and clipboard buffers cannot be reliably zeroized by this component.
+    parts.length = 0;
+  }
 }
 
 /**
@@ -1106,6 +1268,7 @@ export function getCacheStats() {
  * Clear the viewer
  */
 export function clearViewer() {
+  readyCopy = null;
   activeConversationLoadId += 1;
   // Clean up virtual list
   destroyVirtualList();
@@ -1125,6 +1288,7 @@ export function cleanupConversationViewer() {
  * Clear all cached conversations
  */
 export function clearAllCache() {
+  readyCopy = null;
   // An active view may still use its source after a manual cache clear.
   // Clear retained text without disabling scrolling; lock disposes sources.
   currentMessages.clearCache?.();
