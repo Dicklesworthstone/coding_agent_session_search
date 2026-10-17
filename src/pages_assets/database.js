@@ -974,6 +974,68 @@ export function normalizeSearchTimeRange(since = null, until = null) {
 }
 
 /**
+ * Workspace identities are exact archive values, not local filesystem paths.
+ * Preserve case, separators, whitespace and wildcard characters. An absent or
+ * empty selector means all workspaces; malformed selectors must not widen it.
+ */
+function normalizeWorkspaceFilter(workspace) {
+  if (workspace === undefined || workspace === null || workspace === "") {
+    return null;
+  }
+  if (typeof workspace !== "string" || workspace.length > 4096 ||
+      workspace.includes("\0") || !workspace.isWellFormed()) {
+    throw new RangeError("Workspace must be a well-formed path of at most 4096 characters without NUL");
+  }
+  return workspace;
+}
+
+// Both text search and recent-session browsing apply the SAME intersection
+// before ordering/limiting. The fixed c alias is internal, never user input.
+function conversationScope({ agent = null, workspace = null, since = null, until = null }) {
+  const selectedWorkspace = normalizeWorkspaceFilter(workspace);
+  const bounds = normalizeSearchTimeRange(since, until);
+  const clauses = [];
+  const params = [];
+  if (agent) {
+    clauses.push("c.agent = ?");
+    params.push(agent);
+  }
+  if (selectedWorkspace !== null) {
+    clauses.push("c.workspace = ? COLLATE BINARY");
+    params.push(selectedWorkspace);
+  }
+  if (bounds.since !== null) {
+    clauses.push("c.started_at >= ?");
+    params.push(bounds.since);
+  }
+  if (bounds.until !== null) {
+    clauses.push("c.started_at <= ?");
+    params.push(bounds.until);
+  }
+  return { sql: clauses.length ? ` AND ${clauses.join(" AND ")}` : "", params };
+}
+
+/**
+ * Browse one page of conversations with intersecting agent/workspace/time
+ * filters. Uses searchConversations' filter semantics without requiring FTS
+ * text. Workspace is an exact stored path; omitted filters keep all sessions.
+ * @param {Object} options - limit (0-1000), offset, agent, workspace, since, until
+ * @returns {Array<Object>} Recent conversation metadata, never message bodies
+ */
+export function getConversations(options = {}) {
+  const { limit = 50, offset = 0 } = options;
+  validatePagination(limit, offset);
+  const scope = conversationScope(options);
+  return queryAll(
+    `SELECT c.id, c.agent, c.workspace, c.title, c.source_path,
+            c.started_at, c.ended_at, c.message_count
+     FROM conversations c WHERE 1 = 1${scope.sql}
+     ORDER BY c.started_at DESC, c.id DESC LIMIT ? OFFSET ?`,
+    [...scope.params, limit, offset],
+  );
+}
+
+/**
  * Search conversations using FTS5
  * Automatically routes to the appropriate FTS table:
  * - messages_fts (porter stemmer) for natural language
@@ -984,6 +1046,7 @@ export function normalizeSearchTimeRange(since = null, until = null) {
  * @param {number} [options.limit=50] - Maximum results (0-1000)
  * @param {number} [options.offset=0] - Result offset for pagination
  * @param {string|null} [options.agent=null] - Filter by agent name
+ * @param {string|null} [options.workspace=null] - Exact stored workspace path
  * @param {SearchMode} [options.searchMode='auto'] - Search mode: 'auto', 'prose', or 'code'
  * @param {number|string|null} [options.since=null] - Earliest conversation start timestamp (ms or YYYY-MM-DD)
  * @param {number|string|null} [options.until=null] - Latest conversation start timestamp (ms or YYYY-MM-DD)
@@ -994,12 +1057,13 @@ export function searchConversations(query, options = {}) {
     limit = 50,
     offset = 0,
     agent = null,
+    workspace = null,
     searchMode = "auto",
     since = null,
     until = null,
   } = options;
   validatePagination(limit, offset);
-  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
+  const scope = conversationScope({ agent, workspace, since, until });
 
   // Parse and escape the query before preparing any database statement.
   const escapedQuery = escapeFts5Query(query);
@@ -1035,22 +1099,8 @@ export function searchConversations(query, options = {}) {
         WHERE ${ftsTable} MATCH ?
     `;
 
-  const params = [escapedQuery];
-
-  if (agent) {
-    sql += " AND c.agent = ?";
-    params.push(agent);
-  }
-
-  if (sinceTimestamp !== null) {
-    sql += " AND c.started_at >= ?";
-    params.push(sinceTimestamp);
-  }
-
-  if (untilTimestamp !== null) {
-    sql += " AND c.started_at <= ?";
-    params.push(untilTimestamp);
-  }
+  sql += scope.sql;
+  const params = [escapedQuery, ...scope.params];
 
   sql += `
         ORDER BY score, m.id ASC
@@ -1237,6 +1287,7 @@ export default {
   getExportMeta,
   getStatistics,
   getRecentConversations,
+  getConversations,
   getConversation,
   getConversationMessages,
   searchConversations,
