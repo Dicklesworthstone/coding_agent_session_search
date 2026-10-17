@@ -31939,8 +31939,10 @@ fn run_cli_search(
     let mut skipped_sections = Vec::<String>::new();
     let mut session_paths_timed_out = false;
 
-    let mut filters = SearchFilters::default();
-    filters.agents = normalize_agent_filters(agents)?.into_iter().collect();
+    let mut filters = SearchFilters {
+        agents: normalize_agent_filters(agents)?.into_iter().collect(),
+        ..SearchFilters::default()
+    };
     if !workspaces.is_empty() {
         filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
     }
@@ -33922,8 +33924,10 @@ fn run_cli_pack(
         tracing::debug!(?outcome, "pack: auto-refresh evaluated");
     }
 
-    let mut filters = SearchFilters::default();
-    filters.agents = normalized_agents.into_iter().collect();
+    let mut filters = SearchFilters {
+        agents: normalized_agents.into_iter().collect(),
+        ..SearchFilters::default()
+    };
     if !workspaces.is_empty() {
         filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
     }
