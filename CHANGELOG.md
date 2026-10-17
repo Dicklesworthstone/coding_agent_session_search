@@ -109,6 +109,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   source's registered kind. Sessions indexed before the fix keep the remote
   label until `cass index --full --force-rebuild` rebuilds the lexical index;
   plain `--full` leaves an up-to-date index as it is.
+- **`cass sources add` accepts a read-only rrsync key (#531).** Its
+  connectivity check ran `echo ok` on the remote. A key whose forced command
+  is `rrsync -ro DIR` refuses everything except rsync and `true`, so `add`
+  failed with exit 12 unless `--no-test` was given. The check now runs `true`,
+  as `cass sources doctor` already did.
 - **`cass mirror prune` reclaims capture staging left by killed captures
   (#523).** A `cass index` run killed mid-capture (for example by `timeout`)
   left its `raw-mirror/v1/tmp/capture.*` staging behind, and nothing removed

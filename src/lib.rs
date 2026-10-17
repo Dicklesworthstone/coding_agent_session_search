@@ -120549,8 +120549,7 @@ fn test_ssh_connectivity(host: &str) -> CliResult<()> {
     let mut ssh_args = crate::sources::strict_ssh_cli_tokens(5);
     ssh_args.push("--".to_string());
     ssh_args.push(host.to_string());
-    ssh_args.push("echo".to_string());
-    ssh_args.push("ok".to_string());
+    ssh_args.push(crate::sources::SSH_CONNECTIVITY_PROBE_COMMAND.to_string());
 
     let output = std::process::Command::new("ssh")
         .args(&ssh_args)
@@ -121507,7 +121506,7 @@ fn check_ssh_connectivity(host: &str, timeout: Duration) -> DiagnosticCheck {
     let mut ssh_args = crate::sources::strict_ssh_cli_tokens(5);
     ssh_args.push("--".to_string());
     ssh_args.push(host.to_string());
-    ssh_args.push("true".to_string());
+    ssh_args.push(crate::sources::SSH_CONNECTIVITY_PROBE_COMMAND.to_string());
 
     let output = bounded_ssh_output(&ssh_args, timeout);
 
