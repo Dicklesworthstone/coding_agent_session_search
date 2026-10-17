@@ -48,7 +48,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.4.4. 0.3.15 was evaluated on
+        // migration, bead bo000; now at 0.4.9. 0.3.15 was evaluated on
         // 2026-09-02 (bead gh382-fsqlite-pin) and NOT adopted: cass's own
         // writable open still looped on a large archive with a large WAL
         // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo).
@@ -74,10 +74,24 @@ const CONTRACTS: &[DependencyContract] = &[
         // WAL-index publication fixes; CASS archive acceptance is separate.
         // 0.4.2 adds explicit derived WAL-index recovery for read-only
         // connections, including the dedicated async owner (GH#477).
+        // 0.4.6 stops a live B-tree page from being freed and granted again
+        // across a WAL generation (bd-b5vmw) and fixes the lost-index-entry
+        // race (bd-11sz4). 0.4.7 keeps index entries whole past register
+        // 65,535 in large multi-row INSERTs (bd-2eebi), fixes the serialized
+        // DDL index race (bd-4iaoi), carries the GH#503 legacy FTS5
+        // shadow-autoindex repair open (ENGINE_REPAIRS_MISSING_FTS5_SHADOW_
+        // AUTOINDEX is true), bounds the published-page plane (5s1la) and
+        // stops the first sqlite_master query reading the whole file (k2k20).
+        // 0.4.7 also slowed strict read-only opens on a stale WAL index to
+        // ~30 s, so CASS skipped it; 0.4.9 (replacing the withdrawn 0.4.8)
+        // refuses that index promptly again (48c6cf6b2) and lets the first
+        // write after stock SQLite's empty, unindexed WAL index establish the
+        // WAL generation instead of failing BusyRecovery forever (GH#443,
+        // cass#509).
         // fsqlite resolves from crates.io at the exact version below.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.4",
+        expected_version: "0.4.9",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -95,10 +109,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // The 0.4.4 release publishes the entire family at one version.
+        // The 0.4.9 release publishes the entire family at one version.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.4",
+        expected_version: "0.4.9",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -116,7 +130,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Match the production shared types from the published family.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.4",
+        expected_version: "0.4.9",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -157,16 +171,26 @@ const CONTRACTS: &[DependencyContract] = &[
         // rollout read cap, which 0.3.1 fixed at 100 MiB regardless of
         // CASS_CODEX_MAX_SOURCE_BYTES. 0.3.3 (2026-09-28) indexes OpenCode 2.x
         // sessions from session_v2/session_message (cass#504) and decodes
-        // OpenClaw's zstd-compressed transcript events (FAD#25).
+        // OpenClaw's zstd-compressed transcript events (FAD#25). 0.3.4
+        // (2026-10-05) indexes native Codebuff transcripts, whose timestamps
+        // are a locale time of day, taking each instant from the message ID
+        // (cass#511); 0.3.5 keeps indexing a Codebuff store's other chats when
+        // one transcript does not parse, and names that transcript. 0.3.6
+        // (codex-zstd) reads Codex rollouts compressed to .jsonl.zst (cass#513).
+        // 0.3.7 adds the pi_durable connector (FAD#28; its SQLite stores need
+        // pi-durable) and pi_agent_rust SQLite sessions (pi-sqlite). 0.3.8
+        // resolves `..`, relative and symlink-alias CASS_EXCLUDE_PATHS
+        // entries for the Claude, Pi and Codex readers (cass 0f1k0).
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.3",
+        expected_version: "0.3.8",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
         expected_features: &[
             "chatgpt",
             "codebuff",
+            "codex-zstd",
             "connectors",
             "copilot-vscdb",
             "crush",
@@ -177,6 +201,8 @@ const CONTRACTS: &[DependencyContract] = &[
             "hermes",
             "openclaw-sqlite",
             "opencode",
+            "pi-durable",
+            "pi-sqlite",
             "shelley",
         ],
         expected_default_features: None,
@@ -194,7 +220,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         // crates.io-only exact pin: every source (direct dep, frankensqlite
         // transitive, frankensearch transitive) resolves to a single published
-        // release. SQLite 0.4.x, FAD 0.3.0 and FrankenSearch 0.6.1 use
+        // release. SQLite 0.4.x, FAD 0.3.0 and FrankenSearch 0.7.1 use
         // asupersync 0.5.x native contexts; mixing the old runtime would
         // split caller context, cancellation and capability identity.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
@@ -216,15 +242,14 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Coordinated registry candidate with asupersync 0.5.0. Preserve
-        // explicit native MiniLM, Quill and cass-compat lexical behavior.
-        // The producer's 0.6.1 publication and CASS qualification must finish
-        // before release; a manifest pin alone is not runtime acceptance.
+        // Registry release on asupersync 0.5. Preserve explicit native
+        // MiniLM, Quill and cass-compat lexical behavior; a manifest pin
+        // alone is not runtime acceptance.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.6.1",
+        expected_version: "0.7.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
@@ -401,20 +426,42 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
         .unwrap_or_else(|error| fatal(format!("cannot parse ingest dependency lock: {error}")));
     let crate_name = env::var("CARGO_PKG_NAME").unwrap_or_default();
     let crate_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let pinned_dependencies =
-        lock.get("package")
-            .and_then(Value::as_array)
-            .is_some_and(|packages| {
-                !packages.is_empty()
-                    && packages.iter().all(|package| {
-                        package.get("source").and_then(Value::as_str).is_some()
-                            || (package.get("name").and_then(Value::as_str)
-                                == Some(crate_name.as_str())
-                                && package.get("version").and_then(Value::as_str)
-                                    == Some(crate_version.as_str()))
-                    })
-            });
+    let packages = lock
+        .get("package")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // The first package that disables reuse, named so `cass capabilities` can
+    // tell an operator why (GH#426): a source build with a local path override
+    // reparses every source on every incremental run.
+    let reuse_blocker = if packages.is_empty() {
+        Some("Cargo.lock lists no packages".to_string())
+    } else {
+        packages
+            .iter()
+            .find(|package| {
+                package.get("source").and_then(Value::as_str).is_none()
+                    && !(package.get("name").and_then(Value::as_str) == Some(crate_name.as_str())
+                        && package.get("version").and_then(Value::as_str)
+                            == Some(crate_version.as_str()))
+            })
+            .map(|package| {
+                format!(
+                    "{} {} has no registry or git source (local path dependency or [patch])",
+                    package.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    package
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                )
+            })
+    };
+    let pinned_dependencies = reuse_blocker.is_none();
     println!("cargo:rustc-env=CASS_SOURCE_INGEST_REUSE={pinned_dependencies}");
+    println!(
+        "cargo:rustc-env=CASS_SOURCE_INGEST_REUSE_BLOCKER={}",
+        reuse_blocker.unwrap_or_default()
+    );
     let mut inputs = BTreeSet::from([
         PathBuf::from("Cargo.toml"),
         PathBuf::from("Cargo.lock"),
@@ -555,7 +602,7 @@ fn validate_path_dependency_contracts(
 
 fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
     // The fsqlite engine family must resolve exclusively from crates.io at
-    // the uniform published 0.4.4 version, including the shared types.
+    // the uniform published 0.4.9 version, including the shared types.
     // One source per package remains load-bearing for read-only integrity.
     const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -624,7 +671,7 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
         if !(name == "fsqlite" || name.starts_with("fsqlite-")) {
             continue;
         }
-        let expected_version = "0.4.4";
+        let expected_version = "0.4.9";
         let version = package.get("version").and_then(Value::as_str).unwrap_or("");
         if !seen.insert(name) {
             violations.push(format!(
