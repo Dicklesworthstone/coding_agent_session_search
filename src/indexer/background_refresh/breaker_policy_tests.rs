@@ -200,7 +200,10 @@ fn backoff_rounds_up_and_expires_at_the_exact_millisecond() {
             (interval, BreakerVerdict::Closed),
             (interval + 1, BreakerVerdict::Closed),
         ] {
-            assert_eq!(recorded_breaker_verdict(&state, DETECTED + elapsed), expected);
+            assert_eq!(
+                recorded_breaker_verdict(&state, DETECTED + elapsed),
+                expected
+            );
         }
     }
 }

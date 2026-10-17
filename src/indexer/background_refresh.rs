@@ -819,13 +819,8 @@ pub fn maybe_spawn_with_policy(
     }
     if let Some(current) = state.as_mut() {
         let before = current.clone();
-        let verdict = spawn_breaker_verdict(
-            current,
-            full,
-            last_indexed_at_ms,
-            now,
-            &log_path(data_dir),
-        );
+        let verdict =
+            spawn_breaker_verdict(current, full, last_indexed_at_ms, now, &log_path(data_dir));
         if *current != before
             && let Err(error) = save_state(data_dir, current)
         {
