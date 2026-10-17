@@ -132,18 +132,19 @@ fn search_client_routes_a_complete_sharded_cohort_through_native_ann() {
 }
 
 #[test]
-fn missing_shard_ann_falls_back_to_every_exact_shard_not_just_ready_ones() {
+fn missing_shard_ann_uses_exact_only_for_that_shard_and_keeps_native_owners() {
     let dir = tempfile::tempdir().unwrap();
     let client = client(None);
     let first = artifact(dir.path(), "a", 1, [0.6, 0.8]);
     let second = artifact(dir.path(), "b", 2, [1.0, 0.0]);
     let second = SemanticIndexArtifact::open(second.fsvi_path(), None).unwrap();
     let context = install(&client, vec![first, second]);
-    assert!(client.ann_index().unwrap().is_none());
-    assert!(matches!(
-        client.ann_unavailability_reason().unwrap(),
-        Some(SemanticAnnUnavailableReason::SidecarMissing)
-    ));
+    let ann = client
+        .ann_index()
+        .unwrap()
+        .expect("healthy native shard remains usable");
+    assert!(Arc::ptr_eq(&ann, &client.ann_index().unwrap().unwrap()));
+    assert!(client.ann_unavailability_reason().unwrap().is_none());
     let (hits, _, stats) = client
         .search_semantic_candidates(
             &context,
@@ -151,10 +152,10 @@ fn missing_shard_ann_falls_back_to_every_exact_shard_not_just_ready_ones() {
             &SearchFilters::default(),
             SemanticCandidateSearchRequest {
                 fetch_limit: 2,
-                approximate: false,
+                approximate: true,
                 tier_mode: SemanticTierMode::Single,
                 in_memory_two_tier_index: None,
-                ann_index: None,
+                ann_index: Some(&ann),
             },
         )
         .unwrap();
@@ -162,7 +163,21 @@ fn missing_shard_ann_falls_back_to_every_exact_shard_not_just_ready_ones() {
         hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
         vec![2, 1]
     );
-    assert!(stats.is_none(), "fallback is exact, not an ANN success");
+    let stats = stats.unwrap();
+    assert_eq!(
+        stats.index_size, 1,
+        "only the admitted native graph is counted"
+    );
+    assert_eq!(stats.k_requested, 1);
+    assert!(stats.exact_fallback.is_none());
+    let exact = stats.partial_exact.unwrap();
+    assert_eq!(exact.shards.len(), 1);
+    assert_eq!(exact.shards[0].shard, 1);
+    assert_eq!(
+        exact.shards[0].reason,
+        SemanticAnnUnavailableReason::SidecarMissing
+    );
+    assert_eq!(exact.returned_messages, 1);
 }
 
 #[test]
@@ -252,4 +267,42 @@ fn replacing_the_context_invalidates_cached_ann_and_its_old_owner_identity() {
     );
     client.clear_semantic_context().unwrap();
     assert!(client.ann_index().is_err());
+}
+
+#[test]
+fn entirely_unpaired_client_keeps_complete_exact_search_and_no_native_statistics() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(None);
+    let artifacts = [("missing-a", 1, [0.6, 0.8]), ("missing-b", 2, [1.0, 0.0])]
+        .into_iter()
+        .map(|(name, message, vector)| {
+            let item = artifact(dir.path(), name, message, vector);
+            SemanticIndexArtifact::open(item.fsvi_path(), None).unwrap()
+        })
+        .collect();
+    let context = install(&client, artifacts);
+    assert!(client.ann_index().unwrap().is_none());
+    assert_eq!(
+        client.ann_unavailability_reason().unwrap(),
+        Some(SemanticAnnUnavailableReason::SidecarMissing)
+    );
+    let (hits, _, stats) = client
+        .search_semantic_candidates(
+            &context,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            SemanticCandidateSearchRequest {
+                fetch_limit: 2,
+                approximate: false,
+                tier_mode: SemanticTierMode::Single,
+                in_memory_two_tier_index: None,
+                ann_index: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    assert!(stats.is_none());
 }

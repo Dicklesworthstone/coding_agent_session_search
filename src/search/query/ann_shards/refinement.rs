@@ -55,6 +55,11 @@ pub(super) fn accumulate_native_stats(total: &mut AnnSearchStats, next: &AnnSear
     total.search_time_us = total.search_time_us.saturating_add(next.search_time_us);
     total.estimated_recall = total.estimated_recall.min(next.estimated_recall);
     total.is_approximate |= next.is_approximate;
+    if let Some(next) = &next.candidate_rescore {
+        let receipt = total.candidate_rescore.get_or_insert_with(Default::default);
+        receipt.candidates = receipt.candidates.saturating_add(next.candidates);
+        receipt.search_time_us = receipt.search_time_us.saturating_add(next.search_time_us);
+    }
 }
 
 #[cfg(test)]

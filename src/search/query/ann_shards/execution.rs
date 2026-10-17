@@ -20,6 +20,12 @@ struct WalShardOverlay<'a> {
     has_more_candidates: bool,
 }
 
+struct ExactPartition {
+    hits: Vec<VectorSearchResult>,
+    has_more_candidates: bool,
+    receipt: AnnPartialExactStats,
+}
+
 type WalCohortOverlay<'a> = HashMap<usize, WalShardOverlay<'a>>;
 
 fn wal_delta_fits_budget(shards: impl IntoIterator<Item = (usize, usize)>) -> bool {
@@ -78,70 +84,114 @@ impl SemanticAnnShardSet {
         if !self.validate_native_query(&context.artifacts, embedding, fetch_limit)? {
             return Ok((Vec::new(), SemanticCandidateRetryState::default(), None));
         }
-        let mut budget = NativeRefillBudget::new(fetch_limit, context.artifacts.len());
+        let mut budget = NativeRefillBudget::new(fetch_limit, self.graphs.len());
         let mut native_window = fetch_limit;
         let mut stats: Option<AnnSearchStats> = None;
+        let mut partial_exact = None;
         let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
         let (native_messages, reason) =
             match self.prepare_wal_overlay(embedding, fetch_limit, filter) {
-                Ok(overlay) => loop {
-                    match self.search_prepared(embedding, native_window, filter, &overlay) {
-                        Ok((hits, mut retry, measured)) => {
-                            if let Some(measured) = measured {
-                                match stats.as_mut() {
-                                    Some(total) => accumulate_native_stats(total, &measured),
-                                    None => stats = Some(measured),
+                Ok(overlay) => {
+                    // Score the complete exact subset once, with its existing
+                    // message-refill budget. Never rescan it on native retries.
+                    // A failed exact subset is an error, not a partial native page.
+                    let exact =
+                        self.prepare_exact_partition(context, embedding, fetch_limit, filter)?;
+                    partial_exact = exact.as_ref().map(|exact| exact.receipt.clone());
+                    loop {
+                        match self.search_prepared(embedding, native_window, filter, &overlay) {
+                            Ok((hits, mut retry, measured)) => {
+                                if let Some(measured) = measured {
+                                    match stats.as_mut() {
+                                        Some(total) => accumulate_native_stats(total, &measured),
+                                        None => stats = Some(measured),
+                                    }
                                 }
-                            }
-                            // A wider approximate window need not contain all
-                            // earlier winners. All passes apply the same WAL
-                            // shadow set, so retaining these scores is safe.
-                            for hit in hits {
-                                best_by_message
-                                    .entry(hit.message_id)
-                                    .and_modify(|best| {
-                                        if hit.score.total_cmp(&best.score).is_gt() {
-                                            best.score = hit.score;
-                                            best.chunk_idx = hit.chunk_idx;
+                                // A wider approximate window need not contain all
+                                // earlier winners. All passes apply the same WAL
+                                // shadow set, so retaining these scores is safe.
+                                for hit in hits {
+                                    best_by_message
+                                        .entry(hit.message_id)
+                                        .and_modify(|best| {
+                                            if hit.score.total_cmp(&best.score).is_gt()
+                                                || (hit.score.total_cmp(&best.score).is_eq()
+                                                    && hit.chunk_idx < best.chunk_idx)
+                                            {
+                                                best.score = hit.score;
+                                                best.chunk_idx = hit.chunk_idx;
+                                            }
+                                        })
+                                        .or_insert(hit);
+                                }
+                                let omitted_retained = best_by_message.len() > fetch_limit;
+                                let hits = SearchClient::collapse_semantic_results(
+                                    best_by_message,
+                                    fetch_limit,
+                                );
+                                if hits.len() >= fetch_limit || !retry.has_more_candidates {
+                                    retry.has_more_candidates |= omitted_retained;
+                                    // An exact shard filling the final page is not
+                                    // permission to skip native filter/chunk refills.
+                                    // Merge only after the native subset converges.
+                                    let mut combined: HashMap<_, _> =
+                                        hits.into_iter().map(|hit| (hit.message_id, hit)).collect();
+                                    if let Some(exact) = &exact {
+                                        retry.has_more_candidates |= exact.has_more_candidates;
+                                        for hit in &exact.hits {
+                                            combined
+                                                .entry(hit.message_id)
+                                                .and_modify(|best| {
+                                                    if hit.score.total_cmp(&best.score).is_gt()
+                                                        || (hit
+                                                            .score
+                                                            .total_cmp(&best.score)
+                                                            .is_eq()
+                                                            && hit.chunk_idx < best.chunk_idx)
+                                                    {
+                                                        *best = hit.clone();
+                                                    }
+                                                })
+                                                .or_insert_with(|| hit.clone());
                                         }
-                                    })
-                                    .or_insert(hit);
-                            }
-                            let omitted_retained = best_by_message.len() > fetch_limit;
-                            let hits = SearchClient::collapse_semantic_results(
-                                best_by_message,
-                                fetch_limit,
-                            );
-                            if hits.len() >= fetch_limit || !retry.has_more_candidates {
-                                retry.has_more_candidates |= omitted_retained;
-                                return Ok((hits, retry, stats));
-                            }
-                            let Some(next_window) = budget.next_window() else {
-                                let reason = if filter.is_some() {
-                                    AnnExactFallbackReason::FilteredCandidateUnderfill
-                                } else {
-                                    AnnExactFallbackReason::MessageCandidateUnderfill
-                                };
-                                break (hits.len(), reason);
-                            };
-                            best_by_message =
-                                hits.into_iter().map(|hit| (hit.message_id, hit)).collect();
-                            native_window = next_window;
-                        }
-                        Err(error) => {
-                            let failure = error.downcast::<NativeAnnSearchFailure>()?;
-                            // Keep completed work, but discard ALL native
-                            // and delta hits before exact cohort recovery.
-                            match stats.as_mut() {
-                                Some(total) => {
-                                    accumulate_native_stats(total, &failure.completed_stats);
+                                    }
+                                    retry.has_more_candidates |= combined.len() > fetch_limit;
+                                    let hits = SearchClient::collapse_semantic_results(
+                                        combined,
+                                        fetch_limit,
+                                    );
+                                    if let Some(stats) = stats.as_mut() {
+                                        stats.partial_exact = partial_exact.take();
+                                    }
+                                    return Ok((hits, retry, stats));
                                 }
-                                None => stats = Some(failure.completed_stats),
+                                let Some(next_window) = budget.next_window() else {
+                                    let reason = if filter.is_some() {
+                                        AnnExactFallbackReason::FilteredCandidateUnderfill
+                                    } else {
+                                        AnnExactFallbackReason::MessageCandidateUnderfill
+                                    };
+                                    break (hits.len(), reason);
+                                };
+                                best_by_message =
+                                    hits.into_iter().map(|hit| (hit.message_id, hit)).collect();
+                                native_window = next_window;
                             }
-                            break (0, AnnExactFallbackReason::NativeSearchFailed);
+                            Err(error) => {
+                                let failure = error.downcast::<NativeAnnSearchFailure>()?;
+                                // Keep completed work, but discard ALL native
+                                // and delta hits before exact cohort recovery.
+                                match stats.as_mut() {
+                                    Some(total) => {
+                                        accumulate_native_stats(total, &failure.completed_stats);
+                                    }
+                                    None => stats = Some(failure.completed_stats),
+                                }
+                                break (0, AnnExactFallbackReason::NativeSearchFailed);
+                            }
                         }
                     }
-                },
+                }
                 Err(error) if error.is::<PendingWalDelta>() => {
                     let pending = error
                         .downcast_ref::<PendingWalDelta>()
@@ -173,6 +223,7 @@ impl SemanticAnnShardSet {
         if let Some(stats) = stats.as_mut() {
             stats.is_approximate = false;
             stats.exact_fallback = Some(receipt);
+            stats.partial_exact = partial_exact;
         }
         Ok((exact, exact_retry, stats))
     }
@@ -199,6 +250,10 @@ impl SemanticAnnShardSet {
         if !self.validate_native_query(artifacts, embedding, fetch_limit)? {
             return Ok((Vec::new(), SemanticCandidateRetryState::default(), None));
         }
+        if !self.exact_shards.is_empty() {
+            bail!("native-only probe cannot execute a mixed cohort; use complete search");
+        }
+
         let overlay = self.prepare_wal_overlay(embedding, fetch_limit, filter)?;
         self.search_prepared(embedding, fetch_limit, filter, &overlay)
     }
@@ -233,8 +288,8 @@ impl SemanticAnnShardSet {
         fetch_limit: usize,
         filter: Option<&dyn FsSearchFilter>,
     ) -> Result<WalCohortOverlay<'a>> {
-        if !wal_delta_fits_budget(self.artifacts.iter().map(|artifact| {
-            let index = artifact.index();
+        if !wal_delta_fits_budget(self.native_ordinals.iter().map(|&ordinal| {
+            let index = self.artifacts[ordinal].index();
             (index.wal_record_count(), index.dimension())
         })) {
             return Err(PendingWalDelta {
@@ -246,8 +301,8 @@ impl SemanticAnnShardSet {
         let mut overlay = HashMap::new();
         let mut scored = 0usize;
         let mut records = 0usize;
-        for (ordinal, artifact) in self.artifacts.iter().enumerate() {
-            let index = artifact.index();
+        for &ordinal in &self.native_ordinals {
+            let index = self.artifacts[ordinal].index();
             let count = index.wal_record_count();
             if count == 0 {
                 continue;
@@ -309,6 +364,49 @@ impl SemanticAnnShardSet {
         Ok(overlay)
     }
 
+    fn prepare_exact_partition(
+        &self,
+        context: &SemanticCandidateContext,
+        embedding: &[f32],
+        fetch_limit: usize,
+        filter: Option<&dyn FsSearchFilter>,
+    ) -> Result<Option<ExactPartition>> {
+        if self.exact_shards.is_empty() {
+            return Ok(None);
+        }
+        // Cloning an artifact retains the SAME already-open native vector owner.
+        // No path lookup, graph rebuild or mutable generation read occurs here.
+        let exact_context = SemanticCandidateContext {
+            artifacts: Arc::new(
+                self.exact_shards
+                    .iter()
+                    .map(|fallback| self.artifacts[fallback.shard].clone())
+                    .collect(),
+            ),
+            filter_maps: context.filter_maps.clone(),
+            roles: context.roles.clone(),
+        };
+        let started = std::time::Instant::now();
+        let (mut hits, retry) = SearchClient::search_exact_semantic_indexes(
+            &exact_context,
+            embedding,
+            fetch_limit,
+            filter,
+        )?;
+        let has_more_candidates = retry.has_more_candidates || hits.len() > fetch_limit;
+        hits.truncate(fetch_limit);
+        let receipt = AnnPartialExactStats {
+            shards: self.exact_shards.clone(),
+            search_time_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            returned_messages: hits.len(),
+        };
+        Ok(Some(ExactPartition {
+            hits,
+            has_more_candidates,
+            receipt,
+        }))
+    }
+
     /// Called only after request validation and complete delta preparation.
     /// Each shadow set is shard-local: a replacement in one artifact cannot
     /// erase a distinct current contribution from another retained artifact.
@@ -334,7 +432,7 @@ impl SemanticAnnShardSet {
         };
         let mut best_by_message = HashMap::new();
         let mut has_more_candidates = false;
-        for (ordinal, graph) in self.graphs.iter().enumerate() {
+        for (&ordinal, graph) in self.native_ordinals.iter().zip(&self.graphs) {
             let candidate = candidate_limit.min(graph.len());
             let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
             // Borrow the exact source selected at admission, never its path.
@@ -361,7 +459,35 @@ impl SemanticAnnShardSet {
                     continue;
                 }
                 if filter.is_none_or(|filter| filter.matches(&hit.doc_id, None)) {
-                    SearchClient::record_fs_semantic_hit(&mut best_by_message, hit);
+                    if self.exact_shards.is_empty() {
+                        SearchClient::record_fs_semantic_hit(&mut best_by_message, hit);
+                    } else {
+                        // Distance-to-score restoration can differ by an ULP
+                        // from exact FSVI scoring. Reuse the canonical row's
+                        // exact kernel before comparing native and exact hits.
+                        // This remains bounded by the admitted native windows.
+                        let started = std::time::Instant::now();
+                        let row = hit.index as usize;
+                        if source.is_deleted(row)
+                            || source.doc_id_at(row).ok() != Some(hit.doc_id.as_str())
+                        {
+                            return Err(NativeAnnSearchFailure::new(ordinal, stats).into());
+                        }
+                        let score = source
+                            .dot_query_at(row, embedding)
+                            .map_err(|_| NativeAnnSearchFailure::new(ordinal, stats.clone()))?;
+                        if !score.is_finite() {
+                            return Err(NativeAnnSearchFailure::new(ordinal, stats).into());
+                        }
+                        let mut canonical = hit.clone();
+                        canonical.score = score;
+                        SearchClient::record_fs_semantic_hit(&mut best_by_message, &canonical);
+                        let receipt = stats.candidate_rescore.get_or_insert_with(Default::default);
+                        receipt.candidates = receipt.candidates.saturating_add(1);
+                        receipt.search_time_us = receipt.search_time_us.saturating_add(
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        );
+                    }
                 }
             }
             if let Some(delta) = delta {

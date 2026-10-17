@@ -39,9 +39,29 @@ pub struct AnnExactFallbackStats {
     pub returned_messages: usize,
 }
 
+/// A shard whose optional accelerator was refused, not whose vectors were lost.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnnExactShardFallback {
+    /// Zero-based ordinal in the retained, ordered semantic cohort.
+    pub shard: usize,
+    pub reason: crate::search::vector_index::SemanticAnnUnavailableReason,
+}
+
+/// Exact work on only the unavailable shards, performed once before native
+/// refills. Native counters do not include these vectors, hits or elapsed time.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnnPartialExactStats {
+    pub shards: Vec<AnnExactShardFallback>,
+    pub search_time_us: u64,
+    /// Distinct candidates retained from the exact subset before global merge.
+    pub returned_messages: usize,
+}
+
 /// Statistics from an ANN search operation.
 ///
 /// These metrics help users understand the quality/speed tradeoff of approximate search.
+///
+/// Native calls, canonical rescoring and exact fallback have separate counters.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AnnSearchStats {
     /// Total vectors in the HNSW index.
@@ -73,6 +93,20 @@ pub struct AnnSearchStats {
     /// they exclude the failed call and are not totals for the complete cohort.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact_fallback: Option<AnnExactFallbackStats>,
+    /// Present for a mixed native/exact plan. This does not certify the native
+    /// ranking as exact and does not replace complete-cohort recovery above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_exact: Option<AnnPartialExactStats>,
+    /// Canonical rescoring of bounded native candidates in a mixed plan, using
+    /// the retained source's exact dot kernel rather than restored ANN distances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_rescore: Option<AnnCandidateRescoreStats>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AnnCandidateRescoreStats {
+    pub candidates: usize,
+    pub search_time_us: u64,
 }
 
 /// Default on-disk location for the HNSW index for a given embedder.
