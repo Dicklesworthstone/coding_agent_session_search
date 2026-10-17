@@ -22,8 +22,10 @@ use anyhow::{Context, Result, ensure};
 use std::path::PathBuf;
 
 mod pages;
+mod progress;
 mod selected;
 
+pub(crate) use progress::packet_embedding_inputs_from_storage_with_progress;
 pub(crate) use selected::{
     packet_embedding_inputs_from_storage_for_message_ids,
     packet_embedding_inputs_from_storage_since,

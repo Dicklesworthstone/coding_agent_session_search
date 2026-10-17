@@ -300,3 +300,334 @@ fn single_parent_replay_stays_scoped_and_stops_before_later_body_pages() -> Resu
     storage.close()?;
     Ok(())
 }
+
+#[test]
+fn direct_semantic_progress_precedes_an_unadmitted_corrupt_history_tail() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 1, pages::MAX_ROWS + 1)?;
+    storage.raw().execute(&format!(
+        "UPDATE messages SET role = X'00' WHERE idx = {}",
+        pages::MAX_ROWS,
+    ))?;
+    let mut progress = Vec::new();
+    let error = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |current, total| progress.push((current, total)),
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<FrankenError>().is_some());
+    assert!(
+        progress
+            .iter()
+            .filter(|&&(done, total)| done == 0 && total == 1)
+            .count()
+            >= 2,
+        "planning and real bounded message work must report before decoding the tail: {progress:?}"
+    );
+    assert!(
+        !progress.contains(&(1, 1)),
+        "failed replay cannot report completion"
+    );
+    let count: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM messages",
+        &[] as &[ParamValue],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(count, (pages::MAX_ROWS + 1) as i64);
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_progress_replay_includes_signed_canonical_parents() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 1, 1)?;
+    let agent: i64 = storage.raw().query_row_map(
+        "SELECT id FROM agents WHERE slug = 'codex'",
+        &[] as &[ParamValue],
+        |row| row.get_typed(0),
+    )?;
+    for id in [-1_i64, 0] {
+        storage.raw().execute_compat(
+            "INSERT INTO conversations(id, agent_id, source_id, external_id, source_path) VALUES (?1, ?2, 'local', ?3, ?4)",
+            &[ParamValue::from(id), ParamValue::from(agent), ParamValue::from(format!("direct-signed-{id}")), ParamValue::from(format!("/direct-signed/{id}.jsonl"))],
+        )?;
+        storage.raw().execute_compat(
+            "INSERT INTO messages(conversation_id, idx, role, content, created_at) VALUES (?1, 0, 'user', ?2, 1)",
+            &[ParamValue::from(id), ParamValue::from(format!("signed direct semantic evidence {id}"))],
+        )?;
+    }
+    let mut expected = Vec::new();
+    visit(
+        &storage,
+        |input| {
+            expected.push(input);
+            Ok(())
+        },
+        || Ok(()),
+    )?;
+    let mut progress = Vec::new();
+    let actual = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |current, total| progress.push((current, total)),
+    )?;
+    assert_eq!(
+        actual.len(),
+        3,
+        "a zero-initialized cursor must not skip legacy parents"
+    );
+    assert_eq!(signature(actual), signature(expected));
+    assert_eq!(progress.last(), Some(&(3, 3)));
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_progress_matches_legacy_content_and_actual_nonempty_parent_count() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), PARENT_PAGE_SIZE + 2, 3)?;
+    storage.raw().execute_compat(
+        "UPDATE messages SET content = ?1, role = 'tool' WHERE id = 1",
+        &[ParamValue::from(
+            "Unicode café 東京, complete tool evidence. ".repeat(1200),
+        )],
+    )?;
+    storage
+        .raw()
+        .execute("UPDATE messages SET content = '' WHERE conversation_id = 2")?;
+    let expected = engine::packet_embedding_inputs_from_storage_with_progress(&storage, |_, _| {})?;
+    let mut progress = Vec::new();
+    let actual = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |current, total| progress.push((current, total)),
+    )?;
+    assert_eq!(signature(actual), signature(expected));
+    assert_eq!(
+        progress.last(),
+        Some(&(PARENT_PAGE_SIZE + 2, PARENT_PAGE_SIZE + 2))
+    );
+    assert!(
+        progress
+            .windows(2)
+            .all(|w| w[0].0 <= w[1].0 && w[0].1 == w[1].1)
+    );
+    storage
+        .raw()
+        .execute("DELETE FROM messages WHERE conversation_id = 3")?;
+    let mut progress = Vec::new();
+    crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |current, total| progress.push((current, total)),
+    )?;
+    assert_eq!(
+        progress.last(),
+        Some(&(PARENT_PAGE_SIZE + 1, PARENT_PAGE_SIZE + 1)),
+        "stale nonempty tail hints must not inflate progress; blank parents still count"
+    );
+    assert!(!storage.raw().as_async().in_transaction());
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_progress_preserves_caller_transactions_on_success_and_unwind() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 1, pages::MAX_ROWS + 1)?;
+    storage.raw().execute("BEGIN")?;
+    let expected = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |_, _| {},
+    )?;
+    assert_eq!(expected.len(), pages::MAX_ROWS + 1);
+    assert!(storage.raw().as_async().in_transaction());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+            &storage,
+            |_, _| panic!("interrupt direct replay progress"),
+        );
+    }));
+    assert!(outcome.is_err());
+    assert!(
+        storage.raw().as_async().in_transaction(),
+        "borrowed transaction must remain caller-owned"
+    );
+    storage.raw().execute("ROLLBACK")?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+            &storage,
+            |_, _| panic!("interrupt owned replay snapshot"),
+        );
+    }));
+    assert!(outcome.is_err());
+    assert!(
+        !storage.raw().as_async().in_transaction(),
+        "owned snapshot must release on unwind"
+    );
+    assert_eq!(
+        crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+            &storage,
+            |_, _| {}
+        )?
+        .len(),
+        expected.len()
+    );
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_progress_snapshot_does_not_mix_concurrent_canonical_rewrites() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 2, 1)?;
+    let writer = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    let mut before = Vec::new();
+    visit(
+        &storage,
+        |input| {
+            before.push(input);
+            Ok(())
+        },
+        || Ok(()),
+    )?;
+    let mut changed = false;
+    let actual = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |_, _| {
+            if !changed {
+                writer.raw().execute("UPDATE messages SET content = 'later committed semantic snapshot evidence' WHERE id = 2").unwrap();
+                changed = true;
+            }
+        },
+    )?;
+    assert!(changed);
+    assert_eq!(signature(actual), signature(before));
+    assert!(!storage.raw().as_async().in_transaction());
+    let later = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |_, _| {},
+    )?;
+    assert!(
+        later
+            .iter()
+            .any(|input| input.content == "later committed semantic snapshot evidence")
+    );
+    writer.close()?;
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_progress_empty_archive_reports_no_fabricated_work() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), PARENT_PAGE_SIZE + 1, 0)?;
+    let mut progress = Vec::new();
+    let inputs = crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+        &storage,
+        |current, total| progress.push((current, total)),
+    )?;
+    assert!(inputs.is_empty());
+    assert_eq!(progress, vec![(0, 0)]);
+    assert!(!storage.raw().as_async().in_transaction());
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "subprocess measurement worker; invoked explicitly by paired memory test"]
+fn direct_semantic_memory_worker() -> Result<()> {
+    let root = std::env::var_os("CASS_DIRECT_REPLAY_MEMORY_ROOT").expect("measurement archive");
+    let mode = std::env::var("CASS_DIRECT_REPLAY_MEMORY_MODE").expect("measurement mode");
+    let storage = FrankenStorage::open_readonly(&PathBuf::from(root).join("archive.db"))?;
+    let started = std::time::Instant::now();
+    let inputs = match mode.as_str() {
+        "legacy" => {
+            engine::packet_embedding_inputs_from_storage_with_progress(&storage, |_, _| {})?
+        }
+        "bounded" => crate::indexer::semantic::packet_embedding_inputs_from_storage_with_progress(
+            &storage,
+            |_, _| {},
+        )?,
+        _ => anyhow::bail!("invalid measurement mode"),
+    };
+    let elapsed = started.elapsed().as_micros();
+    let mut digest = blake3::Hasher::new();
+    for input in &inputs {
+        let identity = engine::semantic_doc_id_for_input(input).context("measurement identity")?;
+        digest.update(&(identity.len() as u64).to_le_bytes());
+        digest.update(identity.as_bytes());
+        digest.update(&(input.content.len() as u64).to_le_bytes());
+        digest.update(input.content.as_bytes());
+    }
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let rss = status
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))
+        .context("Linux peak RSS")?
+        .split_whitespace()
+        .nth(1)
+        .context("peak RSS number")?;
+    println!(
+        "DIRECT_REPLAY_MEMORY mode={mode} inputs={} digest={} elapsed_us={elapsed} peak_rss_kib={rss}",
+        inputs.len(),
+        digest.finalize().to_hex()
+    );
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "paired synthetic history replay and RSS measurement; execute explicitly"]
+fn direct_semantic_paired_memory_measurement() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let messages = 4096;
+    let storage = database(temp.path(), 1, messages)?;
+    let text =
+        "canonical tool transcript evidence with complete context and Unicode 東京. ".repeat(220);
+    storage.raw().execute_compat(
+        "UPDATE messages SET content = ?1",
+        &[ParamValue::from(text)],
+    )?;
+    storage.close()?;
+    let mut reference = None;
+    for mode in ["legacy", "bounded", "bounded", "legacy"] {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--ignored",
+                "--exact",
+                "indexer::semantic::replay::tests::direct_semantic_memory_worker",
+                "--nocapture",
+            ])
+            .env("CASS_DIRECT_REPLAY_MEMORY_ROOT", temp.path())
+            .env("CASS_DIRECT_REPLAY_MEMORY_MODE", mode)
+            .env("CASS_SEMANTIC_STREAM_REPLAY", "1")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "measurement child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with("DIRECT_REPLAY_MEMORY "))
+            .context("measurement receipt")?;
+        let identity: Vec<_> = line
+            .split_whitespace()
+            .filter(|field| field.starts_with("inputs=") || field.starts_with("digest="))
+            .map(str::to_owned)
+            .collect();
+        if let Some(expected) = &reference {
+            assert_eq!(
+                &identity, expected,
+                "both modes must retain every canonical passage"
+            );
+        } else {
+            reference = Some(identity);
+        }
+        eprintln!("{line}");
+    }
+    Ok(())
+}
