@@ -293,8 +293,7 @@ pub mod vibe;
 pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
 
 /// Runtime factories that can retain the receiving archive's state directory.
-pub(crate) type ArchiveConnectorFactory =
-    Box<dyn Fn() -> Box<dyn Connector + Send> + Send + Sync>;
+pub(crate) type ArchiveConnectorFactory = Box<dyn Fn() -> Box<dyn Connector + Send> + Send + Sync>;
 
 fn claude_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(claude_code::ClaudeCodeConnector::new())

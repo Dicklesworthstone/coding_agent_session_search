@@ -118,13 +118,7 @@ impl Connector for CodexConnector {
             let source = source
                 .as_ref()
                 .context("Codex delivery has no admitted source boundary")?;
-            layout_identity::deliver(
-                archive_data_dir,
-                ctx,
-                source,
-                conversation,
-                on_conversation,
-            )
+            layout_identity::deliver(archive_data_dir, ctx, source, conversation, on_conversation)
         };
         // Recovery normalizes the physical source's directory identity before
         // delivery. Receipt proof and canonicalization must finish before the
