@@ -48,7 +48,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.4.9. 0.3.15 was evaluated on
+        // migration, bead bo000; now at 0.4.12. 0.3.15 was evaluated on
         // 2026-09-02 (bead gh382-fsqlite-pin) and NOT adopted: cass's own
         // writable open still looped on a large archive with a large WAL
         // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo).
@@ -87,11 +87,15 @@ const CONTRACTS: &[DependencyContract] = &[
         // refuses that index promptly again (48c6cf6b2) and lets the first
         // write after stock SQLite's empty, unindexed WAL index establish the
         // WAL generation instead of failing BusyRecovery forever (GH#443,
-        // cass#509).
+        // cass#509). 0.4.12 carries the 0.4.10 data-integrity advisory fix
+        // (stale retained right-edge leaf corrupting a table b-tree on
+        // explicit-transaction inserts, bd-obwsy), ROLLBACK returning
+        // reserved AUTOINCREMENT rowids (bd-gwoit) and reading a WAL a stock
+        // writer truncated to zero bytes as empty (bd-yxqs9, cass GH#519).
         // fsqlite resolves from crates.io at the exact version below.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.9",
+        expected_version: "0.4.12",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -109,10 +113,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // The 0.4.9 release publishes the entire family at one version.
+        // The 0.4.12 release publishes the entire family at one version.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.9",
+        expected_version: "0.4.12",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -130,7 +134,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Match the production shared types from the published family.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.9",
+        expected_version: "0.4.12",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -605,7 +609,7 @@ fn validate_path_dependency_contracts(
 
 fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
     // The fsqlite engine family must resolve exclusively from crates.io at
-    // the uniform published 0.4.9 version, including the shared types.
+    // the uniform published 0.4.12 version, including the shared types.
     // One source per package remains load-bearing for read-only integrity.
     const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -674,7 +678,7 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
         if !(name == "fsqlite" || name.starts_with("fsqlite-")) {
             continue;
         }
-        let expected_version = "0.4.9";
+        let expected_version = "0.4.12";
         let version = package.get("version").and_then(Value::as_str).unwrap_or("");
         if !seen.insert(name) {
             violations.push(format!(

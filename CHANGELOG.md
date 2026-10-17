@@ -150,6 +150,18 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   run, the rebuild never finished and a new quarantine directory appeared
   each time. A killed rebuild now resumes from its last commit. Checkpoints
   written by earlier versions are read the same way.
+- **SQLite engine data-integrity fixes: FrankenSQLite 0.4.12 (#516).** The
+  pinned 0.4.9, and the 0.4.6 that v0.10.0 ships, are on the 0.4.10
+  advisory's affected list: inserts inside an explicit transaction could
+  append through a stale retained right-edge leaf and corrupt a table b-tree
+  (stock `integrity_check` then reports `Rowid N out of order`). Every
+  `cass index` batch writes variable-width rows inside explicit
+  transactions. 0.4.12 also gives back the AUTOINCREMENT rowids a
+  rolled-back transaction reserved, reads a WAL that a stock SQLite writer
+  truncated to zero bytes as empty instead of corrupt (the OpenCode export
+  path in #519), seeks indexes for `IN (...)` lists and
+  `k = ? ORDER BY id`, and keeps explicit-rowid writes working in a table
+  that holds the largest rowid.
 
 - **`cass timeline` and `cass sessions` read `--since`/`--until` the way
   `cass search` does.** Timeline understood only dates, `today`,
