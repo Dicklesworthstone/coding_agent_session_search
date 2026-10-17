@@ -34439,8 +34439,19 @@ pub mod persist {
                 })
             },
         )?;
-        let origin_kind =
-            crate::search::tantivy::normalized_index_origin_kind(&canonical.source_id, None);
+        // Use the registered kind, as a full rebuild's source map does. Without
+        // it, a local source named anything but `local` (GH #524's
+        // `full-history-plan`) was replayed as remote and dropped out of
+        // local-only keyword searches.
+        let registered_kind = storage
+            .get_source(&canonical.source_id)?
+            .map(|source| source.kind);
+        let origin_kind = crate::search::tantivy::normalized_index_origin_kind(
+            &canonical.source_id,
+            registered_kind
+                .as_ref()
+                .map(crate::sources::provenance::SourceKind::as_str),
+        );
         canonical.metadata_json = serde_json::json!({
             "cass": {
                 "origin": {
@@ -34457,11 +34468,16 @@ pub mod persist {
         conversation: &Conversation,
         messages: Vec<Message>,
     ) -> ConversationPacket {
+        // The envelope canonical_lexical_conversation synthesized already
+        // carries the registered kind.
         let provenance = ConversationPacketProvenance {
             source_id: conversation.source_id.clone(),
             origin_kind: crate::search::tantivy::normalized_index_origin_kind(
                 &conversation.source_id,
-                None,
+                conversation
+                    .metadata_json
+                    .pointer("/cass/origin/kind")
+                    .and_then(serde_json::Value::as_str),
             ),
             origin_host: conversation.origin_host.clone(),
         };
@@ -37991,6 +38007,85 @@ pub mod persist {
             for route in 0..3 {
                 assert_gh466_canonical_prefix_cap("claude_code", route, false);
             }
+        }
+
+        /// lk524 (GH #524 follow-up): canonical replay labels a conversation
+        /// with its registered source kind, as a full rebuild's source map
+        /// does. A local source named anything but `local` replayed as remote.
+        #[test]
+        fn canonical_replay_uses_the_registered_source_kind() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let mut named_local = Source::local();
+            named_local.id = "full-history-plan".into();
+            storage.upsert_source(&named_local).unwrap();
+            storage
+                .upsert_source(&Source::remote("laptop", "laptop.example"))
+                .unwrap();
+            let mut index = TantivyIndex::open_or_create(&dir.path().join("index")).unwrap();
+            let mut expected = Vec::new();
+            // Origins as the connectors record them; the replay must not
+            // depend on that stored metadata, which it does not read.
+            for (source_id, origin, kind) in [
+                (
+                    "full-history-plan",
+                    serde_json::json!({"source_id": "full-history-plan", "kind": "local"}),
+                    "local",
+                ),
+                (
+                    "laptop",
+                    serde_json::json!({"source_id": "laptop", "kind": "ssh", "host": "laptop.example"}),
+                    "remote",
+                ),
+                (
+                    "local",
+                    serde_json::json!({"source_id": "local", "kind": "local"}),
+                    "local",
+                ),
+            ] {
+                let conv = NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(format!("{source_id}-session")),
+                    title: Some(source_id.into()),
+                    workspace: None,
+                    source_path: dir.path().join(format!("{source_id}.jsonl")),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_001),
+                    metadata: serde_json::json!({"cass": {"origin": origin}}),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000),
+                        content: format!("{source_id} provenance probe"),
+                        extra: serde_json::json!({}),
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    }],
+                };
+                persist_conversation(&storage, &mut index, &conv).unwrap();
+                expected.push((source_id.to_string(), kind.to_string()));
+            }
+            let ids: Vec<i64> = storage
+                .raw()
+                .query_map_collect("SELECT id FROM conversations ORDER BY id", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            let replayed: Vec<(String, String)> = ids
+                .into_iter()
+                .map(|id| {
+                    let conversation = canonical_lexical_conversation(&storage, id).unwrap();
+                    let envelope = conversation.metadata_json["cass"]["origin"]["kind"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let packet = canonical_lexical_packet(&conversation, Vec::new());
+                    assert_eq!(packet.payload.provenance.origin_kind, envelope);
+                    (conversation.source_id, envelope)
+                })
+                .collect();
+            assert_eq!(replayed, expected);
         }
 
         /// bgn6s: an inline replay reads a conversation one bounded chunk at

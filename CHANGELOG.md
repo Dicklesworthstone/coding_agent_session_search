@@ -101,6 +101,14 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   provider unavailable and left the ready, in-progress and blocked counts
   unknown. br 0.7.x keeps the JSON shape the reader parses, and it is now
   accepted. Other versions are still refused.
+- **Keyword search keeps a named local source local (#524).** A configured
+  local source with its own name (anything but `local`) was labelled remote
+  when an incremental index run or `cass index --watch-once` replayed its
+  sessions into the lexical index, so local-only keyword searches missed
+  them. A lexical rebuild labelled them correctly. Both paths now use the
+  source's registered kind. Sessions indexed before the fix keep the remote
+  label until `cass index --full --force-rebuild` rebuilds the lexical index;
+  plain `--full` leaves an up-to-date index as it is.
 - **`cass mirror prune` reclaims capture staging left by killed captures
   (#523).** A `cass index` run killed mid-capture (for example by `timeout`)
   left its `raw-mirror/v1/tmp/capture.*` staging behind, and nothing removed
