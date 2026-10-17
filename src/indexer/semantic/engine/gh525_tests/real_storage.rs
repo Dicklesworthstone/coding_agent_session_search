@@ -264,7 +264,10 @@ fn gh525_message_cursor_filters_before_accounting_and_empty_histories_do_not_spe
     )?;
     assert_eq!(loads, ids);
     assert!(empty.conversations.is_empty() && empty.grouped_messages.is_empty());
-    assert_eq!(empty.last_conversation_id, None);
+    // Every candidate was read and filtered empty, so the cursor advances past
+    // the last one without claiming documents (c119b343; the synthetic
+    // inspected_empty_or_filtered_pages_advance_without_claiming_documents).
+    assert_eq!(empty.last_conversation_id, Some(ids[2]));
     assert!(!empty.stopped_before_candidate);
     storage.close()?;
     Ok(())
