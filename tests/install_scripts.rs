@@ -1624,9 +1624,17 @@ fn verify_flag_rejects_a_binary_whose_version_probe_fails() {
 #[test]
 fn powershell_verify_contract_fails_closed_on_native_command_errors() {
     let script = fs::read_to_string("install.ps1").expect("read install.ps1");
+    // A bare `$LASTEXITCODE = $null` in a script run as a file creates a
+    // script-scope variable that hides the global one native commands set, so
+    // the self-test read $null and failed after every good install when cass
+    // self-update ran it (`& install.ps1`, GH #381 Windows).
+    assert!(
+        !script.contains("$LASTEXITCODE = $null") && !script.contains("= $LASTEXITCODE"),
+        "the verify step must use $global:LASTEXITCODE, not a script-scope shadow"
+    );
     for required in [
-        "$LASTEXITCODE = $null",
-        "$verifyExitCode = $LASTEXITCODE",
+        "$global:LASTEXITCODE = $null",
+        "$verifyExitCode = $global:LASTEXITCODE",
         "if ($null -eq $verifyExitCode)",
         "did not report an exit code",
         "if ($verifyExitCode -ne 0)",

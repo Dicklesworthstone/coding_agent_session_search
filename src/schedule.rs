@@ -11,8 +11,8 @@
 //! * **nightly** (default 03:00 local): remote syncs that are due, a full
 //!   `cass index --full --background`, then bounded semantic backfill batches
 //!   (`cass models backfill --scheduled --max-batches N`) in one worker per
-//!   tier — first the fast (hash) tier, then
-//!   the quality (MiniLM) tier when the model is installed — until the
+//!   tier — resume the pending checkpoint's owner first, otherwise start with
+//!   the fast (hash) tier, then the configured quality tier — until the
 //!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
 //! Priority is delegated to the OS: launchd uses `Nice=15` without
@@ -1150,10 +1150,10 @@ fn run_job_with_gate(
         let prerequisites_ok = steps.iter().all(|step| step.ok);
 
         // 3. Semantic backfill (nightly only). Two tiers: the fast (hash)
-        // tier needs no model files; the quality (MiniLM) tier only runs
-        // when the model is installed — requesting it without the model
-        // fails with a model-domain exit code, which must read as "tier not
-        // available", never as a failed nightly.
+        // tier needs no model files. The local quality tier requires an
+        // installed model; its missing-assets exit is an optional tier skip.
+        // Explicit external quality selection is different: endpoint failures
+        // must fail the nightly rather than masquerading as successful work.
         if full {
             if !cfg.semantic {
                 steps.push(skipped_step(
@@ -1171,18 +1171,40 @@ fn run_job_with_gate(
                     "source sync or indexing failed; semantic backfill requires a successful run",
                 ));
             } else {
-                let (probe, model_installed) =
-                    minilm_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
+                let (probe, model_installed, quality_policy) =
+                    quality_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
+                let external_quality = crate::search::embedder_registry::selects_external(Some(
+                    &quality_policy.quality_tier_embedder,
+                ));
                 steps.push(probe);
-                let mut tiers = vec!["fast"];
-                if model_installed {
-                    tiers.push("quality");
-                } else {
+                if !model_installed {
                     steps.push(skipped_step(
                         "semantic-backfill:quality",
                         "MiniLM model not installed (`cass models install`); quality tier skipped",
                     ));
                 }
+                let tiers = match nightly_backfill_order(&cfg.data_dir, model_installed, || {
+                    scheduled_quality_identity(&cfg.data_dir, &quality_policy)
+                }) {
+                    Ok(tiers) => tiers,
+                    Err(reason) => {
+                        steps.push(StepReport {
+                            name: "semantic-backfill-plan".to_string(),
+                            argv: Vec::new(),
+                            exit_code: None,
+                            ok: false,
+                            duration_ms: 0,
+                            skipped_reason: None,
+                            result: Some(serde_json::json!({
+                                "status": "failed",
+                                "reason": "semantic_checkpoint_resume_required",
+                                "semantic_workers_started": false,
+                            })),
+                            stderr_tail: Some(reason),
+                        });
+                        Vec::new()
+                    }
+                };
                 let mut batches = 0u32;
                 for tier in tiers {
                     let remaining = cfg.max_backfill_batches - batches;
@@ -1193,7 +1215,7 @@ fn run_job_with_gate(
                         ));
                         break;
                     }
-                    let args = vec![
+                    let mut args = vec![
                         "--db".to_string(),
                         cfg.db_path.display().to_string(),
                         "--color=never".to_string(),
@@ -1208,12 +1230,20 @@ fn run_job_with_gate(
                         cfg.data_dir.display().to_string(),
                         "--json".to_string(),
                     ];
+                    if tier == "fast" {
+                        args.extend(["--embedder".to_string(), "hash".to_string()]);
+                    } else if external_quality {
+                        // Pin the selected provider in the worker invocation so
+                        // a configured endpoint failure cannot be mistaken for
+                        // an optional missing local model. Credentials stay in env.
+                        args.extend(["--embedder".to_string(), "external".to_string()]);
+                    }
                     let mut step = run_step(
                         &format!("semantic-backfill:{tier}:{}", batches + 1),
                         &cfg.binary,
                         &cfg.data_dir,
                         &args,
-                        &[],
+                        &[(crate::indexer::semantic::SCHEDULE_PRESERVE_CHECKPOINT, "1")],
                         log.as_mut(),
                     );
                     let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
@@ -1231,14 +1261,9 @@ fn run_job_with_gate(
                         break;
                     };
                     batches += attempted;
-                    let paused = step.result.as_ref().is_some_and(|result| {
-                        matches!(
-                            result.get("status").and_then(serde_json::Value::as_str),
-                            Some("paused" | "disabled")
-                        )
-                    });
+                    let stop = backfill_worker_retains_tier(&step);
                     steps.push(step);
-                    if paused {
+                    if stop {
                         break;
                     }
                 }
@@ -1317,7 +1342,16 @@ const MODEL_UNAVAILABLE_EXIT_CODES: [i32; 6] = [15, 20, 21, 22, 23, 24];
 /// into a skipped (non-failing) step. Returns true when the conversion
 /// applied, which also ends that tier's loop.
 pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
-    if step.ok {
+    // Endpoint consent, configuration, preflight and transport failures are
+    // failures of an explicitly requested job, not optional asset discovery.
+    let external = step.argv.windows(2).any(|pair| {
+        pair[0] == "--embedder"
+            && crate::search::embedder_registry::selects_external(Some(&pair[1]))
+    }) || step.argv.iter().any(|arg| {
+        arg.strip_prefix("--embedder=")
+            .is_some_and(|name| crate::search::embedder_registry::selects_external(Some(name)))
+    });
+    if external || step.ok {
         return false;
     }
     let Some(code) = step.exit_code else {
@@ -1328,7 +1362,7 @@ pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
     }
     step.ok = true;
     step.skipped_reason = Some(format!(
-        "semantic model unavailable (exit {code}); run `cass models install` to enable this tier"
+        "semantic provider unavailable (exit {code}); check the worker diagnostic and external consent/configuration, or run `cass models install` for the selected local model"
     ));
     true
 }
@@ -1341,27 +1375,188 @@ pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
         return false;
     }
     step.ok = false;
-    // Exit 7 also covers a background run that deferred the one-time storage
-    // migration repair (GH #450); name the cause the child reported.
+    // Exit 7 covers several causes; name the one the child reported. Only a
+    // child that saw another index run holding the lock is contention
+    // (GH #509: a database stuck in WAL-index recovery was reported as a
+    // held lock, so a permanently failing schedule read as a benign skip).
+    let message = step_error_field(step, "/error/message").unwrap_or_default();
     step.skipped_reason = Some(
-        if step_error_kind(step).as_deref() == Some("migration-repair-pending") {
+        if step_error_field(step, "/error/kind").as_deref() == Some("migration-repair-pending") {
             "the archive still needs its one-time storage migration repair; run `cass index --full` in the foreground".to_string()
-        } else {
+        } else if message.contains("another 'cass index' run is already active")
+            || message.contains("another cass index process already holds")
+        {
             "another index run already holds the index lock; skipped this cycle".to_string()
+        } else if message.contains("canonical database is busy/locked") {
+            format!(
+                "the index run failed: the canonical database stayed busy and no other index run held the lock: {}",
+                bounded_reason(&message)
+            )
+        } else if message.is_empty() {
+            "the index run exited 7 (busy) without an error message; see stderr_tail".to_string()
+        } else {
+            format!(
+                "the index run exited 7 (busy): {}",
+                bounded_reason(&message)
+            )
         },
     );
     true
 }
 
-/// `error.kind` from the last JSON error envelope a step wrote to stderr.
-fn step_error_kind(step: &StepReport) -> Option<String> {
+/// A field from the last JSON error envelope a step wrote to stderr.
+fn step_error_field(step: &StepReport, pointer: &str) -> Option<String> {
     step.stderr_tail.as_deref()?.lines().rev().find_map(|line| {
         serde_json::from_str::<serde_json::Value>(line.trim())
             .ok()?
-            .pointer("/error/kind")?
+            .pointer(pointer)?
             .as_str()
             .map(str::to_owned)
     })
+}
+
+/// The first 300 characters of a child's error message, for a step reason.
+fn bounded_reason(message: &str) -> String {
+    let mut reason: String = message.chars().take(300).collect();
+    if reason.len() < message.len() {
+        reason.push('…');
+    }
+    reason
+}
+
+/// External selection is explicit policy, not discovery of a configured URL.
+/// The quality worker enforces consent and preflight; planning sends no text.
+fn quality_model_probe(
+    binary: &Path,
+    data_dir: &Path,
+    log: Option<&mut File>,
+) -> (StepReport, bool, crate::search::policy::SemanticPolicy) {
+    let policy = crate::search::policy::SemanticPolicy::resolve(
+        &crate::search::policy::CliSemanticOverrides::default(),
+    );
+    let (step, available) =
+        quality_model_probe_with_policy(&policy, || minilm_model_probe(binary, data_dir, log));
+    (step, available, policy)
+}
+
+/// Resolve only the explicitly selected producer's identity; never create an
+/// HTTP client or load model weights. Called lazily for a quality checkpoint.
+fn scheduled_quality_identity(
+    data_dir: &Path,
+    policy: &crate::search::policy::SemanticPolicy,
+) -> Result<String, String> {
+    use crate::search::embedder_registry::{EmbedderRegistry, selects_external};
+    use crate::search::external_embedder::ExternalEmbeddingConfig;
+
+    if selects_external(Some(&policy.quality_tier_embedder)) {
+        return ExternalEmbeddingConfig::from_env()
+            .map_err(|error| error.to_string())?
+            .map(|config| config.identity())
+            .ok_or_else(|| {
+                "external_disabled: consent is required to resume the external checkpoint".into()
+            });
+    }
+    // Match the CLI's default resolution, including its legacy fastembed alias.
+    let name = if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        "hash"
+    } else {
+        crate::search::fastembed_embedder::FastEmbedder::canonical_name(
+            &policy.quality_tier_embedder,
+        )
+        .unwrap_or("minilm")
+    };
+    EmbedderRegistry::new(data_dir)
+        .get(name)
+        .map(|info| info.id.to_string())
+        .ok_or_else(|| "the selected quality provider has no registered identity".into())
+}
+
+/// The legacy manifest has one checkpoint slot for both tiers. Starting fast
+/// unconditionally can replace an interrupted quality build and authorize GC
+/// of its staged vectors. Resume its owner first; a changed/disabled producer
+/// is an explicit refusal, not permission to run another tier.
+fn nightly_backfill_order(
+    data_dir: &Path,
+    quality_available: bool,
+    quality_identity: impl FnOnce() -> Result<String, String>,
+) -> Result<Vec<&'static str>, String> {
+    use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+
+    let checkpoint = SemanticManifest::load(data_dir)
+        .map_err(|_| {
+            "cannot read the durable semantic checkpoint; no semantic worker was started; repair the ledger before retrying".to_string()
+        })?
+        .and_then(|manifest| manifest.checkpoint);
+    if let Some(checkpoint) = checkpoint {
+        let expected = match checkpoint.tier {
+            TierKind::Fast => "fnv1a-384".to_string(),
+            TierKind::Quality => {
+                if !quality_available {
+                    return Err("unfinished quality checkpoint retained: its provider is unavailable; restore it before starting another tier".into());
+                }
+                quality_identity()
+                    .map_err(|reason| format!("unfinished quality checkpoint retained: {reason}"))?
+            }
+        };
+        if checkpoint.embedder_id != expected {
+            return Err("unfinished semantic checkpoint retained: selected provider differs from its owner; resume with the original provider configuration before switching tiers".into());
+        }
+        if checkpoint.tier == TierKind::Quality {
+            // Do not reject an old DB fingerprint here. Its matching owner
+            // must reconcile canonical edits/additions through the normal path.
+            return Ok(vec!["quality", "fast"]);
+        }
+    }
+    Ok(if quality_available {
+        vec!["fast", "quality"]
+    } else {
+        vec!["fast"]
+    })
+}
+
+fn backfill_worker_retains_tier(step: &StepReport) -> bool {
+    // Even with unused budget, a worker that stopped on a checkpoint has not
+    // released the single cursor slot. Pauses/disablement keep the same rule.
+    step.result.as_ref().is_some_and(|result| {
+        matches!(
+            result.get("status").and_then(serde_json::Value::as_str),
+            Some("paused" | "disabled" | "checkpointed")
+        )
+    })
+}
+
+fn quality_model_probe_with_policy(
+    policy: &crate::search::policy::SemanticPolicy,
+    local_probe: impl FnOnce() -> (StepReport, bool),
+) -> (StepReport, bool) {
+    if policy
+        .quality_tier_embedder
+        .trim()
+        .eq_ignore_ascii_case("hash")
+    {
+        return (
+            skipped_step(
+                "models-status",
+                "hash quality provider requires no model files",
+            ),
+            true,
+        );
+    }
+    if crate::search::embedder_registry::selects_external(Some(&policy.quality_tier_embedder)) {
+        (
+            skipped_step(
+                "models-status",
+                "external quality provider explicitly selected; consent and preflight are checked by the backfill worker",
+            ),
+            true,
+        )
+    } else {
+        local_probe()
+    }
 }
 
 /// Probe whether the MiniLM model is installed via `models status --json`.
@@ -1725,6 +1920,203 @@ mod tests {
     }
 
     #[test]
+    fn external_quality_schedule_does_not_require_minilm_or_probe_http() {
+        let mut policy = crate::search::policy::SemanticPolicy::compiled_defaults();
+        policy.quality_tier_embedder = "external".into();
+        let (step, admitted) = quality_model_probe_with_policy(&policy, || {
+            panic!("external scheduling must not probe local assets")
+        });
+        assert!(admitted);
+        assert!(
+            step.skipped_reason
+                .unwrap()
+                .contains("consent and preflight")
+        );
+        policy.quality_tier_embedder = "hash".into();
+        let (_, admitted) = quality_model_probe_with_policy(&policy, || {
+            panic!("an explicit hash quality checkpoint needs no model files")
+        });
+        assert!(admitted);
+        policy.quality_tier_embedder = "minilm".into();
+        let (_, admitted) = quality_model_probe_with_policy(&policy, || {
+            (skipped_step("models-status", "missing local model"), false)
+        });
+        assert!(!admitted, "the default must retain local model admission");
+    }
+
+    fn checkpoint_fixture(
+        data_dir: &Path,
+        tier: crate::search::semantic_manifest::TierKind,
+        id: &str,
+    ) {
+        use crate::search::semantic_manifest::{BuildCheckpoint, SemanticManifest};
+        let mut manifest = SemanticManifest {
+            checkpoint: Some(BuildCheckpoint {
+                tier,
+                embedder_id: id.into(),
+                last_offset: 1,
+                docs_embedded: 1,
+                conversations_processed: 1,
+                total_conversations: 3,
+                db_fingerprint: "previous-canonical-snapshot".into(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                saved_at_ms: 1,
+                last_message_id: Some(1),
+                cursor_exhausted: false,
+            }),
+            ..SemanticManifest::default()
+        };
+        manifest.save(data_dir).unwrap();
+    }
+
+    #[test]
+    fn nightly_default_and_fast_resume_do_not_resolve_external_configuration() {
+        use crate::search::semantic_manifest::TierKind;
+        let dir = tempfile::tempdir().unwrap();
+        for quality in [false, true] {
+            let expected = if quality {
+                vec!["fast", "quality"]
+            } else {
+                vec!["fast"]
+            };
+            assert_eq!(
+                nightly_backfill_order(dir.path(), quality, || panic!("no quality checkpoint"))
+                    .unwrap(),
+                expected
+            );
+        }
+        checkpoint_fixture(dir.path(), TierKind::Fast, "fnv1a-384");
+        assert_eq!(
+            nightly_backfill_order(dir.path(), true, || panic!("fast checkpoint is local"))
+                .unwrap(),
+            ["fast", "quality"]
+        );
+    }
+
+    #[test]
+    fn nightly_resumes_quality_before_fast_without_rewriting_the_checkpoint() {
+        use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["minilm-384", "external-fixture-identity"] {
+            checkpoint_fixture(dir.path(), TierKind::Quality, id);
+            let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+            let mut lookups = 0;
+            assert_eq!(
+                nightly_backfill_order(dir.path(), true, || {
+                    lookups += 1;
+                    Ok(id.to_string())
+                })
+                .unwrap(),
+                ["quality", "fast"]
+            );
+            assert_eq!(lookups, 1);
+            assert_eq!(
+                std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn nightly_foreign_or_unavailable_checkpoint_owner_blocks_all_tiers() {
+        use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+        let dir = tempfile::tempdir().unwrap();
+        checkpoint_fixture(dir.path(), TierKind::Quality, "original-external-identity");
+        let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
+        assert!(nightly_backfill_order(dir.path(), false, || panic!("missing provider")).is_err());
+        for id in [
+            "minilm-384",
+            "fnv1a-384",
+            "another-model-or-endpoint-identity",
+        ] {
+            assert!(nightly_backfill_order(dir.path(), true, || Ok(id.into())).is_err());
+        }
+        assert!(
+            nightly_backfill_order(dir.path(), true, || Err("external_disabled".into()))
+                .unwrap_err()
+                .contains("external_disabled")
+        );
+        assert_eq!(
+            std::fs::read(SemanticManifest::path(dir.path())).unwrap(),
+            before
+        );
+        checkpoint_fixture(dir.path(), TierKind::Fast, "not-the-hash-space");
+        assert!(nightly_backfill_order(dir.path(), true, || panic!("foreign fast owner")).is_err());
+    }
+
+    #[test]
+    fn nightly_corrupt_ledger_never_becomes_permission_to_start_fast() {
+        use crate::search::semantic_manifest::SemanticManifest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = SemanticManifest::path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{truncated checkpoint").unwrap();
+        assert!(
+            nightly_backfill_order(dir.path(), true, || panic!("unreadable checkpoint")).is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"{truncated checkpoint");
+    }
+
+    #[test]
+    fn nightly_checkpointed_worker_does_not_release_the_cursor_slot() {
+        for (status, stop) in [
+            ("checkpointed", true),
+            ("paused", true),
+            ("disabled", true),
+            ("published", false),
+            ("unchanged", false),
+            ("idle", false),
+        ] {
+            let mut step = skipped_step("semantic-backfill", "fixture");
+            step.result = Some(serde_json::json!({"status": status}));
+            assert_eq!(backfill_worker_retains_tier(&step), stop, "{status}");
+        }
+    }
+
+    #[test]
+    fn nightly_local_checkpoint_identity_matches_cli_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = crate::search::policy::SemanticPolicy::compiled_defaults();
+        for (name, id) in [
+            ("minilm", "minilm-384"),
+            ("fastembed", "minilm-384"),
+            ("multilingual-minilm", "multilingual-minilm-384"),
+            ("HASH", "fnv1a-384"),
+            ("unrecognized-policy", "minilm-384"),
+        ] {
+            policy.quality_tier_embedder = name.into();
+            assert_eq!(scheduled_quality_identity(dir.path(), &policy).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn explicit_external_failures_remain_failures_not_optional_model_skips() {
+        for code in [15, 20, 21, 22, 23, 24, 5, 130, 143] {
+            for selection in [vec!["--embedder", "external"], vec!["--embedder=external"]] {
+                let mut step = StepReport {
+                    name: "semantic-backfill:quality:2".into(),
+                    argv: ["cass", "models", "backfill", "--tier", "quality"]
+                        .into_iter()
+                        .chain(selection)
+                        .map(str::to_owned)
+                        .collect(),
+                    exit_code: Some(code),
+                    ok: false,
+                    duration_ms: 10,
+                    skipped_reason: None,
+                    result: Some(serde_json::json!({"status": "failed", "batches_completed": 1})),
+                    stderr_tail: Some("external_http_503: checkpoint retained".into()),
+                };
+                let before = serde_json::to_value(&step).unwrap();
+                assert!(!soften_model_unavailable_backfill_step(&mut step), "{code}");
+                assert_eq!(serde_json::to_value(&step).unwrap(), before);
+                assert!(!step.ok);
+            }
+        }
+    }
+
+    #[test]
     fn model_unavailable_backfill_batches_soften_to_skips() {
         let step = |exit: Option<i32>, ok: bool| StepReport {
             name: "b".into(),
@@ -1793,10 +2185,39 @@ mod tests {
         let reason = deferred.skipped_reason.unwrap();
         assert!(reason.contains("migration repair"), "{reason}");
         assert!(reason.contains("cass index --full"), "{reason}");
-        let mut locked =
-            with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
+        let mut locked = with_stderr(
+            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"another 'cass index' run is already active for data dir /d (pid 42)\",\"retryable\":true}}",
+        );
         assert!(soften_busy_index_step(&mut locked));
         assert!(locked.skipped_reason.unwrap().contains("index lock"));
+        let mut held = with_stderr(
+            "{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed: another cass index process already holds /d/index-run.lock\",\"retryable\":true}}",
+        );
+        assert!(soften_busy_index_step(&mut held));
+        assert!(held.skipped_reason.unwrap().contains("index lock"));
+
+        // GH #509: the same exit 7 and kind from a database stuck in
+        // WAL-index recovery is not lock contention, and says what failed.
+        let mut stuck = with_stderr(
+            "ERROR group-commit callback failed\n{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"message\":\"index failed because the canonical database is busy/locked: ephemeral writer preflight write failed for serial batched indexing | database is busy (recovery in progress)\",\"retryable\":true}}",
+        );
+        assert!(soften_busy_index_step(&mut stuck));
+        assert!(!stuck.ok);
+        let reason = stuck.skipped_reason.unwrap();
+        assert!(!reason.contains("index lock"), "{reason}");
+        assert!(
+            reason.contains("no other index run held the lock"),
+            "{reason}"
+        );
+        assert!(reason.contains("recovery in progress"), "{reason}");
+
+        // Without a message the step claims no cause at all.
+        let mut bare =
+            with_stderr("{\"error\":{\"code\":7,\"kind\":\"index-busy\",\"retryable\":true}}");
+        assert!(soften_busy_index_step(&mut bare));
+        let reason = bare.skipped_reason.unwrap();
+        assert!(!reason.contains("index lock"), "{reason}");
+        assert!(reason.contains("stderr_tail"), "{reason}");
     }
 
     #[test]

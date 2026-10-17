@@ -1853,7 +1853,7 @@ fn write_export_publish_journal(
     Ok(journal)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(all(not(windows), test))]
 fn remove_export_publish_journal(
     final_path: &Path,
     expected_journal: &ExportPublishJournal,

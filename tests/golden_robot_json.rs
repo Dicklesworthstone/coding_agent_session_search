@@ -472,6 +472,9 @@ fn normalize_live_robot_values(value: &mut Value) {
                     topology.insert("source".to_string(), json!("fallback"));
                     topology.insert("memory_total_bytes".to_string(), Value::Null);
                     topology.insert("memory_available_bytes".to_string(), Value::Null);
+                    // Host RAM and the process's cgroup path differ per runner.
+                    topology.insert("host_memory_total_bytes".to_string(), Value::Null);
+                    topology.insert("memory_limit_source".to_string(), Value::Null);
                 }
                 if let Some(policy) = map
                     .get_mut("reserved_core_policy")
@@ -495,6 +498,15 @@ fn normalize_live_robot_values(value: &mut Value) {
                         "no /sys-derived CPU locality assumptions are made in fallback mode"
                     ]),
                 );
+            }
+            // The governor's resident-memory observation (92bee6cf, cc79e80b)
+            // is omitted until the sampler has run, and once present its
+            // figures follow host RAM, this process's RSS and the live policy
+            // decision. Like last_snapshot, it is a live sample: present or
+            // not, it becomes a placeholder, or the golden fails on every host
+            // but the one that wrote it.
+            if map.contains_key("recent_decisions") && map.contains_key("calibration") {
+                map.insert("memory".to_string(), json!("[LIVE_SAMPLE]"));
             }
             let redact_result_content = map.contains_key("source_path")
                 && map.contains_key("line_number")
@@ -742,7 +754,9 @@ fn live_value_scrubbing_normalizes_host_topology_without_erasing_its_shape() {
                 "llc_groups": 4,
                 "smt_threads_per_core": 2,
                 "memory_total_bytes": 123,
-                "memory_available_bytes": 45
+                "memory_available_bytes": 45,
+                "host_memory_total_bytes": 678,
+                "memory_limit_source": "cgroup_v2:/user.slice/run-r1.scope"
             },
             "reserved_core_policy": {
                 "reserved_cores": 8,
@@ -775,6 +789,8 @@ fn live_value_scrubbing_normalizes_host_topology_without_erasing_its_shape() {
     assert_eq!(topology_budget["topology"]["source"], "fallback");
     assert!(topology_budget["topology"]["memory_total_bytes"].is_null());
     assert!(topology_budget["topology"]["memory_available_bytes"].is_null());
+    assert!(topology_budget["topology"]["host_memory_total_bytes"].is_null());
+    assert!(topology_budget["topology"]["memory_limit_source"].is_null());
     assert_eq!(topology_budget["fallback_active"], true);
     assert!(topology_budget["reserved_core_policy"].is_object());
     assert!(topology_budget["advisory_budgets"].is_object());
@@ -1068,6 +1084,9 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         "available_bytes",
         "max_inflight_bytes",
         "pipeline_max_message_bytes_in_flight",
+        // A page's byte budget is a share of the in-flight budget above.
+        "startup_page_fetch_message_bytes",
+        "steady_page_fetch_message_bytes",
         // WS-B.4a: the archive footprint depends on the engine's page layout
         // and on whether a WAL sidecar happens to exist; keep the keys, scrub
         // the values.

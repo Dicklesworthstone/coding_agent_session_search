@@ -7,10 +7,12 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use super::{EmbeddingJobConfig, EmbeddingWorkerHandle, FastEmbedder, WorkerMessage};
+use crate::franken_sync::CancellationHandle;
 
 const MAX_PENDING_JOBS: usize = 32;
 const MAX_PENDING_CANCELLATIONS: usize = 32;
@@ -29,7 +31,8 @@ fn model_key(model: &str) -> String {
 
 struct Cancellation {
     db_path: String,
-    models: Vec<(String, AtomicBool)>,
+    models: Vec<(String, AtomicBool, CancellationHandle)>,
+    preparation: CancellationHandle,
 }
 
 #[derive(Clone)]
@@ -46,8 +49,15 @@ impl JobControl {
             db_path: config.db_path.clone(),
             models: models
                 .into_iter()
-                .map(|model| (model_key(&model), AtomicBool::new(false)))
+                .map(|model| {
+                    (
+                        model_key(&model),
+                        AtomicBool::new(false),
+                        CancellationHandle::default(),
+                    )
+                })
                 .collect(),
+            preparation: CancellationHandle::default(),
         }))
     }
 
@@ -56,21 +66,21 @@ impl JobControl {
         self.0
             .models
             .iter()
-            .any(|(candidate, cancelled)| candidate == &key && cancelled.load(Ordering::SeqCst))
+            .any(|(candidate, cancelled, _)| candidate == &key && cancelled.load(Ordering::SeqCst))
     }
 
     pub(super) fn all_cancelled(&self) -> bool {
         self.0
             .models
             .iter()
-            .all(|(_, cancelled)| cancelled.load(Ordering::SeqCst))
+            .all(|(_, cancelled, _)| cancelled.load(Ordering::SeqCst))
     }
 
     fn any_cancelled(&self) -> bool {
         self.0
             .models
             .iter()
-            .any(|(_, cancelled)| cancelled.load(Ordering::SeqCst))
+            .any(|(_, cancelled, _)| cancelled.load(Ordering::SeqCst))
     }
 
     fn cancel(&self, scope: &CancelScope) -> usize {
@@ -79,7 +89,7 @@ impl JobControl {
         }
         let selected = scope.model.as_deref().map(model_key);
         let mut changed = 0;
-        for (model, cancelled) in &self.0.models {
+        for (model, cancelled, _) in &self.0.models {
             if selected.as_ref().is_none_or(|selected| selected == model)
                 && !cancelled.swap(true, Ordering::SeqCst)
             {
@@ -90,8 +100,36 @@ impl JobControl {
     }
 
     fn cancel_all(&self) {
-        for (_, cancelled) in &self.0.models {
+        for (_, cancelled, _) in &self.0.models {
             cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn preparation_cancellation(&self) -> CancellationHandle {
+        self.0.preparation.clone()
+    }
+
+    pub(super) fn model_cancellation(&self, model: &str) -> Option<CancellationHandle> {
+        let key = model_key(model);
+        self.0
+            .models
+            .iter()
+            .find(|(candidate, _, _)| candidate == &key)
+            .map(|(_, _, cancellation)| cancellation.clone())
+    }
+
+    /// Engine relays invoke wakers, so callers must release the mailbox and
+    /// worker ownership mutexes before propagating these already-latched flags.
+    fn propagate_sql_cancellation(&self) {
+        for (_, cancelled, cancellation) in &self.0.models {
+            if cancelled.load(Ordering::SeqCst) {
+                cancellation.cancel();
+            }
+        }
+        // Initial archive preparation serves every tier. Cancelling only the
+        // fast tier must not poison the snapshot the quality tier still needs.
+        if self.all_cancelled() {
+            self.0.preparation.cancel();
         }
     }
 }
@@ -99,11 +137,13 @@ impl JobControl {
 struct PendingJob {
     config: EmbeddingJobConfig,
     control: JobControl,
+    retry_at: Option<Instant>,
 }
 
 struct CancelScope {
     db_path: String,
     model: Option<String>,
+    retry_at: Option<Instant>,
 }
 
 impl CancelScope {
@@ -225,6 +265,7 @@ impl Sender {
             return Err("embedding worker is shutting down".to_string());
         }
         let mut cancelled_passes = 0;
+        let mut sql_cancellations = Vec::new();
         match message {
             WorkerMessage::Submit(config) => {
                 validate_request(&[
@@ -247,7 +288,11 @@ impl Sender {
                         );
                     }
                     let control = JobControl::new(&config);
-                    state.pending.push_back(PendingJob { config, control });
+                    state.pending.push_back(PendingJob {
+                        config,
+                        control,
+                        retry_at: None,
+                    });
                 }
             }
             WorkerMessage::Cancel { db_path, model_id } => {
@@ -258,6 +303,7 @@ impl Sender {
                 let scope = CancelScope {
                     db_path,
                     model: model_id,
+                    retry_at: None,
                 };
                 let duplicate = state
                     .cancellations
@@ -274,10 +320,18 @@ impl Sender {
                     return Err("embedding cancellation queue is full; retry after pending controls complete".to_string());
                 }
                 if let Some(active) = &state.active {
-                    cancelled_passes += active.cancel(&scope);
+                    let count = active.cancel(&scope);
+                    cancelled_passes += count;
+                    if count > 0 {
+                        sql_cancellations.push(active.clone());
+                    }
                 }
                 for pending in &state.pending {
-                    cancelled_passes += pending.control.cancel(&scope);
+                    let count = pending.control.cancel(&scope);
+                    cancelled_passes += count;
+                    if count > 0 {
+                        sql_cancellations.push(pending.control.clone());
+                    }
                 }
                 state
                     .pending
@@ -291,12 +345,16 @@ impl Sender {
                 state.stopped = true;
                 if let Some(active) = &state.active {
                     active.cancel_all();
+                    sql_cancellations.push(active.clone());
                 }
                 state.pending.clear();
                 state.cancellations.clear();
             }
         }
         drop(state);
+        for control in sql_cancellations {
+            control.propagate_sql_cancellation();
+        }
         match self.wake.try_send(()) {
             Ok(()) | Err(TrySendError::Full(())) => Ok(cancelled_passes),
             Err(TrySendError::Disconnected(())) => {
@@ -321,53 +379,169 @@ impl EmbeddingWorkerHandle {
 }
 
 impl Receiver {
+    /// Return accepted work to the tail without creating a new cancellation
+    /// generation. The active slot already accounts for this job, so a full
+    /// pending queue must not make a lock-contention retry lose accepted work.
+    pub(super) fn defer_job(
+        &self,
+        config: EmbeddingJobConfig,
+        permit: JobPermit,
+        delay: Duration,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "embedding queue state lock poisoned".to_string())?;
+        if !state
+            .active
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.0, &permit.control.0))
+        {
+            return Err("deferred embedding job no longer owns its active slot".to_string());
+        }
+        state.active = None;
+        if !state.stopped && !permit.control.all_cancelled() {
+            state.pending.push_back(PendingJob {
+                config,
+                control: permit.control.clone(),
+                retry_at: Some(Instant::now() + delay),
+            });
+        }
+        // JobPermit::drop also takes state; never drop it under this lock.
+        drop(state);
+        drop(permit);
+        Ok(())
+    }
+
+    /// A deferred cleanup remains ahead of newer submissions for its archive.
+    /// Other archives can proceed while this one waits for a maintenance lock.
+    pub(super) fn defer_cancel(
+        &self,
+        db_path: String,
+        model: Option<String>,
+        delay: Duration,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "embedding queue state lock poisoned".to_string())?;
+        if state.stopped {
+            return Ok(());
+        }
+        let scope = CancelScope {
+            db_path,
+            model,
+            retry_at: Some(Instant::now() + delay),
+        };
+        if !state
+            .cancellations
+            .iter()
+            .any(|pending| pending.covers(&scope))
+        {
+            state.cancellations.retain(|pending| !scope.covers(pending));
+            state.cancellations.push_back(scope);
+        }
+        Ok(())
+    }
+
     pub(super) fn recv(&self) -> Result<(WorkerMessage, Option<JobPermit>), String> {
         loop {
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| "embedding queue state lock poisoned".to_string())?;
-                if state.stopped {
-                    return Ok((WorkerMessage::Shutdown, None));
-                }
-                if let Some(scope) = state.cancellations.pop_front() {
-                    return Ok((
-                        WorkerMessage::Cancel {
-                            db_path: scope.db_path,
-                            model_id: scope.model,
-                        },
-                        None,
-                    ));
-                }
-                if state.active.is_some() {
-                    return Err("previous embedding job permit is still active".to_string());
-                }
-                if let Some(pending) = state.pending.pop_front() {
-                    state.active = Some(pending.control.clone());
-                    let permit = JobPermit {
-                        state: Arc::downgrade(&self.state),
-                        control: pending.control,
-                    };
-                    return Ok((WorkerMessage::Submit(pending.config), Some(permit)));
-                }
+            let retry_delay =
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| "embedding queue state lock poisoned".to_string())?;
+                    if state.stopped {
+                        return Ok((WorkerMessage::Shutdown, None));
+                    }
+                    let now = Instant::now();
+                    if let Some(position) = state
+                        .cancellations
+                        .iter()
+                        .position(|scope| scope.retry_at.is_none_or(|retry_at| retry_at <= now))
+                    {
+                        let scope = state.cancellations.remove(position).ok_or_else(|| {
+                            "selected embedding cancellation disappeared".to_string()
+                        })?;
+                        return Ok((
+                            WorkerMessage::Cancel {
+                                db_path: scope.db_path,
+                                model_id: scope.model,
+                            },
+                            None,
+                        ));
+                    }
+                    if state.active.is_some() {
+                        return Err("previous embedding job permit is still active".to_string());
+                    }
+                    if let Some(position) = state.pending.iter().position(|pending| {
+                        pending.retry_at.is_none_or(|retry_at| retry_at <= now)
+                            && !state
+                                .cancellations
+                                .iter()
+                                .any(|scope| scope.db_path == pending.config.db_path)
+                    }) {
+                        let pending = state.pending.remove(position).ok_or_else(|| {
+                            "selected embedding submission disappeared".to_string()
+                        })?;
+                        state.active = Some(pending.control.clone());
+                        let permit = JobPermit {
+                            state: Arc::downgrade(&self.state),
+                            control: pending.control,
+                        };
+                        return Ok((WorkerMessage::Submit(pending.config), Some(permit)));
+                    }
+                    state
+                        .cancellations
+                        .iter()
+                        .filter_map(|scope| scope.retry_at)
+                        .chain(
+                            state
+                                .pending
+                                .iter()
+                                .filter(|pending| {
+                                    !state
+                                        .cancellations
+                                        .iter()
+                                        .any(|scope| scope.db_path == pending.config.db_path)
+                                })
+                                .filter_map(|pending| pending.retry_at),
+                        )
+                        .min()
+                        .map(|retry_at| retry_at.saturating_duration_since(now))
+                };
+            match retry_delay {
+                Some(delay) => match self.wake.recv_timeout(delay) {
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                    // Sender loss still drains admitted work. No sender can
+                    // request shutdown now, so this bounded wait is sufficient.
+                    Err(RecvTimeoutError::Disconnected) => std::thread::sleep(delay),
+                },
+                None => self
+                    .wake
+                    .recv()
+                    .map_err(|_| "embedding worker channel closed".to_string())?,
             }
-            self.wake
-                .recv()
-                .map_err(|_| "embedding worker channel closed".to_string())?;
         }
     }
 }
 
 impl Drop for Receiver {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.lock() {
+        let active = if let Ok(mut state) = self.state.lock() {
             state.receiver_alive = false;
             if let Some(active) = &state.active {
                 active.cancel_all();
             }
             state.pending.clear();
             state.cancellations.clear();
+            state.active.clone()
+        } else {
+            None
+        };
+        if let Some(active) = active {
+            active.propagate_sql_cancellation();
         }
     }
 }
@@ -426,6 +600,103 @@ mod tests {
     }
 
     #[test]
+    fn deferred_jobs_keep_their_cancellation_generation_and_yield_to_other_archives() {
+        let (sender, receiver) = channel();
+        sender.send(WorkerMessage::Submit(job(1))).unwrap();
+        sender.send(WorkerMessage::Submit(job(2))).unwrap();
+        let (_, first) = receiver.recv().unwrap();
+        let first = first.unwrap();
+        let control = first.control();
+        receiver.defer_job(job(1), first, Duration::ZERO).unwrap();
+
+        let (ready, permit) = receiver.recv().unwrap();
+        assert!(matches!(ready, WorkerMessage::Submit(config) if config.db_path == job(2).db_path));
+        drop(permit);
+        cancel(&sender, 1, Some("minilm"));
+        sender.send(WorkerMessage::Submit(job(1))).unwrap();
+        assert!(control.is_cancelled("minilm"));
+        assert!(!control.is_cancelled("hash"));
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Cancel { .. }
+        ));
+        let (_, resumed) = receiver.recv().unwrap();
+        assert!(resumed.as_ref().unwrap().control().is_cancelled("minilm"));
+        drop(resumed);
+        let (_, fresh) = receiver.recv().unwrap();
+        assert!(!fresh.as_ref().unwrap().control().any_cancelled());
+        drop(fresh);
+    }
+
+    #[test]
+    fn deferring_an_active_job_cannot_lose_it_when_pending_admission_is_full() {
+        let (sender, receiver) = channel();
+        sender.send(WorkerMessage::Submit(job(100))).unwrap();
+        let (_, permit) = receiver.recv().unwrap();
+        for id in 0..MAX_PENDING_JOBS {
+            sender.send(WorkerMessage::Submit(job(id))).unwrap();
+        }
+        receiver
+            .defer_job(job(100), permit.unwrap(), Duration::ZERO)
+            .unwrap();
+        assert!(sender.send(WorkerMessage::Submit(job(200))).is_err());
+        drop(sender);
+        let mut delivered = Vec::new();
+        while let Ok((message, permit)) = receiver.recv() {
+            if let WorkerMessage::Submit(config) = message {
+                delivered.push(config.db_path);
+            }
+            drop(permit);
+        }
+        assert_eq!(delivered.len(), MAX_PENDING_JOBS + 1);
+        assert_eq!(delivered.last(), Some(&job(100).db_path));
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|path| **path == job(100).db_path)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_cleanup_blocks_only_its_archive_and_shutdown_wakes_the_deadline() {
+        let (sender, receiver) = channel();
+        receiver
+            .defer_cancel(job(1).db_path, None, Duration::from_secs(60))
+            .unwrap();
+        sender.send(WorkerMessage::Submit(job(1))).unwrap();
+        sender.send(WorkerMessage::Submit(job(2))).unwrap();
+        let (ready, permit) = receiver.recv().unwrap();
+        assert!(matches!(ready, WorkerMessage::Submit(config) if config.db_path == job(2).db_path));
+        drop(permit);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let shutdown = matches!(receiver.recv().unwrap().0, WorkerMessage::Shutdown);
+            finished_tx.send(shutdown).unwrap();
+        });
+        sender.send(WorkerMessage::Shutdown).unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn ready_cleanup_retried_before_a_later_submission_for_its_archive() {
+        let (sender, receiver) = channel();
+        sender.send(WorkerMessage::Submit(job(1))).unwrap();
+        receiver
+            .defer_cancel(job(1).db_path, None, Duration::ZERO)
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Cancel { .. }
+        ));
+        let (ready, permit) = receiver.recv().unwrap();
+        assert!(matches!(ready, WorkerMessage::Submit(config) if config.db_path == job(1).db_path));
+        drop(permit);
+    }
+
+    #[test]
     fn cancel_removes_queued_work_before_it_can_open_an_archive() {
         let (sender, receiver) = channel();
         sender.send(WorkerMessage::Submit(job(1))).unwrap();
@@ -449,11 +720,22 @@ mod tests {
         sender.send(WorkerMessage::Submit(job(1))).unwrap();
         let (_, old_permit) = receiver.recv().unwrap();
         let old = old_permit.as_ref().unwrap().control();
+        let preparation = old.preparation_cancellation();
+        let quality_sql = old.model_cancellation("minilm").unwrap();
+        let fast_sql = old.model_cancellation("hash").unwrap();
         cancel(&sender, 2, None);
         assert!(!old.any_cancelled());
+        assert!(!preparation.is_cancelled());
+        assert!(!quality_sql.is_cancelled());
         cancel(&sender, 1, Some("all-minilm-l6-v2"));
         assert!(old.is_cancelled("minilm-384"));
         assert!(!old.is_cancelled("hash"));
+        assert!(quality_sql.is_cancelled());
+        assert!(!fast_sql.is_cancelled());
+        assert!(
+            !preparation.is_cancelled(),
+            "the uncancelled tier still needs initial archive preparation"
+        );
         sender.send(WorkerMessage::Submit(job(1))).unwrap();
         drop(old_permit);
         assert!(matches!(
@@ -470,6 +752,8 @@ mod tests {
             !new.any_cancelled(),
             "a retry admitted after cancellation is a new job"
         );
+        assert!(!new.preparation_cancellation().is_cancelled());
+        assert!(!new.model_cancellation("minilm").unwrap().is_cancelled());
         assert!(old.is_cancelled("minilm"));
         drop(new_permit);
     }
@@ -508,6 +792,9 @@ mod tests {
         }
         sender.send(WorkerMessage::Shutdown).unwrap();
         assert!(active.all_cancelled());
+        assert!(active.preparation_cancellation().is_cancelled());
+        assert!(active.model_cancellation("hash").unwrap().is_cancelled());
+        assert!(active.model_cancellation("minilm").unwrap().is_cancelled());
         assert!(matches!(
             receiver.recv().unwrap().0,
             WorkerMessage::Shutdown
@@ -562,6 +849,8 @@ mod tests {
         let active = permit.as_ref().unwrap().control();
         drop(receiver);
         assert!(active.all_cancelled());
+        assert!(active.preparation_cancellation().is_cancelled());
+        assert!(active.model_cancellation("hash").unwrap().is_cancelled());
         assert!(sender.send(WorkerMessage::Submit(job(2))).is_err());
         drop(permit);
 

@@ -1,4 +1,4 @@
- ▐ Search ▌  · Analytics   · Swarm   · Sources  | Alt+A=analytics  Alt+W=swarm  Ctrl+Shift+S=sources  Ctrl+P=palette  F1
+ ▐ Search ▌  · Analytics   · Swarm   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  Ctrl+P=palette  F1=help  F2=
 ╭ ██ cass · High Contrast · Hybrid · Prefix ───────────────────────────────────────────────────────────────────────────╮
 │ ?? authenticatio│n regression                                                                                        │
 │○ agent:✎any ○ ws:✎any ○ time:✎all ○ source:✎all                                                                      │
@@ -20,5 +20,5 @@
 │                                                                                  ││glyphs → λ Δ ✓ to stress wrapping │
 │1 sessions │ 1 msgs                                                               ││behavior.                         │
 ╰──────────────────────────────────────────────────────────────────────────────────│╰──────────────────────────────────╯
- hits 1 · view med/cozy · query HYB / PFX · perf lat:— cache:cold                                                       
-  | Enter=open Ctrl+X=select Alt+S=mode Tab=focus                                                                       
+ hits 1 · view med/cozy · query HYB / PFX · perf lat:— cache:cold
+  | Enter=open Ctrl+X=select Alt+S=mode Tab=focus

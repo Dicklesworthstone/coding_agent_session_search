@@ -314,10 +314,19 @@
             "controller_loadavg_low_watermark_1m": {
               "type": "number"
             },
+            "startup_page_fetch_message_bytes": {
+              "type": "integer"
+            },
+            "steady_page_fetch_message_bytes": {
+              "type": "integer"
+            },
             "runtime": {
               "type": "null"
             }
           }
+        },
+        "expected_docs_scan": {
+          "type": "null"
         }
       }
     },
@@ -606,6 +615,9 @@
         "quarantined_conversations": {
           "type": "integer"
         },
+        "deferred_conversations": {
+          "type": "integer"
+        },
         "recent_quarantined_conversations": {
           "type": "integer"
         },
@@ -742,6 +754,12 @@
             },
             "memory_available_bytes": {
               "type": "integer"
+            },
+            "host_memory_total_bytes": {
+              "type": "integer"
+            },
+            "memory_limit_source": {
+              "type": "string"
             }
           }
         },
@@ -1342,6 +1360,9 @@
         },
         "sole_copy_warning_count": {
           "type": "integer"
+        },
+        "raw_mirror_capture_disabled": {
+          "type": "boolean"
         },
         "recommended_action": {
           "type": "string"

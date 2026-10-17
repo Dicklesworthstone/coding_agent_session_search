@@ -13,6 +13,17 @@
     "build_commit_date": {
       "type": "string"
     },
+    "source_ingest_reuse": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "disabled_by": {
+          "type": "null"
+        }
+      }
+    },
     "api_version": {
       "type": "integer"
     },

@@ -19,6 +19,129 @@ const CACHE_CONFIG = {
   MAX_SIZE_BYTES: 50 * 1024 * 1024, // 50 MB max cache size
 };
 
+// Bound admission independently of the retained cache: two fetch/decrypt jobs,
+// at most 64 queued requests, and a finite lifetime for each admitted job.
+// Limits cover encoded bytes, not image decoding, Blob/URL copies, or WASM.
+const LOAD_CONFIG = {
+  MAX_CONCURRENT: 2,
+  MAX_PENDING: 64,
+  MAX_MANIFEST_BYTES: 8 * 1024 * 1024,
+  TIMEOUT_MS: 120_000,
+};
+const AES_GCM_TAG_BYTES = 16;
+const activeLoads = new Set();
+const pendingLoads = [];
+const attachmentObservers = new Set();
+
+function ensureActiveLoad(epoch, signal) {
+  if (!isCurrentEpoch(epoch)) {
+    throw createInvalidationError();
+  }
+  if (signal.aborted) {
+    throw signal.reason;
+  }
+}
+
+function drainAttachmentLoads() {
+  while (activeLoads.size < LOAD_CONFIG.MAX_CONCURRENT && pendingLoads.length) {
+    pendingLoads.shift().start();
+  }
+}
+
+function withAttachmentLoad(epoch, task) {
+  return new Promise((resolve, reject) => {
+    if (!isCurrentEpoch(epoch)) {
+      reject(createInvalidationError());
+      return;
+    }
+    const start = () => {
+      const controller = new AbortController();
+      activeLoads.add(controller);
+      const timeout = setTimeout(() => controller.abort(createAttachmentError(
+        "Attachment request timed out; try again", "ATTACHMENT_REQUEST_TIMED_OUT",
+      )), LOAD_CONFIG.TIMEOUT_MS);
+      Promise.resolve().then(() => {
+        ensureActiveLoad(epoch, controller.signal);
+        return task(controller.signal);
+      }).then(resolve, (error) => {
+        reject(controller.signal.aborted ? controller.signal.reason : error);
+      }).finally(() => {
+        clearTimeout(timeout);
+        controller.abort();
+        // Do not release admission on abort alone: WebCrypto cannot be
+        // interrupted, and must settle before another large job starts.
+        activeLoads.delete(controller);
+        drainAttachmentLoads();
+      });
+    };
+    if (activeLoads.size < LOAD_CONFIG.MAX_CONCURRENT) {
+      start();
+    } else if (pendingLoads.length < LOAD_CONFIG.MAX_PENDING) {
+      pendingLoads.push({ start, reject });
+    } else {
+      reject(createAttachmentError(
+        "Too many attachment requests; try again after current loads finish",
+        "ATTACHMENT_LOAD_QUEUE_FULL",
+      ));
+    }
+  });
+}
+
+async function readAttachmentCiphertext(response, limit, epoch, signal) {
+  const tooLarge = () => createAttachmentError(
+    `Attachment exceeds the browser loading limit of ${limit - AES_GCM_TAG_BYTES} bytes`,
+    "ATTACHMENT_TOO_LARGE",
+  );
+  const declared = response.headers?.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > limit) {
+    void response.body?.cancel().catch(() => {});
+    throw tooLarge();
+  }
+  ensureActiveLoad(epoch, signal);
+  // Fetch responses in supported browsers expose a stream. Keep compatibility
+  // with non-streaming embedders/test transports; that fallback can check the
+  // size only AFTER their arrayBuffer allocation, not bound that allocation.
+  if (!response.body?.getReader) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    ensureActiveLoad(epoch, signal);
+    if (bytes.byteLength > limit) throw tooLarge();
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
+  let buffer = new Uint8Array(0);
+  let length = 0;
+  let complete = false;
+  try {
+    while (true) {
+      ensureActiveLoad(epoch, signal);
+      const { done, value } = await reader.read();
+      ensureActiveLoad(epoch, signal);
+      if (done) {
+        complete = true;
+        return buffer.subarray(0, length);
+      }
+      if (value.byteLength > limit - length) throw tooLarge();
+      const needed = length + value.byteLength;
+      if (needed > buffer.byteLength) {
+        // A growable byte buffer avoids retaining one object per network
+        // fragment (an adversarial stream could deliver millions of bytes
+        // one at a time). Never grow past the actual per-response ceiling.
+        const grown = new Uint8Array(Math.min(limit, Math.max(needed, 65536, buffer.length * 2)));
+        grown.set(buffer.subarray(0, length));
+        buffer = grown;
+      }
+      buffer.set(value, length);
+      length = needed;
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    if (!complete) cancel();
+    reader.releaseLock();
+  }
+}
+
 // Module state
 let manifest = null;
 let isManifestLoaded = false;
@@ -43,6 +166,17 @@ function createAttachmentError(message, code) {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+function attachmentFailureMessage(error, fallback) {
+  switch (error?.code) {
+    case "ATTACHMENT_TOO_LARGE":
+    case "ATTACHMENT_LOAD_QUEUE_FULL":
+    case "ATTACHMENT_REQUEST_TIMED_OUT":
+      return error.message;
+    default:
+      return fallback;
+  }
 }
 
 function createInvalidationError() {
@@ -75,7 +209,7 @@ export async function initAttachments(dek, exportId) {
   manifestLoadEpoch = epoch;
   manifestLoadPromise = (async () => {
     try {
-      const loadedManifest = await loadManifest(dek, exportId);
+      const loadedManifest = await loadManifest(dek, exportId, epoch);
       if (!isCurrentEpoch(epoch)) {
         throw createInvalidationError();
       }
@@ -83,6 +217,7 @@ export async function initAttachments(dek, exportId) {
       isManifestLoaded = true;
       return manifest;
     } catch (error) {
+      if (!isCurrentEpoch(epoch)) throw createInvalidationError();
       if (error?.code !== "ATTACHMENT_REQUEST_INVALIDATED") {
         console.warn("[Attachments] No attachments found or manifest failed:", error.message);
       }
@@ -107,50 +242,62 @@ export async function initAttachments(dek, exportId) {
 /**
  * Load and decrypt the manifest
  */
-async function loadManifest(dek, exportId) {
-  const response = await fetch("./blobs/manifest.enc");
-  if (!response.ok) {
-    if (response.status === 404) {
-      throw createAttachmentError("Manifest not found", "ATTACHMENT_MANIFEST_ABSENT");
+async function loadManifest(dek, exportId, epoch) {
+  return withAttachmentLoad(epoch, async (signal) => {
+    const response = await fetch("./blobs/manifest.enc", { signal });
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw createAttachmentError("Manifest not found", "ATTACHMENT_MANIFEST_ABSENT");
+      }
+      throw createAttachmentError(
+        `Failed to load attachment manifest: ${response.status}`,
+        "ATTACHMENT_MANIFEST_FETCH_FAILED",
+      );
     }
-    throw createAttachmentError(
-      `Failed to load attachment manifest: ${response.status}`,
-      "ATTACHMENT_MANIFEST_FETCH_FAILED",
+
+    const ciphertext = await readAttachmentCiphertext(
+      response, LOAD_CONFIG.MAX_MANIFEST_BYTES + AES_GCM_TAG_BYTES, epoch, signal,
     );
-  }
 
-  const ciphertext = new Uint8Array(await response.arrayBuffer());
+    // Derive nonce using HKDF
+    const nonce = await deriveBlobNonce("manifest");
 
-  // Derive nonce using HKDF
-  const nonce = await deriveBlobNonce("manifest");
+    // Import DEK for decryption
+    const dekKey = await crypto.subtle.importKey("raw", dek, { name: "AES-GCM" }, false, ["decrypt"]);
 
-  // Import DEK for decryption
-  const dekKey = await crypto.subtle.importKey("raw", dek, { name: "AES-GCM" }, false, ["decrypt"]);
+    ensureActiveLoad(epoch, signal);
 
-  // Decrypt with AAD = export_id only
-  const plaintext = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv: nonce,
-      additionalData: exportId,
-    },
-    dekKey,
-    ciphertext,
-  );
-
-  // Parse JSON manifest
-  const decoder = new TextDecoder();
-  const manifestJson = decoder.decode(plaintext);
-  let parsedManifest;
-  try {
-    parsedManifest = JSON.parse(manifestJson);
-  } catch (error) {
-    throw createAttachmentError(
-      `Invalid attachment manifest JSON: ${error.message}`,
-      "ATTACHMENT_MANIFEST_INVALID",
+    // Decrypt with AAD = export_id only
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: nonce,
+        additionalData: exportId,
+      },
+      dekKey,
+      ciphertext,
     );
-  }
-  return validateManifest(parsedManifest);
+
+    try {
+      ensureActiveLoad(epoch, signal);
+
+      // Parse JSON manifest
+      const decoder = new TextDecoder();
+      const manifestJson = decoder.decode(plaintext);
+      let parsedManifest;
+      try {
+        parsedManifest = JSON.parse(manifestJson);
+      } catch (error) {
+        throw createAttachmentError(
+          `Invalid attachment manifest JSON: ${error.message}`,
+          "ATTACHMENT_MANIFEST_INVALID",
+        );
+      }
+      return validateManifest(parsedManifest);
+    } finally {
+      new Uint8Array(plaintext).fill(0);
+    }
+  });
 }
 
 /**
@@ -206,14 +353,16 @@ export async function loadBlob(hash, dek, exportId) {
   }
 
   let loadPromise;
-  loadPromise = (async () => {
+  loadPromise = withAttachmentLoad(epoch, async (signal) => {
     // Fetch encrypted blob
-    const response = await fetch(`./blobs/${normalizedHash}.bin`);
+    const response = await fetch(`./blobs/${normalizedHash}.bin`, { signal });
     if (!response.ok) {
       throw new Error(`Blob not found: ${normalizedHash}`);
     }
 
-    const ciphertext = new Uint8Array(await response.arrayBuffer());
+    const ciphertext = await readAttachmentCiphertext(
+      response, CACHE_CONFIG.MAX_SIZE_BYTES + AES_GCM_TAG_BYTES, epoch, signal,
+    );
 
     // Derive nonce using HKDF
     const nonce = await deriveBlobNonce(normalizedHash);
@@ -229,6 +378,8 @@ export async function loadBlob(hash, dek, exportId) {
     aad.set(exportId);
     aad.set(hashBytes, exportId.length);
 
+    ensureActiveLoad(epoch, signal);
+
     // Decrypt
     const plaintext = await crypto.subtle.decrypt(
       {
@@ -242,15 +393,17 @@ export async function loadBlob(hash, dek, exportId) {
 
     const data = new Uint8Array(plaintext);
 
-    if (!isCurrentEpoch(epoch)) {
-      throw createInvalidationError();
+    try {
+      ensureActiveLoad(epoch, signal);
+      // Cache the result only after both authentication and admission checks.
+      cacheBlob(normalizedHash, data);
+    } catch (error) {
+      data.fill(0);
+      throw error;
     }
 
-    // Cache the result
-    cacheBlob(normalizedHash, data);
-
     return data;
-  })().finally(() => {
+  }).finally(() => {
     const current = blobLoadPromises.get(normalizedHash);
     if (current?.epoch === epoch && current.promise === loadPromise) {
       blobLoadPromises.delete(normalizedHash);
@@ -461,6 +614,9 @@ function validateManifestEntry(entry, index) {
  * Cache a blob with LRU eviction
  */
 function cacheBlob(hash, data) {
+  if (data.byteLength > CACHE_CONFIG.MAX_SIZE_BYTES) {
+    throw createAttachmentError("Attachment exceeds the browser cache limit", "ATTACHMENT_TOO_LARGE");
+  }
   if (blobCache.has(hash)) {
     updateLru(hash);
     return;
@@ -533,6 +689,12 @@ export function clearCache() {
  */
 export function reset() {
   attachmentEpoch += 1;
+  const error = createInvalidationError();
+  for (const pending of pendingLoads.splice(0)) pending.reject(error);
+  for (const controller of activeLoads) controller.abort(error);
+  for (const observer of attachmentObservers) observer.disconnect();
+  attachmentObservers.clear();
+  for (const entry of blobCache.values()) entry.data.fill(0);
   clearCache();
   manifest = null;
   isManifestLoaded = false;
@@ -583,6 +745,7 @@ export function createAttachmentElement(entry, dek, exportId) {
  * Create an image attachment element with lazy loading
  */
 function createImageAttachment(entry, dek, exportId) {
+  const epoch = attachmentEpoch;
   const container = document.createElement("figure");
   container.className = "attachment attachment-image";
 
@@ -619,8 +782,9 @@ function createImageAttachment(entry, dek, exportId) {
   const observer = new IntersectionObserver(
     async (observerEntries) => {
       const [observerEntry] = observerEntries;
-      if (observerEntry.isIntersecting) {
+      if (observerEntry?.isIntersecting && isCurrentEpoch(epoch)) {
         observer.disconnect();
+        attachmentObservers.delete(observer);
         await loadImageAttachment(
           container,
           img,
@@ -638,11 +802,14 @@ function createImageAttachment(entry, dek, exportId) {
 
   container.dataset.hash = entry.hash;
   container.dataset.mimeType = entry.mime_type;
+  attachmentObservers.add(observer);
   observer.observe(container);
 
   // Also allow click to load
   placeholder.addEventListener("click", async () => {
+    if (!isCurrentEpoch(epoch)) return;
     observer.disconnect();
+    attachmentObservers.delete(observer);
     await loadImageAttachment(
       container,
       img,
@@ -671,18 +838,20 @@ async function loadImageAttachment(
   placeholder,
   loading,
 ) {
+  const epoch = attachmentEpoch;
   try {
     placeholder.classList.add("hidden");
     loading.classList.remove("hidden");
 
     const url = await loadBlobAsUrl(hash, mimeType, dek, exportId);
     await waitForImageLoad(img, url);
+    if (!isCurrentEpoch(epoch)) return;
 
     loading.classList.add("hidden");
     img.classList.remove("hidden");
     container.classList.add("loaded");
   } catch (error) {
-    if (error?.code === "ATTACHMENT_REQUEST_INVALIDATED") {
+    if (!isCurrentEpoch(epoch) || error?.code === "ATTACHMENT_REQUEST_INVALIDATED") {
       return;
     }
     console.error("[Attachments] Failed to load image:", error);
@@ -690,7 +859,7 @@ async function loadImageAttachment(
     placeholder.classList.remove("hidden");
     placeholder.innerHTML = `
             <span class="attachment-icon">⚠️</span>
-            <span class="attachment-error">Failed to load</span>
+            <span class="attachment-error">${escapeHtml(attachmentFailureMessage(error, "Failed to load"))}</span>
         `;
   }
 }
@@ -724,6 +893,7 @@ function waitForImageLoad(img, url) {
  * Create a PDF attachment element
  */
 function createPdfAttachment(entry, dek, exportId) {
+  const epoch = attachmentEpoch;
   const container = document.createElement("div");
   container.className = "attachment attachment-pdf";
 
@@ -736,6 +906,7 @@ function createPdfAttachment(entry, dek, exportId) {
 
   const downloadBtn = container.querySelector(".attachment-download");
   downloadBtn.addEventListener("click", async () => {
+    if (!isCurrentEpoch(epoch)) return;
     await downloadAttachment(entry, dek, exportId);
   });
 
@@ -746,6 +917,7 @@ function createPdfAttachment(entry, dek, exportId) {
  * Create a generic download attachment element
  */
 function createDownloadAttachment(entry, dek, exportId) {
+  const epoch = attachmentEpoch;
   const container = document.createElement("div");
   container.className = "attachment attachment-file";
 
@@ -758,6 +930,7 @@ function createDownloadAttachment(entry, dek, exportId) {
 
   const downloadBtn = container.querySelector(".attachment-download");
   downloadBtn.addEventListener("click", async () => {
+    if (!isCurrentEpoch(epoch)) return;
     await downloadAttachment(entry, dek, exportId);
   });
 
@@ -768,8 +941,10 @@ function createDownloadAttachment(entry, dek, exportId) {
  * Download an attachment
  */
 async function downloadAttachment(entry, dek, exportId) {
+  const epoch = attachmentEpoch;
   try {
     const url = await loadBlobAsUrl(entry.hash, entry.mime_type, dek, exportId);
+    if (!isCurrentEpoch(epoch)) return;
 
     // Create download link
     const a = document.createElement("a");
@@ -779,11 +954,11 @@ async function downloadAttachment(entry, dek, exportId) {
     a.click();
     document.body.removeChild(a);
   } catch (error) {
-    if (error?.code === "ATTACHMENT_REQUEST_INVALIDATED") {
+    if (!isCurrentEpoch(epoch) || error?.code === "ATTACHMENT_REQUEST_INVALIDATED") {
       return;
     }
     console.error("[Attachments] Failed to download:", error);
-    alert("Failed to download attachment");
+    alert(attachmentFailureMessage(error, "Failed to download attachment"));
   }
 }
 

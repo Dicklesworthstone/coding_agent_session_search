@@ -45,6 +45,12 @@ jobs:
         rustc --version
         cargo --version
         /usr/bin/ssh -V
+    # A cold, uncached build of the crate does not fit the first test step's
+    # 1500 s budget on a slow runner (exit 124 twice on bb40b10d, both while
+    # compiling). Build every target here, bounded by the job's timeout, so
+    # the per-step timeouts below measure the tests.
+    - name: Build the regression targets
+      run: cargo test --locked --no-run --lib --test tailscale_discovery --test setup_workflow --test e2e_sources
     - name: Focused discovery unit regressions
       shell: bash
       run: |

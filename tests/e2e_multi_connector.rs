@@ -151,6 +151,820 @@ fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
     assert_eq!(messages(), 2, "a native-ID edit must not append a message");
 }
 
+/// The GH #511 reporter's store layout under an isolated home: one native
+/// Codebuff chat in `project` whose run state names `/synthetic/probe`.
+fn gh511_codebuff_chat(
+    home: &Path,
+    project: &str,
+    records: &serde_json::Value,
+) -> std::path::PathBuf {
+    // One component per join: a "/" inside a joined fragment survives on
+    // Windows, so the path would not match the one the connector reports.
+    let chat = gh511_codebuff_projects(home)
+        .join(project)
+        .join("chats")
+        .join("2026-03-21T17-14-03.768Z");
+    std::fs::create_dir_all(&chat).unwrap();
+    let transcript = chat.join("chat-messages.json");
+    std::fs::write(&transcript, serde_json::to_vec(records).unwrap()).unwrap();
+    std::fs::write(
+        chat.join("run-state.json"),
+        br#"{"sessionState":{"fileContext":{"projectRoot":"/synthetic/probe"}}}"#,
+    )
+    .unwrap();
+    transcript
+}
+
+/// `cass` that sees only the isolated home and data dir. In particular,
+/// `env_clear` leaves XDG_CONFIG_HOME, XDG_DATA_HOME and
+/// CASS_CODEBUFF_DATA_ROOT unset, matching the reporter's macOS default-path
+/// invocation. The Codebuff binary need not be installed to find its history.
+///
+/// Windows is the exception (bead mt90z): FAD's default Codebuff root is
+/// `dirs::home_dir()`, which there comes from the Known Folder API and ignores
+/// USERPROFILE, so an isolated home cannot redirect it and the fixture was
+/// never found. There the root is named explicitly; Unix and macOS keep
+/// exercising default-path discovery.
+fn gh511_cass(home: &Path, data: &Path) -> assert_cmd::Command {
+    let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("CASS_DATA_DIR", data)
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("RUST_MIN_STACK", "134217728")
+        .current_dir(home)
+        .timeout(std::time::Duration::from_secs(180));
+    if let Ok(system_root) = dotenvy::var("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    if cfg!(windows) {
+        command.env("CASS_CODEBUFF_DATA_ROOT", gh511_codebuff_projects(home));
+    }
+    command
+}
+
+/// Codebuff's default projects root under `home`.
+fn gh511_codebuff_projects(home: &Path) -> std::path::PathBuf {
+    home.join(".config").join("manicode").join("projects")
+}
+
+/// The one Codebuff hit for the message whose content is `content`, from a
+/// search for `needle`. Every message also matches through its conversation
+/// title (the first user message), so a search can return several hits.
+fn gh511_message_hit(home: &Path, data: &Path, needle: &str, content: &str) -> serde_json::Value {
+    let output = gh511_cass(home, data)
+        .args([
+            "search",
+            needle,
+            "--agent",
+            "codebuff",
+            "--mode",
+            "lexical",
+            "--json",
+            "--no-maintenance",
+            "--timeout",
+            "10000",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let hits: Vec<serde_json::Value> = result["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit["content"] == content)
+        .cloned()
+        .collect();
+    assert_eq!(hits.len(), 1, "{result}");
+    hits[0].clone()
+}
+
+/// The reporter's native transcript: `timestamp` is a locale time of day.
+fn gh511_native_records() -> serde_json::Value {
+    serde_json::json!([
+        {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
+         "timestamp":"01:15 PM"},
+        {"id":"ai-1774113411457", "variant":"ai", "content":"Synthetic probe answer",
+         "timestamp":"01:16 PM"}
+    ])
+}
+
+fn gh511_connector_stats(report: &serde_json::Value) -> &serde_json::Value {
+    report["indexing_stats"]["connectors"]
+        .as_array()
+        .expect("connector summaries")
+        .iter()
+        .find(|connector| connector["name"] == "codebuff")
+        .expect("default discovery found the Codebuff store")
+}
+
+fn gh511_assert_parse_diagnostic(report: &serde_json::Value, data: &Path, transcript: &Path) {
+    let reported_transcript = transcript.to_string_lossy();
+    let transcript = transcript.canonicalize().unwrap();
+    let connector = gh511_connector_stats(report);
+    let error = connector["error"].as_str().unwrap();
+    assert!(
+        error.contains(reported_transcript.as_ref())
+            || error.contains(&transcript.display().to_string()),
+        "the connector error must identify the failed transcript: {connector}"
+    );
+    assert_eq!(
+        report["indexing_stats"]["scan_had_errors"], true,
+        "{report}"
+    );
+    let codebuff: Vec<_> = report["indexing_stats"]["connector_diagnostics"]
+        .as_array()
+        .expect("connector diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["provider"] == "codebuff")
+        .collect();
+    assert!(!codebuff.is_empty(), "{report}");
+    for diagnostic in codebuff {
+        assert_eq!(
+            diagnostic["failure_kind"], "unparseable-source",
+            "{diagnostic}"
+        );
+        assert_eq!(diagnostic["severity"], "error", "{diagnostic}");
+        assert_eq!(diagnostic["retryable"], false, "{diagnostic}");
+        assert_eq!(diagnostic["disposition"], "skipped", "{diagnostic}");
+        let source = Path::new(diagnostic["source_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_ne!(source, data.canonicalize().unwrap(), "{diagnostic}");
+        assert!(
+            transcript.starts_with(&source),
+            "the diagnostic must identify the transcript or its scan root: {diagnostic}"
+        );
+        assert!(
+            !diagnostic["safe_next_action"]
+                .as_str()
+                .unwrap()
+                .contains("check permissions"),
+            "{diagnostic}"
+        );
+    }
+    assert_eq!(
+        report["indexing_stats"]["connector_summary"]["codebuff"]["locked"], 0,
+        "{report}"
+    );
+}
+
+fn gh511_assert_native_messages(home: &Path, data: &Path, transcript: &Path) {
+    for (needle, content, instant) in [
+        (
+            "question",
+            "Synthetic probe question",
+            1_774_113_351_457_i64,
+        ),
+        ("answer", "Synthetic probe answer", 1_774_113_411_457),
+    ] {
+        let hit = gh511_message_hit(home, data, needle, content);
+        assert_eq!(hit["created_at"].as_i64(), Some(instant), "{hit}");
+        assert_eq!(hit["workspace"], "/synthetic/probe", "{hit}");
+        assert_eq!(
+            Path::new(hit["source_path"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            transcript.canonicalize().unwrap(),
+            "{hit}"
+        );
+    }
+}
+
+/// GH #511 (bead b7rhs): a Codebuff transcript the connector could not
+/// interpret failed the codebuff scan, and cass reported `unreadable-source`
+/// with "check permissions" against the cass data directory. The failure is in
+/// the content, so it must be `unparseable-source`, not retryable on unchanged
+/// bytes, and name a scan root that holds the transcript. The fixture is the
+/// reporter's second probe: a variant ("assistant") the CLI never writes.
+#[test]
+fn gh511_unparseable_codebuff_transcript_is_not_an_unreadable_data_dir() {
+    use serde_json::{Value, json};
+
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let transcript = gh511_codebuff_chat(
+            &home,
+            "probe",
+            &json!([
+                {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
+                 "timestamp":"2026-03-21T17:15:51.457Z"},
+                {"id":"ai-1774113411457", "variant":"assistant", "content":"Synthetic probe answer",
+                 "timestamp":"2026-03-21T17:16:51.457Z"}
+            ]),
+        );
+        let before = fs::read(&transcript).unwrap();
+        let output = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "streaming={streaming}: {output:?}"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let connector = gh511_connector_stats(&report);
+        assert!(
+            connector["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("variant at record 1")),
+            "the connector error still names the bad record: {connector}"
+        );
+        gh511_assert_parse_diagnostic(&report, &data, &transcript);
+        assert_eq!(fs::read(&transcript).unwrap(), before);
+    }
+}
+
+/// GH #511: native Codebuff writes `timestamp` as a locale time of day
+/// ("01:15 PM"), which franken-agent-detection 0.3.3 rejected for every
+/// native transcript. The reporter's transcript now indexes, and each message
+/// carries the instant its ID's `Date.now()` recorded; nothing is derived
+/// from the time of day. Both indexing modes must discover the home-relative
+/// store with XDG_CONFIG_HOME and the Codebuff root override unset.
+#[test]
+fn gh511_native_time_of_day_transcript_indexes_with_its_id_instants() {
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let transcript = gh511_codebuff_chat(&home, "probe", &gh511_native_records());
+        let before = fs::read(&transcript).unwrap();
+        let output = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let connector = gh511_connector_stats(&report);
+        assert_eq!(
+            connector["conversations"], 1,
+            "streaming={streaming}: {report}"
+        );
+        assert_eq!(connector["messages"], 2, "streaming={streaming}: {report}");
+        assert!(connector.get("error").is_none(), "{connector}");
+        assert_eq!(
+            report["indexing_stats"]["scan_had_errors"], false,
+            "{report}"
+        );
+        assert_eq!(
+            report["indexing_stats"]["connector_summary"]["codebuff"]["indexed"], 1,
+            "{report}"
+        );
+        gh511_assert_native_messages(&home, &data, &transcript);
+        assert_eq!(fs::read(&transcript).unwrap(), before);
+    }
+}
+
+/// GH #511: a real default-store enumeration failure must name the directory
+/// that could not be read, retaining the I/O cause before any source is found.
+/// Root runs drop only the child process's privileges so chmod is meaningful.
+#[test]
+#[cfg(unix)]
+fn gh511_default_discovery_permission_error_names_the_manicode_directory() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+    use std::os::unix::process::CommandExt;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("cass-gh511-permissions-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let root = fs::metadata(tmp.path()).unwrap().uid() == 0;
+    let binary = if root {
+        // The build tree may be beneath a root-only directory. Copying just
+        // the executable keeps that tree's permissions unchanged.
+        let executable = tmp.path().join("cass");
+        fs::copy(assert_cmd::cargo::cargo_bin!("cass"), &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        executable
+    } else {
+        assert_cmd::cargo::cargo_bin!("cass").to_path_buf()
+    };
+
+    for streaming in ["0", "1"] {
+        let home = tmp.path().join(format!("home-{streaming}"));
+        let data = tmp.path().join(format!("data-{streaming}"));
+        fs::create_dir_all(&data).unwrap();
+        let transcript = gh511_codebuff_chat(&home, "unreadable-project", &gh511_native_records());
+        let before = fs::read(&transcript).unwrap();
+        for path in [
+            home.clone(),
+            home.join(".config"),
+            home.join(".config/manicode"),
+            home.join(".config/manicode/projects"),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let denied = home.join(".config/manicode/projects/unreadable-project");
+        let original_permissions = fs::metadata(&denied).unwrap().permissions();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut command = std::process::Command::new(&binary); // ubs:ignore[rust.security.command-executable] — Cargo's test binary or its byte-identical copy in this private test directory.
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_STREAMING_INDEX", streaming)
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home)
+            .args(["index", "--full", "--json", "--no-progress-events"]);
+        if root {
+            chown(&home, Some(65_534), Some(65_534)).unwrap();
+            chown(&data, Some(65_534), Some(65_534)).unwrap();
+            command.gid(65_534).uid(65_534);
+        }
+        let result = assert_cmd::Command::from(command)
+            .timeout(std::time::Duration::from_secs(180))
+            .output();
+        // Restore access before any assertion, including a subprocess error.
+        fs::set_permissions(&denied, original_permissions).unwrap();
+        let output = result.unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "streaming={streaming}: {output:?}"
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let connector = gh511_connector_stats(&report);
+        let error = connector["error"].as_str().unwrap();
+        assert!(
+            error.contains("cannot enumerate Codebuff / Freebuff history")
+                && error.to_ascii_lowercase().contains("permission denied")
+                && (error.contains(&denied.display().to_string())
+                    || error.contains(&denied.canonicalize().unwrap().display().to_string())),
+            "the discovery error must preserve the failed path and I/O cause: {connector}"
+        );
+        assert_eq!(
+            report["indexing_stats"]["scan_had_errors"], true,
+            "{report}"
+        );
+        let diagnostics: Vec<_> = report["indexing_stats"]["connector_diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["provider"] == "codebuff")
+            .collect();
+        assert!(!diagnostics.is_empty(), "{report}");
+        let mut named_failed_directory = false;
+        for diagnostic in diagnostics {
+            assert_eq!(
+                diagnostic["failure_kind"], "unreadable-source",
+                "{diagnostic}"
+            );
+            assert_eq!(diagnostic["retryable"], true, "{diagnostic}");
+            let source = Path::new(diagnostic["source_path"].as_str().unwrap())
+                .canonicalize()
+                .unwrap();
+            assert_ne!(source, data.canonicalize().unwrap(), "{diagnostic}");
+            assert!(
+                denied.canonicalize().unwrap().starts_with(&source),
+                "{diagnostic}"
+            );
+            named_failed_directory |= source == denied.canonicalize().unwrap();
+        }
+        assert!(named_failed_directory, "{report}");
+        assert_eq!(fs::read(&transcript).unwrap(), before);
+    }
+}
+
+/// GH #511: one Codebuff transcript that does not parse (here truncated
+/// mid-write) stopped the scan, so every chat after it in path order went
+/// unindexed (franken-agent-detection 0.3.4 and earlier). The bad chat sorts
+/// first here. The good chat now indexes, the run still exits 9, and the
+/// connector error names the bad transcript and its cause. Batch mode must
+/// retain FAD's successful callbacks too, and "busy" in a project name must
+/// not turn a parse failure into a lock diagnosis.
+#[test]
+fn gh511_one_unparseable_codebuff_transcript_does_not_hide_the_others() {
+    use serde_json::{Value, json};
+
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let truncated = gh511_codebuff_chat(&home, "a-busy-project", &json!([]));
+        fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
+        let good = gh511_codebuff_chat(&home, "z-good", &gh511_native_records());
+        assert!(
+            truncated < good,
+            "the bad transcript must be discovered first"
+        );
+        let modified_before_failure =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_774_113_351);
+        let before: Vec<_> = [
+            truncated.clone(),
+            truncated.with_file_name("run-state.json"),
+            good.clone(),
+            good.with_file_name("run-state.json"),
+        ]
+        .into_iter()
+        .map(|path| {
+            // Both the transcript and its run state predate this scan, so a
+            // fresh sidecar cannot accidentally rescue an advanced watermark.
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified_before_failure)
+                .unwrap();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        let output = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "streaming={streaming}: {output:?}"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let connector = gh511_connector_stats(&report);
+        assert!(
+            connector["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid Codebuff / Freebuff transcript JSON"),
+            "{connector}"
+        );
+        gh511_assert_parse_diagnostic(&report, &data, &truncated);
+        assert_eq!(
+            connector["conversations"], 1,
+            "streaming={streaming}: {report}"
+        );
+        assert_eq!(connector["messages"], 2, "streaming={streaming}: {report}");
+        assert_eq!(
+            report["indexing_stats"]["connector_summary"]["codebuff"]["indexed"], 1,
+            "{report}"
+        );
+        gh511_assert_native_messages(&home, &data, &good);
+        for (path, bytes) in before {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+
+        // A failed scan must not advance the connector watermark. Repair the
+        // bad source but retain its pre-failure mtime: a normal incremental
+        // retry must ingest it and keep the good chat without duplication.
+        fs::write(
+            &truncated,
+            serde_json::to_vec(&json!([
+                {"id":"user-1774113471457", "variant":"user", "content":"Synthetic recovered question",
+                 "timestamp":"01:17 PM"}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&truncated)
+            .unwrap()
+            .set_modified(modified_before_failure)
+            .unwrap();
+        let retry = gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--json", "--no-progress-events"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let retry: Value = serde_json::from_slice(&retry).unwrap();
+        assert_eq!(retry["indexing_stats"]["scan_had_errors"], false, "{retry}");
+        assert!(
+            gh511_connector_stats(&retry).get("error").is_none(),
+            "{retry}"
+        );
+        let recovered =
+            gh511_message_hit(&home, &data, "recovered", "Synthetic recovered question");
+        assert_eq!(
+            recovered["created_at"].as_i64(),
+            Some(1_774_113_471_457),
+            "{recovered}"
+        );
+        gh511_assert_native_messages(&home, &data, &good);
+    }
+}
+
+/// A Codex rollout holding one question with `needle` and its answer.
+fn gh513_rollout_text(needle: &str) -> String {
+    [
+        serde_json::json!({"timestamp": "2026-08-01T10:00:00Z", "type": "session_meta",
+            "payload": {"cwd": "/synthetic/gh513"}}),
+        serde_json::json!({"timestamp": "2026-08-01T10:00:01Z", "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": format!("question {needle}")}]}}),
+        serde_json::json!({"timestamp": "2026-08-01T10:00:02Z", "type": "response_item",
+            "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "the answer"}]}}),
+    ]
+    .iter()
+    .map(|record| format!("{record}\n"))
+    .collect()
+}
+
+/// A session as Codex's `local_thread_store_compression` leaves it:
+/// `rollout-*.jsonl.zst`, one zstd frame that records the decoded length,
+/// with the plain rollout's modification time (here 30 days ago).
+fn gh513_compressed_rollout(home: &Path, name: &str, text: &str) -> std::path::PathBuf {
+    let day = home.join(".codex/sessions/2026/08/01");
+    fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-2026-08-01T10-00-00-{name}.jsonl.zst"));
+    fs::write(&path, zstd::bulk::compress(text.as_bytes(), 3).unwrap()).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    path
+}
+
+/// Codex hits for `needle`, as `(source_path, conversation_id)`.
+fn gh513_hits(home: &Path, data: &Path, needle: &str) -> Vec<(String, serde_json::Value)> {
+    let output = gh511_cass(home, data)
+        .args([
+            "search",
+            needle,
+            "--agent",
+            "codex",
+            "--mode",
+            "lexical",
+            "--json",
+            "--no-maintenance",
+            "--timeout",
+            "10000",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    result["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| {
+            (
+                hit["source_path"].as_str().unwrap_or_default().to_owned(),
+                hit["conversation_id"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn gh513_codex_conversations(home: &Path, data: &Path) -> serde_json::Value {
+    let output = gh511_cass(home, data)
+        .args(["stats", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stats: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    stats["by_agent"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["agent"] == "codex")
+        .map_or(serde_json::Value::Null, |row| row["count"].clone())
+}
+
+/// GH #513: both Codex passes (franken-agent-detection's parse and cass's
+/// enrichment) read a compressed rollout's decoded text, so the connector
+/// gives the same conversation, id included, for either form of one rollout.
+#[test]
+fn gh513_a_compressed_rollout_scans_and_enriches_like_its_plain_form() {
+    use coding_agent_search::connectors::{
+        Connector, ScanContext, ScanRoot, codex::CodexConnector,
+    };
+    let response = |payload: serde_json::Value| {
+        serde_json::json!({"type": "response_item", "timestamp": "2026-08-01T10:00:05.000Z",
+            "payload": payload})
+    };
+    let text = [
+        response(serde_json::json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "compressed parity question"}]})),
+        response(
+            serde_json::json!({"type": "custom_tool_call", "name": "apply_patch",
+            "call_id": "patch-1", "input": "*** Begin Patch\n+compressed_parity\n*** End Patch\n"}),
+        ),
+        response(
+            serde_json::json!({"type": "function_call_output", "call_id": "patch-1",
+            "output": "patch applied"}),
+        ),
+    ]
+    .iter()
+    .map(|record| format!("{record}\n"))
+    .collect::<String>();
+    let scan = |compressed: bool, enrich: bool| -> Vec<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".codex");
+        let day = home.join("sessions/2026/08/01");
+        fs::create_dir_all(&day).unwrap();
+        let plain = day.join("rollout-2026-08-01T10-00-00-parity.jsonl");
+        let written = if compressed {
+            plain.with_extension("jsonl.zst")
+        } else {
+            plain
+        };
+        if compressed {
+            fs::write(&written, zstd::bulk::compress(text.as_bytes(), 3).unwrap()).unwrap();
+        } else {
+            fs::write(&written, &text).unwrap();
+        }
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(home)],
+            None,
+        );
+        let conversations = if enrich {
+            CodexConnector::new().scan(&ctx).unwrap()
+        } else {
+            franken_agent_detection::CodexConnector::new()
+                .scan(&ctx)
+                .unwrap()
+        };
+        conversations
+            .into_iter()
+            .map(|conversation| {
+                assert_eq!(conversation.source_path, written);
+                let mut value = serde_json::to_value(conversation).unwrap();
+                value.as_object_mut().unwrap().remove("source_path");
+                value
+            })
+            .collect()
+    };
+    let plain = scan(false, true);
+    assert_eq!(plain.len(), 1);
+    assert_eq!(
+        plain[0]["external_id"],
+        "2026/08/01/rollout-2026-08-01T10-00-00-parity"
+    );
+    // The fixture needs the enrichment pass: without it the messages differ.
+    assert_ne!(plain[0]["messages"], scan(false, false)[0]["messages"]);
+    assert_eq!(scan(true, true), plain);
+}
+
+/// GH #513 (bead 3u22z): a Codex home holding only compressed sessions (the
+/// reporter's 1,599 of 1,609) indexes every one of them, searchably.
+#[test]
+fn gh513_codex_sessions_compressed_to_jsonl_zst_are_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let first = gh513_compressed_rollout(&home, "first", &gh513_rollout_text("gh513firstneedle"));
+    gh513_compressed_rollout(&home, "second", &gh513_rollout_text("gh513secondneedle"));
+    gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    assert_eq!(gh513_codex_conversations(&home, &data), 2);
+    let hits = gh513_hits(&home, &data, "gh513firstneedle");
+    assert!(
+        !hits.is_empty(),
+        "the compressed session's text is searchable"
+    );
+    let name = first.file_name().unwrap();
+    assert!(
+        hits.iter()
+            .all(|(path, _)| Path::new(path).file_name() == Some(name)),
+        "{hits:?}"
+    );
+}
+
+/// GH #513: a session indexed as `rollout-*.jsonl` that Codex then compresses
+/// (plain file removed, modification time kept) is the same session, not a
+/// second one.
+#[test]
+fn gh513_a_session_compressed_after_indexing_is_not_duplicated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let text = gh513_rollout_text("gh513sameneedle");
+    let packed = gh513_compressed_rollout(&home, "same", &text);
+    let plain = packed.with_extension("");
+    let mtime = fs::metadata(&packed).unwrap().modified().unwrap();
+    fs::rename(&packed, packed.with_extension("parked")).unwrap();
+    fs::write(&plain, &text).unwrap();
+    gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    let before = gh513_hits(&home, &data, "gh513sameneedle");
+    assert!(!before.is_empty());
+    // The comparison below needs a real id, not two missing ones.
+    assert!(before[0].1.is_i64(), "{before:?}");
+
+    // Codex compresses it: the compressed file keeps the plain file's mtime.
+    fs::remove_file(&plain).unwrap();
+    fs::rename(packed.with_extension("parked"), &packed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&packed)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    gh511_cass(&home, &data)
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    assert_eq!(gh513_codex_conversations(&home, &data), 1);
+    let after = gh513_hits(&home, &data, "gh513sameneedle");
+    assert!(
+        after.iter().all(|(_, id)| *id == before[0].1),
+        "before {before:?} after {after:?}"
+    );
+}
+
+/// GH #513: an archive whose Codex watermark an older build recorded picks
+/// up compressed sessions older than that watermark on its next plain
+/// `cass index`, in both ingest modes, and records the scan contract so the
+/// run after it has a cutoff again.
+#[test]
+fn gh513_an_older_codex_watermark_does_not_hide_old_compressed_sessions() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    for streaming in ["0", "1"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let plain_day = home.join(".codex/sessions/2026/10/01");
+        fs::create_dir_all(&plain_day).unwrap();
+        fs::write(
+            plain_day.join("rollout-2026-10-01T10-00-00-plain.jsonl"),
+            gh513_rollout_text("gh513plainneedle"),
+        )
+        .unwrap();
+        gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .assert()
+            .success();
+        let db = data.join("agent_search.db");
+        {
+            // Leave the archive as an older build would: a Codex watermark
+            // recorded without the scan contract.
+            let storage = FrankenStorage::open(&db).unwrap();
+            let state = storage.connector_scan_states(&["codex"]).unwrap()["codex"];
+            assert!(state.last_scan_ts.is_some(), "streaming={streaming}");
+            assert!(!state.scan_contract_pending, "streaming={streaming}");
+            storage
+                .raw()
+                .execute("DELETE FROM meta WHERE key = 'scan_contract:connector:codex'")
+                .unwrap();
+            assert!(
+                storage.connector_scan_states(&["codex"]).unwrap()["codex"].scan_contract_pending
+            );
+        }
+
+        // Compressed long ago, so older than the watermark.
+        let packed =
+            gh513_compressed_rollout(&home, "backlog", &gh513_rollout_text("gh513backlogneedle"));
+        gh511_cass(&home, &data)
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--json", "--no-progress-events"])
+            .assert()
+            .success();
+        let hits = gh513_hits(&home, &data, "gh513backlogneedle");
+        assert!(
+            hits.iter()
+                .any(|(path, _)| Path::new(path).file_name() == packed.file_name()),
+            "streaming={streaming}: {hits:?}"
+        );
+        let storage = FrankenStorage::open_readonly(&db).unwrap();
+        assert!(
+            !storage.connector_scan_states(&["codex"]).unwrap()["codex"].scan_contract_pending,
+            "streaming={streaming}: the scan recorded the contract"
+        );
+    }
+}
+
 /// GH #499 (bead 2l1b0.49): once an incremental run tombstones a row inside a
 /// sealed Quill segment, every date-filtered search failed with "posting
 /// cursor invariant failed: Boolean children belong to different segment
@@ -2170,4 +2984,127 @@ fn multi_connector_empty_connector() {
     );
 
     tracker.complete();
+}
+
+/// GH #511: watch-once uses the same callback contract as initial indexing.
+/// A failed transcript must retain good chats, report the actual error even
+/// when nothing parses, and leave an older repaired source eligible for retry.
+#[test]
+fn gh511_watch_once_retains_good_chats_and_retries_failed_sources() {
+    use serde_json::{Value, json};
+
+    for with_good_chat in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let truncated = gh511_codebuff_chat(&home, "a-busy-project", &json!([]));
+        fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
+        let good =
+            with_good_chat.then(|| gh511_codebuff_chat(&home, "z-good", &gh511_native_records()));
+        let modified_before_failure =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_774_113_351);
+        let source_paths = [truncated.clone()]
+            .into_iter()
+            .chain(good.iter().cloned())
+            .flat_map(|path| [path.with_file_name("run-state.json"), path]);
+        let before: Vec<_> = source_paths
+            .map(|path| {
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(modified_before_failure)
+                    .unwrap();
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let projects = gh511_codebuff_projects(&home);
+        let output = gh511_cass(&home, &data)
+            .args(["index", "--watch", "--watch-once"])
+            .arg(&projects)
+            .args(["--json", "--no-progress-events"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "with_good_chat={with_good_chat}: {output:?}"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        gh511_assert_parse_diagnostic(&report, &data, &truncated);
+        assert_eq!(report["success"], false, "{report}");
+        assert_eq!(report["partial"], true, "{report}");
+        assert_eq!(report["coverage_status"], "incomplete", "{report}");
+        let connector = gh511_connector_stats(&report);
+        assert_eq!(
+            connector["conversations"],
+            usize::from(with_good_chat),
+            "{report}"
+        );
+        assert_eq!(
+            connector["messages"],
+            2 * usize::from(with_good_chat),
+            "{report}"
+        );
+        assert!(
+            connector["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid Codebuff / Freebuff transcript JSON"),
+            "{connector}"
+        );
+        assert!(!data.join("watch_state.json").exists());
+        if let Some(good) = &good {
+            gh511_assert_native_messages(&home, &data, good);
+        }
+        for (path, bytes) in before {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+
+        fs::write(
+            &truncated,
+            serde_json::to_vec(&json!([
+                {"id":"user-1774113471457", "variant":"user", "content":"Synthetic watch recovered question",
+                 "timestamp":"01:17 PM"}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&truncated)
+            .unwrap()
+            .set_modified(modified_before_failure)
+            .unwrap();
+        let retry = gh511_cass(&home, &data)
+            .args(["index", "--watch", "--watch-once"])
+            .arg(&projects)
+            .args(["--json", "--no-progress-events"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let retry: Value = serde_json::from_slice(&retry).unwrap();
+        assert_eq!(retry["indexing_stats"]["scan_had_errors"], false, "{retry}");
+        assert!(
+            gh511_connector_stats(&retry).get("error").is_none(),
+            "{retry}"
+        );
+        assert_ne!(retry["partial"], true, "{retry}");
+        assert!(!data.join("watch_state.json").exists());
+        let recovered = gh511_message_hit(
+            &home,
+            &data,
+            "recovered",
+            "Synthetic watch recovered question",
+        );
+        assert_eq!(recovered["created_at"].as_i64(), Some(1_774_113_471_457));
+        assert_eq!(recovered["workspace"], "/synthetic/probe");
+        if let Some(good) = &good {
+            gh511_assert_native_messages(&home, &data, good);
+        }
+    }
 }

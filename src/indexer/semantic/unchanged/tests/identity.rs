@@ -195,36 +195,44 @@ fn foreign_revision_or_tombstoned_vector_image_is_not_a_completed_no_op() -> Res
         let temp = tempfile::tempdir()?;
         let data = temp.path();
         let (storage, manifest, plan, live) = setup(data)?;
-        let reader = VectorIndex::open_read_only(&live)?;
-        let records: Vec<_> = (0..reader.record_count())
-            .map(|i| Ok((reader.doc_id_at(i)?.to_owned(), reader.vector_at_f32(i)?)))
-            .collect::<Result<_>>()?;
-        drop(reader);
-        let expected = engine::expected_vector_space_revision("fnv1a-384").unwrap();
-        let revision = if tombstone {
-            expected.to_owned()
+        if tombstone {
+            // Tombstone one row in place, as reconciliation's soft_delete_batch
+            // does to a live legacy image: same bytes elsewhere, same length,
+            // no WAL. FSVI 0.3 writers refuse to write tombstones into a new
+            // legacy image, so rewriting the file cannot produce this state.
+            let mut index = VectorIndex::open(&live)?;
+            let first = index.doc_id_at(0)?.to_owned();
+            assert!(index.soft_delete(&first)?);
+            drop(index);
         } else {
-            "x".repeat(expected.len())
-        };
-        let mut writer = VectorIndex::create_with_revision(
-            &live,
-            "fnv1a-384",
-            &revision,
-            384,
-            Quantization::F16,
-        )?;
-        for (i, (id, vector)) in records.iter().enumerate() {
-            if tombstone && i == 0 {
-                writer.write_tombstone_record(id, vector)?;
-            } else {
+            let reader = VectorIndex::open_read_only(&live)?;
+            let records: Vec<_> = (0..reader.record_count())
+                .map(|i| Ok((reader.doc_id_at(i)?.to_owned(), reader.vector_at_f32(i)?)))
+                .collect::<Result<_>>()?;
+            drop(reader);
+            let expected = engine::expected_vector_space_revision("fnv1a-384").unwrap();
+            let mut writer = VectorIndex::create_with_revision(
+                &live,
+                "fnv1a-384",
+                &"x".repeat(expected.len()),
+                384,
+                Quantization::F16,
+            )?;
+            for (id, vector) in &records {
                 writer.write_record(id, vector)?;
             }
+            writer.finish()?;
         }
-        writer.finish()?;
         assert_eq!(
             fs::metadata(&live)?.len(),
             manifest.quality_tier.as_ref().unwrap().size_bytes
         );
+        // Only the revision or the tombstone may differ, so the proof must
+        // reject the image on that alone, not on a WAL or a length change.
+        assert!(!wal_path_for(&live).exists());
+        let image = VectorIndex::open_read_only(&live)?;
+        assert_eq!(image.tombstone_count(), usize::from(tombstone));
+        drop(image);
         let before = snapshot(data)?;
         let inner = engine::SemanticIndexer::new("hash", None)?;
         assert!(

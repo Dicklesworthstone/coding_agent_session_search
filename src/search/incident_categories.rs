@@ -198,7 +198,7 @@ static CATEGORIES: &[IncidentCategoryDef] = &[
         confidence: DetectionConfidence::High,
         root_cause_family: RootCauseFamily::CassDerivedState,
         privacy_tier: PrivacyTier::Redacted,
-        recommended_next_probe: "cass diag --json --quarantine",
+        recommended_next_probe: "cass quarantine list --json",
     },
     IncidentCategoryDef {
         category: IncidentCategory::StorageBusyCorrupt,

@@ -546,6 +546,9 @@
         "sole_copy_warning_count": {
           "type": "integer"
         },
+        "raw_mirror_capture_disabled": {
+          "type": "boolean"
+        },
         "recommended_action": {
           "type": "string"
         }
@@ -633,6 +636,9 @@
           "type": "string"
         },
         "quarantined_conversations": {
+          "type": "integer"
+        },
+        "deferred_conversations": {
           "type": "integer"
         },
         "recent_quarantined_conversations": {
@@ -789,6 +795,9 @@
               "type": "null"
             }
           }
+        },
+        "memory": {
+          "type": "string"
         }
       }
     },
@@ -1177,10 +1186,19 @@
                 "controller_loadavg_low_watermark_1m": {
                   "type": "number"
                 },
+                "startup_page_fetch_message_bytes": {
+                  "type": "string"
+                },
+                "steady_page_fetch_message_bytes": {
+                  "type": "string"
+                },
                 "runtime": {
                   "type": "null"
                 }
               }
+            },
+            "expected_docs_scan": {
+              "type": "null"
             }
           }
         },
@@ -1393,6 +1411,9 @@
               "type": "string"
             },
             "quarantined_conversations": {
+              "type": "integer"
+            },
+            "deferred_conversations": {
               "type": "integer"
             },
             "recent_quarantined_conversations": {

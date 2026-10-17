@@ -32,6 +32,26 @@
       "cfg_test_only": true,
       "permanent": true,
       "note": "GH505 covers tag-only and DNS-only providers, normal exit nodes, aliases, all-provider discovery, and resumed stale discovery. No SSH executable is substituted."
+    },
+    {
+      "path": "tests/install_scripts.rs",
+      "pattern": "fake_bin",
+      "rationale": "External toolchain/network boundary: a real from-source install clones the repository from GitHub and compiles cass with a rustup-installed pinned toolchain. Scripted git/rustup/cargo executables on PATH record their invocation order, so source_install_bootstraps_the_toolchain_after_clone proves install.sh installs the pinned toolchain after the clone and before the build, without network access or a toolchain build. install.sh itself runs unchanged.",
+      "owner": "release-team",
+      "review_date": "2027-03-29",
+      "cfg_test_only": true,
+      "permanent": true,
+      "note": "Directory holding the substituted git/rustup/cargo scripts."
+    },
+    {
+      "path": "tests/install_scripts.rs",
+      "pattern": "fake_path",
+      "rationale": "PATH value that puts the scripted git/rustup/cargo executables ahead of the inherited PATH for the same test; see the fake_bin entry.",
+      "owner": "release-team",
+      "review_date": "2027-03-29",
+      "cfg_test_only": true,
+      "permanent": true,
+      "note": "Only the substituted tool directory is prepended; every other command resolves normally."
     }
   ],
   "excluded_paths": [

@@ -87,9 +87,10 @@ def main() -> None:
             source = f'version = {json.dumps(version)}'
             if fad_checkout is not None:
                 source = f'version = {json.dumps("=" + fad_version)}, path = {json.dumps(fad_checkout.as_posix(), ensure_ascii=False)}'
+            # codex-zstd: the Codex connector reads compressed rollouts (GH #513).
             lines.append(
                 f'{name} = {{ {source}, '
-                'default-features = false, features = ["connectors"] }'
+                'default-features = false, features = ["connectors", "codex-zstd"] }'
             )
         elif name == "serde":
             lines.append(f'{name} = {{ version = {json.dumps(version)}, features = ["derive"] }}')
@@ -98,6 +99,9 @@ def main() -> None:
     lines.extend(["", "[lints.rust]", 'unsafe_code = "forbid"', ""])
 
     library = '''// Re-exports only; the Codex implementation is unmodified production code.
+// Crate-internal entry points used only by unstaged CASS modules (such as
+// ingest diagnostics) are unused here; the full crate's clippy checks them.
+#![allow(dead_code)]
 pub use franken_agent_detection::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation,
     NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages,

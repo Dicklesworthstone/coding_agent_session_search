@@ -1,13 +1,13 @@
 ---
 source: tests/tui_flows.rs
-expression: "flow_snapshot(&app, \"search_open_find_in_detail\", \"login <SearchCompleted:1 hit> <Enter> / error <Enter>\")"
+expression: "flow_snapshot(&app, \"search_open_find_in_detail\",\n\"login <SearchCompleted:1 hit> <Enter> / error <Enter>\")"
 ---
 FLOW: search_open_find_in_detail
 -----
 KEYS: login <SearchCompleted:1 hit> <Enter> / error <Enter>
 STATE: query="login" detail_open=true detail_tab=Messages find_query="error" palette_visible=false theme_dark=true status="Loaded 1 results in 7ms"
 FINAL_FRAME:
- ▐ Search ▌  · Analytics   · Swarm   · Sources  | Alt+A=analytics  Alt+W=swarm  Ctrl+Shift+S=sources
+ ▐ Search ▌  · Analytics   · Swarm   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  Ctrl+P=
 ╭╭ Detail · Messages ↩ ───────────────────────────────────────────────────────────────────────────╮╮
 ││  ▐Messages▌  │  Snippets  │  Raw  │  Json  │  Analytics  │  Export                             ││
 ││ agent ✓ claude_code · ws /workspace/cass · src ⌂ local · score 0.970 (9.7/10) · mt exact       ││

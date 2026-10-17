@@ -1,0 +1,157 @@
+--- a/src/indexer/semantic/engine.rs
++++ b/src/indexer/semantic/engine.rs
+@@ -44,4 +44,6 @@
+ use crate::storage::sqlite::FrankenStorage;
++
++mod replay_cache;
+ 
+ #[cfg(test)]
+ mod shard_publication_tests;
+@@ -2404,3 +2406,4 @@
+     // MiniLM producers. Multilingual retains uncached batches until qualified.
+     exact_reuse: bool,
++    replay_cache: replay_cache::CanonicalReplayCache,
+ }
+@@ -2431,4 +2434,5 @@
+             embedder,
+             batch_size: resolved_default_batch_size(),
+             exact_reuse,
++            replay_cache: replay_cache::CanonicalReplayCache::default(),
+         })
+@@ -3780,14 +3784,4 @@
+         let total_conversations = total_semantic_conversations(storage)?;
+-        let mut current_ids = HashSet::new();
+-        let mut selected_ids = HashSet::new();
+-        let mut inputs = Vec::new();
+-        let mut selected_conversations = 0usize;
+-        let mut selected_messages = 0usize;
+-        let mut selected_bytes = 0u64;
+-        let mut covered_conversations = 0u64;
+-        let mut after_conversation_id = 0i64;
+-        let mut last_covered_conversation = 0i64;
+-        let mut last_message_id = None;
+         sink.emit(
+             SemanticProgressEvent::SelectionStart,
+             SemanticProgressFields {
+@@ -3796,91 +3790,19 @@
+                 ..Default::default()
+             },
+         );
+-        loop {
+-            // Page actual parent IDs independently of append-tail metadata:
+-            // deleting the last message must not strand this scan on a stale
+-            // tail cache or make a deleted document count as covered.
+-            let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+-                "SELECT id FROM conversations WHERE id > ?1 ORDER BY id LIMIT ?2",
+-                &[
+-                    ParamValue::from(after_conversation_id),
+-                    ParamValue::from(DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64),
+-                ],
+-                |row| row.get_typed(0),
+-            )?;
+-            if conversation_ids.is_empty() {
+-                break;
+-            }
+-            for conversation_id in conversation_ids {
+-                let (conversation_inputs, _) =
+-                    packet_embedding_inputs_from_selected_canonical_messages(
+-                        storage,
+-                        &[conversation_id],
+-                        |_| true,
+-                    )?;
+-                let mut missing = Vec::new();
+-                let mut missing_ids = Vec::new();
+-                for input in conversation_inputs {
+-                    let Some(id) = semantic_doc_id_for_input(&input) else {
+-                        continue;
+-                    };
+-                    if !current_ids.insert(id.clone()) {
+-                        bail!("canonical semantic backfill produced duplicate document {id}");
+-                    }
+-                    if !existing_ids.contains(&id) {
+-                        missing_ids.push(id);
+-                        missing.push(input);
+-                    }
+-                }
+-                let missing_bytes = missing.iter().fold(0u64, |bytes, input| {
+-                    bytes.saturating_add(saturating_u64_from_usize(input.content.len()))
+-                });
+-                let missing_messages = missing
+-                    .iter()
+-                    .map(|input| input.message_id)
+-                    .collect::<HashSet<_>>()
+-                    .len();
+-                // Match the existing whole-conversation exception: the first
+-                // missing conversation may exceed a message/byte cap by itself.
+-                let select = !missing.is_empty()
+-                    && selected_conversations < plan.max_conversations.max(1)
+-                    && (selected_conversations == 0
+-                        || ((!caps.message_limited()
+-                            || selected_messages.saturating_add(missing_messages)
+-                                <= caps.max_messages)
+-                            && (!caps.byte_limited()
+-                                || selected_bytes.saturating_add(missing_bytes)
+-                                    <= caps.max_bytes)));
+-                if missing.is_empty() || select {
+-                    covered_conversations = covered_conversations.saturating_add(1);
+-                    last_covered_conversation = conversation_id;
+-                }
+-                if select {
+-                    selected_conversations = selected_conversations.saturating_add(1);
+-                    selected_messages = selected_messages.saturating_add(missing_messages);
+-                    selected_bytes = selected_bytes.saturating_add(missing_bytes);
+-                    for input in &missing {
+-                        let id = i64::try_from(input.message_id).unwrap_or(i64::MAX);
+-                        last_message_id =
+-                            Some(last_message_id.map_or(id, |prior: i64| prior.max(id)));
+-                    }
+-                    selected_ids.extend(missing_ids);
+-                    inputs.extend(missing);
+-                }
+-                after_conversation_id = conversation_id;
+-                sink.emit(
+-                    SemanticProgressEvent::PacketReplayProgress,
+-                    SemanticProgressFields {
+-                        last_conversation_id: Some(conversation_id),
+-                        rows_processed: Some(saturating_u64_from_usize(current_ids.len())),
+-                        conversations_in_batch: Some(saturating_u64_from_usize(
+-                            selected_conversations,
+-                        )),
+-                        ..Default::default()
+-                    },
+-                );
+-            }
+-        }
++        let (selection, replay_proof) = self.replay_cache.select(
++            self, storage, &plan, &existing_ids, caps, sink,
++        )?;
++        let replay_cache::ReconcileSelection {
++            current_ids,
++            selected_ids,
++            inputs,
++            selected_conversations,
++            covered_conversations,
++            last_covered_conversation,
++            last_message_id,
++            ..
++        } = selection;
+         let mut covered_ids: HashSet<String> =
+             existing_ids.intersection(&current_ids).cloned().collect();
+         covered_ids.extend(selected_ids);
+@@ -3895,5 +3817,8 @@
+             },
+         );
+         let embeddings = self.embed_messages_with_sink(&inputs, sink)?;
++        // A hit is valid only while the descriptor-bound canonical archive
++        // remains unchanged, including across a potentially long embed batch.
++        replay_proof.verify(storage)?;
+         let embedded_docs = saturating_u64_from_usize(embeddings.len());
+         let staging_path = semantic_staging_index_path(
+--- a/src/indexer/semantic/shard_publication_tests.rs
++++ b/src/indexer/semantic/shard_publication_tests.rs
+@@ -8,4 +8,5 @@
+         embedder: Box::new(HashEmbedder::default()),
+         batch_size: 2,
+         exact_reuse: false,
++        replay_cache: replay_cache::CanonicalReplayCache::default(),
+     }

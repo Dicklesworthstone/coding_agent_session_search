@@ -1,0 +1,80 @@
+# Qualify the real native caller before publishing its guarded integration.
+name: Exact message streaming
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/search/query/message_stream.rs'
+      - 'src/search/query/message_stream/**'
+      - 'scripts/patches/exact-message-stream.patch'
+      - '.github/workflows/exact-message-stream.yml'
+permissions:
+  contents: write
+jobs:
+  integrate-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Integrate exact call sites on the recorded main revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/exact-message-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/exact-message-evidence/tested-base.txt"
+          # This reviewed diff supersedes the old unconditional-WAL wrapper.
+          # After activation, rustfmt changes line layout; the runtime tests
+          # below, including separate native/refinement visit counters, still
+          # qualify every subsequent module change on the current main tree.
+          if grep -Fq 'fn streaming_wal_queries_keep_a_proven_native_first_window(' src/search/query/message_stream/tests.rs; then
+            grep -Fq 'a retained delta alone is not a reason to bypass its proven first window.' src/search/query.rs
+            grep -Fq 'fn legacy_width_live_caller_preserves_native_repair_and_late_filter_negative(' src/search/query/message_stream/retained_wal/tests.rs
+            echo 'Reviewed first-window integration already present.' | tee "$RUNNER_TEMP/exact-message-evidence/integration.txt"
+          else
+            git apply --check scripts/patches/exact-message-stream.patch
+            git apply scripts/patches/exact-message-stream.patch
+            echo 'Applied reviewed first-window integration and regression diff.' | tee "$RUNNER_TEMP/exact-message-evidence/integration.txt"
+          fi
+          rustc --version | tee "$RUNNER_TEMP/exact-message-evidence/toolchain.txt"
+          rustfmt --edition 2024 --config skip_children=true src/search/query.rs
+          rustfmt --edition 2024 src/search/query/message_stream.rs
+          git diff --check
+          git diff -- src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs src/search/query/message_stream/retained_wal.rs src/search/query/message_stream/retained_wal/tests.rs > "$RUNNER_TEMP/exact-message-evidence/source.diff"
+      - name: Differential tests on real FSVI, WAL, and the integrated CASS driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib search::query::message_stream:: -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/streaming.log"
+          cargo test --locked --lib search::query::message_topk -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/existing-exact.log"
+          cargo test --locked --lib search::query::ann_shards -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/existing-ann.log"
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/exact-message-evidence/clippy.log"
+      - name: Publish the tested integration without rewriting concurrent work
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/search/query.rs src/search/query/message_stream.rs src/search/query/message_stream/tests.rs src/search/query/message_stream/retained_wal.rs src/search/query/message_stream/retained_wal/tests.rs
+          if git diff --cached --quiet; then
+            echo 'Integration already present; no commit required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(search): activate bounded exact refinement after proven native windows' -m 'Keep the native first-window proof for both main-only and retained-WAL queries. Only unresolved chunk windows use complete bounded message selection, including legacy widths and large deltas. Preserve backend WAL repair; retain late-filter historical negatives without requiring the pinned backend to reproduce an already-fixed bug. Validate exact scores, chunks, scope, immutable artifacts and one-pass routing with locked FSVI/WAL tests, existing exact/ANN regressions and lib Clippy. No dependency or acceptance-gate changes.'
+          git push origin HEAD:refs/heads/main
+          git rev-parse HEAD | tee "$RUNNER_TEMP/exact-message-evidence/published-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: exact-message-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/exact-message-evidence/
+          if-no-files-found: error
+          retention-days: 14

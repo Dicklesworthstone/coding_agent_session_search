@@ -381,17 +381,15 @@ fn single_link_regular(path: &Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return false;
-        }
+        metadata.is_file() && metadata.nlink() == 1
     }
-    true
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 #[derive(Debug, Default)]

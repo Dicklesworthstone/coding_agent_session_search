@@ -43,6 +43,12 @@ pub struct TopologySnapshot {
     pub smt_threads_per_core: usize,
     pub memory_total_bytes: Option<u64>,
     pub memory_available_bytes: Option<u64>,
+    /// GH #496: the host's own total before any cgroup limit.
+    pub host_memory_total_bytes: Option<u64>,
+    /// GH #496: what set `memory_total_bytes`: `host`, or the cgroup level
+    /// whose limit is below the host total (`cgroup_v2:/<path>`,
+    /// `cgroup_v1:/<path>`).
+    pub memory_limit_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,10 +96,12 @@ pub struct TopologyPlannerDefaults {
     pub max_inflight_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySnapshot {
     pub total_bytes: Option<u64>,
     pub available_bytes: Option<u64>,
+    pub host_total_bytes: Option<u64>,
+    pub limit_source: Option<String>,
 }
 
 impl TopologyPlannerDefaults {
@@ -117,7 +125,7 @@ impl TopologyPlannerDefaults {
         }
     }
 
-    fn from_current_process_with(memory: MemorySnapshot) -> Self {
+    fn from_current_process_with(memory: &MemorySnapshot) -> Self {
         let pipeline = crate::indexer::lexical_rebuild_pipeline_settings_snapshot();
         Self::conservative(
             pipeline.available_parallelism,
@@ -138,9 +146,12 @@ impl TopologyPlannerDefaults {
 /// a cap, and sized the planner's cache and in-flight caps for memory the
 /// process may not use.
 fn effective_memory_snapshot() -> MemorySnapshot {
+    let total = crate::indexer::responsiveness::memory_total();
     MemorySnapshot {
-        total_bytes: crate::indexer::responsiveness::total_memory_bytes(),
+        total_bytes: total.as_ref().map(|total| total.effective_bytes),
         available_bytes: crate::indexer::responsiveness::available_memory_bytes(),
+        host_total_bytes: total.as_ref().map(|total| total.host_bytes),
+        limit_source: total.map(|total| total.limit_source),
     }
 }
 
@@ -149,7 +160,7 @@ pub(crate) fn inspect_host_topology_budget() -> TopologyBudgetPlan {
 }
 
 fn inspect_host_topology_budget_with(memory: MemorySnapshot) -> TopologyBudgetPlan {
-    let defaults = TopologyPlannerDefaults::from_current_process_with(memory);
+    let defaults = TopologyPlannerDefaults::from_current_process_with(&memory);
     #[cfg(target_os = "linux")]
     {
         topology_budget_for_sysfs(Path::new("/sys"), memory, defaults)
@@ -169,7 +180,7 @@ pub fn topology_budget_for_sysfs(
     memory: MemorySnapshot,
     defaults: TopologyPlannerDefaults,
 ) -> TopologyBudgetPlan {
-    match read_linux_sysfs_topology(sys_root, memory) {
+    match read_linux_sysfs_topology(sys_root, &memory) {
         Ok(topology) => plan_for_topology(topology, defaults),
         Err(reason) => fallback_plan(
             fallback_topology(Some(memory), defaults.available_parallelism),
@@ -190,9 +201,12 @@ pub fn read_meminfo_snapshot(path: &Path) -> Option<MemorySnapshot> {
             available_bytes = parse_meminfo_kib(rest);
         }
     }
+    // A meminfo file only carries host figures; no cgroup limit applies.
     Some(MemorySnapshot {
         total_bytes,
         available_bytes,
+        host_total_bytes: total_bytes,
+        limit_source: total_bytes.map(|_| "host".to_owned()),
     })
 }
 
@@ -206,7 +220,7 @@ fn parse_meminfo_kib(rest: &str) -> Option<u64> {
 
 fn read_linux_sysfs_topology(
     sys_root: &Path,
-    memory: MemorySnapshot,
+    memory: &MemorySnapshot,
 ) -> Result<TopologySnapshot, String> {
     let cpu_root = sys_root.join("devices/system/cpu");
     let online_cpus = read_online_cpus(&cpu_root)?;
@@ -260,6 +274,8 @@ fn read_linux_sysfs_topology(
         smt_threads_per_core,
         memory_total_bytes: memory.total_bytes,
         memory_available_bytes: memory.available_bytes,
+        host_memory_total_bytes: memory.host_total_bytes,
+        memory_limit_source: memory.limit_source.clone(),
     })
 }
 
@@ -578,10 +594,7 @@ fn fallback_topology(
     memory: Option<MemorySnapshot>,
     available_parallelism: usize,
 ) -> TopologySnapshot {
-    let memory = memory.unwrap_or(MemorySnapshot {
-        total_bytes: None,
-        available_bytes: None,
-    });
+    let memory = memory.unwrap_or_default();
     TopologySnapshot {
         source: TopologySource::Fallback,
         topology_class: TopologyClass::Unknown,
@@ -593,6 +606,8 @@ fn fallback_topology(
         smt_threads_per_core: 1,
         memory_total_bytes: memory.total_bytes,
         memory_available_bytes: memory.available_bytes,
+        host_memory_total_bytes: memory.host_total_bytes,
+        memory_limit_source: memory.limit_source,
     }
 }
 
@@ -653,6 +668,8 @@ mod tests {
         MemorySnapshot {
             total_bytes: Some(total_gib * GIB),
             available_bytes: Some(available_gib * GIB),
+            host_total_bytes: Some(total_gib * GIB),
+            limit_source: Some("host".to_owned()),
         }
     }
 
@@ -849,6 +866,43 @@ mod tests {
             "a capped process must not get a larger cache than a roomy one: {} > {}",
             capped.advisory_budgets.cache_cap_bytes,
             roomy.advisory_budgets.cache_cap_bytes
+        );
+    }
+
+    #[test]
+    fn topology_reports_what_set_the_memory_total_in_sysfs_and_fallback_plans() {
+        // GH #496: a reporter could not tell whether `MemoryMax=16G` reached
+        // the process, because status showed only the clamped total.
+        let capped = MemorySnapshot {
+            total_bytes: Some(16 * GIB),
+            available_bytes: Some(12 * GIB),
+            host_total_bytes: Some(64 * GIB),
+            limit_source: Some("cgroup_v2:/user.slice/run-r1.scope".to_owned()),
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sys = temp.path();
+        write(&sys.join("devices/system/cpu/online"), "0-1\n");
+        for cpu in 0..2 {
+            add_cpu(sys, cpu, 0, cpu as i64, 0, "0-1\n");
+        }
+        let sysfs = topology_budget_for_sysfs(sys, capped.clone(), defaults(2));
+        let missing = tempfile::tempdir().expect("tempdir");
+        let fallback = topology_budget_for_sysfs(missing.path(), capped, defaults(2));
+        assert!(!sysfs.fallback_active);
+        assert!(fallback.fallback_active);
+        for plan in [&sysfs, &fallback] {
+            assert_eq!(plan.topology.memory_total_bytes, Some(16 * GIB));
+            assert_eq!(plan.topology.host_memory_total_bytes, Some(64 * GIB));
+            assert_eq!(
+                plan.topology.memory_limit_source.as_deref(),
+                Some("cgroup_v2:/user.slice/run-r1.scope")
+            );
+        }
+        let json = serde_json::to_value(&sysfs).expect("plan serializes");
+        assert_eq!(json["topology"]["host_memory_total_bytes"], 64 * GIB);
+        assert_eq!(
+            json["topology"]["memory_limit_source"],
+            "cgroup_v2:/user.slice/run-r1.scope"
         );
     }
 

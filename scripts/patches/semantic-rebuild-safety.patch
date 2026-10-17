@@ -1,0 +1,294 @@
+--- a/src/indexer/semantic/engine.rs
++++ b/src/indexer/semantic/engine.rs
+@@ -2916,34 +2916,29 @@
+         )
+         .map_err(|err| anyhow::anyhow!("create fsvi index failed: {err}"))?;
+ 
++        // The FSVI writer buffers records until finish() publishes its own
++        // temporary file. A rejected row therefore leaves no partial index
++        // at index_path: that path can still own the previous valid generation
++        // and its acknowledged WAL. Drop only the uncommitted writer on error;
++        // never unlink the destination as purported partial-output cleanup.
+         let mut records_written = 0_usize;
+-        let write_result: Result<()> = (|| {
+-            for embedded in embedded_messages {
+-                validate_embedding_vector(
+-                    &embedded.embedding,
+-                    self.embedder_dimension(),
+-                    embedded.message_id,
+-                )?;
+-                let doc_id = semantic_doc_id_for_embedded(&embedded);
+-                writer
+-                    .write_record(&doc_id, &embedded.embedding)
+-                    .map_err(|err| anyhow::anyhow!("write fsvi record failed: {err}"))?;
+-                records_written = records_written.saturating_add(1);
+-                on_progress(records_written);
+-            }
+-            Ok(())
+-        })();
+-
+-        if let Err(e) = &write_result {
+-            // Clean up partial index file to prevent corruption
+-            tracing::warn!("removing partial vector index after write failure: {e}");
+-            if let Err(rm_err) = std::fs::remove_file(index_path) {
+-                tracing::error!(
+-                    "failed to remove partial index file {}: {rm_err}",
+-                    index_path.display()
+-                );
+-            }
+-            return Err(anyhow::anyhow!("{e}"));
++        for embedded in embedded_messages {
++            validate_embedding_vector(
++                &embedded.embedding,
++                self.embedder_dimension(),
++                embedded.message_id,
++            )?;
++            let doc_id = semantic_doc_id_for_embedded(&embedded);
++            writer
++                .write_record(&doc_id, &embedded.embedding)
++                .map_err(|err| {
++                    // Preserve both the existing top-level diagnostic and the
++                    // backend's typed cause for callers that inspect the chain.
++                    let message = format!("write fsvi record failed: {err}");
++                    anyhow::Error::new(err).context(message)
++                })?;
++            records_written = records_written.saturating_add(1);
++            on_progress(records_written);
+         }
+ 
+         writer
+--- /dev/null
++++ b/tests/semantic_rebuild_safety.rs
+@@ -0,0 +1,232 @@
++//! Rejected semantic rebuilds must not delete the last valid generation.
++//!
++//! Uses the public CASS indexer, real hash embeddings, real FSVI writers and a
++//! genuinely serialized WAL. No mocked storage or forged artifact bytes.
++use anyhow::Result;
++use coding_agent_search::indexer::semantic::{EmbeddedMessage, EmbeddingInput, SemanticIndexer};
++use coding_agent_search::search::vector_index::{SemanticDocId, vector_index_path};
++use frankensearch::index::{VectorIndex, wal_path_for};
++use std::fs;
++use std::path::Path;
++
++#[derive(Clone, Copy, Debug)]
++enum InvalidVector {
++    WrongDimension,
++    Nan,
++    PositiveInfinity,
++    NegativeInfinity,
++    ZeroNorm,
++}
++
++impl InvalidVector {
++    fn apply(self, message: &mut EmbeddedMessage) {
++        match self {
++            Self::WrongDimension => {
++                message.embedding.pop();
++            }
++            Self::Nan => message.embedding[0] = f32::NAN,
++            Self::PositiveInfinity => message.embedding[0] = f32::INFINITY,
++            Self::NegativeInfinity => message.embedding[0] = f32::NEG_INFINITY,
++            // This passes CASS's finite/dimension check and is rejected by the
++            // actual backend writer, exercising both error sources.
++            Self::ZeroNorm => message.embedding.fill(0.0),
++        }
++    }
++}
++
++fn embed(indexer: &SemanticIndexer, rows: &[(u64, &str)]) -> Result<Vec<EmbeddedMessage>> {
++    let inputs: Vec<_> = rows
++        .iter()
++        .map(|(id, text)| EmbeddingInput::new(*id, *text))
++        .collect();
++    indexer.embed_messages(&inputs)
++}
++
++fn doc_id(message: &EmbeddedMessage) -> String {
++    SemanticDocId {
++        message_id: message.message_id,
++        chunk_idx: message.chunk_idx,
++        agent_id: message.agent_id,
++        workspace_id: message.workspace_id,
++        source_id: message.source_id,
++        role: message.role,
++        created_at_ms: message.created_at_ms,
++        content_hash: Some(message.content_hash),
++    }
++    .to_doc_id_string()
++}
++
++fn retained_hits(path: &Path, query: &[f32]) -> Result<Vec<(String, u32)>> {
++    let index = VectorIndex::open_read_only(path)?;
++    let count = index
++        .record_count()
++        .saturating_add(index.wal_record_count());
++    Ok(index
++        .search_top_k(query, count, None)?
++        .into_iter()
++        .map(|hit| (hit.doc_id.to_string(), hit.score.to_bits()))
++        .collect())
++}
++
++fn exercise_rejections(with_wal: bool) -> Result<()> {
++    let temp = tempfile::tempdir()?;
++    let indexer = SemanticIndexer::new("hash", None)?;
++    let old = embed(
++        &indexer,
++        &[
++            (1, "retained compiler checkpoint"),
++            (2, "retained network recovery"),
++        ],
++    )?;
++    let path = vector_index_path(temp.path(), indexer.embedder_id());
++    drop(indexer.build_and_save_index(old.clone(), temp.path())?);
++    let mut expected_ids: Vec<_> = old.iter().map(doc_id).collect();
++    let wal_path = wal_path_for(&path);
++    if with_wal {
++        let delta = embed(&indexer, &[(3, "acknowledged durable WAL update")])?;
++        let mut writer = VectorIndex::open_writer(&path)?;
++        writer.append_batch(&[(doc_id(&delta[0]), delta[0].embedding.clone())])?;
++        expected_ids.push(doc_id(&delta[0]));
++        drop(writer);
++    }
++    let query = &old[0].embedding;
++    let before_hits = retained_hits(&path, query)?;
++    let mut before_ids: Vec<_> = before_hits.iter().map(|(id, _)| id.clone()).collect();
++    before_ids.sort();
++    expected_ids.sort();
++    assert_eq!(
++        before_ids, expected_ids,
++        "the preservation control must contain every durable row"
++    );
++    let before_main = fs::read(&path)?;
++    let before_wal = if with_wal {
++        Some(fs::read(&wal_path)?)
++    } else {
++        None
++    };
++    let replacements = embed(
++        &indexer,
++        &[
++            (10, "replacement alpha"),
++            (11, "replacement beta"),
++            (12, "replacement gamma"),
++        ],
++    )?;
++
++    for invalid in [
++        InvalidVector::WrongDimension,
++        InvalidVector::Nan,
++        InvalidVector::PositiveInfinity,
++        InvalidVector::NegativeInfinity,
++        InvalidVector::ZeroNorm,
++    ] {
++        for invalid_at in [0, 1, 2] {
++            let mut attempt = replacements.clone();
++            invalid.apply(&mut attempt[invalid_at]);
++            let error = indexer
++                .build_and_save_index(attempt, temp.path())
++                .expect_err("invalid rebuild must fail");
++            assert_eq!(
++                fs::read(&path)?,
++                before_main,
++                "rejected {invalid:?} at row {invalid_at} must preserve the prior main file"
++            );
++            if let Some(expected_wal) = &before_wal {
++                assert_eq!(
++                    &fs::read(&wal_path)?,
++                    expected_wal,
++                    "failed rebuild must retain acknowledged WAL bytes"
++                );
++            } else {
++                assert!(!wal_path.exists(), "rejection must not create a WAL");
++            }
++            assert_eq!(
++                retained_hits(&path, query)?,
++                before_hits,
++                "a fresh reader must still search exactly the prior durable generation"
++            );
++            eprintln!(
++                "semantic_rebuild_rejection invalid={invalid:?} row={invalid_at} \
++                 wal={with_wal} preserved=true error={error:#}"
++            );
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn rejected_rebuild_preserves_main_and_reopened_search() -> Result<()> {
++    exercise_rejections(false)
++}
++
++#[test]
++fn rejected_rebuild_preserves_acknowledged_wal_and_reopened_search() -> Result<()> {
++    exercise_rejections(true)
++}
++
++#[test]
++fn rejected_first_build_does_not_publish_partial_records() -> Result<()> {
++    let temp = tempfile::tempdir()?;
++    let indexer = SemanticIndexer::new("hash", None)?;
++    let path = vector_index_path(temp.path(), indexer.embedder_id());
++    let mut rows = embed(
++        &indexer,
++        &[(1, "valid buffered prefix"), (2, "rejected tail")],
++    )?;
++    InvalidVector::Nan.apply(&mut rows[1]);
++    assert!(indexer.build_and_save_index(rows, temp.path()).is_err());
++    assert!(!path.exists());
++    assert!(!wal_path_for(&path).exists());
++    Ok(())
++}
++
++#[test]
++fn rejected_rebuild_can_retry_with_valid_replacement() -> Result<()> {
++    let temp = tempfile::tempdir()?;
++    let indexer = SemanticIndexer::new("hash", None)?;
++    let old = embed(&indexer, &[(1, "old preserved checkpoint")])?;
++    drop(indexer.build_and_save_index(old, temp.path())?);
++    let replacement = embed(
++        &indexer,
++        &[(20, "new compiler marker"), (21, "new network marker")],
++    )?;
++    let path = vector_index_path(temp.path(), indexer.embedder_id());
++    let before = fs::read(&path)?;
++    let mut invalid = replacement.clone();
++    InvalidVector::WrongDimension.apply(&mut invalid[1]);
++    assert!(indexer.build_and_save_index(invalid, temp.path()).is_err());
++    assert_eq!(fs::read(&path)?, before);
++    drop(indexer.build_and_save_index(replacement.clone(), temp.path())?);
++    let actual = retained_hits(&path, &replacement[0].embedding)?;
++    let mut ids: Vec<_> = actual.into_iter().map(|(id, _)| id).collect();
++    ids.sort();
++    let mut expected: Vec<_> = replacement.iter().map(doc_id).collect();
++    expected.sort();
++    assert_eq!(
++        ids, expected,
++        "valid retry must publish only the replacement rows"
++    );
++    Ok(())
++}
++
++#[test]
++fn backend_rejection_preserves_its_typed_cause() -> Result<()> {
++    let temp = tempfile::tempdir()?;
++    let indexer = SemanticIndexer::new("hash", None)?;
++    let mut rows = embed(&indexer, &[(1, "zero norm writer rejection")])?;
++    InvalidVector::ZeroNorm.apply(&mut rows[0]);
++    let error = indexer
++        .build_and_save_index(rows, temp.path())
++        .expect_err("zero vector");
++    assert!(
++        matches!(
++            error.downcast_ref::<frankensearch::SearchError>(),
++            Some(frankensearch::SearchError::InvalidConfig { .. })
++        ),
++        "backend error must not be flattened into a string: {error:#}"
++    );
++    let diagnostic = error.to_string();
++    assert!(diagnostic.contains("write fsvi record failed"));
++    assert!(diagnostic.contains("embedding"));
++    Ok(())
++}

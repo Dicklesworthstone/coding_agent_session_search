@@ -1,0 +1,59 @@
+name: Nightly checkpoint preservation
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/schedule.rs
+      - src/lib.rs
+      - src/indexer/semantic.rs
+      - src/indexer/semantic/**
+      - tests/external_backfill_runtime.rs
+      - tests/external_backfill_runtime/**
+      - .github/workflows/nightly-checkpoint.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    # The direct-command candidate is committed. Test only the checked-out
+    # source; no source-export dependency or uncommitted overlay remains.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the committed source revision
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - name: Scheduler checkpoint order and failure regressions
+        run: cargo test --locked --lib schedule::tests -- --nocapture
+      - name: Semantic engine and artifact ownership regressions
+        if: ${{ !cancelled() }}
+        run: 'cargo test --locked --lib indexer::semantic:: -- --nocapture'
+      - name: Real nightly, checkpoint, external transport and CLI regressions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --test external_backfill_runtime -- --nocapture
+      - name: Committed library Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --lib -- -D warnings
+      - name: Check checkpoint-owner source formatting
+        if: always()
+        run: rustfmt --edition 2024 --check --config skip_children=true src/indexer/semantic.rs src/indexer/semantic/artifacts.rs src/indexer/semantic/artifacts/lease_tests.rs src/lib.rs src/schedule.rs tests/external_backfill_runtime/cli.rs
+      - name: Verify validation did not alter committed sources
+        if: always()
+        run: git diff --exit-code HEAD -- src tests Cargo.toml Cargo.lock build.rs rust-toolchain.toml .cargo

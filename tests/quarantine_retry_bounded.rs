@@ -336,6 +336,141 @@ fn cli_list_and_clear_include_poison_only_quarantine_records() -> anyhow::Result
     Ok(())
 }
 
+/// `cass health` reports quarantined conversations with a `next_command`; that
+/// command must name them (v0.10.0 pointed at `cass diag --json --quarantine`,
+/// which inventories derived assets and never lists a conversation). The list
+/// then groups the merged state + poison rows and offers a retry only while
+/// one can help: an eligible row whose source is gone does not count.
+#[test]
+fn cli_health_pointer_lists_conversations_and_list_status_offers_only_useful_retries()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let data_dir = dir.path().join("data");
+    let mut state = QuarantineState::default();
+    state
+        .entries
+        .insert("conv-legacy::v1".to_string(), legacy_oom(1)?);
+    state.entries.insert(
+        "conv-same::v1".to_string(),
+        QuarantineRecord {
+            cass_version_at_quarantine: Some(CURRENT.to_string()),
+            ..legacy_oom(4)?
+        },
+    );
+    state.save(&data_dir)?;
+    let quarantine_dir = data_dir.join("quarantine");
+    fs::create_dir_all(&quarantine_dir)?;
+    fs::write(
+        quarantine_dir.join("index_ingest_poison.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "conversation_id": "conv-gone",
+                "schema_version_at_quarantine": 1,
+                "last_attempt_at_ms": 1_700_000_001_000_i64,
+                "attempt_count": 2,
+                "cass_version_at_quarantine": "0.0.1-old",
+                "reason": "index-ingest-out-of-memory",
+                "source_path": dir.path().join("moved-away.jsonl"),
+            })
+        ),
+    )?;
+
+    let data_dir_arg = data_dir.to_str().context("UTF-8 data dir")?;
+    let run_json = |label: &str, args: &[&str]| -> anyhow::Result<serde_json::Value> {
+        let mut command = Command::new(cargo_bin("cass"));
+        command
+            .args(args)
+            .args(["--data-dir", data_dir_arg])
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+            .env("XDG_CACHE_HOME", dir.path().join("xdg-cache"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("NO_COLOR", "1")
+            .env_remove("CLAUDE_CONFIG_DIR");
+        let output = spawn_with_timeout_or_diag(command, label, Some(&data_dir), COMMAND_TIMEOUT);
+        // `health` exits 1 on an unindexed archive; its JSON is still the
+        // contract under test.
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "{label} stdout is not JSON; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    };
+
+    let health = run_json("quarantine-health", &["health", "--json"])?;
+    let completeness = health
+        .get("search_completeness")
+        .or_else(|| health["state"].get("search_completeness"))
+        .context("health reports search_completeness")?;
+    ensure!(
+        completeness["quarantined_conversations"] == 3,
+        "health must count all three quarantined conversations: {completeness}"
+    );
+    let next = completeness["next_command"]
+        .as_str()
+        .context("next_command is a string")?;
+    ensure!(
+        next == "cass quarantine list --json",
+        "health must point at the surface that lists the conversations, got {next}"
+    );
+
+    let args: Vec<&str> = next.split_whitespace().skip(1).collect();
+    let listed = run_json("quarantine-list-from-health-pointer", &args)?;
+    let ids: Vec<&str> = listed["entries"]
+        .as_array()
+        .context("entries array")?
+        .iter()
+        .filter_map(|entry| entry["conversation_id"].as_str())
+        .collect();
+    ensure!(
+        ids == ["conv-gone", "conv-legacy", "conv-same"],
+        "the pointed-at command must name every excluded conversation: {ids:?}"
+    );
+    let status = &listed["status"];
+    ensure!(
+        status["total_excluded_conversations"] == 3
+            && status["by_eligibility"]["eligible"] == 2
+            && status["by_eligibility"]["irreducible_same_version"] == 1
+            && status["by_version_bucket"]["legacy"] == 1
+            && status["by_version_bucket"]["same_version"] == 1
+            && status["by_version_bucket"]["version_stale"] == 1
+            && status["source_missing_count"] == 1,
+        "status must group the merged rows: {status}"
+    );
+    ensure!(
+        status["retryable_now"] == 1,
+        "only conv-legacy is retryable: conv-gone is eligible but its source is gone: {status}"
+    );
+    ensure!(
+        status["next_safe_command"] == "cass quarantine retry --json",
+        "an eligible row with its source present gets the bounded retry plan: {status}"
+    );
+
+    // Negative: once the only retryable row is gone, the remaining rows are an
+    // irreducible same-version failure and a source-missing one. No retry can
+    // help, so none is offered.
+    state.entries.remove("conv-legacy::v1");
+    state.save(&data_dir)?;
+    let listed = run_json(
+        "quarantine-list-nothing-retryable",
+        &["quarantine", "list", "--json"],
+    )?;
+    let status = &listed["status"];
+    ensure!(
+        status["total_excluded_conversations"] == 2
+            && status["retryable_now"] == 0
+            && status["next_safe_command"].is_null(),
+        "no retry command may be offered when no retry can help: {status}"
+    );
+    Ok(())
+}
+
 #[test]
 fn cli_dry_run_plans_then_apply_reingests_exact_quarantine_key() -> anyhow::Result<()> {
     let dir = tempdir()?;
@@ -605,6 +740,125 @@ fn cli_dry_run_plans_then_apply_reingests_exact_quarantine_key() -> anyhow::Resu
             .as_str()
             .is_some_and(|value| matches!(value, "safe")),
         "proof manifest must pass its redaction review"
+    );
+    Ok(())
+}
+
+/// Run `cass <args> --data-dir <data_dir>` in an isolated HOME and return its
+/// stdout (status/health exit non-zero on an unindexed archive).
+fn cass_stdout_in(
+    home: &std::path::Path,
+    data_dir: &std::path::Path,
+    label: &str,
+    args: &[&str],
+) -> anyhow::Result<(Vec<u8>, String)> {
+    let data_dir_arg = data_dir.to_str().context("UTF-8 data dir")?;
+    let mut command = Command::new(cargo_bin("cass"));
+    command
+        .args(args)
+        .args(["--data-dir", data_dir_arg])
+        .current_dir(home)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join("xdg-data"))
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("NO_COLOR", "1")
+        .env_remove("CLAUDE_CONFIG_DIR");
+    let output = spawn_with_timeout_or_diag(command, label, Some(data_dir), COMMAND_TIMEOUT);
+    Ok((
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+/// GH#510: conversations the watcher keeps deferring after a bounded-guard
+/// NoMem are missing from search; `status` and `health` must say so and point
+/// at the list, without calling them a quarantine. Without a ledger neither
+/// surface mentions deferrals.
+#[test]
+fn cli_status_and_health_warn_about_watch_nomem_deferrals() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let run_json = |data_dir: &std::path::Path, label: &str, args: &[&str]| {
+        let (stdout, stderr) = cass_stdout_in(dir.path(), data_dir, label, args)?;
+        serde_json::from_slice::<serde_json::Value>(&stdout)
+            .with_context(|| format!("{label} stdout is not JSON; stderr: {stderr}"))
+    };
+    let human_status = |data_dir: &std::path::Path, label: &str| {
+        cass_stdout_in(dir.path(), data_dir, label, &["status"])
+            .map(|(stdout, _)| String::from_utf8_lossy(&stdout).into_owned())
+    };
+    // ingest_quarantine.recommended_action already names deferrals, so match
+    // the top-level warnings, not the whole payload.
+    let mentions_deferral = |payload: &serde_json::Value| {
+        payload["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|warning| warning.contains("deferred by the watcher"))
+        })
+    };
+
+    let deferred_dir = dir.path().join("deferred");
+    fs::create_dir_all(deferred_dir.join("quarantine"))?;
+    fs::write(
+        deferred_dir.join("quarantine/watch_nomem_deferrals.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "entries": {
+                "amp\u{1f}/logs/a.json\u{1f}": {
+                    "agent": "amp",
+                    "source_path": "/logs/a.json",
+                    "deferrals": 3,
+                    "first_deferred_at_ms": 1_700_000_000_000_i64,
+                    "last_deferred_at_ms": 1_700_000_100_000_i64,
+                    "next_retry_at_ms": 1_700_000_340_000_i64,
+                    "indexed_text_bytes": 525
+                }
+            }
+        }))?,
+    )?;
+    for (label, args) in [
+        ("deferral-status", ["status", "--json"]),
+        ("deferral-health", ["health", "--json"]),
+    ] {
+        let payload = run_json(&deferred_dir, label, &args)?;
+        ensure!(
+            mentions_deferral(&payload),
+            "{label} must warn about the deferred conversation: {payload}"
+        );
+        let summary = payload
+            .get("ingest_quarantine")
+            .or_else(|| payload["state"].get("ingest_quarantine"))
+            .context("ingest_quarantine summary")?;
+        ensure!(
+            summary["deferred_conversations"] == 1 && summary["status"] == "ok",
+            "{label}: one deferral, not a quarantine: {summary}"
+        );
+    }
+    let human = human_status(&deferred_dir, "deferral-status-human")?;
+    ensure!(
+        human.contains("Warning: 1 conversation(s) are deferred by the watcher"),
+        "human status must warn about the deferred conversation:\n{human}"
+    );
+
+    let clean_dir = dir.path().join("clean");
+    fs::create_dir_all(&clean_dir)?;
+    for (label, args) in [
+        ("clean-status", ["status", "--json"]),
+        ("clean-health", ["health", "--json"]),
+    ] {
+        let payload = run_json(&clean_dir, label, &args)?;
+        ensure!(
+            !mentions_deferral(&payload),
+            "{label} must not mention deferrals without a ledger: {payload}"
+        );
+    }
+    let human = human_status(&clean_dir, "clean-status-human")?;
+    ensure!(
+        !human.contains("deferred by the watcher"),
+        "human status must not mention deferrals without a ledger:\n{human}"
     );
     Ok(())
 }

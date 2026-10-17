@@ -1,24 +1,38 @@
 //! Verify a precise endpoint message, not whichever conversation ranks first.
 
+pub(super) mod exact;
+
+// Retain the previous ranked verifier only as an independent regression
+// comparator. Production resolves exact identities on one native snapshot.
+#[cfg(test)]
 use crate::search::quill_bridge::{search_paginated, stored_i64, stored_text, stored_u64};
+#[cfg(test)]
 use anyhow::{Result, ensure};
+#[cfg(test)]
 use frankensearch::quill::QuillSearchIndex;
+#[cfg(test)]
 use frankensearch::quill::cass::{
     CassConversationKey, CassDerivedColumns, CassDocument, cass_document_identity, field,
 };
+#[cfg(test)]
 use frankensearch::quill::query::{
     BooleanClause, CassQueryFilters, CassQueryParser, Occur, Query, QueryValue,
 };
+#[cfg(test)]
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
+#[cfg(test)]
 use std::collections::HashSet;
 
+#[cfg(test)]
 const PAGE_SIZE: usize = 64;
+#[cfg(test)]
 const MAX_CANDIDATES: usize = 4096;
 
 /// Read-only endpoint check. The reader is opened once by the caller after
 /// publication and is never refreshed during verification. Missing evidence
 /// returns false; engine/read errors and exhausted work budgets remain errors.
 /// A text token narrows discovery, but its absence never waives verification.
+#[cfg(test)]
 pub(super) fn verify(
     reader: &QuillSearchIndex,
     document: &CassDocument,
@@ -27,6 +41,7 @@ pub(super) fn verify(
     verify_with_budget(reader, document, token, MAX_CANDIDATES)
 }
 
+#[cfg(test)]
 fn verify_with_budget(
     reader: &QuillSearchIndex,
     document: &CassDocument,

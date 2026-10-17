@@ -177,6 +177,9 @@ fn scrub(input: &str, test_home: &Path) -> String {
         "available_bytes",
         "max_inflight_bytes",
         "pipeline_max_message_bytes_in_flight",
+        // A page's byte budget is a share of the in-flight budget above.
+        "startup_page_fetch_message_bytes",
+        "steady_page_fetch_message_bytes",
     ] {
         let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
         out = re

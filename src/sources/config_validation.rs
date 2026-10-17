@@ -1,8 +1,7 @@
-// Dead-code tolerated module-wide: this source-configuration validation +
-// setup-race diagnostic contract (bead cass-fleet-resilience-20260608-uojcg.8.5)
-// lands the classifier ahead of its projection into run_sources_doctor's live
-// JSON output (the .8.6 wiring slice) and the source/fleet doctor real-binary
-// E2E gate (.8.7). The reachability/sync-health side lives in
+// Dead-code tolerated module-wide: `validate_sources_config` feeds
+// `cass sources doctor` (its `config_validation` field), but the parse-failure
+// half (`validate_malformed`) and the change manifest (`diff_configs`) have no
+// production caller yet. The reachability/sync-health side lives in
 // source_doctor_health.rs (.8.2); this module is config-time validation.
 #![allow(dead_code)]
 

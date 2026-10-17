@@ -1,4 +1,4 @@
- ▐ Search ▌  · Analytics   · Swarm   · Sources  | Alt+A=analytics  Alt+W=swarm  Ctrl+Shift+S=sources  Ctrl+P=palette  F1
+ ▐ Search ▌  · Analytics   · Swarm   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  Ctrl+P=palette  F1=help  F2=
 ╭ ██ cass · Tokyo Night · Hybrid · Prefix ─────────────────────────────────────────────────────────────────────────────╮
 │ ?? authenticatio│n regression                                                                                        │
 │● agent:codex ● ws:/workspace/cass ● time:Jan 20, 1970 -> now ● source:remote-ci ● pane:triage                        │
@@ -20,5 +20,5 @@
 │                                                                                  ││glyphs → λ Δ ✓ to stress wrapping │
 │0 sessions │ 0 msgs                                                               ││behavior.                         │
 ╰──────────────────────────────────────────────────────────────────────────────────│╰──────────────────────────────────╯
- hits 1 · view med/cozy · query HYB / PFX · perf lat:— cache:cold · scope rank:balanced ctx:M src:remote-ci             
-  | Enter=open Ctrl+X=select Alt+S=mode Tab=focus                                                                       
+ hits 1 · view med/cozy · query HYB / PFX · perf lat:— cache:cold · scope rank:balanced ctx:M src:remote-ci
+  | Enter=open Ctrl+X=select Alt+S=mode Tab=focus

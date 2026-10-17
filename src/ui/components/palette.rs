@@ -165,6 +165,11 @@ pub enum PaletteAction {
     LoadViewSlot(u8),
     OpenBulkActions,
     ReloadIndex,
+    /// Save the selected search hit through `crate::bookmarks`.
+    BookmarkSelectedHit,
+    /// Open the swarm operations cockpit (the Swarm tab), which has no
+    /// direct key.
+    OpenSwarm,
     // -- Analytics surface ------------------------------------------------
     AnalyticsDashboard,
     AnalyticsExplorer,
@@ -201,7 +206,9 @@ impl PaletteAction {
             | Self::SaveViewSlot(_)
             | Self::LoadViewSlot(_)
             | Self::OpenBulkActions
-            | Self::ReloadIndex => PaletteGroup::View,
+            | Self::ReloadIndex
+            | Self::BookmarkSelectedHit
+            | Self::OpenSwarm => PaletteGroup::View,
             Self::AnalyticsDashboard
             | Self::AnalyticsExplorer
             | Self::AnalyticsHeatmap
@@ -242,6 +249,8 @@ impl PaletteAction {
             Self::LoadViewSlot(_) => "ViewLoaded(slot)",
             Self::OpenBulkActions => "BulkActionsOpened",
             Self::ReloadIndex => "IndexRefreshRequested",
+            Self::BookmarkSelectedHit => "BookmarkSelectedHit",
+            Self::OpenSwarm => "SwarmEntered",
             // Analytics (all batch: AnalyticsEntered + AnalyticsViewChanged)
             Self::AnalyticsDashboard => "batch[AnalyticsEntered, AnalyticsViewChanged(Dashboard)]",
             Self::AnalyticsExplorer => "batch[AnalyticsEntered, AnalyticsViewChanged(Explorer)]",
@@ -295,6 +304,10 @@ pub enum PaletteResult {
     OpenBulkActions,
     /// Reload/refresh the index.
     ReloadIndex,
+    /// Bookmark the selected search hit.
+    BookmarkSelectedHit,
+    /// Switch to the swarm operations cockpit.
+    OpenSwarm,
     /// Navigate to an analytics sub-view (by name).
     OpenAnalyticsView(AnalyticsTarget),
     /// Request a screenshot export in the given format.
@@ -372,6 +385,8 @@ impl PaletteAction {
             Self::LoadViewSlot(slot) => PaletteResult::LoadViewSlot(*slot),
             Self::OpenBulkActions => PaletteResult::OpenBulkActions,
             Self::ReloadIndex => PaletteResult::ReloadIndex,
+            Self::BookmarkSelectedHit => PaletteResult::BookmarkSelectedHit,
+            Self::OpenSwarm => PaletteResult::OpenSwarm,
             // Analytics
             Self::AnalyticsDashboard => {
                 PaletteResult::OpenAnalyticsView(AnalyticsTarget::Dashboard)
@@ -553,6 +568,16 @@ pub fn default_actions() -> Vec<PaletteItem> {
             PaletteAction::OpenBulkActions,
             "Bulk actions",
             shortcuts::BULK_MENU,
+        ),
+        item(
+            PaletteAction::BookmarkSelectedHit,
+            "Bookmark selected result",
+            shortcuts::BOOKMARK,
+        ),
+        item(
+            PaletteAction::OpenSwarm,
+            "Swarm operations cockpit",
+            "Swarm tab: live read-only swarm status",
         ),
         item(
             PaletteAction::ReloadIndex,
@@ -1067,6 +1092,8 @@ mod tests {
             PaletteAction::LoadViewSlot(1),
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,
@@ -1102,6 +1129,8 @@ mod tests {
             PaletteAction::LoadViewSlot(1),
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,
@@ -1168,6 +1197,11 @@ mod tests {
         assert_eq!(PaletteAction::LoadViewSlot(5).group(), PaletteGroup::View);
         assert_eq!(PaletteAction::OpenBulkActions.group(), PaletteGroup::View);
         assert_eq!(PaletteAction::ReloadIndex.group(), PaletteGroup::View);
+        assert_eq!(
+            PaletteAction::BookmarkSelectedHit.group(),
+            PaletteGroup::View
+        );
+        assert_eq!(PaletteAction::OpenSwarm.group(), PaletteGroup::View);
     }
 
     #[test]
@@ -1209,6 +1243,8 @@ mod tests {
             PaletteAction::OpenSavedViews,
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,
@@ -1320,6 +1356,14 @@ mod tests {
             PaletteAction::ReloadIndex.dispatch(),
             PaletteResult::ReloadIndex
         );
+        assert_eq!(
+            PaletteAction::BookmarkSelectedHit.dispatch(),
+            PaletteResult::BookmarkSelectedHit
+        );
+        assert_eq!(
+            PaletteAction::OpenSwarm.dispatch(),
+            PaletteResult::OpenSwarm
+        );
     }
 
     #[test]
@@ -1392,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_exhaustive_all_26_actions() {
+    fn dispatch_exhaustive_all_actions() {
         // Every action variant must dispatch without panic and return non-Noop.
         let all: Vec<PaletteAction> = vec![
             PaletteAction::ToggleTheme,
@@ -1409,6 +1453,8 @@ mod tests {
             PaletteAction::LoadViewSlot(1),
             PaletteAction::OpenBulkActions,
             PaletteAction::ReloadIndex,
+            PaletteAction::BookmarkSelectedHit,
+            PaletteAction::OpenSwarm,
             PaletteAction::AnalyticsDashboard,
             PaletteAction::AnalyticsExplorer,
             PaletteAction::AnalyticsHeatmap,

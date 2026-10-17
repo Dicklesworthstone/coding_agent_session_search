@@ -31,9 +31,10 @@ impl SourceSnapshot {
             )
             .into());
         }
-        if before.len() > limit {
+        let observed = super::text_len(path, &file, before.len());
+        if observed > limit {
             return Err(super::EnrichmentBudgetExceeded {
-                observed_bytes: before.len(),
+                observed_bytes: observed,
             }
             .into());
         }

@@ -104,8 +104,11 @@
       "pipeline_channel_size": 4,
       "controller_loadavg_high_watermark_1m": 121.0,
       "controller_loadavg_low_watermark_1m": 120.0,
+      "startup_page_fetch_message_bytes": "[LIVE_BYTES]",
+      "steady_page_fetch_message_bytes": "[LIVE_BYTES]",
       "runtime": null
-    }
+    },
+    "expected_docs_scan": null
   },
   "rebuild_progress": {
     "active": false,
@@ -204,6 +207,7 @@
     "schema_version": 1,
     "status": "ok",
     "quarantined_conversations": 0,
+    "deferred_conversations": 0,
     "recent_quarantined_conversations": 0,
     "recent_window_seconds": 3600,
     "circuit_breaker_limit": 25,
@@ -281,7 +285,9 @@
       "llc_groups": 8,
       "smt_threads_per_core": 2,
       "memory_total_bytes": null,
-      "memory_available_bytes": null
+      "memory_available_bytes": null,
+      "host_memory_total_bytes": null,
+      "memory_limit_source": null
     },
     "reserved_core_policy": {
       "reserved_cores": "[LIVE_COUNTER]",
@@ -495,6 +501,7 @@
     "current_source_newer_than_archive_count": 0,
     "raw_mirror_db_link_count": 0,
     "sole_copy_warning_count": 0,
+    "raw_mirror_capture_disabled": false,
     "recommended_action": "Run 'cass index --full' once before coverage can be assessed."
   },
   "quarantine": {

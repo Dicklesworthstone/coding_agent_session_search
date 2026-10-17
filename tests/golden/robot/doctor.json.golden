@@ -2863,6 +2863,7 @@
     "current_source_newer_than_archive_count": 0,
     "raw_mirror_db_link_count": 0,
     "sole_copy_warning_count": 0,
+    "raw_mirror_capture_disabled": false,
     "recommended_action": "Coverage ledger has no immediate action for archive preservation."
   },
   "source_authority": {

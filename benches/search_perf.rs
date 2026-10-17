@@ -344,6 +344,7 @@ fn pack_bench_render_request(
         limits,
         search_mode: "lexical".to_string(),
         fallback_mode: Some("lexical".to_string()),
+        fallback_reason: Some("pack_enrichment_unavailable".to_string()),
         semantic_joined: false,
         freshness_policy: PackFreshnessPolicy::PreferRecent,
         freshness_window_seconds: PACK_BENCH_FRESHNESS_WINDOW_SECONDS,

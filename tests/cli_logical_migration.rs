@@ -1,4 +1,5 @@
-//! Real-binary proof for the reviewed logical-archive v20 -> v21 bridge.
+//! Real-binary proof for the reviewed logical-archive v20 and v21 -> v22
+//! bridges.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,8 +14,7 @@ use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
 use serde_json::Value;
 
-const REVIEWED_SOURCE_VERSION: i64 = 20;
-const REVIEWED_TARGET_VERSION: i64 = 21;
+const REVIEWED_TARGET_VERSION: i64 = 22;
 
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
@@ -58,50 +58,58 @@ fn database_files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
-fn make_v20_source(root: &Path) -> PathBuf {
+/// A canonical database at storage schema `version`, made by undoing on a
+/// current database exactly what each later reviewed step added: v22's
+/// `forgotten_sources` table, and for v20 also v21's context index.
+fn make_source(root: &Path, version: i64) -> PathBuf {
     assert_eq!(
         CURRENT_SCHEMA_VERSION, REVIEWED_TARGET_VERSION,
         "reviewed migration test must be revisited when the canonical target schema advances"
     );
-    let source = root.join("source-v20.db");
+    let source = root.join(format!("source-v{version}.db"));
     let storage = SqliteStorage::open(&source).expect("create current canonical fixture");
     storage
         .ensure_agent(&Agent {
             id: None,
-            slug: "reviewed-v20-agent".into(),
-            name: "Reviewed v20 agent".into(),
+            slug: format!("reviewed-v{version}-agent"),
+            name: format!("Reviewed v{version} agent"),
             version: Some("preserve-me".into()),
             kind: AgentKind::Cli,
         })
         .expect("insert canonical source row");
     drop(storage);
 
+    let downgrade = match version {
+        20 => {
+            "DROP TABLE forgotten_sources;
+             DROP INDEX idx_conversations_context;
+             DELETE FROM _schema_migrations WHERE version >= 21;
+             UPDATE meta SET value = '20' WHERE key = 'schema_version';"
+        }
+        21 => {
+            "DROP TABLE forgotten_sources;
+             DELETE FROM _schema_migrations WHERE version >= 22;
+             UPDATE meta SET value = '21' WHERE key = 'schema_version';"
+        }
+        other => panic!("no reviewed downgrade for schema {other}"),
+    };
     let connection =
         Connection::open(source.to_str().expect("UTF-8 fixture path")).expect("open fixture");
     connection
-        .execute_batch(
-            "DROP INDEX idx_conversations_context;
-             DELETE FROM _schema_migrations WHERE version >= 21;
-             UPDATE meta SET value = '20' WHERE key = 'schema_version';",
-        )
-        .expect("downgrade only the reviewed v21 index/schema authority");
+        .execute_batch(downgrade)
+        .expect("downgrade only what the reviewed steps added");
     connection
         .close()
         .expect("durably close downgraded fixture");
     source
 }
 
-fn export_v20(home: &Path, source: &Path, backup: &Path) -> Value {
+fn export_source(home: &Path, source: &Path, backup: &Path, archive_id: &str) -> Value {
     json(
         command(home)
             .args(["archive", "export", "--db"])
             .arg(source)
-            .args([
-                "--archive-id",
-                "reviewed-v20",
-                "--include-private",
-                "--output",
-            ])
+            .args(["--archive-id", archive_id, "--include-private", "--output"])
             .arg(backup)
             .output()
             .expect("run archive export"),
@@ -109,32 +117,35 @@ fn export_v20(home: &Path, source: &Path, backup: &Path) -> Value {
 }
 
 #[test]
-fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
+fn reviewed_v20_backup_migrates_to_v22_and_retries_read_only() {
+    assert_reviewed_backup_migrates(20, "reviewed_v20_to_v22");
+}
+
+/// A v0.9.0 export (schema v21) restores into the current v22 build.
+#[test]
+fn reviewed_v21_backup_migrates_to_v22_and_retries_read_only() {
+    assert_reviewed_backup_migrates(21, "reviewed_v21_to_v22");
+}
+
+fn assert_reviewed_backup_migrates(version: i64, mode: &str) {
     let home = tempfile::tempdir().expect("temp home");
-    let source = make_v20_source(home.path());
-    let backup = home.path().join("v20.jsonl");
-    let export_receipt = export_v20(home.path(), &source, &backup);
-    assert_eq!(
-        export_receipt["archive_id"], "reviewed-v20",
-        "{export_receipt}"
-    );
+    let source = make_source(home.path(), version);
+    let archive_id = format!("reviewed-v{version}");
+    let backup = home.path().join(format!("v{version}.jsonl"));
+    let export_receipt = export_source(home.path(), &source, &backup, &archive_id);
+    assert_eq!(export_receipt["archive_id"], archive_id, "{export_receipt}");
 
     let exact_destination = home.path().join("exact-refused.db");
     let exact = command(home.path())
         .args(["archive", "import"])
         .arg(&backup)
-        .args([
-            "--archive-id",
-            "reviewed-v20",
-            "--include-private",
-            "--output",
-        ])
+        .args(["--archive-id", &archive_id, "--include-private", "--output"])
         .arg(&exact_destination)
         .output()
         .expect("run exact import");
     assert!(
         !exact.status.success(),
-        "exact schema import unexpectedly accepted v20"
+        "exact schema import unexpectedly accepted v{version}"
     );
     assert!(
         !exact_destination.exists(),
@@ -148,7 +159,7 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
             .arg(&backup)
             .args([
                 "--archive-id",
-                "reviewed-v20",
+                &archive_id,
                 "--include-private",
                 "--allow-compatible-schema",
                 "--output",
@@ -158,13 +169,10 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
             .expect("run reviewed migration"),
     );
     assert_eq!(created["destination_status"], "created", "{created}");
-    assert_eq!(
-        created["schema_migration"]["mode"], "reviewed_v20_to_v21",
-        "{created}"
-    );
+    assert_eq!(created["schema_migration"]["mode"], mode, "{created}");
     assert_eq!(
         created["schema_migration"]["from_storage_schema_version"],
-        REVIEWED_SOURCE_VERSION.to_string(),
+        version.to_string(),
         "{created}"
     );
     assert_eq!(
@@ -184,16 +192,24 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
     );
     let agent = storage
         .raw()
-        .query_row("SELECT slug, version FROM agents WHERE slug = 'reviewed-v20-agent'")
+        .query_row(&format!(
+            "SELECT slug, version FROM agents WHERE slug = 'reviewed-v{version}-agent'"
+        ))
         .expect("read migrated agent");
     assert_eq!(
         agent.get_typed::<String>(0).expect("agent slug"),
-        "reviewed-v20-agent"
+        format!("reviewed-v{version}-agent")
     );
     assert_eq!(
         agent.get_typed::<Option<String>>(1).expect("agent version"),
         Some("preserve-me".into())
     );
+    // v22's table exists and is empty, as an in-place upgrade leaves it.
+    let forgotten = storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM forgotten_sources")
+        .expect("forgotten_sources exists after migration");
+    assert_eq!(forgotten.get_typed::<i64>(0).expect("count"), 0);
     drop(storage);
 
     let before = database_files(&destination);
@@ -203,7 +219,7 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
             .arg(&backup)
             .args([
                 "--archive-id",
-                "reviewed-v20",
+                &archive_id,
                 "--include-private",
                 "--allow-compatible-schema",
                 "--if-identical",
@@ -214,10 +230,7 @@ fn reviewed_v20_backup_migrates_to_v21_and_retries_read_only() {
             .expect("run reviewed identical retry"),
     );
     assert_eq!(repeated["destination_status"], "unchanged", "{repeated}");
-    assert_eq!(
-        repeated["schema_migration"]["mode"], "reviewed_v20_to_v21",
-        "{repeated}"
-    );
+    assert_eq!(repeated["schema_migration"]["mode"], mode, "{repeated}");
     assert_eq!(
         before,
         database_files(&destination),

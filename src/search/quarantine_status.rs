@@ -1,8 +1,3 @@
-// Dead-code tolerated module-wide: this quarantine status grouping lands
-// ahead of its projection into `cass quarantine status --json` / the status
-// subsection in src/lib.rs. Bounded-budget wrapping is .2.2's concern.
-#![allow(dead_code)]
-
 //! Quarantine status grouped by cause, version, and eligibility (bead
 //! cass-fleet-resilience-20260608-uojcg.3.1).
 //!
@@ -13,21 +8,40 @@
 //! legacy/version-stale entry that is retry-eligible, and from a
 //! source-missing entry.
 //!
-//! [`quarantine_status`] consumes the canonical
-//! [`QuarantineState`](crate::indexer::quarantine::QuarantineState) (the
-//! `.3.4` model) plus the current `cass` version and a caller-supplied set of
-//! conversation ids whose source path is gone, and produces a
-//! [`QuarantineStatusReport`] with `total_excluded_conversations`, grouped
-//! counts (by cause, version bucket, schema_version, eligibility), a
-//! representative entry per group, retry-eligibility reasons,
-//! last-attempt timestamps, and the single next safe command. All enums
-//! serialize as snake_case; the next command is never bare/destructive.
+//! [`quarantine_status`] groups the rows `cass quarantine list` reports (the
+//! structured state merged with the poison ledgers, see
+//! [`QuarantineListEntry`]) given the current `cass` version and the
+//! conversation ids whose source path is gone. It produces the `status`
+//! object of `cass quarantine list --json`: `total_excluded_conversations`,
+//! grouped counts (by cause, version bucket, schema_version, eligibility), a
+//! representative entry per group, how many entries `cass quarantine retry`
+//! would attempt now, and the next safe command (none when no retry can
+//! help). All enums serialize as snake_case; the next command is never
+//! bare/destructive.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::indexer::quarantine::QuarantineState;
+/// The command that retries quarantined conversations: a read-only plan of the
+/// bounded, per-key retry (`--apply` runs it).
+pub(crate) const QUARANTINE_RETRY_PLAN_COMMAND: &str = "cass quarantine retry --json";
+
+/// One row of `cass quarantine list`: a quarantine key from the structured
+/// state merged with the poison ledgers. `retry_eligible` already reflects the
+/// merge (a key either surface retried under this binary is not eligible).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct QuarantineListEntry {
+    pub conversation_id: String,
+    pub schema_version: i64,
+    pub attempt_count: u64,
+    pub last_reason: String,
+    /// RFC3339; absent when a poison record carries no timestamp.
+    pub first_attempt_at: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub cass_version_at_quarantine: Option<String>,
+    pub retry_eligible: bool,
+}
 
 /// How an entry's `cass_version_at_quarantine` relates to the current binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -55,14 +69,14 @@ pub(crate) enum RetryEligibility {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RepresentativeEntry {
     pub conversation_id: String,
-    pub schema_version: u32,
+    pub schema_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cass_version_at_quarantine: Option<String>,
     pub version_bucket: VersionBucket,
     pub eligibility: RetryEligibility,
     pub attempt_count: u64,
-    /// RFC3339 last-attempt timestamp.
-    pub last_attempt_at: String,
+    /// RFC3339 last-attempt timestamp, when recorded.
+    pub last_attempt_at: Option<String>,
     pub last_reason: String,
     /// Whether the conversation's source path is gone (when known).
     pub source_missing: bool,
@@ -77,79 +91,80 @@ pub(crate) struct QuarantineStatusReport {
     /// Count by version bucket (same/stale/legacy).
     pub by_version_bucket: BTreeMap<VersionBucket, usize>,
     /// Count by schema_version.
-    pub by_schema_version: BTreeMap<u32, usize>,
+    pub by_schema_version: BTreeMap<i64, usize>,
     /// Count by retry eligibility.
     pub by_eligibility: BTreeMap<RetryEligibility, usize>,
     /// Number of entries whose source path is gone.
     pub source_missing_count: usize,
+    /// Entries `cass quarantine retry` would attempt now: retry-eligible with
+    /// the source file still present.
+    pub retryable_now: usize,
     /// One representative entry per (cause, version_bucket) group.
     pub representative_entries: Vec<RepresentativeEntry>,
     /// One-line retry-eligibility summary reason.
     pub eligibility_reason: String,
-    /// The single next safe command (never bare/destructive).
-    pub next_safe_command: String,
+    /// The next safe command (never bare/destructive); `None` when no
+    /// command can help until a newer `cass` makes entries retry-eligible.
+    pub next_safe_command: Option<String>,
 }
 
-/// Build the grouped quarantine status from the canonical state.
+/// Group the `cass quarantine list` rows.
 ///
-/// - `current_version`: the running `cass` version, for eligibility.
-/// - `source_missing_ids`: conversation ids whose source path is gone (the
-///   caller joins this from the source table; empty when not evaluated).
+/// - `current_version`: the running `cass` version, for the version bucket.
+/// - `source_missing_ids`: conversation ids whose source path is gone, as the
+///   retry planner sees them (empty when not evaluated).
 pub(crate) fn quarantine_status(
-    state: &QuarantineState,
+    entries: &[QuarantineListEntry],
     current_version: &str,
     source_missing_ids: &BTreeSet<String>,
 ) -> QuarantineStatusReport {
     let mut by_cause: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_version_bucket: BTreeMap<VersionBucket, usize> = BTreeMap::new();
-    let mut by_schema_version: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut by_schema_version: BTreeMap<i64, usize> = BTreeMap::new();
     let mut by_eligibility: BTreeMap<RetryEligibility, usize> = BTreeMap::new();
     let mut source_missing_count = 0usize;
+    let mut retryable_now = 0usize;
     // One representative per (cause, bucket) so the list stays bounded.
     let mut reps: BTreeMap<(String, VersionBucket), RepresentativeEntry> = BTreeMap::new();
-    let mut total = 0usize;
 
-    for (key, record) in state.iter() {
-        total += 1;
-
-        let bucket = match &record.cass_version_at_quarantine {
+    for entry in entries {
+        let bucket = match entry.cass_version_at_quarantine.as_deref() {
             None => VersionBucket::Legacy,
             Some(v) if v == current_version => VersionBucket::SameVersion,
             Some(_) => VersionBucket::VersionStale,
         };
-        let eligibility = if record.is_version_stale_for_retry(current_version) {
+        let eligibility = if entry.retry_eligible {
             RetryEligibility::Eligible
         } else {
             RetryEligibility::IrreducibleSameVersion
         };
-        let source_missing = source_missing_ids.contains(&key.conversation_id);
+        let source_missing = source_missing_ids.contains(&entry.conversation_id);
         if source_missing {
             source_missing_count += 1;
+        } else if entry.retry_eligible {
+            retryable_now += 1;
         }
 
-        *by_cause.entry(record.last_reason.clone()).or_default() += 1;
+        *by_cause.entry(entry.last_reason.clone()).or_default() += 1;
         *by_version_bucket.entry(bucket).or_default() += 1;
-        *by_schema_version.entry(key.schema_version).or_default() += 1;
+        *by_schema_version.entry(entry.schema_version).or_default() += 1;
         *by_eligibility.entry(eligibility).or_default() += 1;
 
-        reps.entry((record.last_reason.clone(), bucket))
+        reps.entry((entry.last_reason.clone(), bucket))
             .or_insert_with(|| RepresentativeEntry {
-                conversation_id: key.conversation_id.clone(),
-                schema_version: key.schema_version,
-                cass_version_at_quarantine: record.cass_version_at_quarantine.clone(),
+                conversation_id: entry.conversation_id.clone(),
+                schema_version: entry.schema_version,
+                cass_version_at_quarantine: entry.cass_version_at_quarantine.clone(),
                 version_bucket: bucket,
                 eligibility,
-                attempt_count: record.attempt_count,
-                last_attempt_at: record.last_attempt_at.to_rfc3339(),
-                last_reason: record.last_reason.clone(),
+                attempt_count: entry.attempt_count,
+                last_attempt_at: entry.last_attempt_at.clone(),
+                last_reason: entry.last_reason.clone(),
                 source_missing,
             });
     }
 
-    let eligible = by_eligibility
-        .get(&RetryEligibility::Eligible)
-        .copied()
-        .unwrap_or(0);
+    let total = entries.len();
     let irreducible = by_eligibility
         .get(&RetryEligibility::IrreducibleSameVersion)
         .copied()
@@ -158,22 +173,21 @@ pub(crate) fn quarantine_status(
     let (eligibility_reason, next_safe_command) = if total == 0 {
         (
             "no quarantined conversations".to_string(),
-            "cass status --json".to_string(),
+            Some("cass status --json".to_string()),
         )
-    } else if eligible > 0 {
+    } else if retryable_now > 0 {
         (
             format!(
-                "{eligible} entries are retry-eligible (legacy/version-stale); {irreducible} are irreducible under the current version"
+                "{retryable_now} of {total} can be retried now (quarantined by an older or unrecorded cass version, source present); {irreducible} already failed under cass {current_version}; {source_missing_count} have no source file"
             ),
-            // Re-running the index retries eligible entries; non-destructive.
-            "cass index".to_string(),
+            Some(QUARANTINE_RETRY_PLAN_COMMAND.to_string()),
         )
     } else {
         (
             format!(
-                "all {irreducible} entries are irreducible same-version failures; inspect before any action"
+                "none of {total} can be retried now: {irreducible} already failed under cass {current_version} (a newer cass makes them retry-eligible); {source_missing_count} have no source file"
             ),
-            "cass diag --json --quarantine".to_string(),
+            None,
         )
     };
 
@@ -184,6 +198,7 @@ pub(crate) fn quarantine_status(
         by_schema_version,
         by_eligibility,
         source_missing_count,
+        retryable_now,
         representative_entries: reps.into_values().collect(),
         eligibility_reason,
         next_safe_command,
@@ -274,51 +289,47 @@ pub(crate) fn project_search_completeness(
         can_search: true,
         coverage_suspect: circuit_breaker_active,
         impact,
-        // Inspect-first pointer is always safe; eligibility-aware retry lives in
-        // `quarantine_status()` / `cass index`, which the operator runs after review.
-        next_command: "cass diag --json --quarantine".to_string(),
+        // Inspect-first pointer: the list names the excluded conversations and
+        // carries `quarantine_status()`'s retry verdict. `cass diag
+        // --quarantine` covers derived assets and names none of them.
+        next_command: crate::indexer::quarantine_retry::QUARANTINE_LIST_COMMAND.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::quarantine::QuarantineRecord;
-    use chrono::{DateTime, Utc};
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::from_timestamp(secs, 0).expect("valid timestamp")
-    }
-
-    fn record(version: Option<&str>, reason: &str, attempts: u64) -> QuarantineRecord {
-        QuarantineRecord {
-            first_attempt_at: ts(1_700_000_000),
-            last_attempt_at: ts(1_700_000_500),
+    /// A list row as `cass quarantine list` builds it: eligible unless the
+    /// key was quarantined under the current version.
+    fn entry(
+        id: &str,
+        schema_version: i64,
+        version: Option<&str>,
+        reason: &str,
+        attempts: u64,
+    ) -> QuarantineListEntry {
+        QuarantineListEntry {
+            conversation_id: id.to_string(),
+            schema_version,
             attempt_count: attempts,
             last_reason: reason.to_string(),
+            first_attempt_at: Some("2023-11-14T22:13:20+00:00".to_string()),
+            last_attempt_at: Some("2023-11-14T22:21:40+00:00".to_string()),
             cass_version_at_quarantine: version.map(str::to_string),
+            retry_eligible: version != Some("0.6.13"),
         }
     }
 
-    /// State with: 2 same-version ingest_oom (irreducible), 1 legacy (eligible),
+    /// Rows: 2 same-version ingest_oom (irreducible), 1 legacy (eligible),
     /// 1 older-version (eligible), 1 different cause.
-    fn mixed_state() -> QuarantineState {
-        let mut s = QuarantineState::default();
-        s.entries.insert(
-            "c-same-1::v3".to_string(),
-            record(Some("0.6.13"), "ingest_oom", 4),
-        );
-        s.entries.insert(
-            "c-same-2::v3".to_string(),
-            record(Some("0.6.13"), "ingest_oom", 7),
-        );
-        s.entries
-            .insert("c-legacy::v1".to_string(), record(None, "ingest_oom", 1));
-        s.entries.insert(
-            "c-old::v2".to_string(),
-            record(Some("0.5.1"), "validation_failed", 2),
-        );
-        s
+    fn mixed_entries() -> Vec<QuarantineListEntry> {
+        vec![
+            entry("c-legacy", 1, None, "ingest_oom", 1),
+            entry("c-old", 2, Some("0.5.1"), "validation_failed", 2),
+            entry("c-same-1", 3, Some("0.6.13"), "ingest_oom", 4),
+            entry("c-same-2", 3, Some("0.6.13"), "ingest_oom", 7),
+        ]
     }
 
     #[test]
@@ -335,7 +346,7 @@ mod tests {
 
     #[test]
     fn distinguishes_irreducible_same_version_from_legacy_and_stale() {
-        let report = quarantine_status(&mixed_state(), "0.6.13", &BTreeSet::new());
+        let report = quarantine_status(&mixed_entries(), "0.6.13", &BTreeSet::new());
         assert_eq!(report.total_excluded_conversations, 4);
         // 2 same-version irreducible.
         assert_eq!(
@@ -365,7 +376,7 @@ mod tests {
 
     #[test]
     fn groups_by_cause_and_schema_version() {
-        let report = quarantine_status(&mixed_state(), "0.6.13", &BTreeSet::new());
+        let report = quarantine_status(&mixed_entries(), "0.6.13", &BTreeSet::new());
         assert_eq!(report.by_cause.get("ingest_oom"), Some(&3));
         assert_eq!(report.by_cause.get("validation_failed"), Some(&1));
         assert_eq!(report.by_schema_version.get(&3), Some(&2));
@@ -373,14 +384,12 @@ mod tests {
     }
 
     #[test]
-    fn all_irreducible_recommends_inspection_not_retry() {
-        let mut s = QuarantineState::default();
+    fn all_irreducible_offers_no_retry_command() {
         // 133 same-version ingest-OOM (the report's local node).
-        for i in 0..133 {
-            s.entries
-                .insert(format!("c{i}::v3"), record(Some("0.6.13"), "ingest_oom", 5));
-        }
-        let report = quarantine_status(&s, "0.6.13", &BTreeSet::new());
+        let entries: Vec<_> = (0..133)
+            .map(|i| entry(&format!("c{i}"), 3, Some("0.6.13"), "ingest_oom", 5))
+            .collect();
+        let report = quarantine_status(&entries, "0.6.13", &BTreeSet::new());
         assert_eq!(report.total_excluded_conversations, 133);
         assert_eq!(
             report
@@ -388,33 +397,65 @@ mod tests {
                 .get(&RetryEligibility::IrreducibleSameVersion),
             Some(&133)
         );
-        assert!(report.eligibility_reason.contains("irreducible"));
-        assert_eq!(report.next_safe_command, "cass diag --json --quarantine");
+        assert_eq!(report.retryable_now, 0);
+        assert!(report.eligibility_reason.contains("133 already failed"));
+        assert_eq!(report.next_safe_command, None);
     }
 
     #[test]
-    fn eligible_entries_recommend_a_nondestructive_retry() {
-        let report = quarantine_status(&mixed_state(), "0.6.13", &BTreeSet::new());
-        assert_eq!(report.next_safe_command, "cass index");
-        for bad in ["rm ", "--force-clean", "delete ", "DROP "] {
-            assert!(!report.next_safe_command.contains(bad));
-        }
+    fn eligible_entries_recommend_the_bounded_retry_plan() {
+        let report = quarantine_status(&mixed_entries(), "0.6.13", &BTreeSet::new());
+        assert_eq!(report.retryable_now, 2);
+        assert_eq!(
+            report.next_safe_command.as_deref(),
+            Some("cass quarantine retry --json")
+        );
     }
 
     #[test]
-    fn source_missing_entries_are_counted() {
+    fn source_missing_entries_are_counted_and_never_retryable() {
         let mut missing = BTreeSet::new();
         missing.insert("c-legacy".to_string());
-        let report = quarantine_status(&mixed_state(), "0.6.13", &missing);
+        let report = quarantine_status(&mixed_entries(), "0.6.13", &missing);
         assert_eq!(report.source_missing_count, 1);
+        assert_eq!(report.retryable_now, 1, "only c-old is retryable");
+
+        // Every eligible row's source is gone: a retry cannot help, so no
+        // retry command is offered even though the rows are eligible.
+        missing.insert("c-old".to_string());
+        let report = quarantine_status(&mixed_entries(), "0.6.13", &missing);
+        assert_eq!(
+            report.by_eligibility.get(&RetryEligibility::Eligible),
+            Some(&2)
+        );
+        assert_eq!(report.retryable_now, 0);
+        assert_eq!(report.next_safe_command, None);
+        assert!(report.eligibility_reason.contains("2 have no source file"));
+    }
+
+    /// The list merges the poison ledgers into the structured state and marks
+    /// a key retried under this binary on either surface as not eligible,
+    /// even when its recorded version is older. Grouping follows that merged
+    /// verdict rather than re-deriving eligibility from the version.
+    #[test]
+    fn eligibility_follows_the_merged_list_verdict() {
+        let mut row = entry("c-merged", 1, Some("0.5.1"), "ingest_oom", 2);
+        row.retry_eligible = false;
+        let report = quarantine_status(&[row], "0.6.13", &BTreeSet::new());
+        assert_eq!(
+            report.by_version_bucket.get(&VersionBucket::VersionStale),
+            Some(&1)
+        );
+        assert_eq!(report.retryable_now, 0);
+        assert_eq!(report.next_safe_command, None);
     }
 
     #[test]
     fn representative_entries_carry_eligibility_and_timestamp() {
-        let report = quarantine_status(&mixed_state(), "0.6.13", &BTreeSet::new());
+        let report = quarantine_status(&mixed_entries(), "0.6.13", &BTreeSet::new());
         assert!(!report.representative_entries.is_empty());
         for rep in &report.representative_entries {
-            assert!(!rep.last_attempt_at.is_empty());
+            assert!(rep.last_attempt_at.is_some());
             // A same-version ingest_oom rep is irreducible; legacy/old eligible.
             match rep.version_bucket {
                 VersionBucket::SameVersion => {
@@ -429,14 +470,14 @@ mod tests {
 
     #[test]
     fn empty_state_reports_nothing_excluded() {
-        let report = quarantine_status(&QuarantineState::default(), "0.6.13", &BTreeSet::new());
+        let report = quarantine_status(&[], "0.6.13", &BTreeSet::new());
         assert_eq!(report.total_excluded_conversations, 0);
         assert!(report.eligibility_reason.contains("no quarantined"));
     }
 
     #[test]
     fn report_round_trips_through_json() {
-        let report = quarantine_status(&mixed_state(), "0.6.13", &BTreeSet::new());
+        let report = quarantine_status(&mixed_entries(), "0.6.13", &BTreeSet::new());
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"total_excluded_conversations\":4"));
         assert!(json.contains("\"next_safe_command\""));
@@ -469,7 +510,9 @@ mod tests {
         assert!(!c.coverage_suspect);
         assert!(c.impact.contains("133"));
         assert!(c.impact.contains("rest of the archive is searchable"));
-        assert_eq!(c.next_command, "cass diag --json --quarantine");
+        // The pointer must name the surface that lists the excluded
+        // conversations; `cass diag --quarantine` never does.
+        assert_eq!(c.next_command, "cass quarantine list --json");
     }
 
     #[test]
