@@ -128,11 +128,12 @@ impl Fixture {
         assert_eq!(bytes(&wal_path_for(&self.path))?, self.wal_before);
         if let Some(parent) = self.path.parent().filter(|parent| parent.exists()) {
             for entry in fs::read_dir(parent)? {
+                let name = entry?.file_name();
+                let name = name.to_string_lossy();
                 assert!(
-                    !entry?
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".semantic-reconcile-")
+                    !name.starts_with(".semantic-reconcile-")
+                        && !name.starts_with(".backfill-reuse-"),
+                    "cancelled reconciliation left scratch: {name}"
                 );
             }
         }
@@ -236,9 +237,23 @@ fn cancellation_after_native_finish_does_not_install_complete_candidate() -> Res
                         if entry
                             .file_name()
                             .to_string_lossy()
-                            .starts_with(".semantic-reconcile-")
+                            .starts_with(".backfill-reuse-")
                             && entry.path().join("candidate.fsvi").exists()
                         {
+                            // Observe a real finished candidate in the leased
+                            // namespace, not a callback ordinal or retired name.
+                            let candidate =
+                                VectorIndex::open_read_only(&entry.path().join("candidate.fsvi"))?;
+                            assert_eq!(candidate.wal_record_count(), 0);
+                            assert_eq!(candidate.record_count(), fixture.current.len());
+                            let mut observed = HashSet::new();
+                            for row in 0..candidate.record_count() {
+                                assert!(!candidate.is_deleted(row));
+                                assert!(candidate.is_vector_usable(row));
+                                assert!(observed.insert(candidate.doc_id_at(row)?.to_owned()));
+                            }
+                            assert_eq!(observed, fixture.current);
+                            drop(candidate);
                             observed_candidate = true;
                             return Err(interrupted());
                         }
@@ -250,6 +265,16 @@ fn cancellation_after_native_finish_does_not_install_complete_candidate() -> Res
         assert_interrupted(&error);
         assert!(observed_candidate, "must cancel after real writer finish");
         fixture.assert_preserved()?;
+        // The cancelled operation must release its native handles and artifact
+        // lease so a subsequent attempt can publish and reopen the full result.
+        let retried = fixture.run(&indexer, || Ok(()))?;
+        assert_eq!(retried.record_count(), fixture.current.len());
+        let expected = vectors(&retried)?;
+        drop(retried);
+        assert_eq!(
+            vectors(&VectorIndex::open_read_only(&fixture.path)?)?,
+            expected
+        );
     }
     Ok(())
 }
@@ -268,6 +293,99 @@ fn canonical_success_has_no_post_publication_cancellation_verdict() -> Result<()
         })?;
         assert_eq!(result.record_count(), fixture.current.len());
         assert_ne!(bytes(&fixture.path)?, fixture.before);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_canonical_inputs_do_not_reclaim_recovery_artifacts() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    for existing in [false, true] {
+        for rejection in [
+            "dimension",
+            "nan",
+            "zero",
+            "duplicate",
+            "foreign",
+            "fingerprint",
+            "missing",
+            "cancelled",
+        ] {
+            // Incomplete deltas can legitimately reuse an existing generation;
+            // only initial publication can reject missing coverage without I/O.
+            if existing && rejection == "missing" {
+                continue;
+            }
+            let fixture = Fixture::new(&indexer, usize::from(existing))?;
+            let evidence = fixture
+                .root
+                .path()
+                .join("vector_index/.backfill-reuse-Rejected123");
+            fs::create_dir_all(&evidence)?;
+            let retained = evidence.join("candidate.fsvi");
+            fs::write(&retained, b"interrupted recovery evidence")?;
+            let mut replacements = fixture.replacements.clone();
+            let mut fingerprint = "rejected-input-fixture";
+            match rejection {
+                "dimension" => {
+                    replacements[0].embedding.pop();
+                }
+                "nan" => replacements[0].embedding[0] = f32::NAN,
+                "zero" => replacements[0].embedding.fill(0.0),
+                "duplicate" => replacements.push(replacements[0].clone()),
+                "foreign" => replacements[0].message_id = u64::MAX,
+                "fingerprint" => fingerprint = "  ",
+                "missing" => {
+                    replacements.pop();
+                }
+                "cancelled" => {}
+                _ => unreachable!(),
+            }
+            let mut checks = 0;
+            let error = run(
+                &indexer,
+                replacements,
+                fixture.root.path(),
+                TierKind::Fast,
+                fingerprint,
+                &fixture.current,
+                || {
+                    checks += 1;
+                    if rejection == "cancelled" && checks == 2 {
+                        Err(interrupted())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            if rejection == "cancelled" {
+                assert_interrupted(&error);
+                assert_eq!(checks, 2);
+            }
+            assert_eq!(bytes(&fixture.path)?, fixture.before, "{rejection}");
+            assert_eq!(
+                bytes(&wal_path_for(&fixture.path))?,
+                fixture.wal_before,
+                "{rejection}"
+            );
+            assert_eq!(
+                fs::read(&retained)
+                    .with_context(|| format!("{rejection} reclaimed recovery evidence"))?,
+                b"interrupted recovery evidence",
+                "{rejection}"
+            );
+            if !existing {
+                assert!(
+                    !fixture
+                        .root
+                        .path()
+                        .join("semantic-backfill-artifacts.lock")
+                        .exists(),
+                    "{rejection} created an artifact lease before input admission"
+                );
+            }
+        }
     }
     Ok(())
 }
