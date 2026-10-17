@@ -1,8 +1,11 @@
 //! CASS admission and retry semantics for Continue's single-file snapshots.
 //!
-//! The pinned FAD parser owns discovery, normalization and source observations.
+//! CASS owns fallible metadata discovery; the pinned FAD parser still owns
+//! normalization and source observations for each admitted snapshot.
 //! This adapter applies operator exclusions before content reads and lets the
 //! durable source ledger, when supplied, override a global timestamp cutoff.
+
+mod discovery;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -68,6 +71,18 @@ fn source_excluded(source: &DiscoveredSourceFile, excludes: &dyn Fn(&Path) -> bo
     excludes(&source.source_path) || excludes(&source.scan_root)
 }
 
+// Only the parser selector changes when narrowing to a discovered file.
+fn same_observation(left: &DiscoveredSourceFile, right: &DiscoveredSourceFile) -> bool {
+    left.provider_slug == right.provider_slug
+        && left.source_path == right.source_path
+        && left.role == right.role
+        && left.origin == right.origin
+        && left.platform == right.platform
+        && left.required_for_reconstruction == right.required_for_reconstruction
+        && left.size_bytes == right.size_bytes
+        && left.modified_at_ms == right.modified_at_ms
+}
+
 impl ContinueConnector {
     #[must_use]
     pub fn new() -> Self {
@@ -82,9 +97,11 @@ impl ContinueConnector {
         let Some(scope) = selected_scope(ctx, excludes) else {
             return Ok(Vec::new());
         };
-        let mut sources = self.inner.discover_source_files(&scope)?;
-        sources.retain(|source| !source_excluded(source, excludes));
-        Ok(sources)
+        Ok(discovery::discover(&scope, excludes)?
+            .into_iter()
+            .map(|source| source.file)
+            .filter(|source| !source_excluded(source, excludes))
+            .collect())
     }
 
     fn scan_allowed(
@@ -102,48 +119,55 @@ impl ContinueConnector {
             // change. Discover it before asking the authoritative ledger.
             scope.since_ts = None;
         }
+        // Discover once. FAD's collecting discovery suppresses directory I/O
+        // errors and scanning it again could silently lose a removed source.
+        // Each inventory member now gets its own observed completion outcome.
+        let sources = discovery::discover(&scope, excludes)?;
         let progress = RefCell::new(SourceProgress::default());
-        {
-            let SourceScanHooks {
-                should_scan_source,
-                on_source_complete,
-            } = hooks;
-            let mut admit = |source: &DiscoveredSourceFile| {
-                progress.borrow_mut().finish_pending();
-                if source_excluded(source, excludes)
-                    || !should_scan_source
-                        .as_mut()
-                        .is_none_or(|predicate| predicate(source))
-                {
-                    return false;
-                }
-                // A host hook can change filesystem aliases. Recheck policy
-                // before FAD opens the admitted source; no decision is cached
-                // across hooks. This is not a handle-bound filesystem sandbox.
-                if source_excluded(source, excludes) {
-                    return false;
-                }
-                progress.borrow_mut().pending = Some(source.clone());
-                true
+        for selected in sources {
+            progress.borrow_mut().finish_pending();
+            let source = &selected.file;
+            if source_excluded(source, excludes) || !hooks.should_scan(source) {
+                continue;
+            }
+            if source_excluded(source, excludes) {
+                continue;
+            }
+            progress.borrow_mut().pending = Some(source.clone());
+            // The inventory/ledger already admitted this source. A second
+            // global cutoff must not make an admitted file vanish silently.
+            // Construct just this root, not a clone of the whole root list.
+            let mut single = ScanContext::with_roots(
+                scope.data_dir.clone(),
+                vec![selected.root.with_path(source.source_path.clone())],
+                None,
+            );
+            single.progress_tick.clone_from(&scope.progress_tick);
+            let mut admit = |observed: &DiscoveredSourceFile| {
+                same_observation(source, observed) && !source_excluded(source, excludes)
             };
             let mut complete = |completion: &SourceCompletion| {
                 ensure!(
-                    progress.borrow().pending.as_ref() == Some(&completion.source),
+                    progress.borrow().pending.as_ref() == Some(source)
+                        && same_observation(source, &completion.source),
                     "Continue source completion does not match the admitted observation"
                 );
-                if source_excluded(&completion.source, excludes) {
-                    // Leave it pending: a policy/namespace change is not a
-                    // successful checkpoint, even if content was delivered.
+                if source_excluded(source, excludes) || source.fs_metadata_changed() {
                     return Ok(());
                 }
-                if let Some(sink) = on_source_complete.as_mut() {
-                    sink(completion)?;
-                }
+                // Narrowing the parser's selector does not change the ledger
+                // identity. Discovery, admission and completion retain the
+                // original expanded scan root, provenance and observations.
+                hooks.complete(&SourceCompletion {
+                    source: source.clone(),
+                    required_sidecars: completion.required_sidecars.clone(),
+                    conversations_emitted: completion.conversations_emitted,
+                })?;
                 progress.borrow_mut().pending = None;
                 Ok(())
             };
             self.inner.scan_with_source_boundaries(
-                &scope,
+                &single,
                 &mut SourceScanHooks {
                     should_scan_source: Some(&mut admit),
                     on_source_complete: Some(&mut complete),
