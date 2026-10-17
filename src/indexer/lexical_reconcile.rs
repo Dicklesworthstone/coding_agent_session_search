@@ -434,15 +434,15 @@ pub(crate) fn run_lexical_conversation_reconcile(
     let early_doc = early_doc.ok_or_else(|| anyhow!("missing early reconcile endpoint"))?;
     let late_doc = late_doc.ok_or_else(|| anyhow!("missing late reconcile endpoint"))?;
 
-    // 2. Durable checkpoint BEFORE publication; on retry, converge only when
-    // the complete projected content and metadata are unchanged. A legacy
-    // shape-only checkpoint is rebound before the full replay, never trusted
-    // as evidence that any document was already published.
+    // 2. Durable checkpoint BEFORE publication. Retry keeps an identical
+    // binding or proves the old projected prefix unchanged before rebinding
+    // appended rows. Legacy shape-only checkpoints require an unchanged shape
+    // and full replay; they cannot prove an append-only extension.
     let index_path = expected_index_dir(data_dir);
     let checkpoint_path = lexical_reconcile_checkpoint_path(&index_path, conversation_id);
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("creating index directory {}", index_path.display()))?;
-    let checkpoint = checkpoint::resume(
+    let checkpoint = checkpoint::resume_on_snapshot(
         LexicalReconcileCheckpoint {
             version: checkpoint::VERSION,
             conversation_id,
@@ -457,6 +457,7 @@ pub(crate) fn run_lexical_conversation_reconcile(
             attempt: 1,
         },
         load_checkpoint(&checkpoint_path)?,
+        &projection,
     )?;
     let attempt = checkpoint.attempt;
     super::write_json_pretty_atomically(&checkpoint_path, &checkpoint)?;
@@ -893,7 +894,7 @@ mod tests {
         let error = projection
             .visit(|_| {
                 visits += 1;
-                bail!("consumer failed")
+                bail!("consumer failed");
             })
             .unwrap_err();
         assert!(error.to_string().contains("consumer failed"));

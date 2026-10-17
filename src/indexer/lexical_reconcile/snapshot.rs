@@ -292,4 +292,228 @@ mod tests {
         assert_eq!(canonical_bytes(tmp.path())?, before_archive);
         Ok(())
     }
+
+    fn append_message(storage: &FrankenStorage, id: i64, idx: i64, content: &str) -> Result<()> {
+        storage.raw().execute_with_params(
+            "INSERT INTO messages(conversation_id, idx, role, content, created_at) \
+             VALUES (?1, ?2, 'user', ?3, ?4)",
+            &[
+                id.into(),
+                idx.into(),
+                content.into(),
+                (1_700_000_000_000_i64 + idx).into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_reconcile_accepts_append_only_growth_after_interruption() -> Result<()> {
+        for noise_tail in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let (storage, docs, previous) = seed(tmp.path())?;
+            let content = if noise_tail {
+                ""
+            } else {
+                "meridian durable new tail"
+            };
+            append_message(&storage, previous.conversation_id, 9, content)?;
+            let snapshot = CanonicalSnapshot::begin(storage.raw())?;
+            let (agents, workspaces) = storage.build_lexical_rebuild_lookups()?;
+            let row = storage
+                .list_conversations_for_lexical_rebuild_after_id(
+                    1,
+                    previous.conversation_id - 1,
+                    &agents,
+                    &workspaces,
+                )?
+                .into_iter()
+                .next()
+                .context("current projection row")?;
+            let (provenance, _) = crate::indexer::lexical_rebuild_packet_provenance_from_canonical(
+                &row,
+                &HashMap::new(),
+            );
+            for max_messages in [1, 2, 4, 64] {
+                let projection = super::super::CanonicalProjection {
+                    storage: &storage,
+                    row: &row,
+                    provenance: &provenance,
+                    conversation_id: previous.conversation_id,
+                    max_content_bytes: 1024,
+                    max_messages,
+                };
+                let mut projected = Vec::new();
+                let summary = projection.visit(|batch| {
+                    projected.extend_from_slice(batch);
+                    Ok(())
+                })?;
+                let mut current = previous.clone();
+                current.message_count = summary.message_count;
+                current.max_message_idx = summary.max_message_idx;
+                current.content_bytes = summary.content_bytes;
+                current.expected_docs = summary.expected_docs;
+                current.projection_blake3 = Some(checkpoint::projection_fingerprint(&projected));
+                current.started_at_ms = 999;
+                let resumed = checkpoint::resume_on_snapshot(
+                    current.clone(),
+                    Some(previous.clone()),
+                    &projection,
+                )?;
+                assert_eq!(resumed.started_at_ms, previous.started_at_ms);
+                assert_eq!(resumed.attempt, previous.attempt + 1);
+                assert_eq!(resumed.projection_blake3, current.projection_blake3);
+            }
+            snapshot.release()?;
+            drop(storage);
+            let before = canonical_bytes(tmp.path())?;
+            let report = run_lexical_conversation_reconcile(
+                tmp.path(),
+                &tmp.path().join("archive.db"),
+                previous.conversation_id,
+            )?;
+            let expected = if noise_tail { 6 } else { 7 };
+            assert_eq!(report.attempt, previous.attempt + 1);
+            assert_eq!(report.message_count, 7);
+            assert_eq!(report.expected_docs, expected);
+            assert_eq!(report.verified_docs, expected);
+            assert_eq!(report.doc_count_after, expected as u64);
+            assert_eq!(
+                report.upserted_docs, expected,
+                "growth must replay, not trust the old cursor"
+            );
+            assert!(report.converged && report.checkpoint_cleared);
+            assert_eq!(canonical_bytes(tmp.path())?, before);
+            let published = super::super::canary::exact::PublishedSnapshot::open(
+                &expected_index_dir(tmp.path()),
+            )?;
+            for doc in &docs {
+                assert!(published.verify_content(doc)?);
+            }
+            if !noise_tail {
+                let mut tail = docs[5].clone();
+                tail.msg_idx = 9;
+                tail.content = content.into();
+                tail.created_at = Some(1_700_000_000_009);
+                assert!(published.verify_content(&tail)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn appended_snapshot_invalidates_a_completed_old_replay_cursor() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (storage, docs, previous) = seed(tmp.path())?;
+        let index_path = expected_index_dir(tmp.path());
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.upsert_prebuilt_documents_slice(&docs)?;
+        index.commit()?;
+        assert_eq!(index.doc_count()?, 6);
+        drop(index);
+        let digest = |name: &str| -> Result<Option<String>> {
+            match std::fs::read(index_path.join(name)) {
+                Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        };
+        // Model a real durable end-of-replay receipt over the OLD complete
+        // publication. The new binding must not inherit its completed cursor.
+        let progress = lexical_reconcile_checkpoint_path(&index_path, previous.conversation_id)
+            .with_extension("progress.json");
+        crate::indexer::write_json_pretty_atomically(
+            &progress,
+            &serde_json::json!({
+                "version": 1, "binding": previous,
+                "pass": "replay", "completed_docs": 6,
+                "prefix_blake3": previous.projection_blake3,
+                "first_pass_live_docs": 6,
+                "publication": {
+                    "manifest_blake3": digest("MANIFEST")?,
+                    "previous_blake3": digest("MANIFEST.prev")?, "live_docs": 6
+                }
+            }),
+        )?;
+        append_message(
+            &storage,
+            previous.conversation_id,
+            9,
+            "meridian appended after replay",
+        )?;
+        drop(storage);
+        let report = run_lexical_conversation_reconcile(
+            tmp.path(),
+            &tmp.path().join("archive.db"),
+            previous.conversation_id,
+        )?;
+        assert_eq!(report.upserted_docs, 7);
+        assert_eq!(report.verified_docs, 7);
+        assert_eq!(report.doc_count_after, 7);
+        assert!(report.checkpoint_cleared && !progress.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn appended_tail_never_authorizes_a_changed_prefix_or_legacy_binding() -> Result<()> {
+        for case in 0..5 {
+            let tmp = tempfile::tempdir()?;
+            let (storage, _, mut previous) = seed(tmp.path())?;
+            append_message(
+                &storage,
+                previous.conversation_id,
+                9,
+                "meridian durable tail",
+            )?;
+            match case {
+                0 => {
+                    storage.raw().execute_with_params(
+                    "UPDATE messages SET content = 'meridian bravo endpoint 0' WHERE conversation_id = ?1 AND idx = 0",
+                    &[previous.conversation_id.into()],
+                )?;
+                }
+                1 => {
+                    storage.raw().execute_with_params(
+                        "DELETE FROM messages WHERE conversation_id = ?1 AND idx = 0",
+                        &[previous.conversation_id.into()],
+                    )?;
+                }
+                2 => append_message(
+                    &storage,
+                    previous.conversation_id,
+                    -1,
+                    "meridian inserted before prefix",
+                )?,
+                3 => previous.projection_blake3 = Some("0".repeat(64)),
+                _ => {
+                    previous.version = 1;
+                    previous.projection_blake3 = None;
+                }
+            }
+            let index_path = expected_index_dir(tmp.path());
+            crate::indexer::write_json_pretty_atomically(
+                &lexical_reconcile_checkpoint_path(&index_path, previous.conversation_id),
+                &previous,
+            )?;
+            drop(storage);
+            let before_archive = canonical_bytes(tmp.path())?;
+            let before_index = tree_bytes(&index_path)?;
+            let error = run_lexical_conversation_reconcile(
+                tmp.path(),
+                &tmp.path().join("archive.db"),
+                previous.conversation_id,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("checkpoint retained"),
+                "case {case}: {error:#}"
+            );
+            assert_eq!(tree_bytes(&index_path)?, before_index, "case {case}");
+            assert_eq!(canonical_bytes(tmp.path())?, before_archive, "case {case}");
+        }
+        Ok(())
+    }
 }
