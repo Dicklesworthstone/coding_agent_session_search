@@ -67849,9 +67849,12 @@ c.close()
             conv.metadata.pointer("/cass/raw_mirror/storage_kind"),
             Some(&serde_json::json!("fixed_chunks_v1"))
         );
+        // A .jsonl transcript is captured in 256 KiB chunks (4c10a2a1).
         assert_eq!(
             conv.metadata.pointer("/cass/raw_mirror/chunk_count"),
-            Some(&serde_json::json!(4))
+            Some(&serde_json::json!(
+                CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES / (256 * 1024)
+            ))
         );
     }
 
