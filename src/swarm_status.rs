@@ -889,17 +889,24 @@ fn unchanged_beads_export(path: &Path, before: &fs::Metadata) -> Result<fs::Meta
     Ok(after)
 }
 
+/// br lines whose read-only JSON contract this reader has checked: `ready`
+/// returns an issue array, and `list`/`blocked` return complete
+/// `{issues, has_more: false}` pages whose rows carry string `id` and
+/// `status`. 0.7.x keeps 0.6.x's contract (verified with br 0.7.6, GH #529).
+const SUPPORTED_BEADS_LINES: [&str; 2] = ["br 0.6.", "br 0.7."];
+
 fn supported_beads_version(bytes: &[u8]) -> Result<&str, String> {
     let version = std::str::from_utf8(bytes)
         .map_err(|_| "invalid br version")?
         .trim();
-    if version
-        .strip_prefix("br 0.6.")
-        .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit()))
-    {
+    if SUPPORTED_BEADS_LINES.iter().any(|line| {
+        version.strip_prefix(line).is_some_and(|patch| {
+            !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) {
         Ok(version)
     } else {
-        Err("unsupported br version; live reader supports 0.6.x".to_string())
+        Err("unsupported br version; live reader supports 0.6.x and 0.7.x".to_string())
     }
 }
 
@@ -1953,8 +1960,13 @@ mod tests {
             supported_beads_version(b"br 0.6.12\n").unwrap(),
             "br 0.6.12"
         );
+        // GH #529: 0.7.x keeps the reader's JSON contract.
+        assert_eq!(supported_beads_version(b"br 0.7.6\n").unwrap(), "br 0.7.6");
         for bytes in [
-            b"br 0.7.0".as_slice(),
+            b"br 0.8.0".as_slice(),
+            b"br 0.7.".as_slice(),
+            b"br 0.7.1-dev".as_slice(),
+            b"br 1.0.0".as_slice(),
             b"br 0.6.".as_slice(),
             b"br 0.6.1-dev".as_slice(),
             b"br 0.6.future".as_slice(),

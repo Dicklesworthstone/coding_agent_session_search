@@ -96,6 +96,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`cass swarm status` reads Beads with br 0.7.x (#529).** The live Beads
+  reader accepted only br 0.6.x, so with the current br it reported the
+  provider unavailable and left the ready, in-progress and blocked counts
+  unknown. br 0.7.x keeps the JSON shape the reader parses, and it is now
+  accepted. Other versions are still refused.
 - **`cass mirror prune` reclaims capture staging left by killed captures
   (#523).** A `cass index` run killed mid-capture (for example by `timeout`)
   left its `raw-mirror/v1/tmp/capture.*` staging behind, and nothing removed

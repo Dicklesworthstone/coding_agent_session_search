@@ -1164,7 +1164,7 @@ cass swarm dependency-drift --json
 `swarm proof-debt` and `swarm failure-patterns` collect the same bounded
 read-only Git state and Beads exports when run from the repository root
 without a fixture. Git uses
-porcelain-v2 with optional locks disabled. Beads uses `br 0.6.x --no-db`, so its
+porcelain-v2 with optional locks disabled. Beads uses `br --no-db` (0.6.x or 0.7.x), so its
 JSONL snapshot is explicitly partial: unexported database changes may exist.
 Recheck Beads and reservations before claiming work. Child commands share a
 single 15-second request budget and each has an 8 MiB output cap; Beads categories
