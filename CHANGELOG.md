@@ -114,6 +114,13 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   is `rrsync -ro DIR` refuses everything except rsync and `true`, so `add`
   failed with exit 12 unless `--no-test` was given. The check now runs `true`,
   as `cass sources doctor` already did.
+- **A first full index no longer leaves an empty publish backup.** On a fresh
+  install, `cass index --full` kept the placeholder index directory, which
+  held only the rebuild's own progress checkpoint, as a retained lexical
+  publish backup. `cass doctor` and `cass diag --quarantine` counted it, and
+  `cass doctor cleanup` offered to prune it. A placeholder holding only that
+  checkpoint and the archive fingerprint cache is now replaced on first
+  publish. A directory holding anything else is still retained.
 - **`cass mirror prune` reclaims capture staging left by killed captures
   (#523).** A `cass index` run killed mid-capture (for example by `timeout`)
   left its `raw-mirror/v1/tmp/capture.*` staging behind, and nothing removed

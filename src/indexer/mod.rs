@@ -24702,7 +24702,7 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         })?;
     }
     recover_or_finalize_interrupted_lexical_publish_backup(index_path)?;
-    remove_empty_lexical_index_dir_placeholder(index_path);
+    remove_lexical_index_dir_placeholder(index_path);
 
     if !index_path.exists() {
         rename_lexical_publish_path(
@@ -25107,18 +25107,47 @@ fn ensure_lexical_publish_backups_dir(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_empty_lexical_index_dir_placeholder(index_path: &Path) {
+fn remove_lexical_index_dir_placeholder(index_path: &Path) {
     // `index_dir(&data_dir)` calls `fs::create_dir_all` at startup, creating an
-    // empty directory before any lexical generation has been published. `fs::remove_dir`
-    // only succeeds when the directory has zero entries (failing with ENOTEMPTY
-    // if any file or subdirectory exists), so calling it here turns the empty
+    // empty directory before any lexical generation has been published. A first
+    // full rebuild then writes its in-progress checkpoint into it, and status may
+    // cache the archive fingerprint there. Both are rewritten with the published
+    // generation, so a directory holding only them is still a placeholder;
+    // retaining it gave a fresh install a "prior-live" publish backup with no
+    // index in it. Only those two sidecars are removed. `fs::remove_dir` only
+    // succeeds when the directory has zero entries (failing with ENOTEMPTY if
+    // any other file or subdirectory exists), so calling it here turns the
     // placeholder back into `!index_path.exists()` without touching a populated
     // live index (dcp01).
-    if index_path.is_dir()
-        && fs::read_dir(index_path).is_ok_and(|mut entries| entries.next().is_none())
-    {
-        let _ = fs::remove_dir(index_path);
+    if !fs::symlink_metadata(index_path).is_ok_and(|meta| meta.is_dir()) {
+        return;
     }
+    let Ok(entries) = fs::read_dir(index_path) else {
+        return;
+    };
+    let placeholder_sidecars = [
+        lexical_rebuild_state_path(index_path),
+        index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE),
+    ];
+    let mut sidecars = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return;
+        };
+        let path = entry.path();
+        if !placeholder_sidecars.contains(&path)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            return;
+        }
+        sidecars.push(path);
+    }
+    for sidecar in &sidecars {
+        if fs::remove_file(sidecar).is_err() {
+            return;
+        }
+    }
+    let _ = fs::remove_dir(index_path);
 }
 
 fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> Result<()> {
@@ -25127,7 +25156,7 @@ fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> 
         return Ok(());
     }
 
-    remove_empty_lexical_index_dir_placeholder(index_path);
+    remove_lexical_index_dir_placeholder(index_path);
 
     if index_path.exists() {
         ensure_lexical_publish_backups_dir(index_path)?;
@@ -61224,6 +61253,136 @@ c.close()
                 "first publish over empty index_dir placeholder must not retain an empty backup; got {entries:?}"
             );
         }
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_first_publish_over_checkpoint_only_index_dir_does_not_retain_it()
+     {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        // A first full rebuild checkpoints into the startup placeholder, and
+        // status may cache the archive fingerprint there, before any generation
+        // exists. `cass index --force-rebuild` on a fresh data dir retained that
+        // directory as a "prior-live" publish backup holding no index.
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::write(
+            lexical_rebuild_state_path(&index_path),
+            b"{\"completed\":false}",
+        )
+        .unwrap();
+        fs::write(index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE), b"{}").unwrap();
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-first-publish-checkpoint-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("first-publish-checkpoint-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "first publish over a checkpoint-only placeholder must land the staged index"
+        );
+        assert!(
+            !lexical_rebuild_state_path(&index_path).exists(),
+            "the superseded in-progress checkpoint must not survive into the published generation"
+        );
+        assert!(
+            !lexical_publish_in_progress_backup_path(&index_path).exists(),
+            "first publish must not park the placeholder"
+        );
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        if backups_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&backups_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "a checkpoint-only placeholder is not a prior-live generation; got {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_retains_a_checkpointed_index_dir_holding_anything_else() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::write(
+            lexical_rebuild_state_path(&index_path),
+            b"{\"completed\":false}",
+        )
+        .unwrap();
+        // Any entry beyond the two placeholder sidecars means the directory is
+        // not a placeholder, so publish must retain it untouched.
+        fs::write(
+            index_path.join("segment-unknown"),
+            b"not a placeholder sidecar",
+        )
+        .unwrap();
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-publish-checkpoint-plus-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("publish-checkpoint-plus-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "publish must land the staged index"
+        );
+        let entries: Vec<_> = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the prior live directory must be retained; got {entries:?}"
+        );
+        assert_eq!(
+            fs::read(entries[0].join("segment-unknown")).unwrap(),
+            b"not a placeholder sidecar"
+        );
+        assert_eq!(
+            fs::read(entries[0].join(".lexical-rebuild-state.json")).unwrap(),
+            b"{\"completed\":false}",
+            "a retained directory keeps its checkpoint"
+        );
     }
 
     /// An interrupted prior publish left a `.<name>.publish-in-progress.bak`
