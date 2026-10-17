@@ -548,17 +548,18 @@ impl ReceiptLock {
 }
 
 pub(super) fn deliver(
+    archive_data_dir: &Path,
     ctx: &ScanContext,
     source: &DiscoveredSourceFile,
     mut conversation: NormalizedConversation,
     sink: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    // `cass index --watch-once <rollout>` scans with the rollout file itself as
-    // data_dir. Stat'ing a registry under a file fails with ENOTDIR and dropped
-    // every targeted Codex conversation, so only a directory can hold receipts.
+    // The receiving archive owns the receipts; ScanContext's data_dir may
+    // instead name a configured source directory or a watch-once rollout.
+    // Unbound standalone file scans cannot contain a receipt registry.
     if conversation.agent_slug != "codex"
-        || !ctx.data_dir.is_dir()
-        || !ctx.data_dir.join(REGISTRY_DIRECTORY).try_exists()?
+        || !archive_data_dir.is_dir()
+        || !archive_data_dir.join(REGISTRY_DIRECTORY).try_exists()?
     {
         return sink(conversation);
     }
@@ -571,7 +572,7 @@ pub(super) fn deliver(
     };
     let bare_id = name.strip_suffix(".zst").unwrap_or(name);
     let bare_id = bare_id.strip_suffix(".jsonl").unwrap_or(bare_id);
-    let path = receipt_path(&ctx.data_dir, &source.origin.source_id, bare_id);
+    let path = receipt_path(archive_data_dir, &source.origin.source_id, bare_id);
     if !path.try_exists()? {
         return sink(conversation);
     }

@@ -243,16 +243,22 @@ fn gh524_delivery_uses_the_canonical_id_and_keeps_write_ahead_proof_on_failure()
     .with_fs_metadata();
     let mut seen = None;
     assert!(
-        deliver(&ctx, &source, conversation.clone(), &mut |conversation| {
-            seen = conversation.external_id;
-            anyhow::bail!("synthetic consumer failure")
-        })
+        deliver(
+            &ctx.data_dir,
+            &ctx,
+            &source,
+            conversation.clone(),
+            &mut |conversation| {
+                seen = conversation.external_id;
+                anyhow::bail!("synthetic consumer failure")
+            },
+        )
         .is_err()
     );
     assert_eq!(seen.as_deref(), Some(pair.bare_id.as_str()));
     let saved = ReceiptLock::load_path(&path)?.unwrap();
     assert!(saved.head.bytes > receipt.head.bytes);
-    deliver(&ctx, &source, conversation, &mut |_| Ok(()))?;
+    deliver(&ctx.data_dir, &ctx, &source, conversation, &mut |_| Ok(()))?;
     assert_eq!(ReceiptLock::load_path(&path)?.unwrap(), saved);
     Ok(())
 }
@@ -273,10 +279,16 @@ fn watch_once_rollout_as_data_dir_is_delivered_unchanged() -> Result<()> {
     )
     .with_fs_metadata();
     let mut delivered = Vec::new();
-    deliver(&ctx, &source, conversation.clone(), &mut |conversation| {
-        delivered.push(conversation.external_id);
-        Ok(())
-    })?;
+    deliver(
+        &ctx.data_dir,
+        &ctx,
+        &source,
+        conversation.clone(),
+        &mut |conversation| {
+            delivered.push(conversation.external_id);
+            Ok(())
+        },
+    )?;
     assert_eq!(delivered, vec![conversation.external_id]);
     Ok(())
 }
@@ -305,10 +317,16 @@ fn gh524_other_agents_and_sources_keep_their_original_ids() -> Result<()> {
         )
         .with_fs_metadata();
         let expected = conversation.external_id.clone();
-        deliver(&ctx, &source, conversation.clone(), &mut |conversation| {
-            assert_eq!(conversation.external_id, expected);
-            Ok(())
-        })?;
+        deliver(
+            &ctx.data_dir,
+            &ctx,
+            &source,
+            conversation.clone(),
+            &mut |conversation| {
+                assert_eq!(conversation.external_id, expected);
+                Ok(())
+            },
+        )?;
     }
     Ok(())
 }

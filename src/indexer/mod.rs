@@ -14980,12 +14980,15 @@ struct StreamingProducerConfig {
 /// any explicitly configured additional roots.
 /// Conversations are sent through the channel as they're discovered, providing
 /// backpressure when the consumer (indexer) falls behind.
-fn spawn_connector_producer(
+fn spawn_connector_producer<F>(
     name: &'static str,
-    factory: fn() -> Box<dyn Connector + Send>,
+    factory: F,
     tx: Sender<IndexMessage>,
     config: StreamingProducerConfig,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    F: Fn() -> Box<dyn Connector + Send> + Send + 'static,
+{
     thread::spawn(move || {
         let scan_start = std::time::Instant::now();
         let conn = factory();
@@ -16052,7 +16055,9 @@ fn run_streaming_index(
         lexical_strategy,
         additional_scan_roots,
         local_connector_roots,
-        configured_connector_factories(),
+        filter_disabled_connector_factories(
+            crate::connectors::get_connector_factories_for_archive(&opts.data_dir),
+        ),
         scan_start_ts,
         progress_bump,
     )
@@ -16064,9 +16069,9 @@ fn configured_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     filter_disabled_connector_factories(get_connector_factories())
 }
 
-fn filter_disabled_connector_factories(
-    connector_factories: Vec<(&'static str, ConnectorFactory)>,
-) -> Vec<(&'static str, ConnectorFactory)> {
+fn filter_disabled_connector_factories<F>(
+    connector_factories: Vec<(&'static str, F)>,
+) -> Vec<(&'static str, F)> {
     if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
         return connector_factories;
     }
@@ -16102,7 +16107,7 @@ fn filter_disabled_connector_factories(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_streaming_index_with_connector_factories(
+fn run_streaming_index_with_connector_factories<F>(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
@@ -16110,10 +16115,13 @@ fn run_streaming_index_with_connector_factories(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
-    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+    connector_factories: Vec<(&'static str, F)>,
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
-) -> Result<NonWatchIngestOutcome> {
+) -> Result<NonWatchIngestOutcome>
+where
+    F: Fn() -> Box<dyn Connector + Send> + Send + Sync + 'static,
+{
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
         if let Some(p) = &opts.progress {
@@ -16292,14 +16300,16 @@ fn run_batch_index(
         lexical_strategy,
         additional_scan_roots,
         local_connector_roots,
-        configured_connector_factories(),
+        filter_disabled_connector_factories(
+            crate::connectors::get_connector_factories_for_archive(&opts.data_dir),
+        ),
         scan_start_ts,
         progress_bump,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_batch_index_with_connector_factories(
+fn run_batch_index_with_connector_factories<F>(
     storage: &FrankenStorage,
     mut t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
@@ -16307,10 +16317,13 @@ fn run_batch_index_with_connector_factories(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
-    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+    connector_factories: Vec<(&'static str, F)>,
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
-) -> Result<NonWatchIngestOutcome> {
+) -> Result<NonWatchIngestOutcome>
+where
+    F: Fn() -> Box<dyn Connector + Send> + Send + Sync + 'static,
+{
     let (boundary, fallback): (Vec<_>, Vec<_>) = connector_factories
         .into_iter()
         .partition(|(_, factory)| factory().supports_source_boundaries());
@@ -16918,10 +16931,10 @@ fn connector_activity_time_lower_bound(name: &str, since_ts: Option<i64>) -> Opt
     }
 }
 
-fn connector_local_scan_since_ts_map(
+fn connector_local_scan_since_ts_map<F>(
     storage: &FrankenStorage,
     fallback_since_ts: Option<i64>,
-    connector_factories: &[(&'static str, ConnectorFactory)],
+    connector_factories: &[(&'static str, F)],
 ) -> Result<HashMap<&'static str, Option<i64>>> {
     let connector_names = connector_factories
         .iter()
@@ -30352,7 +30365,7 @@ fn targeted_quarantine_retry_inner(
             source.provider
         )
     })?;
-    let connector = kind.create_connector();
+    let connector = kind.create_connector(Some(data_dir));
     let root = ScanRoot::local(source.source_path.clone());
     let context = crate::connectors::ScanContext::with_roots(
         source.source_path.clone(),
@@ -31026,9 +31039,12 @@ impl ConnectorKind {
 
     /// Create a boxed connector instance for this kind.
     /// Centralizes connector instantiation to avoid duplicate match arms.
-    fn create_connector(&self) -> Box<dyn Connector + Send> {
+    fn create_connector(&self, archive_data_dir: Option<&Path>) -> Box<dyn Connector + Send> {
         match self {
-            Self::Codex => Box::new(CodexConnector::new()),
+            Self::Codex => Box::new(match archive_data_dir {
+                Some(data_dir) => CodexConnector::new().with_archive_data_dir(data_dir),
+                None => CodexConnector::new(),
+            }),
             Self::Cline => Box::new(ClineConnector::new()),
             Self::Gemini => Box::new(GeminiConnector::new()),
             Self::Antigravity => Box::new(AntigravityConnector::new()),
@@ -31685,7 +31701,7 @@ fn reindex_paths_with_semantic_delta(
     let preserve_watch_watermark = scan_path_exclusions_active();
 
     for (kind, root, min_ts, max_ts) in triggers {
-        let conn = kind.create_connector();
+        let conn = kind.create_connector(Some(&opts.data_dir));
         let detect = conn.detect();
         if !detect.detected && root.origin.kind == SourceKind::Local && !root.path.exists() {
             // For local roots, if detection fails and the root is gone, skip.
@@ -55682,7 +55698,10 @@ mod tests {
             Vec::new(),
             None,
             vec![
-                ("claude", active_batch_watermark_connector_factory),
+                (
+                    "claude",
+                    active_batch_watermark_connector_factory as ConnectorFactory,
+                ),
                 ("codex", safe_batch_watermark_connector_factory),
             ],
             Some(scan_start_ts),
@@ -71577,7 +71596,7 @@ c.close()
                 serde_json::from_str::<ConnectorKind>(&serialized).expect("read connector kind"),
                 kind
             );
-            let routed = kind.create_connector();
+            let routed = kind.create_connector(None);
             let expected = configured_factory();
             let routed_detection = routed.detect();
             let expected_detection = expected.detect();
