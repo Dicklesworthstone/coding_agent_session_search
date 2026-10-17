@@ -65,7 +65,9 @@ fn compressed_only_preflight_matches_actual_directory_scan() {
     let expected = scanned(vec![root], &tmp.path().join("cass"));
     assert_eq!(expected.len(), 2, "the fixture must exercise real decoding");
     assert!(expected.iter().all(|row| {
-        row.2.iter().any(|text| text.contains("compressed history sentinel"))
+        row.2
+            .iter()
+            .any(|text| text.contains("compressed history sentinel"))
     }));
     assert_eq!(
         scanned(preflight.scan_roots, &tmp.path().join("cass")),
@@ -113,10 +115,8 @@ fn representation_preference_precedes_the_incremental_cutoff() {
             .unwrap()
             .is_empty()
     );
-    let preflight = preflight_codex_explicit_file_roots(
-        &[ScanRoot::local(sessions.clone())],
-        Some(200_000),
-    );
+    let preflight =
+        preflight_codex_explicit_file_roots(&[ScanRoot::local(sessions.clone())], Some(200_000));
     assert_eq!(preflight.fallback_roots, 1);
     assert_eq!(preflight.scan_roots[0].path, sessions);
 }
@@ -139,9 +139,11 @@ fn full_home_retains_archived_rollouts_and_their_identity() {
     assert_eq!(preflight.scan_roots[0].path, home);
     let expected = scanned(roots, &tmp.path().join("cass"));
     assert_eq!(expected.len(), 2);
-    assert!(expected.iter().any(|row| row.1.as_deref().is_some_and(|id| {
-        id.starts_with("2026/10/15/") || id.starts_with("2026\\10\\15\\")
-    })));
+    assert!(expected.iter().any(|row| {
+        row.1
+            .as_deref()
+            .is_some_and(|id| id.starts_with("2026/10/15/") || id.starts_with("2026\\10\\15\\"))
+    }));
     assert_eq!(
         scanned(preflight.scan_roots, &tmp.path().join("cass")),
         expected
@@ -175,8 +177,7 @@ fn empty_selected_roots_never_turn_into_implicit_default_discovery() {
         assert_eq!(preflight.explicit_file_roots, 0);
         assert_eq!(preflight.scan_roots.len(), 1);
         assert_eq!(preflight.scan_roots[0].path, selected);
-        let context =
-            ScanContext::with_roots(tmp.path().join("cass"), preflight.scan_roots, None);
+        let context = ScanContext::with_roots(tmp.path().join("cass"), preflight.scan_roots, None);
         assert!(!context.use_default_detection());
     }
 }

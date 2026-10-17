@@ -14,7 +14,9 @@ use anyhow::{Result, ensure};
 use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
 
 use super::codex::path_policy::ScanExclusions;
-use super::{Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext};
+use super::{
+    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext,
+};
 
 #[derive(Default)]
 pub struct ContinueConnector {
@@ -223,7 +225,9 @@ impl Connector for ContinueConnector {
     ) -> Result<()> {
         let exclusions = ScanExclusions::from_env();
         exclusions.validate()?;
-        self.scan_allowed(ctx, hooks, on_conversation, &|path| exclusions.excludes(path))
+        self.scan_allowed(ctx, hooks, on_conversation, &|path| {
+            exclusions.excludes(path)
+        })
     }
 }
 

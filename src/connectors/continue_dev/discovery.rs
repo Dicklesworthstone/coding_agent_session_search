@@ -46,9 +46,9 @@ fn default_root(ctx: &ScanContext) -> Result<Option<PathBuf>> {
     let data = &ctx.data_dir;
     let native_data = data.file_name().is_some_and(|name| name == ".continue")
         || (data.file_name().is_some_and(|name| name == "sessions")
-            && data.parent().is_some_and(|parent| {
-                parent.file_name().is_some_and(|name| name == ".continue")
-            }))
+            && data
+                .parent()
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == ".continue")))
         || global
             .as_ref()
             .is_some_and(|root| data == root || *data == root.join("sessions"));
@@ -106,7 +106,10 @@ fn mirror_root(root: &ScanRoot) -> Result<Option<ScanRoot>> {
 fn roots(ctx: &ScanContext, excludes: &dyn Fn(&Path) -> bool) -> Result<Vec<ScanRoot>> {
     let defaults = ctx.use_default_detection();
     let bases = if defaults {
-        default_root(ctx)?.map(ScanRoot::local).into_iter().collect()
+        default_root(ctx)?
+            .map(ScanRoot::local)
+            .into_iter()
+            .collect()
     } else {
         ctx.scan_roots.clone()
     };
@@ -167,14 +170,12 @@ fn roots(ctx: &ScanContext, excludes: &dyn Fn(&Path) -> bool) -> Result<Vec<Scan
 }
 
 fn session_name(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| extension == "json")
+    path.extension()
+        .is_some_and(|extension| extension == "json")
         && path.file_name().is_some_and(|name| name != "sessions.json")
 }
 
-pub(super) fn discover(
-    ctx: &ScanContext,
-    excludes: &dyn Fn(&Path) -> bool,
-) -> Result<Vec<Source>> {
+pub(super) fn discover(ctx: &ScanContext, excludes: &dyn Fn(&Path) -> bool) -> Result<Vec<Source>> {
     let mut sources = Vec::new();
     let mut seen = HashSet::new();
     for root in roots(ctx, excludes)? {

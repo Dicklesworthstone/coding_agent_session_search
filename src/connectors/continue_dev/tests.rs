@@ -85,16 +85,15 @@ fn all_selected_roots_excluded_does_not_scan_the_default_data_home() {
     seed(&implicit.join("sessions/default.json"));
     let selected = temp.path().join("selected");
     seed(&selected.join("explicit.json"));
-    let ctx = ScanContext::with_roots(
-        implicit,
-        vec![ScanRoot::local(selected.clone())],
-        None,
-    );
+    let ctx = ScanContext::with_roots(implicit, vec![ScanRoot::local(selected.clone())], None);
     let excludes = |path: &Path| path.starts_with(&selected);
     let connector = ContinueConnector::new();
     assert!(selected_scope(&ctx, &excludes).is_none());
     assert!(
-        connector.discover_allowed(&ctx, &excludes).unwrap().is_empty()
+        connector
+            .discover_allowed(&ctx, &excludes)
+            .unwrap()
+            .is_empty()
     );
     connector
         .scan_allowed(
@@ -127,12 +126,7 @@ fn durable_ledger_can_retry_old_sources_but_plain_scans_keep_their_cutoff() {
         Ok(())
     };
     connector
-        .scan_allowed(
-            &ctx,
-            &mut SourceScanHooks::default(),
-            &mut emit,
-            &|_| false,
-        )
+        .scan_allowed(&ctx, &mut SourceScanHooks::default(), &mut emit, &|_| false)
         .unwrap();
     assert_eq!(delivered.get(), 0);
     let mut completions = 0;
@@ -229,7 +223,11 @@ fn malformed_sources_do_not_hide_successful_sources_or_certify_the_scan() {
         )
         .unwrap_err();
     assert_eq!((delivered, completed), (1, 1));
-    assert!(error.to_string().contains("2 admitted snapshot(s) did not complete"));
+    assert!(
+        error
+            .to_string()
+            .contains("2 admitted snapshot(s) did not complete")
+    );
     assert!(error.to_string().contains("a-invalid.json"));
 }
 
@@ -255,11 +253,10 @@ fn delivery_and_checkpoint_errors_preserve_the_original_error() {
                 },
                 &mut |_| {
                     if fail_delivery {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "delivery failure",
+                        Err(
+                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "delivery failure")
+                                .into(),
                         )
-                        .into())
                     } else {
                         Ok(())
                     }
@@ -293,7 +290,11 @@ fn a_source_changed_during_delivery_is_not_a_successful_scan() {
             &|_| false,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("1 admitted snapshot(s) did not complete"));
+    assert!(
+        error
+            .to_string()
+            .contains("1 admitted snapshot(s) did not complete")
+    );
 }
 
 #[test]
@@ -304,7 +305,10 @@ fn actual_registry_factory_uses_ledger_first_admission() {
     ctx.since_ts = Some(i64::MAX);
     let factories = crate::connectors::get_connector_factories();
     assert_eq!(
-        factories.iter().filter(|(name, _)| *name == "continue").count(),
+        factories
+            .iter()
+            .filter(|(name, _)| *name == "continue")
+            .count(),
         1
     );
     let factory = factories
@@ -330,8 +334,7 @@ fn actual_registry_factory_uses_ledger_first_admission() {
         )
         .unwrap();
     assert_eq!(
-        delivered,
-        1,
+        delivered, 1,
         "the raw FAD factory loses this old source before its hook"
     );
 }

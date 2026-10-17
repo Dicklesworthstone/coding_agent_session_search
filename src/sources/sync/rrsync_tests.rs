@@ -83,8 +83,7 @@ fn restricted_readonly_transfer() {
     std::fs::create_dir_all(&source).expect("create restricted session directory");
     std::fs::write(source.join("session.jsonl"), b"{\"message\":\"initial\"}\n")
         .expect("write session");
-    std::fs::write(source.join("a quoted name.jsonl"), b"spaces\n")
-        .expect("write spaced filename");
+    std::fs::write(source.join("a quoted name.jsonl"), b"spaces\n").expect("write spaced filename");
     let adapter = temp.path().join("rrsync-transport.sh");
     std::fs::write(
         &adapter,
@@ -121,9 +120,9 @@ fn restricted_readonly_transfer() {
             !rejected.status.success(),
             "rrsync must reject hidden server arguments"
         );
-        assert!(rsync_arg_protection_remote_rejected(&String::from_utf8_lossy(
-            &rejected.stderr
-        )));
+        assert!(rsync_arg_protection_remote_rejected(
+            &String::from_utf8_lossy(&rejected.stderr)
+        ));
         assert!(!destination.join("session.jsonl").exists());
 
         let accepted = transfer(RsyncArgProtection::None);

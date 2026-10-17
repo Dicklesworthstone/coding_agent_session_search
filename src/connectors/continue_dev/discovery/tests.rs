@@ -25,7 +25,10 @@ fn context(root: ScanRoot, data: &Path) -> ScanContext {
 fn exercise(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
     let connector = ContinueConnector::new();
     let expected = connector.discover_allowed(ctx, &|_| false).unwrap();
-    assert!(!expected.is_empty(), "the fixture must contain real sessions");
+    assert!(
+        !expected.is_empty(),
+        "the fixture must contain real sessions"
+    );
     let mut admitted = Vec::new();
     let mut completed = Vec::new();
     let mut delivered = 0;
@@ -66,8 +69,16 @@ fn ordinary_layouts_keep_the_pinned_discovery_identity_and_checkpoint() {
     let file = profile.join(".continue/sessions/native.json");
     seed(&file);
     seed(&profile.join("sessions/relocated.json"));
-    fs::write(profile.join(".continue/sessions/sessions.json"), b"not a transcript").unwrap();
-    fs::write(profile.join(".continue/sessions/notes.txt"), b"not a transcript").unwrap();
+    fs::write(
+        profile.join(".continue/sessions/sessions.json"),
+        b"not a transcript",
+    )
+    .unwrap();
+    fs::write(
+        profile.join(".continue/sessions/notes.txt"),
+        b"not a transcript",
+    )
+    .unwrap();
     seed(&profile.join(".continue/sessions/child/ignored.json"));
     for root in [
         profile.clone(),
@@ -105,26 +116,36 @@ fn basename_preserving_mirrors_use_remote_store_identity_and_keep_provenance() {
         assert_eq!(sources[0].origin, Origin::remote("workstation"));
         assert_eq!(sources[0].scan_root, container.join(relative));
         let mut rows = Vec::new();
-        ContinueConnector::new().scan_allowed(
-            &ctx, &mut SourceScanHooks::default(),
-            &mut |row| { rows.push(row); Ok(()) }, &|_| false,
-        ).unwrap();
+        ContinueConnector::new()
+            .scan_allowed(
+                &ctx,
+                &mut SourceScanHooks::default(),
+                &mut |row| {
+                    rows.push(row);
+                    Ok(())
+                },
+                &|_| false,
+            )
+            .unwrap();
         assert_eq!(rows[0].workspace, Some(PathBuf::from("/local/project")));
         assert_eq!(
             rows[0].metadata["origin"],
             serde_json::to_value(Origin::remote("workstation")).unwrap()
         );
-        assert_eq!(ctx.scan_roots[0].path, container, "leave the caller's selector intact");
-        assert_eq!(ctx.scan_roots[0].mirrored_source_path.as_deref(), Some(remote));
+        assert_eq!(
+            ctx.scan_roots[0].path, container,
+            "leave the caller's selector intact"
+        );
+        assert_eq!(
+            ctx.scan_roots[0].mirrored_source_path.as_deref(),
+            Some(remote)
+        );
     }
 }
 
 #[test]
 fn contents_only_mirrors_do_not_require_a_second_basename_directory() {
-    for (remote, relative) in [
-        ("~/.continue/", "sessions"),
-        ("~/.continue/sessions/", ""),
-    ] {
+    for (remote, relative) in [("~/.continue/", "sessions"), ("~/.continue/sessions/", "")] {
         let temp = tempfile::tempdir().unwrap();
         let container = temp.path().join("contents");
         seed(&container.join(relative).join("session.json"));
@@ -146,23 +167,34 @@ fn unrelated_mirrors_never_reach_the_continue_parser_or_implicit_home() {
     seed(&container.join("sessions/codex.json"));
     let data = temp.path().join(".continue");
     seed(&data.join("sessions/default.json"));
-    for remote in ["~/.codex/sessions", "~/sessions", "~/.continue-copy/sessions"] {
+    for remote in [
+        "~/.codex/sessions",
+        "~/sessions",
+        "~/.continue-copy/sessions",
+    ] {
         let ctx = context(
             ScanRoot::remote(container.clone(), Origin::remote("other"), None)
                 .with_mirrored_source_path(remote),
             &data,
         );
         let connector = ContinueConnector::new();
-        assert!(connector.discover_allowed(&ctx, &|_| false).unwrap().is_empty());
-        connector.scan_allowed(
-            &ctx,
-            &mut SourceScanHooks {
-                should_scan_source: Some(&mut |_| panic!("unowned source admitted")),
-                on_source_complete: Some(&mut |_| panic!("unowned source completed")),
-            },
-            &mut |_| panic!("unowned mirror or implicit home parsed"),
-            &|_| false,
-        ).unwrap();
+        assert!(
+            connector
+                .discover_allowed(&ctx, &|_| false)
+                .unwrap()
+                .is_empty()
+        );
+        connector
+            .scan_allowed(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| panic!("unowned source admitted")),
+                    on_source_complete: Some(&mut |_| panic!("unowned source completed")),
+                },
+                &mut |_| panic!("unowned mirror or implicit home parsed"),
+                &|_| false,
+            )
+            .unwrap();
     }
 }
 
@@ -176,11 +208,20 @@ fn excluded_derived_stores_do_not_fall_back_to_parent_json_files() {
     let ctx = context(ScanRoot::local(root), &temp.path().join("cass"));
     let excluded = |path: &Path| path.starts_with(&sessions);
     let connector = ContinueConnector::new();
-    assert!(connector.discover_allowed(&ctx, &excluded).unwrap().is_empty());
-    connector.scan_allowed(
-        &ctx, &mut SourceScanHooks::default(),
-        &mut |_| panic!("excluded store broadened to its parent"), &excluded,
-    ).unwrap();
+    assert!(
+        connector
+            .discover_allowed(&ctx, &excluded)
+            .unwrap()
+            .is_empty()
+    );
+    connector
+        .scan_allowed(
+            &ctx,
+            &mut SourceScanHooks::default(),
+            &mut |_| panic!("excluded store broadened to its parent"),
+            &excluded,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -191,11 +232,20 @@ fn missing_explicit_roots_fail_without_scanning_the_default_home() {
     let ctx = context(ScanRoot::local(temp.path().join("missing")), &data);
     let connector = ContinueConnector::new();
     let error = connector.discover_allowed(&ctx, &|_| false).unwrap_err();
-    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::NotFound);
-    assert!(connector.scan_allowed(
-        &ctx, &mut SourceScanHooks::default(),
-        &mut |_| panic!("missing selection broadened to home"), &|_| false,
-    ).is_err());
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(
+        connector
+            .scan_allowed(
+                &ctx,
+                &mut SourceScanHooks::default(),
+                &mut |_| panic!("missing selection broadened to home"),
+                &|_| false,
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -205,24 +255,36 @@ fn moved_inventory_members_cannot_disappear_between_discovery_and_parsing() {
     let second = temp.path().join("b.json");
     seed(&first);
     seed(&second);
-    let ctx = context(ScanRoot::local(temp.path().to_path_buf()), &temp.path().join("cass"));
+    let ctx = context(
+        ScanRoot::local(temp.path().to_path_buf()),
+        &temp.path().join("cass"),
+    );
     let mut delivered = 0;
     let mut completed = 0;
-    let error = ContinueConnector::new().scan_allowed(
-        &ctx,
-        &mut SourceScanHooks {
-            should_scan_source: None,
-            on_source_complete: Some(&mut |_| { completed += 1; Ok(()) }),
-        },
-        &mut |_| {
-            delivered += 1;
-            fs::rename(&second, temp.path().join("b.retained")).unwrap();
-            Ok(())
-        },
-        &|_| false,
-    ).unwrap_err();
+    let error = ContinueConnector::new()
+        .scan_allowed(
+            &ctx,
+            &mut SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut |_| {
+                    completed += 1;
+                    Ok(())
+                }),
+            },
+            &mut |_| {
+                delivered += 1;
+                fs::rename(&second, temp.path().join("b.retained")).unwrap();
+                Ok(())
+            },
+            &|_| false,
+        )
+        .unwrap_err();
     assert_eq!((delivered, completed), (1, 1));
-    assert!(error.to_string().contains("1 admitted snapshot(s) did not complete"));
+    assert!(
+        error
+            .to_string()
+            .contains("1 admitted snapshot(s) did not complete")
+    );
     assert!(error.to_string().contains("b.json"));
     assert!(temp.path().join("b.retained").is_file());
 }
@@ -232,23 +294,36 @@ fn changed_observations_are_refused_before_delivering_replacement_contents() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("session.json");
     seed(&file);
-    let ctx = context(ScanRoot::local(temp.path().to_path_buf()), &temp.path().join("cass"));
-    let error = ContinueConnector::new().scan_allowed(
-        &ctx,
-        &mut SourceScanHooks {
-            should_scan_source: Some(&mut |_| {
-                // Change size deterministically even on coarse-mtime filesystems.
-                use std::io::Write;
-                fs::OpenOptions::new().append(true).open(&file).unwrap()
-                    .write_all(b"\n ").unwrap();
-                true
-            }),
-            on_source_complete: Some(&mut |_| panic!("changed observation certified")),
-        },
-        &mut |_| panic!("replacement contents crossed old admission"),
-        &|_| false,
-    ).unwrap_err();
-    assert!(error.to_string().contains("1 admitted snapshot(s) did not complete"));
+    let ctx = context(
+        ScanRoot::local(temp.path().to_path_buf()),
+        &temp.path().join("cass"),
+    );
+    let error = ContinueConnector::new()
+        .scan_allowed(
+            &ctx,
+            &mut SourceScanHooks {
+                should_scan_source: Some(&mut |_| {
+                    // Change size deterministically even on coarse-mtime filesystems.
+                    use std::io::Write;
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&file)
+                        .unwrap()
+                        .write_all(b"\n ")
+                        .unwrap();
+                    true
+                }),
+                on_source_complete: Some(&mut |_| panic!("changed observation certified")),
+            },
+            &mut |_| panic!("replacement contents crossed old admission"),
+            &|_| false,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("1 admitted snapshot(s) did not complete")
+    );
 }
 
 #[cfg(unix)]
@@ -259,7 +334,10 @@ fn filesystem_discovery_errors_are_not_empty_successes_and_exclusions_still_appl
     let bad = temp.path().join("private.json");
     symlink("private.json", &bad).unwrap();
     seed(&temp.path().join("public.json"));
-    let ctx = context(ScanRoot::local(temp.path().to_path_buf()), &temp.path().join("cass"));
+    let ctx = context(
+        ScanRoot::local(temp.path().to_path_buf()),
+        &temp.path().join("cass"),
+    );
     let connector = ContinueConnector::new();
     let error = connector.discover_allowed(&ctx, &|_| false).unwrap_err();
     assert!(error.downcast_ref::<io::Error>().is_some());
@@ -268,9 +346,14 @@ fn filesystem_discovery_errors_are_not_empty_successes_and_exclusions_still_appl
     let sources = connector.discover_allowed(&ctx, &excluded).unwrap();
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].source_path.file_name().unwrap(), "public.json");
-    connector.scan_allowed(
-        &ctx, &mut SourceScanHooks::default(), &mut |_| Ok(()), &excluded,
-    ).unwrap();
+    connector
+        .scan_allowed(
+            &ctx,
+            &mut SourceScanHooks::default(),
+            &mut |_| Ok(()),
+            &excluded,
+        )
+        .unwrap();
 }
 
 #[cfg(unix)]
@@ -287,7 +370,11 @@ fn inferred_mirror_stores_never_follow_a_symlinked_transport_boundary() {
             .with_mirrored_source_path("~/.continue/sessions"),
         &temp.path().join("cass"),
     );
-    assert!(ContinueConnector::new().discover_allowed(&ctx, &|_| false).is_err());
+    assert!(
+        ContinueConnector::new()
+            .discover_allowed(&ctx, &|_| false)
+            .is_err()
+    );
 }
 
 #[test]
@@ -295,7 +382,12 @@ fn an_absent_default_installation_is_empty_not_an_explicit_root_failure() {
     let temp = tempfile::tempdir().unwrap();
     let ctx = ScanContext::local_default(temp.path().join(".continue"), None);
     let connector = ContinueConnector::new();
-    assert!(connector.discover_allowed(&ctx, &|_| false).unwrap().is_empty());
+    assert!(
+        connector
+            .discover_allowed(&ctx, &|_| false)
+            .unwrap()
+            .is_empty()
+    );
     connector
         .scan_allowed(
             &ctx,
