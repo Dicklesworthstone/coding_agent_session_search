@@ -13,6 +13,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use franken_agent_detection::connectors::codex as codex_rollouts;
 
 #[cfg(test)]
 use super::MAX_AUGMENT_ROLLOUT_BYTES;
@@ -59,25 +60,31 @@ pub(super) fn validate_with_limit(
         tick();
     }
     // A finite opened prefix, not an unbounded read of a growing source.
-    let mut reader = BufReader::new((&file).take(before.len()));
-    let legacy = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
-    let consumed = if legacy {
-        validate_legacy(&mut reader)?;
-        // from_reader checks trailing data and reaches EOF on success, so no
-        // unread bytes remain in BufReader after a complete legacy document.
-        before.len() - reader.get_ref().limit()
+    if codex_rollouts::is_compressed_rollout(path) {
+        // The decoder validates complete frames and bounds decoded bytes.
+        let mut reader = codex_rollouts::decompressed_rollout((&file).take(before.len()), limit)?;
+        validate_jsonl(&mut reader, progress_tick)?;
     } else {
-        validate_jsonl(&mut reader, progress_tick)?
-    };
-    if consumed != before.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "zero-output Codex source was truncated while reading",
-        )
-        .into());
+        let mut reader = BufReader::new((&file).take(before.len()));
+        let legacy = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        let consumed = if legacy {
+            validate_legacy(&mut reader)?;
+            // from_reader checks trailing data and reaches EOF on success, so no
+            // unread bytes remain in BufReader after a complete legacy document.
+            before.len() - reader.get_ref().limit()
+        } else {
+            validate_jsonl(&mut reader, progress_tick)?
+        };
+        if consumed != before.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "zero-output Codex source was truncated while reading",
+            )
+            .into());
+        }
     }
     let opened = file
         .metadata()

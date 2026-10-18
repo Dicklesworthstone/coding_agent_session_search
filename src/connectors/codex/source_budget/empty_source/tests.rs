@@ -124,6 +124,32 @@ fn valid_empty_sources_and_historical_jsonl_tolerance_are_preserved() -> Result<
 }
 
 #[test]
+fn compressed_zero_message_sources_validate_decoded_text_and_refuse_damage() -> Result<()> {
+    let text = b"{\"type\":\"session_meta\",\"payload\":{}}\n";
+    let compressed = zstd::stream::encode_all(text.as_slice(), 0)?;
+    let (_temp, paths, ctx) = fixture("jsonl.zst", &compressed)?;
+    let conversations = CodexConnector::new().scan(&ctx)?;
+    assert_eq!(conversations.len(), 2);
+    assert_eq!(conversations[0].source_path, paths[0]);
+    assert_eq!(conversations[1].source_path, paths[2]);
+    assert_eq!(fs::read(&paths[1])?, compressed);
+
+    for damaged in [
+        compressed[..compressed.len() - 1].to_vec(),
+        zstd::stream::encode_all(b"\xff\n".as_slice(), 0)?,
+        zstd::stream::encode_all(b"{\"type\":".as_slice(), 0)?,
+    ] {
+        fs::write(&paths[1], &damaged)?;
+        assert!(CodexConnector::new().scan(&ctx).is_err());
+        assert_eq!(fs::read(&paths[1])?, damaged);
+    }
+    let large = zstd::stream::encode_all(" \n".repeat(4096).as_bytes(), 0)?;
+    fs::write(&paths[1], large)?;
+    assert!(validate_with_limit(&paths[1], None, 4096).is_err());
+    Ok(())
+}
+
+#[test]
 fn host_veto_prevents_validation_of_intentionally_skipped_input() -> Result<()> {
     for extension in ["json", "jsonl"] {
         let (_temp, paths, ctx) = fixture(extension, b"\xff")?;

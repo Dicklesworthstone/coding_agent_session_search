@@ -65,7 +65,7 @@ def main() -> None:
     dependencies = manifest["dependencies"]
     names = (
         "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection",
-        "serde", "serde_json", "tempfile", "thiserror", "tracing",
+        "serde", "serde_json", "tempfile", "thiserror", "tracing", "zstd",
     )
     tests = ("connector_codex_exclusions", "codex_source_containment")
     refuse_full_crate_tests(root, tests)
@@ -81,7 +81,7 @@ def main() -> None:
         ])
     lines.extend(["", "[dependencies]"])
     for name in names:
-        spec = dependencies[name]
+        spec = dependencies[name] if name in dependencies else manifest["dev-dependencies"][name]
         version = spec if isinstance(spec, str) else spec["version"]
         if name == "franken-agent-detection":
             source = f'version = {json.dumps(version)}'
