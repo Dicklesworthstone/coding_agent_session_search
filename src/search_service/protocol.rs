@@ -6,6 +6,8 @@ use std::io::{self, BufRead, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod agent_filters;
+
 pub(super) const VERSION: u32 = 1;
 pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub(super) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -22,13 +24,19 @@ fn default_limit() -> usize {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Filters {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "agent_filters::deserialize")]
     pub agents: Vec<String>,
     #[serde(default)]
     pub workspaces: Vec<String>,
     pub source_id: Option<String>,
     pub created_from: Option<i64>,
     pub created_to: Option<i64>,
+}
+
+/// The argv lane constructs Filters without serde; share the same admission
+/// and canonicalization instead of letting that transport bypass GH #532.
+pub(super) fn normalize_agents(agents: &[String]) -> Result<Vec<String>, String> {
+    agent_filters::normalize(agents)
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +208,11 @@ pub(super) fn validate_search(
         {
             return Err("filter values must be nonempty and at most 4096 UTF-8 bytes");
         }
+    }
+    // Also protect internally constructed requests, which do not deserialize.
+    // Transport decoding retains the detailed unknown-name/suggestion error.
+    if normalize_agents(&filters.agents).is_err() {
+        return Err("unknown agent filter; use a connector from 'cass capabilities --json'");
     }
     if filters.source_id.as_ref().is_some_and(|value| {
         value.trim().is_empty() || value != value.trim() || value.len() > MAX_IDENTITY_BYTES
