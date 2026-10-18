@@ -150,8 +150,171 @@ fn compressed_zero_message_sources_validate_decoded_text_and_refuse_damage() -> 
 }
 
 #[test]
+fn compressed_empty_sources_succeed_without_fabricating_conversations() -> Result<()> {
+    let text = b"{\"type\":\"session_meta\",\"payload\":{}}\n";
+    let frame = zstd::stream::encode_all(text.as_slice(), 0)?;
+    for compressed in [
+        frame.clone(),
+        zstd::bulk::compress(text, 0)?,
+        zstd::stream::encode_all(b"".as_slice(), 0)?,
+        zstd::stream::encode_all(
+            "\u{feff}{\"type\":\"session_meta\"}\r\nnot-json\n".as_bytes(),
+            0,
+        )?,
+        [frame.as_slice(), frame.as_slice()].concat(),
+    ] {
+        let (_temp, paths, mut ctx) = fixture("jsonl.zst", &compressed)?;
+        for since in [None, Some(0)] {
+            ctx.since_ts = since;
+            let mut completed = Vec::new();
+            let mut complete = |done: &SourceCompletion| {
+                completed.push((done.source.source_path.clone(), done.conversations_emitted));
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut complete),
+            };
+            let mut delivered = Vec::new();
+            CodexConnector::new().scan_with_source_boundaries(
+                &ctx,
+                &mut hooks,
+                &mut |conversation| {
+                    delivered.push(conversation.source_path);
+                    Ok(())
+                },
+            )?;
+            assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
+            // FAD only emits a completion when it emits a conversation.
+            // Preserve that contract; validating empty input must synthesize
+            // neither a conversation nor an upstream completion event.
+            assert_eq!(completed, [(paths[0].clone(), 1), (paths[2].clone(), 1)]);
+            assert_eq!(fs::read(&paths[1])?, compressed);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_source_failures_withhold_completion_and_keep_both_neighbors() -> Result<()> {
+    let text = b"{\"type\":\"session_meta\",\"payload\":{}}\n";
+    let frame = zstd::stream::encode_all(text.as_slice(), 0)?;
+    let mut checksum_encoder = zstd::stream::Encoder::new(Vec::new(), 0)?;
+    checksum_encoder.include_checksum(true)?;
+    std::io::Write::write_all(&mut checksum_encoder, text)?;
+    let mut bad_checksum = checksum_encoder.finish()?;
+    *bad_checksum.last_mut().unwrap() ^= 1;
+    for (damaged, expected) in [
+        (Vec::new(), io::ErrorKind::UnexpectedEof),
+        (
+            frame[..frame.len() - 1].to_vec(),
+            io::ErrorKind::UnexpectedEof,
+        ),
+        (
+            [frame.as_slice(), &frame[..frame.len() - 1]].concat(),
+            io::ErrorKind::UnexpectedEof,
+        ),
+        (bad_checksum, io::ErrorKind::Other),
+        (text.to_vec(), io::ErrorKind::Other),
+        (
+            [frame.as_slice(), b"not a frame".as_slice()].concat(),
+            io::ErrorKind::Other,
+        ),
+        (
+            zstd::stream::encode_all(b"\xff\n".as_slice(), 0)?,
+            io::ErrorKind::InvalidData,
+        ),
+        (
+            zstd::stream::encode_all(b"{\"private_marker\":".as_slice(), 0)?,
+            io::ErrorKind::UnexpectedEof,
+        ),
+    ] {
+        let (_temp, paths, ctx) = fixture("jsonl.zst", &damaged)?;
+        let mut completed = Vec::new();
+        let mut complete = |done: &SourceCompletion| {
+            completed.push(done.source.source_path.clone());
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut complete),
+        };
+        let mut delivered = Vec::new();
+        let error = CodexConnector::new()
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                delivered.push(conversation.source_path);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            expected,
+            "{error:#}"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("rollout-b-empty.jsonl.zst"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("private_marker"), "{diagnostic}");
+        assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
+        assert_eq!(completed, delivered);
+        assert_eq!(fs::read(&paths[1])?, damaged);
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_zero_output_validation_enforces_exact_decoded_budget() -> Result<()> {
+    let text = " \n".repeat(2048);
+    let frame = zstd::stream::encode_all(text.as_bytes(), 0)?;
+    let compressed = [frame.as_slice(), frame.as_slice()].concat();
+    let (_temp, paths, _ctx) = fixture("jsonl.zst", &compressed)?;
+    let limit = 2 * text.len() as u64;
+    assert!((compressed.len() as u64) < limit - 1);
+    validate_with_limit(&paths[1], None, limit)?;
+    let error = validate_with_limit(&paths[1], None, limit - 1).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::FileTooLarge
+    );
+    assert_eq!(fs::read(&paths[1])?, compressed);
+    Ok(())
+}
+
+#[test]
+fn compressed_zero_output_validation_rechecks_its_opened_snapshot() -> Result<()> {
+    let frame = zstd::stream::encode_all(b"{}\n".as_slice(), 0)?;
+    let (_temp, paths, _ctx) = fixture("jsonl.zst", &frame)?;
+    let ticks = AtomicUsize::new(0);
+    let tick = || {
+        if ticks.fetch_add(1, Ordering::Relaxed) == 0 {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&paths[1])
+                .unwrap()
+                .write_all(&frame)
+                .unwrap();
+        }
+    };
+    // The originally opened prefix is a complete valid frame. Success still
+    // requires the snapshot check, even though decoding that prefix succeeds.
+    let error = validate(&paths[1], Some(&tick)).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        fs::read(&paths[1])?,
+        [frame.as_slice(), frame.as_slice()].concat()
+    );
+    Ok(())
+}
+
+#[test]
 fn host_veto_prevents_validation_of_intentionally_skipped_input() -> Result<()> {
-    for extension in ["json", "jsonl"] {
+    for extension in ["json", "jsonl", "jsonl.zst"] {
         let (_temp, paths, ctx) = fixture(extension, b"\xff")?;
         let mut predicate =
             |source: &franken_agent_detection::DiscoveredSourceFile| source.source_path != paths[1];
