@@ -31939,13 +31939,15 @@ fn run_cli_search(
     let mut skipped_sections = Vec::<String>::new();
     let mut session_paths_timed_out = false;
 
-    let mut filters = SearchFilters::default();
-    filters.agents = normalize_agent_filters(agents)?.into_iter().collect();
+    let mut filters = SearchFilters {
+        agents: normalize_agent_filters(agents)?.into_iter().collect(),
+        created_from: time_filter.since,
+        created_to: time_filter.until,
+        ..Default::default()
+    };
     if !workspaces.is_empty() {
         filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
     }
-    filters.created_from = time_filter.since;
-    filters.created_to = time_filter.until;
 
     // Apply source filter (P3.1)
     if let Some(ref source_str) = source {
@@ -33922,13 +33924,15 @@ fn run_cli_pack(
         tracing::debug!(?outcome, "pack: auto-refresh evaluated");
     }
 
-    let mut filters = SearchFilters::default();
-    filters.agents = normalized_agents.into_iter().collect();
+    let mut filters = SearchFilters {
+        agents: normalized_agents.into_iter().collect(),
+        created_from: time_filter.since,
+        created_to: time_filter.until,
+        ..Default::default()
+    };
     if !workspaces.is_empty() {
         filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
     }
-    filters.created_from = time_filter.since;
-    filters.created_to = time_filter.until;
     if let Some(ref source_str) = source {
         filters.source_filter = SourceFilter::parse(source_str);
     }
