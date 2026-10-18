@@ -7,7 +7,7 @@
 
 // Bump whenever any shipped archive asset or cache policy changes. A new name
 // keeps install from mutating the active generation entry-by-entry.
-const CACHE_VERSION = "v7";
+const CACHE_VERSION = "v8";
 const STATIC_ASSETS = [
   "./",
   "./index.html",
@@ -53,6 +53,64 @@ const LOG = {
 };
 
 let logLevel = LOG.INFO;
+
+// A clear is a boundary for this worker's runtime cache reads AND writes.
+// Fetches started before/during it may still return their network response,
+// but cannot restore cleared data or fall back to a pre-clear cache handle.
+// New requests after cleanup may cache again; this is not an offline opt-out
+// or a purge of the browser's separate HTTP cache.
+let cacheEpoch = {};
+let pendingCacheClears = 0;
+let cacheClearTail = Promise.resolve();
+const cacheMutations = new Set();
+
+function cacheRequestIsCurrent(epoch) {
+  return epoch !== null && epoch === cacheEpoch && pendingCacheClears === 0;
+}
+
+function trackCacheMutation(operation) {
+  // Register before invoking any asynchronous Cache API work, including open.
+  // Do not serialize body writes: queuing response clones behind a large
+  // download would retain unread stream data for every subsequent request.
+  const task = Promise.resolve().then(operation);
+  cacheMutations.add(task);
+  const release = () => cacheMutations.delete(task);
+  void task.then(release, release);
+  return task;
+}
+
+function discardCacheResponse(response) {
+  // A clone's tee cancellation may wait for the network consumer. Do not
+  // await it or make clearing depend on the client draining that response.
+  void response.body?.cancel().catch(() => {});
+}
+
+function clearArchiveCaches() {
+  // Invalidate synchronously, before keys()/open()/put() can resume. Requests
+  // admitted DURING a clear carry no epoch and stay ineligible after it ends.
+  cacheEpoch = {};
+  pendingCacheClears++;
+  const task = cacheClearTail.then(async () => {
+    // Every previously admitted mutation settles before names are deleted.
+    // No new mutation can enter while pendingCacheClears is nonzero. A slow
+    // Cache API means no success acknowledgement, not a premature receipt.
+    await Promise.allSettled([...cacheMutations]);
+    const cachePrefix = getCachePrefix();
+    const targets = (await caches.keys()).filter((key) => key.startsWith(cachePrefix));
+    await Promise.allSettled(targets.map((key) => caches.delete(key)));
+    const remaining = (await caches.keys()).filter((key) => key.startsWith(cachePrefix));
+    if (remaining.length > 0) {
+      throw new Error(`Archive caches still present after cleanup: ${remaining.join(", ")}`);
+    }
+    return targets;
+  }).finally(() => {
+    pendingCacheClears--;
+  });
+  // Multiple tabs can clear concurrently. A failed deletion must not poison
+  // the next attempt, nor reopen admission while a later clear is queued.
+  cacheClearTail = task.catch(() => {});
+  return task;
+}
 
 function hashScopeId(input) {
   let hash = 0x811c9dc5;
@@ -212,26 +270,33 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
   const url = new URL(request.url);
   const cacheName = getCacheName();
   const cacheEligible = isCacheEligibleRequest(request, url);
-  let cachePromise = null;
-  const getCurrentCache = () => {
-    cachePromise ||= caches.open(cacheName);
-    return cachePromise;
-  };
+  const epoch = pendingCacheClears === 0 ? cacheEpoch : null;
+  const canUseCache = () => cacheEligible && cacheRequestIsCurrent(epoch);
 
   // Network first so updated archive contents win when online.
   try {
     const response = await fetch(request);
 
     // Only cache successful responses
-    if (cacheEligible && responseAllowsCaching(response)) {
+    if (canUseCache() && responseAllowsCaching(response)) {
       // Clone before returning the original response. Once the client
       // starts consuming its body, a later clone would throw.
       const responseForCache = response.clone();
-      const cacheWrite = getCurrentCache()
-        .then((cache) => cache.put(request, responseForCache))
-        .catch((error) => {
-          log(LOG.WARN, "Cache put error:", error);
-        });
+      const cacheWrite = trackCacheMutation(async () => {
+        if (!canUseCache()) {
+          discardCacheResponse(responseForCache);
+          return;
+        }
+        const cache = await caches.open(cacheName);
+        if (!canUseCache()) {
+          discardCacheResponse(responseForCache);
+          return;
+        }
+        await cache.put(request, responseForCache);
+      }).catch((error) => {
+        discardCacheResponse(responseForCache);
+        log(LOG.WARN, "Cache put error:", error);
+      });
       trackBackgroundTask(cacheWrite);
     }
 
@@ -241,28 +306,29 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
 
     // Offline/cache fallback
     try {
-      if (cacheEligible) {
-        const cache = await getCurrentCache();
-        const cached = await cache.match(request);
-        if (cached) {
+      if (canUseCache()) {
+        // CacheStorage.match does not create an empty cache after a purge.
+        const cached = await caches.match(request, { cacheName });
+        if (cached && canUseCache()) {
           log(LOG.INFO, "Serving cached response after network failure:", url.pathname);
-          return addSecurityHeaders(cached.clone());
+          return addSecurityHeaders(cached);
         }
+        if (cached) discardCacheResponse(cached);
       }
     } catch (cacheError) {
       log(LOG.WARN, "Cache fallback error:", cacheError);
     }
 
     // Try cache as fallback for navigation requests
-    if (cacheEligible && request.mode === "navigate") {
+    if (canUseCache() && request.mode === "navigate") {
       try {
-        const cache = await getCurrentCache();
         const indexUrl = new URL("./index.html", getCacheScopeUrl()).href;
-        const cachedIndex = await cache.match(indexUrl);
-        if (cachedIndex) {
+        const cachedIndex = await caches.match(indexUrl, { cacheName });
+        if (cachedIndex && canUseCache()) {
           log(LOG.INFO, "Serving cached index.html for offline navigation");
-          return addSecurityHeaders(cachedIndex.clone());
+          return addSecurityHeaders(cachedIndex);
         }
+        if (cachedIndex) discardCacheResponse(cachedIndex);
       } catch (cacheError) {
         log(LOG.WARN, "Navigation cache fallback error:", cacheError);
       }
@@ -374,18 +440,7 @@ self.addEventListener("message", (event) => {
       break;
 
     case "CLEAR_CACHE": {
-      const clearCacheTask = caches
-        .keys()
-        .then(async (keys) => {
-          const cachePrefix = getCachePrefix();
-          const targets = keys.filter((key) => key.startsWith(cachePrefix));
-          await Promise.allSettled(targets.map((key) => caches.delete(key)));
-          const remaining = (await caches.keys()).filter((key) => key.startsWith(cachePrefix));
-          if (remaining.length > 0) {
-            throw new Error(`Archive caches still present after cleanup: ${remaining.join(", ")}`);
-          }
-          return targets;
-        })
+      const clearCacheTask = clearArchiveCaches()
         .then((targets) => {
           respond({
             type: "CACHE_CLEARED",
