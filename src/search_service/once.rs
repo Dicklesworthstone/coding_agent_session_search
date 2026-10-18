@@ -22,7 +22,8 @@ pub(super) struct Options {
     /// Result offset for --query (default 0; offset + limit + 1 must be at most 1024).
     #[arg(long, requires = "query")]
     offset: Option<usize>,
-    /// Exact stored agent slug for --query; repeat for multiple agents.
+    /// Agent name or supported alias for --query; repeat for multiple agents.
+    /// Unknown names fail before opening the index or archive.
     #[arg(long = "agent", requires = "query")]
     agents: Vec<String>,
     /// Exact workspace for --query; repeat for multiple workspaces.
@@ -41,22 +42,22 @@ pub(super) struct Options {
 
 impl Options {
     /// Validate before resolving paths, starting supervisors or touching storage.
-    pub(super) fn request(self) -> Result<Option<Request>, &'static str> {
+    pub(super) fn request(self) -> Result<Option<Request>, String> {
         let Some(query) = self.query else {
             return Ok(None);
         };
         let limit = self.limit.unwrap_or(10);
         let offset = self.offset.unwrap_or(0);
-        let filters = Filters {
+        let mut filters = Filters {
             agents: self.agents,
             workspaces: self.workspaces,
             source_id: self.source_id,
             created_from: self.created_from,
             created_to: self.created_to,
         };
-        protocol::validate_search(&query, limit, offset, &filters)?;
         // argv has no JSON frame, but must not bypass the transport's aggregate
         // input budget by supplying many individually valid filter identities.
+        // Count RAW identities before trimming and collapsing agent aliases.
         let identity_bytes = filters
             .agents
             .iter()
@@ -65,8 +66,12 @@ impl Options {
             .try_fold(query.len(), |total, value| total.checked_add(value.len()))
             .ok_or("one-shot query and filters exceed the 64 KiB input limit")?;
         if identity_bytes > protocol::MAX_REQUEST_BYTES {
-            return Err("one-shot query and filters exceed the 64 KiB input limit");
+            return Err("one-shot query and filters exceed the 64 KiB input limit".into());
         }
+        // This lane constructs Filters directly rather than deserializing it.
+        // Use the same resolver and retain its unknown-name/suggestion detail.
+        filters.agents = protocol::normalize_agents(&filters.agents)?;
+        protocol::validate_search(&query, limit, offset, &filters)?;
         Ok(Some(Request::Search {
             id: 1,
             query,
@@ -77,7 +82,7 @@ impl Options {
     }
 }
 
-pub(super) fn invalid_request(message: &'static str) -> CliError {
+pub(super) fn invalid_request(message: impl Into<String>) -> CliError {
     // main recognizes a preformatted envelope even without a --json flag.
     CliError {
         code: 2,
@@ -229,6 +234,49 @@ mod tests {
             .request()
             .is_err()
         );
+    }
+
+    #[test]
+    fn one_shot_aliases_share_transport_resolution_and_unknown_names_are_usage_errors() {
+        let request = Options {
+            query: Some("scopeprobe".into()),
+            agents: vec!["claude".into(), "Claude-Code".into(), "CODEX".into()],
+            ..Options::default()
+        }
+        .request()
+        .unwrap()
+        .unwrap();
+        let Request::Search { filters, .. } = request else {
+            panic!("expected a lexical request");
+        };
+        assert_eq!(filters.agents, ["claude_code", "codex"]);
+        let error = Options {
+            query: Some("scopeprobe".into()),
+            agents: vec!["codex".into(), "claud_code".into()],
+            ..Options::default()
+        }
+        .request()
+        .unwrap_err();
+        let error = invalid_request(error);
+        assert_eq!(error.code, 2);
+        assert!(!error.retryable);
+        let envelope: serde_json::Value = serde_json::from_str(&error.message).unwrap();
+        assert_eq!(envelope["ok"], false);
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(message.contains("claud_code"));
+        assert!(message.contains("Did you mean 'claude_code'?"));
+    }
+
+    #[test]
+    fn one_shot_raw_byte_budget_cannot_be_bypassed_by_alias_collapse() {
+        let error = Options {
+            query: Some("scopeprobe".into()),
+            agents: vec![format!("{}claude", " ".repeat(2050)); protocol::MAX_FILTERS],
+            ..Options::default()
+        }
+        .request()
+        .unwrap_err();
+        assert!(error.contains("64 KiB"));
     }
 
     #[test]
