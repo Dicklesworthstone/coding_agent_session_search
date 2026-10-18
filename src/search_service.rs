@@ -23,6 +23,8 @@ mod lexical_fallback;
 mod mcp;
 #[path = "search_service/memory.rs"]
 mod memory;
+#[path = "search_service/once.rs"]
+mod once;
 #[path = "search_service/protocol.rs"]
 mod protocol;
 #[path = "search_service/refinement.rs"]
@@ -57,7 +59,7 @@ struct ServiceCli {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
-    /// Reuse read-only search readers for a stream of JSON requests.
+    /// Reuse read-only search readers, or run one supervised --query and exit.
     /// Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md.
     Serve {
         /// Published lexical index directory, instead of --data-dir.
@@ -78,8 +80,10 @@ enum ServiceCommand {
         )]
         data_dir: Option<PathBuf>,
         /// Use newline-delimited JSON requests and responses on standard I/O.
-        #[arg(long, required = true)]
+        #[arg(long, required_unless_present = "query", conflicts_with = "query")]
         stdio: bool,
+        #[command(flatten)]
+        once: once::Options,
         /// Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport.
         #[arg(long, requires = "stdio")]
         mcp: bool,
@@ -100,8 +104,9 @@ enum ServiceCommand {
         /// Requires explicit --data-dir and --db; ordinary search stays lexical.
         #[arg(long, value_enum, requires_all = ["data_dir", "db"])]
         semantic_embedder: Option<semantic::EmbedderChoice>,
-        /// Whole-request deadline, from first frame byte through response flush.
-        /// Expiry exits the worker with code 124; idle sessions are not timed out.
+        /// Whole-request deadline, including setup, search, teardown and output for --query.
+        /// For --stdio, starts at the first frame byte; idle sessions are not timed out.
+        /// Expiry exits the worker with code 124.
         #[arg(
             long,
             default_value_t = deadline::DEFAULT_TIMEOUT_MS,
@@ -155,6 +160,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         index,
         data_dir,
         stdio: _,
+        once,
         mcp,
         db,
         lexical_fallback,
@@ -165,6 +171,15 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         admission_slots,
         max_resident_mib,
     } = cli.command;
+    let one_shot = once.request().map_err(once::invalid_request)?;
+    // One budget covers ALL one-shot work, including the initial memory probe,
+    // reader setup, optional recovery, native teardown and blocked output. This
+    // guard stays alive until run returns; no stage gets a fresh deadline.
+    let _one_shot_deadline = one_shot
+        .as_ref()
+        .map(|_| deadline::Deadline::start(Duration::from_millis(request_timeout_ms)))
+        .transpose()
+        .map_err(cli_io_error)?;
     let semantic_data_dir = data_dir.clone();
     let index = match (index, data_dir) {
         (Some(index), None) => index,
@@ -189,6 +204,9 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
     let mut session = Session::new(index);
     session.lexical_recovery.enabled = lexical_fallback;
     session.request_timeout = Duration::from_millis(request_timeout_ms);
+    if one_shot.is_some() {
+        session.timeout_scope = "validated_arguments_through_reader_teardown_and_response_flush";
+    }
     session.archive = db
         .map(|path| {
             if path.is_absolute() {
@@ -245,6 +263,22 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
             .transpose()
             .map_err(cli_io_error)?,
     );
+    if let Some(request) = one_shot {
+        let (mut reply, _) = session.handle(request);
+        // Do not publish successful results before storage destruction has
+        // completed. In particular, never reopen stdin or rearm the watchdog.
+        drop(session);
+        if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
+            reply = Reply::failure(
+                Some(1),
+                "bridge_shutdown_failed",
+                "search bridge teardown did not complete; no successful result was published",
+            );
+        }
+        let result = once::publish(&reply, &mut io::stdout().lock(), &mut io::stderr().lock());
+        drop(memory_guard);
+        return result;
+    }
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let result = if mcp {
@@ -275,6 +309,7 @@ fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {
 struct Session {
     index: PathBuf,
     request_timeout: Duration,
+    timeout_scope: &'static str,
     archive: Option<PathBuf>,
     memory_observation: Option<std::sync::Arc<memory::Observation>>,
     refiner: refinement::Refiner,
@@ -296,6 +331,7 @@ impl Session {
         Self {
             index,
             request_timeout: Duration::from_millis(deadline::DEFAULT_TIMEOUT_MS),
+            timeout_scope: "first_frame_byte_through_response_flush",
             archive: None,
             memory_observation: None,
             refiner: refinement::Refiner::default(),
@@ -410,7 +446,7 @@ impl Session {
                 "transcript_content_bytes": canonical::transcript::MAX_PAGE_BYTES,
                 "request_timeout_ms": self.request_timeout.as_millis(),
                 "timeout_exit_code": deadline::TIMEOUT_EXIT_CODE,
-                "timeout_scope": "first_frame_byte_through_response_flush",
+                "timeout_scope": self.timeout_scope,
             }
         })
     }
