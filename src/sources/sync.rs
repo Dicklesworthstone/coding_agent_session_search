@@ -153,7 +153,8 @@ fn run_rsync_command(
     // Keep each negotiated attempt authoritative: inherited RSYNC_PROTECT_ARGS
     // would otherwise re-enable -s on the rrsync compatibility retry (#531).
     // RSYNC_OLD_ARGS disables rsync's own remote-shell escaping; never inherit it.
-    cmd.env("RSYNC_PROTECT_ARGS", "0").env_remove("RSYNC_OLD_ARGS");
+    cmd.env("RSYNC_PROTECT_ARGS", "0")
+        .env_remove("RSYNC_OLD_ARGS");
     cmd.args(["-avz", "--links", "--safe-links", "--stats", "--partial"]);
     if let Some(flag) = arg_protection.flag() {
         cmd.arg(flag);

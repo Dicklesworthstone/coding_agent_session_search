@@ -140,8 +140,8 @@ pub(super) fn publish(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ServiceCli;
+    use super::*;
     use clap::{CommandFactory, Parser};
     use serde_json::json;
 
@@ -179,31 +179,56 @@ mod tests {
         .request()
         .unwrap()
         .unwrap();
-        let Request::Search { id, query, limit, offset, filters } = request else {
+        let Request::Search {
+            id,
+            query,
+            limit,
+            offset,
+            filters,
+        } = request
+        else {
             panic!("expected a lexical request");
         };
-        assert_eq!((id, query.as_str(), limit, offset), (1, "git fixture", 3, 4));
+        assert_eq!(
+            (id, query.as_str(), limit, offset),
+            (1, "git fixture", 3, 4)
+        );
         assert_eq!(filters.agents, ["codex"]);
         assert_eq!(filters.workspaces, ["/work"]);
         assert_eq!(filters.source_id.as_deref(), Some("remote-id"));
-        assert_eq!((filters.created_from, filters.created_to), (Some(-1), Some(42)));
+        assert_eq!(
+            (filters.created_from, filters.created_to),
+            (Some(-1), Some(42))
+        );
         for (limit, offset) in [(0, 0), (101, 0), (1, 1023), (1, usize::MAX)] {
-            assert!(Options {
-                query: Some("needle".into()),
-                limit: Some(limit),
-                offset: Some(offset),
-                ..Options::default()
-            }.request().is_err());
+            assert!(
+                Options {
+                    query: Some("needle".into()),
+                    limit: Some(limit),
+                    offset: Some(offset),
+                    ..Options::default()
+                }
+                .request()
+                .is_err()
+            );
         }
-        assert!(Options {
-            query: Some(" ".into()),
-            ..Options::default()
-        }.request().is_err());
-        assert!(Options {
-            query: Some("needle".into()),
-            agents: vec!["a".repeat(protocol::MAX_IDENTITY_BYTES); protocol::MAX_FILTERS],
-            ..Options::default()
-        }.request().is_err());
+        assert!(
+            Options {
+                query: Some(" ".into()),
+                ..Options::default()
+            }
+            .request()
+            .is_err()
+        );
+        assert!(
+            Options {
+                query: Some("needle".into()),
+                agents: vec!["a".repeat(protocol::MAX_IDENTITY_BYTES); protocol::MAX_FILTERS],
+                ..Options::default()
+            }
+            .request()
+            .is_err()
+        );
     }
 
     #[test]
@@ -214,7 +239,10 @@ mod tests {
             let reply = Reply::success(1, json!({"hits": hits}));
             publish(&reply, &mut out, &mut err).unwrap();
             assert!(err.is_empty());
-            assert_eq!(serde_json::from_slice::<serde_json::Value>(&out).unwrap()["ok"], true);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&out).unwrap()["ok"],
+                true
+            );
             assert_eq!(out.last(), Some(&b'\n'));
         }
     }
@@ -223,7 +251,10 @@ mod tests {
     fn runtime_and_size_failures_are_nonzero_and_never_reach_stdout() {
         for reply in [
             Reply::failure(Some(1), "search_failed", "query fuel exhausted"),
-            Reply::success(1, json!({"oversized": "x".repeat(protocol::MAX_RESPONSE_BYTES)})),
+            Reply::success(
+                1,
+                json!({"oversized": "x".repeat(protocol::MAX_RESPONSE_BYTES)}),
+            ),
         ] {
             let mut out = Vec::new();
             let mut err = Vec::new();
@@ -231,7 +262,10 @@ mod tests {
             assert_eq!(failure.code, 1);
             assert!(failure.was_already_reported());
             assert!(out.is_empty());
-            assert_eq!(serde_json::from_slice::<serde_json::Value>(&err).unwrap()["ok"], false);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&err).unwrap()["ok"],
+                false
+            );
             assert!(err.len() <= protocol::MAX_RESPONSE_BYTES);
         }
     }
@@ -244,12 +278,18 @@ mod tests {
             &Reply::failure(Some(1), "bridge_shutdown_failed", "teardown failed"),
             &mut out,
             &mut err,
-        ).unwrap_err();
-        assert_eq!(failure.code, super::super::deadline::WATCHDOG_FAILURE_EXIT_CODE);
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.code,
+            super::super::deadline::WATCHDOG_FAILURE_EXIT_CODE
+        );
         assert!(failure.was_already_reported());
         assert!(out.is_empty());
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&err).unwrap()["error"]["kind"],
-            "bridge_shutdown_failed");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&err).unwrap()["error"]["kind"],
+            "bridge_shutdown_failed"
+        );
     }
 
     #[test]
@@ -259,9 +299,18 @@ mod tests {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         assert!(publish(&Reply::success(1, json!({})), &mut Broken, &mut Vec::new()).is_err());
-        assert!(publish(&Reply::failure(Some(1), "search_failed", "refused"), &mut Vec::new(), &mut Broken).is_err());
+        assert!(
+            publish(
+                &Reply::failure(Some(1), "search_failed", "refused"),
+                &mut Vec::new(),
+                &mut Broken
+            )
+            .is_err()
+        );
     }
 }

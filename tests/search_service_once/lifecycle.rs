@@ -16,7 +16,10 @@ fn blocked_output() -> Result<(UnixStream, Stdio)> {
             Ok(0) => anyhow::bail!("output fixture closed while filling"),
             Ok(count) => {
                 written += count;
-                ensure!(written <= 2 * 1024 * 1024, "output fixture exceeded its memory bound");
+                ensure!(
+                    written <= 2 * 1024 * 1024,
+                    "output fixture exceeded its memory bound"
+                );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -33,16 +36,27 @@ fn deadline_releases_pool_after_blocked_output(one_shot: bool) -> Result<()> {
     let (index, _, _) = fixture(temp.path())?;
     // Establish a real successful query with the same index before blocking
     // output. A parser/index failure is not an acceptable test substitute.
-    let (status, out, err) = execute(temp.path(), &index,
-        &["--query", "git fixture", "--limit", "1"], 10_000_000)?;
-    ensure!(status.success(), "control failed: {}", String::from_utf8_lossy(&err));
+    let (status, out, err) = execute(
+        temp.path(),
+        &index,
+        &["--query", "git fixture", "--limit", "1"],
+        10_000_000,
+    )?;
+    ensure!(
+        status.success(),
+        "control failed: {}",
+        String::from_utf8_lossy(&err)
+    );
     assert_eq!(serde_json::from_slice::<Value>(&out)?["result"]["count"], 1);
 
     let pool = temp.path().join("pool");
     let (_undrained_reader, output) = blocked_output()?;
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
-    command.args(["serve", "--index"]).arg(&index)
-        .args(["--request-timeout-ms", "2000", "--admission-dir"]).arg(&pool)
+    command
+        .args(["serve", "--index"])
+        .arg(&index)
+        .args(["--request-timeout-ms", "2000", "--admission-dir"])
+        .arg(&pool)
         .args(["--admission-slots", "1"])
         .current_dir(temp.path())
         .env("CASS_QUILL_QUERY_FUEL_BUDGET", "10000000")
@@ -59,20 +73,31 @@ fn deadline_releases_pool_after_blocked_output(one_shot: bool) -> Result<()> {
     let mut child = Child(command.spawn()?);
     let mut input = child.0.stdin.take().context("stdin")?;
     if !one_shot {
-        writeln!(input, "{}", json!({"id":1,"op":"search","query":"git fixture","limit":1}))?;
+        writeln!(
+            input,
+            "{}",
+            json!({"id":1,"op":"search","query":"git fixture","limit":1})
+        )?;
     }
     // Do not drain stdout or close stdin to rescue the worker. Its own
     // deadline must terminate even a blocked flush, and the kernel must free
     // any pool lease when the process dies.
-    let status = child.0.wait_timeout(Duration::from_secs(12))?
+    let status = child
+        .0
+        .wait_timeout(Duration::from_secs(12))?
         .context("blocked output escaped request supervision")?;
     assert_eq!(status.code(), Some(124));
     drop(input);
     let policy = std::fs::read(pool.join("policy-v1"))?;
     assert_eq!(policy, b"CASS-READER-POOL-1\nslots=1\n");
-    let slot = std::fs::OpenOptions::new().read(true).write(true)
+    let slot = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .open(pool.join("reader-00.lock"))?;
-    assert!(slot.try_lock().is_ok(), "terminated worker leaked its reader slot");
+    assert!(
+        slot.try_lock().is_ok(),
+        "terminated worker leaked its reader slot"
+    );
     drop(slot);
     assert_eq!(std::fs::read(pool.join("policy-v1"))?, policy);
     Ok(())
