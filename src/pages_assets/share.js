@@ -91,6 +91,8 @@ export async function copyTextToClipboard(text, { signal, isCurrent = () => true
   const lockEvents = globalThis.window;
   let textArea = null;
   let cancelled = false;
+  let releaseCancelled;
+  const cancellation = new Promise(resolve => { releaseCancelled = () => resolve(false); });
   const clearTemporaryText = () => {
     if (textArea) {
       textArea.value = "";
@@ -99,6 +101,7 @@ export async function copyTextToClipboard(text, { signal, isCurrent = () => true
   };
   const cancel = () => {
     cancelled = true;
+    releaseCancelled();
     clearTemporaryText();
   };
   const active = () => !cancelled && !signal?.aborted && isCurrent();
@@ -111,7 +114,11 @@ export async function copyTextToClipboard(text, { signal, isCurrent = () => true
     const clipboard = globalThis.navigator?.clipboard;
     if (clipboard?.writeText) {
       try {
-        await clipboard.writeText(text);
+        // Stop retaining the request/listeners when cancelled, even if a
+        // browser permission prompt never settles. The issued write itself
+        // is not cancelled. Promise.race also observes any later rejection.
+        const written = Promise.resolve(clipboard.writeText(text)).then(() => true);
+        if (!await Promise.race([written, cancellation])) return false;
         return active();
       } catch (error) {
         // A permission prompt may outlive navigation, abort or archive lock.
@@ -145,6 +152,8 @@ export async function copyTextToClipboard(text, { signal, isCurrent = () => true
     lockEvents?.removeEventListener("cass:lock", cancel);
     signal?.removeEventListener("abort", cancel);
     clearTemporaryText();
+    // Drop this helper's reference; JS strings cannot be reliably zeroized.
+    text = "";
   }
 }
 

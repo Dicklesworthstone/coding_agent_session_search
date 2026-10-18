@@ -120,7 +120,7 @@ export function initConversationViewer(container, backCallback) {
  * @param {number|null} highlightMessageId - Message ID to highlight/scroll to
  */
 export async function loadConversation(conversationId, highlightMessageId = null) {
-  readyCopy = null;
+  cancelConversationCopy();
   const loadId = ++activeConversationLoadId;
   try {
     let conversation;
@@ -546,7 +546,7 @@ function appendAttachmentsToMessage(messageElement, message) {
 }
 
 function handleArchiveLock() {
-  readyCopy = null;
+  cancelConversationCopy();
   activeConversationLoadId += 1;
   currentMessages.dispose?.();
   for (const cached of loadedConversations.values()) {
@@ -580,8 +580,11 @@ function setupEventListeners() {
 
   // Copy button
   const copyBtn = document.getElementById("copy-btn");
+  const copyLoadId = activeConversationLoadId;
   copyBtn?.addEventListener("click", () => {
-    copyConversation();
+    // A new load can await attachments while the previous DOM still exists.
+    // Do not assign that old button's transcript to the new load generation.
+    if (copyLoadId === activeConversationLoadId) copyConversation();
   });
 
   // Escape key to go back
@@ -797,6 +800,26 @@ const COPY_MAX_MESSAGES = 100_000;
 let activeCopy = null;
 let readyCopy = null;
 
+function cancelConversationCopy() {
+  const previous = activeCopy;
+  activeCopy = null;
+  readyCopy = null;
+  // Invalidate producers too: clearing only readyCopy lets an in-flight
+  // preparation or late permission rejection repopulate the plaintext cache.
+  // Release our wait even if the browser never settles its permission prompt.
+  // This cannot retract data already supplied to a native clipboard request.
+  previous?.cancel();
+  if (copyFeedbackTimeoutId !== null) {
+    clearTimeout(copyFeedbackTimeoutId);
+    copyFeedbackTimeoutId = null;
+  }
+  const button = document.getElementById("copy-btn");
+  if (button) {
+    button.disabled = false;
+    if (button.dataset.defaultLabel) button.innerHTML = button.dataset.defaultLabel;
+  }
+}
+
 class ConversationCopyLimit extends Error {
   constructor(message = "Copy limit: 8 MiB") {
     super(message);
@@ -806,7 +829,11 @@ class ConversationCopyLimit extends Error {
 /** Copy one current view, without concurrent whole-transcript preparations. */
 async function copyConversation() {
   if (!currentConversation || activeCopy?.loadId === activeConversationLoadId) return;
-  const operation = { loadId: activeConversationLoadId };
+  const operation = { loadId: activeConversationLoadId, cancel: null };
+  const controller = new AbortController();
+  const cancelled = new Promise(resolve => {
+    operation.cancel = () => { controller.abort(); resolve(false); };
+  });
   const conversation = currentConversation;
   const messages = currentMessages;
   const copyBtn = document.getElementById("copy-btn");
@@ -831,7 +858,9 @@ async function copyConversation() {
       // execCommand retry after preparation exhausted transient activation.
       const text = readyCopy.text;
       readyCopy = null;
-      copied = await copyTextToClipboard(text, { isCurrent });
+      copied = await Promise.race([
+        copyTextToClipboard(text, { isCurrent, signal: controller.signal }), cancelled,
+      ]);
     } else {
       readyCopy = null;
       const prepared = formatConversationAsText(conversation, messages, isCurrent);
@@ -859,7 +888,7 @@ async function copyConversation() {
       }
       const text = await prepared;
       if (!isCurrent()) return;
-      copied = writing ? await writing : false;
+      copied = writing ? await Promise.race([writing, cancelled]) : false;
       if (!isCurrent()) return;
       if (!copied) {
         // Keep only this bounded result. Navigation, a new load or archive lock
@@ -1156,6 +1185,7 @@ function unloadOldestConversation() {
  * @param {number} [keepCount=1] - Number of recent conversations to keep
  */
 export function clearOldConversations(keepCount = 1) {
+  cancelConversationCopy();
   const entries = Array.from(loadedConversations.entries());
   const toRemove = entries.length - keepCount;
 
@@ -1268,7 +1298,7 @@ export function getCacheStats() {
  * Clear the viewer
  */
 export function clearViewer() {
-  readyCopy = null;
+  cancelConversationCopy();
   activeConversationLoadId += 1;
   // Clean up virtual list
   destroyVirtualList();
@@ -1288,7 +1318,7 @@ export function cleanupConversationViewer() {
  * Clear all cached conversations
  */
 export function clearAllCache() {
-  readyCopy = null;
+  cancelConversationCopy();
   // An active view may still use its source after a manual cache clear.
   // Clear retained text without disabling scrolling; lock disposes sources.
   currentMessages.clearCache?.();

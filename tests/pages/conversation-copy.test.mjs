@@ -10,10 +10,12 @@ import vm from "node:vm";
 
 const conversationSource = readFileSync(process.env.CASS_CONVERSATION_SOURCE ||
   new URL("../../src/pages_assets/conversation.js", import.meta.url), "utf8");
-const shareSource = readFileSync(new URL("../../src/pages_assets/share.js", import.meta.url), "utf8");
+const shareSource = readFileSync(process.env.CASS_SHARE_SOURCE ||
+  new URL("../../src/pages_assets/share.js", import.meta.url), "utf8");
 const MAX = 8 * 1024 * 1024;
 
-async function fixture(t, { count = 301, native, onYield, failQuery, promiseClipboard = true, rejectItem = false } = {}) {
+async function fixture(t, { count = 301, native, onYield, failQuery, promiseClipboard = true, rejectItem = false,
+  loadMetadata, attachmentGate } = {}) {
   const sql = new DatabaseSync(":memory:");
   sql.exec(`CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER,
     idx INTEGER, role TEXT, content TEXT);
@@ -37,9 +39,11 @@ async function fixture(t, { count = 301, native, onYield, failQuery, promiseClip
       },
       removeEventListener(type, handler) { handlers.get(type)?.delete(handler); },
       dispatch(type) { for (const handler of [...(handlers.get(type) || [])]) handler({ type }); },
+      listenerCount(type) { return handlers.get(type)?.size || 0; },
     };
   };
   const window = { ...eventTarget(), location: { href: "https://example.invalid/archive/" } };
+  if (attachmentGate) window.cassSession = { dek: "AQ==", config: { export_id: "AQ==" } };
   const button = { ...eventTarget(), dataset: {}, innerHTML: "Copy", textContent: "", disabled: false, isConnected: true };
   let fallbackCalls = 0;
   const document = { ...eventTarget(),
@@ -82,7 +86,7 @@ async function fixture(t, { count = 301, native, onYield, failQuery, promiseClip
   const keepAlive = setInterval(() => {}, 1000);
   window.setTimeout = tick;
   const context = vm.createContext({ window, document, setTimeout: tick, clearTimeout,
-    TextEncoder, URL, URLSearchParams, Blob,
+    TextEncoder, URL, URLSearchParams, Blob, atob, AbortController,
     ...(promiseClipboard ? { ClipboardItem: class { constructor(data) { this.data = data; } } } : {}),
     navigator: { clipboard: {
       ...(promiseClipboard ? { write(items) {
@@ -107,14 +111,15 @@ async function fixture(t, { count = 301, native, onYield, failQuery, promiseClip
   const share = new vm.SourceTextModule(shareSource, { context });
   await share.link(name => { assert.equal(name, "./router.js"); return router; });
   const deps = {
-    "./database.js": synthetic({ ConversationMessageSource: class {}, checkMemoryPressure: () => false,
-      getConversation: () => null, getMemoryUsage: () => null, queryAll }),
+    "./database.js": synthetic({ ConversationMessageSource: class { constructor() { return source; } }, checkMemoryPressure: () => false,
+      getConversation: loadMetadata || (() => null), getMemoryUsage: () => null, queryAll }),
     "./attachments.js": synthetic({ createAttachmentElement() {}, getMessageAttachments: () => [],
-      initAttachments: async () => ({}), reset() {} }),
+      initAttachments: async () => attachmentGate ? await attachmentGate : ({}), reset() {} }),
     "./share.js": share,
     "./virtual-list.js": synthetic({ VariableHeightVirtualList: class {} }),
   };
   const injected = `\nexport { copyConversation as copyForTest, formatConversationAsText as formatForTest };
+    export function copyStateForTest() { return { active: activeCopy !== null, ready: readyCopy !== null }; }
     export function activateForTest(conversation, messages, container) {
       activeConversationLoadId++;
       currentConversation = conversation; currentMessages = messages;
@@ -128,7 +133,8 @@ async function fixture(t, { count = 301, native, onYield, failQuery, promiseClip
   const f = { api: module.namespace, source, conv, calls, copied, errors, sql, button,
     lock: () => window.dispatch("cass:lock"),
     navigation: () => module.namespace.clearViewer(),
-    stats: () => ({ rowsHydrated, metadataRows, maxHydratedRows, sourceTraversals, yields, fallbackCalls, itemRequests }),
+    stats: () => ({ rowsHydrated, metadataRows, maxHydratedRows, sourceTraversals, yields, fallbackCalls, itemRequests,
+      lockListeners: window.listenerCount("cass:lock") }),
     edit(operation) { sql.exec("PRAGMA query_only=OFF"); try { operation(sql); } finally { sql.exec("PRAGMA query_only=ON"); } },
   };
   t.after(() => { for (const timer of timers) clearTimeout(timer); clearInterval(keepAlive); sql.close(); });
@@ -326,4 +332,155 @@ test("archive lock discards prepared fallback text instead of copying it later",
   assert.equal(f.button.innerHTML, "Ready — click to copy");
   f.lock(); await f.api.copyForTest();
   assert.equal(f.copied.length, 0); assert.equal(f.stats().fallbackCalls, 0);
+});
+
+// Cache clearing must invalidate the producer, not only the currently retained
+// result. Otherwise a late preparation/permission rejection restores plaintext.
+test("cache clear cancels copy before its first read without disposing the active viewer source", async t => {
+  const f = await fixture(t, { promiseClipboard: false });
+  const pending = f.api.copyForTest();
+  f.api.clearAllCache();
+  await pending;
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.copied.length, 0);
+  assert.equal(f.api.copyStateForTest().ready, false);
+  assert.equal(f.api.copyStateForTest().active, false);
+  assert.equal(f.button.disabled, false);
+  assert.equal(f.button.innerHTML, "Copy");
+  assert.equal(f.source.length, 301, "cache clear must not disable the current viewer");
+  // A fresh explicit action is still allowed, and must prepare from scratch.
+  await f.api.copyForTest();
+  assert.equal(f.stats().metadataRows, 301);
+  assert.equal(f.copied.length, 0);
+  await f.api.copyForTest();
+  assert.deepEqual(f.copied, [expectedText(f)]);
+});
+
+for (const phase of ["metadata", "body"]) {
+  test(`cache clear during ${phase} paging stops the next page and does not repopulate prepared text`, async t => {
+    let cleared = false;
+    const f = await fixture(t, { promiseClipboard: false, onYield(f) {
+      const work = phase === "metadata" ? f.stats().metadataRows : f.stats().rowsHydrated;
+      if (!cleared && work > 0) { cleared = true; f.api.clearAllCache(); }
+    } });
+    await f.api.copyForTest();
+    assert.equal(cleared, true);
+    assert.equal(f.stats().rowsHydrated, phase === "metadata" ? 0 : 32);
+    assert.equal(f.stats().metadataRows, phase === "metadata" ? 128 : 301);
+    assert.equal(f.copied.length, 0);
+    assert.equal(f.api.copyStateForTest().ready, false);
+    assert.equal(f.button.disabled, false);
+    assert.equal(f.button.innerHTML, "Copy");
+  });
+}
+
+for (const promiseClipboard of [true, false]) {
+  test(`cache clear releases ${promiseClipboard ? "item" : "text"} copy wait before native permission settles`, async t => {
+    let entered, reject;
+    const started = new Promise(resolve => { entered = resolve; });
+    const native = new Promise((_, no) => { reject = no; });
+    const f = await fixture(t, { count: 1, promiseClipboard, native() { entered(); return native; } });
+    if (!promiseClipboard) await f.api.copyForTest();
+    let settled = false;
+    const copying = f.api.copyForTest().then(() => { settled = true; });
+    await started;
+    try {
+      f.api.clearAllCache();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, true, "the view must not await a dismissed browser permission prompt");
+      assert.equal(f.api.copyStateForTest().active, false);
+      assert.equal(f.api.copyStateForTest().ready, false);
+      assert.equal(f.button.disabled, false);
+      assert.equal(f.button.innerHTML, "Copy");
+      assert.equal(f.stats().lockListeners, 1, "only the viewer listener remains while native permission is pending");
+    } finally {
+      // A real browser operation cannot be cancelled; settle the controlled
+      // boundary even when the regression fails on the old source.
+      reject(new Error("late permission rejection"));
+      await copying;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(f.api.copyStateForTest().ready, false, "late failure must not restore cleared text");
+    assert.equal(f.stats().fallbackCalls, 0);
+    assert.equal(f.copied.length, 1, "only bytes already supplied to the browser are observable");
+    assert.equal(f.button.innerHTML, "Copy");
+  });
+}
+
+test("clearing an already prepared fallback resets feedback and requires new preparation", async t => {
+  const f = await fixture(t, { count: 1, promiseClipboard: false });
+  await f.api.copyForTest();
+  assert.equal(f.api.copyStateForTest().ready, true);
+  f.api.clearAllCache();
+  assert.equal(f.api.copyStateForTest().ready, false);
+  assert.equal(f.button.innerHTML, "Copy");
+  await f.api.copyForTest();
+  assert.equal(f.stats().metadataRows, 2);
+  assert.equal(f.copied.length, 0);
+  await f.api.copyForTest();
+  assert.deepEqual(f.copied, [expectedText(f)]);
+});
+
+test("an old Copy button cannot start work while a new conversation load is pending", async t => {
+  let release;
+  const attachmentGate = new Promise(resolve => { release = resolve; });
+  const f = await fixture(t, { count: 1, attachmentGate,
+    loadMetadata: id => ({ id, title: "Next conversation", agent: "codex" }) });
+  // Execute the real loader through its attachment await. The old DOM still
+  // exists, but its click handler belongs to the previous load generation.
+  const loading = f.api.loadConversation(2);
+  try {
+    f.button.dispatch("click");
+    assert.equal(f.stats().itemRequests, 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.api.copyStateForTest().active, false);
+  } finally {
+    release({});
+    await loading;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+});
+
+test("the memory-warning cache action also cancels a running preparation", async t => {
+  const f = await fixture(t, { promiseClipboard: false });
+  const copying = f.api.copyForTest();
+  f.api.clearOldConversations(1);
+  await copying;
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.api.copyStateForTest().ready, false);
+  assert.equal(f.button.disabled, false);
+  assert.equal(f.source.length, 301);
+});
+
+test("a cancelled legacy write cannot overwrite feedback from a subsequent successful copy", async t => {
+  let entered, reject;
+  const started = new Promise(resolve => { entered = resolve; });
+  const oldPermission = new Promise((_, no) => { reject = no; });
+  let requests = 0;
+  const f = await fixture(t, { count: 1, promiseClipboard: false, native() {
+    requests++;
+    if (requests === 1) { entered(); return oldPermission; }
+    return Promise.resolve();
+  } });
+  await f.api.copyForTest();
+  const oldCopy = f.api.copyForTest();
+  await started;
+  f.api.clearAllCache();
+  try {
+    // There must be no wait on oldPermission before a new user request.
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.api.copyStateForTest().active, false);
+    await f.api.copyForTest();
+    await f.api.copyForTest();
+    assert.equal(f.button.innerHTML, "Copied!");
+    assert.equal(f.stats().metadataRows, 2);
+    assert.deepEqual(f.copied, [expectedText(f), expectedText(f)]);
+  } finally {
+    reject(new Error("obsolete permission rejection"));
+    await oldCopy;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(f.button.innerHTML, "Copied!");
+  assert.equal(f.api.copyStateForTest().ready, false);
+  assert.equal(f.stats().fallbackCalls, 0);
 });
