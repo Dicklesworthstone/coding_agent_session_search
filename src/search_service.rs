@@ -291,9 +291,23 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
     let _teardown = deadline::Deadline::start(session.request_timeout)
         .unwrap_or_else(|_| std::process::exit(deadline::WATCHDOG_FAILURE_EXIT_CODE));
     drop(session);
+    // Cached bridge runtimes own scheduler threads even after the readers are
+    // gone. Tear them down before either supervisor stops; main's later
+    // idempotent shutdown must not be the first guarded attempt.
+    let bridges_shutdown = coding_agent_search::shutdown_thread_local_bridge_runtimes();
     // Join the sampler while the teardown deadline still protects this process.
     drop(memory_guard);
-    result.map_err(cli_io_error)
+    result.map_err(cli_io_error)?;
+    if !bridges_shutdown {
+        return Err(coding_agent_search::CliError {
+            code: deadline::WATCHDOG_FAILURE_EXIT_CODE,
+            kind: "bridge_shutdown_failed",
+            message: "search service bridge teardown did not complete".into(),
+            hint: None,
+            retryable: false,
+        });
+    }
+    Ok(())
 }
 
 fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {

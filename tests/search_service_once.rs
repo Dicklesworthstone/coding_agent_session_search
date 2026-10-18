@@ -205,3 +205,7 @@ fn one_shot_invalid_work_is_rejected_before_creating_any_storage() -> Result<()>
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[path = "search_service_once/lifecycle.rs"]
+mod lifecycle;

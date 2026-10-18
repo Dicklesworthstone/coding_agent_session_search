@@ -125,7 +125,11 @@ pub(super) fn publish(
     if let Some(kind) = failure {
         write(diagnostics).map_err(super::cli_io_error)?;
         Err(CliError::already_reported(
-            if kind == "invalid_request" { 2 } else { 1 },
+            match kind {
+                "invalid_request" => 2,
+                "bridge_shutdown_failed" => super::deadline::WATCHDOG_FAILURE_EXIT_CODE,
+                _ => 1,
+            },
             kind,
             false,
         ))
@@ -230,6 +234,22 @@ mod tests {
             assert_eq!(serde_json::from_slice::<serde_json::Value>(&err).unwrap()["ok"], false);
             assert!(err.len() <= protocol::MAX_RESPONSE_BYTES);
         }
+    }
+
+    #[test]
+    fn incomplete_bridge_teardown_has_a_supervisor_failure_exit() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let failure = publish(
+            &Reply::failure(Some(1), "bridge_shutdown_failed", "teardown failed"),
+            &mut out,
+            &mut err,
+        ).unwrap_err();
+        assert_eq!(failure.code, super::super::deadline::WATCHDOG_FAILURE_EXIT_CODE);
+        assert!(failure.was_already_reported());
+        assert!(out.is_empty());
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&err).unwrap()["error"]["kind"],
+            "bridge_shutdown_failed");
     }
 
     #[test]

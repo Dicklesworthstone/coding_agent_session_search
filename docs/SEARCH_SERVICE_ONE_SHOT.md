@@ -48,7 +48,9 @@ Successful replies, including authoritative empty results, go to stdout and
 exit zero. Search failures and oversized replies go to stderr, leave stdout
 empty, and exit 1. Invalid query/page/filter values exit 2. The shared watchdog
 and memory-supervisor exit codes remain 124 (deadline), 125 (supervisor failure)
-and 126 (sampled memory threshold). A forcibly terminated worker need not emit
+and 126 (sampled memory threshold). Incomplete bridge teardown also exits 125.
+Persistent stdio mode likewise shuts down its cached bridge runtimes before
+its teardown deadline and memory sampler stop. A forcibly terminated worker need not emit
 a final JSON diagnostic. CLI syntax errors retain Clap's normal diagnostics.
 
 ## Filters and bounds
@@ -71,5 +73,7 @@ Regression coverage: `cargo test --bin cass search_service::once::tests` and
 `cargo test --test search_service_once`. These include real index/archive
 fixtures, open-stdin completion, explicit fuel recovery, read-only checks,
 authoritative empties, validation-before-storage, bounded serialization and
-nonzero failure exits. Test presence is not evidence that a particular build
+nonzero failure exits. Unix lifecycle tests also inject a pre-filled output
+socket and require exit 124 plus released pool locks in one-shot and stdio modes.
+Test presence is not evidence that a particular build
 has passed them.
