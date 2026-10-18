@@ -6,7 +6,8 @@
 
 The temporary crate stages byte-identical production Rust files with their
 normal module layout; there is no maintained fork or mock connector.
-By default dependency versions and the initial lockfile come from CASS.
+By default dependency sources, versions and the initial lockfile come from CASS.
+The resolved FAD source must match CASS's lockfile before tests may start.
 --fad-checkout tests an upstream change before publication, verifies Cargo
 selected that checkout, and changes only the temporary crate's dependency.
 Only FAD's unrelated SQLite/crypto features are omitted. The integration
@@ -30,6 +31,59 @@ import tomllib
 # never build here; 11fcce89 added such a module and left this lane red for
 # days behind a bare compile error (bead coding_agent_session_search-2l1b0.62).
 FULL_CRATE_ONLY = ("assert_cmd::", "cargo_bin!(", "get_connector_factories(")
+
+
+def toml_value(value: object) -> str:
+    """Encode the string/bool/list values used by Cargo dependency tables."""
+    if isinstance(value, str):
+        # JSON's ASCII surrogate pairs are not legal TOML Unicode escapes.
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    raise ValueError(f"unsupported Cargo dependency value type: {type(value).__name__}")
+
+
+def dependency_for_harness(
+    name: str, specification: str | dict, root: Path,
+    fad_checkout: Path | None, fad_version: str,
+) -> str:
+    spec = {"version": specification} if isinstance(specification, str) else dict(specification)
+    if "workspace" in spec:
+        raise ValueError(f"{name}: resolve workspace inheritance before staging this dependency")
+    if name == "franken-agent-detection":
+        if fad_checkout is not None:
+            for key in ("git", "rev", "tag", "branch", "path", "registry", "registry-index"):
+                spec.pop(key, None)
+            spec.update(version="=" + fad_version, path=str(fad_checkout))
+        # The only deliberate feature reduction: unrelated FAD SQLite/crypto.
+        # Keep its git/rev (or registry/path) source, not just its version.
+        spec.update({"default-features": False, "features": ["connectors", "codex-zstd"]})
+    elif name == "serde":
+        spec["features"] = list(dict.fromkeys([*spec.get("features", []), "derive"]))
+    if "path" in spec:
+        spec["path"] = str((root / spec["path"]).resolve(strict=True))
+    return name + " = { " + ", ".join(
+        f"{key} = {toml_value(value)}" for key, value in spec.items()
+    ) + " }"
+
+
+def verify_fad_selection(metadata: dict, lockfile: dict, fad_checkout: Path | None) -> None:
+    selected = [package for package in metadata["packages"] if package["name"] == "franken-agent-detection"]
+    if len(selected) != 1:
+        raise RuntimeError("Cargo must select exactly one franken-agent-detection package")
+    package = selected[0]
+    if fad_checkout is not None:
+        if package.get("source") is not None or Path(package["manifest_path"]).resolve() != fad_checkout / "Cargo.toml":
+            raise RuntimeError("Cargo did not select the requested local FAD checkout")
+    else:
+        locked = [entry for entry in lockfile["package"] if entry["name"] == "franken-agent-detection"]
+        if len(locked) != 1 or (
+            package["version"], package.get("source")
+        ) != (locked[0]["version"], locked[0].get("source")):
+            raise RuntimeError("Cargo's FAD version/source differs from CASS's committed lockfile")
+    print(f"Verified FAD {package['version']}: {package.get('source') or package['manifest_path']}", flush=True)
 
 
 def refuse_full_crate_tests(root: Path, tests: tuple[str, ...]) -> None:
@@ -62,6 +116,7 @@ def main() -> None:
 
     root = Path(__file__).resolve().parents[1]
     manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    lockfile = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
     dependencies = manifest["dependencies"]
     names = (
         "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection",
@@ -82,20 +137,7 @@ def main() -> None:
     lines.extend(["", "[dependencies]"])
     for name in names:
         spec = dependencies[name] if name in dependencies else manifest["dev-dependencies"][name]
-        version = spec if isinstance(spec, str) else spec["version"]
-        if name == "franken-agent-detection":
-            source = f'version = {json.dumps(version)}'
-            if fad_checkout is not None:
-                source = f'version = {json.dumps("=" + fad_version)}, path = {json.dumps(fad_checkout.as_posix(), ensure_ascii=False)}'
-            # codex-zstd: the Codex connector reads compressed rollouts (GH #513).
-            lines.append(
-                f'{name} = {{ {source}, '
-                'default-features = false, features = ["connectors", "codex-zstd"] }'
-            )
-        elif name == "serde":
-            lines.append(f'{name} = {{ version = {json.dumps(version)}, features = ["derive"] }}')
-        else:
-            lines.append(f"{name} = {json.dumps(version)}")
+        lines.append(dependency_for_harness(name, spec, root, fad_checkout, fad_version))
     lines.extend(["", "[lints.rust]", 'unsafe_code = "forbid"', ""])
 
     library = '''// Re-exports only; the Codex implementation is unmodified production code.
@@ -103,14 +145,14 @@ def main() -> None:
 // ingest diagnostics) are unused here; the full crate's clippy checks them.
 #![allow(dead_code)]
 pub use franken_agent_detection::{
-    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation,
-    NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages,
+    Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
+    NormalizedMessage, Origin, ScanContext, ScanRoot, SourceKind, parse_timestamp, reindex_messages,
 };
 pub mod codex;
 pub mod connectors {
     pub use super::{
-        Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation,
-        NormalizedMessage, ScanContext, ScanRoot, codex,
+        Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
+        NormalizedMessage, Origin, ScanContext, ScanRoot, SourceKind, codex,
     };
 }
 '''
@@ -141,18 +183,17 @@ pub mod connectors {
         # The ordinary unit tests must not inherit operator scan exclusions.
         # Integration tests supply each child's own real exclusion value.
         env["CASS_EXCLUDE_PATHS"] = ""
-        if fad_checkout is not None:
-            metadata = json.loads(subprocess.check_output(
-                [cargo, "metadata", "--manifest-path", str(project), "--format-version", "1"],
-                cwd=root, env=env, text=True,
-            ))
-            selected = [package for package in metadata["packages"] if package["name"] == "franken-agent-detection"]
-            if len(selected) != 1 or Path(selected[0]["manifest_path"]).resolve() != fad_checkout / "Cargo.toml":
-                raise RuntimeError("Cargo did not select the requested local FAD checkout")
-            print(f"Verified local FAD {fad_version}: {selected[0]['manifest_path']}", flush=True)
+        # The reduced crate needs its own root entry in the copied lockfile.
+        # Normalize once, verify the actual source (including the resolved Git
+        # commit), then disallow resolution changes during tests and Clippy.
+        metadata = json.loads(subprocess.check_output(
+            [cargo, "metadata", "--manifest-path", str(project), "--format-version", "1"],
+            cwd=root, env=env, text=True,
+        ))
+        verify_fad_selection(metadata, lockfile, fad_checkout)
         commands = [
-            [cargo, "test", "--manifest-path", str(project), "--all-targets"],
-            [cargo, "clippy", "--manifest-path", str(project), "--all-targets", "--", "-D", "warnings"],
+            [cargo, "test", "--locked", "--manifest-path", str(project), "--all-targets"],
+            [cargo, "clippy", "--locked", "--manifest-path", str(project), "--all-targets", "--", "-D", "warnings"],
         ]
         for command in commands:
             print("+ " + " ".join(command), flush=True)
