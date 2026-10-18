@@ -2360,6 +2360,9 @@ pub enum SourcesCommand {
         /// Skip connectivity test
         #[arg(long)]
         no_test: bool,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
     /// Remove a configured source
     Remove {
@@ -26567,6 +26570,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         }
         Commands::Forget { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sources(SourcesCommand::List { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(SourcesCommand::Add { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Sources(SourcesCommand::Doctor { json, .. }) => {
@@ -119849,7 +119855,11 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             preset,
             paths,
             no_test,
-        } => run_sources_add(&url, name, preset, paths, no_test),
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_add(&url, name, preset, paths, no_test, structured_format)
+        }
         SourcesCommand::Remove { name, purge, yes } => run_sources_remove(&name, purge, yes),
         SourcesCommand::Doctor {
             source,
@@ -120347,9 +120357,18 @@ fn run_sources_add(
     preset: Option<String>,
     paths_arg: Vec<String>,
     no_test: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::sources::config::{Platform, SourceDefinition, SourcesConfig, get_preset_paths};
     use crate::sources::provenance::SourceKind;
+
+    let structured_format = output_format.map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
 
     // Parse URL to extract host
     let (host, source_id) = parse_source_url(url, name.as_deref())?;
@@ -120383,11 +120402,16 @@ fn run_sources_add(
         });
     };
 
-    // Test SSH connectivity unless --no-test
+    // Test SSH connectivity unless --no-test. Structured output keeps stdout
+    // for the result object, so progress text is printed only for humans.
     if !no_test {
-        println!("Testing SSH connectivity to {host}...");
+        if structured_format.is_none() {
+            println!("Testing SSH connectivity to {host}...");
+        }
         test_ssh_connectivity(&host)?;
-        println!("  Connected successfully");
+        if structured_format.is_none() {
+            println!("  Connected successfully");
+        }
     }
 
     // Load existing config
@@ -120453,6 +120477,26 @@ fn run_sources_add(
         .ok()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/cass/sources.toml".into());
+
+    if let Some(fmt) = structured_format {
+        let output = serde_json::json!({
+            "status": "added",
+            "source": {
+                "name": source_id,
+                "type": SourceKind::Ssh.as_str(),
+                "host": host,
+                "paths": paths,
+                "platform": platform.map(|p| p.to_string()),
+            },
+            "connectivity_tested": !no_test,
+            "config_path": config_path,
+            "next_steps": [
+                format!("cass sources sync --source {source_id}"),
+                "cass sources list".to_string(),
+            ],
+        });
+        return output_structured_value(output, fmt);
+    }
 
     println!();
     println!("Added source '{source_id}'");

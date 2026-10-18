@@ -1212,6 +1212,100 @@ fn sources_add_no_test() {
     tracker.complete();
 }
 
+/// Test: `sources add --json` prints only the saved source as JSON, and a
+/// refused duplicate add prints a JSON error envelope with no stdout data
+/// (GH #531 follow-up, coding_agent_session_search-kw97g).
+#[test]
+fn sources_add_json_reports_the_saved_source_and_refuses_duplicates_as_json() {
+    let tracker =
+        tracker_for("sources_add_json_reports_the_saved_source_and_refuses_duplicates_as_json");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let add = || {
+        tracker
+            .cass_assert_command()
+            .args([
+                "sources",
+                "add",
+                "user@myserver.local",
+                "--name",
+                "myserver",
+                "--preset",
+                "linux-defaults",
+                "--path",
+                "~/extra/sessions",
+                "--no-test",
+                "--json",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .output()
+            .expect("sources add --json")
+    };
+
+    let output = add();
+    assert!(
+        output.status.success(),
+        "sources add --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "stdout must be exactly one JSON value ({err}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(result["status"], "added");
+    assert_eq!(result["source"]["name"], "myserver");
+    assert_eq!(result["source"]["type"], "ssh");
+    assert_eq!(result["source"]["host"], "user@myserver.local");
+    assert_eq!(result["source"]["platform"], "linux");
+    let paths: Vec<&str> = result["source"]["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(paths.contains(&"~/extra/sessions"), "paths: {paths:?}");
+    assert!(paths.len() > 1, "preset paths must be merged: {paths:?}");
+    assert_eq!(result["connectivity_tested"], false);
+    assert_eq!(
+        result["next_steps"][0],
+        "cass sources sync --source myserver"
+    );
+    assert!(read_sources_config(&config_dir).contains("user@myserver.local"));
+
+    let duplicate = add();
+    assert_eq!(duplicate.status.code(), Some(10));
+    assert!(
+        duplicate.stdout.is_empty(),
+        "a refused add must not print success data: {}",
+        String::from_utf8_lossy(&duplicate.stdout)
+    );
+    let error: Value = serde_json::from_slice(&duplicate.stderr).unwrap_or_else(|err| {
+        panic!(
+            "stderr must be a JSON error envelope ({err}): {}",
+            String::from_utf8_lossy(&duplicate.stderr)
+        )
+    });
+    assert_eq!(error["error"]["kind"], "config");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already exists")),
+        "{error}"
+    );
+    assert_eq!(
+        read_sources_config(&config_dir)
+            .matches("user@myserver.local")
+            .count(),
+        1,
+        "the refused add must leave the config unchanged"
+    );
+
+    tracker.complete();
+}
+
 /// Test: sources add with explicit paths.
 #[test]
 fn sources_add_explicit_paths() {
