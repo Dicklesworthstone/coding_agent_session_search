@@ -29,6 +29,11 @@ function fixture(t) {
       if (!stores.has(name)) stores.set(name, new Map());
       const store = stores.get(name); // Remains detached, not resurrected, after delete(name).
       return {
+        async add(request) {
+          const response = await network(urlOf(request));
+          if (!response.ok) throw new Error("Cache.add received an unsuccessful response");
+          await this.put(request, response);
+        },
         async put(request, response) {
           const url = urlOf(request);
           calls.push(["put", name, url]);
@@ -43,7 +48,19 @@ function fixture(t) {
           await hooks.match?.(name, url);
           return snapshot;
         },
+        async delete(request, options) {
+          assert.equal(options?.ignoreVary, true, "revocation removes every Vary representation");
+          const url = urlOf(request);
+          calls.push(["entry-delete", name, url]);
+          await hooks.entryDelete?.(name, url);
+          return store.delete(url);
+        },
       };
+    },
+    async has(name) {
+      calls.push(["has", name]);
+      await hooks.has?.(name);
+      return stores.has(name);
     },
     async match(request, { cacheName } = {}) {
       assert.equal(typeof cacheName, "string", "fallback must name only this generation");
@@ -69,8 +86,9 @@ function fixture(t) {
     addEventListener(type, handler) { handlers.set(type, handler); },
   };
   let network = async () => new Response("network body");
-  vm.runInNewContext(source, { self, caches, URL, Headers, Response,
-    fetch: request => network(request), console: { log() {} } }, { filename: "sw.js" });
+  const context = vm.createContext({ self, caches, URL, Headers, Response,
+    fetch: request => network(request), console: { log() {} } });
+  vm.runInContext(source, context, { filename: "sw.js" });
   function message(type = "CLEAR_CACHE") {
     const replies = [], waits = [];
     handlers.get("message")({ data: { type }, ports: [{ postMessage(reply) { replies.push(reply); } }],
@@ -93,10 +111,25 @@ function fixture(t) {
     pending.push(settled);
     return { response, settled };
   }
-  const f = { name, prefix, stores, calls, hooks, message, request,
+  function install() {
+    const waits = [];
+    handlers.get("install")({ waitUntil(task) { waits.push(task); } });
+    const settled = Promise.all(waits);
+    void settled.catch(() => {});
+    pending.push(settled);
+    return settled;
+  }
+  const f = { name, prefix, stores, calls, hooks, message, request, install,
+    resources: () => vm.runInContext("typeof cacheResources === 'undefined' ? 0 : cacheResources.size", context),
     network(fn) { network = fn; },
     offline() { network = async () => { throw new Error("offline"); }; },
-    hold() { const gate = deferred(); gates.push(gate); return gate; },
+    hold() {
+      const gate = deferred();
+      // Baseline implementations may never reach a boundary under test.
+      // Observe an unused rejection without changing what awaiters receive.
+      void gate.promise.catch(() => {});
+      gates.push(gate); return gate;
+    },
     seed(path, body = "cached body", cacheName = name) {
       if (!stores.has(cacheName)) stores.set(cacheName, new Map());
       stores.get(cacheName).set(urlOf(path), new Response(body));
@@ -275,4 +308,219 @@ test("cache enumeration failures cannot produce a successful clear receipt", asy
   assert.equal(clear.replies[0].type, "CACHE_CLEAR_FAILED");
   f.hooks.keys = null; await cleared(f);
   assert.equal(f.stores.size, 0);
+});
+
+for (const directive of ["no-store", "private", "no-cache", 'max-age=0, PRIVATE="set-cookie"']) {
+  test(`a new ${directive} response removes the older offline copy`, async t => {
+    const f = fixture(t);
+    f.seed("payload.enc", "old retained data"); f.seed("other.enc", "unrelated resource");
+    f.network(async () => new Response("new private response", { headers: { "cache-control": directive } }));
+    const request = f.request();
+    assert.equal((await body(request))[1], "new private response"); await request.settled;
+    assert.ok(!f.stores.get(f.name).has(scope + "payload.enc"));
+    f.offline();
+    assert.equal((await body(f.request()))[0].status, 503);
+    assert.equal((await body(f.request("other.enc")))[1], "unrelated resource");
+    assert.equal(f.resources(), 0);
+  });
+}
+
+for (const status of [401, 403, 404, 410]) {
+  test(`authoritative HTTP ${status} is returned, not replaced, and evicts stale offline data`, async t => {
+    const f = fixture(t); f.seed("payload.enc", "old retained data");
+    f.network(async () => new Response("server refusal", { status }));
+    const request = f.request();
+    const [response, text] = await body(request);
+    assert.equal(response.status, status); assert.equal(text, "server refusal");
+    await request.settled; f.offline();
+    assert.equal((await body(f.request()))[0].status, 503);
+  });
+}
+
+test("transient server failures do not erase useful offline data or masquerade as cached success", async t => {
+  const f = fixture(t); f.seed("payload.enc", "last usable response");
+  f.network(async () => new Response("unavailable", { status: 503 }));
+  const request = f.request(); assert.equal((await body(request))[0].status, 503); await request.settled;
+  f.offline(); assert.equal((await body(f.request()))[1], "last usable response");
+});
+
+test("an older network response cannot resurrect a resource after a newer privacy response", async t => {
+  const f = fixture(t), oldNetwork = f.hold();
+  f.seed("payload.enc"); f.network(() => oldNetwork.promise);
+  const old = f.request();
+  f.network(async () => new Response("now private", { headers: { "cache-control": "no-store" } }));
+  const privateRequest = f.request(); await body(privateRequest); await privateRequest.settled;
+  oldNetwork.resolve(new Response("old public data")); await body(old); await old.settled;
+  f.offline(); assert.equal((await body(f.request()))[0].status, 503);
+  assert.equal(f.resources(), 0);
+});
+
+test("revocation waits for an older body write without delaying the new network response", async t => {
+  const f = fixture(t), put = f.hold();
+  f.hooks.put = () => put.promise;
+  const old = f.request(); await body(old); await turn();
+  f.network(async () => new Response("private", { headers: { "cache-control": "private" } }));
+  const restricted = f.request(); assert.equal((await body(restricted))[1], "private");
+  let evicted = false; void restricted.settled.then(() => { evicted = true; });
+  await turn(); const premature = evicted;
+  f.offline(); assert.equal((await body(f.request()))[0].status, 503);
+  put.resolve(); await old.settled; await restricted.settled;
+  assert.equal(premature, false);
+  assert.equal((await body(f.request()))[0].status, 503);
+  assert.equal(f.resources(), 0);
+});
+
+test("a pending offline match cannot return revoked text after a server denial", async t => {
+  const f = fixture(t), read = f.hold();
+  f.seed("payload.enc", "revoked text"); f.offline(); f.hooks.match = () => read.promise;
+  const old = f.request(); await turn();
+  f.network(async () => new Response("gone", { status: 410 }));
+  const denied = f.request(); await body(denied); await denied.settled;
+  read.resolve(); assert.equal((await body(old))[0].status, 503);
+});
+
+test("resource eviction does not wait for a different URL's large cache write", async t => {
+  const f = fixture(t), put = f.hold();
+  f.seed("payload.enc"); f.hooks.put = () => put.promise;
+  const other = f.request("large.enc"); await body(other); await turn();
+  f.network(async () => new Response("gone", { status: 404 }));
+  const gone = f.request(); await body(gone); await gone.settled;
+  assert.ok(!f.stores.get(f.name).has(scope + "payload.enc"));
+  put.resolve(); await other.settled;
+  assert.equal(f.resources(), 0);
+});
+
+test("entry deletion failure disables fallback until an explicit successful clear", async t => {
+  const f = fixture(t);
+  f.seed("payload.enc", "revoked"); f.hooks.entryDelete = () => { throw new Error("storage fault"); };
+  f.network(async () => new Response("private", { headers: { "cache-control": "no-store" } }));
+  const restricted = f.request(); await body(restricted); await restricted.settled;
+  f.offline(); assert.equal((await body(f.request()))[0].status, 503);
+  assert.equal(f.resources(), 0, "failed URLs must not accumulate in a denylist");
+  f.hooks.entryDelete = null; await cleared(f);
+  f.network(async () => new Response("new public data"));
+  const fresh = f.request(); await body(fresh); await fresh.settled;
+  f.offline(); assert.equal((await body(f.request()))[1], "new public data");
+});
+
+test("a privacy response for a never-cached resource creates no empty persistent cache", async t => {
+  const f = fixture(t);
+  f.network(async () => new Response("private", { headers: { "cache-control": "no-store" } }));
+  const request = f.request(); await body(request); await request.settled;
+  assert.equal(f.stores.size, 0);
+  assert.equal(f.calls.filter(call => call[0] === "open").length, 0);
+  assert.equal(f.resources(), 0);
+});
+
+test("manual clear and an in-flight per-resource eviction cannot restore a cache", async t => {
+  const f = fixture(t), eviction = f.hold();
+  f.seed("payload.enc"); f.hooks.entryDelete = () => eviction.promise;
+  f.network(async () => new Response("gone", { status: 410 }));
+  const gone = f.request(); await body(gone); await turn();
+  const clear = f.message(); await turn(); const premature = clear.replies.length;
+  eviction.resolve(); await gone.settled; await clear.settled;
+  assert.equal(premature, 0);
+  assert.equal(clear.replies[0].type, "CACHE_CLEARED"); assert.equal(f.stores.size, 0);
+});
+
+test("resource ordering state is released after many distinct completed requests", async t => {
+  const f = fixture(t);
+  for (let n = 0; n < 100; n++) {
+    const request = f.request(`${n}.enc`); await body(request); await request.settled;
+  }
+  assert.equal(f.resources(), 0);
+});
+
+test("opaque network responses are passed through, never converted to stale offline success", async t => {
+  const f = fixture(t); f.seed("payload.enc", "must not substitute");
+  // Status 0 is not constructible with new Response; Response.error exercises
+  // that reconstruction boundary without claiming a real cross-origin fetch.
+  const opaque = Response.error(); f.network(async () => opaque);
+  const request = f.request(); assert.equal(await request.response, opaque); await request.settled;
+  assert.equal(f.calls.filter(call => call[0] === "match").length, 0);
+});
+
+for (const directive of ["no-store", "private", "no-cache"]) {
+  test(`installation refuses ${directive} assets instead of persisting them behind a ready worker`, async t => {
+    const f = fixture(t);
+    f.network(async () => new Response("must not persist", { headers: { "cache-control": directive } }));
+    await assert.rejects(f.install());
+    assert.equal(f.calls.filter(call => call[0] === "put").length, 0);
+  });
+}
+
+test("installation still preloads the complete runtime and leaves older generations untouched", async t => {
+  const f = fixture(t); f.seed("old.enc", "keep until activation", f.prefix + "v7");
+  await f.install();
+  const urls = [...f.stores.get(f.name).keys()];
+  for (const path of ["index.html", "auth.js", "database.js", "conversation.js", "crypto_worker.js",
+    "vendor/sqlite3.mjs", "vendor/sqlite3.wasm", "vendor/argon2.wasm"]) {
+    assert.ok(urls.includes(scope + path), path);
+  }
+  assert.ok(f.stores.has(f.prefix + "v7"));
+});
+
+test("failed installation settles sibling writes before a clear may acknowledge", async t => {
+  const f = fixture(t), put = f.hold();
+  f.hooks.put = () => put.promise;
+  f.network(async url => url.endsWith("styles.css")
+    ? new Response("gone", { status: 404 }) : new Response("asset"));
+  const installation = f.install();
+  await turn();
+  assert.ok(f.calls.some(call => call[0] === "put"));
+  const clear = f.message(); await turn(); const premature = clear.replies.length;
+  put.resolve(); await assert.rejects(installation); await clear.settled;
+  assert.equal(premature, 0);
+  assert.equal(clear.replies[0].type, "CACHE_CLEARED"); assert.equal(f.stores.size, 0);
+});
+
+for (const navigation of [false, true]) {
+  test(`offline ${navigation ? "navigation" : "resource"} fallback refuses already-stored private responses`, async t => {
+    const f = fixture(t), path = navigation ? "index.html" : "payload.enc";
+    f.seed(path); f.stores.get(f.name).set(scope + path,
+      new Response("private legacy cache", { headers: { "cache-control": "private" } }));
+    f.offline();
+    const request = f.request(navigation ? "nested/" : path, { navigate: navigation });
+    assert.equal((await body(request))[0].status, 503);
+  });
+}
+
+test("a request admitted during revocation cannot refill the URL when it completes later", async t => {
+  const f = fixture(t), deletion = f.hold(), network = f.hold();
+  f.seed("payload.enc"); f.hooks.entryDelete = () => deletion.promise;
+  f.network(async () => new Response("private", { headers: { "cache-control": "private" } }));
+  const restricted = f.request(); await body(restricted); await turn();
+  f.network(() => network.promise); const during = f.request();
+  deletion.resolve(); await restricted.settled;
+  network.resolve(new Response("outdated public response")); await body(during); await during.settled;
+  f.offline(); assert.equal((await body(f.request()))[0].status, 503);
+  f.network(async () => new Response("fresh public response"));
+  const fresh = f.request(); await body(fresh); await fresh.settled;
+  f.offline(); assert.equal((await body(f.request()))[1], "fresh public response");
+});
+
+test("successful manual clear recovers even when an older eviction fails during the clear", async t => {
+  const f = fixture(t), deletion = f.hold();
+  f.seed("payload.enc"); f.hooks.entryDelete = () => deletion.promise;
+  f.network(async () => new Response("gone", { status: 410 }));
+  const restricted = f.request(); await body(restricted); await turn();
+  const clear = f.message(); deletion.reject(new Error("entry deletion failed"));
+  await restricted.settled; await clear.settled;
+  assert.equal(clear.replies[0].type, "CACHE_CLEARED"); assert.equal(f.stores.size, 0);
+  f.hooks.entryDelete = null; f.network(async () => new Response("fresh"));
+  const fresh = f.request(); await body(fresh); await fresh.settled;
+  f.offline(); assert.equal((await body(f.request()))[1], "fresh");
+  assert.equal(f.resources(), 0);
+});
+
+test("revocation invalidates an older pending open before it can issue a put", async t => {
+  const f = fixture(t), opening = f.hold();
+  f.hooks.open = () => opening.promise;
+  const old = f.request(); await body(old); await turn();
+  f.network(async () => new Response("private", { headers: { "cache-control": "no-store" } }));
+  const restricted = f.request(); await body(restricted);
+  opening.resolve(); await old.settled; await restricted.settled;
+  assert.equal(f.calls.filter(call => call[0] === "put").length, 0);
+  f.offline(); assert.equal((await body(f.request()))[0].status, 503);
+  assert.equal(f.resources(), 0);
 });

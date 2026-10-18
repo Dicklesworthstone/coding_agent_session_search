@@ -7,7 +7,7 @@
 
 // Bump whenever any shipped archive asset or cache policy changes. A new name
 // keeps install from mutating the active generation entry-by-entry.
-const CACHE_VERSION = "v8";
+const CACHE_VERSION = "v9";
 const STATIC_ASSETS = [
   "./",
   "./index.html",
@@ -63,9 +63,68 @@ let cacheEpoch = {};
 let pendingCacheClears = 0;
 let cacheClearTail = Promise.resolve();
 const cacheMutations = new Set();
+const cacheResources = new Map();
+let cacheStorageUnsafe = false;
 
 function cacheRequestIsCurrent(epoch) {
-  return epoch !== null && epoch === cacheEpoch && pendingCacheClears === 0;
+  return epoch !== null && epoch === cacheEpoch && pendingCacheClears === 0 && !cacheStorageUnsafe;
+}
+
+function acquireCacheResource(url) {
+  let resource = cacheResources.get(url);
+  if (!resource) {
+    resource = { url, users: 0, version: {}, blocked: false, mutations: new Set() };
+    cacheResources.set(url, resource);
+  }
+  resource.users++;
+  return resource;
+}
+
+function pruneCacheResource(resource) {
+  // Keep ordering state only for live requests/mutations, not every URL ever
+  // fetched. Failed eviction disables fallback globally until a successful
+  // explicit clear, so it needs no unbounded in-memory denylist.
+  if (resource.users === 0 && resource.mutations.size === 0) {
+    cacheResources.delete(resource.url);
+  }
+}
+
+function trackResourceMutation(resource, operation) {
+  const task = trackCacheMutation(operation);
+  resource.mutations.add(task);
+  const release = () => {
+    resource.mutations.delete(task);
+    pruneCacheResource(resource);
+  };
+  void task.then(release, release);
+  return task;
+}
+
+function revokeCachedResource(request, resource, epoch) {
+  // A newer private/deleted response supersedes every earlier request for
+  // this URL, including writes already consuming a body and pending matches.
+  resource.version = {};
+  resource.blocked = true;
+  const earlierMutations = [...resource.mutations];
+  return trackResourceMutation(resource, async () => {
+    await Promise.allSettled(earlierMutations);
+    if (!cacheRequestIsCurrent(epoch)) return;
+    const cacheName = getCacheName();
+    if (!await caches.has(cacheName) || !cacheRequestIsCurrent(epoch)) return;
+    const cache = await caches.open(cacheName);
+    if (!cacheRequestIsCurrent(epoch)) return;
+    // Remove all Vary representations of the URL, not just this request's
+    // header variant. Never reinterpret a server refusal as an offline miss.
+    await cache.delete(request, { ignoreVary: true });
+  }).catch((error) => {
+    // Never serve a known-revoked copy after storage failed to remove it.
+    // Network responses remain available. This guard lasts for this worker;
+    // it is not a durable erasure receipt when the Cache API is failing.
+    cacheStorageUnsafe = true;
+    log(LOG.WARN, "Cache eviction failed; offline fallback disabled until cache clear:", error);
+  }).finally(() => {
+    resource.blocked = false;
+  });
 }
 
 function trackCacheMutation(operation) {
@@ -102,6 +161,7 @@ function clearArchiveCaches() {
     if (remaining.length > 0) {
       throw new Error(`Archive caches still present after cleanup: ${remaining.join(", ")}`);
     }
+    cacheStorageUnsafe = false;
     return targets;
   }).finally(() => {
     pendingCacheClears--;
@@ -152,17 +212,24 @@ function isCacheEligibleRequest(request, url) {
   );
 }
 
-function responseAllowsCaching(response) {
+function responseForbidsCaching(response) {
   const cacheDirectives = (response.headers.get("cache-control") || "")
     .split(",")
     .map((directive) => directive.trim().toLowerCase());
-  const forbidsStorage = cacheDirectives.some((directive) => {
+  return cacheDirectives.some((directive) => {
     const directiveName = directive.split("=", 1)[0].trim();
     return (
       directiveName === "no-store" || directiveName === "no-cache" || directiveName === "private"
     );
   });
-  return response.status === 200 && !forbidsStorage;
+}
+
+function responseAllowsCaching(response) {
+  return response.status === 200 && !responseForbidsCaching(response);
+}
+
+function responseRevokesCachedCopy(response) {
+  return responseForbidsCaching(response) || [401, 403, 404, 410].includes(response.status);
 }
 
 function log(level, ...args) {
@@ -179,17 +246,30 @@ function log(level, ...args) {
 self.addEventListener("install", (event) => {
   log(LOG.INFO, "Installing service worker...");
   const cacheName = getCacheName();
+  const epoch = cacheEpoch;
 
   event.waitUntil(
-    caches
-      .open(cacheName)
-      .then((cache) => {
-        log(LOG.INFO, "Caching static assets");
-        // Runtime dependencies are part of the bundle contract. A
-        // missing asset must fail installation instead of producing a
-        // service worker that only breaks once the archive is offline.
-        return Promise.all(STATIC_ASSETS.map((asset) => cache.add(asset)));
-      })
+    trackCacheMutation(async () => {
+      if (!cacheRequestIsCurrent(epoch)) throw new Error("Archive installation invalidated");
+      const cache = await caches.open(cacheName);
+      log(LOG.INFO, "Caching static assets");
+      // Cache.add ignores Cache-Control. Apply the same explicit storage
+      // policy as runtime reads, and fail installation if offline essentials
+      // cannot be retained. Settle every started put before completing the
+      // mutation so a clear cannot race a sibling asset after one fails.
+      const results = await Promise.allSettled(STATIC_ASSETS.map(async (asset) => {
+        if (!cacheRequestIsCurrent(epoch)) throw new Error("Archive installation invalidated");
+        const url = new URL(asset, getCacheScopeUrl()).href;
+        const response = await fetch(url);
+        if (!cacheRequestIsCurrent(epoch) || !responseAllowsCaching(response)) {
+          discardCacheResponse(response);
+          throw new Error(`Archive offline asset is unavailable or not cacheable: ${asset}`);
+        }
+        await cache.put(url, response);
+      }));
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+    })
       .then(() => {
         log(LOG.INFO, "Service worker installed");
       })
@@ -270,19 +350,23 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
   const url = new URL(request.url);
   const cacheName = getCacheName();
   const cacheEligible = isCacheEligibleRequest(request, url);
-  const epoch = pendingCacheClears === 0 ? cacheEpoch : null;
-  const canUseCache = () => cacheEligible && cacheRequestIsCurrent(epoch);
+  const epoch = pendingCacheClears === 0 && !cacheStorageUnsafe ? cacheEpoch : null;
+  const resource = cacheEligible && epoch !== null ? acquireCacheResource(url.href) : null;
+  const version = resource && !resource.blocked ? resource.version : null;
+  const canUseCache = () => resource !== null && version !== null && !resource.blocked
+    && version === resource.version && cacheRequestIsCurrent(epoch);
 
   // Network first so updated archive contents win when online.
   try {
     const response = await fetch(request);
 
-    // Only cache successful responses
-    if (canUseCache() && responseAllowsCaching(response)) {
+    if (canUseCache() && responseRevokesCachedCopy(response)) {
+      trackBackgroundTask(revokeCachedResource(request, resource, epoch));
+    } else if (canUseCache() && responseAllowsCaching(response)) {
       // Clone before returning the original response. Once the client
       // starts consuming its body, a later clone would throw.
       const responseForCache = response.clone();
-      const cacheWrite = trackCacheMutation(async () => {
+      const cacheWrite = trackResourceMutation(resource, async () => {
         if (!canUseCache()) {
           discardCacheResponse(responseForCache);
           return;
@@ -309,7 +393,7 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
       if (canUseCache()) {
         // CacheStorage.match does not create an empty cache after a purge.
         const cached = await caches.match(request, { cacheName });
-        if (cached && canUseCache()) {
+        if (cached && canUseCache() && responseAllowsCaching(cached)) {
           log(LOG.INFO, "Serving cached response after network failure:", url.pathname);
           return addSecurityHeaders(cached);
         }
@@ -324,7 +408,7 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
       try {
         const indexUrl = new URL("./index.html", getCacheScopeUrl()).href;
         const cachedIndex = await caches.match(indexUrl, { cacheName });
-        if (cachedIndex && canUseCache()) {
+        if (cachedIndex && canUseCache() && responseAllowsCaching(cachedIndex)) {
           log(LOG.INFO, "Serving cached index.html for offline navigation");
           return addSecurityHeaders(cachedIndex);
         }
@@ -342,6 +426,11 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
         "Content-Type": "text/plain",
       },
     });
+  } finally {
+    if (resource) {
+      resource.users--;
+      pruneCacheResource(resource);
+    }
   }
 }
 
@@ -352,6 +441,10 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
  * optimal sqlite-wasm performance.
  */
 function addSecurityHeaders(response) {
+  // Opaque (including manual redirect) responses cannot be reconstructed with
+  // status 0. Preserve them rather than converting a network result into an
+  // offline fallback. The browser enforces their request-mode restrictions.
+  if (response.status === 0) return response;
   // Clone headers
   const headers = new Headers(response.headers);
 
