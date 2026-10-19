@@ -1229,19 +1229,24 @@ impl QuillCassIndex {
     pub fn reader(&self) -> Result<QuillSearchIndex> {
         #[cfg(test)]
         READER_OPEN_COUNT.with(|count| count.set(count.get() + 1));
-        drive(|cx| {
-            let directory = self.directory.clone();
-            async move {
-                QuillSearchIndex::open_with_schema(
-                    &cx,
-                    directory,
-                    CASS_SEMANTIC_SCHEMA,
-                    cass_quill_config(),
-                )
-                .await
-            }
-        })
-        .map_err(|error| anyhow!("opening the Quill CASS reader: {error}"))
+        let reader = self
+            .with_engine_liveness(|| {
+                drive(|cx| {
+                    let directory = self.directory.clone();
+                    async move {
+                        QuillSearchIndex::open_with_schema(
+                            &cx,
+                            directory,
+                            CASS_SEMANTIC_SCHEMA,
+                            cass_quill_config(),
+                        )
+                        .await
+                    }
+                })
+            })
+            .map_err(|error| anyhow!("opening the Quill CASS reader: {error}"))?;
+        self.tick_heartbeat();
+        Ok(reader)
     }
 
     /// Live document count in the published snapshot.
@@ -2546,6 +2551,27 @@ mod tests {
                 "getrusage must work on unix"
             );
         }
+    }
+
+    #[test]
+    fn quill_reader_validation_ticks_the_installed_heartbeat() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut index = QuillCassIndex::open_or_create(tmp.path()).expect("open");
+        index
+            .add_cass_documents(&[sample("s1", 0, "verified reader work")])
+            .expect("accumulate");
+        index.commit().expect("commit");
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::clone(&ticks);
+        index.set_heartbeat(Some(Arc::new(move || {
+            sink.fetch_add(1, Ordering::Relaxed);
+        })));
+        index.reader().expect("validated reader");
+        assert!(ticks.load(Ordering::Relaxed) > 0);
+        index.set_heartbeat(None);
+        let before = ticks.load(Ordering::Relaxed);
+        index.reader().expect("read without heartbeat");
+        assert_eq!(ticks.load(Ordering::Relaxed), before);
     }
 
     /// Real sink work must reach the heartbeat: accumulate and commit each
