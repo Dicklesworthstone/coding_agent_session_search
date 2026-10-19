@@ -143,15 +143,31 @@ fn execute(
         .context("canonical one-shot waited for stdin or exceeded its deadline")?;
     drop(input);
     for path in [&out, &err] {
-        ensure!(std::fs::metadata(path)?.len() <= 2 * 1024 * 1024, "oversized test output");
+        ensure!(
+            std::fs::metadata(path)?.len() <= 2 * 1024 * 1024,
+            "oversized test output"
+        );
     }
     Ok((status, std::fs::read(out)?, std::fs::read(err)?))
 }
 
 fn read_page(fixture: &Fixture, selector: &Value) -> Result<Value> {
-    let (status, out, err) = execute(fixture.root.path(), &fixture.db, &selector.to_string(), false)?;
-    ensure!(status.success(), "{status}: {}", String::from_utf8_lossy(&err));
-    ensure!(err.is_empty(), "unexpected diagnostic: {}", String::from_utf8_lossy(&err));
+    let (status, out, err) = execute(
+        fixture.root.path(),
+        &fixture.db,
+        &selector.to_string(),
+        false,
+    )?;
+    ensure!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&err)
+    );
+    ensure!(
+        err.is_empty(),
+        "unexpected diagnostic: {}",
+        String::from_utf8_lossy(&err)
+    );
     let reply: Value = serde_json::from_slice(&out)?;
     assert_eq!(reply["id"], 1);
     assert_eq!(reply["ok"], true);
@@ -173,11 +189,22 @@ fn transcript_one_shot_matches_stdio_without_lexical_assets_or_raw_files() -> Re
     assert_eq!(page["preview_only"], false);
     assert_eq!(page["maintenance_performed"], false);
     assert_eq!(page["cross_page_snapshot"], false);
-    let (status, out, err) = execute(fixture.root.path(), &fixture.db, &selected.to_string(), true)?;
-    ensure!(status.success(), "{status}: {}", String::from_utf8_lossy(&err));
+    let (status, out, err) = execute(
+        fixture.root.path(),
+        &fixture.db,
+        &selected.to_string(),
+        true,
+    )?;
+    ensure!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&err)
+    );
     assert!(err.is_empty());
-    let replies = std::str::from_utf8(&out)?.lines()
-        .map(serde_json::from_str).collect::<std::result::Result<Vec<Value>, _>>()?;
+    let replies = std::str::from_utf8(&out)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<Value>, _>>()?;
     assert_eq!(replies.len(), 2);
     assert_eq!(replies[0]["result"], page);
     assert_eq!(replies[1]["result"]["shutdown"], true);
@@ -187,7 +214,11 @@ fn transcript_one_shot_matches_stdio_without_lexical_assets_or_raw_files() -> Re
 
 #[test]
 fn transcript_one_shot_cursor_reassembles_large_messages_exactly_across_processes() -> Result<()> {
-    let large = format!("{}😀{}\0tail", "a".repeat(PAGE_BYTES - 1), "雪".repeat(PAGE_BYTES));
+    let large = format!(
+        "{}😀{}\0tail",
+        "a".repeat(PAGE_BYTES - 1),
+        "雪".repeat(PAGE_BYTES)
+    );
     let fixture = Fixture::new(&[(1, 0, ""), (2, 7, &large), (3, 19, "after\0message")])?;
     let before = snapshot(fixture.root.path())?;
     let mut selected = selection();
@@ -200,7 +231,8 @@ fn transcript_one_shot_cursor_reassembles_large_messages_exactly_across_processe
         assert!(page["content_bytes"].as_u64().context("page byte count")? <= PAGE_BYTES as u64);
         assert_eq!(page["cross_page_snapshot"], false);
         for message in page["messages"].as_array().context("page messages")? {
-            let body = bodies.entry(message["message_id"].as_i64().context("message identity")?)
+            let body = bodies
+                .entry(message["message_id"].as_i64().context("message identity")?)
                 .or_default();
             assert_eq!(message["byte_offset"].as_u64(), Some(body.len() as u64));
             body.push_str(message["content"].as_str().context("message chunk")?);
@@ -232,12 +264,21 @@ fn transcript_one_shot_distinguishes_empty_from_missing_and_mismatched_identity(
     assert_eq!(empty["end_of_conversation"], true);
     for (field, value, kind) in [
         ("source_id", json!("other"), "canonical_identity_mismatch"),
-        ("source_path", json!("/wrong"), "canonical_identity_mismatch"),
+        (
+            "source_path",
+            json!("/wrong"),
+            "canonical_identity_mismatch",
+        ),
         ("conversation_id", json!(2), "canonical_not_found"),
     ] {
         let mut selected = selection();
         selected[field] = value;
-        let (status, out, err) = execute(fixture.root.path(), &fixture.db, &selected.to_string(), false)?;
+        let (status, out, err) = execute(
+            fixture.root.path(),
+            &fixture.db,
+            &selected.to_string(),
+            false,
+        )?;
         assert_eq!(status.code(), Some(1));
         assert!(out.is_empty());
         let reply: Value = serde_json::from_slice(&err)?;
@@ -249,7 +290,8 @@ fn transcript_one_shot_distinguishes_empty_from_missing_and_mismatched_identity(
 }
 
 #[test]
-fn transcript_one_shot_refuses_a_resized_cursor_instead_of_substituting_a_neighbour() -> Result<()> {
+fn transcript_one_shot_refuses_a_resized_cursor_instead_of_substituting_a_neighbour() -> Result<()>
+{
     let fixture = Fixture::new(&[(1, 0, &"x".repeat(PAGE_BYTES + 20)), (2, 7, "neighbour")])?;
     let first = read_page(&fixture, &selection())?;
     assert!(!first["next_cursor"].is_null());
@@ -259,7 +301,12 @@ fn transcript_one_shot_refuses_a_resized_cursor_instead_of_substituting_a_neighb
     let before = snapshot(fixture.root.path())?;
     let mut selected = selection();
     selected["cursor"] = first["next_cursor"].clone();
-    let (status, out, err) = execute(fixture.root.path(), &fixture.db, &selected.to_string(), false)?;
+    let (status, out, err) = execute(
+        fixture.root.path(),
+        &fixture.db,
+        &selected.to_string(),
+        false,
+    )?;
     assert_eq!(status.code(), Some(1));
     assert!(out.is_empty());
     let reply: Value = serde_json::from_slice(&err)?;
@@ -277,7 +324,11 @@ fn transcript_one_shot_rejects_invalid_selection_before_creating_storage() -> Re
     wrong_limit["limit"] = json!(33);
     let mut wrong_cursor = selection();
     wrong_cursor["cursor"] = json!({"message_id":1,"message_index":1,"byte_offset":4});
-    for selected in ["{".into(), wrong_limit.to_string(), wrong_cursor.to_string()] {
+    for selected in [
+        "{".into(),
+        wrong_limit.to_string(),
+        wrong_cursor.to_string(),
+    ] {
         let (status, out, err) = execute(root.path(), &missing, &selected, false)?;
         assert_eq!(status.code(), Some(2));
         assert!(out.is_empty());
