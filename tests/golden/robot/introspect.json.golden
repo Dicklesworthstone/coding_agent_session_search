@@ -3925,6 +3925,13 @@
           "required": false
         },
         {
+          "name": "transcript",
+          "description": "Read one bounded canonical transcript page and exit without reading stdin. JSON selects source_path, source_id, conversation_id, optional cursor and limit. Requires --db; never opens source files, lexical readers or models",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
           "name": "mode",
           "description": "Retrieval mode for --query (default lexical). Semantic and hybrid require --semantic-embedder, --data-dir and --db. No models are downloaded",
           "arg_type": "option",
