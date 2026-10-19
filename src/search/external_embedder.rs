@@ -481,11 +481,8 @@ impl Embedder for ExternalEmbedder {
             // Count serde's actual escaped UTF-8 bytes without first allocating
             // the encoded input. Reject a late oversized input before any of
             // this call's earlier, otherwise valid inputs can reach the server.
-            if wire::json_string_bytes(
-                text,
-                self.config.max_request_bytes.saturating_sub(overhead),
-            )
-            .is_none()
+            if wire::json_string_bytes(text, self.config.max_request_bytes.saturating_sub(overhead))
+                .is_none()
             {
                 return Err(self.failure(format!("external_input_too_large: input {index} exceeds request byte limit; no text from this call sent")));
             }
@@ -503,8 +500,8 @@ impl Embedder for ExternalEmbedder {
                     .max_request_bytes
                     .checked_sub(bytes)
                     .and_then(|remaining| remaining.checked_sub(separator));
-                let Some(encoded) = remaining
-                    .and_then(|remaining| wire::json_string_bytes(texts[end], remaining))
+                let Some(encoded) =
+                    remaining.and_then(|remaining| wire::json_string_bytes(texts[end], remaining))
                 else {
                     break;
                 };
