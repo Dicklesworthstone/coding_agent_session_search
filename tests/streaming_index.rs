@@ -14,12 +14,60 @@ use coding_agent_search::indexer::streaming_index_enabled;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::process::Command;
 
-mod util;
-use util::EnvGuard;
+const STREAMING_FLAG_CHILD_ENV: &str = "CASS_TEST_STREAMING_FLAG_CHILD";
+const STREAMING_FLAG_EXPECTED_ENV: &str = "CASS_TEST_STREAMING_FLAG_EXPECTED";
+const STREAMING_FLAG_CHILD_RECEIPT: &str = "STREAMING_FLAG_CHILD_OK";
 
-static STREAMING_ENV_LOCK: Mutex<()> = Mutex::new(());
+fn assert_streaming_flag_in_child(value: &str, expected: bool) {
+    let temp = tempfile::TempDir::new().expect("tempdir for streaming flag child");
+    let output =
+        Command::new(std::env::current_exe().expect("current streaming_index test binary"))
+            .arg("--exact")
+            .arg("streaming_index_flag_probe_child")
+            .arg("--nocapture")
+            .current_dir(temp.path())
+            .env_clear()
+            .env(STREAMING_FLAG_CHILD_ENV, "1")
+            .env(
+                STREAMING_FLAG_EXPECTED_ENV,
+                if expected { "1" } else { "0" },
+            )
+            .env("CASS_STREAMING_INDEX", value)
+            .env("RUST_MIN_STACK", "16777216")
+            .output()
+            .expect("spawn isolated streaming_index_enabled probe child");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "isolated streaming flag child failed for CASS_STREAMING_INDEX={value:?}\nstatus={:?}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains(STREAMING_FLAG_CHILD_RECEIPT),
+        "isolated streaming flag child omitted receipt for CASS_STREAMING_INDEX={value:?}: {combined}"
+    );
+}
+
+#[test]
+fn streaming_index_flag_probe_child() {
+    if std::env::var_os(STREAMING_FLAG_CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let expected = std::env::var(STREAMING_FLAG_EXPECTED_ENV).expect("expected flag value") == "1";
+    assert_eq!(
+        streaming_index_enabled(),
+        expected,
+        "streaming_index_enabled() mismatch for CASS_STREAMING_INDEX={:?}",
+        std::env::var("CASS_STREAMING_INDEX").ok()
+    );
+    eprintln!("{STREAMING_FLAG_CHILD_RECEIPT}");
+}
 
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(root: &Path, date_path: &str, filename: &str, content: &str, ts: u64) {
@@ -70,35 +118,20 @@ fn count_conversations(db_path: &Path) -> i64 {
 
 #[test]
 fn test_streaming_enabled_when_var_set_to_1() {
-    let _env_lock = STREAMING_ENV_LOCK.lock().unwrap();
     // Explicitly setting to "1" enables streaming
-    let _guard = EnvGuard::set("CASS_STREAMING_INDEX", "1");
-    assert!(
-        streaming_index_enabled(),
-        "streaming should be enabled when CASS_STREAMING_INDEX=1"
-    );
+    assert_streaming_flag_in_child("1", true);
 }
 
 #[test]
 fn test_streaming_disabled_via_env_var() {
-    let _env_lock = STREAMING_ENV_LOCK.lock().unwrap();
     // Setting to "0" disables streaming
-    let _guard = EnvGuard::set("CASS_STREAMING_INDEX", "0");
-    assert!(
-        !streaming_index_enabled(),
-        "streaming should be disabled when CASS_STREAMING_INDEX=0"
-    );
+    assert_streaming_flag_in_child("0", false);
 }
 
 #[test]
 fn test_streaming_enabled_with_non_zero_value() {
-    let _env_lock = STREAMING_ENV_LOCK.lock().unwrap();
     // Any value other than "0" enables streaming
-    let _guard = EnvGuard::set("CASS_STREAMING_INDEX", "yes");
-    assert!(
-        streaming_index_enabled(),
-        "streaming should be enabled when CASS_STREAMING_INDEX is not '0'"
-    );
+    assert_streaming_flag_in_child("yes", true);
 }
 
 // =============================================================================

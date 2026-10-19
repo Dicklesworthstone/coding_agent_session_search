@@ -7,14 +7,12 @@
 //! SSH operations without requiring external infrastructure.
 
 mod ssh_test_helper;
-mod util;
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::sources::provenance::SourceKind;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use ssh_test_helper::{SshTestServer, docker_available};
 use std::path::Path;
-use util::EnvGuard;
 
 /// Skip tests if Docker is not available.
 fn require_docker() {
@@ -205,11 +203,6 @@ EOF
         .ssh_exec_with_stdin(seed_script)
         .expect("seed remote session");
 
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("CASS_DATA_DIR", data_dir.to_string_lossy());
-    let _guard_ssh_config = EnvGuard::set("CASS_SSH_CONFIG", ssh_config_path.to_string_lossy());
-
     let ssh_probe = std::process::Command::new("ssh")
         .args([
             "-F",
@@ -244,6 +237,7 @@ EOF
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_SSH_CONFIG", &ssh_config_path)
         .output()
         .expect("sources sync (no sources)");
     assert!(no_sources.status.success());
@@ -289,6 +283,7 @@ EOF
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_SSH_CONFIG", &ssh_config_path)
         .output()
         .expect("sources mappings add");
     assert!(
@@ -332,6 +327,7 @@ EOF
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_SSH_CONFIG", &ssh_config_path)
         .output()
         .expect("cass index --full");
     assert!(

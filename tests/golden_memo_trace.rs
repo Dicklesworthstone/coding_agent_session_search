@@ -10,15 +10,16 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
 use serde_json::{Map, Value, json};
-use serial_test::serial;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-mod util;
+const MEMO_TRACE_CHILD_ENV: &str = "CASS_TEST_MEMO_TRACE_CHILD";
+const MEMO_TRACE_CHILD_RECEIPT: &str = "MEMO_TRACE_CHILD_OK";
 
 #[derive(Clone, Default)]
 struct TraceEventCollector {
@@ -168,9 +169,6 @@ fn capture_memo_trace_json() -> Result<String> {
     let collector = TraceEventCollector::default();
     let subscriber = Registry::default().with(collector.clone());
 
-    let _parallel_guard = util::EnvGuard::set("CASS_SEMANTIC_PREP_PARALLEL", "0");
-    let _capacity_guard = util::EnvGuard::set("CASS_SEMANTIC_PREP_MEMO_CAPACITY", "4");
-
     let indexer = SemanticIndexer::new("hash", None)
         .context("hash indexer")?
         .with_batch_size(1)
@@ -196,8 +194,49 @@ fn capture_memo_trace_json() -> Result<String> {
 }
 
 #[test]
-#[serial]
 fn semantic_prep_memo_trace_matches_golden() -> Result<()> {
+    let temp = tempfile::TempDir::new().context("tempdir for memo trace child")?;
+    let mut cmd =
+        Command::new(std::env::current_exe().context("current golden_memo_trace binary")?);
+    cmd.arg("--exact")
+        .arg("semantic_prep_memo_trace_matches_golden_child")
+        .arg("--nocapture")
+        .current_dir(temp.path())
+        .env_clear()
+        .env(MEMO_TRACE_CHILD_ENV, "1")
+        .env("CASS_SEMANTIC_PREP_PARALLEL", "0")
+        .env("CASS_SEMANTIC_PREP_MEMO_CAPACITY", "4")
+        .env("RUST_MIN_STACK", "16777216");
+    if let Some(update) = std::env::var_os("UPDATE_GOLDENS") {
+        cmd.env("UPDATE_GOLDENS", update);
+    }
+    let output = cmd
+        .output()
+        .context("spawn isolated memo trace golden child")?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        bail!(
+            "isolated memo trace golden child failed (status={:?}):\n{combined}",
+            output.status
+        );
+    }
+    if !combined.contains(MEMO_TRACE_CHILD_RECEIPT) {
+        bail!("isolated memo trace golden child omitted receipt:\n{combined}");
+    }
+    Ok(())
+}
+
+#[test]
+fn semantic_prep_memo_trace_matches_golden_child() -> Result<()> {
+    if std::env::var_os(MEMO_TRACE_CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
     let actual = capture_memo_trace_json()?;
-    assert_golden("log/memo_trace.json.golden", &actual)
+    assert_golden("log/memo_trace.json.golden", &actual)?;
+    eprintln!("{MEMO_TRACE_CHILD_RECEIPT}");
+    Ok(())
 }
