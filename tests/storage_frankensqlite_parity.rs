@@ -291,6 +291,10 @@ fn readonly_live_wal_preserves_archive_bytes_and_modification_times() {
     };
     let before = snapshot();
     assert!(before[1].0.len() > 32, "fixture must retain WAL frames");
+    // The Unix VFS publishes the WAL index into the -shm file. The Windows VFS
+    // keeps the index in process memory and opens -shm only for stock SQLite's
+    // lock bytes, so the file stays empty there.
+    #[cfg(unix)]
     assert!(!before[2].0.is_empty(), "fixture must have a WAL index");
 
     let reader = FrankenStorage::open_readonly(&db_path).expect("open live archive read-only");

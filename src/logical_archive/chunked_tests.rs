@@ -197,7 +197,9 @@ fn v1_header_cannot_authorize_a_continued_row() {
 
 #[test]
 fn unsupported_versions_and_inconsistent_record_type_lists_are_refused() {
-    let mut unknown = header(3);
+    // The first version past the newest supported one (3 became
+    // SEQUENCE_VERSION in 5d21e253), still with v1 record-type names.
+    let mut unknown = header(codec::SEQUENCE_VERSION + 1);
     assert!(Validator::new(unknown.clone()).is_err());
     unknown.schema_version = codec::CHUNKED_VERSION;
     assert!(Validator::new(unknown).is_err()); // v1 names do not admit v2.

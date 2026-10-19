@@ -2360,6 +2360,21 @@ pub enum SourcesCommand {
         /// Skip connectivity test
         #[arg(long)]
         no_test: bool,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Set how often scheduled jobs sync a remote source (manual, hourly, daily)
+    Schedule {
+        /// Name of the configured remote source
+        name: String,
+        /// manual: only an explicit `cass sources sync`; hourly or daily: the
+        /// jobs from `cass schedule install` sync it when due
+        #[arg(value_enum)]
+        schedule: crate::sources::config::SyncSchedule,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
     /// Remove a configured source
     Remove {
@@ -26569,6 +26584,10 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Sources(SourcesCommand::List { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Sources(SourcesCommand::Add { json, .. })
+        | Commands::Sources(SourcesCommand::Schedule { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Sources(SourcesCommand::Doctor { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -27545,6 +27564,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass sources artifact-manifest  Write/verify lexical artifact proof".to_string(),
             "  cass sources discover     Just discover hosts (no setup)".to_string(),
             "  cass sources add          Manually add a source".to_string(),
+            "  cass sources schedule     Set a remote source's sync_schedule (manual|hourly|daily)"
+                .to_string(),
         ],
         RobotTopic::Analytics => render_analytics_docs(),
         RobotTopic::Doctor => crate::doctor_robot_docs::doctor_robot_docs_body()
@@ -119849,7 +119870,19 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             preset,
             paths,
             no_test,
-        } => run_sources_add(&url, name, preset, paths, no_test),
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_add(&url, name, preset, paths, no_test, structured_format)
+        }
+        SourcesCommand::Schedule {
+            name,
+            schedule,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_schedule(&name, schedule, structured_format)
+        }
         SourcesCommand::Remove { name, purge, yes } => run_sources_remove(&name, purge, yes),
         SourcesCommand::Doctor {
             source,
@@ -120347,9 +120380,18 @@ fn run_sources_add(
     preset: Option<String>,
     paths_arg: Vec<String>,
     no_test: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::sources::config::{Platform, SourceDefinition, SourcesConfig, get_preset_paths};
     use crate::sources::provenance::SourceKind;
+
+    let structured_format = output_format.map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
 
     // Parse URL to extract host
     let (host, source_id) = parse_source_url(url, name.as_deref())?;
@@ -120383,11 +120425,16 @@ fn run_sources_add(
         });
     };
 
-    // Test SSH connectivity unless --no-test
+    // Test SSH connectivity unless --no-test. Structured output keeps stdout
+    // for the result object, so progress text is printed only for humans.
     if !no_test {
-        println!("Testing SSH connectivity to {host}...");
+        if structured_format.is_none() {
+            println!("Testing SSH connectivity to {host}...");
+        }
         test_ssh_connectivity(&host)?;
-        println!("  Connected successfully");
+        if structured_format.is_none() {
+            println!("  Connected successfully");
+        }
     }
 
     // Load existing config
@@ -120454,6 +120501,26 @@ fn run_sources_add(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/cass/sources.toml".into());
 
+    if let Some(fmt) = structured_format {
+        let output = serde_json::json!({
+            "status": "added",
+            "source": {
+                "name": source_id,
+                "type": SourceKind::Ssh.as_str(),
+                "host": host,
+                "paths": paths,
+                "platform": platform.map(|p| p.to_string()),
+            },
+            "connectivity_tested": !no_test,
+            "config_path": config_path,
+            "next_steps": [
+                format!("cass sources sync --source {source_id}"),
+                "cass sources list".to_string(),
+            ],
+        });
+        return output_structured_value(output, fmt);
+    }
+
     println!();
     println!("Added source '{source_id}'");
     println!("  Host: {host}");
@@ -120464,6 +120531,93 @@ fn run_sources_add(
     println!("  cass sources sync --source {source_id}   # Fetch sessions from this source");
     println!("  cass sources list               # View all configured sources");
 
+    Ok(())
+}
+
+/// Set a remote source's `sync_schedule` in sources.toml (GH #531 follow-up).
+fn run_sources_schedule(
+    name: &str,
+    schedule: crate::sources::config::SyncSchedule,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::sources::config::{SourcesConfig, SyncSchedule};
+
+    let structured_format = output_format.map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let mut config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+    let Some(source) = config.find_source_mut(name) else {
+        return Err(CliError {
+            code: 13,
+            kind: CliErrorKind::NotFound.kind_str(),
+            message: format!("Source '{name}' not found"),
+            hint: Some("Run 'cass sources list' to see configured sources".into()),
+            retryable: false,
+        });
+    };
+    if !source.is_remote() {
+        return Err(CliError {
+            code: 10,
+            kind: CliErrorKind::Config.kind_str(),
+            message: format!(
+                "Source '{}' is local; sync_schedule applies only to remote (ssh) sources",
+                source.name
+            ),
+            hint: Some("Local sources are indexed in place by `cass index`".into()),
+            retryable: false,
+        });
+    }
+    let previous = source.sync_schedule;
+    let stored_name = source.name.clone();
+    let changed = previous != schedule;
+    if changed {
+        source.sync_schedule = schedule;
+        config.save().map_err(|e| CliError {
+            code: 11,
+            kind: CliErrorKind::Config.kind_str(),
+            message: format!("Failed to save config: {e}"),
+            hint: Some("Check file permissions on config directory".into()),
+            retryable: false,
+        })?;
+    }
+    let config_path = SourcesConfig::config_path()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    if let Some(fmt) = structured_format {
+        let output = serde_json::json!({
+            "status": if changed { "updated" } else { "unchanged" },
+            "source": stored_name,
+            "sync_schedule": schedule.to_string(),
+            "previous_sync_schedule": previous.to_string(),
+            "config_path": config_path,
+        });
+        return output_structured_value(output, fmt);
+    }
+
+    if changed {
+        println!("Source '{stored_name}': sync_schedule {previous} -> {schedule}");
+    } else {
+        println!("Source '{stored_name}': sync_schedule is already {schedule}");
+    }
+    if matches!(schedule, SyncSchedule::Manual) {
+        println!("  Only an explicit `cass sources sync` fetches it.");
+    } else {
+        println!("  Jobs from `cass schedule install` sync it when due.");
+    }
+    println!("  Config: {config_path}");
     Ok(())
 }
 

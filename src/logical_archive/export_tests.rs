@@ -1283,16 +1283,31 @@ fn wal_writer_committing_during_export_cannot_mix_snapshot_generations() -> Resu
                 && !changed.replace(true)
             {
                 assert!(reader.as_async().in_transaction());
-                writer
-                    .execute_batch(
-                        "BEGIN;
-                         UPDATE messages SET body = 'PRIVATE-NEW-GENERATION' WHERE id = 7;
-                         INSERT INTO messages VALUES (9, 'PRIVATE-NEW-GENERATION', NULL, NULL);
-                         UPDATE meta SET value = '10' WHERE key = 'schema_version';
-                         INSERT INTO z_jobs VALUES (1000, 'PRIVATE-NEW-GENERATION');
-                         DELETE FROM z_jobs;
-                         COMMIT;",
-                    )
+                // Commit from another thread, as a real concurrent writer
+                // does. Calling the blocking API here, on the thread whose
+                // own read is suspended in this callback, re-enters the
+                // driver and never completes (m5cob).
+                let (done, committed) = std::sync::mpsc::channel();
+                let database = database.clone();
+                std::thread::spawn(move || {
+                    let commit = || -> Result<()> {
+                        let writer = Connection::open(path_text(&database)?)?;
+                        writer.execute_batch(
+                            "BEGIN;
+                             UPDATE messages SET body = 'PRIVATE-NEW-GENERATION' WHERE id = 7;
+                             INSERT INTO messages VALUES (9, 'PRIVATE-NEW-GENERATION', NULL, NULL);
+                             UPDATE meta SET value = '10' WHERE key = 'schema_version';
+                             INSERT INTO z_jobs VALUES (1000, 'PRIVATE-NEW-GENERATION');
+                             DELETE FROM z_jobs;
+                             COMMIT;",
+                        )?;
+                        Ok(())
+                    };
+                    let _ = done.send(commit().map_err(|err| format!("{err:#}")));
+                });
+                committed
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("the independent WAL writer must finish within 60 s")
                     .expect(
                         "the independent WAL writer must commit while the read snapshot is held",
                     );

@@ -1212,6 +1212,197 @@ fn sources_add_no_test() {
     tracker.complete();
 }
 
+/// Test: `sources add --json` prints only the saved source as JSON, and a
+/// refused duplicate add prints a JSON error envelope with no stdout data
+/// (GH #531 follow-up, coding_agent_session_search-kw97g).
+#[test]
+fn sources_add_json_reports_the_saved_source_and_refuses_duplicates_as_json() {
+    let tracker =
+        tracker_for("sources_add_json_reports_the_saved_source_and_refuses_duplicates_as_json");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let add = || {
+        tracker
+            .cass_assert_command()
+            .args([
+                "sources",
+                "add",
+                "user@myserver.local",
+                "--name",
+                "myserver",
+                "--preset",
+                "linux-defaults",
+                "--path",
+                "~/extra/sessions",
+                "--no-test",
+                "--json",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .output()
+            .expect("sources add --json")
+    };
+
+    let output = add();
+    assert!(
+        output.status.success(),
+        "sources add --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "stdout must be exactly one JSON value ({err}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(result["status"], "added");
+    assert_eq!(result["source"]["name"], "myserver");
+    assert_eq!(result["source"]["type"], "ssh");
+    assert_eq!(result["source"]["host"], "user@myserver.local");
+    assert_eq!(result["source"]["platform"], "linux");
+    let paths: Vec<&str> = result["source"]["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(paths.contains(&"~/extra/sessions"), "paths: {paths:?}");
+    assert!(paths.len() > 1, "preset paths must be merged: {paths:?}");
+    assert_eq!(result["connectivity_tested"], false);
+    assert_eq!(
+        result["next_steps"][0],
+        "cass sources sync --source myserver"
+    );
+    assert!(read_sources_config(&config_dir).contains("user@myserver.local"));
+
+    let duplicate = add();
+    assert_eq!(duplicate.status.code(), Some(10));
+    assert!(
+        duplicate.stdout.is_empty(),
+        "a refused add must not print success data: {}",
+        String::from_utf8_lossy(&duplicate.stdout)
+    );
+    let error: Value = serde_json::from_slice(&duplicate.stderr).unwrap_or_else(|err| {
+        panic!(
+            "stderr must be a JSON error envelope ({err}): {}",
+            String::from_utf8_lossy(&duplicate.stderr)
+        )
+    });
+    assert_eq!(error["error"]["kind"], "config");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already exists")),
+        "{error}"
+    );
+    assert_eq!(
+        read_sources_config(&config_dir)
+            .matches("user@myserver.local")
+            .count(),
+        1,
+        "the refused add must leave the config unchanged"
+    );
+
+    tracker.complete();
+}
+
+/// Test: `sources schedule` sets a remote source's sync_schedule in
+/// sources.toml, reports unchanged repeats, and refuses unknown names, local
+/// sources and invalid values without touching the config (GH #531
+/// follow-up, coding_agent_session_search-kw97g).
+#[test]
+fn sources_schedule_sets_a_remote_sync_schedule_and_refuses_bad_targets() {
+    let tracker =
+        tracker_for("sources_schedule_sets_a_remote_sync_schedule_and_refuses_bad_targets");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "laptop"
+type = "ssh"
+host = "user@laptop.local"
+paths = ["/home/user/.claude/projects"]
+
+[[sources]]
+name = "here"
+type = "local"
+paths = ["/tmp/sessions"]
+"#,
+    );
+    let run = |args: &[&str]| {
+        tracker
+            .cass_assert_command()
+            .args(args)
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .output()
+            .expect("cass sources schedule")
+    };
+    let schedule_of = |name: &str| -> String {
+        let output = run(&["sources", "list", "--json"]);
+        assert!(output.status.success());
+        let list: Value = serde_json::from_slice(&output.stdout).unwrap();
+        list["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from {list}"))["sync_schedule"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(schedule_of("laptop"), "manual");
+
+    let set = run(&["sources", "schedule", "laptop", "daily", "--json"]);
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let result: Value = serde_json::from_slice(&set.stdout).unwrap();
+    assert_eq!(result["status"], "updated");
+    assert_eq!(result["source"], "laptop");
+    assert_eq!(result["sync_schedule"], "daily");
+    assert_eq!(result["previous_sync_schedule"], "manual");
+    assert_eq!(schedule_of("laptop"), "daily");
+    assert!(read_sources_config(&config_dir).contains("sync_schedule = \"daily\""));
+
+    let again = run(&["sources", "schedule", "laptop", "daily", "--json"]);
+    assert!(again.status.success());
+    let result: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(result["status"], "unchanged");
+
+    let hourly = run(&["sources", "schedule", "laptop", "hourly"]);
+    assert!(hourly.status.success());
+    assert!(String::from_utf8_lossy(&hourly.stdout).contains("daily -> hourly"));
+    assert_eq!(schedule_of("laptop"), "hourly");
+
+    let before = read_sources_config(&config_dir);
+    let missing = run(&["sources", "schedule", "nosuch", "daily", "--json"]);
+    assert_eq!(missing.status.code(), Some(13));
+    assert!(missing.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "not-found");
+
+    let local = run(&["sources", "schedule", "here", "daily", "--json"]);
+    assert_eq!(local.status.code(), Some(10));
+    let error: Value = serde_json::from_slice(&local.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "config");
+
+    let invalid = run(&["sources", "schedule", "laptop", "weekly"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(
+        read_sources_config(&config_dir),
+        before,
+        "refused schedules must leave sources.toml unchanged"
+    );
+
+    tracker.complete();
+}
+
 /// Test: sources add with explicit paths.
 #[test]
 fn sources_add_explicit_paths() {
