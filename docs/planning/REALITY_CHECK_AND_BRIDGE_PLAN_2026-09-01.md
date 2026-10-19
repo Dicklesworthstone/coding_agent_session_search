@@ -140,6 +140,35 @@ Applying `/idea-wizard` (30 candidate improvements winnowed to Top 5 + Next 10),
    - **Pass 4 (Adversarial & Negative Test Specification)**: Every bead includes both positive and planted-negative assertions (e.g., `2l1b0.81` asserts `status: "ready"` AND `stale: true, fresh: false` when `age_seconds > stale_threshold` and `fingerprint_matches == Some(true)`).
    - **Pass 5 (Immediate Execution & Accretive Delivery)**: Transitioned directly from plan space into code execution per `/just-say-no-to-process-porn-and-ceremony`.
 
+### Execution & Gate Receipt Summary (2026-10-14..2026-10-19 — 37 Beads Closed Across 4 Waves)
+
+1. **Wave 1 (6 Beads Closed — `a5dc182d`, `52ebded3`, `c1b1b5d9`, `7958066a`, `54d9610f`, `eaf0a74c`, `6a241c92`; Receipts `/data/tmp/cass-gate.85vSx4`, `/data/tmp/cass-gate.VUDd59`)**:
+   - **`2l1b0.80` (GH #526)**: Restored repo-wide `STAGE=fmt EXIT=0` across 90+ Rust files.
+   - **`dcp01`**: Fixed `publish_staged_lexical_index` empty placeholder backup bug (`src/indexer/mod.rs`), restoring all 3 `tests/cli_doctor.rs` cleanup tests (`6426`, `7420`, `7647`).
+   - **`2l1b0.81`**: Implemented the two-edge freshness model (`src/search/asset_state.rs`, `src/indexer/background_refresh.rs`) so `cass status` and `cass health` honor `--stale-threshold` and `CASS_STALE_THRESHOLD_SECS`.
+   - **`pc522`**: Routed `src/raw_mirror/store.rs` capture tests through production `policy::capture` with over-budget pause diagnostics.
+   - **`2l1b0.82`**: Added all 49 missing `README.md` environment variables to `cass robot-docs env` (`0` warnings in `./scripts/validate_docs.sh --env`), documented `codex-layout-migrate` and `lexical-quarantine`, and aligned 35 connectors in `AGENTS.md`/`README.md`.
+   - **`2l1b0.55`**: Wired TUI `F7`/`Ctrl+Space` context-window (`S`/`M`/`L`/`XL`) geometry, `F9` match mode, and saved-view query persistence (`src/ui/app.rs`).
+2. **Wave 2 (5 Beads Closed — `7ccfd590`, `8cb5815f`, `034b7f80`, `c0728653`; Receipts `/data/tmp/cass-gate.PUz1Fg`, `/data/tmp/cass-gate.0hOdkt`)**:
+   - **`2l1b0.74`**: Closed Windows `fs2` -> `std::fs::File::try_lock` lock-contention migration across indexer, doctor, raw-mirror, Pages, and logical-archive locks.
+   - **`2l1b0.58`**: Added the held-operation-lock `exit 7` (`index-busy`) scenario to `doctor_exit_codes_match_the_advertised_contract` (`tests/cli_doctor.rs`) and verified exit-code 4/6/8/70 contracts.
+   - **`2l1b0.67`**: Verified encrypted `export-html` sealed title/header/metadata and added Node WebCrypto AES-256-GCM unlock verification in `test_encrypted_export_hides_topic_in_default_name_and_html` (`tests/html_export_integration.rs`).
+   - **`2l1b0.61`**: Verified Pages viewer typed recovery-key entry (`site/index.html`, `site/auth.js`) and non-reused revoked key-slot IDs (`tests/pages_key_cli.rs`).
+   - **`gh465-trust-proof-gnr6n`**: Verified release containment retains `ProofDebt` instead of escalating to `Proven` without claim-specific proof (`tests/e2e_search_trust_meta_gate.rs`).
+3. **Wave 3 (3 Beads Closed — `bb4d8137`; Receipt `/data/tmp/cass-gate.GspwnK`)**:
+   - **`2l1b0.42` (GH #491)**: Verified `--build-hnsw` ANN setup help, `models status --json`, and `capabilities`/`introspect` goldens (`tests/e2e_lexical_fail_open.rs`, `tests/cli_robot.rs`).
+   - **`ds7uy.4.1`**: Verified explicit semantic robot-budget two-checkpoint fail-closed execution (`src/lib.rs`, `tests/spec_search_format_contracts.rs`).
+   - **`2l1b0.68`**: Verified `_meta.effective` interpretation echo on `search` and `pack`, `_meta.wildcard_fallback_skipped`, and the 9-relation `tests/search_metamorphic.rs` oracle (`tests/search_wildcard_fallback.rs` 63/63).
+4. **Wave 4 (23 Beads Closed — Receipt `/data/tmp/cass-gate.MWVkPx`, `gate: GREEN`, 240 tests + 68 goldens + `STAGE=ubs EXIT=0`)**:
+   - **`yb11u`**: `serve --query` one-shot surface aligned in `capabilities.json.golden` and `introspect.json.golden` (`11724d5b`, 68/68 goldens).
+   - **`uvii3`**: SQLite source-scan fallback and FTS5 lane `NOT > AND > OR` precedence, local negation, and within-field phrase adjacency (`sqlite_message_scan` 8/8 + `search_metamorphic` 9/9).
+   - **`6r17d` (GH #494)**: Resumed candidate with uncounted documents retained to `.lexical-rebuild-quarantine-*` and rebuilt from zero in the same run (`f5a9d48c`, `5f948841`).
+   - **`igh4d`**: Primary writer discovers FrankenSQLite virtual FTS (`rootpage = 0`) via `type = 'table'` (`ca621f9d`, `storage_frankensqlite_parity` 39/39).
+   - **`9lz4y`**: `doctor_database_quick_check` collects multi-row `PRAGMA quick_check(1)` findings (`bc5f89f5`).
+   - **`kz23l` (GH #413)**, **`r5c6h` (GH #440)**, **`cdzcl`**, **`qz43b`**, **`hh4jf`**: Legacy readonly resume FTS shadow preflight, resumed shared-writer checkpoint fingerprint/count finalization, object-only index idempotency cache replay, non-ASCII `source_repo` prefix guard in `parse_bead_refs`, and `usize::MAX` saturating context arithmetic in `view`/`expand`.
+   - **`qu81y.6`**, **`qu81y.5`**, **`qu81y.2`**, **`yylyr`**: Zero-parent-env-mutation isolation across `packet_audit.rs`, `tests/util/e2e_log.rs`, `tests/connector_omp.rs` (12/12), and `tests/connector_chatgpt.rs` (82/82).
+   - **`i7amy`**, **`gk9ho` (GH #481)**, **`mtt5q` (GH #480)**, **`mlo9d` (GH #476)**, **`931di` (GH #478)**, **`gh466-canonical-lexical-cap-a3fvq` (GH #466)**, **`mduty`**, **`watch-lexical-oom-retry-dh3vd`**, **`6i5ji`**: Bounded `hnsw_present`/`hnsw_state` projection, incremental semantic append preflight before model load, explicit `--embedder` override precedence, marker-independent FTS shadow corpus bound, watch-once symlink connector hint preservation, retained canonical prefix lexical cap, daemon quality model alias/refusal enforcement, connector-qualified watch-once lexical OOM replay debt, and continuous semantic watch cooldown retention/publication.
+
 ---
 
 ## Assessment: 2026-09-23 night (DarkFinch)
