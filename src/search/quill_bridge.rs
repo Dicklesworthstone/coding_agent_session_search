@@ -32,6 +32,9 @@ use frankensearch::quill::cass::{
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument};
 
+#[path = "quill_bridge/fuel_errors.rs"]
+mod fuel_errors;
+
 /// Filename that marks a directory as a published Quill index.
 ///
 /// Verified empirically rather than assumed: a freshly created CASS index
@@ -46,15 +49,13 @@ pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 /// knob; the durable fix for fuel exhaustion is a compacted index (#441).
 pub const CASS_QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
 
-/// Whether `error` is Quill's typed query-fuel refusal (#441), anywhere in
-/// its context chain. The engine reports it as `... query fuel exhausted after
-/// N/M units ...`; callers use this to tell "the lexical engine refused the
-/// work" apart from an index fault.
+/// Whether `error` is a Quill query-fuel refusal, anywhere in its cause chain.
+/// Concrete engine errors take precedence over diagnostic text. Historical
+/// flattened bridge errors are accepted only in the engine's diagnostic format,
+/// not because a query, context or unrelated failure mentions fuel exhaustion.
 #[must_use]
 pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains("query fuel exhausted"))
+    fuel_errors::is_exhausted(error)
 }
 
 /// Whether `error` is Quill's posting-cursor invariant refusal
@@ -313,7 +314,12 @@ pub fn search_paginated(
     let result = drive(|cx| async move {
         reader.search_preparsed_paginated(&cx, query, limit, offset, exact_count)
     })
-    .map_err(|error| anyhow!("executing a Quill lexical query: {error}"))?;
+    .map_err(|error| {
+        // Preserve the engine type for recovery admission, while retaining the
+        // full outer display for CLI callers that do not print the cause chain.
+        let diagnostic = format!("executing a Quill lexical query: {error}");
+        anyhow::Error::new(error).context(diagnostic)
+    })?;
     Ok(QuillLexicalPage {
         hits: result
             .hits
