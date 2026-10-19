@@ -782,6 +782,9 @@ cass sources list [--verbose] [--json]
 # Add a new source
 cass sources add <user@host> [--name <name>] [--preset macos-defaults|linux-defaults] [--path <path>...] [--no-test] [--json]
 
+# Set how often `cass schedule install` jobs sync a remote source (default: manual)
+cass sources schedule <name> <manual|hourly|daily> [--json]
+
 # Remove a source
 cass sources remove <name> [--purge] [-y]
 
