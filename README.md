@@ -1076,18 +1076,22 @@ hit can be a landed fix or a failed attempt):
 
 | `trust_tier` | Meaning | What to do |
 |--------------|---------|------------|
-| `trusted` | Landed, proof-backed, release/bead-contained | Safe to reuse |
-| `likely` | Has provenance (commit/closed bead) but not proof-pinned | Confirm via the cited ref first |
+| `trusted` | Landed and backed by claim-specific proof (schema-defined in `trust_scoring`; live search/pack correlation retains `proof_debt` -> `likely` until claim-specific proof is supplied) | Safe to reuse |
+| `likely` | Has provenance (commit/closed bead/release) with `proof_debt` (not claim-proof-pinned) | Confirm via the cited ref first |
 | `unverified` | Relevant but no provenance link, or lexical-only corroboration | Corroborate before reuse |
-| `stale` | Aged out (`aged_out`) or superseded (`superseded_by_newer`) | Prefer a newer result |
-| `failed` | A failed/reverted attempt (`failed_attempt`) | Do not reuse |
+| `stale` | Aged out (`aged_out` in live search; `superseded_by_newer` is schema-defined when supersession markers are supplied) | Prefer a newer result |
+| `failed` | A failed/reverted attempt (`failed_attempt`, schema-defined when explicit failure markers are supplied) | Do not reuse |
 
 The verdict is **advisory metadata only** — it never changes result ordering.
 It is derived from metadata-only signals (recency, source health, realized
 search mode, cwd-relative workspace match, and — opportunistically — linked
-commit/bead/release provenance); it carries no raw session text. The same
-`trust` block is attached to `cass pack` evidence. Branch on `trust_tier` and
-`stale_reason`, not on `confidence` alone.
+commit/bead/release provenance); it carries no raw session text. Live `cass search`
+and `cass pack` correlation currently emits `likely`, `unverified`, and `stale`
+(with `stale_reason` values `aged_out`, `source_unhealthy`, `workspace_mismatch`,
+`proof_debt`, `lexical_only`, or `corroboration_needed`), while `trusted` and
+`failed` remain in the schema v1 `TrustTier` vocabulary for explicit proof or
+failure inputs. The same `trust` block is attached to `cass pack` evidence.
+Branch on `trust_tier` and `stale_reason`, not on `confidence` alone.
 
 Provenance correlation is **project-scoped and explicit-reference anchored**:
 for a hit from the project you are running `cass` in now, cass links it to a

@@ -238,12 +238,142 @@ fn assert_viewer_worker_unlocks(bundle: &Path, secret: &str, refused: Option<&st
 
         const refusedSecret = process.env.CASS_REFUSED_SECRET
             || (secret[0] === 'A' ? 'B' : 'A') + secret.slice(1);
-        const refused = await request({ type: 'UNLOCK_RECOVERY', recoverySecret: refusedSecret, config, requestId: 1 });
+        const indexHtml = await readFile(join(site, 'index.html'), 'utf8');
+        for (const requiredId of ['id="recovery-key-btn"', 'id="recovery-key-form"', 'id="recovery-key-input"', 'id="recovery-key-submit"']) {
+            if (!indexHtml.includes(requiredId)) {
+                throw new Error(`site/index.html missing ${requiredId}`);
+            }
+        }
+
+        // Exercise auth.js's recovery-key button, form submit, input zeroization,
+        // and wrong-secret error presentation before and during worker handoff.
+        const authSource = (await readFile(join(site, 'auth.js'), 'utf8'))
+            .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];\s*$/gm, '')
+            .replace(/const ARCHIVE_SCOPE_URL =[\s\S]*?const QR_SCANNER_LIBRARY_URL =[^\n]+/m, '')
+            .replace(/if \(document\.readyState === "loading"\)[\s\S]*$/m, '');
+        const makeClassList = (initial = []) => {
+            const set = new Set(initial);
+            return {
+                contains: (c) => set.has(c),
+                add: (c) => set.add(c),
+                remove: (c) => set.delete(c),
+                toggle: (c, force) => {
+                    const shouldAdd = force === undefined ? !set.has(c) : Boolean(force);
+                    if (shouldAdd) set.add(c); else set.delete(c);
+                    return shouldAdd;
+                },
+            };
+        };
+        const makeEl = (classes = []) => {
+            const attrs = new Map();
+            const listeners = new Map();
+            return {
+                value: '',
+                disabled: false,
+                textContent: '',
+                style: {},
+                classList: makeClassList(classes),
+                setAttribute: (k, v) => attrs.set(k, String(v)),
+                getAttribute: (k) => attrs.get(k) ?? null,
+                addEventListener: (ev, fn) => listeners.set(ev, fn),
+                dispatch: (ev, payload = {}) => listeners.get(ev)?.(payload),
+                focus() { this.focused = true; },
+                querySelector() { return null; },
+            };
+        };
+        const errorMessageEl = makeEl();
+        const authErrorEl = makeEl(['hidden']);
+        authErrorEl.querySelector = (sel) => sel === '.error-message' ? errorMessageEl : null;
+        const progressFillEl = makeEl();
+        const progressTextEl = makeEl();
+        const authProgressEl = makeEl(['hidden']);
+        authProgressEl.querySelector = (sel) => {
+            if (sel === '.progress-fill') return progressFillEl;
+            if (sel === '.progress-text') return progressTextEl;
+            return null;
+        };
+        const domById = {
+            'auth-screen': makeEl(),
+            'app-screen': makeEl(['hidden']),
+            'auth-form': makeEl(),
+            'password': makeEl(),
+            'unlock-btn': makeEl(),
+            'toggle-password': makeEl(),
+            'qr-btn': makeEl(),
+            'recovery-key-btn': makeEl(),
+            'recovery-key-form': makeEl(['auth-form', 'hidden']),
+            'recovery-key-input': makeEl(),
+            'recovery-key-submit': makeEl(),
+            'qr-scanner': makeEl(['hidden']),
+            'qr-reader': makeEl(),
+            'qr-cancel-btn': makeEl(),
+            'fingerprint-value': makeEl(),
+            'fingerprint-help': makeEl(),
+            'fingerprint-tooltip': makeEl(['hidden']),
+            'auth-error': authErrorEl,
+            'auth-progress': authProgressEl,
+            'lock-btn': makeEl(),
+            'strength-meter': null,
+            'strength-label': null,
+            'strength-suggestions': null,
+        };
+        const postedToWorker = [];
+        const authContext = {
+            console,
+            window: { addEventListener() {}, cassSession: null },
+            document: {
+                getElementById: (id) => domById[id] ?? null,
+                querySelector: () => null,
+                addEventListener() {},
+            },
+            StorageMode: { MEMORY: 'memory' },
+            JSON,
+            Error,
+            String,
+            Boolean,
+        };
+        vm.createContext(authContext);
+        vm.runInContext(
+            `${authSource}\nthis.__test = { cacheElements, setupEventListeners, handleUnlockFailed, setContext: (cfg, w) => { config = cfg; worker = w; } };`,
+            authContext,
+        );
+        authContext.__test.cacheElements();
+        authContext.__test.setupEventListeners();
+        authContext.__test.setContext(config, {
+            postMessage: (msg) => postedToWorker.push(msg),
+        });
+
+        // 1. Clicking 'Use Recovery Key' reveals the form and focuses the input.
+        domById['recovery-key-btn'].dispatch('click');
+        if (domById['recovery-key-form'].classList.contains('hidden') || domById['recovery-key-btn'].getAttribute('aria-expanded') !== 'true') {
+            throw new Error('clicking Use Recovery Key must reveal #recovery-key-form');
+        }
+        // 2. Submitting an empty recovery key shows the validation prompt.
+        domById['recovery-key-form'].dispatch('submit', { preventDefault() {} });
+        if (authErrorEl.classList.contains('hidden') || errorMessageEl.textContent !== 'Enter the recovery key') {
+            throw new Error(`empty recovery submit should prompt for key: ${errorMessageEl.textContent}`);
+        }
+        // 3. Submitting a wrong recovery key clears the input, disables controls,
+        //    posts UNLOCK_RECOVERY to the worker, and surfaces the worker error.
+        domById['recovery-key-input'].value = `  ${refusedSecret}\n`;
+        domById['recovery-key-form'].dispatch('submit', { preventDefault() {} });
+        if (domById['recovery-key-input'].value !== '' || !domById['recovery-key-submit'].disabled) {
+            throw new Error('submitting recovery key must immediately clear input and disable controls');
+        }
+        const formRefusedReq = postedToWorker.pop();
+        const refused = await request(formRefusedReq);
         if (refused?.type !== 'UNLOCK_FAILED') {
             throw new Error(`a wrong recovery key was not refused: ${JSON.stringify(refused)}`);
         }
-        // The form posts the typed text; a paste carries surrounding whitespace.
-        const unlocked = await request({ type: 'UNLOCK_RECOVERY', recoverySecret: `  ${secret}\n`, config, requestId: 2 });
+        authContext.__test.handleUnlockFailed(refused);
+        if (authErrorEl.classList.contains('hidden') || !errorMessageEl.textContent || domById['recovery-key-submit'].disabled) {
+            throw new Error(`failed unlock must show error and re-enable form: ${errorMessageEl.textContent}`);
+        }
+        // 4. Submitting the printed recovery key (with surrounding whitespace) unlocks and decrypts.
+        domById['recovery-key-input'].value = `  ${secret}\n`;
+        domById['recovery-key-form'].dispatch('submit', { preventDefault() {} });
+        const formUnlockReq = postedToWorker.pop();
+        const unlocked = await request(formUnlockReq);
         if (unlocked?.type !== 'UNLOCK_SUCCESS') {
             throw new Error(`the printed recovery key did not unlock: ${JSON.stringify(unlocked)}`);
         }
@@ -255,7 +385,13 @@ fn assert_viewer_worker_unlocks(bundle: &Path, secret: &str, refused: Option<&st
         if (text !== 'pages key cli fixture') {
             throw new Error(`the recovered key decrypted the wrong bytes: ${JSON.stringify(text)}`);
         }
-        console.log(JSON.stringify({ refused: refused.type, unlocked: unlocked.type, decrypted: decrypted.type }));
+        console.log(JSON.stringify({
+            refused: refused.type,
+            refused_error: errorMessageEl.textContent,
+            unlocked: unlocked.type,
+            decrypted: decrypted.type,
+            dom_form_verified: true,
+        }));
     "#;
     // No --experimental-default-type: Node 24 removed it, and the worker has no
     // import/export, so it loads the same as CommonJS or as a module.

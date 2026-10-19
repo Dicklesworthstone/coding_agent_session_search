@@ -1442,6 +1442,50 @@ fn doctor_exit_codes_match_the_advertised_contract() {
     );
     assert_advertised(5, "doctor");
 
+    // A repair blocked by an active operation lock exits 7 (`index-busy`); the
+    // full report stays on stdout with `operation_outcome.exit_code_kind = "lock-busy"`.
+    let lock_dir = data_dir.join("doctor").join("locks");
+    fs::create_dir_all(&lock_dir).expect("create doctor lock dir");
+    let lock_path = lock_dir.join("doctor-repair.lock");
+    let mut lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open doctor lock");
+    lock_file
+        .try_lock_exclusive()
+        .expect("hold doctor mutation lock");
+    writeln!(
+        lock_file,
+        "schema_version=1\npid={}\nstarted_at_ms=1733001111000\nupdated_at_ms=1733001112000\ndb_path={}\nmode=safe_auto_run\ncommand=cass doctor --fix",
+        std::process::id(),
+        data_dir.join("agent_search.db").display()
+    )
+    .expect("write lock metadata");
+    lock_file.flush().expect("flush lock");
+    let locked = run(
+        "fix blocked by held doctor lock",
+        &["doctor", "--json", "--fix", "--data-dir", data_dir_arg],
+    );
+    assert_eq!(
+        locked.status.code(),
+        Some(7),
+        "repair blocked by active lock"
+    );
+    let locked_payload: Value =
+        serde_json::from_slice(&locked.stdout).expect("doctor json on lock-busy");
+    assert_eq!(
+        locked_payload["operation_outcome"]["kind"], "repair-blocked",
+        "exit 7 must report repair-blocked: {locked_payload:#}"
+    );
+    assert_eq!(
+        locked_payload["operation_outcome"]["exit_code_kind"], "lock-busy",
+        "exit 7 must report lock-busy exit_code_kind: {locked_payload:#}"
+    );
+    assert_advertised(7, "index-busy");
+
     // robot-docs doctor documents only advertised codes.
     let docs = run("robot-docs doctor", &["robot-docs", "doctor"]);
     assert!(docs.status.success(), "robot-docs doctor failed");
