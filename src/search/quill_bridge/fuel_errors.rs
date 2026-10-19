@@ -176,7 +176,10 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("building CASS query parser: {error}"))?;
         for raw in ["git fixture", "test isolation"] {
             let query = parser.parse(raw, &CassQueryFilters::default()).query;
-            assert_eq!(search_paginated(&normal, &query, 1, 0, false)?.hits.len(), 1);
+            assert_eq!(
+                search_paginated(&normal, &query, 1, 0, false)?.hits.len(),
+                1
+            );
             for exact_count in [false, true] {
                 let error = search_paginated(&constrained, &query, 1, 0, exact_count)
                     .expect_err("the reader must actually meter its work");
@@ -189,7 +192,9 @@ mod tests {
                 );
                 assert!(is_query_fuel_exhausted(&error));
                 assert!(
-                    error.to_string().starts_with("executing a Quill lexical query: ")
+                    error
+                        .to_string()
+                        .starts_with("executing a Quill lexical query: ")
                 );
             }
         }

@@ -405,9 +405,17 @@ mod tests {
     fn transcript_one_shot_requires_archive_consent_and_excludes_other_transports() {
         ServiceCli::command().debug_assert();
         let base = [
-            "cass", "serve", "--index", "/never-opened", "--transcript", TRANSCRIPT,
+            "cass",
+            "serve",
+            "--index",
+            "/never-opened",
+            "--transcript",
+            TRANSCRIPT,
         ];
-        assert!(ServiceCli::try_parse_from(base).is_err(), "--db is required");
+        assert!(
+            ServiceCli::try_parse_from(base).is_err(),
+            "--db is required"
+        );
         let configured = base
             .into_iter()
             .chain(["--db", "/archive.db"])
@@ -415,7 +423,12 @@ mod tests {
         let request = parse_options(&configured).request().unwrap().unwrap();
         assert!(matches!(
             request,
-            Request::Transcript { id: 1, limit: 16, cursor: None, .. }
+            Request::Transcript {
+                id: 1,
+                limit: 16,
+                cursor: None,
+                ..
+            }
         ));
         for extra in [
             vec!["--stdio"],
@@ -428,14 +441,20 @@ mod tests {
             vec!["--approximate"],
             vec!["--reranker-model", "/model"],
         ] {
-            assert!(
-                ServiceCli::try_parse_from(configured.iter().copied().chain(extra)).is_err()
-            );
+            assert!(ServiceCli::try_parse_from(configured.iter().copied().chain(extra)).is_err());
         }
         assert!(
             ServiceCli::try_parse_from([
-                "cass", "serve", "--data-dir", "/never-opened", "--db", "/archive.db",
-                "--transcript", TRANSCRIPT, "--semantic-embedder", "hash",
+                "cass",
+                "serve",
+                "--data-dir",
+                "/never-opened",
+                "--db",
+                "/archive.db",
+                "--transcript",
+                TRANSCRIPT,
+                "--semantic-embedder",
+                "hash",
             ])
             .is_err()
         );
@@ -456,8 +475,14 @@ mod tests {
         let actual = transcript_request(&selection.to_string()).unwrap();
         let extract = |request| {
             let Request::Transcript {
-                id, source_path, source_id, conversation_id, cursor, limit,
-            } = request else {
+                id,
+                source_path,
+                source_id,
+                conversation_id,
+                cursor,
+                limit,
+            } = request
+            else {
                 panic!("expected canonical transcript request");
             };
             (id, source_path, source_id, conversation_id, cursor, limit)
@@ -468,21 +493,35 @@ mod tests {
     #[test]
     fn transcript_one_shot_rejects_ambiguous_malformed_and_unknown_selections() {
         for selection in ["", "null", "[]", "{}", "true", "{", "{} {}"] {
-            assert!(transcript_request(selection).is_err(), "accepted {selection}");
+            assert!(
+                transcript_request(selection).is_err(),
+                "accepted {selection}"
+            );
         }
         let base: serde_json::Value = serde_json::from_str(TRANSCRIPT).unwrap();
         for (field, value) in [
-            ("conversation_id", json!(0)), ("conversation_id", json!(-1)),
-            ("conversation_id", json!(u64::MAX)), ("conversation_id", json!(1.5)),
-            ("source_path", json!(" ")), ("source_path", json!("δ".repeat(2049))),
-            ("source_id", json!(" local ")), ("source_id", json!(null)),
-            ("limit", json!(0)), ("limit", json!(33)), ("limit", json!("1")),
-            ("cursor", json!({})), ("op", json!("transcript")), ("id", json!(1)),
+            ("conversation_id", json!(0)),
+            ("conversation_id", json!(-1)),
+            ("conversation_id", json!(u64::MAX)),
+            ("conversation_id", json!(1.5)),
+            ("source_path", json!(" ")),
+            ("source_path", json!("δ".repeat(2049))),
+            ("source_id", json!(" local ")),
+            ("source_id", json!(null)),
+            ("limit", json!(0)),
+            ("limit", json!(33)),
+            ("limit", json!("1")),
+            ("cursor", json!({})),
+            ("op", json!("transcript")),
+            ("id", json!(1)),
             ("filters", json!({"agents":["codex"]})),
         ] {
             let mut selection = base.clone();
             selection[field] = value;
-            assert!(transcript_request(&selection.to_string()).is_err(), "accepted {field}");
+            assert!(
+                transcript_request(&selection.to_string()).is_err(),
+                "accepted {field}"
+            );
         }
         assert!(transcript_request(r#"{"source_path":"/x","source_id":"local","source_id":"other","conversation_id":7}"#).is_err());
     }
@@ -513,32 +552,86 @@ mod tests {
 
     #[test]
     fn transcript_one_shot_bounds_encoded_input_before_json_decoding() {
-        let exact = format!("{}{}", TRANSCRIPT, " ".repeat(protocol::MAX_REQUEST_BYTES - TRANSCRIPT.len()));
+        let exact = format!(
+            "{}{}",
+            TRANSCRIPT,
+            " ".repeat(protocol::MAX_REQUEST_BYTES - TRANSCRIPT.len())
+        );
         assert!(transcript_request(&exact).is_ok());
-        assert!(transcript_request(&(exact + " ")).unwrap_err().contains("64 KiB"));
-        assert!(transcript_request(&"δ".repeat(protocol::MAX_REQUEST_BYTES / 2 + 1))
-            .unwrap_err().contains("64 KiB"), "limit counts UTF-8 bytes, not characters");
+        assert!(
+            transcript_request(&(exact + " "))
+                .unwrap_err()
+                .contains("64 KiB")
+        );
+        assert!(
+            transcript_request(&"δ".repeat(protocol::MAX_REQUEST_BYTES / 2 + 1))
+                .unwrap_err()
+                .contains("64 KiB"),
+            "limit counts UTF-8 bytes, not characters"
+        );
     }
 
     #[test]
     fn constructed_transcript_options_cannot_discard_search_scopes() {
         for mut options in [
-            Options { query: Some("needle".into()), ..Options::default() },
-            Options { mode: Some(QueryMode::Lexical), ..Options::default() },
-            Options { approximate: true, ..Options::default() },
-            Options { limit: Some(1), ..Options::default() },
-            Options { offset: Some(0), ..Options::default() },
-            Options { agents: vec!["codex".into()], ..Options::default() },
-            Options { workspaces: vec!["/work".into()], ..Options::default() },
-            Options { source_id: Some("local".into()), ..Options::default() },
-            Options { created_from: Some(0), ..Options::default() },
-            Options { created_to: Some(0), ..Options::default() },
+            Options {
+                query: Some("needle".into()),
+                ..Options::default()
+            },
+            Options {
+                mode: Some(QueryMode::Lexical),
+                ..Options::default()
+            },
+            Options {
+                approximate: true,
+                ..Options::default()
+            },
+            Options {
+                limit: Some(1),
+                ..Options::default()
+            },
+            Options {
+                offset: Some(0),
+                ..Options::default()
+            },
+            Options {
+                agents: vec!["codex".into()],
+                ..Options::default()
+            },
+            Options {
+                workspaces: vec!["/work".into()],
+                ..Options::default()
+            },
+            Options {
+                source_id: Some("local".into()),
+                ..Options::default()
+            },
+            Options {
+                created_from: Some(0),
+                ..Options::default()
+            },
+            Options {
+                created_to: Some(0),
+                ..Options::default()
+            },
         ] {
             options.transcript = Some(TRANSCRIPT.into());
-            assert!(options.request().unwrap_err().contains("cannot be combined"));
+            assert!(
+                options
+                    .request()
+                    .unwrap_err()
+                    .contains("cannot be combined")
+            );
         }
-        assert!(matches!(Options { transcript: Some(TRANSCRIPT.into()), ..Options::default() }
-            .request().unwrap(), Some(Request::Transcript { .. })));
+        assert!(matches!(
+            Options {
+                transcript: Some(TRANSCRIPT.into()),
+                ..Options::default()
+            }
+            .request()
+            .unwrap(),
+            Some(Request::Transcript { .. })
+        ));
     }
 
     #[test]
