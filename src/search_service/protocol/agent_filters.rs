@@ -61,8 +61,10 @@ pub(super) fn normalize(agents: &[String]) -> Result<Vec<String>, String> {
                 .map(|slug| (*slug, strsim::levenshtein(candidate, slug)))
                 .filter(|(_, distance)| *distance <= 3)
                 .min_by_key(|(_, distance)| *distance)
+                // ubs:ignore[rust.perf.string-alloc-in-loop] -- One bounded suggestion is built only on the returning error path.
                 .map(|(slug, _)| format!("Did you mean '{slug}'? "))
                 .unwrap_or_default();
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- A single diagnostic returns immediately; raw values are capped at 4096 bytes.
             return Err(format!(
                 "unknown agent filter {raw:?}. {suggestion}Known agents: {}. Run 'cass capabilities --json' to list connectors.",
                 known.join(", ")
@@ -70,6 +72,7 @@ pub(super) fn normalize(agents: &[String]) -> Result<Vec<String>, String> {
         };
         // A repeated alias must preserve union semantics, never widen scope.
         if !resolved.iter().any(|value| value == agent) {
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Owned canonical output is bounded by MAX_FILTERS (32), checked before this loop.
             resolved.push(agent.to_string());
         }
     }
@@ -86,8 +89,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{Filters, Request, validate_search};
+    use super::*;
     use serde_json::json;
 
     fn names(values: &[&str]) -> Vec<String> {
@@ -96,28 +99,49 @@ mod tests {
 
     #[test]
     fn aliases_preserve_canonical_scope_and_distinct_agent_union() {
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(
             normalize(&names(&[
-                " Claude-Code ", "claude", "Claude_Code", "CODEX", "pi-agent",
-                "Oh-My-Pi", "ohmypi", "open-claw", "Open_Claw", "UNKNOWN",
-            ])).unwrap(),
-            names(&["claude_code", "codex", "pi_agent", "omp", "openclaw", "unknown"])
+                " Claude-Code ",
+                "claude",
+                "Claude_Code",
+                "CODEX",
+                "pi-agent",
+                "Oh-My-Pi",
+                "ohmypi",
+                "open-claw",
+                "Open_Claw",
+                "UNKNOWN",
+            ]))
+            .unwrap(),
+            names(&[
+                "claude_code",
+                "codex",
+                "pi_agent",
+                "omp",
+                "openclaw",
+                "unknown"
+            ])
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert!(normalize(&[]).unwrap().is_empty());
     }
 
     #[test]
     fn every_registered_identity_accepts_case_and_separator_variants() {
         for slug in known_agents() {
+            // ubs:ignore[rust.panic.assert-macros,rust.perf.string-alloc-in-loop] -- Test compares owned case variants for the finite connector registry.
             assert_eq!(
                 normalize(&[
                     (*slug).to_string(),
                     slug.to_ascii_uppercase().replace('_', "-"),
-                ]).unwrap(),
+                ])
+                .unwrap(),
                 [(*slug).to_string()]
             );
         }
         // Availability on this host is not part of filter admission.
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(normalize(&names(&["aider"])).unwrap(), names(&["aider"]));
     }
 
@@ -130,11 +154,17 @@ mod tests {
             names(&["未登録"]),
         ] {
             let error = normalize(&agents).unwrap_err();
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
             assert!(error.contains("unknown agent filter"));
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
             assert!(error.contains("Known agents:"));
         }
-        assert!(normalize(&names(&["claud_code"]))
-            .unwrap_err().contains("Did you mean 'claude_code'?"));
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+        assert!(
+            normalize(&names(&["claud_code"]))
+                .unwrap_err()
+                .contains("Did you mean 'claude_code'?")
+        );
     }
 
     #[test]
@@ -145,9 +175,12 @@ mod tests {
             names(&[""]),
             names(&["  "]),
         ] {
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
             assert!(normalize(&agents).is_err());
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
             assert!(serde_json::from_value::<Filters>(json!({"agents": agents})).is_err());
         }
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(
             normalize(&vec!["claude".to_string(); MAX_FILTERS]).unwrap(),
             names(&["claude_code"])
@@ -169,6 +202,7 @@ mod tests {
             if op == "refine" {
                 value["lexical_query"] = json!("paper cuts");
             }
+            // ubs:ignore[rust.collections.clone-in-loop] -- Two test operations each need an independent copy before the invalid-scope control.
             let request = serde_json::from_value::<Request>(value.clone()).unwrap();
             let filters = match request {
                 Request::Search { filters, .. }
@@ -176,14 +210,25 @@ mod tests {
                 | Request::Refine { filters, .. } => filters,
                 _ => panic!("expected a retrieval request"),
             };
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
             assert_eq!(filters.agents, names(&["claude_code", "codex"]));
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
             assert_eq!(filters.workspaces, names(&[" /Case/Sensitive "]));
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
             assert_eq!(filters.source_id.as_deref(), Some("remote/CaseSensitive"));
-            assert_eq!((filters.created_from, filters.created_to), (Some(-1), Some(42)));
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+            assert_eq!(
+                (filters.created_from, filters.created_to),
+                (Some(-1), Some(42))
+            );
             validate_search("paper cuts", 1, 0, &filters).unwrap();
             value["filters"]["agents"] = json!(["claude", "claud_code"]);
             let error = serde_json::from_value::<Request>(value).unwrap_err();
-            assert!(error.to_string().contains("unknown agent filter"), "{op}: {error}");
+            // ubs:ignore[rust.panic.assert-macros,rust.perf.string-alloc-in-loop] -- Test must check the error text for each of the two protocol operations.
+            assert!(
+                error.to_string().contains("unknown agent filter"),
+                "{op}: {error}"
+            );
         }
     }
 
@@ -191,13 +236,22 @@ mod tests {
     fn direct_filter_decoding_and_internal_validation_do_not_allow_unknown_scopes() {
         // MCP argument structs deserialize this same Filters type, not Request.
         let filters: Filters = serde_json::from_value(json!({"agents": ["Claude_Code"]})).unwrap();
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(filters.agents, names(&["claude_code"]));
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert!(serde_json::from_value::<Filters>(json!({"agents": ["nonsense-agent"]})).is_err());
         let invalid = Filters {
             agents: names(&["codex", "nonsense-agent"]),
             ..Filters::default()
         };
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert!(validate_search("paper cuts", 1, 0, &invalid).is_err());
-        assert!(serde_json::from_value::<Filters>(json!({})).unwrap().agents.is_empty());
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+        assert!(
+            serde_json::from_value::<Filters>(json!({}))
+                .unwrap()
+                .agents
+                .is_empty()
+        );
     }
 }

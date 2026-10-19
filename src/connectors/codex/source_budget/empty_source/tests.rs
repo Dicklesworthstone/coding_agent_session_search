@@ -67,6 +67,7 @@ fn zero_message_failures_do_not_report_success_or_starve_healthy_sources() -> Re
             let mut delivered = Vec::new();
             let mut completed = Vec::new();
             let mut complete = |done: &SourceCompletion| {
+                // ubs:ignore[rust.collections.clone-in-loop] -- Own each source path retained by the test callback.
                 completed.push(done.source.source_path.clone());
                 Ok(())
             };
@@ -81,20 +82,28 @@ fn zero_message_failures_do_not_report_success_or_starve_healthy_sources() -> Re
                     Ok(())
                 })
                 .unwrap_err();
+            // ubs:ignore[rust.panic.assert-macros] -- Test failure must reject the incorrect error kind.
             assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), expected);
+            // ubs:ignore[rust.panic.assert-macros,rust.collections.clone-in-loop] -- Compare owned fixture paths; mismatch must fail the test.
             assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
+            // ubs:ignore[rust.panic.assert-macros] -- Test assertion forbids certifying an undelivered source.
             assert_eq!(completed, delivered);
+            // ubs:ignore[rust.panic.assert-macros] -- A corrupt source must fail the collecting scan too.
             assert!(connector.scan(&ctx).is_err());
+            // ubs:ignore[rust.panic.assert-macros] -- The scan must preserve the fixture's source bytes.
             assert_eq!(fs::read(&paths[1])?, bytes);
         }
         let repaired = if extension == "json" {
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Own one small repaired fixture for this test case.
             "{\"items\":[{\"role\":\"user\",\"content\":\"repaired\"}]}".to_owned()
         } else {
             message("repaired")
         };
         fs::write(&paths[1], repaired)?;
         let retry = CodexConnector::new().scan(&ctx)?;
+        // ubs:ignore[rust.panic.assert-macros] -- Retry must recover all three fixture conversations.
         assert_eq!(retry.len(), 3);
+        // ubs:ignore[rust.panic.assert-macros] -- The repaired source must supply its actual message.
         assert_eq!(retry[1].messages[0].content, "repaired");
     }
     Ok(())
@@ -115,9 +124,13 @@ fn valid_empty_sources_and_historical_jsonl_tolerance_are_preserved() -> Result<
     ] {
         let (_temp, paths, ctx) = fixture(extension, content.as_bytes())?;
         let conversations = CodexConnector::new().scan(&ctx)?;
+        // ubs:ignore[rust.panic.assert-macros] -- Empty input must not fabricate a conversation.
         assert_eq!(conversations.len(), 2, "{extension}");
+        // ubs:ignore[rust.panic.assert-macros] -- Keep the healthy source preceding the empty fixture.
         assert_eq!(conversations[0].source_path, paths[0]);
+        // ubs:ignore[rust.panic.assert-macros] -- Keep the healthy source following the empty fixture.
         assert_eq!(conversations[1].source_path, paths[2]);
+        // ubs:ignore[rust.panic.assert-macros] -- Scanning must not mutate the source fixture.
         assert_eq!(fs::read_to_string(&paths[1])?, content);
     }
     Ok(())
@@ -129,9 +142,13 @@ fn compressed_zero_message_sources_validate_decoded_text_and_refuse_damage() -> 
     let compressed = zstd::stream::encode_all(text.as_slice(), 0)?;
     let (_temp, paths, ctx) = fixture("jsonl.zst", &compressed)?;
     let conversations = CodexConnector::new().scan(&ctx)?;
+    // ubs:ignore[rust.panic.assert-macros] -- Preserve the original reporter's two-conversation regression.
     assert_eq!(conversations.len(), 2);
+    // ubs:ignore[rust.panic.assert-macros] -- The preceding healthy fixture must remain indexed.
     assert_eq!(conversations[0].source_path, paths[0]);
+    // ubs:ignore[rust.panic.assert-macros] -- The following healthy fixture must remain indexed.
     assert_eq!(conversations[1].source_path, paths[2]);
+    // ubs:ignore[rust.panic.assert-macros] -- The compressed fixture must remain byte-identical.
     assert_eq!(fs::read(&paths[1])?, compressed);
 
     for damaged in [
@@ -140,11 +157,14 @@ fn compressed_zero_message_sources_validate_decoded_text_and_refuse_damage() -> 
         zstd::stream::encode_all(b"{\"type\":".as_slice(), 0)?,
     ] {
         fs::write(&paths[1], &damaged)?;
+        // ubs:ignore[rust.panic.assert-macros] -- Damage is expected to fail this connector regression.
         assert!(CodexConnector::new().scan(&ctx).is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- Failure must not repair or overwrite the source fixture.
         assert_eq!(fs::read(&paths[1])?, damaged);
     }
     let large = zstd::stream::encode_all(" \n".repeat(4096).as_bytes(), 0)?;
     fs::write(&paths[1], large)?;
+    // ubs:ignore[rust.panic.assert-macros] -- The regression must fail if decoded input escapes its byte limit.
     assert!(validate_with_limit(&paths[1], None, 4096).is_err());
     Ok(())
 }
@@ -153,6 +173,9 @@ fn compressed_zero_message_sources_validate_decoded_text_and_refuse_damage() -> 
 fn compressed_empty_sources_succeed_without_fabricating_conversations() -> Result<()> {
     let text = b"{\"type\":\"session_meta\",\"payload\":{}}\n";
     let frame = zstd::stream::encode_all(text.as_slice(), 0)?;
+    // A frame boundary can divide a JSON record, not just separate lines.
+    let mut split_record = zstd::bulk::compress(&text[..17], 0)?;
+    split_record.extend(zstd::stream::encode_all(&text[17..], 0)?);
     for compressed in [
         frame.clone(),
         zstd::bulk::compress(text, 0)?,
@@ -162,12 +185,15 @@ fn compressed_empty_sources_succeed_without_fabricating_conversations() -> Resul
             0,
         )?,
         [frame.as_slice(), frame.as_slice()].concat(),
+        split_record,
     ] {
         let (_temp, paths, mut ctx) = fixture("jsonl.zst", &compressed)?;
+        let originals = paths.iter().map(fs::read).collect::<io::Result<Vec<_>>>()?;
         for since in [None, Some(0)] {
             ctx.since_ts = since;
             let mut completed = Vec::new();
             let mut complete = |done: &SourceCompletion| {
+                // ubs:ignore[rust.collections.clone-in-loop] -- Retain an owned completion observation for this test case.
                 completed.push((done.source.source_path.clone(), done.conversations_emitted));
                 Ok(())
             };
@@ -179,17 +205,31 @@ fn compressed_empty_sources_succeed_without_fabricating_conversations() -> Resul
             CodexConnector::new().scan_with_source_boundaries(
                 &ctx,
                 &mut hooks,
+                // ubs:ignore[rust.panic.assert-macros] -- This synchronous test callback verifies each healthy message.
                 &mut |conversation| {
+                    let expected_content = if conversation.source_path == paths[0] {
+                        "before"
+                    } else {
+                        "after"
+                    };
+                    assert_eq!(conversation.messages.len(), 1);
+                    assert_eq!(conversation.messages[0].content, expected_content);
                     delivered.push(conversation.source_path);
                     Ok(())
                 },
             )?;
+            // ubs:ignore[rust.panic.assert-macros,rust.collections.clone-in-loop] -- Compare owned fixture paths; mismatch must fail the test.
             assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
             // FAD only emits a completion when it emits a conversation.
             // Preserve that contract; validating empty input must synthesize
             // neither a conversation nor an upstream completion event.
+            // ubs:ignore[rust.panic.assert-macros,rust.collections.clone-in-loop] -- Require exactly the healthy fixtures' completion records.
             assert_eq!(completed, [(paths[0].clone(), 1), (paths[2].clone(), 1)]);
-            assert_eq!(fs::read(&paths[1])?, compressed);
+            // ubs:ignore[rust.panic.assert-macros] -- All source fixtures must survive indexing byte-for-byte.
+            assert_eq!(
+                paths.iter().map(fs::read).collect::<io::Result<Vec<_>>>()?,
+                originals
+            );
         }
     }
     Ok(())
@@ -214,6 +254,10 @@ fn compressed_source_failures_withhold_completion_and_keep_both_neighbors() -> R
             [frame.as_slice(), &frame[..frame.len() - 1]].concat(),
             io::ErrorKind::UnexpectedEof,
         ),
+        (
+            [frame.as_slice(), bad_checksum.as_slice()].concat(),
+            io::ErrorKind::Other,
+        ),
         (bad_checksum, io::ErrorKind::Other),
         (text.to_vec(), io::ErrorKind::Other),
         (
@@ -229,37 +273,75 @@ fn compressed_source_failures_withhold_completion_and_keep_both_neighbors() -> R
             io::ErrorKind::UnexpectedEof,
         ),
     ] {
-        let (_temp, paths, ctx) = fixture("jsonl.zst", &damaged)?;
-        let mut completed = Vec::new();
-        let mut complete = |done: &SourceCompletion| {
-            completed.push(done.source.source_path.clone());
-            Ok(())
-        };
-        let mut hooks = SourceScanHooks {
-            should_scan_source: None,
-            on_source_complete: Some(&mut complete),
-        };
-        let mut delivered = Vec::new();
-        let error = CodexConnector::new()
-            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
-                delivered.push(conversation.source_path);
-                Ok(())
-            })
-            .unwrap_err();
+        let (_temp, paths, mut ctx) = fixture("jsonl.zst", &damaged)?;
+        let originals = paths.iter().map(fs::read).collect::<io::Result<Vec<_>>>()?;
+        // Primary parsing rejects some damage before the zero-output path.
+        // Exercise that fallback directly so upstream validation cannot mask
+        // an incomplete-frame or decoded-text regression in this validator.
+        let validation_error = validate(&paths[1], None).unwrap_err();
+        // ubs:ignore[rust.panic.assert-macros] -- Fallback validation must independently report the expected corruption kind.
         assert_eq!(
-            error.downcast_ref::<io::Error>().unwrap().kind(),
+            validation_error.downcast_ref::<io::Error>().unwrap().kind(),
             expected,
-            "{error:#}"
+            "{validation_error:#}"
         );
-        let diagnostic = format!("{error:#}");
-        assert!(
-            diagnostic.contains("rollout-b-empty.jsonl.zst"),
-            "{diagnostic}"
-        );
-        assert!(!diagnostic.contains("private_marker"), "{diagnostic}");
-        assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
-        assert_eq!(completed, delivered);
-        assert_eq!(fs::read(&paths[1])?, damaged);
+        for since in [None, Some(0)] {
+            ctx.since_ts = since;
+            let mut completed = Vec::new();
+            let mut complete = |done: &SourceCompletion| {
+                // ubs:ignore[rust.collections.clone-in-loop] -- Own each source path retained by the test callback.
+                completed.push(done.source.source_path.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut complete),
+            };
+            let mut delivered = Vec::new();
+            let error = CodexConnector::new()
+                // ubs:ignore[rust.panic.assert-macros] -- This synchronous test callback verifies healthy messages around corrupted input.
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                    let expected_content = if conversation.source_path == paths[0] {
+                        "before"
+                    } else {
+                        "after"
+                    };
+                    assert_eq!(conversation.messages.len(), 1);
+                    assert_eq!(conversation.messages[0].content, expected_content);
+                    delivered.push(conversation.source_path);
+                    Ok(())
+                })
+                .unwrap_err();
+            // ubs:ignore[rust.panic.assert-macros] -- Corruption must retain its actionable I/O error kind.
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                expected,
+                "{error:#}"
+            );
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Materialize each fixture's error chain for diagnostic assertions.
+            let diagnostic = format!("{error:#}");
+            let serialized_path = serde_json::to_string(&paths[1].to_string_lossy())?;
+            // ubs:ignore[rust.panic.assert-macros] -- The diagnostic must identify the failed physical fixture.
+            assert!(diagnostic.contains(&serialized_path), "{diagnostic}");
+            let reason = match expected {
+                io::ErrorKind::UnexpectedEof => "unfinished_source",
+                io::ErrorKind::InvalidData => "invalid_source_data",
+                _ => "source_read_failed",
+            };
+            // ubs:ignore[rust.panic.assert-macros] -- The fixture's error must carry its expected recovery reason.
+            assert!(diagnostic.contains(reason), "{diagnostic}");
+            // ubs:ignore[rust.panic.assert-macros] -- Diagnostics must never disclose the fixture's private-content marker.
+            assert!(!diagnostic.contains("private_marker"), "{diagnostic}");
+            // ubs:ignore[rust.panic.assert-macros,rust.collections.clone-in-loop] -- Compare owned fixture paths; mismatch must fail the test.
+            assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
+            // ubs:ignore[rust.panic.assert-macros] -- Failed-source completions are forbidden by this regression.
+            assert_eq!(completed, delivered);
+            // ubs:ignore[rust.panic.assert-macros] -- All three source fixtures must remain unchanged after failure.
+            assert_eq!(
+                paths.iter().map(fs::read).collect::<io::Result<Vec<_>>>()?,
+                originals
+            );
+        }
     }
     Ok(())
 }
@@ -268,47 +350,115 @@ fn compressed_source_failures_withhold_completion_and_keep_both_neighbors() -> R
 fn compressed_zero_output_validation_enforces_exact_decoded_budget() -> Result<()> {
     let text = " \n".repeat(2048);
     let frame = zstd::stream::encode_all(text.as_bytes(), 0)?;
-    let compressed = [frame.as_slice(), frame.as_slice()].concat();
-    let (_temp, paths, _ctx) = fixture("jsonl.zst", &compressed)?;
+    let declared_frame = zstd::bulk::compress(text.as_bytes(), 0)?;
+    let whole = text.repeat(2);
     let limit = 2 * text.len() as u64;
-    assert!((compressed.len() as u64) < limit - 1);
-    validate_with_limit(&paths[1], None, limit)?;
-    let error = validate_with_limit(&paths[1], None, limit - 1).unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<io::Error>().unwrap().kind(),
-        io::ErrorKind::FileTooLarge
-    );
-    assert_eq!(fs::read(&paths[1])?, compressed);
+    for compressed in [
+        [frame.as_slice(), frame.as_slice()].concat(),
+        [declared_frame.as_slice(), declared_frame.as_slice()].concat(),
+        zstd::stream::encode_all(whole.as_bytes(), 0)?,
+        zstd::bulk::compress(whole.as_bytes(), 0)?,
+    ] {
+        let (_temp, paths, _ctx) = fixture("jsonl.zst", &compressed)?;
+        // ubs:ignore[rust.panic.assert-macros] -- This fixture must isolate the decoded limit from the physical-file limit.
+        assert!((compressed.len() as u64) < limit - 1);
+        validate_with_limit(&paths[1], None, limit)?;
+        let error = validate_with_limit(&paths[1], None, limit - 1).unwrap_err();
+        // ubs:ignore[rust.panic.assert-macros] -- One byte over the decoded budget must fail, never appear as clean EOF.
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        // ubs:ignore[rust.panic.assert-macros,rust.perf.string-alloc-in-loop] -- Assert the configured byte limit in this test's error text.
+        assert!(error.to_string().contains(&(limit - 1).to_string()));
+        // ubs:ignore[rust.panic.assert-macros] -- Budget rejection must leave the compressed fixture intact.
+        assert_eq!(fs::read(&paths[1])?, compressed);
+    }
     Ok(())
 }
 
 #[test]
 fn compressed_zero_output_validation_rechecks_its_opened_snapshot() -> Result<()> {
+    use std::io::Write;
+
     let frame = zstd::stream::encode_all(b"{}\n".as_slice(), 0)?;
-    let (_temp, paths, _ctx) = fixture("jsonl.zst", &frame)?;
-    let ticks = AtomicUsize::new(0);
-    let tick = || {
-        if ticks.fetch_add(1, Ordering::Relaxed) == 0 {
-            use std::io::Write;
-            fs::OpenOptions::new()
-                .append(true)
-                .open(&paths[1])
-                .unwrap()
-                .write_all(&frame)
-                .unwrap();
-        }
-    };
-    // The originally opened prefix is a complete valid frame. Success still
-    // requires the snapshot check, even though decoding that prefix succeeds.
-    let error = validate(&paths[1], Some(&tick)).unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<io::Error>().unwrap().kind(),
-        io::ErrorKind::Interrupted
-    );
-    assert_eq!(
-        fs::read(&paths[1])?,
-        [frame.as_slice(), frame.as_slice()].concat()
-    );
+    for mutation in ["append", "truncate at frame boundary", "replace"] {
+        let compressed = if mutation == "truncate at frame boundary" {
+            [frame.as_slice(), frame.as_slice()].concat()
+        } else {
+            // ubs:ignore[rust.collections.clone-in-loop] -- Each mutation needs its own owned source fixture.
+            frame.clone()
+        };
+        let (_temp, paths, _ctx) = fixture("jsonl.zst", &compressed)?;
+        let modified = fs::metadata(&paths[1])?.modified()?;
+        let retained = paths[1].with_extension("retained");
+        let ticks = AtomicUsize::new(0);
+        let tick = || {
+            if ticks.fetch_add(1, Ordering::Relaxed) != 0 {
+                return;
+            }
+            match mutation {
+                "append" => fs::OpenOptions::new()
+                    .append(true)
+                    .open(&paths[1])
+                    .unwrap()
+                    .write_all(&frame)
+                    .unwrap(),
+                // A complete first frame still decodes to clean EOF, so this
+                // must fail on snapshot integrity rather than frame syntax.
+                "truncate at frame boundary" => fs::OpenOptions::new()
+                    .write(true)
+                    .open(&paths[1])
+                    .unwrap()
+                    .set_len(frame.len() as u64)
+                    .unwrap(),
+                "replace" => {
+                    fs::rename(&paths[1], &retained).unwrap();
+                    fs::write(&paths[1], &compressed).unwrap();
+                    // Unix must catch a different inode even with identical
+                    // length and mtime. Other platforms use observable mtime.
+                    let replacement_mtime = if cfg!(unix) {
+                        modified
+                    } else {
+                        modified + std::time::Duration::from_secs(2)
+                    };
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&paths[1])
+                        .unwrap()
+                        .set_modified(replacement_mtime)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+        };
+        // Decoding the admitted prefix succeeds; the snapshot guard must
+        // reject the concurrent mutation before certifying successful input.
+        let error = validate(&paths[1], Some(&tick)).unwrap_err();
+        // ubs:ignore[rust.panic.assert-macros] -- The mutation fixture must trip the snapshot-integrity guard.
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Interrupted,
+            "{mutation}: {error:#}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- The deterministic callback must mutate the fixture exactly once.
+        assert_eq!(ticks.load(Ordering::Relaxed), 1);
+        let expected = match mutation {
+            "append" => [compressed.as_slice(), frame.as_slice()].concat(),
+            // ubs:ignore[rust.collections.clone-in-loop] -- Own the expected bytes of this bounded truncation fixture.
+            "truncate at frame boundary" => frame.clone(),
+            "replace" => {
+                // ubs:ignore[rust.panic.assert-macros] -- The validator must not mutate the retained original inode.
+                assert_eq!(fs::read(&retained)?, compressed);
+                // ubs:ignore[rust.collections.clone-in-loop] -- Own the expected bytes of the replacement fixture.
+                compressed.clone()
+            }
+            _ => unreachable!(),
+        };
+        // ubs:ignore[rust.panic.assert-macros] -- Only the fixture callback's intended mutation may be present.
+        assert_eq!(fs::read(&paths[1])?, expected, "{mutation}");
+        validate(&paths[1], None)?;
+    }
     Ok(())
 }
 
@@ -331,6 +481,7 @@ fn host_veto_prevents_validation_of_intentionally_skipped_input() -> Result<()> 
                 Ok(())
             },
         )?;
+        // ubs:ignore[rust.panic.assert-macros,rust.collections.clone-in-loop] -- Host veto must preserve exactly the healthy fixture sources.
         assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
     }
     Ok(())
@@ -350,11 +501,13 @@ fn broken_archives_with_no_messages_are_not_successful_empty_history() -> Result
         Some(i64::MAX),
     );
     let error = CodexConnector::new().scan(&ctx).unwrap_err();
+    // ubs:ignore[rust.panic.assert-macros] -- The deliberately truncated archive fixture must fail as unfinished input.
     assert_eq!(
         error.downcast_ref::<io::Error>().unwrap().kind(),
         io::ErrorKind::UnexpectedEof
     );
     fs::write(&path, "{\"items\":[]}")?;
+    // ubs:ignore[rust.panic.assert-macros] -- Repairing an empty archive must not fabricate history.
     assert!(CodexConnector::new().scan(&ctx)?.is_empty());
     Ok(())
 }
@@ -370,12 +523,14 @@ fn zero_output_validation_is_bounded_and_checks_its_opened_snapshot() -> Result<
         }
     };
     let error = validate(&paths[1], Some(&tick)).unwrap_err();
+    // ubs:ignore[rust.panic.assert-macros] -- The test callback's append must trip the opened-snapshot guard.
     assert_eq!(
         error.downcast_ref::<io::Error>().unwrap().kind(),
         io::ErrorKind::Interrupted
     );
     fs::File::create(&paths[1])?.set_len(MAX_AUGMENT_ROLLOUT_BYTES + 1)?;
     let error = validate(&paths[1], None).unwrap_err();
+    // ubs:ignore[rust.panic.assert-macros] -- The oversized fixture must appear in the rejection count.
     assert_eq!(
         error
             .downcast_ref::<IncompleteScan>()

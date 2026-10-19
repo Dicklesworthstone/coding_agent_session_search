@@ -30,10 +30,13 @@ fn fixture(root: &Path) -> Result<PathBuf> {
             agent: agent.into(),
             workspace: Some("/work".into()),
             workspace_original: None,
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- This fixed three-conversation fixture needs distinct source identities.
             source_path: format!("/history/gh532/{conversation_id}.jsonl"),
             msg_idx: 0,
             created_at: Some(1_700_000_000_000 + conversation_id),
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- This fixed three-conversation fixture needs distinct titles.
             title: Some(format!("scope fixture {conversation_id}")),
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- This fixed three-conversation fixture needs distinct message bodies.
             content: format!("scopeprobe paper cuts in conversation {conversation_id}"),
             source_id: "local".into(),
             origin_kind: "local".into(),
@@ -88,7 +91,10 @@ fn run(
         .wait_timeout(Duration::from_secs(40))?
         .context("service failed to exit under its external test deadline")?;
     for path in [&stdout_path, &stderr_path] {
-        ensure!(std::fs::metadata(path)?.len() <= 1024 * 1024, "oversized test output");
+        ensure!(
+            std::fs::metadata(path)?.len() <= 1024 * 1024,
+            "oversized test output"
+        );
     }
     let stdout = std::fs::read_to_string(stdout_path)?;
     let stderr = std::fs::read(stderr_path)?;
@@ -104,7 +110,11 @@ fn identities(result: &Value) -> Result<BTreeSet<i64>> {
         .as_array()
         .context("result hits")?
         .iter()
-        .map(|hit| hit["conversation_id"].as_i64().context("conversation identity"))
+        .map(|hit| {
+            hit["conversation_id"]
+                .as_i64()
+                .context("conversation identity")
+        })
         .collect()
 }
 
@@ -131,23 +141,38 @@ fn stdio_aliases_union_and_known_absent_agents_preserve_actual_hit_sets() -> Res
             json!({"id": 8, "op": "status"}),
         ],
     )?;
-    ensure!(status.success(), "{status}: {}", String::from_utf8_lossy(&stderr));
+    ensure!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies.len(), 8);
     for reply in &replies[..7] {
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(reply["ok"], true, "{reply}");
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(reply["result"]["backend"], "quill");
     }
     for reply in &replies[..5] {
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(identities(&reply["result"])?, BTreeSet::from([1, 2]));
     }
-    assert_eq!(identities(&replies[5]["result"])?, BTreeSet::from([1, 2, 3]));
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+    assert_eq!(
+        identities(&replies[5]["result"])?,
+        BTreeSet::from([1, 2, 3])
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert!(identities(&replies[6]["result"])?.is_empty());
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[7]["result"]["successful_opens"], 1);
     Ok(())
 }
 
 #[test]
-fn invalid_json_scopes_fail_before_reader_admission_and_do_not_poison_later_requests() -> Result<()> {
+fn invalid_json_scopes_fail_before_reader_admission_and_do_not_poison_later_requests() -> Result<()>
+{
     let root = tempfile::tempdir()?;
     let index = fixture(root.path())?;
     let (status, replies, stderr) = run(
@@ -166,17 +191,35 @@ fn invalid_json_scopes_fail_before_reader_admission_and_do_not_poison_later_requ
             json!({"id": 7, "op": "status"}),
         ],
     )?;
-    ensure!(status.success(), "{status}: {}", String::from_utf8_lossy(&stderr));
+    ensure!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies.len(), 7);
     for reply in &replies[..4] {
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(reply["ok"], false, "{reply}");
-        assert!(reply["error"]["message"].as_str().unwrap().contains("unknown agent filter"));
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown agent filter")
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert!(reply.get("result").is_none());
     }
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[4]["result"]["successful_opens"], 0);
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[4]["result"]["canonical_database_accessed"], false);
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[5]["ok"], true);
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(identities(&replies[5]["result"])?, BTreeSet::from([1, 2]));
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[6]["result"]["successful_opens"], 1);
     Ok(())
 }
@@ -188,7 +231,7 @@ fn mcp_agent_aliases_retrieve_hits_and_unknown_names_are_invalid_params() -> Res
     let (status, replies, stderr) = run(
         root.path(),
         &index,
-        &["--mcp"],
+        &["--stdio", "--mcp"],
         &[
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                 "protocolVersion": "2025-11-25", "capabilities": {},
@@ -202,14 +245,33 @@ fn mcp_agent_aliases_retrieve_hits_and_unknown_names_are_invalid_params() -> Res
                     "query": "scopeprobe", "filters": {"agents": ["claude", "claud_code"]}}}}),
         ],
     )?;
-    ensure!(status.success(), "{status}: {}", String::from_utf8_lossy(&stderr));
+    ensure!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies.len(), 3);
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[1]["id"], 2);
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[1]["result"]["isError"], false);
-    assert_eq!(identities(&replies[1]["result"]["structuredContent"])?, BTreeSet::from([1, 2]));
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+    assert_eq!(
+        identities(&replies[1]["result"]["structuredContent"])?,
+        BTreeSet::from([1, 2])
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[2]["id"], 3);
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(replies[2]["error"]["code"], -32602);
-    assert!(replies[2]["error"]["message"].as_str().unwrap().contains("unknown agent filter"));
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+    assert!(
+        replies[2]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown agent filter")
+    );
     Ok(())
 }
 
@@ -219,23 +281,55 @@ fn one_shot_agent_aliases_retrieve_hits_and_invalid_names_exit_two_before_storag
     let index = fixture(root.path())?;
     for alias in ["claude", "claude-code", "Claude_Code"] {
         let (status, replies, stderr) = run(
-            root.path(), &index, &["--query", "scopeprobe", "--agent", alias], &[],
+            root.path(),
+            &index,
+            &["--query", "scopeprobe", "--agent", alias],
+            &[],
         )?;
-        ensure!(status.success(), "{alias}: {status}: {}", String::from_utf8_lossy(&stderr));
+        ensure!(
+            status.success(),
+            "{alias}: {status}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(replies.len(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(replies[0]["ok"], true);
+        // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
         assert_eq!(identities(&replies[0]["result"])?, BTreeSet::from([1, 2]));
     }
     let missing = root.path().join("must-not-open");
     let (status, replies, stderr) = run(
-        root.path(), &missing,
-        &["--query", "scopeprobe", "--agent", "codex", "--agent", "claud_code"], &[],
+        root.path(),
+        &missing,
+        &[
+            "--query",
+            "scopeprobe",
+            "--agent",
+            "codex",
+            "--agent",
+            "claud_code",
+        ],
+        &[],
     )?;
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(status.code(), Some(2));
-    assert!(replies.is_empty(), "invalid scope emitted a success payload");
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+    assert!(
+        replies.is_empty(),
+        "invalid scope emitted a success payload"
+    );
     let error: Value = serde_json::from_slice(&stderr)?;
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert_eq!(error["ok"], false);
-    assert!(error["error"]["message"].as_str().unwrap().contains("claud_code"));
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("claud_code")
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Test assertions must fail when the agent-scope contract regresses.
     assert!(!missing.exists());
     Ok(())
 }

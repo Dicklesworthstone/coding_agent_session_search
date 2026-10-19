@@ -6,6 +6,7 @@ use std::io::{self, BufRead, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[path = "protocol/agent_filters.rs"]
 mod agent_filters;
 
 pub(super) const VERSION: u32 = 1;
