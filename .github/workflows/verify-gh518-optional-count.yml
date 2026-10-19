@@ -11,6 +11,8 @@ jobs:
     if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      candidate_blobs: ${{ steps.candidate.outputs.candidate_blobs }}
     env:
       CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -22,10 +24,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Prepare reviewed candidate in the disposable checkout
+        id: candidate
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64, hashlib, json, subprocess, urllib.request
+          import base64, hashlib, json, os, subprocess, urllib.request
           from pathlib import Path
           api = 'https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/git/blobs/'
           def identity(data):
@@ -64,6 +67,8 @@ jobs:
           receipt = {'bases': bases, 'candidate_blobs': {
               name: identity(Path(name).read_bytes()) for name in list(bases) + list(additions)}}
           Path('gh518-source-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('candidate_blobs=' + json.dumps(receipt['candidate_blobs'], separators=(',', ':')) + '\n')
           print(json.dumps(receipt, indent=2))
           PY
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
@@ -97,3 +102,76 @@ jobs:
             gh518-source-receipt.json
           if-no-files-found: warn
           retention-days: 3
+  materialize_validated_blobs:
+    needs: validate
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Reconstruct and store only the validated immutable source blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_POSTIMAGES: ${{ needs.validate.outputs.candidate_blobs }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, re, subprocess, tempfile, urllib.request
+          from pathlib import Path
+          api = 'https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/git/blobs'
+          bases = {
+              'src/search/query.rs': '100db9df37b1a09970db497343c609394a203efe',
+              'src/search/quill_bridge.rs': '95cb3d1b63cf4a8b37490c37a0ba3ba3b5215403',
+              'tests/logging.rs': '52bb22d58a3eafedffdc36e1c2fa927b89e5ae0b',
+          }
+          additions = {
+              'src/search/query/optional_budget.rs': '0f4068d24c0cf62cb69f9540a4570f0542d41a39',
+              'src/search/query/optional_budget_tests.rs': 'a0a0de33684796b990d7afc6b1b1b503d16ee0ee',
+          }
+          expected = json.loads(os.environ['EXPECTED_POSTIMAGES'])
+          assert set(expected) == set(bases) | set(additions)
+          assert all(re.fullmatch('[0-9a-f]{40}', value) for value in expected.values())
+          def identity(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def fetch(sha):
+              request = urllib.request.Request(api + '/' + sha, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+              })
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+              assert result['encoding'] == 'base64'
+              data = base64.b64decode(result['content'])
+              assert identity(data) == sha
+              return data
+          with tempfile.TemporaryDirectory(prefix='gh518-source-') as directory:
+              root = Path(directory)
+              for name, sha in bases.items():
+                  path = root / name
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(fetch(sha))
+              patch = fetch('c2978bec677ac5212b22dacfb7f3ad7b455df3e0')
+              assert hashlib.sha256(patch).hexdigest() == '7fe6d8ea3b26d2a0856995da15763ddb50a35f2bae39ea68677f74dab352d501'
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, cwd=root, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, cwd=root, check=True)
+              subprocess.run(['git', 'apply', '--reverse', '--check', '-'], input=patch, cwd=root, check=True)
+              for name, sha in additions.items():
+                  path = root / name
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(fetch(sha))
+              postimages = {name: (root / name).read_bytes() for name in expected}
+              assert {name: identity(data) for name, data in postimages.items()} == expected
+              for name, data in postimages.items():
+                  payload = json.dumps({'content': base64.b64encode(data).decode('ascii'), 'encoding': 'base64'}).encode()
+                  request = urllib.request.Request(api, data=payload, method='POST', headers={
+                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                      'Accept': 'application/vnd.github+json',
+                      'Content-Type': 'application/json',
+                  })
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      result = json.load(response)
+                  assert result['sha'] == expected[name]
+                  print(json.dumps({'path': name, 'validated_blob_sha': result['sha']}))
+          # Deliberately no commit, tree, branch/ref, issue, or secret API writes.
+          PY
