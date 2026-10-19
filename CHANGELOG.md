@@ -96,6 +96,31 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- **`cass swarm status` reads Beads with br 0.7.x (#529).** The live Beads
+  reader accepted only br 0.6.x, so with the current br it reported the
+  provider unavailable and left the ready, in-progress and blocked counts
+  unknown. br 0.7.x keeps the JSON shape the reader parses, and it is now
+  accepted. Other versions are still refused.
+- **Keyword search keeps a named local source local (#524).** A configured
+  local source with its own name (anything but `local`) was labelled remote
+  when an incremental index run or `cass index --watch-once` replayed its
+  sessions into the lexical index, so local-only keyword searches missed
+  them. A lexical rebuild labelled them correctly. Both paths now use the
+  source's registered kind. Sessions indexed before the fix keep the remote
+  label until `cass index --full --force-rebuild` rebuilds the lexical index;
+  plain `--full` leaves an up-to-date index as it is.
+- **`cass sources add` accepts a read-only rrsync key (#531).** Its
+  connectivity check ran `echo ok` on the remote. A key whose forced command
+  is `rrsync -ro DIR` refuses everything except rsync and `true`, so `add`
+  failed with exit 12 unless `--no-test` was given. The check now runs `true`,
+  as `cass sources doctor` already did.
+- **A first full index no longer leaves an empty publish backup.** On a fresh
+  install, `cass index --full` kept the placeholder index directory, which
+  held only the rebuild's own progress checkpoint, as a retained lexical
+  publish backup. `cass doctor` and `cass diag --quarantine` counted it, and
+  `cass doctor cleanup` offered to prune it. A placeholder holding only that
+  checkpoint and the archive fingerprint cache is now replaced on first
+  publish. A directory holding anything else is still retained.
 - **`cass mirror prune` reclaims capture staging left by killed captures
   (#523).** A `cass index` run killed mid-capture (for example by `timeout`)
   left its `raw-mirror/v1/tmp/capture.*` staging behind, and nothing removed
@@ -132,6 +157,18 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   run, the rebuild never finished and a new quarantine directory appeared
   each time. A killed rebuild now resumes from its last commit. Checkpoints
   written by earlier versions are read the same way.
+- **SQLite engine data-integrity fixes: FrankenSQLite 0.4.12 (#516).** The
+  pinned 0.4.9, and the 0.4.6 that v0.10.0 ships, are on the 0.4.10
+  advisory's affected list: inserts inside an explicit transaction could
+  append through a stale retained right-edge leaf and corrupt a table b-tree
+  (stock `integrity_check` then reports `Rowid N out of order`). Every
+  `cass index` batch writes variable-width rows inside explicit
+  transactions. 0.4.12 also gives back the AUTOINCREMENT rowids a
+  rolled-back transaction reserved, reads a WAL that a stock SQLite writer
+  truncated to zero bytes as empty instead of corrupt (the OpenCode export
+  path in #519), seeks indexes for `IN (...)` lists and
+  `k = ? ORDER BY id`, and keeps explicit-rowid writes working in a table
+  that holds the largest rowid.
 
 - **`cass timeline` and `cass sessions` read `--since`/`--until` the way
   `cass search` does.** Timeline understood only dates, `today`,

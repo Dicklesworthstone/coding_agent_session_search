@@ -3,6 +3,7 @@
 use super::*;
 use crate::model::types::{Agent, AgentKind, MessageRole};
 use serde_json::json;
+#[cfg(unix)]
 use std::time::Instant;
 
 fn fixture(bodies: &[&str]) -> Result<(tempfile::TempDir, FrankenStorage)> {

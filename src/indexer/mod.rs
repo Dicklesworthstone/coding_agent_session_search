@@ -24702,7 +24702,7 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         })?;
     }
     recover_or_finalize_interrupted_lexical_publish_backup(index_path)?;
-    remove_empty_lexical_index_dir_placeholder(index_path);
+    remove_lexical_index_dir_placeholder(index_path);
 
     if !index_path.exists() {
         rename_lexical_publish_path(
@@ -25107,18 +25107,47 @@ fn ensure_lexical_publish_backups_dir(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_empty_lexical_index_dir_placeholder(index_path: &Path) {
+fn remove_lexical_index_dir_placeholder(index_path: &Path) {
     // `index_dir(&data_dir)` calls `fs::create_dir_all` at startup, creating an
-    // empty directory before any lexical generation has been published. `fs::remove_dir`
-    // only succeeds when the directory has zero entries (failing with ENOTEMPTY
-    // if any file or subdirectory exists), so calling it here turns the empty
+    // empty directory before any lexical generation has been published. A first
+    // full rebuild then writes its in-progress checkpoint into it, and status may
+    // cache the archive fingerprint there. Both are rewritten with the published
+    // generation, so a directory holding only them is still a placeholder;
+    // retaining it gave a fresh install a "prior-live" publish backup with no
+    // index in it. Only those two sidecars are removed. `fs::remove_dir` only
+    // succeeds when the directory has zero entries (failing with ENOTEMPTY if
+    // any other file or subdirectory exists), so calling it here turns the
     // placeholder back into `!index_path.exists()` without touching a populated
     // live index (dcp01).
-    if index_path.is_dir()
-        && fs::read_dir(index_path).is_ok_and(|mut entries| entries.next().is_none())
-    {
-        let _ = fs::remove_dir(index_path);
+    if !fs::symlink_metadata(index_path).is_ok_and(|meta| meta.is_dir()) {
+        return;
     }
+    let Ok(entries) = fs::read_dir(index_path) else {
+        return;
+    };
+    let placeholder_sidecars = [
+        lexical_rebuild_state_path(index_path),
+        index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE),
+    ];
+    let mut sidecars = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return;
+        };
+        let path = entry.path();
+        if !placeholder_sidecars.contains(&path)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            return;
+        }
+        sidecars.push(path);
+    }
+    for sidecar in &sidecars {
+        if fs::remove_file(sidecar).is_err() {
+            return;
+        }
+    }
+    let _ = fs::remove_dir(index_path);
 }
 
 fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> Result<()> {
@@ -25127,7 +25156,7 @@ fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> 
         return Ok(());
     }
 
-    remove_empty_lexical_index_dir_placeholder(index_path);
+    remove_lexical_index_dir_placeholder(index_path);
 
     if index_path.exists() {
         ensure_lexical_publish_backups_dir(index_path)?;
@@ -34439,8 +34468,19 @@ pub mod persist {
                 })
             },
         )?;
-        let origin_kind =
-            crate::search::tantivy::normalized_index_origin_kind(&canonical.source_id, None);
+        // Use the registered kind, as a full rebuild's source map does. Without
+        // it, a local source named anything but `local` (GH #524's
+        // `full-history-plan`) was replayed as remote and dropped out of
+        // local-only keyword searches.
+        let registered_kind = storage
+            .get_source(&canonical.source_id)?
+            .map(|source| source.kind);
+        let origin_kind = crate::search::tantivy::normalized_index_origin_kind(
+            &canonical.source_id,
+            registered_kind
+                .as_ref()
+                .map(crate::sources::provenance::SourceKind::as_str),
+        );
         canonical.metadata_json = serde_json::json!({
             "cass": {
                 "origin": {
@@ -34457,11 +34497,16 @@ pub mod persist {
         conversation: &Conversation,
         messages: Vec<Message>,
     ) -> ConversationPacket {
+        // The envelope canonical_lexical_conversation synthesized already
+        // carries the registered kind.
         let provenance = ConversationPacketProvenance {
             source_id: conversation.source_id.clone(),
             origin_kind: crate::search::tantivy::normalized_index_origin_kind(
                 &conversation.source_id,
-                None,
+                conversation
+                    .metadata_json
+                    .pointer("/cass/origin/kind")
+                    .and_then(serde_json::Value::as_str),
             ),
             origin_host: conversation.origin_host.clone(),
         };
@@ -37991,6 +38036,85 @@ pub mod persist {
             for route in 0..3 {
                 assert_gh466_canonical_prefix_cap("claude_code", route, false);
             }
+        }
+
+        /// lk524 (GH #524 follow-up): canonical replay labels a conversation
+        /// with its registered source kind, as a full rebuild's source map
+        /// does. A local source named anything but `local` replayed as remote.
+        #[test]
+        fn canonical_replay_uses_the_registered_source_kind() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let mut named_local = Source::local();
+            named_local.id = "full-history-plan".into();
+            storage.upsert_source(&named_local).unwrap();
+            storage
+                .upsert_source(&Source::remote("laptop", "laptop.example"))
+                .unwrap();
+            let mut index = TantivyIndex::open_or_create(&dir.path().join("index")).unwrap();
+            let mut expected = Vec::new();
+            // Origins as the connectors record them; the replay must not
+            // depend on that stored metadata, which it does not read.
+            for (source_id, origin, kind) in [
+                (
+                    "full-history-plan",
+                    serde_json::json!({"source_id": "full-history-plan", "kind": "local"}),
+                    "local",
+                ),
+                (
+                    "laptop",
+                    serde_json::json!({"source_id": "laptop", "kind": "ssh", "host": "laptop.example"}),
+                    "remote",
+                ),
+                (
+                    "local",
+                    serde_json::json!({"source_id": "local", "kind": "local"}),
+                    "local",
+                ),
+            ] {
+                let conv = NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(format!("{source_id}-session")),
+                    title: Some(source_id.into()),
+                    workspace: None,
+                    source_path: dir.path().join(format!("{source_id}.jsonl")),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_001),
+                    metadata: serde_json::json!({"cass": {"origin": origin}}),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000),
+                        content: format!("{source_id} provenance probe"),
+                        extra: serde_json::json!({}),
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    }],
+                };
+                persist_conversation(&storage, &mut index, &conv).unwrap();
+                expected.push((source_id.to_string(), kind.to_string()));
+            }
+            let ids: Vec<i64> = storage
+                .raw()
+                .query_map_collect("SELECT id FROM conversations ORDER BY id", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            let replayed: Vec<(String, String)> = ids
+                .into_iter()
+                .map(|id| {
+                    let conversation = canonical_lexical_conversation(&storage, id).unwrap();
+                    let envelope = conversation.metadata_json["cass"]["origin"]["kind"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let packet = canonical_lexical_packet(&conversation, Vec::new());
+                    assert_eq!(packet.payload.provenance.origin_kind, envelope);
+                    (conversation.source_id, envelope)
+                })
+                .collect();
+            assert_eq!(replayed, expected);
         }
 
         /// bgn6s: an inline replay reads a conversation one bounded chunk at
@@ -61129,6 +61253,136 @@ c.close()
                 "first publish over empty index_dir placeholder must not retain an empty backup; got {entries:?}"
             );
         }
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_first_publish_over_checkpoint_only_index_dir_does_not_retain_it()
+     {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        // A first full rebuild checkpoints into the startup placeholder, and
+        // status may cache the archive fingerprint there, before any generation
+        // exists. `cass index --force-rebuild` on a fresh data dir retained that
+        // directory as a "prior-live" publish backup holding no index.
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::write(
+            lexical_rebuild_state_path(&index_path),
+            b"{\"completed\":false}",
+        )
+        .unwrap();
+        fs::write(index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE), b"{}").unwrap();
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-first-publish-checkpoint-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("first-publish-checkpoint-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "first publish over a checkpoint-only placeholder must land the staged index"
+        );
+        assert!(
+            !lexical_rebuild_state_path(&index_path).exists(),
+            "the superseded in-progress checkpoint must not survive into the published generation"
+        );
+        assert!(
+            !lexical_publish_in_progress_backup_path(&index_path).exists(),
+            "first publish must not park the placeholder"
+        );
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        if backups_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&backups_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "a checkpoint-only placeholder is not a prior-live generation; got {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_retains_a_checkpointed_index_dir_holding_anything_else() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::write(
+            lexical_rebuild_state_path(&index_path),
+            b"{\"completed\":false}",
+        )
+        .unwrap();
+        // Any entry beyond the two placeholder sidecars means the directory is
+        // not a placeholder, so publish must retain it untouched.
+        fs::write(
+            index_path.join("segment-unknown"),
+            b"not a placeholder sidecar",
+        )
+        .unwrap();
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-publish-checkpoint-plus-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("publish-checkpoint-plus-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "publish must land the staged index"
+        );
+        let entries: Vec<_> = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the prior live directory must be retained; got {entries:?}"
+        );
+        assert_eq!(
+            fs::read(entries[0].join("segment-unknown")).unwrap(),
+            b"not a placeholder sidecar"
+        );
+        assert_eq!(
+            fs::read(entries[0].join(".lexical-rebuild-state.json")).unwrap(),
+            b"{\"completed\":false}",
+            "a retained directory keeps its checkpoint"
+        );
     }
 
     /// An interrupted prior publish left a `.<name>.publish-in-progress.bak`

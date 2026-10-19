@@ -1,4 +1,4 @@
-//! One-shot access to the supervised, read-only lexical service.
+//! One-shot access to the supervised, read-only search service.
 //!
 //! This is deliberately the same request path as stdio search, not another
 //! search engine or an implicit repair lane. No stdin is opened in this mode.
@@ -9,20 +9,40 @@ use clap::Args;
 use coding_agent_search::{CliError, CliResult};
 
 use super::protocol::{self, Filters, Reply, Request};
+use super::semantic;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum QueryMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
+}
 
 #[derive(Debug, Default, Args)]
 pub(super) struct Options {
-    /// Run one lexical query and exit; emit a bounded JSON reply without reading stdin.
+    /// Run one query and exit; emit a bounded JSON reply without reading stdin.
     /// Uses the service's read-only readers, fallback consent and resource supervision.
-    #[arg(long, value_name = "QUERY", conflicts_with_all = ["stdio", "mcp", "reranker_model", "semantic_embedder"])]
+    #[arg(long, value_name = "QUERY", conflicts_with_all = ["stdio", "mcp", "reranker_model"])]
     query: Option<String>,
+    /// Retrieval mode for --query (default lexical). Semantic and hybrid require
+    /// --semantic-embedder, --data-dir and --db. No models are downloaded.
+    #[arg(long, value_enum, requires = "query", requires_ifs([
+        ("semantic", "semantic_embedder"), ("hybrid", "semantic_embedder")
+    ]))]
+    mode: Option<QueryMode>,
+    /// Request approximate retrieval with an explicit semantic/hybrid --mode.
+    /// The service currently uses exact search and reports ANN as unavailable.
+    #[arg(long, requires_all = ["query", "mode"])]
+    approximate: bool,
     /// Maximum hits for --query (default 10, maximum 100).
     #[arg(long, requires = "query")]
     limit: Option<usize>,
     /// Result offset for --query (default 0; offset + limit + 1 must be at most 1024).
     #[arg(long, requires = "query")]
     offset: Option<usize>,
-    /// Exact stored agent slug for --query; repeat for multiple agents.
+    /// Agent name or supported alias for --query; repeat for multiple agents.
+    /// Unknown names fail before opening the index or archive.
     #[arg(long = "agent", requires = "query")]
     agents: Vec<String>,
     /// Exact workspace for --query; repeat for multiple workspaces.
@@ -41,22 +61,29 @@ pub(super) struct Options {
 
 impl Options {
     /// Validate before resolving paths, starting supervisors or touching storage.
-    pub(super) fn request(self) -> Result<Option<Request>, &'static str> {
+    pub(super) fn request(self) -> Result<Option<Request>, String> {
         let Some(query) = self.query else {
+            if self.mode.is_some() || self.approximate {
+                return Err("--mode and --approximate require --query".into());
+            }
             return Ok(None);
         };
+        let mode = self.mode.unwrap_or_default();
+        if self.approximate && mode == QueryMode::Lexical {
+            return Err("--approximate requires --mode semantic or --mode hybrid".into());
+        }
         let limit = self.limit.unwrap_or(10);
         let offset = self.offset.unwrap_or(0);
-        let filters = Filters {
+        let mut filters = Filters {
             agents: self.agents,
             workspaces: self.workspaces,
             source_id: self.source_id,
             created_from: self.created_from,
             created_to: self.created_to,
         };
-        protocol::validate_search(&query, limit, offset, &filters)?;
         // argv has no JSON frame, but must not bypass the transport's aggregate
         // input budget by supplying many individually valid filter identities.
+        // Count RAW identities before trimming and collapsing agent aliases.
         let identity_bytes = filters
             .agents
             .iter()
@@ -65,19 +92,40 @@ impl Options {
             .try_fold(query.len(), |total, value| total.checked_add(value.len()))
             .ok_or("one-shot query and filters exceed the 64 KiB input limit")?;
         if identity_bytes > protocol::MAX_REQUEST_BYTES {
-            return Err("one-shot query and filters exceed the 64 KiB input limit");
+            return Err("one-shot query and filters exceed the 64 KiB input limit".into());
         }
-        Ok(Some(Request::Search {
-            id: 1,
-            query,
-            limit,
-            offset,
-            filters,
+        // This lane constructs Filters directly rather than deserializing it.
+        // Use the same resolver and retain its unknown-name/suggestion detail.
+        filters.agents = protocol::normalize_agents(&filters.agents)?;
+        protocol::validate_search(&query, limit, offset, &filters)?;
+        // Dispatch through Session::handle just like the wire protocol. In
+        // particular, hybrid's explicit fallback metadata and semantic-only
+        // refusal semantics must not be reimplemented in the argv transport.
+        Ok(Some(match mode {
+            QueryMode::Lexical => Request::Search {
+                id: 1,
+                query,
+                limit,
+                offset,
+                filters,
+            },
+            QueryMode::Semantic | QueryMode::Hybrid => Request::SemanticSearch {
+                id: 1,
+                query,
+                mode: match mode {
+                    QueryMode::Semantic => semantic::Mode::Semantic,
+                    _ => semantic::Mode::Hybrid,
+                },
+                approximate: self.approximate,
+                limit,
+                offset,
+                filters,
+            },
         }))
     }
 }
 
-pub(super) fn invalid_request(message: &'static str) -> CliError {
+pub(super) fn invalid_request(message: impl Into<String>) -> CliError {
     // main recognizes a preformatted envelope even without a --json flag.
     CliError {
         code: 2,
@@ -175,6 +223,7 @@ mod tests {
             source_id: Some("remote-id".into()),
             created_from: Some(-1),
             created_to: Some(42),
+            ..Options::default()
         }
         .request()
         .unwrap()
@@ -229,6 +278,332 @@ mod tests {
             .request()
             .is_err()
         );
+    }
+
+    #[test]
+    fn one_shot_aliases_share_transport_resolution_and_unknown_names_are_usage_errors() {
+        let request = Options {
+            query: Some("scopeprobe".into()),
+            agents: vec!["claude".into(), "Claude-Code".into(), "CODEX".into()],
+            ..Options::default()
+        }
+        .request()
+        .unwrap()
+        .unwrap();
+        let Request::Search { filters, .. } = request else {
+            panic!("expected a lexical request");
+        };
+        assert_eq!(filters.agents, ["claude_code", "codex"]);
+        let error = Options {
+            query: Some("scopeprobe".into()),
+            agents: vec!["codex".into(), "claud_code".into()],
+            ..Options::default()
+        }
+        .request()
+        .unwrap_err();
+        let error = invalid_request(error);
+        assert_eq!(error.code, 2);
+        assert!(!error.retryable);
+        let envelope: serde_json::Value = serde_json::from_str(&error.message).unwrap();
+        assert_eq!(envelope["ok"], false);
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(message.contains("claud_code"));
+        assert!(message.contains("Did you mean 'claude_code'?"));
+    }
+
+    #[test]
+    fn one_shot_raw_byte_budget_cannot_be_bypassed_by_alias_collapse() {
+        let error = Options {
+            query: Some("scopeprobe".into()),
+            agents: vec![format!("{}claude", " ".repeat(2050)); protocol::MAX_FILTERS],
+            ..Options::default()
+        }
+        .request()
+        .unwrap_err();
+        assert!(error.contains("64 KiB"));
+    }
+
+    fn parse_options(arguments: &[&str]) -> Options {
+        let cli = ServiceCli::try_parse_from(arguments).expect("valid one-shot arguments");
+        let super::super::ServiceCommand::Serve { once, .. } = cli.command;
+        once
+    }
+
+    #[test]
+    fn lexical_default_and_explicit_mode_need_no_semantic_configuration() {
+        for extra in [vec![], vec!["--mode", "lexical"]] {
+            let mut arguments = vec![
+                "cass", "serve", "--index", "/not-opened", "--query", "needle",
+            ];
+            arguments.extend(extra);
+            let request = parse_options(&arguments).request().unwrap().unwrap();
+            assert!(matches!(request, Request::Search { id: 1, .. }));
+        }
+    }
+
+    #[test]
+    fn semantic_modes_construct_the_same_typed_request_as_stdio() {
+        for (name, expected) in [
+            ("semantic", semantic::Mode::Semantic),
+            ("hybrid", semantic::Mode::Hybrid),
+        ] {
+            let request = parse_options(&[
+                "cass",
+                "serve",
+                "--data-dir",
+                "/not-opened",
+                "--db",
+                "/archive.db",
+                "--semantic-embedder",
+                "hash",
+                "--query",
+                "cache δ",
+                "--mode",
+                name,
+                "--limit",
+                "3",
+                "--offset",
+                "4",
+                "--agent",
+                "Claude-Code",
+                "--agent",
+                "codex",
+                "--workspace",
+                "/work/δ ' %_",
+                "--source-id",
+                "remote-id",
+                "--created-from",
+                "-1",
+                "--created-to",
+                "42",
+                "--approximate",
+            ])
+            .request()
+            .unwrap()
+            .unwrap();
+            let wire: Request = serde_json::from_value(json!({
+                "id": 1, "op": "semantic_search", "query": "cache δ", "mode": name,
+                "limit": 3, "offset": 4, "approximate": true,
+                "filters": { "agents": ["Claude-Code", "codex"],
+                    "workspaces": ["/work/δ ' %_"], "source_id": "remote-id",
+                    "created_from": -1, "created_to": 42 }
+            }))
+            .unwrap();
+            for actual in [request, wire] {
+                let Request::SemanticSearch {
+                    id,
+                    query,
+                    mode,
+                    approximate,
+                    limit,
+                    offset,
+                    filters,
+                } = actual
+                else {
+                    panic!("expected a semantic service request");
+                };
+                assert_eq!(
+                    (id, query.as_str(), mode, approximate, limit, offset),
+                    (1, "cache δ", expected, true, 3, 4)
+                );
+                assert_eq!(filters.agents, ["claude_code", "codex"]);
+                assert_eq!(filters.workspaces, ["/work/δ ' %_"]);
+                assert_eq!(filters.source_id.as_deref(), Some("remote-id"));
+                assert_eq!(
+                    (filters.created_from, filters.created_to),
+                    (Some(-1), Some(42))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_modes_require_an_explicit_embedder_archive_and_data_directory() {
+        for mode in ["semantic", "hybrid"] {
+            for location in [
+                vec!["--index", "/index"],
+                vec!["--data-dir", "/data", "--db", "/archive"],
+                vec!["--data-dir", "/data", "--semantic-embedder", "hash"],
+                vec![
+                    "--index", "/index", "--db", "/archive", "--semantic-embedder", "hash",
+                ],
+            ] {
+                let mut arguments = vec!["cass", "serve", "--query", "needle", "--mode", mode];
+                arguments.extend(location);
+                assert!(ServiceCli::try_parse_from(arguments).is_err());
+            }
+            for embedder in ["hash", "minilm", "multilingual-minilm", "external"] {
+                let options = parse_options(&[
+                    "cass",
+                    "serve",
+                    "--query",
+                    "needle",
+                    "--mode",
+                    mode,
+                    "--data-dir",
+                    "/data",
+                    "--db",
+                    "/archive",
+                    "--semantic-embedder",
+                    embedder,
+                ]);
+                let request = options.request().unwrap().unwrap();
+                assert!(matches!(
+                    request,
+                    Request::SemanticSearch {
+                        approximate: false,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn one_shot_modes_do_not_change_stdio_or_allow_mixed_transports() {
+        let base = [
+            "cass",
+            "serve",
+            "--data-dir",
+            "/data",
+            "--db",
+            "/archive",
+            "--semantic-embedder",
+            "hash",
+        ];
+        for extra in [vec!["--stdio"], vec!["--stdio", "--mcp"]] {
+            let arguments = base.into_iter().chain(extra).collect::<Vec<_>>();
+            assert!(parse_options(&arguments).request().unwrap().is_none());
+        }
+        for extra in [
+            vec!["--stdio", "--mode", "hybrid"],
+            vec!["--stdio", "--query", "needle", "--mode", "semantic"],
+            vec!["--query", "needle", "--mode", "semantic", "--mcp"],
+            vec![
+                "--query", "needle", "--mode", "hybrid", "--reranker-model", "/model",
+            ],
+            vec!["--query", "needle", "--mode", "unknown"],
+            vec!["--query", "needle", "--approximate"],
+        ] {
+            assert!(ServiceCli::try_parse_from(base.into_iter().chain(extra)).is_err());
+        }
+    }
+
+    #[test]
+    fn approximate_lexical_requests_fail_before_service_admission() {
+        for mode in [None, Some(QueryMode::Lexical)] {
+            let error = Options {
+                query: Some("needle".into()),
+                mode,
+                approximate: true,
+                ..Options::default()
+            }
+            .request()
+            .unwrap_err();
+            let error = invalid_request(error);
+            assert_eq!(error.code, 2);
+            assert!(!error.retryable);
+            assert!(error.message.contains("requires --mode semantic or --mode hybrid"));
+        }
+        let options = parse_options(&[
+            "cass",
+            "serve",
+            "--index",
+            "/not-opened",
+            "--query",
+            "needle",
+            "--mode",
+            "lexical",
+            "--approximate",
+        ]);
+        assert!(options.request().is_err());
+    }
+
+    #[test]
+    fn every_mode_keeps_shared_query_scope_and_page_admission() {
+        for mode in [QueryMode::Lexical, QueryMode::Semantic, QueryMode::Hybrid] {
+            let cases = [
+                Options {
+                    query: Some(" ".into()),
+                    ..Options::default()
+                },
+                Options {
+                    query: Some("é".repeat(2049)),
+                    ..Options::default()
+                },
+                Options {
+                    limit: Some(0),
+                    ..Options::default()
+                },
+                Options {
+                    limit: Some(101),
+                    ..Options::default()
+                },
+                Options {
+                    offset: Some(usize::MAX),
+                    ..Options::default()
+                },
+                Options {
+                    offset: Some(1023),
+                    limit: Some(1),
+                    ..Options::default()
+                },
+                Options {
+                    agents: vec!["codex".into(), "nonsense-agent".into()],
+                    ..Options::default()
+                },
+                Options {
+                    workspaces: vec!["/work".into(); 33],
+                    ..Options::default()
+                },
+                Options {
+                    source_id: Some(" local ".into()),
+                    ..Options::default()
+                },
+                Options {
+                    created_from: Some(42),
+                    created_to: Some(41),
+                    ..Options::default()
+                },
+            ];
+            for mut options in cases {
+                options.mode = Some(mode);
+                options.query.get_or_insert_with(|| "needle".into());
+                assert!(options.request().is_err(), "mode {mode:?} bypassed admission");
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_modes_preserve_raw_byte_admission_before_alias_normalization() {
+        for mode in [QueryMode::Semantic, QueryMode::Hybrid] {
+            let error = Options {
+                query: Some("needle".into()),
+                mode: Some(mode),
+                agents: vec![format!("{}claude", " ".repeat(2050)); protocol::MAX_FILTERS],
+                ..Options::default()
+            }
+            .request()
+            .unwrap_err();
+            assert!(error.contains("64 KiB"));
+        }
+    }
+
+    #[test]
+    fn constructed_options_cannot_silently_drop_mode_without_a_query() {
+        for options in [
+            Options {
+                mode: Some(QueryMode::Semantic),
+                ..Options::default()
+            },
+            Options {
+                approximate: true,
+                ..Options::default()
+            },
+        ] {
+            assert!(options.request().unwrap_err().contains("require --query"));
+        }
+        assert!(Options::default().request().unwrap().is_none());
     }
 
     #[test]

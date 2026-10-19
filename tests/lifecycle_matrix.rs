@@ -180,6 +180,10 @@ fn scrub(input: &str, test_home: &Path) -> String {
         // A page's byte budget is a share of the in-flight budget above.
         "startup_page_fetch_message_bytes",
         "steady_page_fetch_message_bytes",
+        // Resident-memory feedback (92bee6cf): the reporting process's own RSS
+        // and the in-flight limit derived from that observation.
+        "resident_bytes",
+        "inflight_byte_limit",
     ] {
         let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
         out = re

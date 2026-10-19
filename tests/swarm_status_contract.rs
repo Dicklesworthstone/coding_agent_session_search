@@ -290,7 +290,7 @@ fn live_swarm_observes_explicit_database_without_opening_it() {
 }
 
 #[test]
-#[ignore = "requires installed br 0.6.x; run explicitly through RCH"]
+#[ignore = "requires installed br 0.6.x or 0.7.x; run explicitly through RCH"]
 fn live_swarm_cli_reads_real_git_and_beads_without_authorizing_claims() {
     let sandbox = TempDir::new().expect("isolated CLI environment");
     let repo = sandbox.path().join("repo");

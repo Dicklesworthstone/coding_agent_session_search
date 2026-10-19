@@ -5222,3 +5222,166 @@ fn gh453_snapshot(home: &std::path::Path, data_dir: &std::path::Path) -> Gh453Sn
             .unwrap_or_default(),
     }
 }
+
+/// Rows of `sql` as stock SQLite's CLI reads them, strictly read-only.
+fn stock_sqlite_json(db: &std::path::Path, sql: &str) -> Vec<serde_json::Value> {
+    let output = std::process::Command::new("sqlite3")
+        .args(["-readonly", "-json"])
+        .arg(db)
+        .arg(sql)
+        .output()
+        .expect("run the stock sqlite3 CLI");
+    assert!(
+        output.status.success(),
+        "sqlite3 {sql:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("sqlite3 output is UTF-8");
+    if stdout.trim().is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(&stdout).expect("sqlite3 -json output parses")
+}
+
+/// Texts in `expected` with no stored copy, and stored texts nobody wrote.
+fn payload_mismatches(expected: &[String], stored: &[String]) -> (usize, usize) {
+    let mut remaining = std::collections::HashMap::<&str, usize>::new();
+    for text in expected {
+        *remaining.entry(text.as_str()).or_default() += 1;
+    }
+    let mut unexpected = 0;
+    for text in stored {
+        match remaining.get_mut(text.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => unexpected += 1,
+        }
+    }
+    (remaining.values().sum(), unexpected)
+}
+
+/// gi7k7 (#516): FrankenSQLite's 0.4.10 data-integrity advisory (bd-obwsy)
+/// covers inserts inside an explicit transaction that could corrupt a table
+/// b-tree, which stock SQLite reports as "Rowid N out of order". Every
+/// `cass index` batch writes variable-width rows inside explicit
+/// transactions. This drives the real `cass index --full` over 2,000 messages
+/// 50 to 3,200 characters wide, then has stock SQLite verify the archive:
+/// integrity_check, exact counts, and every message payload.
+#[test]
+fn index_full_variable_width_corpus_passes_stock_sqlite_verification() {
+    let sqlite3_available = std::process::Command::new("sqlite3")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !sqlite3_available {
+        eprintln!(
+            "skipping index_full_variable_width_corpus_passes_stock_sqlite_verification: \
+             the stock verification requires the sqlite3 CLI"
+        );
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let sessions = home.join(".codex/sessions/2026/10/17");
+    fs::create_dir_all(&sessions).unwrap();
+    let data_dir = home.join("cass_data");
+
+    // Deterministic widths and text without a rand dependency (PCG constants).
+    let mut state: u64 = 0x0b5e_0b5e;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    };
+    let mut expected = Vec::new();
+    for session in 0..20_u64 {
+        let id = format!("00000000-0000-4000-8000-{session:012}");
+        let mut lines = vec![
+            serde_json::json!({
+                "timestamp": "2026-10-17T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-10-17T10:00:00.000Z",
+                    "cwd": format!("/tmp/obwsy/{session}"),
+                    "originator": "codex_cli_rs",
+                    "cli_version": "0.1.0"
+                }
+            })
+            .to_string(),
+        ];
+        for message in 0..100_u64 {
+            let width = 50 + usize::try_from(next() % 3_151).unwrap();
+            let mut text = format!("obwsy s{session} m{message} ");
+            while text.len() < width {
+                text.push(char::from(b'a' + u8::try_from(next() % 26).unwrap()));
+            }
+            let (role, kind) = if message % 2 == 0 {
+                ("user", "input_text")
+            } else {
+                ("assistant", "output_text")
+            };
+            lines.push(
+                serde_json::json!({
+                    "timestamp": format!(
+                        "2026-10-17T10:{:02}:{:02}.000Z",
+                        (message + 1) / 60,
+                        (message + 1) % 60
+                    ),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": kind, "text": text}]
+                    }
+                })
+                .to_string(),
+            );
+            expected.push(text);
+        }
+        fs::write(
+            sessions.join(format!("rollout-2026-10-17T10-00-00-{id}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
+    base_cmd(home)
+        .current_dir(home)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let db = data_dir.join("agent_search.db");
+    assert_eq!(
+        stock_sqlite_json(&db, "PRAGMA integrity_check"),
+        vec![serde_json::json!({"integrity_check": "ok"})],
+        "stock SQLite must find the archive intact"
+    );
+    assert_eq!(
+        stock_sqlite_json(
+            &db,
+            "SELECT (SELECT count(*) FROM conversations) AS conversations, \
+             (SELECT count(*) FROM messages) AS messages",
+        ),
+        vec![serde_json::json!({"conversations": 20, "messages": 2000})]
+    );
+    let stored: Vec<String> = stock_sqlite_json(&db, "SELECT content FROM messages")
+        .into_iter()
+        .map(|row| row["content"].as_str().expect("content is text").to_owned())
+        .collect();
+    assert_eq!(
+        payload_mismatches(&expected, &stored),
+        (0, 0),
+        "every written message must be stored exactly once, byte for byte"
+    );
+
+    // The comparison is not vacuous: one altered text is one missing and one
+    // unexpected payload.
+    let mut altered = expected.clone();
+    altered[1_000].push('!');
+    assert_eq!(payload_mismatches(&altered, &stored), (1, 1));
+}

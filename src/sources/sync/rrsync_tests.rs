@@ -197,3 +197,35 @@ fn restricted_transfer_ignores_inherited_argument_defaults() {
         );
     }
 }
+
+/// `sources add` and `sources doctor` check a host with one remote command.
+/// sshd hands a key's forced command the client's command in
+/// SSH_ORIGINAL_COMMAND, and stock `rrsync -ro` must accept it. The `echo ok`
+/// that `sources add` sent before GH #531 is the refused control.
+#[test]
+#[ignore = "requires real rsync and rrsync executables on PATH"]
+fn connectivity_probe_passes_a_read_only_rrsync_forced_command() {
+    let temp = tempfile::TempDir::new().expect("rrsync probe tempdir");
+    let restricted = temp.path().to_str().expect("UTF-8 tempdir");
+    let forced = |remote_command: &str| {
+        Command::new("rrsync")
+            .args(["-ro", restricted])
+            .env("SSH_ORIGINAL_COMMAND", remote_command)
+            .stdin(Stdio::null())
+            .output()
+            .expect("execute rrsync")
+    };
+    let probe = forced(crate::sources::SSH_CONNECTIVITY_PROBE_COMMAND);
+    assert!(
+        probe.status.success(),
+        "rrsync refused the connectivity probe: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let refused = forced("echo ok");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("does not run rsync"),
+        "unexpected rrsync refusal: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}

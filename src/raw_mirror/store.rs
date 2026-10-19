@@ -2488,7 +2488,7 @@ fn persist_raw_mirror_blob_cache(root: &Path, entry: &CachedRawMirrorBlobRecord)
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn cached_raw_mirror_blob_record(
     key: &RawMirrorBlobCacheKey,
     root: &Path,
