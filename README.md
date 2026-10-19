@@ -780,7 +780,7 @@ agents = ["claude_code"]
 cass sources list [--verbose] [--json]
 
 # Add a new source
-cass sources add <user@host> [--name <name>] [--preset macos-defaults|linux-defaults] [--path <path>...] [--no-test]
+cass sources add <user@host> [--name <name>] [--preset macos-defaults|linux-defaults] [--path <path>...] [--no-test] [--json]
 
 # Remove a source
 cass sources remove <name> [--purge] [-y]
@@ -791,6 +791,14 @@ cass sources doctor [--source <name>] [--json]
 # Sync sessions
 cass sources sync [--source <name>] [--no-index] [--verbose] [--dry-run] [--json]
 ```
+
+#### Read-Only (rrsync) Remotes
+
+A key restricted in the remote's `authorized_keys` to `command="rrsync -ro /home/user",restrict` works: `cass sources sync` retries without `--secluded-args` (which rrsync refuses), and the connectivity check in `sources add` and `sources doctor` runs `true`, the one non-rsync command rrsync allows. Three things differ from an unrestricted key:
+
+- Write remote paths without `~`. cass expands `~` by asking the remote shell for `$HOME`, and rrsync refuses that.
+- rrsync anchors every path at its directory. With `rrsync -ro /home/user`, configure `/.claude/projects` (served as `/home/user/.claude/projects`); `/home/user/.claude/projects` would be served as `/home/user/home/user/.claude/projects`. Paths containing `..` are refused.
+- Tailscale SSH authenticates through the tailnet, not `authorized_keys`, so a forced command does not restrict a Tailscale SSH session. Use a regular sshd for a read-only key.
 
 #### Excluding Noisy Agent Harnesses
 
