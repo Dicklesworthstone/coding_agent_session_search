@@ -27,9 +27,35 @@
 set -uo pipefail
 
 test_log_counts() {
-    awk '
+    local log="$1"
+    shift
+    local filters_nl=""
+    if [ "$#" -gt 0 ]; then
+        printf -v filters_nl '%s\n' "$@"
+    fi
+    GATE_TEST_FILTERS="$filters_nl" awk '
+        BEGIN {
+            n = split(ENVIRON["GATE_TEST_FILTERS"], raw_filters, "\n")
+            for (i = 1; i <= n; i++) {
+                if (length(raw_filters[i]) > 0) {
+                    filters[++filter_count] = raw_filters[i]
+                }
+            }
+        }
         /^running [0-9]+ tests?$/ {
             announced[++depth] = $2
+            next
+        }
+        depth == 1 && /^test [^ ].* \.\.\. ok$/ {
+            line = $0
+            sub(/^test /, "", line)
+            sub(/ \.\.\. ok$/, "", line)
+            sub(/ - should panic$/, "", line)
+            for (f = 1; f <= filter_count; f++) {
+                if (index(line, filters[f]) > 0) {
+                    matched[f]++
+                }
+            }
             next
         }
         /^test result: ok\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out/ {
@@ -44,10 +70,16 @@ test_log_counts() {
         }
         /^test result:/ { incomplete++ }
         END {
-            if (binaries == 0 || empty > 0 || incomplete > 0 || depth != 0) exit 1
+            for (f = 1; f <= filter_count; f++) {
+                if (!matched[f]) {
+                    printf "gate: test filter matched 0 passing tests: %s\n", filters[f] > "/dev/stderr"
+                    unmatched++
+                }
+            }
+            if (binaries == 0 || empty > 0 || incomplete > 0 || depth != 0 || unmatched > 0) exit 1
             printf "PASSED=%d BINARIES=%d\n", passed, binaries
         }
-    ' "$1"
+    ' "$log"
 }
 
 verify_receipt() {
@@ -141,7 +173,8 @@ if [ "${1:-}" = --verify-receipt ]; then
     exit $?
 fi
 if [ "${1:-}" = --verify-test-log ]; then
-    test_log_counts "$2"
+    shift
+    test_log_counts "$@"
     exit $?
 fi
 if [ "${1:-}" = --verify-fmt ]; then
@@ -282,6 +315,11 @@ SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
 run_tests() {
     local stage="$1"
     shift
+    local -a filters=()
+    while [ "${1:-}" = --filter ]; do
+        filters+=("$2")
+        shift 2
+    done
     local log rc counts
     local -a statuses
     log="$(mktemp -t cass-gate-tests.XXXXXX)"
@@ -290,7 +328,7 @@ run_tests() {
     rc=${statuses[0]}
     [ "${statuses[1]}" -eq 0 ] || rc=1
     if [ "$rc" -eq 0 ]; then
-        if counts="$(test_log_counts "$log")"; then
+        if counts="$(test_log_counts "$log" "${filters[@]}")"; then
             echo "TEST_COUNT=${stage} ${counts}"
         else
             echo "gate: ${stage} has missing or empty test binaries (log=${log})" >&2
@@ -367,8 +405,15 @@ if [ "$RUN_LIB" = 1 ]; then
     fi
     read -r -a filter_words <<< "$LIB_FILTER"
     filter_args=""
-    [ "${#filter_words[@]}" -eq 0 ] || printf -v filter_args ' %q' "${filter_words[@]}"
-    lib_stage="run_tests lib-tests timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
+    filter_check_args=""
+    if [ "${#filter_words[@]}" -gt 0 ]; then
+        printf -v filter_args ' %q' "${filter_words[@]}"
+        for fw in "${filter_words[@]}"; do
+            printf -v fw_q ' --filter %q' "$fw"
+            filter_check_args+="$fw_q"
+        done
+    fi
+    lib_stage="run_tests lib-tests${filter_check_args} timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
 fi
 # Every stage the remote script will run, in order. The receipt check below
 # requires each one to report: a job cut short by the fleet's SSH ceiling
@@ -396,8 +441,15 @@ if [ "$RUN_INTEGRATION" = 1 ]; then
         fi
         read -r -a filter_words <<< "$filter"
         filter_args=""
-        [ "${#filter_words[@]}" -eq 0 ] || printf -v filter_args ' %q' "${filter_words[@]}"
-        integration_stage+="run_tests test-${t} cargo test --locked -j ${BUILD_JOBS} --test ${t} -- --test-threads=${BUILD_JOBS} ${filter_args};"
+        filter_check_args=""
+        if [ "${#filter_words[@]}" -gt 0 ]; then
+            printf -v filter_args ' %q' "${filter_words[@]}"
+            for fw in "${filter_words[@]}"; do
+                printf -v fw_q ' --filter %q' "$fw"
+                filter_check_args+="$fw_q"
+            done
+        fi
+        integration_stage+="run_tests test-${t}${filter_check_args} cargo test --locked -j ${BUILD_JOBS} --test ${t} -- --test-threads=${BUILD_JOBS} ${filter_args};"
         EXPECTED_STAGES+=("test-${t}")
     done
 fi

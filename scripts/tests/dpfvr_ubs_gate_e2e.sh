@@ -173,6 +173,24 @@ TESTS
     check_exit nonzero-failures-in-ok-summary 1 bash "$gate" --verify-test-log "$proof_dir/tests-false-ok.txt"
     { cat "$proof_dir/tests-positive.txt"; echo 'test result: ok. 1 passed;'; } > "$proof_dir/tests-malformed-summary.txt"
     check_exit malformed-terminal-summary 1 bash "$gate" --verify-test-log "$proof_dir/tests-malformed-summary.txt"
+    cat > "$proof_dir/tests-named.txt" <<'TESTS'
+running 2 tests
+test indexer::tests::gh494_mid_run_resume ... ok
+test storage::sqlite::tests::fts_shadow_recreation - should panic ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7000 filtered out
+TESTS
+    check_exit all-declared-filters-matched 0 bash "$gate" --verify-test-log "$proof_dir/tests-named.txt" indexer::tests::gh494 fts_shadow_recreation
+    check_exit mixed-filter-with-typo-rejected 1 bash "$gate" --verify-test-log "$proof_dir/tests-named.txt" indexer::tests::gh494 indexer::gh494_tests
+    check_exit mixed-filter-typo-named 0 rg -F 'gate: test filter matched 0 passing tests: indexer::gh494_tests' "$proof_dir/mixed-filter-with-typo-rejected.log"
+    {
+        echo 'running 1 test'
+        echo 'running 1 test'
+        echo 'test child::only_match ... ok'
+        echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+        echo 'test parent::real_match ... ok'
+        echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+    } > "$proof_dir/tests-nested-filter.txt"
+    check_exit child-only-filter-match-rejected 1 bash "$gate" --verify-test-log "$proof_dir/tests-nested-filter.txt" parent::real_match child::only_match
     check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
 
     # Exercise actual source admission and filesystem timestamps, without
