@@ -24367,46 +24367,53 @@ mod tests {
     /// smallest budget the page fits, the search must return that page with an
     /// unknown total instead of failing; with fuel to spare it reports the
     /// exact total and the same hits.
+    ///
+    /// The fixture has to give the ranked pass something to skip. Quill scores
+    /// a disjunction in 4,096-document windows, the first window is always
+    /// exhaustive, and opening a segment's cursor enters its first block. So a
+    /// ranked pass saves fuel only on documents past the first window of one
+    /// segment: one document per segment, or an index that fits in one window,
+    /// costs the count no more than the page. The documents therefore go in as
+    /// one batch (one segment), strong matches first and then three windows of
+    /// weak ones. The title never contains the term, so a weak document can
+    /// score no higher than its own weak content match.
     #[test]
     fn bounded_exact_count_survives_a_real_count_fuel_refusal() -> Result<()> {
         const STRONG: usize = 4;
-        const WEAK: usize = 4_096;
+        const WEAK: usize = 3 * 4_096;
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        let conversation = |id: usize, content: String| NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("needle".into()),
-            workspace: Some(std::path::PathBuf::from("/ws")),
-            source_path: dir.path().join(format!("{id}.jsonl")),
-            started_at: Some(100),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(100),
-                content,
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: Vec::new(),
-            }],
-        };
-        // A few strong matches ahead of many weak ones of the same length:
+        // Same length, so only the term frequency separates the two kinds:
         // once the top-k holds the strong ones, no weak block can enter it.
         let strong = ["needle"; 24].join(" ");
         let weak = std::iter::once("needle")
             .chain(std::iter::repeat_n("filler", 23))
             .collect::<Vec<_>>()
             .join(" ");
-        for id in 0..STRONG {
-            index.add_conversation(&conversation(id, strong.clone()))?;
+        let mut documents = Vec::with_capacity(STRONG + WEAK);
+        for ordinal in 0..STRONG + WEAK {
+            documents.push(frankensearch::quill::cass::CassDocument {
+                agent: "codex".into(),
+                workspace: Some("/ws".into()),
+                workspace_original: None,
+                source_path: format!("/gh518/{ordinal}.jsonl"),
+                msg_idx: 0,
+                created_at: Some(100),
+                title: Some("fixture".into()),
+                content: if ordinal < STRONG {
+                    strong.clone()
+                } else {
+                    weak.clone()
+                },
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+                conversation_id: Some(i64::try_from(ordinal)? + 1),
+            });
         }
-        for id in STRONG..STRONG + WEAK {
-            index.add_conversation(&conversation(id, weak.clone()))?;
-        }
-        index.commit()?;
+        let mut writer = crate::search::quill_bridge::QuillCassIndex::open_or_create(dir.path())?;
+        writer.add_cass_documents(&documents)?;
+        writer.commit()?;
+        drop(writer);
 
         let query = frankensearch::quill::query::CassQueryParser::new(
             frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
@@ -24446,10 +24453,18 @@ mod tests {
         // Precondition, in production order on a fresh reader: at the smallest
         // budget the ranked page fits, the counting pass does not.
         let probe = open(fits_at)?;
+        let segments = probe.segment_count()?;
         crate::search::quill_bridge::search_paginated(&probe, &query, STRONG, 0, false)?;
         let count_error =
-            crate::search::quill_bridge::search_paginated(&probe, &query, STRONG, 0, true)
-                .expect_err("counting every match must cost more fuel than the ranked page");
+            match crate::search::quill_bridge::search_paginated(&probe, &query, STRONG, 0, true) {
+                Ok(page) => bail!(
+                    "budget {fits_at}, {segments} segment(s): counting every match must cost \
+                     more fuel than the ranked page, but it returned {} hits and total {:?}",
+                    page.hits.len(),
+                    page.total_count
+                ),
+                Err(error) => error,
+            };
         assert!(
             crate::search::quill_bridge::is_query_fuel_exhausted(&count_error),
             "{count_error:#}"
@@ -24473,12 +24488,10 @@ mod tests {
         let direct =
             crate::search::quill_bridge::search_paginated(&ample, &query, STRONG, 0, true)?;
         assert_eq!(counted.total_count, direct.total_count);
-        assert!(
-            counted
-                .total_count
-                .is_some_and(|total| total >= STRONG + WEAK),
-            "every document matches: {:?}",
-            counted.total_count
+        assert_eq!(
+            counted.total_count,
+            Some(STRONG + WEAK),
+            "every document matches"
         );
         assert_eq!(counted.hits, degraded.hits);
         Ok(())
