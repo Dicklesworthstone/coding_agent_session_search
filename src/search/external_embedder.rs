@@ -17,6 +17,7 @@ use url::{Host, Url};
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
 
 mod retry;
+mod wire;
 
 pub const EXTERNAL_EMBEDDER: &str = "external";
 pub const EXTERNAL_VECTOR_SPACE_REVISION: &str = "external-openai-v1:unit-norm:passages-v2";
@@ -477,9 +478,15 @@ impl Embedder for ExternalEmbedder {
             if text.trim().is_empty() {
                 return Err(self.failure(format!("external_input_empty: input {index}")));
             }
-            let encoded = serde_json::to_string(text)
-                .map_err(|_| self.failure("external_request: could not encode input"))?;
-            if overhead + encoded.len() > self.config.max_request_bytes {
+            // Count serde's actual escaped UTF-8 bytes without first allocating
+            // the encoded input. Reject a late oversized input before any of
+            // this call's earlier, otherwise valid inputs can reach the server.
+            if wire::json_string_bytes(
+                text,
+                self.config.max_request_bytes.saturating_sub(overhead),
+            )
+            .is_none()
+            {
                 return Err(self.failure(format!("external_input_too_large: input {index} exceeds request byte limit; no text from this call sent")));
             }
         }
@@ -490,13 +497,18 @@ impl Embedder for ExternalEmbedder {
             let mut end = start;
             let mut bytes = overhead;
             while end < texts.len() && end - start < self.config.batch_size {
-                let encoded = serde_json::to_string(texts[end])
-                    .map_err(|_| self.failure("external_request: could not encode input"))?;
-                let next = bytes + encoded.len() + usize::from(end > start);
-                if next > self.config.max_request_bytes {
+                let separator = usize::from(end > start);
+                let remaining = self
+                    .config
+                    .max_request_bytes
+                    .checked_sub(bytes)
+                    .and_then(|remaining| remaining.checked_sub(separator));
+                let Some(encoded) = remaining
+                    .and_then(|remaining| wire::json_string_bytes(texts[end], remaining))
+                else {
                     break;
-                }
-                bytes = next;
+                };
+                bytes += encoded + separator;
                 end += 1;
             }
             let body = self.body(&texts[start..end])?;
