@@ -140,7 +140,7 @@ Applying `/idea-wizard` (30 candidate improvements winnowed to Top 5 + Next 10),
    - **Pass 4 (Adversarial & Negative Test Specification)**: Every bead includes both positive and planted-negative assertions (e.g., `2l1b0.81` asserts `status: "ready"` AND `stale: true, fresh: false` when `age_seconds > stale_threshold` and `fingerprint_matches == Some(true)`).
    - **Pass 5 (Immediate Execution & Accretive Delivery)**: Transitioned directly from plan space into code execution per `/just-say-no-to-process-porn-and-ceremony`.
 
-### Execution & Gate Receipt Summary (2026-10-14..2026-10-19 — 37 Beads Closed Across 4 Waves)
+### Execution & Gate Receipt Summary (2026-10-14..2026-10-19 — 61 Beads Closed Across 5 Waves)
 
 1. **Wave 1 (6 Beads Closed — `a5dc182d`, `52ebded3`, `c1b1b5d9`, `7958066a`, `54d9610f`, `eaf0a74c`, `6a241c92`; Receipts `/data/tmp/cass-gate.85vSx4`, `/data/tmp/cass-gate.VUDd59`)**:
    - **`2l1b0.80` (GH #526)**: Restored repo-wide `STAGE=fmt EXIT=0` across 90+ Rust files.
@@ -159,7 +159,7 @@ Applying `/idea-wizard` (30 candidate improvements winnowed to Top 5 + Next 10),
    - **`2l1b0.42` (GH #491)**: Verified `--build-hnsw` ANN setup help, `models status --json`, and `capabilities`/`introspect` goldens (`tests/e2e_lexical_fail_open.rs`, `tests/cli_robot.rs`).
    - **`ds7uy.4.1`**: Verified explicit semantic robot-budget two-checkpoint fail-closed execution (`src/lib.rs`, `tests/spec_search_format_contracts.rs`).
    - **`2l1b0.68`**: Verified `_meta.effective` interpretation echo on `search` and `pack`, `_meta.wildcard_fallback_skipped`, and the 9-relation `tests/search_metamorphic.rs` oracle (`tests/search_wildcard_fallback.rs` 63/63).
-4. **Wave 4 (23 Beads Closed — Receipt `/data/tmp/cass-gate.MWVkPx`, `gate: GREEN`, 240 tests + 68 goldens + `STAGE=ubs EXIT=0`)**:
+4. **Wave 4 (23 Beads Closed — `b9416372`; Receipt `/data/tmp/cass-gate.MWVkPx`, `gate: GREEN`, 240 tests + 68 goldens + `STAGE=ubs EXIT=0`)**:
    - **`yb11u`**: `serve --query` one-shot surface aligned in `capabilities.json.golden` and `introspect.json.golden` (`11724d5b`, 68/68 goldens).
    - **`uvii3`**: SQLite source-scan fallback and FTS5 lane `NOT > AND > OR` precedence, local negation, and within-field phrase adjacency (`sqlite_message_scan` 8/8 + `search_metamorphic` 9/9).
    - **`6r17d` (GH #494)**: Resumed candidate with uncounted documents retained to `.lexical-rebuild-quarantine-*` and rebuilt from zero in the same run (`f5a9d48c`, `5f948841`).
@@ -168,6 +168,13 @@ Applying `/idea-wizard` (30 candidate improvements winnowed to Top 5 + Next 10),
    - **`kz23l` (GH #413)**, **`r5c6h` (GH #440)**, **`cdzcl`**, **`qz43b`**, **`hh4jf`**: Legacy readonly resume FTS shadow preflight, resumed shared-writer checkpoint fingerprint/count finalization, object-only index idempotency cache replay, non-ASCII `source_repo` prefix guard in `parse_bead_refs`, and `usize::MAX` saturating context arithmetic in `view`/`expand`.
    - **`qu81y.6`**, **`qu81y.5`**, **`qu81y.2`**, **`yylyr`**: Zero-parent-env-mutation isolation across `packet_audit.rs`, `tests/util/e2e_log.rs`, `tests/connector_omp.rs` (12/12), and `tests/connector_chatgpt.rs` (82/82).
    - **`i7amy`**, **`gk9ho` (GH #481)**, **`mtt5q` (GH #480)**, **`mlo9d` (GH #476)**, **`931di` (GH #478)**, **`gh466-canonical-lexical-cap-a3fvq` (GH #466)**, **`mduty`**, **`watch-lexical-oom-retry-dh3vd`**, **`6i5ji`**: Bounded `hnsw_present`/`hnsw_state` projection, incremental semantic append preflight before model load, explicit `--embedder` override precedence, marker-independent FTS shadow corpus bound, watch-once symlink connector hint preservation, retained canonical prefix lexical cap, daemon quality model alias/refusal enforcement, connector-qualified watch-once lexical OOM replay debt, and continuous semantic watch cooldown retention/publication.
+5. **Wave 5 (24 Beads Closed — `79ef6d57`, `57a3f4b2`, `30ea8e38`, `98c1ea5d`; Receipts `/data/tmp/cass-gate.zT5VH7` and `/data/tmp/cass-gate.EfX6cg`, `gate: GREEN`, 243 lib tests + 10 integration tests + 68 goldens + `STAGE=ubs EXIT=0`)**:
+   - **`2l1b0.1`**: Enforced per-filter-word top-level passing test matching in `scripts/gate.sh` (`test_log_counts` + `run_tests` `--filter`), verified by 4 new regression cases in `scripts/tests/dpfvr_ubs_gate_e2e.sh` (`PASS=61 FAIL=0`) and `STAGE=ubs EXIT=0`.
+   - **`qu81y` & `qu81y.4`**: Eliminated all remaining `EnvGuard::set` / `CwdGuard` usages across `tests/ssh_sync_integration.rs`, `tests/streaming_index.rs`, `tests/golden_memo_trace.rs`, `tests/search_latency_under_indexing.rs`, `tests/card_defaults_wallclock_ab.rs`, and `tests/util/mod.rs`; enrolled all 35 integration suites in `e2e_subprocess_sources_cannot_mutate_the_parent_environment`.
+   - **`l2t7m` & `y7vcg`**: Verified bounded SQLite source-scan post-filter query evaluation (`sqlite_message_scan` 8/8).
+   - **`98anf`, `fjp82`, `orz9w`, `apzyi`, `zrtrr`, `3a4ut`, `aocm4`, `4290i`, `wxuu2`, `mt24v`, `h7dla`**: Verified durable-lesson redaction, fail-closed semantic readiness, proof-artifact exit status, redaction diagnostics, structured failure-pattern redaction, short secret detection, segmented provider credentials, secret-scan context scrubbing, key-semantic redaction, strict swarm evidence scrubbing, and fail-closed conversation metadata redaction.
+   - **`gyiuc`, `g3s8y`, `uc7nz`, `9md4k` (GH #411), `prxuj`, `0nq2s`**: Verified unified Pi/OMP root ownership, OMP resume aliases and Pi session env truth surfaces (`cli_robot` + 68/68 goldens), OMP HTML export thinking/tool preservation, Oh My Pi v18 identity and legacy remote mirror reclassification, OMP HTML export alias normalization, and Pi-family session-header resume IDs.
+   - **`povuc` & `cljkz`**: Verified finite unit fallback on hash-embedder cancellation and FrankenSQLite FTS catch-up / duplicate legacy schema row cleanup (`e2e_search_index`).
 
 ---
 
