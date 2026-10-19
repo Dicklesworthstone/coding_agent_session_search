@@ -3891,7 +3891,7 @@
     },
     {
       "name": "serve",
-      "description": "Reuse read-only search readers for a stream of JSON requests. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "description": "Reuse read-only search readers, or run one supervised --query and exit. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
       "arguments": [
         {
           "name": "index",
@@ -3911,11 +3911,91 @@
           "name": "stdio",
           "description": "Use newline-delimited JSON requests and responses on standard I/O",
           "arg_type": "flag",
-          "required": true,
+          "required": false,
           "enum_values": [
             "true",
             "false"
           ]
+        },
+        {
+          "name": "query",
+          "description": "Run one query and exit; emit a bounded JSON reply without reading stdin. Uses the service's read-only readers, fallback consent and resource supervision",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "mode",
+          "description": "Retrieval mode for --query (default lexical). Semantic and hybrid require --semantic-embedder, --data-dir and --db. No models are downloaded",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "lexical",
+            "semantic",
+            "hybrid"
+          ]
+        },
+        {
+          "name": "approximate",
+          "description": "Request approximate retrieval with an explicit semantic/hybrid --mode. The service currently uses exact search and reports ANN as unavailable",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "limit",
+          "description": "Maximum hits for --query (default 10, maximum 100)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "offset",
+          "description": "Result offset for --query (default 0; offset + limit + 1 must be at most 1024)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "agent",
+          "description": "Agent name or supported alias for --query; repeat for multiple agents. Unknown names fail before opening the index or archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "workspace",
+          "description": "Exact workspace for --query; repeat for multiple workspaces",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "source-id",
+          "description": "Exact source ID for --query, not the synthetic remote group",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-from",
+          "description": "Inclusive lower creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-to",
+          "description": "Inclusive upper creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "mcp",
@@ -3966,7 +4046,7 @@
         },
         {
           "name": "request-timeout-ms",
-          "description": "Whole-request deadline, from first frame byte through response flush. Expiry exits the worker with code 124; idle sessions are not timed out",
+          "description": "Whole-request deadline, including setup, search, teardown and output for --query. For --stdio, starts at the first frame byte; idle sessions are not timed out. Expiry exits the worker with code 124",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
