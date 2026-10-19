@@ -402,7 +402,7 @@ fn test_encrypted_export_hides_topic_in_default_name_and_html() {
             s.replace(/&lt;/g, '<')
              .replace(/&gt;/g, '>')
              .replace(/&quot;/g, '"')
-             .replace(/&#x27;/g, "'")
+             .replace(/&#x27;|&#39;/g, "'")
              .replace(/&amp;/g, '&');
 
         let submitHandler = null;
@@ -482,7 +482,7 @@ fn test_encrypted_export_hides_topic_in_default_name_and_html() {
         if (documentStub.title !== expectedTitle || footerTitle.textContent !== expectedTitle) {
             throw new Error(`unlocked title mismatch: doc=${documentStub.title} footer=${footerTitle.textContent} expected=${expectedTitle}`);
         }
-        if (!headerContent.innerHTML.includes(expectedTitle) || conversation.innerHTML.includes('cass-sealed-header')) {
+        if (!decodeHtmlText(headerContent.innerHTML).includes(expectedTitle) || conversation.innerHTML.includes('cass-sealed-header')) {
             throw new Error('sealed header should move into .header-content and be removed from #conversation');
         }
         console.log(JSON.stringify({
