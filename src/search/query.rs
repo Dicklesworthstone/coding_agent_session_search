@@ -2208,20 +2208,53 @@ fn execute_query_with_bounded_exact_count(
     limit: usize,
     offset: usize,
 ) -> Result<CassLexicalSearchResult> {
-    let page = crate::search::quill_bridge::search_paginated(reader, query, limit, offset, false)?;
+    bounded_exact_count_page(limit, offset, exact_total_count_max_docs(), |exact_count| {
+        crate::search::quill_bridge::search_paginated(reader, query, limit, offset, exact_count)
+    })
+}
+
+/// The policy of [`execute_query_with_bounded_exact_count`], with the engine
+/// call passed in as `run(exact_count)`.
+///
+/// The ranked page is the result; the exact total is an optional extra. The
+/// counting pass visits every match (the engine's block-max pruning is off for
+/// it), so on a fragmented or match-heavy index it can exhaust the query fuel
+/// the ranked page fit in. That refusal costs only the total, which is then
+/// reported as unknown exactly as on a large index (GH #518). Every other
+/// failure of the counting pass, cancellation included, still fails the query.
+fn bounded_exact_count_page(
+    limit: usize,
+    offset: usize,
+    exact_count_max_docs: usize,
+    mut run: impl FnMut(bool) -> Result<crate::search::quill_bridge::QuillLexicalPage>,
+) -> Result<CassLexicalSearchResult> {
+    let page = run(false)?;
     // `limit == 0` must not read as saturated: an empty page would equal an
     // empty limit and trigger the expensive exact-count pass for a caller that
     // asked for no rows at all.
     let page_saturated = limit > 0 && page.hits.len() == limit;
     let index_doc_count = page.doc_count;
     let total_count = if page_saturated {
-        if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
-            crate::search::quill_bridge::search_paginated(reader, query, limit, offset, true)?
-                .total_count
+        if should_collect_exact_total_count(index_doc_count, exact_count_max_docs) {
+            match run(true) {
+                Ok(counted) => counted.total_count,
+                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
+                    tracing::warn!(
+                        index_doc_count,
+                        limit,
+                        offset,
+                        error = %format_args!("{error:#}"),
+                        "exact lexical count ran out of query fuel; keeping the ranked page \
+                         and reporting its total as unknown"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             tracing::debug!(
                 index_doc_count,
-                exact_count_max_docs = exact_total_count_max_docs(),
+                exact_count_max_docs,
                 limit,
                 offset,
                 "skipping exact lexical count on large saturated result page"
@@ -24197,6 +24230,258 @@ mod tests {
         assert!(!should_collect_exact_total_count(0, 0));
         assert!(!should_collect_exact_total_count(1, 0));
         assert!(!should_collect_exact_total_count(usize::MAX, 0));
+    }
+
+    fn gh518_page(
+        hits: usize,
+        total_count: Option<usize>,
+        doc_count: usize,
+    ) -> crate::search::quill_bridge::QuillLexicalPage {
+        crate::search::quill_bridge::QuillLexicalPage {
+            hits: (0..hits)
+                .map(|rank| crate::search::quill_bridge::QuillLexicalDocHit {
+                    bm25_score: 1.0,
+                    rank,
+                    global_docid: u32::try_from(rank).expect("fixture rank fits u32"),
+                    document_id: format!("gh518-{rank}"),
+                })
+                .collect(),
+            total_count,
+            doc_count,
+        }
+    }
+
+    /// An error carrying the engine's own Display text, wrapped the way
+    /// `quill_bridge::search_paginated` wraps it.
+    fn gh518_engine_error(error: frankensearch::quill::argus::ArgusError) -> anyhow::Error {
+        anyhow!(
+            "executing a Quill lexical query: {}",
+            frankensearch::quill::QuillIndexError::from(error)
+        )
+    }
+
+    fn gh518_fuel_exhausted() -> anyhow::Error {
+        gh518_engine_error(
+            frankensearch::quill::argus::ArgusError::QueryFuelExhausted {
+                budget: 100,
+                consumed: 100,
+                segments_touched: 1,
+                dictionary_blocks: 2,
+                posting_blocks: 97,
+                position_docs: 0,
+            },
+        )
+    }
+
+    /// GH #518: the exact total is optional. When only the counting pass runs
+    /// out of query fuel, the ranked page is returned and its total is unknown.
+    #[test]
+    fn bounded_exact_count_keeps_the_page_when_only_the_count_runs_out_of_fuel() -> Result<()> {
+        let mut passes = Vec::new();
+        let result = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            passes.push(exact_count);
+            if exact_count {
+                Err(gh518_fuel_exhausted())
+            } else {
+                Ok(gh518_page(4, None, 500))
+            }
+        })?;
+        assert_eq!(
+            passes,
+            [false, true],
+            "a saturated page on a small index asks for the exact count"
+        );
+        assert_eq!(result.hits, gh518_page(4, None, 500).hits);
+        assert_eq!(result.total_count, None);
+        Ok(())
+    }
+
+    /// The degrade is keyed to fuel exhaustion of the counting pass alone: a
+    /// cancelled count still fails the query, and the ranked pass is never
+    /// optional (its fuel refusal fails the query before any count is tried).
+    #[test]
+    fn bounded_exact_count_still_fails_on_other_count_errors_and_on_page_fuel() {
+        let cancelled = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            if exact_count {
+                Err(gh518_engine_error(
+                    frankensearch::quill::argus::ArgusError::QueryCancelled { phase: "collect" },
+                ))
+            } else {
+                Ok(gh518_page(4, None, 500))
+            }
+        });
+        let error = cancelled
+            .err()
+            .expect("a cancelled counting pass fails the query");
+        assert!(
+            !crate::search::quill_bridge::is_query_fuel_exhausted(&error),
+            "{error:#}"
+        );
+
+        let mut passes = Vec::new();
+        let refused = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            passes.push(exact_count);
+            Err(gh518_fuel_exhausted())
+        });
+        let error = refused
+            .err()
+            .expect("a fuel-exhausted ranked pass fails the query");
+        assert!(
+            crate::search::quill_bridge::is_query_fuel_exhausted(&error),
+            "{error:#}"
+        );
+        assert_eq!(passes, [false], "no count is attempted without a page");
+    }
+
+    /// Controls for the unchanged policy: an affordable count is reported, an
+    /// unsaturated page is its own total, and an index over the exact-count
+    /// ceiling is never recounted.
+    #[test]
+    fn bounded_exact_count_reports_affordable_totals_and_skips_unneeded_counts() -> Result<()> {
+        let counted = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            Ok(gh518_page(4, exact_count.then_some(37), 500))
+        })?;
+        assert_eq!(counted.total_count, Some(37));
+
+        let mut passes = Vec::new();
+        let unsaturated = bounded_exact_count_page(4, 10, 1_000, |exact_count| {
+            passes.push(exact_count);
+            Ok(gh518_page(3, None, 500))
+        })?;
+        assert_eq!(passes, [false]);
+        assert_eq!(unsaturated.total_count, Some(13));
+
+        let mut passes = Vec::new();
+        let over_ceiling = bounded_exact_count_page(4, 0, 499, |exact_count| {
+            passes.push(exact_count);
+            Ok(gh518_page(4, None, 500))
+        })?;
+        assert_eq!(passes, [false]);
+        assert_eq!(over_ceiling.total_count, None);
+        Ok(())
+    }
+
+    /// GH #518 on the real engine. The counting pass visits every match while
+    /// the ranked pass may skip posting blocks that cannot reach its top-k, so
+    /// a budget the page fits in can be too small for the count. At the
+    /// smallest budget the page fits, the search must return that page with an
+    /// unknown total instead of failing; with fuel to spare it reports the
+    /// exact total and the same hits.
+    #[test]
+    fn bounded_exact_count_survives_a_real_count_fuel_refusal() -> Result<()> {
+        const STRONG: usize = 4;
+        const WEAK: usize = 4_096;
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let conversation = |id: usize, content: String| NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("needle".into()),
+            workspace: Some(std::path::PathBuf::from("/ws")),
+            source_path: dir.path().join(format!("{id}.jsonl")),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content,
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        // A few strong matches ahead of many weak ones of the same length:
+        // once the top-k holds the strong ones, no weak block can enter it.
+        let strong = ["needle"; 24].join(" ");
+        let weak = std::iter::once("needle")
+            .chain(std::iter::repeat_n("filler", 23))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for id in 0..STRONG {
+            index.add_conversation(&conversation(id, strong.clone()))?;
+        }
+        for id in STRONG..STRONG + WEAK {
+            index.add_conversation(&conversation(id, weak.clone()))?;
+        }
+        index.commit()?;
+
+        let query = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .map_err(|error| anyhow!("building the CASS query parser: {error}"))?
+        .parse("needle", &FsCassQueryFilters::default())
+        .query;
+        let open = |budget: u64| {
+            crate::search::quill_bridge::open_cass_reader_with_query_fuel_budget(dir.path(), budget)
+        };
+        let page_fits = |budget: u64| -> Result<bool> {
+            match crate::search::quill_bridge::search_paginated(
+                &open(budget)?,
+                &query,
+                STRONG,
+                0,
+                false,
+            ) {
+                Ok(_) => Ok(true),
+                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let (mut refused_at, mut fits_at) = (0_u64, 1_u64 << 40);
+        assert!(page_fits(fits_at)?, "the ranked page fits some budget");
+        while fits_at - refused_at > 1 {
+            let mid = refused_at + (fits_at - refused_at) / 2;
+            if page_fits(mid)? {
+                fits_at = mid;
+            } else {
+                refused_at = mid;
+            }
+        }
+
+        // Precondition, in production order on a fresh reader: at the smallest
+        // budget the ranked page fits, the counting pass does not.
+        let probe = open(fits_at)?;
+        crate::search::quill_bridge::search_paginated(&probe, &query, STRONG, 0, false)?;
+        let count_error =
+            crate::search::quill_bridge::search_paginated(&probe, &query, STRONG, 0, true)
+                .expect_err("counting every match must cost more fuel than the ranked page");
+        assert!(
+            crate::search::quill_bridge::is_query_fuel_exhausted(&count_error),
+            "{count_error:#}"
+        );
+
+        let degraded = execute_query_with_bounded_exact_count(&open(fits_at)?, &query, STRONG, 0)?;
+        assert_eq!(
+            degraded.hits.len(),
+            STRONG,
+            "budget {fits_at}: the ranked page"
+        );
+        assert_eq!(
+            degraded.total_count, None,
+            "budget {fits_at}: total unknown"
+        );
+
+        // Control: with fuel to spare the same call reports the exact total
+        // and ranks the same page.
+        let ample = open(fits_at.saturating_mul(1 << 20))?;
+        let counted = execute_query_with_bounded_exact_count(&ample, &query, STRONG, 0)?;
+        let direct =
+            crate::search::quill_bridge::search_paginated(&ample, &query, STRONG, 0, true)?;
+        assert_eq!(counted.total_count, direct.total_count);
+        assert!(
+            counted
+                .total_count
+                .is_some_and(|total| total >= STRONG + WEAK),
+            "every document matches: {:?}",
+            counted.total_count
+        );
+        assert_eq!(counted.hits, degraded.hits);
+        Ok(())
     }
 
     #[test]
