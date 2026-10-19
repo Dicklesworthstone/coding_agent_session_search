@@ -524,3 +524,119 @@ test("revocation invalidates an older pending open before it can issue a put", a
   f.offline(); assert.equal((await body(f.request()))[0].status, 503);
   assert.equal(f.resources(), 0);
 });
+
+// The archive root and index.html are two cache keys for the same shipped
+// entry document. Revocation must also protect navigation's index fallback.
+for (const withdrawn of ["./", "index.html"]) {
+  test(`withdrawing ${withdrawn} evicts both offline entry-document aliases`, async t => {
+    const f = fixture(t);
+    f.seed("./", "withdrawn root document"); f.seed("index.html", "withdrawn index document");
+    f.seed("payload.enc", "unrelated payload");
+    f.network(async () => new Response("document withdrawn", { status: 410 }));
+    const denied = f.request(withdrawn); await body(denied); await denied.settled;
+    f.offline();
+    for (const path of ["./", "index.html", "nested/"]) {
+      const response = f.request(path, { navigate: true });
+      const [result, text] = await body(response); await response.settled;
+      assert.equal(result.status, 503, path);
+      assert.ok(!text.includes("withdrawn"));
+    }
+    assert.equal((await body(f.request("payload.enc")))[1], "unrelated payload");
+    assert.equal(f.resources(), 0);
+  });
+
+  test(`pending entry-document match cannot cross revocation through ${withdrawn}`, async t => {
+    const f = fixture(t), reading = f.hold();
+    const other = withdrawn === "./" ? "index.html" : "./";
+    f.seed(other, "withheld document"); f.offline();
+    f.hooks.match = () => reading.promise;
+    const pending = f.request(other, { navigate: true }); await turn();
+    f.network(async () => new Response("private", { headers: { "cache-control": "private" } }));
+    const privateDocument = f.request(withdrawn); await body(privateDocument); await privateDocument.settled;
+    reading.resolve();
+    const [response, text] = await body(pending); await pending.settled;
+    assert.equal(response.status, 503); assert.ok(!text.includes("withheld document"));
+    assert.equal(f.resources(), 0);
+  });
+
+  test(`entry-document revocation through ${withdrawn} waits for the other alias's pending write`, async t => {
+    const f = fixture(t), writing = f.hold();
+    const other = withdrawn === "./" ? "index.html" : "./";
+    f.hooks.put = () => writing.promise;
+    const old = f.request(other); await body(old); await turn();
+    f.network(async () => new Response("withdrawn", { status: 403 }));
+    const denied = f.request(withdrawn); assert.equal((await body(denied))[0].status, 403);
+    let finished = false; void denied.settled.then(() => { finished = true; });
+    await turn(); const early = finished;
+    writing.resolve(); await old.settled; await denied.settled;
+    assert.equal(early, false, "the older alias write must be settled before eviction completes");
+    f.offline();
+    for (const path of ["./", "index.html", "nested/"]) {
+      const response = f.request(path, { navigate: true });
+      assert.equal((await body(response))[0].status, 503); await response.settled;
+    }
+    assert.equal(f.resources(), 0);
+  });
+}
+
+test("navigation's pending fallback match is invalidated by index.html withdrawal", async t => {
+  const f = fixture(t), reading = f.hold();
+  f.seed("index.html", "withdrawn fallback document"); f.offline();
+  f.hooks.match = (_name, url) => url === scope + "index.html" ? reading.promise : undefined;
+  const navigation = f.request("nested/", { navigate: true }); await turn();
+  assert.ok(f.calls.some(call => call[0] === "match" && call[2] === scope + "index.html"));
+  f.network(async () => new Response("gone", { status: 404 }));
+  const revoked = f.request("index.html"); await body(revoked); await revoked.settled;
+  reading.resolve();
+  const [response, text] = await body(navigation); await navigation.settled;
+  assert.equal(response.status, 503); assert.ok(!text.includes("withdrawn fallback"));
+  assert.equal(f.resources(), 0);
+});
+
+test("navigation cannot enter the index fallback while its eviction is blocked", async t => {
+  const f = fixture(t), deleting = f.hold();
+  f.seed("index.html", "withdrawn fallback document");
+  f.hooks.entryDelete = () => deleting.promise;
+  f.network(async () => new Response("gone", { status: 410 }));
+  const revoked = f.request("index.html"); await body(revoked); await turn();
+  f.offline();
+  const navigation = f.request("nested/", { navigate: true });
+  const [response] = await body(navigation); await navigation.settled;
+  deleting.resolve(); await revoked.settled;
+  assert.equal(response.status, 503);
+  assert.equal(f.calls.filter(call => call[0] === "match" && call[2] === scope + "index.html").length, 0);
+  assert.equal(f.resources(), 0);
+});
+
+test("failed alias eviction settles sibling deletes before manual clear acknowledges", async t => {
+  const f = fixture(t), deleting = f.hold();
+  f.seed("./", "root document"); f.seed("index.html", "index document");
+  f.hooks.entryDelete = (_name, url) => {
+    if (url === scope) throw new Error("root eviction failure");
+    return deleting.promise;
+  };
+  f.network(async () => new Response("private", { headers: { "cache-control": "no-store" } }));
+  const revoked = f.request("./"); await body(revoked); await turn();
+  const clear = f.message(); await turn(); const early = clear.replies.length;
+  deleting.resolve(); await revoked.settled; await clear.settled;
+  assert.equal(early, 0);
+  assert.equal(clear.replies[0].type, "CACHE_CLEARED");
+  assert.equal(f.stores.size, 0); assert.equal(f.resources(), 0);
+});
+
+test("a failed fallback match releases both navigation and entry-document state", async t => {
+  const f = fixture(t); f.seed("index.html", "document"); f.offline();
+  f.hooks.match = (_name, url) => { if (url === scope + "index.html") throw new Error("read failure"); };
+  const navigation = f.request("nested/", { navigate: true });
+  assert.equal((await body(navigation))[0].status, 503); await navigation.settled;
+  assert.equal(f.resources(), 0);
+});
+
+test("ordinary offline navigation still serves the entry document and releases its guards", async t => {
+  const f = fixture(t); f.seed("index.html", "complete offline document"); f.offline();
+  const navigation = f.request("nested/", { navigate: true });
+  const [response, text] = await body(navigation); await navigation.settled;
+  assert.equal(response.status, 200); assert.equal(text, "complete offline document");
+  assert.equal(response.headers.get("cross-origin-opener-policy"), "same-origin");
+  assert.equal(f.resources(), 0);
+});

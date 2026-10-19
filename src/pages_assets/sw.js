@@ -7,7 +7,7 @@
 
 // Bump whenever any shipped archive asset or cache policy changes. A new name
 // keeps install from mutating the active generation entry-by-entry.
-const CACHE_VERSION = "v9";
+const CACHE_VERSION = "v10";
 const STATIC_ASSETS = [
   "./",
   "./index.html",
@@ -71,6 +71,11 @@ function cacheRequestIsCurrent(epoch) {
 }
 
 function acquireCacheResource(url) {
+  // Both shipped entry URLs can satisfy offline navigation. They share a
+  // revocation identity even though CacheStorage retains separate URL keys.
+  if (url === new URL("./", getCacheScopeUrl()).href) {
+    url = new URL("./index.html", getCacheScopeUrl()).href;
+  }
   let resource = cacheResources.get(url);
   if (!resource) {
     resource = { url, users: 0, version: {}, blocked: false, mutations: new Set() };
@@ -100,7 +105,7 @@ function trackResourceMutation(resource, operation) {
   return task;
 }
 
-function revokeCachedResource(request, resource, epoch) {
+function revokeCachedResource(resource, epoch) {
   // A newer private/deleted response supersedes every earlier request for
   // this URL, including writes already consuming a body and pending matches.
   resource.version = {};
@@ -115,7 +120,17 @@ function revokeCachedResource(request, resource, epoch) {
     if (!cacheRequestIsCurrent(epoch)) return;
     // Remove all Vary representations of the URL, not just this request's
     // header variant. Never reinterpret a server refusal as an offline miss.
-    await cache.delete(request, { ignoreVary: true });
+    const entryUrl = new URL("./index.html", getCacheScopeUrl()).href;
+    const aliases = resource.url === entryUrl
+      ? [entryUrl, new URL("./", getCacheScopeUrl()).href] : [resource.url];
+    // The root copy must not bypass a withdrawn index.html (or vice versa).
+    // Settle every delete before completing this mutation, including failure,
+    // so a concurrent clear still waits for all outstanding Cache API work.
+    const results = await Promise.allSettled(aliases.map(url =>
+      cache.delete(url, { ignoreVary: true }),
+    ));
+    const failed = results.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
   }).catch((error) => {
     // Never serve a known-revoked copy after storage failed to remove it.
     // Network responses remain available. This guard lasts for this worker;
@@ -361,7 +376,7 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
     const response = await fetch(request);
 
     if (canUseCache() && responseRevokesCachedCopy(response)) {
-      trackBackgroundTask(revokeCachedResource(request, resource, epoch));
+      trackBackgroundTask(revokeCachedResource(resource, epoch));
     } else if (canUseCache() && responseAllowsCaching(response)) {
       // Clone before returning the original response. Once the client
       // starts consuming its body, a later clone would throw.
@@ -405,16 +420,27 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
 
     // Try cache as fallback for navigation requests
     if (canUseCache() && request.mode === "navigate") {
+      const indexUrl = new URL("./index.html", getCacheScopeUrl()).href;
+      const entryResource = acquireCacheResource(indexUrl);
+      const entryVersion = entryResource.blocked ? null : entryResource.version;
+      const canUseEntry = () => canUseCache() && entryVersion !== null
+        && !entryResource.blocked && entryVersion === entryResource.version;
       try {
-        const indexUrl = new URL("./index.html", getCacheScopeUrl()).href;
-        const cachedIndex = await caches.match(indexUrl, { cacheName });
-        if (cachedIndex && canUseCache() && responseAllowsCaching(cachedIndex)) {
-          log(LOG.INFO, "Serving cached index.html for offline navigation");
-          return addSecurityHeaders(cachedIndex);
+        // The original navigation URL is not the resource we read here.
+        // Fence the actual entry document before AND after the async match.
+        if (canUseEntry()) {
+          const cachedIndex = await caches.match(indexUrl, { cacheName });
+          if (cachedIndex && canUseEntry() && responseAllowsCaching(cachedIndex)) {
+            log(LOG.INFO, "Serving cached index.html for offline navigation");
+            return addSecurityHeaders(cachedIndex);
+          }
+          if (cachedIndex) discardCacheResponse(cachedIndex);
         }
-        if (cachedIndex) discardCacheResponse(cachedIndex);
       } catch (cacheError) {
         log(LOG.WARN, "Navigation cache fallback error:", cacheError);
+      } finally {
+        entryResource.users--;
+        pruneCacheResource(entryResource);
       }
     }
 
