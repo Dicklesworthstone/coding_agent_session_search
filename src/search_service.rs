@@ -80,7 +80,11 @@ enum ServiceCommand {
         )]
         data_dir: Option<PathBuf>,
         /// Use newline-delimited JSON requests and responses on standard I/O.
-        #[arg(long, required_unless_present = "query", conflicts_with = "query")]
+        #[arg(
+            long,
+            required_unless_present_any = ["query", "transcript"],
+            conflicts_with_all = ["query", "transcript"]
+        )]
         stdio: bool,
         #[command(flatten)]
         once: once::Options,

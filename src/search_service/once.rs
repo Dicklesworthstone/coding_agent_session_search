@@ -9,7 +9,7 @@ use clap::Args;
 use coding_agent_search::{CliError, CliResult};
 
 use super::protocol::{self, Filters, Reply, Request};
-use super::semantic;
+use super::{canonical, semantic};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 enum QueryMode {
@@ -25,6 +25,13 @@ pub(super) struct Options {
     /// Uses the service's read-only readers, fallback consent and resource supervision.
     #[arg(long, value_name = "QUERY", conflicts_with_all = ["stdio", "mcp", "reranker_model"])]
     query: Option<String>,
+    /// Read one bounded canonical transcript page and exit without reading stdin.
+    /// JSON selects source_path, source_id, conversation_id, optional cursor and limit.
+    /// Requires --db; never opens source files, lexical readers or models.
+    #[arg(long, value_name = "JSON", requires = "db", conflicts_with_all = [
+        "query", "stdio", "mcp", "reranker_model", "semantic_embedder"
+    ])]
+    transcript: Option<String>,
     /// Retrieval mode for --query (default lexical). Semantic and hybrid require
     /// --semantic-embedder, --data-dir and --db. No models are downloaded.
     #[arg(long, value_enum, requires = "query", requires_ifs([
@@ -62,6 +69,26 @@ pub(super) struct Options {
 impl Options {
     /// Validate before resolving paths, starting supervisors or touching storage.
     pub(super) fn request(self) -> Result<Option<Request>, String> {
+        if let Some(selection) = self.transcript.as_deref() {
+            // Protect internally constructed Options as well as clap callers.
+            // A search filter must not disappear behind an unfiltered transcript.
+            if self.query.is_some()
+                || self.mode.is_some()
+                || self.approximate
+                || self.limit.is_some()
+                || self.offset.is_some()
+                || !self.agents.is_empty()
+                || !self.workspaces.is_empty()
+                || self.source_id.is_some()
+                || self.created_from.is_some()
+                || self.created_to.is_some()
+            {
+                return Err(
+                    "--transcript cannot be combined with query options; put its cursor and limit in the JSON selection".into(),
+                );
+            }
+            return transcript_request(selection).map(Some);
+        }
         let Some(query) = self.query else {
             if self.mode.is_some() || self.approximate {
                 return Err("--mode and --approximate require --query".into());
@@ -123,6 +150,48 @@ impl Options {
             },
         }))
     }
+}
+
+/// Keep cursor validation and the actual reader in the canonical transcript
+/// implementation. This is only an argv adapter to the same typed request as
+/// stdio, including exact source identities and one-based message coordinates.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptSelection {
+    source_path: String,
+    source_id: String,
+    conversation_id: i64,
+    #[serde(default)]
+    cursor: Option<canonical::transcript::Cursor>,
+    #[serde(default = "canonical::transcript::default_limit")]
+    limit: usize,
+}
+
+fn transcript_request(selection: &str) -> Result<Request, String> {
+    // Check encoded UTF-8 bytes before allocating decoded strings or a cursor.
+    // Whitespace and JSON escapes count, just as they do in a stdio frame.
+    if selection.len() > protocol::MAX_REQUEST_BYTES {
+        return Err("transcript selection exceeds the 64 KiB input limit".into());
+    }
+    let selection: TranscriptSelection = serde_json::from_str(selection)
+        .map_err(|error| format!("invalid transcript selection: {error}"))?;
+    canonical::transcript::Page {
+        source_path: &selection.source_path,
+        source_id: &selection.source_id,
+        conversation_id: selection.conversation_id,
+        cursor: selection.cursor.as_ref(),
+        limit: selection.limit,
+    }
+    .validate()
+    .map_err(str::to_owned)?;
+    Ok(Request::Transcript {
+        id: 1,
+        source_path: selection.source_path,
+        source_id: selection.source_id,
+        conversation_id: selection.conversation_id,
+        cursor: selection.cursor,
+        limit: selection.limit,
+    })
 }
 
 pub(super) fn invalid_request(message: impl Into<String>) -> CliError {
@@ -327,6 +396,149 @@ mod tests {
         let cli = ServiceCli::try_parse_from(arguments).expect("valid one-shot arguments");
         let super::super::ServiceCommand::Serve { once, .. } = cli.command;
         once
+    }
+
+    const TRANSCRIPT: &str =
+        r#"{"source_path":"/history/δ.jsonl","source_id":"local","conversation_id":7}"#;
+
+    #[test]
+    fn transcript_one_shot_requires_archive_consent_and_excludes_other_transports() {
+        ServiceCli::command().debug_assert();
+        let base = [
+            "cass", "serve", "--index", "/never-opened", "--transcript", TRANSCRIPT,
+        ];
+        assert!(ServiceCli::try_parse_from(base).is_err(), "--db is required");
+        let configured = base
+            .into_iter()
+            .chain(["--db", "/archive.db"])
+            .collect::<Vec<_>>();
+        let request = parse_options(&configured).request().unwrap().unwrap();
+        assert!(matches!(
+            request,
+            Request::Transcript { id: 1, limit: 16, cursor: None, .. }
+        ));
+        for extra in [
+            vec!["--stdio"],
+            vec!["--mcp"],
+            vec!["--query", "needle"],
+            vec!["--limit", "1"],
+            vec!["--agent", "codex"],
+            vec!["--mode", "lexical"],
+            vec!["--offset", "0"],
+            vec!["--approximate"],
+            vec!["--reranker-model", "/model"],
+        ] {
+            assert!(
+                ServiceCli::try_parse_from(configured.iter().copied().chain(extra)).is_err()
+            );
+        }
+        assert!(
+            ServiceCli::try_parse_from([
+                "cass", "serve", "--data-dir", "/never-opened", "--db", "/archive.db",
+                "--transcript", TRANSCRIPT, "--semantic-embedder", "hash",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn transcript_one_shot_preserves_stdio_cursor_and_exact_source_identity() {
+        let selection = json!({
+            "source_path": " /history/δ ' %_.jsonl ", "source_id": "remote-laptop",
+            "conversation_id": 42, "limit": 32,
+            "cursor": {"message_id": 73, "message_index": 9,
+                "byte_offset": 32766, "content_bytes": 98304}
+        });
+        let mut frame = selection.clone();
+        frame["op"] = json!("transcript");
+        frame["id"] = json!(1);
+        let wire: Request = serde_json::from_value(frame).unwrap();
+        let actual = transcript_request(&selection.to_string()).unwrap();
+        let extract = |request| {
+            let Request::Transcript {
+                id, source_path, source_id, conversation_id, cursor, limit,
+            } = request else {
+                panic!("expected canonical transcript request");
+            };
+            (id, source_path, source_id, conversation_id, cursor, limit)
+        };
+        assert_eq!(extract(actual), extract(wire));
+    }
+
+    #[test]
+    fn transcript_one_shot_rejects_ambiguous_malformed_and_unknown_selections() {
+        for selection in ["", "null", "[]", "{}", "true", "{", "{} {}"] {
+            assert!(transcript_request(selection).is_err(), "accepted {selection}");
+        }
+        let base: serde_json::Value = serde_json::from_str(TRANSCRIPT).unwrap();
+        for (field, value) in [
+            ("conversation_id", json!(0)), ("conversation_id", json!(-1)),
+            ("conversation_id", json!(u64::MAX)), ("conversation_id", json!(1.5)),
+            ("source_path", json!(" ")), ("source_path", json!("δ".repeat(2049))),
+            ("source_id", json!(" local ")), ("source_id", json!(null)),
+            ("limit", json!(0)), ("limit", json!(33)), ("limit", json!("1")),
+            ("cursor", json!({})), ("op", json!("transcript")), ("id", json!(1)),
+            ("filters", json!({"agents":["codex"]})),
+        ] {
+            let mut selection = base.clone();
+            selection[field] = value;
+            assert!(transcript_request(&selection.to_string()).is_err(), "accepted {field}");
+        }
+        assert!(transcript_request(r#"{"source_path":"/x","source_id":"local","source_id":"other","conversation_id":7}"#).is_err());
+    }
+
+    #[test]
+    fn transcript_one_shot_uses_canonical_partial_message_cursor_admission() {
+        let base: serde_json::Value = serde_json::from_str(TRANSCRIPT).unwrap();
+        for cursor in [
+            json!({"message_id":0,"message_index":1,"byte_offset":0}),
+            json!({"message_id":1,"message_index":0,"byte_offset":0}),
+            json!({"message_id":1,"message_index":u64::MAX,"byte_offset":0}),
+            json!({"message_id":1,"message_index":1,"byte_offset":1}),
+            json!({"message_id":1,"message_index":1,"byte_offset":4,"content_bytes":4}),
+            json!({"message_id":1,"message_index":1,"byte_offset":0,"content_bytes":u64::MAX}),
+            json!({"message_id":1,"message_index":1,"byte_offset":0,"unknown":true}),
+        ] {
+            let mut selection = base.clone();
+            selection["cursor"] = cursor;
+            assert!(transcript_request(&selection.to_string()).is_err());
+        }
+        for (offset, bytes) in [(0, None), (1, Some(2)), (32766, Some(98304))] {
+            let mut selection = base.clone();
+            selection["cursor"] = json!({"message_id":1,"message_index":8,
+                "byte_offset":offset,"content_bytes":bytes});
+            assert!(transcript_request(&selection.to_string()).is_ok());
+        }
+    }
+
+    #[test]
+    fn transcript_one_shot_bounds_encoded_input_before_json_decoding() {
+        let exact = format!("{}{}", TRANSCRIPT, " ".repeat(protocol::MAX_REQUEST_BYTES - TRANSCRIPT.len()));
+        assert!(transcript_request(&exact).is_ok());
+        assert!(transcript_request(&(exact + " ")).unwrap_err().contains("64 KiB"));
+        assert!(transcript_request(&"δ".repeat(protocol::MAX_REQUEST_BYTES / 2 + 1))
+            .unwrap_err().contains("64 KiB"), "limit counts UTF-8 bytes, not characters");
+    }
+
+    #[test]
+    fn constructed_transcript_options_cannot_discard_search_scopes() {
+        for mut options in [
+            Options { query: Some("needle".into()), ..Options::default() },
+            Options { mode: Some(QueryMode::Lexical), ..Options::default() },
+            Options { approximate: true, ..Options::default() },
+            Options { limit: Some(1), ..Options::default() },
+            Options { offset: Some(0), ..Options::default() },
+            Options { agents: vec!["codex".into()], ..Options::default() },
+            Options { workspaces: vec!["/work".into()], ..Options::default() },
+            Options { source_id: Some("local".into()), ..Options::default() },
+            Options { created_from: Some(0), ..Options::default() },
+            Options { created_to: Some(0), ..Options::default() },
+        ] {
+            options.transcript = Some(TRANSCRIPT.into());
+            assert!(options.request().unwrap_err().contains("cannot be combined"));
+        }
+        assert!(matches!(Options { transcript: Some(TRANSCRIPT.into()), ..Options::default() }
+            .request().unwrap(), Some(Request::Transcript { .. })));
     }
 
     #[test]
