@@ -171,7 +171,12 @@ fn execute(
         .arg(root)
         .arg("--db")
         .arg(database)
-        .args(["--semantic-embedder", "hash", "--request-timeout-ms", "10000"])
+        .args([
+            "--semantic-embedder",
+            "hash",
+            "--request-timeout-ms",
+            "10000",
+        ])
         .args(arguments)
         .current_dir(root)
         .env("HOME", root)

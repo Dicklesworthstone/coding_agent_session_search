@@ -333,7 +333,12 @@ mod tests {
     fn lexical_default_and_explicit_mode_need_no_semantic_configuration() {
         for extra in [vec![], vec!["--mode", "lexical"]] {
             let mut arguments = vec![
-                "cass", "serve", "--index", "/not-opened", "--query", "needle",
+                "cass",
+                "serve",
+                "--index",
+                "/not-opened",
+                "--query",
+                "needle",
             ];
             arguments.extend(extra);
             let request = parse_options(&arguments).request().unwrap().unwrap();
@@ -425,7 +430,12 @@ mod tests {
                 vec!["--data-dir", "/data", "--db", "/archive"],
                 vec!["--data-dir", "/data", "--semantic-embedder", "hash"],
                 vec![
-                    "--index", "/index", "--db", "/archive", "--semantic-embedder", "hash",
+                    "--index",
+                    "/index",
+                    "--db",
+                    "/archive",
+                    "--semantic-embedder",
+                    "hash",
                 ],
             ] {
                 let mut arguments = vec!["cass", "serve", "--query", "needle", "--mode", mode];
@@ -480,7 +490,12 @@ mod tests {
             vec!["--stdio", "--query", "needle", "--mode", "semantic"],
             vec!["--query", "needle", "--mode", "semantic", "--mcp"],
             vec![
-                "--query", "needle", "--mode", "hybrid", "--reranker-model", "/model",
+                "--query",
+                "needle",
+                "--mode",
+                "hybrid",
+                "--reranker-model",
+                "/model",
             ],
             vec!["--query", "needle", "--mode", "unknown"],
             vec!["--query", "needle", "--approximate"],
@@ -503,7 +518,11 @@ mod tests {
             let error = invalid_request(error);
             assert_eq!(error.code, 2);
             assert!(!error.retryable);
-            assert!(error.message.contains("requires --mode semantic or --mode hybrid"));
+            assert!(
+                error
+                    .message
+                    .contains("requires --mode semantic or --mode hybrid")
+            );
         }
         let options = parse_options(&[
             "cass",
@@ -569,7 +588,10 @@ mod tests {
             for mut options in cases {
                 options.mode = Some(mode);
                 options.query.get_or_insert_with(|| "needle".into());
-                assert!(options.request().is_err(), "mode {mode:?} bypassed admission");
+                assert!(
+                    options.request().is_err(),
+                    "mode {mode:?} bypassed admission"
+                );
             }
         }
     }
