@@ -393,11 +393,17 @@ fn test_encrypted_export_hides_topic_in_default_name_and_html() {
 
         const html = readFileSync(process.env.CASS_ENCRYPTED_HTML_PATH, 'utf8');
         const expectedTitle = process.env.CASS_EXPECTED_TITLE;
-        const encryptedMatch = html.match(/<script id="encrypted-content" type="application\/json">([\s\S]*?)<\/script>/);
+        const encryptedMatch = html.match(/<div id="encrypted-content" hidden>([\s\S]*?)<\/div>/);
         const cryptoMatch = html.match(/(const CASS_HTML_PBKDF2_ITERATIONS =[\s\S]*?\nconst Crypto = \{[\s\S]*?\n\};)/);
         if (!encryptedMatch || !cryptoMatch) {
             throw new Error('missing encrypted-content or Crypto script block in exported HTML');
         }
+        const decodeHtmlText = (s) =>
+            s.replace(/&lt;/g, '<')
+             .replace(/&gt;/g, '>')
+             .replace(/&quot;/g, '"')
+             .replace(/&#x27;/g, "'")
+             .replace(/&amp;/g, '&');
 
         let submitHandler = null;
         const headerContent = { innerHTML: '<h1 class="header-title">Encrypted conversation</h1>' };
@@ -419,16 +425,10 @@ fn test_encrypted_export_hides_topic_in_default_name_and_html() {
                 if (sel !== '#cass-sealed-header') return null;
                 const m = this.innerHTML.match(/<template id="cass-sealed-header" data-title="([^"]*)">([\s\S]*?)<\/template>/);
                 if (!m) return null;
-                const decodeAttr = (s) =>
-                    s.replace(/&quot;/g, '"')
-                     .replace(/&#x27;/g, "'")
-                     .replace(/&lt;/g, '<')
-                     .replace(/&gt;/g, '>')
-                     .replace(/&amp;/g, '&');
                 return {
                     innerHTML: m[2],
                     getAttribute(name) {
-                        return name === 'data-title' ? decodeAttr(m[1]) : null;
+                        return name === 'data-title' ? decodeHtmlText(m[1]) : null;
                     },
                     remove: () => {
                         this.innerHTML = this.innerHTML.replace(m[0], '');
@@ -441,7 +441,7 @@ fn test_encrypted_export_hides_topic_in_default_name_and_html() {
             '#password-form': form,
             '#decrypt-error': errorEl,
             '#password-input': passwordInput,
-            '#encrypted-content': { textContent: encryptedMatch[1] },
+            '#encrypted-content': { textContent: decodeHtmlText(encryptedMatch[1]) },
             '#conversation': conversation,
             '.header .header-content': headerContent,
             '.print-footer-title': footerTitle,
