@@ -4,10 +4,14 @@
 //! milestones. Never turn a failed finalization step into a successful outcome.
 //! The best-effort last-failure record is history, not a readiness verdict. A
 //! successful swap can move it with the prior live generation into its backup.
+//! An off-live candidate also keeps bounded first-failure history that travels
+//! with a later quarantine, without attaching post-swap errors to its backup.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+mod failure_evidence;
 
 const LAST_FAILURE_FILE: &str = ".lexical-rebuild-last-failure.json";
 
@@ -57,6 +61,9 @@ pub(super) struct Finalization<'a> {
     candidate: &'a Path,
     indexed_docs: usize,
     processed_conversations: usize,
+    // Bind the original off-live candidate once, not a prior-live backup left
+    // at the same staging path by a successful publication.
+    candidate_evidence: Result<Option<failure_evidence::Candidate>>,
 }
 
 impl<'a> Finalization<'a> {
@@ -71,6 +78,7 @@ impl<'a> Finalization<'a> {
             candidate,
             indexed_docs,
             processed_conversations,
+            candidate_evidence: failure_evidence::Candidate::capture(live, candidate),
         }
     }
 
@@ -153,6 +161,7 @@ impl<'a> Finalization<'a> {
                     error = %cause,
                     "lexical rebuild finalization failed"
                 );
+                failure_evidence::record(self, phase, &cause);
                 match self.persist_failure(phase, &cause) {
                     Ok(path) => tracing::info!(
                         phase,
