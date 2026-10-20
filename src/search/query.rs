@@ -24372,11 +24372,15 @@ mod tests {
     /// a disjunction in 4,096-document windows, the first window is always
     /// exhaustive, and opening a segment's cursor enters its first block. So a
     /// ranked pass saves fuel only on documents past the first window of one
-    /// segment: one document per segment, or an index that fits in one window,
-    /// costs the count no more than the page. The documents therefore go in as
-    /// one batch (one segment), strong matches first and then three windows of
-    /// weak ones. The title never contains the term, so a weak document can
-    /// score no higher than its own weak content match.
+    /// segment: one document per segment, or segments that each fit in one
+    /// window, cost the count no more than the page. One batch is not enough
+    /// for that, because ordinary ingest spreads a batch over one shard per
+    /// core (up to 32), each sealing its own segment. The fixture therefore
+    /// ingests through a single deterministic shard with seal budgets far
+    /// above its size, and checks that it really is one segment: strong
+    /// matches first, then three windows of weak ones. The title never
+    /// contains the term, so a weak document can score no higher than its own
+    /// weak content match.
     #[test]
     fn bounded_exact_count_survives_a_real_count_fuel_refusal() -> Result<()> {
         const STRONG: usize = 4;
@@ -24395,7 +24399,7 @@ mod tests {
                 agent: "codex".into(),
                 workspace: Some("/ws".into()),
                 workspace_original: None,
-                source_path: format!("/gh518/{ordinal}.jsonl"),
+                source_path: format!("/gh518/{ordinal:05}.jsonl"),
                 msg_idx: 0,
                 created_at: Some(100),
                 title: Some("fixture".into()),
@@ -24410,9 +24414,23 @@ mod tests {
                 conversation_id: Some(i64::try_from(ordinal)? + 1),
             });
         }
-        let mut writer = crate::search::quill_bridge::QuillCassIndex::open_or_create(dir.path())?;
+        let config = frankensearch::quill::QuillConfig {
+            deterministic_ingest: true,
+            scribe_shard_budget_bytes: 256 * 1024 * 1024,
+            delta_budget_bytes: 256 * 1024 * 1024,
+            ..crate::search::quill_bridge::cass_quill_config()
+        };
+        let mut writer = crate::search::quill_bridge::QuillCassIndex::open_or_create_with_config(
+            dir.path(),
+            &config,
+        )?;
         writer.add_cass_documents(&documents)?;
         writer.commit()?;
+        assert_eq!(
+            writer.segment_count(),
+            1,
+            "the fixture must be one segment for the ranked pass to skip anything"
+        );
         drop(writer);
 
         let query = frankensearch::quill::query::CassQueryParser::new(
