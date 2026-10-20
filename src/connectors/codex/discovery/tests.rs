@@ -130,10 +130,31 @@ fn nested_symlinks_do_not_widen_directory_selection() -> Result<()> {
 const CHILD_ROOT: &str = "CASS_CODEX_DISCOVERY_TEST_ROOT";
 const CHILD_MODE: &str = "CASS_CODEX_DISCOVERY_TEST_MODE";
 
+/// Under root, the permission cases rerun this binary as uid 65534, which must
+/// reach the fixture. A runner's TMPDIR can sit below a directory only root
+/// may search (rch: `<project>/.rch-tmp`, mode 1700, where the child's exec
+/// failed with EACCES), so use `/tmp` when any ancestor of TMPDIR denies
+/// others search permission.
+#[cfg(unix)]
+fn permission_fixture() -> Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = std::env::temp_dir();
+    let searchable = base.ancestors().all(|directory| {
+        fs::metadata(directory).is_ok_and(|meta| meta.permissions().mode() & 0o001 != 0)
+    });
+    let base = if searchable {
+        base
+    } else {
+        PathBuf::from("/tmp")
+    };
+    Ok(tempfile::Builder::new().tempdir_in(base)?)
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_active_and_archive_directories_preserve_neighbors_and_retry() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = permission_fixture()?;
     let home = temp.path().join(".codex");
     for collection in ["sessions", "archived_sessions"] {
         for directory in ["a", "b", "c"] {
@@ -165,7 +186,7 @@ fn unreadable_active_and_archive_directories_preserve_neighbors_and_retry() -> R
 #[cfg(unix)]
 #[test]
 fn policy_resolution_failure_preserves_neighbors_for_explicit_roots_and_files() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = permission_fixture()?;
     let home = temp.path().join(".codex");
     for directory in ["a", "blocked", "c"] {
         seed(
