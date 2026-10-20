@@ -18,6 +18,7 @@
 #   scripts/gate.sh                 # fmt, clippy, lib tests, targeted integration, goldens
 #   scripts/gate.sh --lib-filter 'quill_bridge::tests health_watermark'   # narrow the lib run
 #   scripts/gate.sh --no-lib        # skip the lib suite (e.g. while bet45 wedge is open)
+#   scripts/gate.sh --no-bin        # skip the cass bin's own unit tests (stage bin-cass)
 #   scripts/gate.sh --local         # run stages locally (only where rch is not required)
 #   GATE_RETRIES=40 GATE_RETRY_SLEEP=90 scripts/gate.sh   # keep retrying fleet refusals
 #
@@ -192,6 +193,7 @@ cd "$PROJECT_ROOT" || exit 1
 LIB_FILTER=""
 RUN_LIB=1
 RUN_INTEGRATION=1
+RUN_BIN=1
 RUN_GOLDENS=1
 LOCAL=0
 REGEN_GOLDENS=0
@@ -204,7 +206,9 @@ UBS_FILES=()
 # there is invisible to every golden. pages_bundle holds the Pages viewer's
 # safety checks (CSP, sanitizer, crypto worker, auth expiry, service worker);
 # 20 of them sat red for days because no gate ran the target (2l1b0.77).
-INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic pages_bundle)
+# search_service compiles the `cass serve` sources and their unit tests (the
+# cass bin itself is `test = false`); 8 of them sat red for 9 days (5188e).
+INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic pages_bundle search_service)
 while [ $# -gt 0 ]; do
     case "$1" in
         --lib-filter) LIB_FILTER="$2"; shift 2 ;;
@@ -223,6 +227,7 @@ while [ $# -gt 0 ]; do
         # second run with `--no-lib` for integration + goldens.
         --lib-only) RUN_INTEGRATION=0; RUN_GOLDENS=0; shift ;;
         --no-goldens) RUN_GOLDENS=0; shift ;;
+        --no-bin) RUN_BIN=0; shift ;;
         # README ↔ code truth (WS-A.9): key bindings, `cass … --flag` usages
         # and env vars, checked with the debug binary the integration stage
         # just built. Opt-in until the README is clean against main.
@@ -452,6 +457,28 @@ if [ "$RUN_INTEGRATION" = 1 ]; then
         integration_stage+="run_tests test-${t}${filter_check_args} cargo test --locked -j ${BUILD_JOBS} --test ${t} -- --test-threads=${BUILD_JOBS} ${filter_args};"
         EXPECTED_STAGES+=("test-${t}")
     done
+fi
+if [ "$RUN_INTEGRATION" = 1 ] && [ "$RUN_BIN" = 1 ]; then
+    # The cass bin is `test = false`, so the unit tests of its own modules
+    # (logical_archive's backup/restore codec, the CLI modules) ran in no gate;
+    # one hung for hours unseen (m5cob). search_service's share runs as
+    # --test search_service. Every other skip names the bead whose fix
+    # removes it.
+    BIN_TIMEOUT="${GATE_BIN_TIMEOUT_SECS:-900}"
+    if [[ ! "$BIN_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "gate: GATE_BIN_TIMEOUT_SECS must be a positive integer" >&2
+        exit 2
+    fi
+    BIN_SKIPS=(
+        search_service::
+        logical_archive::import::publication_tests::publication_materializes_wal_rows_without_borrowing_replay_sidecars # svhcf
+        logical_archive::export::ordering_tests::explicit_or_unattested_collations_keep_binary_order_and_verify # p94yt
+        logical_archive::codec::chunked::tests::continued_cells_refuse_untyped_nested_payloads_before_buffering_them # jxcrk
+        logical_archive::import::tests::cancellation_after_reading_a_late_row_retains_the_insert_failure # g94db
+    )
+    printf -v bin_skip_args ' --skip %q' "${BIN_SKIPS[@]}"
+    integration_stage+="run_tests bin-cass timeout ${BIN_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --bin cass -- --test-threads=${BUILD_JOBS}${bin_skip_args};"
+    EXPECTED_STAGES+=(bin-cass)
 fi
 golden_regen_stage=""
 golden_stage=""
