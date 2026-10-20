@@ -473,8 +473,6 @@ if [ "$RUN_INTEGRATION" = 1 ] && [ "$RUN_BIN" = 1 ]; then
         search_service::
         logical_archive::import::publication_tests::publication_materializes_wal_rows_without_borrowing_replay_sidecars # svhcf
         logical_archive::export::ordering_tests::explicit_or_unattested_collations_keep_binary_order_and_verify # p94yt
-        logical_archive::codec::chunked::tests::continued_cells_refuse_untyped_nested_payloads_before_buffering_them # jxcrk
-        logical_archive::import::tests::cancellation_after_reading_a_late_row_retains_the_insert_failure # g94db
     )
     printf -v bin_skip_args ' --skip %q' "${BIN_SKIPS[@]}"
     integration_stage+="run_tests bin-cass timeout ${BIN_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --bin cass -- --test-threads=${BUILD_JOBS}${bin_skip_args};"
