@@ -50,6 +50,17 @@ where
 
 const SEARCH_DEMO_DATA_DIR: &str = "tests/fixtures/search_demo_data";
 
+/// Subcommands the binary parses before the main CLI and registers for help,
+/// completions, capabilities and introspect (`register_external_subcommands`
+/// in src/main.rs).
+const BINARY_DISPATCHED_COMMANDS: [&str; 5] = [
+    "serve",
+    "archive",
+    "codex-layout-migrate",
+    "lexical-quarantine",
+    "semantic-reclaim",
+];
+
 fn is_transient_lexical_build_path(path: &Path) -> bool {
     path.components().any(|component| {
         component.as_os_str().to_str().is_some_and(|name| {
@@ -3842,13 +3853,13 @@ fn introspect_commands_match_clap_subcommands() {
             .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
             .collect();
 
-        // The binary also registers the two subcommands it dispatches before
-        // the main CLI parses (src/main.rs).
+        // The binary also registers the subcommands it dispatches before the
+        // main CLI parses (src/main.rs).
         let mut expected = clap_commands;
-        expected.extend(["serve".to_string(), "archive".to_string()]);
+        expected.extend(BINARY_DISPATCHED_COMMANDS.map(String::from));
         assert_eq!(
             expected, introspect_commands,
-            "introspect should list exactly the Clap subcommands plus serve and archive"
+            "introspect should list exactly the Clap subcommands plus the binary-dispatched ones"
         );
 
         // Ensure no help/version pseudo-args leak into schemas
@@ -7565,13 +7576,13 @@ fn introspect_matches_golden_contract_structure() {
             .iter()
             .filter_map(|c| c["name"].as_str())
             .collect();
-        // Plus the two subcommands the binary dispatches itself (src/main.rs).
+        // Plus the subcommands the binary dispatches itself (src/main.rs).
         let clap_cmd = Cli::command();
         let mut expected_cmd_names: HashSet<_> = clap_cmd
             .get_subcommands()
             .map(|command| command.get_name().to_string())
             .collect();
-        expected_cmd_names.extend(["serve".to_string(), "archive".to_string()]);
+        expected_cmd_names.extend(BINARY_DISPATCHED_COMMANDS.map(String::from));
         assert_eq!(
             actual_cmd_names,
             expected_cmd_names

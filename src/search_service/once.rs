@@ -19,6 +19,12 @@ enum QueryMode {
     Hybrid,
 }
 
+// Every --query option also conflicts with each mode that excludes --query.
+// clap counts a `requires` target that conflicts with a present argument as
+// satisfied, so `requires = "query"` alone lets `--refine ... --limit 1` parse
+// and the request silently drop the option.
+const QUERY_ONLY_CONFLICTS: [&str; 3] = ["stdio", "transcript", "refine"];
+
 #[derive(Debug, Default, Args)]
 pub(super) struct Options {
     /// Run one query and exit; emit a bounded JSON reply without reading stdin.
@@ -38,7 +44,7 @@ pub(super) struct Options {
         long,
         value_enum,
         requires = "query",
-        conflicts_with_all = ["stdio", "transcript"],
+        conflicts_with_all = QUERY_ONLY_CONFLICTS,
         requires_ifs([
             ("semantic", "semantic_embedder"),
             ("hybrid", "semantic_embedder")
@@ -47,29 +53,29 @@ pub(super) struct Options {
     mode: Option<QueryMode>,
     /// Request approximate retrieval with an explicit semantic/hybrid --mode.
     /// The service currently uses exact search and reports ANN as unavailable.
-    #[arg(long, requires_all = ["query", "mode"], conflicts_with_all = ["stdio", "transcript"])]
+    #[arg(long, requires_all = ["query", "mode"], conflicts_with_all = QUERY_ONLY_CONFLICTS)]
     approximate: bool,
     /// Maximum hits for --query (default 10, maximum 100).
-    #[arg(long, requires = "query", conflicts_with_all = ["stdio", "transcript"])]
+    #[arg(long, requires = "query", conflicts_with_all = QUERY_ONLY_CONFLICTS)]
     limit: Option<usize>,
     /// Result offset for --query (default 0; offset + limit + 1 must be at most 1024).
-    #[arg(long, requires = "query", conflicts_with_all = ["stdio", "transcript"])]
+    #[arg(long, requires = "query", conflicts_with_all = QUERY_ONLY_CONFLICTS)]
     offset: Option<usize>,
     /// Agent name or supported alias for --query; repeat for multiple agents.
     /// Unknown names fail before opening the index or archive.
-    #[arg(long = "agent", requires = "query", conflicts_with_all = ["stdio", "transcript"])]
+    #[arg(long = "agent", requires = "query", conflicts_with_all = QUERY_ONLY_CONFLICTS)]
     agents: Vec<String>,
     /// Exact workspace for --query; repeat for multiple workspaces.
-    #[arg(long = "workspace", requires = "query", conflicts_with_all = ["stdio", "transcript"])]
+    #[arg(long = "workspace", requires = "query", conflicts_with_all = QUERY_ONLY_CONFLICTS)]
     workspaces: Vec<String>,
     /// Exact source ID for --query, not the synthetic remote group.
-    #[arg(long, requires = "query", conflicts_with_all = ["stdio", "transcript"])]
+    #[arg(long, requires = "query", conflicts_with_all = QUERY_ONLY_CONFLICTS)]
     source_id: Option<String>,
     /// Inclusive lower creation timestamp in epoch milliseconds for --query.
     #[arg(
         long,
         requires = "query",
-        conflicts_with_all = ["stdio", "transcript"],
+        conflicts_with_all = QUERY_ONLY_CONFLICTS,
         allow_hyphen_values = true
     )]
     created_from: Option<i64>,
@@ -77,7 +83,7 @@ pub(super) struct Options {
     #[arg(
         long,
         requires = "query",
-        conflicts_with_all = ["stdio", "transcript"],
+        conflicts_with_all = QUERY_ONLY_CONFLICTS,
         allow_hyphen_values = true
     )]
     created_to: Option<i64>,

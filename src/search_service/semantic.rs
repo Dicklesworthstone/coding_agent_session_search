@@ -34,6 +34,9 @@ use serde_json::{Value, json};
 use super::Session;
 use super::protocol::{self, Filters};
 
+#[path = "hybrid_completion.rs"]
+mod completion;
+
 const MAX_GUARDED_FILES: usize = 4096;
 const MAX_SHARD_MANIFEST_BYTES: u64 = 1024 * 1024;
 const NATIVE_ANN_UNAVAILABLE: &str = "persistent_native_ann_requires_reclaimable_owners";
@@ -538,7 +541,6 @@ impl Session {
         offset: usize,
     ) -> Result<Value> {
         let started = Instant::now();
-        let fallback_filters = filters.clone();
         let reused = self.semantic.client.is_some();
         let setup = self.semantic.admit_request(Instant::now()).and_then(|()| {
             let lease = if self.reader_lease.is_none() {
@@ -598,9 +600,17 @@ impl Session {
             Ok((hits, metadata))
         });
         let mut lexical_fallback = None;
+        // Request-local ownership only: keep the already-paid native page until
+        // the final semantic witness check, without cloning or caching its hits.
+        let mut native_lexical_page = None;
         let (mut hits, realized, ann, lexical_degrade) = match semantic {
             Ok((semantic_hits, ann)) if mode == Mode::Hybrid => {
-                let lexical = self.ensure_loaded().and_then(|()| {
+                let lexical_reused = self.client.is_some();
+                let lexical_started = Instant::now();
+                let lexical_setup = self.ensure_loaded();
+                let lexical_setup_ms = lexical_started.elapsed().as_millis();
+                let lexical_started = Instant::now();
+                let lexical = lexical_setup.and_then(|()| {
                     self.client
                         .as_ref()
                         .context("lexical reader is not loaded")?
@@ -612,6 +622,7 @@ impl Session {
                             FieldMask::new(false, true, true, false),
                         )
                 });
+                let lexical_search_ms = lexical_started.elapsed().as_millis();
                 // A successful semantic leg must not bypass the caller's
                 // explicit lexical recovery grant. Recover only a Quill fuel
                 // refusal, using the SAME candidate window, exact filters,
@@ -635,12 +646,28 @@ impl Session {
                     Ok::<_, anyhow::Error>(page.hits)
                 });
                 match lexical {
-                    Ok(lexical_hits) => (
-                        rrf_fuse_hits(&lexical_hits, &semantic_hits, query, limit + 1, offset),
-                        "hybrid",
-                        ann,
-                        None,
-                    ),
+                    Ok(lexical_hits) => {
+                        ensure!(
+                            lexical_hits.len() <= window,
+                            "lexical candidate budget exceeded"
+                        );
+                        let fused =
+                            rrf_fuse_hits(&lexical_hits, &semantic_hits, query, limit + 1, offset);
+                        // Only the independent pinned Quill page is reusable if
+                        // the archive/vector witness later changes. Archive
+                        // fallback results have no such snapshot guarantee.
+                        if lexical_fallback.is_none() {
+                            native_lexical_page = Some(completion::NativePage {
+                                hits: lexical_hits,
+                                window,
+                                reader_epoch: self.successful_opens,
+                                reader_reused: lexical_reused,
+                                setup_ms: lexical_setup_ms,
+                                search_ms: lexical_search_ms,
+                            });
+                        }
+                        (fused, "hybrid", ann, None)
+                    }
                     Err(error) => (
                         semantic_hits
                             .into_iter()
@@ -680,20 +707,31 @@ impl Session {
         // Check again after the lexical leg before returning any fused result.
         // A changed archive never turns stale semantic coordinates into success.
         if let Err(error) = self.semantic.check() {
-            let reason = format!("{error:#}");
-            self.semantic.last_failure = Some(reason.clone());
-            if mode == Mode::Semantic {
-                return Err(error);
-            }
-            let mut lexical = self.search(query, fallback_filters, limit, offset)?;
-            lexical["requested_mode"] = json!(mode);
-            lexical["realized_mode"] = json!("lexical");
-            lexical["semantic_fallback_reason"] = json!(reason);
-            lexical["semantic_reused"] = json!(reused);
-            lexical["semantic_setup_ms"] = json!(setup_ms);
-            lexical["ann"] = ann_metadata(approximate);
-            return Ok(lexical);
+            // A second search could burn another full fuel allowance and lose
+            // a native page that already succeeded. Complete from that page,
+            // or refuse without replaying a failed/uncertified archive leg.
+            let lexical_failure = lexical_degrade
+                .as_deref()
+                .or_else(|| lexical_fallback.as_ref()?.get("primary_error")?.as_str());
+            // Invalid semantic/fused candidates are not part of the response.
+            drop(hits);
+            return completion::after_invalidation(
+                self,
+                error,
+                native_lexical_page,
+                completion::Request {
+                    mode,
+                    limit,
+                    offset,
+                    approximate,
+                    semantic_reused: reused,
+                    semantic_setup_ms: setup_ms,
+                },
+                lexical_failure,
+            );
         }
+        // The independent prefix is no longer needed after successful validation.
+        drop(native_lexical_page);
         ensure!(
             hits.len() <= limit + 1,
             "semantic backend exceeded the requested page"

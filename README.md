@@ -3572,7 +3572,7 @@ Update check state is stored in `update_state.json` in the data directory:
 
 - **Cache debug**: set `CASS_DEBUG_CACHE_METRICS=1` to emit cache hit/miss/shortfall/reload stats via tracing (debug level).
 
-- **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to keep out of the archive: no conversation from an excluded source is stored, indexed or raw-mirrored, whichever connector found it. The Claude Code, Codex, Codebuff and Pi readers skip an excluded file without opening it; other connectors read it, and cass discards its conversations before storing anything. Entries match whole path components (`sess` does not exclude `sessions`), a relative entry is taken from the working directory, and symlinks and other aliases of an existing directory are resolved on both sides, so a `..`, symlinked or (on Windows) differently-cased spelling of a directory excludes it too. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed.
+- **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to keep out of the archive: no conversation from an excluded source is stored, indexed or raw-mirrored, whichever connector found it. The Claude Code, Codex, Codebuff and Pi readers skip an excluded file without opening it; other connectors read it, and cass discards its conversations before storing anything. Entries match whole path components (`sess` does not exclude `sessions`), a relative entry is taken from the working directory, and symlinks and other aliases of an existing directory are resolved on both sides, so a `..`, symlinked or (on Windows) differently-cased spelling of a directory excludes it too. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed. An exclusion is prospective: conversations archived before it was set stay in the archive and stay searchable, because cass never deletes archived history on its own. To remove them, run `cass forget --source-glob '<glob>'` (a dry run until `--apply`).
 - **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.
@@ -3709,8 +3709,10 @@ rowids a rolled-back transaction reserved (bd-gwoit), and reads a WAL that a
 stock SQLite writer truncated to zero bytes as empty instead of corrupt
 (bd-yxqs9, GH#519).
 The lockfile resolves the 20 SQLite packages CASS uses at 0.4.12.
-Full runtime qualification and the strict UBS gate remain pending, and no
-release of this pin proves recovery of an already damaged archive.
+CASS's runtime qualification of 0.4.12 passed on Linux, macOS and Windows (the
+Windows storage failures predate the pin). The strict UBS gate remains
+pending, and no release of this pin proves recovery of an already damaged
+archive.
 The build guard enforces the reviewed
 uniform SQLite 0.4.12 versions, a single resolution per package, and registry sources.
 
