@@ -362,7 +362,12 @@ mod budget_override {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
 
-        let root = tempfile::tempdir()?;
+        // Under /tmp, not TMPDIR: the uid-65534 child must traverse every
+        // ancestor, and a runner's TMPDIR can be private to root (rch:
+        // `<project>/.rch-tmp`, mode 1700, where the spawn failed with EACCES).
+        let root = tempfile::Builder::new()
+            .prefix("cass-codex-unreadable-")
+            .tempdir_in("/tmp")?;
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))?;
         let compressed =
             zstd::stream::encode_all(&b"{\"type\":\"session_meta\",\"payload\":{}}\n"[..], 0)?;
