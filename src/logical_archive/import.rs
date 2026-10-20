@@ -167,7 +167,16 @@ fn insert_sql(table: &Table) -> Result<String> {
         .map(|name| export::quoted(name))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    let placeholders = vec!["?"; table.columns.len()].join(", ");
+    let placeholders = (0..table.columns.len())
+        .map(|index| {
+            if index == 0 {
+                "CASE WHEN 1 THEN ? END"
+            } else {
+                "?"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     // No OR REPLACE / IGNORE: constraints and duplicate identities must fail.
     Ok(format!(
         "INSERT INTO {} ({columns}) VALUES ({placeholders})",
