@@ -91,7 +91,10 @@ mod tests {
         size.write_all(b"abcd").unwrap();
         assert!(size.write_all(b"x").is_err());
         assert_eq!(size.bytes, 4);
-        let mut size = LimitedSize { bytes: usize::MAX - 1, limit: usize::MAX };
+        let mut size = LimitedSize {
+            bytes: usize::MAX - 1,
+            limit: usize::MAX,
+        };
         assert!(size.write_all(b"xx").is_err());
         size.write_all(b"x").unwrap();
         assert_eq!(size.bytes, usize::MAX);
@@ -102,15 +105,23 @@ mod tests {
         use super::super::EmbeddingRequest;
         for model in ["model", "model\\with\"quotes", "日本語😀"] {
             let encode = |input: &[&str]| {
-                serde_json::to_vec(&EmbeddingRequest { model, input, encoding_format: "float" })
-                    .unwrap()
+                serde_json::to_vec(&EmbeddingRequest {
+                    model,
+                    input,
+                    encoding_format: "float",
+                })
+                .unwrap()
             };
             let texts = ["a", "\0\n\"\\", "δ😀"];
             let overhead = encode(&[]).len();
             for count in 1..=texts.len() {
                 let expected = overhead
-                    + texts[..count].iter().map(|text| json_string_bytes(text, usize::MAX).unwrap()).sum::<usize>()
-                    + count - 1;
+                    + texts[..count]
+                        .iter()
+                        .map(|text| json_string_bytes(text, usize::MAX).unwrap())
+                        .sum::<usize>()
+                    + count
+                    - 1;
                 assert_eq!(expected, encode(&texts[..count]).len());
             }
         }
@@ -152,10 +163,18 @@ mod tests {
             request_gate: Mutex::new(()),
         };
         for oversized in ["x".repeat(4096), "\0".repeat(1024)] {
-            let error = provider.embed_batch_sync(&["valid first input", &oversized])
-                .unwrap_err().to_string();
-            assert!(error.contains("external_input_too_large: input 1"), "{error}");
-            assert_eq!(listener.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            let error = provider
+                .embed_batch_sync(&["valid first input", &oversized])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("external_input_too_large: input 1"),
+                "{error}"
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
         }
     }
 }

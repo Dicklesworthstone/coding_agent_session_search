@@ -200,7 +200,10 @@ mod tests {
         let mut selection: Value = serde_json::from_str(SELECTION).unwrap();
         selection["filters"] = json!({"agents": ["claude", "Claude-Code", "CODEX"]});
         let selected = fields(request(&selection.to_string()).unwrap());
-        assert_eq!(selected["filters"]["agents"], json!(["claude_code", "codex"]));
+        assert_eq!(
+            selected["filters"]["agents"],
+            json!(["claude_code", "codex"])
+        );
         selection["filters"]["agents"] = json!(vec!["claude"; 33]);
         assert!(request(&selection.to_string()).is_err());
     }
@@ -242,10 +245,7 @@ mod tests {
                 "accepted {selection}"
             );
         }
-        assert!(
-            request(r#"{"query":"first","query":"second","lexical_query":"needle"}"#)
-                .is_err()
-        );
+        assert!(request(r#"{"query":"first","query":"second","lexical_query":"needle"}"#).is_err());
         assert!(request(r#"{"query":"q","lexical_query":"needle","filters":{"source_id":"a","source_id":"b"}}"#).is_err());
         let mut selection = base;
         selection["candidate_limit"] = json!(32);
