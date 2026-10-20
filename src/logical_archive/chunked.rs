@@ -301,7 +301,7 @@ impl<R: BufRead> Chunks<'_, R> {
 
 impl<R: BufRead> Read for Chunks<'_, R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() || self.finished {
+        if output.is_empty() || self.finished || super::continued_read_aborted() {
             return Ok(0);
         }
         if self.failure.is_some() {
@@ -360,10 +360,12 @@ pub(super) fn read(reader: &mut impl BufRead, start: &[u8], line: u64) -> Result
         finished: false,
         failure: None,
     };
+    super::clear_continued_read_abort();
     let decoded = serde_json::from_reader::<_, ContinuedRow>(BufReader::with_capacity(
         64 * 1024,
         &mut chunks,
     ));
+    super::clear_continued_read_abort();
     if let Some(error) = chunks.failure.take() {
         return Err(error);
     }

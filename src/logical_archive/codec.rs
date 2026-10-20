@@ -213,6 +213,22 @@ enum CellKind {
     Blob,
 }
 
+thread_local! {
+    static ABORT_CONTINUED_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn clear_continued_read_abort() {
+    ABORT_CONTINUED_READ.with(|aborted| aborted.set(false));
+}
+
+pub(super) fn abort_continued_read() {
+    ABORT_CONTINUED_READ.with(|aborted| aborted.set(true));
+}
+
+pub(super) fn continued_read_aborted() -> bool {
+    ABORT_CONTINUED_READ.with(std::cell::Cell::get)
+}
+
 enum Scalar {
     Integer(i64),
     Text(String),
@@ -226,6 +242,7 @@ impl<'de> Deserialize<'de> for Scalar {
             type Value = Scalar;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                abort_continued_read();
                 formatter.write_str("a signed 64-bit integer or a string")
             }
 
@@ -234,9 +251,10 @@ impl<'de> Deserialize<'de> for Scalar {
             }
 
             fn visit_u64<E: de::Error>(self, value: u64) -> Result<Scalar, E> {
-                i64::try_from(value)
-                    .map(Scalar::Integer)
-                    .map_err(|_| E::custom("logical integer is outside the signed 64-bit range"))
+                i64::try_from(value).map(Scalar::Integer).map_err(|_| {
+                    abort_continued_read();
+                    E::custom("logical integer is outside the signed 64-bit range")
+                })
             }
 
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Scalar, E> {
@@ -250,7 +268,11 @@ impl<'de> Deserialize<'de> for Scalar {
 
         // Reject arrays, objects, booleans and floating-point numbers at their
         // first token, including when the value precedes its kind tag.
-        deserializer.deserialize_any(ScalarVisitor)
+        deserializer
+            .deserialize_any(ScalarVisitor)
+            .inspect_err(|_| {
+                abort_continued_read();
+            })
     }
 }
 
@@ -263,16 +285,21 @@ impl<'de> Deserialize<'de> for Cell {
             value: Option<Scalar>,
         }
 
-        let fields = Fields::deserialize(deserializer)?;
+        let fields = Fields::deserialize(deserializer).inspect_err(|_| {
+            abort_continued_read();
+        })?;
         match (fields.kind, fields.value) {
             (CellKind::Null, None) => Ok(Self::Null),
             (CellKind::Integer, Some(Scalar::Integer(value))) => Ok(Self::Integer(value)),
             (CellKind::Real, Some(Scalar::Text(value))) => Ok(Self::Real(value)),
             (CellKind::Text, Some(Scalar::Text(value))) => Ok(Self::Text(value)),
             (CellKind::Blob, Some(Scalar::Text(value))) => Ok(Self::Blob(value)),
-            _ => Err(de::Error::custom(
-                "logical cell kind and scalar value disagree",
-            )),
+            _ => {
+                abort_continued_read();
+                Err(de::Error::custom(
+                    "logical cell kind and scalar value disagree",
+                ))
+            }
         }
     }
 }
@@ -372,6 +399,7 @@ impl<'de> Visitor<'de> for RowValues {
     type Value = Vec<Cell>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        abort_continued_read();
         formatter.write_str("at most 256 logical cells")
     }
 
@@ -388,6 +416,7 @@ impl<'de> Visitor<'de> for RowValues {
                 deserializer: D,
             ) -> Result<Cell, D::Error> {
                 if !self.admitted {
+                    abort_continued_read();
                     return Err(de::Error::custom("logical row exceeds 256 columns"));
                 }
                 Cell::deserialize(deserializer)
@@ -395,9 +424,14 @@ impl<'de> Visitor<'de> for RowValues {
         }
 
         let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_COLUMNS));
-        while let Some(cell) = sequence.next_element_seed(NextCell {
-            admitted: values.len() < MAX_COLUMNS,
-        })? {
+        while let Some(cell) = sequence
+            .next_element_seed(NextCell {
+                admitted: values.len() < MAX_COLUMNS,
+            })
+            .inspect_err(|_| {
+                abort_continued_read();
+            })?
+        {
             values.push(cell);
         }
         Ok(values)
@@ -412,28 +446,37 @@ impl<'de> Visitor<'de> for RecordVisitor {
     type Value = Record;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        abort_continued_read();
         formatter.write_str("a logical record object")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Record, A::Error> {
         let mut kind = None;
         let mut payload = None;
-        while let Some(field) = map.next_key::<RecordField>()? {
+        while let Some(field) = map.next_key::<RecordField>().inspect_err(|_| {
+            abort_continued_read();
+        })? {
             if !matches!(field, RecordField::Type) && payload.is_some() {
+                abort_continued_read();
                 return Err(de::Error::custom(
                     "duplicate or conflicting logical record payload",
                 ));
             }
             if self.row_only && !matches!(field, RecordField::Type | RecordField::Values) {
+                abort_continued_read();
                 return Err(de::Error::custom("only logical rows may use continuations"));
             }
             let (payload_kind, record) = match field {
                 RecordField::Type => {
                     if kind.is_some() {
+                        abort_continued_read();
                         return Err(de::Error::duplicate_field("type"));
                     }
-                    let next = map.next_value::<RecordKind>()?;
+                    let next = map.next_value::<RecordKind>().inspect_err(|_| {
+                        abort_continued_read();
+                    })?;
                     if self.row_only && next != RecordKind::Row {
+                        abort_continued_read();
                         return Err(de::Error::custom("only logical rows may use continuations"));
                     }
                     kind = Some(next);
@@ -442,42 +485,60 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 RecordField::Header => (
                     RecordKind::Header,
                     Record::Header {
-                        header: map.next_value()?,
+                        header: map.next_value().inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
                     },
                 ),
                 RecordField::Table => (
                     RecordKind::Table,
                     Record::Table {
-                        table: map.next_value()?,
+                        table: map.next_value().inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
                     },
                 ),
                 RecordField::Values => (
                     RecordKind::Row,
                     Record::Row {
-                        values: map.next_value_seed(RowValues)?,
+                        values: map.next_value_seed(RowValues).inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
                     },
                 ),
                 RecordField::Completion => (
                     RecordKind::Completion,
                     Record::Completion {
-                        completion: map.next_value()?,
+                        completion: map.next_value().inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
                     },
                 ),
             };
             if kind.is_some_and(|kind| kind != payload_kind) {
+                abort_continued_read();
                 return Err(de::Error::custom(
                     "logical record type and payload disagree",
                 ));
             }
             payload = Some((payload_kind, record));
         }
-        let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
+        let kind = kind.ok_or_else(|| {
+            abort_continued_read();
+            de::Error::missing_field("type")
+        })?;
         match payload {
             Some((payload_kind, record)) if kind == payload_kind => Ok(record),
-            Some(_) => Err(de::Error::custom(
-                "logical record type and payload disagree",
-            )),
-            None => Err(de::Error::custom("logical record payload is missing")),
+            Some(_) => {
+                abort_continued_read();
+                Err(de::Error::custom(
+                    "logical record type and payload disagree",
+                ))
+            }
+            None => {
+                abort_continued_read();
+                Err(de::Error::custom("logical record payload is missing"))
+            }
         }
     }
 }
