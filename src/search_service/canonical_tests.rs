@@ -346,7 +346,7 @@ fn mcp_catalog_and_dispatch_require_explicit_canonical_permission() -> Result<()
     session.archive = Some(fixture.db.clone());
     let replies = mcp_exchange(&mut session, &[list])?;
     let tools = replies[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     let view = tools
         .iter()
         .find(|tool| tool["name"] == "cass_view")

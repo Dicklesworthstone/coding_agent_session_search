@@ -34,35 +34,52 @@ pub(super) struct Options {
     transcript: Option<String>,
     /// Retrieval mode for --query (default lexical). Semantic and hybrid require
     /// --semantic-embedder, --data-dir and --db. No models are downloaded.
-    #[arg(long, value_enum, requires = "query", requires_ifs([
-        ("semantic", "semantic_embedder"), ("hybrid", "semantic_embedder")
-    ]))]
+    #[arg(
+        long,
+        value_enum,
+        requires = "query",
+        conflicts_with_all = ["stdio", "transcript"],
+        requires_ifs([
+            ("semantic", "semantic_embedder"),
+            ("hybrid", "semantic_embedder")
+        ])
+    )]
     mode: Option<QueryMode>,
     /// Request approximate retrieval with an explicit semantic/hybrid --mode.
     /// The service currently uses exact search and reports ANN as unavailable.
-    #[arg(long, requires_all = ["query", "mode"])]
+    #[arg(long, requires_all = ["query", "mode"], conflicts_with_all = ["stdio", "transcript"])]
     approximate: bool,
     /// Maximum hits for --query (default 10, maximum 100).
-    #[arg(long, requires = "query")]
+    #[arg(long, requires = "query", conflicts_with_all = ["stdio", "transcript"])]
     limit: Option<usize>,
     /// Result offset for --query (default 0; offset + limit + 1 must be at most 1024).
-    #[arg(long, requires = "query")]
+    #[arg(long, requires = "query", conflicts_with_all = ["stdio", "transcript"])]
     offset: Option<usize>,
     /// Agent name or supported alias for --query; repeat for multiple agents.
     /// Unknown names fail before opening the index or archive.
-    #[arg(long = "agent", requires = "query")]
+    #[arg(long = "agent", requires = "query", conflicts_with_all = ["stdio", "transcript"])]
     agents: Vec<String>,
     /// Exact workspace for --query; repeat for multiple workspaces.
-    #[arg(long = "workspace", requires = "query")]
+    #[arg(long = "workspace", requires = "query", conflicts_with_all = ["stdio", "transcript"])]
     workspaces: Vec<String>,
     /// Exact source ID for --query, not the synthetic remote group.
-    #[arg(long, requires = "query")]
+    #[arg(long, requires = "query", conflicts_with_all = ["stdio", "transcript"])]
     source_id: Option<String>,
     /// Inclusive lower creation timestamp in epoch milliseconds for --query.
-    #[arg(long, requires = "query", allow_hyphen_values = true)]
+    #[arg(
+        long,
+        requires = "query",
+        conflicts_with_all = ["stdio", "transcript"],
+        allow_hyphen_values = true
+    )]
     created_from: Option<i64>,
     /// Inclusive upper creation timestamp in epoch milliseconds for --query.
-    #[arg(long, requires = "query", allow_hyphen_values = true)]
+    #[arg(
+        long,
+        requires = "query",
+        conflicts_with_all = ["stdio", "transcript"],
+        allow_hyphen_values = true
+    )]
     created_to: Option<i64>,
 }
 

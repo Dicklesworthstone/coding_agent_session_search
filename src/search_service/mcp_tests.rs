@@ -432,6 +432,7 @@ fn mcp_refinement_catalog_requires_startup_permission_and_matches_lexical_filter
             "cass_reload",
             "cass_view",
             "cass_view_batch",
+            "cass_transcript",
             "cass_refine",
         ]
     );

@@ -76,7 +76,8 @@ enum ServiceCommand {
             long,
             value_name = "PATH",
             required_unless_present = "index",
-            conflicts_with = "index"
+            conflicts_with = "index",
+            required_if_eq_any = [("mode", "semantic"), ("mode", "hybrid")]
         )]
         data_dir: Option<PathBuf>,
         /// Use newline-delimited JSON requests and responses on standard I/O.
@@ -93,7 +94,11 @@ enum ServiceCommand {
         mcp: bool,
         /// Opt in to canonical view requests against this fixed read-only archive.
         /// Search stays index-only unless --lexical-fallback is also supplied.
-        #[arg(long, value_name = "PATH")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            required_if_eq_any = [("mode", "semantic"), ("mode", "hybrid")]
+        )]
         db: Option<PathBuf>,
         /// Recover Quill fuel refusals using this explicit archive's SQLite lane.
         /// Admits at most 64 MiB of database plus WAL; shares the request deadline.
@@ -106,7 +111,13 @@ enum ServiceCommand {
         reranker_model: Option<PathBuf>,
         /// Opt in to retained semantic/hybrid retrieval using installed assets.
         /// Requires explicit --data-dir and --db; ordinary search stays lexical.
-        #[arg(long, value_enum, requires_all = ["data_dir", "db"])]
+        #[arg(
+            long,
+            value_enum,
+            requires_all = ["data_dir", "db"],
+            conflicts_with = "index",
+            required_if_eq_any = [("mode", "semantic"), ("mode", "hybrid")]
+        )]
         semantic_embedder: Option<semantic::EmbedderChoice>,
         /// Whole-request deadline, including setup, search, teardown and output for --query.
         /// For --stdio, starts at the first frame byte; idle sessions are not timed out.
