@@ -1,6 +1,7 @@
 //! Codex history from active and archived rollout collections.
 
 mod archives;
+mod discovery;
 #[path = "codex/implementation.rs"]
 mod implementation;
 #[doc(hidden)]
@@ -71,7 +72,7 @@ impl Connector for CodexConnector {
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         path_policy::ScanExclusions::from_env().validate()?;
-        archives::discover(&self.inner, ctx)
+        archives::discover(ctx)
     }
 
     fn scan_with_callback(

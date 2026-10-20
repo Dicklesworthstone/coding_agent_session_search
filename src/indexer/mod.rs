@@ -15,6 +15,7 @@ pub mod semantic;
 pub mod semantic_progress;
 #[cfg(test)]
 mod source_ledger_tests;
+mod source_writer_probe;
 pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
@@ -22,6 +23,7 @@ use self::refresh_ledger::{
     EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
     RefreshLedgerEvidence, RefreshPhase,
 };
+use self::source_writer_probe::SourceWriterProbe;
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -32,8 +34,6 @@ use std::io::{BufWriter, Seek, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -142,7 +142,7 @@ enum ActiveSessionSourceReason {
 
 #[derive(Debug, Default)]
 struct ActiveSessionSourceFilter {
-    writable_file_ids: HashSet<SourceFileId>,
+    writer_probe: SourceWriterProbe,
     recent_write_window: Option<Duration>,
     deferred_sources: Mutex<BTreeSet<PathBuf>>,
 }
@@ -150,7 +150,7 @@ struct ActiveSessionSourceFilter {
 impl ActiveSessionSourceFilter {
     fn new(enable_recent_write_window: bool) -> Self {
         Self {
-            writable_file_ids: collect_writable_open_session_file_ids(),
+            writer_probe: SourceWriterProbe::capture(is_session_log_source_candidate),
             recent_write_window: active_session_recent_write_window(enable_recent_write_window),
             deferred_sources: Mutex::default(),
         }
@@ -159,7 +159,7 @@ impl ActiveSessionSourceFilter {
     #[cfg(test)]
     fn with_recent_write_window_for_test(recent_write_window: Option<Duration>) -> Self {
         Self {
-            writable_file_ids: HashSet::new(),
+            writer_probe: SourceWriterProbe::default(),
             recent_write_window,
             deferred_sources: Mutex::default(),
         }
@@ -198,7 +198,9 @@ impl ActiveSessionSourceFilter {
             );
             return Some(ActiveSessionSourceReason::RecentlyModified);
         }
-        if source_file_id(path).is_some_and(|file_id| self.writable_file_ids.contains(&file_id)) {
+        if source_file_id(path)
+            .is_some_and(|file_id| self.writer_probe.should_defer((file_id.dev, file_id.ino)))
+        {
             return Some(ActiveSessionSourceReason::WritableFileDescriptor);
         }
         if source_file_has_active_advisory_lock(path) {
@@ -419,111 +421,6 @@ fn source_file_id(path: &Path) -> Option<SourceFileId> {
 #[cfg(not(unix))]
 fn source_file_id(_path: &Path) -> Option<SourceFileId> {
     None
-}
-
-#[cfg(target_os = "linux")]
-fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
-    let mut file_ids = HashSet::new();
-    let Ok(processes) = fs::read_dir("/proc") else {
-        return file_ids;
-    };
-
-    for process in processes.flatten() {
-        let pid = process.file_name();
-        let Some(pid) = pid.to_str() else {
-            continue;
-        };
-        if pid.parse::<u32>().is_err() {
-            continue;
-        }
-        let fd_dir = process.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            let fd_name = fd.file_name();
-            let Some(fd_name) = fd_name.to_str() else {
-                continue;
-            };
-            let fd_path = fd.path();
-            if !linux_fdinfo_is_writable(&process.path().join("fdinfo").join(fd_name)) {
-                continue;
-            }
-            let Ok(target) = fs::read_link(&fd_path) else {
-                continue;
-            };
-            if !is_session_log_source_candidate(&target) {
-                continue;
-            }
-            if let Some(file_id) = source_file_id(&fd_path) {
-                file_ids.insert(file_id);
-            }
-        }
-    }
-
-    file_ids
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fdinfo_is_writable(fdinfo_path: &Path) -> bool {
-    const O_ACCMODE: u64 = 0o3;
-    const O_WRONLY: u64 = 0o1;
-    const O_RDWR: u64 = 0o2;
-
-    let Ok(contents) = fs::read_to_string(fdinfo_path) else {
-        return false;
-    };
-    let Some(flags_value) = contents.lines().find_map(|line| {
-        line.strip_prefix("flags:")
-            .and_then(|value| u64::from_str_radix(value.trim(), 8).ok())
-    }) else {
-        return false;
-    };
-    matches!(flags_value & O_ACCMODE, O_WRONLY | O_RDWR)
-}
-
-#[cfg(target_os = "macos")]
-fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
-    let mut file_ids = HashSet::new();
-    let Ok(output) = Command::new("lsof").args(["-nP", "-F", "pfn"]).output() else {
-        return file_ids;
-    };
-    if !output.status.success() {
-        return file_ids;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut current_fd_is_writable = false;
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let (field, value) = line.split_at(1);
-        match field {
-            "p" => {
-                current_fd_is_writable = false;
-            }
-            "f" => {
-                current_fd_is_writable = value.contains('w') || value.contains('u');
-            }
-            "n" if current_fd_is_writable => {
-                let path = Path::new(value);
-                if is_session_log_source_candidate(path)
-                    && let Some(file_id) = source_file_id(path)
-                {
-                    file_ids.insert(file_id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    file_ids
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
-    HashSet::new()
 }
 
 fn source_file_has_active_advisory_lock(path: &Path) -> bool {

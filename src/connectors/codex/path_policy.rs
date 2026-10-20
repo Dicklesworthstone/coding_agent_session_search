@@ -44,6 +44,19 @@ impl ScanExclusions {
         Ok(())
     }
 
+    /// FAD validates every configured namespace before Codex discovery. Keep
+    /// an unresolvable policy from becoming a successful, wholly vetoed scan.
+    pub(crate) fn validate_codex(&self) -> io::Result<()> {
+        self.validate()?;
+        for path in &self.paths {
+            let absolute = self.absolute(path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unresolvable Codex exclusion")
+            })?;
+            resolve_existing_ancestor(&absolute)?;
+        }
+        Ok(())
+    }
+
     fn parse(value: &str) -> Self {
         Self::parse_in(value, std::env::current_dir().ok())
     }
@@ -72,51 +85,122 @@ impl ScanExclusions {
     }
 
     pub(crate) fn excludes(&self, path: &Path) -> bool {
-        if self.invalid {
-            return true;
-        }
+        // An unresolved namespace cannot establish that the source is outside
+        // the excluded scope. Discovery uses the fallible entry point below.
+        self.try_excludes(path).unwrap_or(true)
+    }
+
+    fn try_excludes(&self, path: &Path) -> io::Result<bool> {
+        self.validate()?;
         if self.paths.is_empty() {
-            return false;
+            return Ok(false);
         }
         // Preserve direct exclusions even for nonexistent or unreadable paths,
         // without touching the source or resolving any filesystem alias.
         if self.paths.iter().any(|excluded| path.starts_with(excluded)) {
-            return true;
+            return Ok(true);
         }
-        let Some(absolute) = self.absolute(path) else {
-            return true;
-        };
+        let absolute = self.absolute(path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "unresolvable source path")
+        })?;
         let mut resolved_source = None;
         for excluded in &self.paths {
-            let Some(excluded) = self.absolute(excluded) else {
-                return true;
-            };
+            let excluded = self.absolute(excluded).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unresolvable exclusion path")
+            })?;
             if absolute.starts_with(&excluded) {
-                return true;
+                return Ok(true);
             }
             // Resolve BEFORE folding '..': a symlink followed by '..' refers
             // to the target's parent, not the lexical link's parent.
             if resolved_source.is_none() {
-                match resolve_existing_ancestor(&absolute) {
-                    Ok(resolved) => resolved_source = Some(resolved),
-                    Err(_) => return true,
-                }
+                resolved_source = Some(resolve_existing_ancestor(&absolute)?);
             }
-            match resolve_existing_ancestor(&excluded) {
-                Ok(excluded) => {
-                    if resolved_source
-                        .as_ref()
-                        .is_some_and(|source: &PathBuf| source.starts_with(excluded))
-                    {
-                        return true;
-                    }
-                }
-                // With an active policy, inability to establish the namespace
-                // is not evidence that a source is outside the excluded scope.
-                Err(_) => return true,
+            let excluded = resolve_existing_ancestor(&excluded)?;
+            if resolved_source
+                .as_ref()
+                .is_some_and(|source: &PathBuf| source.starts_with(excluded))
+            {
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    fn excludes_codex(&self, path: &Path) -> bool {
+        self.try_excludes_codex(path).unwrap_or(true)
+    }
+
+    /// Codex treats a plain rollout and its compressed representation as one
+    /// exact file exclusion. Keep the suffix spelling used by each path, and
+    /// resolve aliases before removing the compression suffix, as FAD does.
+    ///
+    /// Discovery must distinguish a confirmed exclusion from a namespace it
+    /// cannot resolve. Boolean admission callers continue to fail closed.
+    pub(crate) fn try_excludes_codex(&self, path: &Path) -> io::Result<bool> {
+        if self.try_excludes(path)? {
+            return Ok(true);
+        }
+        if self.paths.is_empty() {
+            return Ok(false);
+        }
+        let Some(logical_source) = codex_logical_path(path) else {
+            return Ok(false);
+        };
+        let absolute_source = self.absolute(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unresolvable Codex source path",
+            )
+        })?;
+        if absolute_source.is_dir() {
+            return Ok(false);
+        }
+        let mut resolved_source = None;
+        for excluded in &self.paths {
+            let absolute_excluded = self.absolute(excluded).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unresolvable Codex exclusion")
+            })?;
+            if absolute_excluded.is_dir() {
+                continue;
+            }
+            if let Some(logical_excluded) = codex_logical_path(excluded)
+                && self.absolute(&logical_source) == self.absolute(&logical_excluded)
+            {
+                return Ok(true);
+            }
+            if resolved_source.is_none() {
+                resolved_source = Some(codex_logical_path(&resolve_existing_ancestor(
+                    &absolute_source,
+                )?));
+            }
+            let resolved = resolve_existing_ancestor(&absolute_excluded)?;
+            if let Some(logical_excluded) = codex_logical_path(&resolved)
+                && resolved_source.as_ref().and_then(Option::as_ref) == Some(&logical_excluded)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn codex_logical_path(path: &Path) -> Option<PathBuf> {
+    if franken_agent_detection::connectors::codex::is_compressed_rollout(path) {
+        Some(path.with_extension(""))
+    } else if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-"))
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+    {
+        Some(path.to_path_buf())
+    } else {
+        None
     }
 }
 
@@ -222,6 +306,76 @@ mod tests {
     fn empty_policy_does_not_require_a_working_directory() {
         assert!(!ScanExclusions::parse_in(" , \n", None).excludes(Path::new("source.jsonl")));
         assert!(ScanExclusions::parse_in("private", None).excludes(Path::new("source.jsonl")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_errors_remain_fail_closed_and_are_reported_to_discovery() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        symlink("cycle", root.path().join("cycle"))?;
+        let source = root.path().join("cycle/rollout-hidden.jsonl");
+        let error = fs::canonicalize(&source).unwrap_err();
+        let exclusions = policy(root.path(), "unrelated");
+        exclusions.validate_codex()?;
+        assert_eq!(
+            exclusions.try_excludes_codex(&source).unwrap_err().kind(),
+            error.kind()
+        );
+        assert!(exclusions.excludes(&source));
+        assert!(exclusions.excludes_codex(&source));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_file_exclusions_cover_both_representations_and_keep_directory_semantics()
+    -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        for name in [
+            "rollout-a.jsonl",
+            "rollout-a.jsonl.zst",
+            "rollout-b.JSONL",
+            "rollout-b.JSONL.ZST",
+        ] {
+            std::fs::write(root.path().join(name), b"fixture")?;
+        }
+        for (plain, compressed) in [
+            ("rollout-a.jsonl", "rollout-a.jsonl.zst"),
+            ("rollout-b.JSONL", "rollout-b.JSONL.ZST"),
+        ] {
+            for excluded in [plain, compressed] {
+                let policy = policy(root.path(), excluded);
+                assert!(policy.excludes_codex(&root.path().join(plain)));
+                assert!(policy.excludes_codex(&root.path().join(compressed)));
+                assert!(!policy.excludes_codex(&root.path().join("rollout-neighbor.jsonl")));
+            }
+        }
+        let directory = root.path().join("rollout-directory.jsonl");
+        fs::create_dir(&directory)?;
+        let exclusions = policy(root.path(), "rollout-directory.jsonl");
+        assert!(exclusions.excludes_codex(&directory.join("rollout-private.jsonl")));
+        assert!(!exclusions.excludes_codex(&root.path().join("rollout-directory.jsonl.zst")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_logical_exclusions_resolve_leaf_aliases_before_format_suffixes() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir()?;
+        let plain = root.path().join("rollout-target.jsonl");
+        let compressed = root.path().join("rollout-target.jsonl.zst");
+        fs::write(&plain, b"plain")?;
+        fs::write(&compressed, b"compressed")?;
+        symlink(&plain, root.path().join("private-link"))?;
+        symlink(&compressed, root.path().join("rollout-alias.jsonl.zst"))?;
+        assert!(policy(root.path(), "private-link").excludes_codex(&compressed));
+        assert!(
+            policy(root.path(), "rollout-target.jsonl")
+                .excludes_codex(&root.path().join("rollout-alias.jsonl.zst"))
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

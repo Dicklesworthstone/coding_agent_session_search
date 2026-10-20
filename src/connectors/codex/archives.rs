@@ -6,9 +6,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
 use franken_agent_detection::connectors::codex::rollout_session_path;
 
+use super::discovery::Inventory;
+use super::path_policy::ScanExclusions;
 use super::{Connector, DiscoveredSourceFile, Result, ScanContext, ScanRoot};
 
 const ARCHIVE: &str = "archived_sessions";
@@ -23,7 +24,7 @@ fn configured_home() -> PathBuf {
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
 }
 
-fn default_home(ctx: &ScanContext) -> PathBuf {
+pub(super) fn default_home(ctx: &ScanContext) -> PathBuf {
     // Retain FAD's legacy data_dir-as-Codex-root override.
     let is_codex = ctx.data_dir.to_str().is_some_and(|path| {
         path.contains(".codex") || path.ends_with("/codex") || path.ends_with("\\codex")
@@ -85,16 +86,20 @@ fn path_key(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-pub(super) fn discover(
-    inner: &dyn Connector,
-    ctx: &ScanContext,
-) -> Result<Vec<DiscoveredSourceFile>> {
-    let mut sources = inner.discover_source_files(ctx)?;
-    let mut seen = HashSet::new();
-    sources.retain(|source| seen.insert(path_key(&source.source_path)));
+pub(super) fn discover(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+    discover_for_scan(ctx)?.finish()
+}
+
+pub(super) fn discover_for_scan(ctx: &ScanContext) -> Result<Inventory> {
+    let exclusions = ScanExclusions::from_env();
+    exclusions.validate_codex()?;
+    let mut inventory = Inventory::default();
+    inventory.collect(ctx, &exclusions);
     let mut seen_roots = HashSet::new();
     for root in archive_candidates(ctx) {
-        if !seen_roots.insert(path_key(&root.path)) {
+        if inventory.should_skip(&root.path, &exclusions)
+            || !seen_roots.insert(path_key(&root.path))
+        {
             continue;
         }
         match fs::metadata(&root.path) {
@@ -109,7 +114,8 @@ pub(super) fn discover(
                 continue;
             }
             Err(error) => {
-                return Err(error).context("inspect Codex archive collection");
+                inventory.record_failure(&root.path, error.into());
+                continue;
             }
         }
         // Moving a rollout to the archive does not give its contents a new
@@ -117,13 +123,9 @@ pub(super) fn discover(
         // Let the source-boundary ledger reuse unchanged archived files instead.
         let mut scope = ScanContext::with_roots(ctx.data_dir.clone(), vec![root], None);
         scope.progress_tick.clone_from(&ctx.progress_tick);
-        for source in inner.discover_source_files(&scope)? {
-            if seen.insert(path_key(&source.source_path)) {
-                sources.push(source);
-            }
-        }
+        inventory.collect(&scope, &exclusions);
     }
-    Ok(sources)
+    Ok(inventory)
 }
 
 /// Preserve the full-home active-session identity when Codex archives a native

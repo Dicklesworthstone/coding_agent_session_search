@@ -175,11 +175,10 @@ mod budget_override {
     }
 
     fn assert_only_compressed_neighbors(
-        binary: &Path,
-        root: &Path,
+        mut command: impl FnMut() -> Command,
         paths: &[PathBuf; 3],
     ) -> Result<()> {
-        let output = assert_cmd::Command::from_std(isolated(binary, root))
+        let output = assert_cmd::Command::from_std(command())
             .args(["stats", "--json"])
             .timeout(Duration::from_secs(30))
             .output()?;
@@ -194,7 +193,7 @@ mod budget_override {
         // ubs:ignore[rust.panic.assert-macros] -- Intentional test assertion.
         assert_eq!(stats["messages"], 2, "{stats}");
 
-        let output = assert_cmd::Command::from_std(isolated(binary, root))
+        let output = assert_cmd::Command::from_std(command())
             .args([
                 "search",
                 "compressedneighbor0needle OR compressedneighbor2needle",
@@ -268,7 +267,7 @@ mod budget_override {
             );
             // ubs:ignore[rust.panic.assert-macros] -- Intentional test assertion.
             assert_ne!(result["partial"], true, "{result}");
-            assert_only_compressed_neighbors(binary, root.path(), &paths)?;
+            assert_only_compressed_neighbors(|| isolated(binary, root.path()), &paths)?;
             for (path, original) in paths.iter().zip(&before) {
                 // ubs:ignore[rust.panic.assert-macros] -- Intentional test assertion.
                 assert_eq!(
@@ -340,7 +339,7 @@ mod budget_override {
                     && hint.contains("rerun")),
                 "actionable source failure: {result}"
             );
-            assert_only_compressed_neighbors(binary, root.path(), &paths)?;
+            assert_only_compressed_neighbors(|| isolated(binary, root.path()), &paths)?;
             for (path, original) in paths.iter().zip(&before) {
                 // ubs:ignore[rust.panic.assert-macros] -- Intentional test assertion.
                 assert_eq!(
@@ -350,6 +349,169 @@ mod budget_override {
                     path.display()
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// A traversal error must not certify a partial inventory or advance past
+    /// older history. Run the real binary without root's DAC override so the
+    /// fixture exercises an actual directory-open failure on Linux builders.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_directory_keeps_neighbors_and_retries_older_history() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir()?;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))?;
+        let compressed =
+            zstd::stream::encode_all(&b"{\"type\":\"session_meta\",\"payload\":{}}\n"[..], 0)?;
+        let paths = compressed_metadata_fixture(root.path(), &compressed)?;
+        let blocked = root.path().join(".codex/sessions/blocked");
+        fs::create_dir(&blocked)?;
+        let hidden = blocked.join("rollout-hidden.jsonl");
+        fs::write(
+            &hidden,
+            b"{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"discoveryrecoveryneedle\"}}\n",
+        )?;
+        fs::File::open(&hidden)?.set_times(
+            fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400)),
+        )?;
+        for directory in [
+            root.path().join(".codex"),
+            root.path().join(".codex/sessions"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
+        }
+        for path in paths.iter().chain(std::iter::once(&hidden)) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
+        }
+        let before = paths
+            .iter()
+            .chain(std::iter::once(&hidden))
+            .map(|path| receipt(path))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Only the test's output directory is writable by the child. Provider
+        // files stay read-only to it; no production source is chmod'ed or moved.
+        let archive = root.path().join("archive");
+        fs::create_dir(&archive)?;
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o777))?;
+        // Restore access even if a native assertion fails, so normal TempDir
+        // teardown can inspect and clean up this synthetic fixture.
+        struct RestoreDirectory(PathBuf);
+        impl Drop for RestoreDirectory {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let restore = RestoreDirectory(blocked.clone());
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))?;
+        // A restricted user namespace can map only UID 0 while granting no
+        // DAC override capability. It already observes real EACCES; switching
+        // it to an unmapped UID would fail before the binary starts.
+        let drop_root = match fs::read_dir(&blocked) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
+            Ok(_) => true,
+            Err(error) => return Err(error.into()),
+        };
+        let binary = if drop_root {
+            // A toolchain's temporary parent directory may be private to root.
+            // Copy just the executable into this traversable synthetic fixture.
+            let binary = root.path().join("cass-fixture");
+            fs::copy(assert_cmd::cargo::cargo_bin!("cass"), &binary)?;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+            binary
+        } else {
+            PathBuf::from(assert_cmd::cargo::cargo_bin!("cass"))
+        };
+        let command = || {
+            let mut command = isolated(&binary, root.path());
+            command.env("CASS_RAW_MIRROR", "0");
+            if drop_root {
+                command.gid(65_534).uid(65_534);
+            }
+            command
+        };
+
+        for run in 0..2 {
+            let output = assert_cmd::Command::from_std(command())
+                .args(["index", "--json", "--no-progress-events"])
+                .timeout(Duration::from_secs(180))
+                .output()?;
+            // ubs:ignore[rust.panic.assert-macros] -- Native incomplete-coverage regression.
+            assert_eq!(output.status.code(), Some(9), "run {run}: {output:?}");
+            let result: Value = serde_json::from_slice(&output.stdout)?;
+            // ubs:ignore[rust.panic.assert-macros] -- Native incomplete-coverage regression.
+            assert_eq!(result["coverage_status"], "incomplete", "{result}");
+            // ubs:ignore[rust.panic.assert-macros] -- Native incomplete-coverage regression.
+            assert_eq!(result["failed_connectors"], json!(["codex"]), "{result}");
+            let codex = result["indexing_stats"]["connectors"]
+                .as_array()
+                .expect("connector stats")
+                .iter()
+                .find(|connector| connector["name"] == "codex")
+                .expect("Codex stats");
+            let detail = codex["error"].as_str().expect("directory failure");
+            // ubs:ignore[rust.panic.assert-macros] -- Native actionable-error regression.
+            assert!(detail.contains("blocked"), "{detail}");
+            // ubs:ignore[rust.panic.assert-macros] -- Native actionable-error regression.
+            assert!(
+                detail.contains("Permission denied") || detail.contains("unreadable"),
+                "{detail}"
+            );
+            assert_only_compressed_neighbors(&command, &paths)?;
+        }
+
+        drop(restore);
+        let output = assert_cmd::Command::from_std(command())
+            .args(["index", "--json", "--no-progress-events"])
+            .timeout(Duration::from_secs(180))
+            .output()?;
+        // ubs:ignore[rust.panic.assert-macros] -- Ordinary retry must recover old-mtime history.
+        assert!(output.status.success(), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout)?;
+        // ubs:ignore[rust.panic.assert-macros] -- Ordinary retry must clear incomplete coverage.
+        assert_eq!(
+            result["indexing_stats"]["scan_had_errors"], false,
+            "{result}"
+        );
+        let output = assert_cmd::Command::from_std(command())
+            .args([
+                "search",
+                "discoveryrecoveryneedle OR compressedneighbor0needle OR compressedneighbor2needle",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--no-daemon",
+                "--limit",
+                "10",
+                "--timeout",
+                "5000",
+            ])
+            .timeout(Duration::from_secs(30))
+            .output()?;
+        // ubs:ignore[rust.panic.assert-macros] -- Real lexical recovery regression.
+        assert!(output.status.success(), "{output:?}");
+        let search: Value = serde_json::from_slice(&output.stdout)?;
+        let hits = search["hits"].as_array().expect("search hits");
+        // ubs:ignore[rust.panic.assert-macros] -- Real lexical recovery regression.
+        assert_eq!(hits.len(), 3, "{search}");
+        // ubs:ignore[rust.panic.assert-macros] -- Real lexical recovery regression.
+        assert!(
+            hits.iter()
+                .any(|hit| hit["source_path"].as_str() == hidden.to_str()),
+            "{search}"
+        );
+        for (path, original) in paths.iter().chain(std::iter::once(&hidden)).zip(&before) {
+            // ubs:ignore[rust.panic.assert-macros] -- Source bytes, length and mtime are immutable.
+            assert_eq!(
+                &receipt(path)?,
+                original,
+                "source changed: {}",
+                path.display()
+            );
         }
         Ok(())
     }

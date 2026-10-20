@@ -119,7 +119,7 @@ def main() -> None:
     lockfile = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
     dependencies = manifest["dependencies"]
     names = (
-        "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection",
+        "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection", "walkdir",
         "serde", "serde_json", "tempfile", "thiserror", "tracing", "zstd",
     )
     tests = ("connector_codex_exclusions", "codex_source_containment")

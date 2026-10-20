@@ -76,12 +76,7 @@ impl Connector for CodexConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        // GH #486: the published FAD pin does not filter Codex discovery yet.
-        // Keep excluded sources out of pre-mirroring as well as parsing.
-        let exclusions = exclusions::ScanExclusions::from_env();
-        let mut sources = self.inner.discover_source_files(ctx)?;
-        sources.retain(|source| !exclusions.excludes(&source.source_path));
-        Ok(sources)
+        super::archives::discover(ctx)
     }
 
     fn scan_with_callback(
