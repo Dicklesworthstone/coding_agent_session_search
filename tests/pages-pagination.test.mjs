@@ -162,7 +162,15 @@ test("combined full-text filters retain every selected result across pages", asy
     all,
     Array.from({ length: 69 }, (_, i) => 2 * i + 1),
   );
-  assert.equal(api.searchConversations("needle", { ...options, since: 1001 }).length, 0);
+  assert.equal(
+    api.searchConversations("needle", { ...options, since: 1001, until: null }).length,
+    0,
+  );
+  // An inverted range is refused, not answered with a silently empty page.
+  assert.throws(
+    () => api.searchConversations("needle", { ...options, since: 1001 }),
+    /since must not be later than until/,
+  );
 });
 
 test("unsafe pagination cannot disable LIMIT or silently change the page", async (t) => {
@@ -193,8 +201,18 @@ test("database errors are distinguishable from an empty result set", async (t) =
 });
 
 test("punctuation is parameterized and the archive remains read-only", async (t) => {
-  const { api, sqlite } = await fixture(t);
-  assert.equal(api.searchConversations('" OR 1=1; --').length, 0);
+  const { api, sqlite, queries } = await fixture(t);
+  // An unbalanced quote is a typed parse error before any SQL is prepared.
+  // (The module runs in its own vm realm, so match the name, not the prototype.)
+  assert.throws(() => api.searchConversations('" OR 1=1; --'), {
+    name: "SyntaxError",
+    message: /Unterminated quoted phrase/,
+  });
+  assert.equal(queries.length, 0);
+  // Balanced, the same punctuation is one bound phrase that matches nothing.
+  assert.equal(api.searchConversations('"OR 1=1; --"').length, 0);
+  assert.equal(queries.length, 1);
+  assert.equal(queries[0].sql.includes("1=1"), false);
   assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM conversations").get().n, 137);
   assert.throws(() => api.execute("DELETE FROM conversations"), /read-only/);
   assert.throws(() => api.queryAll("DELETE FROM conversations"), /readonly/i);

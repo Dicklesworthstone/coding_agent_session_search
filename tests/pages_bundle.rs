@@ -52,6 +52,59 @@ mod tests {
         Ok(())
     }
 
+    /// Node suites that execute the shipped Pages modules: real SQLite/FTS5
+    /// through `node:sqlite`, and vm-module harnesses for the search, viewer,
+    /// crypto-worker and service-worker controllers. No cargo target ran them,
+    /// and four of their tests drifted red unnoticed (0dpz2).
+    fn pages_node_suites() -> Result<Vec<String>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut suites = Vec::new();
+        for (dir, prefix) in [
+            ("tests/pages", ""),
+            ("tests", "pages"),
+            ("tests/js", "pages"),
+        ] {
+            for entry in fs::read_dir(root.join(dir))? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if name.starts_with(prefix) && name.ends_with(".mjs") {
+                    suites.push(format!("{dir}/{name}"));
+                }
+            }
+        }
+        suites.sort();
+        Ok(suites)
+    }
+
+    #[test]
+    fn pages_node_behavior_suites_pass() -> Result<()> {
+        let suites = pages_node_suites()?;
+        assert!(
+            suites.len() >= 16,
+            "expected the Pages node suites, found {suites:?}"
+        );
+        // Node 22.13+ (node:sqlite without a flag).
+        let output = Command::new("node")
+            .args(["--experimental-vm-modules", "--test", "--test-reporter=tap"])
+            .args(&suites)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let count = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.trim().parse::<u64>().ok())
+        };
+        assert!(
+            output.status.success()
+                && count("# fail ") == Some(0)
+                && count("# pass ").is_some_and(|passed| passed > 0),
+            "Pages node suites failed ({})\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
     const EXPECTED_PAGE_ASSETS: &[&str] = &[
         "index.html",
         "styles.css",
@@ -845,9 +898,10 @@ mod tests {
         let search_js = include_str!("../src/pages_assets/search.js");
 
         assert!(
-            search_js.contains("!Number.isSafeInteger(numeric)")
-                && !search_js.contains("Number.isSafeInteger(Math.trunc(numeric))"),
-            "routed timestamp filters should reject malformed fractional values instead of truncating them"
+            search_js.contains(
+                "const { since, until } = normalizeSearchTimeRange(routeSearch.since, routeSearch.until);"
+            ) && !search_js.contains("Math.trunc("),
+            "routed timestamp filters should use the shared database normalizer, which rejects malformed fractional values instead of truncating them"
         );
         assert!(
             database_js.contains("!Number.isSafeInteger(numeric)")
@@ -865,23 +919,24 @@ mod tests {
             database_js.contains("searchMode = \"auto\",\n    since = null,\n    until = null"),
             "searchConversations should accept time filters at the database boundary"
         );
+        // Search and browsing share one scope builder (agent, workspace, time).
         assert!(
-            database_js.contains("sql += \" AND c.started_at >= ?\";")
-                && database_js.contains("sql += \" AND c.started_at <= ?\";"),
+            database_js.contains("clauses.push(\"c.started_at >= ?\");")
+                && database_js.contains("clauses.push(\"c.started_at <= ?\");")
+                && database_js.contains(
+                    "const scope = conversationScope({ agent, workspace, since, until });"
+                ),
             "FTS search should add time predicates to SQL instead of filtering after LIMIT/OFFSET"
         );
 
-        let since_predicate = database_js
-            .find("sql += \" AND c.started_at >= ?\";")
-            .expect("expected lower-bound search predicate");
-        let until_predicate = database_js
-            .find("sql += \" AND c.started_at <= ?\";")
-            .expect("expected upper-bound search predicate");
+        let scope_predicates = database_js
+            .find("sql += scope.sql;")
+            .expect("expected scoped search predicates");
         let result_ordering = database_js
             .find("ORDER BY score")
             .expect("expected FTS score ordering");
         assert!(
-            since_predicate < result_ordering && until_predicate < result_ordering,
+            scope_predicates < result_ordering,
             "time predicates must be added before ORDER BY/LIMIT so pagination cannot hide valid matches"
         );
 
@@ -912,14 +967,19 @@ mod tests {
                 && database_js.contains("sql += \" AND started_at <= ?\";"),
             "agent-filtered recent queries should apply time bounds in SQL before LIMIT"
         );
+        // Recent browsing now goes through getConversations' shared scope.
         assert!(
-            search_js.contains(
-                "} else if (currentFilters.since !== null || currentFilters.until !== null) {"
-            ),
+            database_js.contains("if (bounds.since !== null) {")
+                && database_js.contains("if (bounds.until !== null) {"),
             "recent search should treat an explicit since=0 route filter as present"
         );
         assert!(
-            search_js.contains("currentFilters.since,\n      currentFilters.until,\n      offset,"),
+            search_js.contains(
+                "agent: currentFilters.agent,\n    workspace: currentFilters.workspace,\n    since: currentFilters.since,\n    until: currentFilters.until,"
+            ) && search_js.contains("const results = getConversations(options);")
+                && database_js.contains(
+                    "FROM conversations c WHERE 1 = 1${scope.sql}\n     ORDER BY c.started_at DESC, c.id DESC LIMIT ? OFFSET ?"
+                ),
             "recent search should pass time bounds when an agent filter is also active"
         );
     }
@@ -972,9 +1032,13 @@ mod tests {
 
         let search_js = include_str!("../src/pages_assets/search.js");
         assert!(
-            search_js.contains("export async function setSearchRoute(routeSearch = {}, options = {}) {")
+            search_js
+                .contains("export async function setSearchRoute(routeSearch = {}, options = {}) {")
                 && search_js.contains("currentFilters = normalizeRouteFilters(routeSearch);")
-                && search_js.contains("timePreset: since !== null || until !== null ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,"),
+                && search_js.contains("const hasBounds = since !== null || until !== null;")
+                && search_js.contains(
+                    "timePreset: hasBounds ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,"
+                ),
             "search should expose a route-state application path that restores routed filters instead of keeping stale in-memory filters alive"
         );
     }
@@ -1742,7 +1806,8 @@ mod tests {
     fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() {
         let sw_js = include_str!("../src/pages_assets/sw.js");
         assert!(
-            sw_js.contains("const cacheWrite = getCurrentCache()")
+            sw_js.contains("const cacheWrite = trackResourceMutation(resource, async () => {")
+                && sw_js.contains("await cache.put(request, responseForCache);")
                 && sw_js.contains("log(LOG.WARN, \"Cache put error:\", error);")
                 && sw_js.contains("trackBackgroundTask(cacheWrite);")
                 && sw_js.contains("Promise.all(backgroundTasks)")
@@ -1750,8 +1815,9 @@ mod tests {
             "service worker cache writes must stay best-effort for the response while remaining bound to the FetchEvent lifetime"
         );
         assert!(
-            sw_js.contains("if (cacheEligible && request.mode === \"navigate\") {\n      try {")
-                && sw_js.contains("const cachedIndex = await cache.match(indexUrl);")
+            sw_js.contains("if (canUseCache() && request.mode === \"navigate\") {")
+                && sw_js
+                    .contains("const cachedIndex = await caches.match(indexUrl, { cacheName });")
                 && sw_js
                     .contains("log(LOG.WARN, \"Navigation cache fallback error:\", cacheError);"),
             "navigation fallback should not crash if the Cache API itself fails during offline fallback"
@@ -1767,7 +1833,14 @@ mod tests {
                 && sw_js.contains("directiveName === \"no-store\"")
                 && sw_js.contains("directiveName === \"no-cache\"")
                 && sw_js.contains("directiveName === \"private\"")
-                && !sw_js.contains("caches.match("),
+                // CacheStorage.match without a cacheName searches every cache
+                // of the origin. Each read names this generation's cache.
+                && sw_js.contains("const cacheName = getCacheName();")
+                && sw_js.match_indices("caches.match(").all(|(at, _)| {
+                    sw_js[at..]
+                        .split_once(')')
+                        .is_some_and(|(call, _)| call.ends_with(", { cacheName }"))
+                }),
             "runtime caching must stay inside the archive scope and must not fall through to stale or unrelated origin caches"
         );
 
@@ -1782,7 +1855,7 @@ mod tests {
             !install_body.contains("self.skipWaiting()")
                 && sw_js.contains("event.waitUntil(skipWaitingTask);")
                 && sw_js.contains("event.waitUntil(clearCacheTask);")
-                && sw_js.contains("const CACHE_VERSION = \"v7\";"),
+                && sw_js.contains("const CACHE_VERSION = \"v10\";"),
             "updates must wait for explicit user activation and every async message operation must extend its event lifetime"
         );
         assert!(
@@ -2189,8 +2262,14 @@ mod tests {
         assert!(
             attachments_js.contains("if (shouldCacheManifestAbsence(error)) {")
                 && attachments_js.contains("throw error;")
+                && attachments_js.contains(
+                    "createAttachmentError(\"Attachment request invalidated\", \"ATTACHMENT_REQUEST_INVALIDATED\")"
+                )
                 && attachments_js
-                    .contains("if (error?.code === \"ATTACHMENT_REQUEST_INVALIDATED\") {"),
+                    .matches("error?.code === \"ATTACHMENT_REQUEST_INVALIDATED\"")
+                    .count()
+                    >= 2
+                && !attachments_js.contains("message.includes("),
             "attachment invalidation handling should use stable error codes instead of brittle string matching"
         );
     }
@@ -3082,16 +3161,29 @@ mod tests {
                 && worker_js.contains("cannot be read safely without streaming response support")
                 && worker_js.contains("return concatenateAndZeroChunks(chunks);")
                 && worker_js.contains("const generation = beginDecryptAttempt();")
-                && worker_js.contains("ensureCurrentDecryptAttempt(generation);")
+                && worker_js.contains("ensureCurrentDecryptAttempt(job.generation);")
                 && worker_js.contains("invalidateDecryptAttempts();")
-                && worker_js.contains("encryptedChunk?.fill(0);")
+                // Each prefetched ciphertext chunk is scrubbed once consumed.
+                && worker_js.contains(
+                    "yield { index, bytes: slot.bytes };\n      } finally {\n        slot.bytes?.fill(0);"
+                )
                 && worker_js.contains("passwordBytes.fill(0);")
                 && worker_js.contains("result.hash.fill(0);")
                 && !worker_js.contains("await response.arrayBuffer()")
                 && worker_js.matches("await writer.abort(error);").count() == 1
         );
 
-        for unlock_function in ["handleUnlockPassword", "handleUnlockRecovery"] {
+        // The message handlers queue one unlock job at a time (edf9c7af);
+        // these job runners derive the KEK and unwrap the DEK.
+        assert!(
+            worker_js.contains("return enqueueUnlock(\"password\", password, cfg, requestId);")
+                && worker_js.contains(
+                    "return enqueueUnlock(\"recovery\", recoverySecret, cfg, requestId);"
+                )
+                && worker_js.contains("await runPasswordUnlock(job);")
+                && worker_js.contains("await runRecoveryUnlock(job);")
+        );
+        for unlock_function in ["runPasswordUnlock", "runRecoveryUnlock"] {
             let signature = format!("async function {unlock_function}");
             let function_body = worker_js
                 .split_once(signature.as_str())
@@ -3142,6 +3234,12 @@ mod tests {
                 "service worker must cache {vendor_asset}"
             );
         }
-        assert!(sw_js.contains("Promise.all(STATIC_ASSETS.map((asset) => cache.add(asset)))"));
+        // Every static asset is stored under the runtime caching policy, and
+        // one failed asset fails installation after its siblings settle.
+        assert!(
+            sw_js.contains("await Promise.allSettled(STATIC_ASSETS.map(async (asset) => {")
+                && sw_js.contains("await cache.put(url, response);")
+                && sw_js.contains("if (failed) throw failed.reason;")
+        );
     }
 }
