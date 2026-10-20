@@ -3524,7 +3524,7 @@
     },
     {
       "name": "serve",
-      "description": "Reuse read-only search readers, or run one supervised --query and exit. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "description": "Reuse read-only search readers, or run one supervised request and exit. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
       "arguments": [
         {
           "name": "index",
@@ -3638,6 +3638,13 @@
           "required": false
         },
         {
+          "name": "refine",
+          "description": "Refine one bounded lexical shortlist and exit without reading stdin. JSON selects query, lexical_query, filters, candidate_limit and limit. Requires an installed --reranker-model; never downloads model files",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
           "name": "mcp",
           "description": "Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport",
           "arg_type": "flag",
@@ -3686,7 +3693,7 @@
         },
         {
           "name": "request-timeout-ms",
-          "description": "Whole-request deadline, including setup, search, teardown and output for --query. For --stdio, starts at the first frame byte; idle sessions are not timed out. Expiry exits the worker with code 124",
+          "description": "Whole-request deadline, including setup, search, teardown and one-shot output. For --stdio, starts at the first frame byte; idle sessions are not timed out. Expiry exits the worker with code 124",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
