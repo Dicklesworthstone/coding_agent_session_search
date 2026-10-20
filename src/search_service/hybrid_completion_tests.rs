@@ -53,17 +53,13 @@ fn fixture(root: &Path) -> Result<Session> {
 }
 
 fn native(session: &Session, query: &str, window: usize) -> Result<NativePage> {
-    let hits = session
-        .client
-        .as_ref()
-        .context("native reader")?
-        .search(
-            query,
-            SearchFilters::default(),
-            window,
-            0,
-            FieldMask::new(false, true, true, false),
-        )?;
+    let hits = session.client.as_ref().context("native reader")?.search(
+        query,
+        SearchFilters::default(),
+        window,
+        0,
+        FieldMask::new(false, true, true, false),
+    )?;
     Ok(NativePage {
         hits,
         window,
@@ -151,7 +147,10 @@ fn authoritative_empty_native_page_never_reopens_an_archive_after_invalidation()
 #[test]
 fn lost_or_archive_recovered_lexical_leg_is_not_retried_after_invalidation() -> Result<()> {
     let root = tempfile::tempdir()?;
-    for failure in [None, Some("Quill query fuel exhausted; fallback is disabled")] {
+    for failure in [
+        None,
+        Some("Quill query fuel exhausted; fallback is disabled"),
+    ] {
         let mut session = Session::new(root.path().join("never-created-index"));
         session.archive = Some(root.path().join("never-created-archive"));
         session.lexical_recovery.enabled = true;
@@ -176,7 +175,10 @@ fn semantic_only_and_unrelated_failures_cannot_publish_a_lexical_page() -> Resul
     let mut session = fixture(root.path())?;
     let page = native(&session, "git fixture", 6)?;
     let error = invalidate(&mut session, root.path())?;
-    let semantic = Request { mode: Mode::Semantic, ..request(1, 0) };
+    let semantic = Request {
+        mode: Mode::Semantic,
+        ..request(1, 0)
+    };
     let error = after_invalidation(&mut session, error, Some(page), semantic, None).unwrap_err();
     assert_eq!(super::super::error_kind(&error), "semantic_reload_required");
     let page = native(&session, "test isolation", 6)?;
@@ -186,7 +188,8 @@ fn semantic_only_and_unrelated_failures_cannot_publish_a_lexical_page() -> Resul
         Some(page),
         request(1, 0),
         None,
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert_eq!(error.to_string(), "query cancelled");
     assert_eq!(session.queries_completed, 0);
     assert_no_retrieval(&session, 1);
@@ -200,15 +203,25 @@ fn invalid_page_windows_refuse_before_publishing_a_success() -> Result<()> {
     for (limit, offset, window) in [(0, 0, 6), (101, 0, 200), (1, usize::MAX, 6), (5, 2, 6)] {
         let page = native(&session, "git fixture", window)?;
         let error = after_invalidation(
-            &mut session, Refusal::Changed.into(), Some(page), request(limit, offset), None,
-        ).unwrap_err();
+            &mut session,
+            Refusal::Changed.into(),
+            Some(page),
+            request(limit, offset),
+            None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("admitted request window"));
     }
     let mut page = native(&session, "git fixture", 6)?;
     page.window = 2;
     let error = after_invalidation(
-        &mut session, Refusal::Changed.into(), Some(page), request(1, 0), None,
-    ).unwrap_err();
+        &mut session,
+        Refusal::Changed.into(),
+        Some(page),
+        request(1, 0),
+        None,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("admitted request window"));
     assert_eq!(session.queries_completed, 0);
     assert_no_retrieval(&session, 1);
@@ -223,15 +236,25 @@ fn native_page_cannot_claim_an_unloaded_or_replaced_reader_epoch() -> Result<()>
     let stale = native(&session, "test isolation", 6)?;
     session.unload();
     let error = after_invalidation(
-        &mut session, Refusal::Changed.into(), Some(page), request(1, 0), None,
-    ).unwrap_err();
+        &mut session,
+        Refusal::Changed.into(),
+        Some(page),
+        request(1, 0),
+        None,
+    )
+    .unwrap_err();
     assert_eq!(super::super::error_kind(&error), "semantic_reload_required");
     assert!(error.to_string().contains("reader epoch"));
     session.ensure_loaded()?;
     assert_eq!(session.successful_opens, 2);
     let error = after_invalidation(
-        &mut session, Refusal::Changed.into(), Some(stale), request(1, 0), None,
-    ).unwrap_err();
+        &mut session,
+        Refusal::Changed.into(),
+        Some(stale),
+        request(1, 0),
+        None,
+    )
+    .unwrap_err();
     assert_eq!(super::super::error_kind(&error), "semantic_reload_required");
     assert!(error.to_string().contains("reader epoch"));
     assert_eq!(session.queries_completed, 0);

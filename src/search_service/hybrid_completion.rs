@@ -50,9 +50,8 @@ pub(super) fn after_invalidation(
         // An archive recovery might have overlapped the change this witness
         // detected. Neither those candidates nor invalid semantic candidates
         // can stand in for a pinned native page. Do not rerun either engine.
-        let detail = lexical_failure.unwrap_or(
-            "archive-recovered lexical candidates are not a pinned Quill snapshot",
-        );
+        let detail = lexical_failure
+            .unwrap_or("archive-recovered lexical candidates are not a pinned Quill snapshot");
         return Err(error.context(format!(
             "no reusable native lexical page after semantic invalidation; \
              no lexical query was repeated; {detail}"

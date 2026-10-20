@@ -710,9 +710,9 @@ impl Session {
             // A second search could burn another full fuel allowance and lose
             // a native page that already succeeded. Complete from that page,
             // or refuse without replaying a failed/uncertified archive leg.
-            let lexical_failure = lexical_degrade.as_deref().or_else(|| {
-                lexical_fallback.as_ref()?.get("primary_error")?.as_str()
-            });
+            let lexical_failure = lexical_degrade
+                .as_deref()
+                .or_else(|| lexical_fallback.as_ref()?.get("primary_error")?.as_str());
             // Invalid semantic/fused candidates are not part of the response.
             drop(hits);
             return completion::after_invalidation(
