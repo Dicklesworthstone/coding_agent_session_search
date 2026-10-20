@@ -4,6 +4,8 @@
 //! and swapped-out pages are not resident memory. No archive/model/other process
 //! is opened by the probe. It never writes to potentially blocked output pipes.
 
+use super::deadline::terminate;
+
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -115,7 +117,7 @@ impl Guard {
         })?;
         let bytes = resident_bytes()?;
         if bytes > limit_bytes {
-            std::process::exit(MEMORY_EXIT_CODE);
+            terminate(MEMORY_EXIT_CODE);
         }
         let observation = Arc::new(Observation {
             limit_bytes,
@@ -134,18 +136,18 @@ impl Guard {
                     match receiver.recv_timeout(Duration::from_millis(SAMPLE_INTERVAL_MS)) {
                         Ok(()) => return,
                         Err(RecvTimeoutError::Disconnected) => {
-                            std::process::exit(MONITOR_FAILURE_EXIT_CODE);
+                            terminate(MONITOR_FAILURE_EXIT_CODE);
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                     }
                     let bytes = resident_bytes().unwrap_or_else(|_| {
-                        std::process::exit(MONITOR_FAILURE_EXIT_CODE);
+                        terminate(MONITOR_FAILURE_EXIT_CODE);
                     });
                     observed.observe(bytes);
                     if bytes > limit_bytes {
                         // Never log, flush or wait for the thread running the query.
                         // The kernel also releases any reader-pool lease on exit.
-                        std::process::exit(MEMORY_EXIT_CODE);
+                        terminate(MEMORY_EXIT_CODE);
                     }
                 }
             })?;
@@ -169,7 +171,7 @@ impl Drop for Guard {
             .take()
             .is_some_and(|monitor| monitor.join().is_ok());
         if !signalled || !joined {
-            std::process::exit(MONITOR_FAILURE_EXIT_CODE);
+            terminate(MONITOR_FAILURE_EXIT_CODE);
         }
     }
 }
@@ -295,6 +297,9 @@ mod tests {
         let path = std::path::PathBuf::from(std::env::var_os("CASS_MEMORY_TEST_POOL").unwrap());
         let pool = Pool::new(path.clone(), 1).unwrap();
         let _lease = pool.acquire().unwrap();
+        // Cleanup that waits forever must not defeat the RSS supervisor.
+        #[cfg(unix)]
+        super::super::deadline::termination::install_blocked_exit_handler();
         let baseline = resident_bytes().unwrap();
         let _guard = Guard::start(baseline.div_ceil(MIB) + 16).unwrap();
         let stdout = io::stdout();
