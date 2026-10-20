@@ -39328,8 +39328,13 @@ fn run_diag(
 
     let platform = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let quarantine_report =
-        quarantine.then(|| collect_diag_quarantine_report(&data_dir, &index_path));
+    let quarantine_report = quarantine.then(|| {
+        let mut report = collect_diag_quarantine_report(&data_dir, &index_path);
+        report.lexical_rebuild_quarantine = Some(
+            crate::search::lexical_quarantine_diagnostics::collect(&data_dir),
+        );
+        report
+    });
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -39415,6 +39420,11 @@ fn run_diag(
     if let Some(report) = quarantine_report.as_ref() {
         println!();
         println!("Quarantine:");
+        if let Some(rebuilds) = &report.lexical_rebuild_quarantine {
+            for line in rebuilds.human_lines() {
+                println!("  {line}");
+            }
+        }
         println!(
             "  Failed seed bundles: {}",
             report.summary.failed_seed_bundle_count
@@ -68912,6 +68922,8 @@ struct DiagQuarantineSummary {
 #[derive(Debug, Clone, Serialize, Default)]
 struct DiagQuarantineReport {
     summary: DiagQuarantineSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lexical_rebuild_quarantine: Option<crate::search::lexical_quarantine_diagnostics::Report>,
     quarantined_artifacts: Vec<DiagQuarantineInspectionArtifact>,
     failed_seed_bundle_files: Vec<DiagQuarantineArtifact>,
     retained_publish_backups: Vec<DiagQuarantineArtifact>,
@@ -69544,7 +69556,12 @@ fn collect_diag_lexical_manifest_entries(
         }
     }
 
-    for entry in walkdir::WalkDir::new(manifest_root).follow_links(false) {
+    for entry in walkdir::WalkDir::new(manifest_root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(crate::search::lexical_quarantine_diagnostics::generation_walk_entry)
+    {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -95392,12 +95409,14 @@ pub(crate) fn run_doctor_impl(
         }
     });
 
+    let rebuild_quarantine = crate::search::lexical_quarantine_diagnostics::collect(&data_dir);
     if let Some(fmt) = structured_format {
-        let quarantine_report = if command_surface == doctor::DoctorCommandSurface::Check {
+        let mut quarantine_report = if command_surface == doctor::DoctorCommandSurface::Check {
             collect_diag_quarantine_report_without_cleanup_plan(&data_dir, &index_path)
         } else {
             collect_diag_quarantine_report(&data_dir, &index_path)
         };
+        quarantine_report.lexical_rebuild_quarantine = Some(rebuild_quarantine);
         // uojcg.9.2/9.5: attribute a likely root-cause family from the live
         // doctor signals (storage open failure, derived truth-table mismatch,
         // semantic load failure). Complements the per-incident `incidents[]`
@@ -95556,6 +95575,17 @@ pub(crate) fn run_doctor_impl(
         // Human-readable output
         print_doctor_human_line(wrap, "CASS Doctor".bold().to_string());
         println!();
+        if !rebuild_quarantine.complete
+            || rebuild_quarantine
+                .inventory
+                .as_ref()
+                .is_some_and(|inventory| !inventory.artifacts.is_empty())
+        {
+            for line in rebuild_quarantine.human_lines() {
+                print_doctor_human_line(wrap, line);
+            }
+            println!();
+        }
 
         for check in &checks {
             let icon = match check.status.as_str() {
