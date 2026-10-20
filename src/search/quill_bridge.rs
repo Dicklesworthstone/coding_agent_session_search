@@ -1029,7 +1029,7 @@ impl QuillCassIndex {
 
     /// [`Self::open_or_create`] under an explicit engine configuration; tests
     /// use it to isolate one knob against the engine's own behaviour.
-    pub(crate) fn open_or_create_with_config(path: &Path, config: &QuillConfig) -> Result<Self> {
+    fn open_or_create_with_config(path: &Path, config: &QuillConfig) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let directory = path.to_path_buf();
         // Create ONLY when the directory holds no published manifest.

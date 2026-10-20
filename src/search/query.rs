@@ -24361,33 +24361,27 @@ mod tests {
         Ok(())
     }
 
-    /// GH #518 on the real engine. The counting pass visits every match while
-    /// the ranked pass may skip posting blocks that cannot reach its top-k, so
-    /// a budget the page fits in can be too small for the count. At the
-    /// smallest budget the page fits, the search must return that page with an
-    /// unknown total instead of failing; with fuel to spare it reports the
-    /// exact total and the same hits.
+    /// GH #518 on the real engine: the ranked page comes from Quill, the
+    /// counting call gets Quill's own typed fuel refusal, and the policy keeps
+    /// the page with an unknown total. With fuel for both, the same call
+    /// reports the exact total and ranks the same page.
     ///
-    /// The fixture has to give the ranked pass something to skip. Quill scores
-    /// a disjunction in 4,096-document windows, the first window is always
-    /// exhaustive, and opening a segment's cursor enters its first block. So a
-    /// ranked pass saves fuel only on documents past the first window of one
-    /// segment: one document per segment, or segments that each fit in one
-    /// window, cost the count no more than the page. One batch is not enough
-    /// for that, because ordinary ingest spreads a batch over one shard per
-    /// core (up to 32), each sealing its own segment. The fixture therefore
-    /// ingests through a single deterministic shard with seal budgets far
-    /// above its size, and checks that it really is one segment: strong
-    /// matches first, then three windows of weak ones. The title never
-    /// contains the term, so a weak document can score no higher than its own
-    /// weak content match.
+    /// The two calls use separate readers, ample fuel for the page and one
+    /// unit for the count, because a count-only refusal under one shared
+    /// budget could not be produced on frankensearch-quill 0.4.1. For CASS's
+    /// parsed queries the counting pass always fit the smallest budget the
+    /// ranked page fit, whether the matches sat in one segment past the first
+    /// 4,096-document scoring window or spread over one segment per ingest
+    /// shard, so no budget fit the page but not the count. The policy stays
+    /// because the total is optional either way; this test pins its wiring to
+    /// real engine errors, and the injected-error tests above pin its
+    /// decisions.
     #[test]
     fn bounded_exact_count_survives_a_real_count_fuel_refusal() -> Result<()> {
         const STRONG: usize = 4;
-        const WEAK: usize = 3 * 4_096;
+        const WEAK: usize = 60;
         let dir = TempDir::new()?;
-        // Same length, so only the term frequency separates the two kinds:
-        // once the top-k holds the strong ones, no weak block can enter it.
+        // Same length, so only the term frequency ranks the strong ones first.
         let strong = ["needle"; 24].join(" ");
         let weak = std::iter::once("needle")
             .chain(std::iter::repeat_n("filler", 23))
@@ -24399,7 +24393,7 @@ mod tests {
                 agent: "codex".into(),
                 workspace: Some("/ws".into()),
                 workspace_original: None,
-                source_path: format!("/gh518/{ordinal:05}.jsonl"),
+                source_path: format!("/gh518/{ordinal:03}.jsonl"),
                 msg_idx: 0,
                 created_at: Some(100),
                 title: Some("fixture".into()),
@@ -24414,23 +24408,9 @@ mod tests {
                 conversation_id: Some(i64::try_from(ordinal)? + 1),
             });
         }
-        let config = frankensearch::quill::QuillConfig {
-            deterministic_ingest: true,
-            scribe_shard_budget_bytes: 256 * 1024 * 1024,
-            delta_budget_bytes: 256 * 1024 * 1024,
-            ..crate::search::quill_bridge::cass_quill_config()
-        };
-        let mut writer = crate::search::quill_bridge::QuillCassIndex::open_or_create_with_config(
-            dir.path(),
-            &config,
-        )?;
+        let mut writer = crate::search::quill_bridge::QuillCassIndex::open_or_create(dir.path())?;
         writer.add_cass_documents(&documents)?;
         writer.commit()?;
-        assert_eq!(
-            writer.segment_count(),
-            1,
-            "the fixture must be one segment for the ranked pass to skip anything"
-        );
         drop(writer);
 
         let query = frankensearch::quill::query::CassQueryParser::new(
@@ -24442,66 +24422,44 @@ mod tests {
         let open = |budget: u64| {
             crate::search::quill_bridge::open_cass_reader_with_query_fuel_budget(dir.path(), budget)
         };
-        let page_fits = |budget: u64| -> Result<bool> {
-            match crate::search::quill_bridge::search_paginated(
-                &open(budget)?,
-                &query,
-                STRONG,
-                0,
-                false,
-            ) {
-                Ok(_) => Ok(true),
-                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
-                    Ok(false)
-                }
-                Err(error) => Err(error),
-            }
+        let ample = open(crate::search::quill_bridge::cass_quill_config().query_fuel_budget)?;
+        let starved = open(1)?;
+        // Precondition: the starved reader really refuses the counting call
+        // with the engine's typed fuel error, not some other failure.
+        let refusal = match crate::search::quill_bridge::search_paginated(
+            &starved, &query, STRONG, 0, true,
+        ) {
+            Ok(page) => bail!(
+                "a one-unit reader must refuse the count, but it returned {} hits and total {:?}",
+                page.hits.len(),
+                page.total_count
+            ),
+            Err(error) => error,
         };
-        let (mut refused_at, mut fits_at) = (0_u64, 1_u64 << 40);
-        assert!(page_fits(fits_at)?, "the ranked page fits some budget");
-        while fits_at - refused_at > 1 {
-            let mid = refused_at + (fits_at - refused_at) / 2;
-            if page_fits(mid)? {
-                fits_at = mid;
-            } else {
-                refused_at = mid;
-            }
-        }
-
-        // Precondition, in production order on a fresh reader: at the smallest
-        // budget the ranked page fits, the counting pass does not.
-        let probe = open(fits_at)?;
-        let segments = probe.segment_count()?;
-        crate::search::quill_bridge::search_paginated(&probe, &query, STRONG, 0, false)?;
-        let count_error =
-            match crate::search::quill_bridge::search_paginated(&probe, &query, STRONG, 0, true) {
-                Ok(page) => bail!(
-                    "budget {fits_at}, {segments} segment(s): counting every match must cost \
-                     more fuel than the ranked page, but it returned {} hits and total {:?}",
-                    page.hits.len(),
-                    page.total_count
-                ),
-                Err(error) => error,
-            };
         assert!(
-            crate::search::quill_bridge::is_query_fuel_exhausted(&count_error),
-            "{count_error:#}"
+            matches!(
+                refusal.downcast_ref::<frankensearch::quill::QuillIndexError>(),
+                Some(frankensearch::quill::QuillIndexError::QueryFuelExhausted { .. })
+            ),
+            "{refusal:#}"
         );
 
-        let degraded = execute_query_with_bounded_exact_count(&open(fits_at)?, &query, STRONG, 0)?;
+        let mut passes = Vec::new();
+        let degraded = bounded_exact_count_page(STRONG, 0, 1_000_000, |exact_count| {
+            passes.push(exact_count);
+            let reader = if exact_count { &starved } else { &ample };
+            crate::search::quill_bridge::search_paginated(reader, &query, STRONG, 0, exact_count)
+        })?;
         assert_eq!(
-            degraded.hits.len(),
-            STRONG,
-            "budget {fits_at}: the ranked page"
+            passes,
+            [false, true],
+            "a saturated small page asks for its count"
         );
-        assert_eq!(
-            degraded.total_count, None,
-            "budget {fits_at}: total unknown"
-        );
+        assert_eq!(degraded.hits.len(), STRONG, "the ranked page survives");
+        assert_eq!(degraded.total_count, None, "its total is unknown");
 
-        // Control: with fuel to spare the same call reports the exact total
-        // and ranks the same page.
-        let ample = open(fits_at.saturating_mul(1 << 20))?;
+        // Control: with fuel for both passes the production entry point
+        // reports the exact total and ranks the same page.
         let counted = execute_query_with_bounded_exact_count(&ample, &query, STRONG, 0)?;
         let direct =
             crate::search::quill_bridge::search_paginated(&ample, &query, STRONG, 0, true)?;
