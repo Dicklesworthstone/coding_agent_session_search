@@ -597,6 +597,7 @@ impl Session {
             self.semantic.calls_completed = self.semantic.calls_completed.saturating_add(1);
             Ok((hits, metadata))
         });
+        let mut lexical_fallback = None;
         let (mut hits, realized, ann, lexical_degrade) = match semantic {
             Ok((semantic_hits, ann)) if mode == Mode::Hybrid => {
                 let lexical = self.ensure_loaded().and_then(|()| {
@@ -605,11 +606,33 @@ impl Session {
                         .context("lexical reader is not loaded")?
                         .search(
                             query,
-                            search_filters(filters),
+                            search_filters(filters.clone()),
                             window,
                             0,
                             FieldMask::new(false, true, true, false),
                         )
+                });
+                // A successful semantic leg must not bypass the caller's
+                // explicit lexical recovery grant. Recover only a Quill fuel
+                // refusal, using the SAME candidate window, exact filters,
+                // reader admission and whole-request watchdog as this fusion.
+                // A successful empty Quill page remains authoritative.
+                let lexical = lexical.or_else(|error| {
+                    let page = self.lexical_recovery.recover(
+                        self.archive.as_deref(),
+                        error,
+                        super::lexical_fallback::Search {
+                            query,
+                            filters: search_filters(filters),
+                            limit: window,
+                            offset: 0,
+                        },
+                    )?;
+                    // Recovery drops its temporary archive client before
+                    // returning. Keep its changed-backend receipt, not a
+                    // claim that these candidates came from the Quill epoch.
+                    lexical_fallback = Some(page.metadata);
+                    Ok::<_, anyhow::Error>(page.hits)
                 });
                 match lexical {
                     Ok(lexical_hits) => (
@@ -692,6 +715,14 @@ impl Session {
             "page_window_exhausted": has_next && next_offset.is_none(), "preview_only": true,
             "requested_mode": mode, "realized_mode": realized,
             "semantic_fallback_reason": null, "lexical_degrade_reason": lexical_degrade,
+            "degraded": lexical_degrade.is_some() || lexical_fallback.is_some(),
+            "lexical_backend": if realized == "hybrid" {
+                Some(if lexical_fallback.is_some() { "frankensqlite" } else { "quill" })
+            } else { None },
+            "lexical_result_reader_epoch": if realized == "hybrid" && lexical_fallback.is_none() {
+                Some(self.successful_opens)
+            } else { None },
+            "lexical_fallback": lexical_fallback,
             "semantic_reused": reused, "semantic_setup_ms": setup_ms, "search_ms": started.elapsed().as_millis(),
             "candidate_window_per_leg": if mode == Mode::Hybrid { window } else { limit + offset + 1 },
             "ann": ann, "snapshot": self.status(),
