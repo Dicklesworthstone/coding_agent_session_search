@@ -1016,7 +1016,10 @@ fn gh422_timeout_retry_preserves_scoped_read_only_search() {
     for (delay, agent, expected_hits) in [
         ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "codex", 1),
         ("CASS_TEST_SEARCH_META_SLOW_MS", "codex", 1),
-        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "not-a-real-agent", 0),
+        // A known agent with no sessions in this archive: an unknown name is
+        // now a usage error (exit 2, unknown-agent; 4f21ac8a, #532), not an
+        // empty scope.
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "gemini", 0),
     ] {
         let output = cass_cmd(&home)
             .env(delay, "6000")
