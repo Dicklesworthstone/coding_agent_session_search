@@ -44,6 +44,13 @@ fn base_cmd(temp_home: &std::path::Path) -> Command {
     // profile known folder) or under an inherited CLAUDE_CONFIG_DIR; either
     // way the host's real sessions would be indexed into the test archive.
     cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
+    // Once the data dir holds agent_search.db, the Aider connector's default
+    // roots are the working directory (depth 5) and HOME. Inheriting the test
+    // runner's cwd, the checkout root, indexed its Aider histories
+    // (tests/fixtures/aider, plus a git-ignored one a checkout may hold) into
+    // every archive here, so exact conversation counts failed. A test that
+    // needs a different working directory still sets its own.
+    cmd.current_dir(temp_home);
     cmd
 }
 
