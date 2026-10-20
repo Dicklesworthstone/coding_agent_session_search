@@ -402,7 +402,10 @@ lib_stage=""
 if [ "$RUN_LIB" = 1 ]; then
     # A wedged test (the bet45 class: a producer parked forever at ~0 CPU)
     # would otherwise hold the fleet admission until the job's own ceiling.
-    # `timeout` turns that into a loud EXIT=124 on this stage instead.
+    # `timeout` turns that into a loud EXIT=124 on this stage instead. It
+    # bounds the test run only: lib-build compiles first, because a loaded
+    # worker can spend the whole budget compiling (gate b82: lib-tests EXIT=124
+    # before any test ran, after a 72-minute clippy compile).
     LIB_TIMEOUT="${GATE_LIB_TIMEOUT_SECS:-2400}"
     if [[ ! "$LIB_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
         echo "gate: GATE_LIB_TIMEOUT_SECS must be a positive integer" >&2
@@ -418,13 +421,14 @@ if [ "$RUN_LIB" = 1 ]; then
             filter_check_args+="$fw_q"
         done
     fi
-    lib_stage="run_tests lib-tests${filter_check_args} timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
+    lib_stage="cargo test --locked -j ${BUILD_JOBS} --lib --no-run; echo STAGE=lib-build EXIT=\$?; \
+run_tests lib-tests${filter_check_args} timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
 fi
 # Every stage the remote script will run, in order. The receipt check below
 # requires each one to report: a job cut short by the fleet's SSH ceiling
 # leaves later stages missing, and a missing stage is RED, never green.
 EXPECTED_STAGES=(source-identity source-freshness fmt clippy)
-[ "$RUN_LIB" = 1 ] && EXPECTED_STAGES+=(lib-tests)
+[ "$RUN_LIB" = 1 ] && EXPECTED_STAGES+=(lib-build lib-tests)
 integration_stage=""
 if [ "$RUN_INTEGRATION" = 1 ]; then
     declare -A integration_targets=()
@@ -475,8 +479,10 @@ if [ "$RUN_INTEGRATION" = 1 ] && [ "$RUN_BIN" = 1 ]; then
         logical_archive::export::ordering_tests::explicit_or_unattested_collations_keep_binary_order_and_verify # p94yt
     )
     printf -v bin_skip_args ' --skip %q' "${BIN_SKIPS[@]}"
-    integration_stage+="run_tests bin-cass timeout ${BIN_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --bin cass -- --test-threads=${BUILD_JOBS}${bin_skip_args};"
-    EXPECTED_STAGES+=(bin-cass)
+    # As for lib-tests, the timeout bounds the test run, not the compile.
+    integration_stage+="cargo test --locked -j ${BUILD_JOBS} --bin cass --no-run; echo STAGE=bin-build EXIT=\$?; \
+run_tests bin-cass timeout ${BIN_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --bin cass -- --test-threads=${BUILD_JOBS}${bin_skip_args};"
+    EXPECTED_STAGES+=(bin-build bin-cass)
 fi
 golden_regen_stage=""
 golden_stage=""
