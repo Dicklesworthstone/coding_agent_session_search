@@ -3709,8 +3709,10 @@ rowids a rolled-back transaction reserved (bd-gwoit), and reads a WAL that a
 stock SQLite writer truncated to zero bytes as empty instead of corrupt
 (bd-yxqs9, GH#519).
 The lockfile resolves the 20 SQLite packages CASS uses at 0.4.12.
-Full runtime qualification and the strict UBS gate remain pending, and no
-release of this pin proves recovery of an already damaged archive.
+CASS's runtime qualification of 0.4.12 passed on Linux, macOS and Windows (the
+Windows storage failures predate the pin). The strict UBS gate remains
+pending, and no release of this pin proves recovery of an already damaged
+archive.
 The build guard enforces the reviewed
 uniform SQLite 0.4.12 versions, a single resolution per package, and registry sources.
 
