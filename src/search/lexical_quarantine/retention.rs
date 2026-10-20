@@ -84,6 +84,16 @@ pub(super) fn reclaim_one(
     now: SystemTime,
     budget: &mut Budget,
 ) -> io::Result<()> {
+    reclaim_one_with_mount_check(artifact, inventory, now, budget, mounts::check)
+}
+
+fn reclaim_one_with_mount_check(
+    artifact: &Artifact,
+    inventory: &Inventory,
+    now: SystemTime,
+    budget: &mut Budget,
+    mut check_mounts: impl FnMut(&Path, &mut Budget) -> io::Result<()>,
+) -> io::Result<()> {
     survivor::validate_selection(artifact, inventory)?;
     let parent = artifact
         .path
@@ -110,6 +120,9 @@ pub(super) fn reclaim_one(
     // Both walks consume the same sweep-wide budget; exhaustion fails closed.
     survivor::recheck(inventory, now, budget)?;
     budget.check()?;
+    // Re-read mountinfo after target/survivor observation, before any rename.
+    // Same-device bind mounts are not ruled out by metadata fingerprints.
+    check_mounts(&artifact.path, budget)?;
     let doomed = if artifact.interrupted_reclaim {
         artifact.path.clone()
     } else {
@@ -135,6 +148,8 @@ pub(super) fn reclaim_one(
         ));
     }
     real_directory(&doomed)?;
+    // A late refusal leaves the recognized reservation intact for a safe retry.
+    check_mounts(&doomed, budget)?;
     // std's recursive removal does not follow links. Observation additionally
     // refused symlinks, special files, cross-device entries and Unix hard links.
     // Never delete the live index, source archive, backups or arbitrary prefixes.
@@ -331,3 +346,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod mount_tests;

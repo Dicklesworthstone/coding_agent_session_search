@@ -15,6 +15,7 @@ use serde::Serialize;
 
 pub mod cleanup;
 mod evidence;
+mod mounts;
 pub use evidence::{EvidenceKind, FailureEvidence};
 mod retention;
 mod survivor;
@@ -104,6 +105,8 @@ struct Budget {
     root_entries: usize,
     tree_entries: usize,
     path_bytes: usize,
+    #[cfg(target_os = "linux")]
+    mount_bytes: usize,
 }
 
 impl Budget {
@@ -114,6 +117,8 @@ impl Budget {
             root_entries: 0,
             tree_entries: 0,
             path_bytes: 0,
+            #[cfg(target_os = "linux")]
+            mount_bytes: 0,
         }
     }
 
@@ -242,7 +247,18 @@ fn observe(
     now: SystemTime,
     budget: &mut Budget,
 ) -> io::Result<Artifact> {
+    observe_with_mount_check(path, pending, now, budget, mounts::check)
+}
+
+fn observe_with_mount_check(
+    path: &Path,
+    pending: bool,
+    now: SystemTime,
+    budget: &mut Budget,
+    check_mounts: impl FnOnce(&Path, &mut Budget) -> io::Result<()>,
+) -> io::Result<Artifact> {
     let root = real_directory(path)?;
+    check_mounts(path, budget)?;
     let mut latest = root.modified()?;
     let mut bytes = 0_u64;
     let mut nodes = Vec::new();
