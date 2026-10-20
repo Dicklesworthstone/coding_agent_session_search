@@ -339,3 +339,104 @@ fn semantic_only_does_not_open_quill_or_invoke_lexical_recovery() -> Result<()> 
     assert_eq!(inventory(&fixture.data)?, before);
     Ok(())
 }
+
+#[test]
+fn recovered_hybrid_candidates_keep_agent_workspace_source_and_time_scope() -> Result<()> {
+    let fixture = fixture(true)?;
+    let before = inventory(&fixture.data)?;
+    // Each individual positive filter excludes the other real archive/vector
+    // row. The combined request must not widen any one dimension in recovery.
+    let selections = [
+        json!({"agents":["codex"]}),
+        json!({"workspaces":["/work/δ"]}),
+        json!({"created_from":TIME, "created_to":TIME + 500}),
+        json!({"agents":["codex"], "workspaces":["/work/δ"], "source_id":"local",
+            "created_from":TIME, "created_to":TIME + 500}),
+    ];
+    let mut requests = Vec::new();
+    for (ordinal, filters) in selections.into_iter().enumerate() {
+        let mut request = hybrid(u64::try_from(ordinal)? + 1);
+        request["filters"] = filters;
+        requests.push(request);
+    }
+    let mut absent_source = hybrid(5);
+    absent_source["filters"] = json!({"source_id":"different-source"});
+    requests.push(absent_source);
+    let replies = serve(&fixture, true, 1, &requests)?;
+    for (ordinal, reply) in replies[..4].iter().enumerate() {
+        assert_eq!(reply["ok"], true, "{reply}");
+        let result = &reply["result"];
+        assert_eq!(result["realized_mode"], "hybrid");
+        assert_eq!(result["lexical_backend"], "frankensqlite");
+        assert_eq!(result["degraded"], true);
+        assert_eq!(result["count"], 1, "{result}");
+        assert_eq!(result["hits"][0]["conversation_id"], fixture.identities[0]);
+        assert_eq!(result["hits"][0]["message_index"], 8);
+        assert_eq!(result["hits"][0]["source_id"], "local");
+        assert!(result["lexical_result_reader_epoch"].is_null());
+        assert_eq!(result["snapshot"]["lexical_fallback"]["completed"], ordinal + 1);
+    }
+    assert_eq!(replies[4]["ok"], true, "{}", replies[4]);
+    assert_eq!(replies[4]["result"]["count"], 0, "source scope must not widen");
+    assert_eq!(inventory(&fixture.data)?, before);
+    Ok(())
+}
+
+#[test]
+fn recovered_hybrid_pages_apply_offset_after_fusion_without_duplicates() -> Result<()> {
+    let fixture = fixture(true)?;
+    let before = inventory(&fixture.data)?;
+    let replies = serve(&fixture, true, 1, &[
+        hybrid(1),
+        json!({"op":"semantic_search", "id":2, "query":QUERY,
+            "mode":"hybrid", "limit":1, "offset":0}),
+        json!({"op":"semantic_search", "id":3, "query":QUERY,
+            "mode":"hybrid", "limit":1, "offset":1}),
+    ])?;
+    for reply in &replies {
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["result"]["realized_mode"], "hybrid");
+        assert_eq!(reply["result"]["lexical_backend"], "frankensqlite");
+    }
+    let all = replies[0]["result"]["hits"].as_array().context("whole page")?;
+    assert_eq!(all.len(), 2);
+    assert_ne!(all[0]["conversation_id"], all[1]["conversation_id"]);
+    for ordinal in 0..2 {
+        let page = &replies[ordinal + 1]["result"];
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["offset"], ordinal);
+        assert_eq!(page["hits"][0], all[ordinal], "offset must follow fusion");
+    }
+    assert_eq!(replies[1]["result"]["has_more"], true);
+    assert_eq!(replies[1]["result"]["next_offset"], 1);
+    assert!(replies[2]["result"]["has_more"].is_null());
+    assert!(replies[2]["result"]["next_offset"].is_null());
+    assert_eq!(replies[2]["result"]["snapshot"]["lexical_fallback"]["completed"], 3);
+    assert_eq!(inventory(&fixture.data)?, before);
+    Ok(())
+}
+
+#[test]
+fn missing_quill_index_keeps_semantic_results_without_authorizing_archive_recovery() -> Result<()> {
+    let fixture = fixture(true)?;
+    let expected = expected_index_dir(&fixture.data);
+    // Preserve the complete fixture index under a different path. A missing
+    // reader is not a fuel refusal and cannot authorize the archive lane.
+    std::fs::rename(&expected, fixture.data.join("retained-lexical-index"))?;
+    let before = inventory(&fixture.data)?;
+    let replies = serve(&fixture, true, 1, &[hybrid(1)])?;
+    assert_eq!(replies[0]["ok"], true, "{}", replies[0]);
+    let result = &replies[0]["result"];
+    assert_eq!(result["realized_mode"], "semantic");
+    assert_eq!(result["degraded"], true);
+    assert_eq!(result["count"], 2);
+    assert!(result["lexical_backend"].is_null());
+    assert!(result["lexical_fallback"].is_null());
+    let reason = result["lexical_degrade_reason"].as_str().context("reader error")?;
+    assert!(!reason.contains("query fuel exhausted"), "{reason}");
+    assert_eq!(result["snapshot"]["successful_opens"], 0);
+    assert_eq!(result["snapshot"]["lexical_fallback"]["attempts"], 0);
+    assert!(!expected.exists(), "search must never recreate the missing index");
+    assert_eq!(inventory(&fixture.data)?, before);
+    Ok(())
+}

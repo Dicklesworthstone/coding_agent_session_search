@@ -34,9 +34,9 @@ from its internal overfetch or federated search.
 
 A successful empty Quill result remains authoritative. Corruption, invariant,
 parser and cancellation failures are not converted to an empty result or an
-archive search. The lane uses the existing bridge fuel-error classifier; that
-classifier currently recognizes the engine's error text, not a newly added
-typed error API.
+archive search. The bridge preserves the concrete Quill error, and a typed
+non-fuel failure overrides even misleading outer diagnostic text. The classifier
+retains narrow compatibility with historical, already-flattened fuel diagnostics.
 
 Before opening SQLite, the fallback checks the observed size of the database
 and its `-wal` file. Their checked sum must not exceed **64 MiB**. Missing WAL
@@ -85,7 +85,8 @@ Refinement preserves the retrieval backend and degradation metadata alongside
 its separate reranking result. Semantic-to-lexical degradation that already
 uses service lexical search preserves those fields as well.
 
-If fallback fails, the error retains the original fuel refusal and adds the
+For an ordinary lexical request, if fallback fails, the error retains the
+original fuel refusal and adds the
 fallback failure plus the manual repair command. It does not report partial
 results as a successful search. Oversized archives must be maintained outside
 the interactive request:
@@ -98,6 +99,44 @@ cass --db /absolute/path/to/agent_search.db \
 Select matching archive/index coordinates and preserve a consistent backup
 before maintenance. This command is not a verified cure for every archive.
 
+## Recovery inside hybrid retrieval
+
+With `--semantic-embedder` and the required explicit archive/data directory,
+`--lexical-fallback` also applies to the lexical leg of `semantic_search` in
+`hybrid` mode. It is no longer bypassed merely because semantic retrieval
+succeeded. The same `Session` route serves JSON-lines, MCP, and one-shot hybrid
+requests; no second recovery implementation or deadline is introduced.
+
+```json
+{"id":1,"op":"semantic_search","mode":"hybrid","query":"git fixture","limit":2}
+```
+
+When Quill exhausts fuel, eligible recovery reads the same query and exact
+structured filters at candidate offset zero with the existing fusion window.
+The temporary archive reader is dropped before its candidates are fused with
+retained semantic candidates. Pagination is applied after fusion. Semantic
+asset/archive change checks still run after the lexical leg, so a detected
+change prevents stale semantic coordinates from being published as fused hits.
+Those checks do not establish an immutable cross-backend or cross-page snapshot.
+
+A completed two-leg result retains `realized_mode: "hybrid"`. Its response now
+identifies `lexical_backend` as `quill` or `frankensqlite`; recovered results
+carry `lexical_fallback`, set `degraded: true`, and leave
+`lexical_result_reader_epoch` null. The latter records a Quill epoch only when
+that pinned reader actually supplied the lexical result. The recovery receipt
+retains the original failure and explicitly disclaims equivalent Quill ranking.
+
+Without recovery consent, or when eligible recovery fails, the existing hybrid
+policy still returns available semantic results with `realized_mode: "semantic"`
+and `lexical_degrade_reason`. This also remains the behavior for non-fuel lexical
+errors: they cannot authorize an archive search, but are not newly made fatal to
+a successful semantic leg. An empty successful Quill result does not trigger
+recovery. Semantic-only requests never load a lexical reader for this feature.
+
+If semantic retrieval itself is unavailable, the existing lexical-only response
+continues to use `backend` and `fallback`, as described above, alongside its
+semantic failure reason; it is not a successfully fused two-leg response.
+
 ## Regression coverage and verification status
 
 `tests/quill_fuel_fallback.rs` defines real-binary tests for both reported
@@ -106,6 +145,14 @@ recovery through oversized/corrupt archives, preservation of authoritative
 empty results, and a 206-segment index whose actual live segment count is
 asserted before running both queries under 80,000 units. Unit tests cover the
 DB-plus-WAL size boundary and non-resource error routing.
+
+`tests/search_service_hybrid_recovery.rs` adds six real-process tests with real
+hash FSVI, Quill, and canonical archive fixtures. They cover recovery consent,
+reader reuse/unload under one admission slot, authoritative empty lexical
+results, semantic-only isolation, agent/workspace/source/time scoping,
+pagination after fusion, and missing-index refusal without archive recovery.
+Each compares the complete tiny data-directory file inventory and bytes.
+These tests are authored but have not been executed in this environment.
 
 The fixtures use real Quill and FrankenSQLite data. Fuel is configured on each
 child process, not by changing environment variables in a parallel test runner.
@@ -118,6 +165,7 @@ syntax and fleet setup. Direct native test selections are:
 ```sh
 RUST_MIN_STACK=134217728 cargo test --locked --test quill_fuel_fallback
 RUST_MIN_STACK=134217728 cargo test --locked --test search_service
+RUST_MIN_STACK=134217728 cargo test --locked --test search_service_hybrid_recovery
 ```
 
 At implementation time in this session, Cargo, rustc, rustfmt, RCH and UBS were
