@@ -25,6 +25,8 @@ mod mcp;
 mod memory;
 #[path = "search_service/once.rs"]
 mod once;
+#[path = "search_service/once_refine.rs"]
+mod once_refine;
 #[path = "search_service/protocol.rs"]
 mod protocol;
 #[path = "search_service/refinement.rs"]
@@ -59,7 +61,7 @@ struct ServiceCli {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
-    /// Reuse read-only search readers, or run one supervised --query and exit.
+    /// Reuse read-only search readers, or run one supervised request and exit.
     /// Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md.
     Serve {
         /// Published lexical index directory, instead of --data-dir.
@@ -83,12 +85,19 @@ enum ServiceCommand {
         /// Use newline-delimited JSON requests and responses on standard I/O.
         #[arg(
             long,
-            required_unless_present_any = ["query", "transcript"],
-            conflicts_with_all = ["query", "transcript"]
+            required_unless_present_any = ["query", "transcript", "refine"],
+            conflicts_with_all = ["query", "transcript", "refine"]
         )]
         stdio: bool,
         #[command(flatten)]
         once: once::Options,
+        /// Refine one bounded lexical shortlist and exit without reading stdin.
+        /// JSON selects query, lexical_query, filters, candidate_limit and limit.
+        /// Requires an installed --reranker-model; never downloads model files.
+        #[arg(long, value_name = "JSON", requires = "reranker_model", conflicts_with_all = [
+            "stdio", "mcp", "query", "transcript", "semantic_embedder"
+        ])]
+        refine: Option<String>,
         /// Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport.
         #[arg(long, requires = "stdio")]
         mcp: bool,
@@ -119,7 +128,7 @@ enum ServiceCommand {
             required_if_eq_any = [("mode", "semantic"), ("mode", "hybrid")]
         )]
         semantic_embedder: Option<semantic::EmbedderChoice>,
-        /// Whole-request deadline, including setup, search, teardown and output for --query.
+        /// Whole-request deadline, including setup, search, teardown and one-shot output.
         /// For --stdio, starts at the first frame byte; idle sessions are not timed out.
         /// Expiry exits the worker with code 124.
         #[arg(
@@ -176,6 +185,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         data_dir,
         stdio: _,
         once,
+        refine,
         mcp,
         db,
         lexical_fallback,
@@ -186,7 +196,10 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         admission_slots,
         max_resident_mib,
     } = cli.command;
-    let one_shot = once.request().map_err(once::invalid_request)?;
+    let one_shot = match refine {
+        Some(selection) => Some(once_refine::request(&selection).map_err(once::invalid_request)?),
+        None => once.request().map_err(once::invalid_request)?,
+    };
     // One budget covers ALL one-shot work, including the initial memory probe,
     // reader setup, optional recovery, native teardown and blocked output. This
     // guard stays alive until run returns; no stage gets a fresh deadline.
