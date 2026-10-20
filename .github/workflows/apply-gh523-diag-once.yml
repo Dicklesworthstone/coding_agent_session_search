@@ -1,0 +1,95 @@
+name: Apply and qualify GH523 diagnostic integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply-gh523-diag-once.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gh523-diag-integration
+  cancel-in-progress: false
+
+jobs:
+  apply-and-qualify:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_MIN_STACK: "134217728"
+      CASS_LEXICAL_QUARANTINE_RETENTION: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Check guards and apply only the reviewed source edits
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gh523-validation
+          python3 scripts/test_apply_gh523_diag_integration.py -v 2>&1 | tee /tmp/gh523-validation/patch-tests.log
+          python3 scripts/apply_gh523_diag_integration.py --apply 2>&1 | tee /tmp/gh523-validation/application.log
+          git diff --check
+      - name: Install the repository-pinned toolchain and linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y lld pkg-config libssl-dev cmake
+      - name: Format only the new small files and check the monolith without rewriting it
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true \
+            src/search/lexical_quarantine_diagnostics.rs \
+            src/search/lexical_quarantine_diagnostics/tests.rs \
+            tests/cli_diag_lexical_rebuild.rs
+          cp tests/cli_diag_lexical_rebuild.rs tests/cli_diag_lexical_rebuild.rs.in
+          rustfmt --edition 2024 --config skip_children=true --check src/lib.rs
+          git diff --check
+          git diff > /tmp/gh523-validation/qualified-source.patch
+      - name: Run shipping-lockfile Rust regressions and lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib lexical_quarantine -- --test-threads=2 2>&1 | tee /tmp/gh523-validation/quarantine.log
+          cargo test --locked --lib staging_reclaim -- --test-threads=2 2>&1 | tee /tmp/gh523-validation/staging.log
+          cargo test --locked --test cli_diag -- --test-threads=2 2>&1 | tee /tmp/gh523-validation/diag.log
+          cargo test --locked --test cli_diag_lexical_rebuild -- --test-threads=2 2>&1 | tee /tmp/gh523-validation/diag-doctor.log
+          cargo test --locked --test cli_lexical_quarantine_cleanup -- --test-threads=2 2>&1 | tee /tmp/gh523-validation/cleanup.log
+          cargo clippy --locked --lib -- -D warnings 2>&1 | tee /tmp/gh523-validation/clippy.log
+      - name: Commit the qualified integration directly to main without force
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- src/lib.rs src/search/lexical_quarantine_diagnostics.rs \
+            src/search/lexical_quarantine_diagnostics/tests.rs \
+            tests/cli_diag_lexical_rebuild.rs tests/cli_diag_lexical_rebuild.rs.in
+          if git diff --cached --quiet; then
+            echo 'No integration changes to commit.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(diag): surface lexical rebuild quarantines in diag and doctor (#523)' \
+            -m 'Shared bounded metadata report, separate cleanup authority, and rebuild namespace exclusion from legacy manifest planning. Pinned Rust quarantine, staging, diag, diag/doctor integration and cleanup tests plus library Clippy passed in this run.'
+          # A concurrent main update rejects this push rather than overwriting or
+          # rebasing a tested tree onto untested source. No pull request is opened.
+          git push origin HEAD:main
+      - name: Preserve exact patch and native validation output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh523-diag-validation
+          path: /tmp/gh523-validation
+          retention-days: 14
