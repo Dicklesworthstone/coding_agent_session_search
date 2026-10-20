@@ -9,9 +9,17 @@ fn bundle(root: &Path, suffix: &str, pending: bool) -> PathBuf {
         ".lexical-rebuild-quarantine-"
     };
     let path = root.join(format!("{prefix}{suffix}"));
-    let content = if pending { path.join("quarantine") } else { path.clone() };
+    let content = if pending {
+        path.join("quarantine")
+    } else {
+        path.clone()
+    };
     fs::create_dir_all(content.join("index")).unwrap();
-    fs::write(content.join("index/.lexical-rebuild-last-failure.json"), b"private failure").unwrap();
+    fs::write(
+        content.join("index/.lexical-rebuild-last-failure.json"),
+        b"private failure",
+    )
+    .unwrap();
     path
 }
 
@@ -29,7 +37,12 @@ fn both_roots_and_interrupted_evidence_share_one_read_only_report() {
     assert_eq!(inventory.artifacts.len(), 3);
     assert_eq!(inventory.total_bytes, 3 * b"private failure".len() as u64);
     assert_eq!(inventory.eligible_bytes, 0);
-    assert!(inventory.artifacts.iter().all(|artifact| artifact.age_seconds.is_some()));
+    assert!(
+        inventory
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.age_seconds.is_some())
+    );
     let encoded = serde_json::to_string(&report).unwrap();
     assert!(encoded.contains("finalization_failure"));
     assert!(!encoded.contains("private failure"));
@@ -64,7 +77,17 @@ fn preview_arguments_preserve_spaces_and_shell_characters_without_shell_executio
     fs::create_dir(&data).unwrap();
     let report = collect(&data);
     let argv = report.next_safe_argv.unwrap();
-    assert_eq!(argv, vec!["cass", "lexical-quarantine", "--data-dir", data.to_str().unwrap(), "--plan", "--json"]);
+    assert_eq!(
+        argv,
+        vec![
+            "cass",
+            "lexical-quarantine",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--plan",
+            "--json"
+        ]
+    );
     assert!(!report.cleanup_apply_allowed);
 }
 
@@ -78,7 +101,13 @@ fn legacy_generation_walk_does_not_enter_rebuild_or_interrupted_namespaces() {
         "generation-published",
     ] {
         fs::create_dir_all(root.path().join(name).join("index")).unwrap();
-        fs::write(root.path().join(name).join("index/lexical-generation-manifest.json"), b"{private malformed manifest").unwrap();
+        fs::write(
+            root.path()
+                .join(name)
+                .join("index/lexical-generation-manifest.json"),
+            b"{private malformed manifest",
+        )
+        .unwrap();
     }
     let observed: Vec<_> = walkdir::WalkDir::new(root.path())
         .follow_links(false)
@@ -86,10 +115,23 @@ fn legacy_generation_walk_does_not_enter_rebuild_or_interrupted_namespaces() {
         .into_iter()
         .filter_entry(generation_walk_entry)
         .map(|entry| entry.unwrap().into_path())
-        .filter(|path| path.file_name().is_some_and(|name| name == "lexical-generation-manifest.json"))
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "lexical-generation-manifest.json")
+        })
         .collect();
-    assert_eq!(observed, vec![root.path().join("generation-published/index/lexical-generation-manifest.json")]);
-    assert!(root.path().join(".lexical-rebuild-quarantine-000001/index/lexical-generation-manifest.json").is_file());
+    assert_eq!(
+        observed,
+        vec![
+            root.path()
+                .join("generation-published/index/lexical-generation-manifest.json")
+        ]
+    );
+    assert!(
+        root.path()
+            .join(".lexical-rebuild-quarantine-000001/index/lexical-generation-manifest.json")
+            .is_file()
+    );
 }
 
 #[cfg(unix)]
@@ -109,7 +151,10 @@ fn ambiguous_tree_is_reported_without_following_links_or_claiming_zero_size() {
     let text = report.human_lines().join("\n");
     assert!(text.contains("unknown (scan incomplete)"));
     assert!(text.contains("absence is not established"));
-    assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"outside evidence");
+    assert_eq!(
+        fs::read(outside.path().join("sentinel")).unwrap(),
+        b"outside evidence"
+    );
 }
 
 #[cfg(unix)]
@@ -119,7 +164,11 @@ fn reporting_works_while_index_run_lock_is_held_without_rewriting_heartbeat() {
     bundle(root.path(), "000001", false);
     let path = root.path().join("index-run.lock");
     fs::write(&path, b"active writer heartbeat").unwrap();
-    let lock = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
     fs2::FileExt::try_lock_exclusive(&lock).unwrap();
     let report = collect(root.path());
     assert!(report.complete, "{:?}", report.warnings);

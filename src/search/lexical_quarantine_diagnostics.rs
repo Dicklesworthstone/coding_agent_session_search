@@ -34,10 +34,17 @@ fn project(data_dir: &Path, result: std::io::Result<Inventory>) -> Report {
         inventory: None,
         warnings: Vec::new(),
         next_safe_argv: data_dir.to_str().map(|path| {
-            ["cass", "lexical-quarantine", "--data-dir", path, "--plan", "--json"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+            [
+                "cass",
+                "lexical-quarantine",
+                "--data-dir",
+                path,
+                "--plan",
+                "--json",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
         }),
     };
     match result {
@@ -116,7 +123,9 @@ impl Report {
                     ));
                 }
                 if !artifact.size_complete {
-                    lines.push("    Evidence inventory incomplete; absence is not established.".to_owned());
+                    lines.push(
+                        "    Evidence inventory incomplete; absence is not established.".to_owned(),
+                    );
                 }
             }
         }
