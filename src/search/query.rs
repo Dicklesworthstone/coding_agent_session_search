@@ -1,5 +1,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel as mpsc;
+
+#[path = "query/retry_budget.rs"]
+mod retry_budget;
+pub use retry_budget::LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED;
+
 use frankensearch::quill::query::{
     CassQueryFilters as FsCassQueryFilters, CassSourceFilter as FsCassSourceFilter,
 };
@@ -4705,6 +4710,8 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        // This is per-search diagnostics, never a sticky property of a reader.
+        self.record_lexical_degrade_reason(None);
         // NFC-normalize early so every downstream consumer (Tantivy query
         // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
         // matching the NFC-indexed content.
@@ -4797,10 +4804,10 @@ impl SearchClient {
             target_hits.saturating_mul(3)
         };
 
-        // Tantivy is the primary high-performance engine.
+        // Quill is the primary high-performance engine.
         if let Some((reader, fields)) = self.reader.get() {
             tracing::info!(
-                backend = "tantivy",
+                backend = "quill",
                 query = sanitized,
                 limit = initial_fetch_limit,
                 offset = 0,
@@ -4830,6 +4837,7 @@ impl SearchClient {
                 let needs_retry = deduped_len < target_hits
                     && initial_hit_count == initial_fetch_limit
                     && initial_fetch_limit < fallback_fetch_limit;
+                let mut retry_budget_exhausted = false;
 
                 if needs_retry {
                     tracing::debug!(
@@ -4841,7 +4849,7 @@ impl SearchClient {
                         session_path_filter_active,
                         "retrying lexical fetch due to dedup or session-path shortfall"
                     );
-                    let (retry_hits, retry_total_count) = self.search_tantivy(
+                    let attempt = self.search_tantivy(
                         &reader,
                         &fields,
                         query,
@@ -4850,12 +4858,17 @@ impl SearchClient {
                         fallback_fetch_limit,
                         0,
                         field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    );
+                    match self.settle_lexical_retry(attempt, paged_hits.len())? {
+                        Some((retry_hits, retry_total_count)) => {
+                            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                                *tc = retry_total_count;
+                            }
+                            if !retry_hits.is_empty() {
+                                (deduped_len, paged_hits) = page_hits(retry_hits);
+                            }
+                        }
+                        None => retry_budget_exhausted = true,
                     }
                 }
 
@@ -4867,19 +4880,20 @@ impl SearchClient {
                     "lexical fetch complete"
                 );
 
-                if can_use_cache && offset == 0 {
+                // Never promote a budget-shortened page into a complete cache hit.
+                if can_use_cache && offset == 0 && !retry_budget_exhausted {
                     self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
                 }
                 return Ok(paged_hits);
             }
             tracing::debug!(
                 query = sanitized,
-                "tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
+                "quill returned zero hits; skipping sqlite fallback because quill is authoritative when available"
             );
             return Ok(Vec::new());
         } else if let Some(readers) = self.federated_readers() {
             tracing::info!(
-                backend = "tantivy-federated",
+                backend = "quill-federated",
                 query = sanitized,
                 limit = initial_fetch_limit,
                 offset = 0,
@@ -4913,6 +4927,7 @@ impl SearchClient {
                 let needs_retry = deduped_len < target_hits
                     && federated_initial_capacity_reached
                     && initial_fetch_limit < fallback_fetch_limit;
+                let mut retry_budget_exhausted = false;
 
                 if needs_retry {
                     tracing::debug!(
@@ -4925,19 +4940,24 @@ impl SearchClient {
                         session_path_filter_active,
                         "retrying federated lexical fetch due to dedup or session-path shortfall"
                     );
-                    let (retry_hits, retry_total_count) = self.search_tantivy_federated(
+                    let attempt = self.search_tantivy_federated(
                         readers.as_ref(),
                         query,
                         &sanitized,
                         filters.clone(),
                         fallback_fetch_limit,
                         field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    );
+                    match self.settle_lexical_retry(attempt, paged_hits.len())? {
+                        Some((retry_hits, retry_total_count)) => {
+                            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                                *tc = retry_total_count;
+                            }
+                            if !retry_hits.is_empty() {
+                                (deduped_len, paged_hits) = page_hits(retry_hits);
+                            }
+                        }
+                        None => retry_budget_exhausted = true,
                     }
                 }
 
@@ -4950,7 +4970,7 @@ impl SearchClient {
                     "federated lexical fetch complete"
                 );
 
-                if can_use_cache && offset == 0 {
+                if can_use_cache && offset == 0 && !retry_budget_exhausted {
                     self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
                 }
                 return Ok(paged_hits);
@@ -4958,7 +4978,7 @@ impl SearchClient {
             tracing::debug!(
                 query = sanitized,
                 shards = readers.len(),
-                "federated tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
+                "federated quill returned zero hits; skipping sqlite fallback because quill is authoritative when available"
             );
             return Ok(Vec::new());
         }
@@ -4980,7 +5000,8 @@ impl SearchClient {
 
         if has_sqlite_backend {
             tracing::info!(
-                backend = "sqlite-fts5",
+                // This lane may use FTS5 or a source-table scan.
+                backend = "frankensqlite",
                 query = sanitized,
                 limit = fallback_fetch_limit,
                 offset = 0,
@@ -7398,6 +7419,23 @@ impl SearchClient {
             .ok()
             .and_then(|guard| *guard);
 
+        if self.lexical_degrade_reason() == Some(LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED) {
+            // A larger native fetch already spent its budget. Do not turn its
+            // retained short page into another automatic dictionary expansion.
+            self.record_wildcard_fallback_skip(Some(
+                WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+            ));
+            return Ok(SearchResult {
+                hits,
+                wildcard_fallback: false,
+                cache_stats: baseline_stats,
+                suggestions: Vec::new(),
+                ann_stats: None,
+                ann_unavailable_reason: None,
+                total_count: None,
+            });
+        }
+
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
         let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
@@ -7505,6 +7543,12 @@ impl SearchClient {
                     self.record_wildcard_fallback_skip(Some(
                         WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
                     ));
+                    // The original page, not the unsuccessful wildcard request,
+                    // owns the diagnostics exposed with this response.
+                    self.record_lexical_degrade_reason(None);
+                    if let Ok(mut total) = self.last_tantivy_total_count.lock() {
+                        *total = tantivy_total;
+                    }
                     let suggestions = if hits.is_empty() {
                         self.generate_suggestions(query, &filters)
                     } else {
@@ -7552,7 +7596,12 @@ impl SearchClient {
                 total_count: fallback_tantivy_total,
             })
         } else {
-            // Keep original results even if sparse
+            // Keep original results even if sparse. A shorter wildcard page
+            // must not leave its retry-refusal metadata on the selected page.
+            self.record_lexical_degrade_reason(None);
+            if let Ok(mut total) = self.last_tantivy_total_count.lock() {
+                *total = tantivy_total;
+            }
             // Generate suggestions if zero hits
             let suggestions = if hits.is_empty() {
                 self.generate_suggestions(query, &filters)
@@ -10630,8 +10679,10 @@ impl SearchClient {
         }
     }
 
-    /// Why the most recent hybrid search dropped its lexical leg, if it did.
-    /// See [`LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED`] (GH #441).
+    /// Why the most recent lexical request degraded, if it did.
+    /// [`LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED`] means a hybrid lexical leg was lost;
+    /// [`LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED`] means a usable but incomplete native
+    /// page survived a larger-fetch refusal. Neither code denotes an exact total.
     #[must_use]
     pub fn lexical_degrade_reason(&self) -> Option<&'static str> {
         self.last_lexical_degrade_reason
