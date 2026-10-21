@@ -3594,6 +3594,12 @@ impl SemanticIndexer {
         manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
 
         if complete {
+            let retained_generation = self.retain_published_generation_during_replacement(
+                manifest,
+                plan.tier,
+                &plan.db_fingerprint,
+                &plan.model_revision,
+            );
             let db_fingerprint = plan.db_fingerprint.clone();
             if staged_index.wal_record_count() > 0 {
                 staged_index.compact().map_err(|err| {
@@ -3614,6 +3620,12 @@ impl SemanticIndexer {
                         ..Default::default()
                     },
                 );
+            }
+            // Contract-replacement batches keep the old complete generation
+            // published while staging. Retire it only at the actual publication
+            // boundary, immediately before the fixed destination is replaced.
+            if retained_generation {
+                self.revoke_backfill_serving(data_dir, manifest)?;
             }
             // Keep the WAL parked even if publication fails: a failure may
             // follow the rename (for example directory fsync), so restoring it
@@ -3867,6 +3879,55 @@ impl SemanticIndexer {
         Ok(())
     }
 
+    /// A same-corpus contract replacement is private build work, not evidence
+    /// that the last complete generation became invalid. Keep its ledger and
+    /// ANN association intact until the replacement reaches the publication
+    /// boundary. Query admission remains independently strict: this does not
+    /// make an old vector-space revision writable or current for this binary.
+    fn retain_published_generation_during_replacement(
+        &self,
+        manifest: &SemanticManifest,
+        tier: TierKind,
+        db_fingerprint: &str,
+        model_revision: &str,
+    ) -> bool {
+        let artifact = match tier {
+            TierKind::Fast => manifest.fast_tier.as_ref(),
+            TierKind::Quality => manifest.quality_tier.as_ref(),
+        };
+        artifact.is_some_and(|artifact| {
+            artifact.ready
+                && artifact.embedder_id == self.embedder_id()
+                && artifact.db_fingerprint == db_fingerprint
+                && artifact.dimension == self.embedder_dimension()
+                && (artifact.model_revision != model_revision
+                    || artifact.schema_version != SEMANTIC_SCHEMA_VERSION
+                    || artifact.chunking_version != CHUNKING_STRATEGY_VERSION)
+        })
+    }
+
+    fn prepare_backfill_serving(
+        &self,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: &SemanticBackfillStoragePlan,
+    ) -> Result<()> {
+        if self.retain_published_generation_during_replacement(
+            manifest,
+            plan.tier,
+            &plan.db_fingerprint,
+            &plan.model_revision,
+        ) {
+            tracing::info!(
+                tier = plan.tier.as_str(),
+                embedder = self.embedder_id(),
+                "retaining complete semantic generation while replacement contract builds"
+            );
+            return Ok(());
+        }
+        self.revoke_backfill_serving(data_dir, manifest)
+    }
+
     /// Reuse exact canonical identities, never a count or a conversation tail
     /// as evidence that an older vector still describes the current row.
     /// Only one replayed conversation and the capped embedding delta retain
@@ -3917,7 +3978,7 @@ impl SemanticIndexer {
         {
             bail!("semantic backfill candidate has an incompatible vector space");
         }
-        self.revoke_backfill_serving(data_dir, manifest)?;
+        self.prepare_backfill_serving(data_dir, manifest, &plan)?;
         if snapshot.wal_record_count() > 0 {
             snapshot.compact().map_err(|err| {
                 anyhow::anyhow!("compact semantic backfill candidate snapshot: {err}")
@@ -4218,7 +4279,7 @@ impl SemanticIndexer {
         }) {
             manifest.checkpoint = None;
         }
-        self.revoke_backfill_serving(data_dir, manifest)?;
+        self.prepare_backfill_serving(data_dir, manifest, &plan)?;
         let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
             checkpoint.tier == plan.tier
                 && checkpoint.embedder_id == self.embedder_id()
@@ -6477,6 +6538,112 @@ mod tests {
         let unchanged = run(&mut manifest)?;
         assert!(unchanged.published);
         assert_eq!(unchanged.embedded_docs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_contract_replacement_checkpoints_without_revoking_published_generation() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for (name, text) in [
+            ("first", "first retained-contract message"),
+            ("second", "second retained-contract message"),
+        ] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, text))?;
+        }
+
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let db_fingerprint =
+            crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+        let final_path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(final_path.parent().context("semantic index has no parent")?)?;
+        let published_bytes = b"retained published generation sentinel";
+        fs::write(&final_path, published_bytes)?;
+
+        let mut manifest = SemanticManifest::default();
+        manifest.publish_artifact(ArtifactRecord {
+            tier: TierKind::Fast,
+            embedder_id: indexer.embedder_id().to_owned(),
+            model_revision: "hash".into(),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION.wrapping_add(1),
+            dimension: indexer.embedder_dimension(),
+            doc_count: 2,
+            conversation_count: 2,
+            db_fingerprint: db_fingerprint.clone(),
+            index_path: final_path
+                .strip_prefix(temp.path())?
+                .to_string_lossy()
+                .into_owned(),
+            size_bytes: u64::try_from(published_bytes.len())?,
+            started_at_ms: 10,
+            completed_at_ms: 20,
+            ready: true,
+        });
+        manifest.publish_hnsw(crate::search::semantic_manifest::HnswRecord {
+            base_tier: TierKind::Fast,
+            embedder_id: indexer.embedder_id().to_owned(),
+            ef_search: 64,
+            index_path: "vector_index/retained-hnsw.chsw".into(),
+            size_bytes: 17,
+            built_at_ms: 30,
+            ready: true,
+        });
+        manifest.save(temp.path())?;
+        let published = manifest.fast_tier.clone();
+        let ann = manifest.hnsw.clone();
+
+        let run = |manifest: &mut SemanticManifest, max_conversations| {
+            indexer.run_backfill_from_storage(
+                &storage,
+                temp.path(),
+                manifest,
+                SemanticBackfillStoragePlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: db_fingerprint.clone(),
+                    model_revision: "hash".into(),
+                    max_conversations,
+                },
+            )
+        };
+
+        let checkpointed = run(&mut manifest, 1)?;
+        assert!(!checkpointed.published);
+        assert!(checkpointed.checkpoint_saved);
+        assert_eq!(manifest.fast_tier, published);
+        assert_eq!(manifest.hnsw, ann);
+        assert_eq!(fs::read(&final_path)?, published_bytes);
+        let checkpoint = manifest
+            .checkpoint
+            .as_ref()
+            .context("replacement checkpoint missing")?;
+        assert_eq!(checkpoint.chunking_version, CHUNKING_STRATEGY_VERSION);
+
+        let loaded = SemanticManifest::load(temp.path())?.context("saved manifest missing")?;
+        assert_eq!(loaded.fast_tier, published);
+        assert_eq!(loaded.hnsw, ann);
+        assert!(loaded.checkpoint.is_some());
+
+        let completed = run(&mut manifest, 16)?;
+        assert!(completed.published);
+        assert!(!completed.checkpoint_saved);
+        assert!(manifest.checkpoint.is_none());
+        let replacement = manifest
+            .fast_tier
+            .as_ref()
+            .context("replacement not published")?;
+        assert!(replacement.ready);
+        assert_eq!(replacement.chunking_version, CHUNKING_STRATEGY_VERSION);
+        assert_ne!(manifest.fast_tier, published);
+        assert!(manifest.hnsw.as_ref().is_some_and(|record| !record.ready));
+        assert_ne!(fs::read(&final_path)?, published_bytes);
         Ok(())
     }
 
