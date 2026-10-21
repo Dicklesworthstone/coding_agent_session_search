@@ -3501,6 +3501,24 @@
       "cleanup_dry_run_approval_fingerprint": "cleanup-v1-1529494c33aceb4d443809482b810b5f2410dc1b37c3cc95e2c9838ecbaff098",
       "cleanup_apply_allowed": false
     },
+    "lexical_rebuild_quarantine": {
+      "schema_version": 1,
+      "complete": false,
+      "cleanup_apply_allowed": false,
+      "repeated_failure_evidence": false,
+      "inventory": null,
+      "warnings": [
+        "Rebuild-quarantine inventory unavailable (NotFound): No such file or directory (os error 2)"
+      ],
+      "next_safe_argv": [
+        "cass",
+        "lexical-quarantine",
+        "--data-dir",
+        "[TEST_HOME]/coding-agent-search",
+        "--plan",
+        "--json"
+      ]
+    },
     "quarantined_artifacts": [],
     "failed_seed_bundle_files": [],
     "retained_publish_backups": [],

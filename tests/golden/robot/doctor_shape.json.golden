@@ -3192,6 +3192,38 @@
             }
           }
         },
+        "lexical_rebuild_quarantine": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "cleanup_apply_allowed": {
+              "type": "boolean"
+            },
+            "repeated_failure_evidence": {
+              "type": "boolean"
+            },
+            "inventory": {
+              "type": "null"
+            },
+            "warnings": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "next_safe_argv": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
         "quarantined_artifacts": {
           "type": "array",
           "items": {

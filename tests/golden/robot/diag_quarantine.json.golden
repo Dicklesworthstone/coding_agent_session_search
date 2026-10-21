@@ -228,6 +228,32 @@
       "cleanup_dry_run_approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
       "cleanup_apply_allowed": false
     },
+    "lexical_rebuild_quarantine": {
+      "schema_version": 1,
+      "complete": true,
+      "cleanup_apply_allowed": false,
+      "repeated_failure_evidence": false,
+      "inventory": {
+        "schema_version": 1,
+        "complete": true,
+        "automatic_retention_enabled": true,
+        "min_age_seconds": 21600,
+        "keep_newest": 1,
+        "total_bytes": 0,
+        "eligible_bytes": 0,
+        "artifacts": [],
+        "warnings": []
+      },
+      "warnings": [],
+      "next_safe_argv": [
+        "cass",
+        "lexical-quarantine",
+        "--data-dir",
+        "[TEST_HOME]/cass-data",
+        "--plan",
+        "--json"
+      ]
+    },
     "quarantined_artifacts": [
       {
         "asset_class": "failed_seed_bundle",
