@@ -53,8 +53,12 @@ pub(super) fn run(args: Vec<String>) -> CliResult<()> {
     };
     // Required subcommands and the required data_dir were checked by the same
     // Clap tree that defines the standalone command. No tokens are discarded.
-    let (_, mut doctor) = matches.remove_subcommand().expect("required doctor command");
-    let (_, mut options) = doctor.remove_subcommand().expect("required quarantine command");
+    let (_, mut doctor) = matches
+        .remove_subcommand()
+        .expect("required doctor command");
+    let (_, mut options) = doctor
+        .remove_subcommand()
+        .expect("required quarantine command");
     let data_dir = options
         .remove_one::<PathBuf>("data_dir")
         .expect("required quarantine data directory");
@@ -109,11 +113,26 @@ mod tests {
             vec!["--db", "somewhere-else"],
             vec!["--data-dir", "elsewhere"],
         ] {
-            assert!(command().try_get_matches_from(base.iter().copied().chain(args)).is_err());
+            assert!(
+                command()
+                    .try_get_matches_from(base.iter().copied().chain(args))
+                    .is_err()
+            );
         }
-        assert!(command().try_get_matches_from(["cass", "doctor", "quarantine"]).is_err());
-        for args in [vec!["--plan", "--robot"], vec!["--apply", approval.as_str(), "--json"]] {
-            assert!(command().try_get_matches_from(base.iter().copied().chain(args)).is_ok());
+        assert!(
+            command()
+                .try_get_matches_from(["cass", "doctor", "quarantine"])
+                .is_err()
+        );
+        for args in [
+            vec!["--plan", "--robot"],
+            vec!["--apply", approval.as_str(), "--json"],
+        ] {
+            assert!(
+                command()
+                    .try_get_matches_from(base.iter().copied().chain(args))
+                    .is_ok()
+            );
         }
     }
 

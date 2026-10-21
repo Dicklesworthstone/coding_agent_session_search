@@ -36,8 +36,8 @@ fn same_device_root_directory_and_file_mounts_are_refused() {
     let root = Path::new("/data/.lexical-rebuild-quarantine-000001");
     for suffix in ["", "/index", "/index/MANIFEST"] {
         let point = format!("{}{suffix}", root.display());
-        let error = check_reader(Cursor::new(table(point.as_bytes())), root, &mut budget())
-            .unwrap_err();
+        let error =
+            check_reader(Cursor::new(table(point.as_bytes())), root, &mut budget()).unwrap_err();
         assert!(error.to_string().contains("mount point"));
     }
 }
@@ -89,7 +89,11 @@ fn empty_truncated_or_malformed_tables_never_mean_no_mounts() {
         b"1 1 8:1 / / rw - ext4 disk rw trailing\n",
     ] {
         let error = check_reader(Cursor::new(invalid_table), root, &mut budget()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{invalid_table:?}");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "{invalid_table:?}"
+        );
     }
 }
 
@@ -128,7 +132,10 @@ fn snapshot_and_shared_work_limits_stop_reads_instead_of_accepting_partial_table
         read: 0,
     };
     assert!(check_reader(&mut next, root, &mut work).is_err());
-    assert_eq!(next.read, 0, "the sweep must not renew an exhausted allowance");
+    assert_eq!(
+        next.read, 0,
+        "the sweep must not renew an exhausted allowance"
+    );
 }
 
 #[test]
@@ -167,17 +174,12 @@ fn mounted_content_is_refused_before_any_inventory_tree_entry() {
     let canonical = fs::canonicalize(&bundle).unwrap();
     let mountpoint = canonical.join("index");
     let mut work = budget();
-    let error = observe_with_mount_check(
-        &bundle,
-        false,
-        SystemTime::now(),
-        &mut work,
-        |_, work| {
+    let error =
+        observe_with_mount_check(&bundle, false, SystemTime::now(), &mut work, |_, work| {
             let input = table(&escaped(mountpoint.as_os_str().as_bytes()));
             check_reader(Cursor::new(input), &canonical, work)
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(error.to_string().contains("mount point"));
     assert_eq!(work.tree_entries, 0);
     assert_eq!(fs::read(sentinel).unwrap(), b"external mount sentinel");
@@ -209,8 +211,8 @@ fn partial_failed_reads_are_charged_to_the_same_sweep() {
         }
     }
     let mut work = budget();
-    let error = check_reader(FailAfterPrefix(false), Path::new("/data/bundle"), &mut work)
-        .unwrap_err();
+    let error =
+        check_reader(FailAfterPrefix(false), Path::new("/data/bundle"), &mut work).unwrap_err();
     assert!(error.to_string().contains("interrupted mountinfo read"));
     assert_eq!(work.mount_bytes, 1);
 }

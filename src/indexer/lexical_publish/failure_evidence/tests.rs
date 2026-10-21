@@ -27,8 +27,14 @@ fn report(directory: &Path) -> Value {
 }
 
 fn unchanged_payload(candidate: &Path) {
-    assert_eq!(fs::read(candidate.join("MANIFEST")).unwrap(), b"candidate manifest");
-    assert_eq!(fs::read(candidate.join(CHECKPOINT)).unwrap(), b"incomplete checkpoint");
+    assert_eq!(
+        fs::read(candidate.join("MANIFEST")).unwrap(),
+        b"candidate manifest"
+    );
+    assert_eq!(
+        fs::read(candidate.join(CHECKPOINT)).unwrap(),
+        b"incomplete checkpoint"
+    );
 }
 
 #[test]
@@ -75,7 +81,10 @@ fn repeated_failed_rebuilds_keep_distinct_evidence_through_real_quarantine_and_i
     let inventory = lexical_quarantine::inspect(root.path()).unwrap();
     assert!(inventory.complete);
     assert_eq!(inventory.artifacts.len(), 2);
-    assert_eq!(inventory.eligible_bytes, 0, "new failure evidence is recent");
+    assert_eq!(
+        inventory.eligible_bytes, 0,
+        "new failure evidence is recent"
+    );
     for artifact in &inventory.artifacts {
         assert!(artifact.failure_evidence.iter().any(|evidence| {
             evidence.kind == EvidenceKind::FinalizationFailure
@@ -95,8 +104,15 @@ fn first_build_without_live_index_still_keeps_candidate_evidence() {
     let live = root.path().join("missing-live");
     let candidate = root.path().join("candidate");
     seed(&candidate);
-    failure(&Finalization::new(&live, &candidate, 3, 2), "validate_candidate", "unreadable candidate");
-    assert!(!live.exists(), "diagnostics must not manufacture a live generation");
+    failure(
+        &Finalization::new(&live, &candidate, 3, 2),
+        "validate_candidate",
+        "unreadable candidate",
+    );
+    assert!(
+        !live.exists(),
+        "diagnostics must not manufacture a live generation"
+    );
     assert_eq!(report(&candidate)["error_chain"], "unreadable candidate");
     unchanged_payload(&candidate);
 }
@@ -108,7 +124,10 @@ fn successful_phases_leave_no_report_or_temporary_file() {
     let candidate = root.path().join("candidate");
     seed(&candidate);
     let publication = Finalization::new(&live, &candidate, 0, 0);
-    assert_eq!(publication.run("validate_candidate", || Ok(123)).unwrap(), 123);
+    assert_eq!(
+        publication.run("validate_candidate", || Ok(123)).unwrap(),
+        123
+    );
     assert!(!live.exists());
     assert_eq!(fs::read_dir(&candidate).unwrap().count(), 2);
     unchanged_payload(&candidate);
@@ -126,7 +145,10 @@ fn same_finalization_keeps_first_candidate_failure_but_live_report_remains_lates
     let original = fs::read(candidate.join(LAST_FAILURE_FILE)).unwrap();
     publication.run("checkpoint_after_fold", || Ok(())).unwrap();
     failure(&publication, "validate_candidate", "second error");
-    assert_eq!(fs::read(candidate.join(LAST_FAILURE_FILE)).unwrap(), original);
+    assert_eq!(
+        fs::read(candidate.join(LAST_FAILURE_FILE)).unwrap(),
+        original
+    );
     assert_eq!(report(&live)["error_chain"], "second error");
     unchanged_payload(&candidate);
 }
@@ -141,17 +163,26 @@ fn post_swap_failure_never_writes_candidate_evidence_into_prior_live_backup() {
     fs::write(live.join("MANIFEST"), b"prior live").unwrap();
     seed(&candidate);
     let publication = Finalization::new(&live, &candidate, 4, 2);
-    publication.run("publish_staged_generation", || {
-        fs::rename(&live, &intermediate)?;
-        fs::rename(&candidate, &live)?;
-        fs::rename(&intermediate, &candidate)?;
-        Ok(())
-    }).unwrap();
-    failure(&publication, "validate_published_generation", "late verification failure");
+    publication
+        .run("publish_staged_generation", || {
+            fs::rename(&live, &intermediate)?;
+            fs::rename(&candidate, &live)?;
+            fs::rename(&intermediate, &candidate)?;
+            Ok(())
+        })
+        .unwrap();
+    failure(
+        &publication,
+        "validate_published_generation",
+        "late verification failure",
+    );
     assert_eq!(fs::read(candidate.join("MANIFEST")).unwrap(), b"prior live");
     assert_eq!(fs::read_dir(&candidate).unwrap().count(), 1);
     assert_eq!(report(&live)["error_chain"], "late verification failure");
-    assert!(report(&live).get("record_scope").is_none(), "live diagnostic schema is unchanged");
+    assert!(
+        report(&live).get("record_scope").is_none(),
+        "live diagnostic schema is unchanged"
+    );
     unchanged_payload(&live);
 }
 
@@ -164,12 +195,17 @@ fn replacement_candidate_during_failure_does_not_inherit_the_original_cause() {
     let saved = root.path().join("operator-saved");
     seed(&candidate);
     let publication = Finalization::new(&live, &candidate, 0, 0);
-    let error = publication.run::<()>("validate_candidate", || {
-        fs::rename(&candidate, &saved)?;
-        seed(&candidate);
-        Err(io::Error::new(io::ErrorKind::InvalidData, "original candidate failed").into())
-    }).unwrap_err();
-    assert_eq!(error.downcast_ref::<io::Error>().unwrap().to_string(), "original candidate failed");
+    let error = publication
+        .run::<()>("validate_candidate", || {
+            fs::rename(&candidate, &saved)?;
+            seed(&candidate);
+            Err(io::Error::new(io::ErrorKind::InvalidData, "original candidate failed").into())
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().to_string(),
+        "original candidate failed"
+    );
     for path in [&candidate, &saved] {
         assert_eq!(fs::read_dir(path).unwrap().count(), 2);
         unchanged_payload(path);
@@ -203,11 +239,18 @@ fn existing_record_and_directory_obstructions_are_preserved_without_temporary_fi
         } else {
             fs::write(&destination, b"malformed original evidence").unwrap();
         }
-        failure(&Finalization::new(&live, &candidate, 0, 0), "commit_candidate", "later cause");
+        failure(
+            &Finalization::new(&live, &candidate, 0, 0),
+            "commit_candidate",
+            "later cause",
+        );
         if is_directory {
             assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"keep");
         } else {
-            assert_eq!(fs::read(destination).unwrap(), b"malformed original evidence");
+            assert_eq!(
+                fs::read(destination).unwrap(),
+                b"malformed original evidence"
+            );
         }
         assert_eq!(fs::read_dir(&candidate).unwrap().count(), 3);
     }
@@ -215,19 +258,34 @@ fn existing_record_and_directory_obstructions_are_preserved_without_temporary_fi
 
 #[test]
 fn unicode_and_escaped_causes_are_bounded_without_changing_the_typed_error() {
-    for cause in ["界".repeat(MAX_CAUSE_BYTES), "\0".repeat(MAX_CAUSE_BYTES * 2)] {
+    for cause in [
+        "界".repeat(MAX_CAUSE_BYTES),
+        "\0".repeat(MAX_CAUSE_BYTES * 2),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let live = root.path().join("missing-live");
         let candidate = root.path().join("candidate");
         seed(&candidate);
-        failure(&Finalization::new(&live, &candidate, 0, 0), "commit_candidate", &cause);
+        failure(
+            &Finalization::new(&live, &candidate, 0, 0),
+            "commit_candidate",
+            &cause,
+        );
         let record = report(&candidate);
         let saved = record["error_chain"].as_str().unwrap();
         assert!(saved.len() <= MAX_CAUSE_BYTES);
         assert!(cause.starts_with(saved));
         assert_eq!(record["error_chain_truncated"], true);
-        assert_eq!(record["error_chain_original_bytes"].as_u64(), Some(cause.len() as u64));
-        assert!(fs::metadata(candidate.join(LAST_FAILURE_FILE)).unwrap().len() <= MAX_RECORD_BYTES as u64);
+        assert_eq!(
+            record["error_chain_original_bytes"].as_u64(),
+            Some(cause.len() as u64)
+        );
+        assert!(
+            fs::metadata(candidate.join(LAST_FAILURE_FILE))
+                .unwrap()
+                .len()
+                <= MAX_RECORD_BYTES as u64
+        );
         unchanged_payload(&candidate);
     }
 }
@@ -239,8 +297,17 @@ fn oversized_record_is_refused_before_any_candidate_write() {
     let candidate = root.path().join("candidate");
     seed(&candidate);
     let publication = Finalization::new(&live, &candidate, 0, 0);
-    let captured = publication.candidate_evidence.as_ref().unwrap().as_ref().unwrap();
-    assert!(captured.persist(&publication, &"x".repeat(MAX_RECORD_BYTES), "cause").is_err());
+    let captured = publication
+        .candidate_evidence
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap();
+    assert!(
+        captured
+            .persist(&publication, &"x".repeat(MAX_RECORD_BYTES), "cause")
+            .is_err()
+    );
     assert_eq!(fs::read_dir(&candidate).unwrap().count(), 2);
     assert!(!live.exists());
 }
@@ -255,7 +322,11 @@ fn in_place_and_overlapping_paths_do_not_admit_a_candidate_report() {
     seed(&nested);
     assert!(Candidate::capture(&live, &nested).is_err());
     assert!(Candidate::capture(&nested, &live).is_err());
-    failure(&Finalization::new(&live, &live, 0, 0), "late_phase", "in place");
+    failure(
+        &Finalization::new(&live, &live, 0, 0),
+        "late_phase",
+        "in place",
+    );
     assert!(report(&live).get("record_scope").is_none());
     assert!(!nested.join(LAST_FAILURE_FILE).exists());
 }
@@ -277,10 +348,26 @@ fn symlinked_candidates_parents_and_diagnostic_targets_are_not_followed() {
     let alias_parent = root.path().join("alias-parent");
     symlink(root.path(), &alias_parent).unwrap();
     assert!(Candidate::capture(&live, &alias_parent.join("candidate")).is_err());
-    symlink(outside.path().join("sentinel"), candidate.join(LAST_FAILURE_FILE)).unwrap();
-    failure(&Finalization::new(&live, &candidate, 0, 0), "commit_candidate", "target symlink");
-    assert!(fs::symlink_metadata(candidate.join(LAST_FAILURE_FILE)).unwrap().file_type().is_symlink());
-    assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"outside");
+    symlink(
+        outside.path().join("sentinel"),
+        candidate.join(LAST_FAILURE_FILE),
+    )
+    .unwrap();
+    failure(
+        &Finalization::new(&live, &candidate, 0, 0),
+        "commit_candidate",
+        "target symlink",
+    );
+    assert!(
+        fs::symlink_metadata(candidate.join(LAST_FAILURE_FILE))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(outside.path().join("sentinel")).unwrap(),
+        b"outside"
+    );
     assert_eq!(fs::read_dir(&candidate).unwrap().count(), 3);
 }
 
@@ -297,7 +384,11 @@ fn symlink_replacement_after_capture_is_refused_and_original_error_survives() {
     let publication = Finalization::new(&live, &candidate, 0, 0);
     fs::rename(&candidate, &saved).unwrap();
     std::os::unix::fs::symlink(outside.path(), &candidate).unwrap();
-    failure(&publication, "validate_candidate", "refused original candidate");
+    failure(
+        &publication,
+        "validate_candidate",
+        "refused original candidate",
+    );
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     assert!(!saved.join(LAST_FAILURE_FILE).exists());
     unchanged_payload(&saved);
@@ -324,7 +415,10 @@ fn competing_diagnostics_preserve_one_whole_first_record() {
         }
     });
     let record = report(&candidate);
-    assert!(matches!(record["error_chain"].as_str(), Some("first contender" | "second contender")));
+    assert!(matches!(
+        record["error_chain"].as_str(),
+        Some("first contender" | "second contender")
+    ));
     assert_eq!(record["record_scope"], "candidate_first_failure");
     assert_eq!(fs::read_dir(&candidate).unwrap().count(), 3);
     unchanged_payload(&candidate);

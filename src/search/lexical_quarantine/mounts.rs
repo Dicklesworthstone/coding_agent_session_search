@@ -89,9 +89,8 @@ fn parse_mountpoint(line: &[u8]) -> io::Result<std::path::PathBuf> {
     use std::path::Component;
 
     let bad = || invalid("malformed quarantine mount table; retention refused");
-    let decimal = |value: &[u8]| {
-        !value.is_empty() && value.iter().all(|byte| byte.is_ascii_digit())
-    };
+    let decimal =
+        |value: &[u8]| !value.is_empty() && value.iter().all(|byte| byte.is_ascii_digit());
     let mut fields = line
         .split(|&byte| byte == b' ')
         .filter(|field| !field.is_empty());

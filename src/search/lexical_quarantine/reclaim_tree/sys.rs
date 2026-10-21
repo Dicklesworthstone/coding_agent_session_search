@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 
 fn component(bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected one path component"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected one path component",
+        ));
     }
     Ok(())
 }
@@ -35,16 +38,21 @@ fn child_path(parent: &File, name: &CStr) -> io::Result<PathBuf> {
     // the same operator-controlled-namespace contract as the mountinfo guard.
     let original = parent.metadata()?;
     let resolved = fs::metadata(&descriptor)?;
-    if !original.is_dir() || !resolved.is_dir()
-        || original.dev() != resolved.dev() || original.ino() != resolved.ino()
+    if !original.is_dir()
+        || !resolved.is_dir()
+        || original.dev() != resolved.dev()
+        || original.ino() != resolved.ino()
     {
-        return Err(io::Error::other("proc fd link does not name the owned quarantine directory"));
+        return Err(io::Error::other(
+            "proc fd link does not name the owned quarantine directory",
+        ));
     }
     Ok(descriptor.join(OsStr::from_bytes(name.to_bytes())))
 }
 
 pub(super) fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true)
+    OpenOptions::new()
+        .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
 }

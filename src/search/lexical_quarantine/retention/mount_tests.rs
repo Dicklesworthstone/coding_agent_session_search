@@ -22,7 +22,11 @@ fn seed(root: &Path, pending: bool) -> (Inventory, SystemTime, fs::File) {
         .unwrap()
         .set_modified(now - Duration::from_secs(12 * 60 * 60))
         .unwrap();
-    let prefix = if pending { RECLAIM_PREFIX } else { QUARANTINE_PREFIX };
+    let prefix = if pending {
+        RECLAIM_PREFIX
+    } else {
+        QUARANTINE_PREFIX
+    };
     let target = root.join(format!("{prefix}000002"));
     let content = if pending {
         target.join("quarantine/index")
@@ -34,7 +38,11 @@ fn seed(root: &Path, pending: bool) -> (Inventory, SystemTime, fs::File) {
     let inventory = inspect_at(root, now, true, Limits::default()).unwrap();
     assert!(inventory.complete, "{:?}", inventory.warnings);
     assert_eq!(
-        inventory.artifacts.iter().filter(|a| a.disposition == Disposition::Eligible).count(),
+        inventory
+            .artifacts
+            .iter()
+            .filter(|a| a.disposition == Disposition::Eligible)
+            .count(),
         1
     );
     (inventory, now, lock)
@@ -125,9 +133,19 @@ fn post_rename_refusal_retains_a_recognizable_bundle_and_safe_retry_preserves_ne
     .unwrap_err();
     assert!(error.to_string().contains("mount point"));
     assert_eq!(checks.len(), 2);
-    assert!(!target.path.exists(), "rename happened before the final refusal");
+    assert!(
+        !target.path.exists(),
+        "rename happened before the final refusal"
+    );
     let pending = &checks[1];
-    assert!(pending.file_name().unwrap().to_str().unwrap().starts_with(RECLAIM_PREFIX));
+    assert!(
+        pending
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(RECLAIM_PREFIX)
+    );
     assert_eq!(
         fs::read(pending.join("quarantine/index/MANIFEST")).unwrap(),
         b"do not traverse the mount"
@@ -163,7 +181,12 @@ fn unavailable_mount_evidence_is_a_refusal_not_an_empty_mount_table() {
         &inventory,
         now,
         &mut Budget::new(Limits::default()),
-        |_, _| Err(io::Error::new(io::ErrorKind::PermissionDenied, "mountinfo unavailable")),
+        |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "mountinfo unavailable",
+            ))
+        },
     )
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);

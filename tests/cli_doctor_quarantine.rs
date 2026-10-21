@@ -36,7 +36,10 @@ fn command(home: &Path, data: &Path, doctor: bool) -> Command {
 }
 
 fn run(command: &mut Command) -> io::Result<Output> {
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
     match child.wait_timeout(Duration::from_secs(20)) {
         Ok(Some(_)) => child.wait_with_output(),
         outcome => {
@@ -44,7 +47,10 @@ fn run(command: &mut Command) -> io::Result<Output> {
             let _ = child.wait();
             Err(match outcome {
                 Err(error) => error,
-                _ => io::Error::new(io::ErrorKind::TimedOut, "doctor quarantine fixture timed out"),
+                _ => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "doctor quarantine fixture timed out",
+                ),
             })
         }
     }
@@ -74,7 +80,10 @@ fn bundle(root: &Path, suffix: &str, pending: bool) -> io::Result<PathBuf> {
     };
     fs::create_dir_all(&evidence)?;
     fs::write(evidence.join("MANIFEST"), b"retained candidate")?;
-    fs::write(evidence.join(".lexical-rebuild-last-failure.json"), b"private invalid diagnostic")?;
+    fs::write(
+        evidence.join(".lexical-rebuild-last-failure.json"),
+        b"private invalid diagnostic",
+    )?;
     Ok(path)
 }
 
@@ -83,7 +92,9 @@ fn preview(home: &Path, data: &Path, doctor: bool) -> Value {
 }
 
 fn approval(plan: &Value) -> &str {
-    plan["approval_fingerprint"].as_str().expect("complete enabled preview")
+    plan["approval_fingerprint"]
+        .as_str()
+        .expect("complete enabled preview")
 }
 
 #[cfg(unix)]
@@ -145,7 +156,10 @@ fn doctor_and_standalone_share_preview_approval_and_noop_execution() -> TestResu
     assert_eq!(report["attempted_bundles"], 0);
     assert_eq!(report["removed_bundles"], 0);
     assert_eq!(report["complete"], true);
-    assert_eq!(fs::read(data.join("agent_search.db"))?, b"malformed archive");
+    assert_eq!(
+        fs::read(data.join("agent_search.db"))?,
+        b"malformed archive"
+    );
     Ok(())
 }
 
@@ -163,7 +177,10 @@ fn doctor_apply_refuses_active_indexer_without_modifying_heartbeat_or_evidence()
     assert_eq!(output.status.code(), Some(7));
     assert!(output.stdout.is_empty());
     assert_eq!(fs::read(&lock_path)?, b"active indexer heartbeat");
-    assert_eq!(fs::read(path.join("index/MANIFEST"))?, b"retained candidate");
+    assert_eq!(
+        fs::read(path.join("index/MANIFEST"))?,
+        b"retained candidate"
+    );
     fs2::FileExt::unlock(&lock)?;
     let report = json(
         &run(command(home.path(), &data, true).args(["--apply", approval(&plan)]))?,
@@ -179,11 +196,16 @@ fn doctor_reports_incomplete_and_disabled_inventory_without_granting_approval() 
     let data = home.path().join("archive");
     let path = bundle(&data, "000001", false)?;
     let plan = preview(home.path(), &data, true);
-    let disabled = json(&run(command(home.path(), &data, true)
-        .env("CASS_LEXICAL_QUARANTINE_RETENTION", "0").arg("--plan"))?, 0);
+    let disabled = json(
+        &run(command(home.path(), &data, true)
+            .env("CASS_LEXICAL_QUARANTINE_RETENTION", "0")
+            .arg("--plan"))?,
+        0,
+    );
     assert!(disabled["approval_fingerprint"].is_null());
     let output = run(command(home.path(), &data, true)
-        .env("CASS_LEXICAL_QUARANTINE_RETENTION", "0").args(["--apply", approval(&plan)]))?;
+        .env("CASS_LEXICAL_QUARANTINE_RETENTION", "0")
+        .args(["--apply", approval(&plan)]))?;
     assert_eq!(output.status.code(), Some(2));
     assert!(!data.join("index-run.lock").exists());
     fs::write(path.join("operator-notes"), b"unrecognized evidence")?;
@@ -193,7 +215,10 @@ fn doctor_reports_incomplete_and_disabled_inventory_without_granting_approval() 
     assert_eq!(incomplete["inventory"]["eligible_bytes"], 0);
     let output = run(command(home.path(), &data, true).args(["--apply", approval(&plan)]))?;
     assert_eq!(output.status.code(), Some(8));
-    assert_eq!(fs::read(path.join("operator-notes"))?, b"unrecognized evidence");
+    assert_eq!(
+        fs::read(path.join("operator-notes"))?,
+        b"unrecognized evidence"
+    );
     Ok(())
 }
 
@@ -251,10 +276,16 @@ fn doctor_cleanup_keeps_newest_and_recent_while_reclaiming_old_and_interrupted()
     assert!(!old.exists());
     assert!(!pending.exists());
     for path in [&newest, &recent] {
-        assert_eq!(fs::read(path.join("index/MANIFEST"))?, b"retained candidate");
+        assert_eq!(
+            fs::read(path.join("index/MANIFEST"))?,
+            b"retained candidate"
+        );
     }
     assert_eq!(fs::read(data.join("agent_search.db"))?, b"archive sentinel");
-    assert_eq!(fs::read(data.join("index/v9-quill/MANIFEST"))?, b"live sentinel");
+    assert_eq!(
+        fs::read(data.join("index/v9-quill/MANIFEST"))?,
+        b"live sentinel"
+    );
     let stale = run(command(home.path(), &data, true).args(["--apply", approval(&plan)]))?;
     assert_eq!(stale.status.code(), Some(6));
     assert!(stale.stdout.is_empty());
@@ -274,7 +305,11 @@ fn doctor_refuses_symlink_evidence_without_touching_the_outside_target() -> Test
     assert_eq!(report["inventory"]["complete"], false);
     assert!(report["approval_fingerprint"].is_null());
     assert_eq!(fs::read(outside)?, b"external sentinel");
-    assert!(fs::symlink_metadata(path.join("index/link"))?.file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(path.join("index/link"))?
+            .file_type()
+            .is_symlink()
+    );
     assert!(!data.join("index-run.lock").exists());
     Ok(())
 }

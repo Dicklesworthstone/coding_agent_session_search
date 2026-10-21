@@ -102,10 +102,16 @@ impl Plan {
             budget,
             mounts::check,
             |relative, metadata| {
-                if relative.components().any(|part| !matches!(part, Component::Normal(_))) {
+                if relative
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_)))
+                {
                     return Err(io::Error::other("non-relative quarantine removal entry"));
                 }
-                if nodes.insert(relative.to_owned(), Node::of(metadata)).is_some() {
+                if nodes
+                    .insert(relative.to_owned(), Node::of(metadata))
+                    .is_some()
+                {
                     return Err(io::Error::other("duplicate quarantine removal entry"));
                 }
                 Ok(())
@@ -115,7 +121,9 @@ impl Plan {
     }
 
     fn directory(&self, relative: &Path, directory: &File) -> io::Result<()> {
-        let node = self.nodes.get(relative)
+        let node = self
+            .nodes
+            .get(relative)
             .ok_or_else(|| io::Error::other("unobserved quarantine directory"))?;
         let metadata = directory.metadata()?;
         if !node.directory || !metadata.is_dir() || node.identity != Identity::of(&metadata) {
@@ -130,7 +138,11 @@ impl Plan {
         let mut directory = root.try_clone()?;
         let mut prefix = PathBuf::new();
         self.directory(&prefix, &directory)?;
-        for component in relative.parent().unwrap_or_else(|| Path::new("")).components() {
+        for component in relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .components()
+        {
             budget.check()?;
             let Component::Normal(name) = component else {
                 return Err(io::Error::other("invalid quarantine removal parent"));
@@ -151,15 +163,19 @@ impl Plan {
         budget: &mut Budget,
     ) -> io::Result<()> {
         budget.check()?;
-        let parent_path = doomed.parent()
+        let parent_path = doomed
+            .parent()
             .ok_or_else(|| io::Error::other("reclaim directory has no parent"))?;
         real_directory(parent_path)?;
         let parent = sys::open_directory(parent_path)?;
         if *parent_owner != same_file::Handle::from_file(parent.try_clone()?)? {
             return Err(io::Error::other("reclaim parent changed before removal"));
         }
-        let outer_name = sys::name(doomed.file_name()
-            .ok_or_else(|| io::Error::other("reclaim directory has no name"))?)?;
+        let outer_name = sys::name(
+            doomed
+                .file_name()
+                .ok_or_else(|| io::Error::other("reclaim directory has no name"))?,
+        )?;
         let outer = sys::open_child(&parent, &outer_name)?;
         let outer_identity = Identity::of(&outer.metadata()?);
         let root = if wrapped {
@@ -172,7 +188,9 @@ impl Plan {
         let check_location = || -> io::Result<()> {
             real_directory(parent_path)?;
             if *parent_owner != same_file::Handle::from_path(parent_path)? {
-                return Err(io::Error::other("managed quarantine parent moved during removal"));
+                return Err(io::Error::other(
+                    "managed quarantine parent moved during removal",
+                ));
             }
             check_directory_entry(&parent, &outer_name, outer_identity)?;
             if wrapped {
@@ -190,8 +208,11 @@ impl Plan {
             budget.check()?;
             check_location()?;
             let directory = self.parent(&root, relative, budget)?;
-            let name = sys::name(relative.file_name()
-                .ok_or_else(|| io::Error::other("quarantine entry has no name"))?)?;
+            let name = sys::name(
+                relative
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("quarantine entry has no name"))?,
+            )?;
             if !node.matches(&sys::stat_child(&directory, &name)?) {
                 return Err(io::Error::other(format!(
                     "quarantine entry changed before removal: {relative:?}"
@@ -217,10 +238,17 @@ fn check_directory_entry(parent: &File, name: &CStr, identity: Identity) -> io::
     Ok(())
 }
 
-fn remove_entry(parent: &File, name: &CStr, directory: bool, budget: &mut Budget) -> io::Result<()> {
+fn remove_entry(
+    parent: &File,
+    name: &CStr,
+    directory: bool,
+    budget: &mut Budget,
+) -> io::Result<()> {
     budget.check()?;
     if budget.removal_entries >= budget.limits.tree_entries {
-        return Err(io::Error::other("quarantine removal-entry budget exhausted"));
+        return Err(io::Error::other(
+            "quarantine removal-entry budget exhausted",
+        ));
     }
     // Charge attempts, including a failed unlink. This counter and the deadline
     // belong to the entire sweep, not a renewed allowance for each bundle.

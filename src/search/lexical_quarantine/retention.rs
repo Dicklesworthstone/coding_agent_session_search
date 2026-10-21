@@ -158,7 +158,12 @@ fn reclaim_one_with_mount_check(
     // leaves an interrupted reservation, never an expanded recursive deletion.
     #[cfg(target_os = "linux")]
     {
-        removal.remove(&doomed, !artifact.interrupted_reclaim, &parent_owner, budget)
+        removal.remove(
+            &doomed,
+            !artifact.interrupted_reclaim,
+            &parent_owner,
+            budget,
+        )
     }
     // Keep the existing no-symlink-following std implementation elsewhere.
     #[cfg(not(target_os = "linux"))]

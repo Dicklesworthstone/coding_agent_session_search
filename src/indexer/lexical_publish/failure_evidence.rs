@@ -24,13 +24,18 @@ pub(super) struct Candidate {
 
 fn directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    ensure!(metadata.is_dir(), "candidate evidence requires a non-symlink directory");
+    ensure!(
+        metadata.is_dir(),
+        "candidate evidence requires a non-symlink directory"
+    );
     Ok(())
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
     ensure!(
-        !path.components().any(|part| matches!(part, Component::ParentDir)),
+        !path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir)),
         "candidate evidence refuses parent traversal"
     );
     Ok(if path.is_absolute() {
@@ -65,7 +70,10 @@ impl Candidate {
 
     fn check(&self, live: &Path) -> Result<()> {
         directory(&self.path)?;
-        let parent = self.path.parent().context("candidate evidence has no parent")?;
+        let parent = self
+            .path
+            .parent()
+            .context("candidate evidence has no parent")?;
         directory(parent)?;
         ensure!(
             self.owner == same_file::Handle::from_path(&self.path)?
@@ -100,7 +108,12 @@ impl Candidate {
         Ok(())
     }
 
-    fn persist(&self, finalization: &Finalization<'_>, phase: &str, cause: &str) -> Result<Option<PathBuf>> {
+    fn persist(
+        &self,
+        finalization: &Finalization<'_>,
+        phase: &str,
+        cause: &str,
+    ) -> Result<Option<PathBuf>> {
         self.check(finalization.live)?;
         let destination = self.path.join(LAST_FAILURE_FILE);
         match fs::symlink_metadata(&destination) {
@@ -127,7 +140,10 @@ impl Candidate {
             "error_chain_original_bytes": cause.len(),
         });
         let bytes = serde_json::to_vec_pretty(&report)?;
-        ensure!(bytes.len() <= MAX_RECORD_BYTES, "candidate failure record exceeds its byte limit");
+        ensure!(
+            bytes.len() <= MAX_RECORD_BYTES,
+            "candidate failure record exceeds its byte limit"
+        );
         self.check(finalization.live)?;
         let mut temporary = tempfile::Builder::new()
             .prefix(".lexical-rebuild-failure-")
@@ -138,7 +154,9 @@ impl Candidate {
         // No clobber, including a concurrent first report, symlink or directory.
         // On platforms using link/unlink, a crash can leave a second temporary
         // link. Retention already refuses hard-linked/ambiguous bundles.
-        temporary.persist_noclobber(&destination).map_err(|error| error.error)?;
+        temporary
+            .persist_noclobber(&destination)
+            .map_err(|error| error.error)?;
         #[cfg(unix)]
         fs::File::open(&self.path)?.sync_all()?;
         Ok(Some(destination))
@@ -158,8 +176,10 @@ pub(super) fn record(finalization: &Finalization<'_>, phase: &str, cause: &str) 
     match candidate.persist(finalization, phase, cause) {
         Ok(Some(path)) => tracing::info!(phase, path = %path.display(),
             "persisted candidate-owned first-failure evidence"),
-        Ok(None) => tracing::info!(phase,
-            "preserved existing candidate failure evidence without replacement"),
+        Ok(None) => tracing::info!(
+            phase,
+            "preserved existing candidate failure evidence without replacement"
+        ),
         Err(error) => tracing::warn!(phase, error = %format!("{error:#}"),
             "could not persist candidate failure evidence; preserving original finalization error"),
     }

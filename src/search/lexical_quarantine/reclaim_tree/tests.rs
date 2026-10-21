@@ -1,5 +1,5 @@
-use super::*;
 use super::super::{Limits, inspect_at};
+use super::*;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::symlink;
@@ -15,14 +15,24 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let lock = fs::OpenOptions::new().create(true).truncate(false)
-            .read(true).write(true).open(temp.path().join("index-run.lock")).unwrap();
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(temp.path().join("index-run.lock"))
+            .unwrap();
         fs2::FileExt::try_lock_exclusive(&lock).unwrap();
         let target = temp.path().join(".lexical-rebuild-quarantine-000001");
         fs::create_dir_all(target.join("index/nested")).unwrap();
         fs::write(target.join("index/a"), b"first").unwrap();
         fs::write(target.join("index/nested/z"), b"last").unwrap();
-        Self { temp, _lock: lock, target, now: SystemTime::now() + Duration::from_secs(86400) }
+        Self {
+            temp,
+            _lock: lock,
+            target,
+            now: SystemTime::now() + Duration::from_secs(86400),
+        }
     }
 
     fn capture(&self) -> (Plan, Budget) {
@@ -59,7 +69,10 @@ fn new_unobserved_files_stop_empty_directory_removal_and_survive() {
     assert!(fixture.remove(&plan, &mut budget).is_err());
     assert_eq!(fs::read(extra).unwrap(), b"not approved");
     assert!(!fixture.target.join("index/nested/z").exists());
-    assert!(fixture.target.join("index/a").exists(), "stop after the first refusal");
+    assert!(
+        fixture.target.join("index/a").exists(),
+        "stop after the first refusal"
+    );
 }
 
 #[test]
@@ -73,7 +86,12 @@ fn a_replaced_payload_symlink_is_not_unlinked_or_followed() {
     symlink(&outside, &payload).unwrap();
     assert!(fixture.remove(&plan, &mut budget).is_err());
     assert_eq!(budget.removal_entries, 0);
-    assert!(fs::symlink_metadata(payload).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(payload)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(fs::read(outside).unwrap(), b"outside sentinel");
 }
 
@@ -90,7 +108,10 @@ fn replacement_ancestor_symlink_cannot_redirect_a_payload_unlink() {
     assert!(fixture.remove(&plan, &mut budget).is_err());
     assert_eq!(budget.removal_entries, 0);
     assert_eq!(fs::read(outside.join("z")).unwrap(), b"outside sentinel");
-    assert_eq!(fs::read(fixture.temp.path().join("saved-directory/z")).unwrap(), b"last");
+    assert_eq!(
+        fs::read(fixture.temp.path().join("saved-directory/z")).unwrap(),
+        b"last"
+    );
 }
 
 #[test]
@@ -121,10 +142,16 @@ fn replacement_root_and_parent_are_refused_before_unlink() {
     assert!(fixture.remove(&plan, &mut budget).is_err());
     assert_eq!(budget.removal_entries, 0);
     assert_eq!(fs::read(saved.join("index/nested/z")).unwrap(), b"last");
-    assert_eq!(fs::read(fixture.target.join("index/nested/z")).unwrap(), b"replacement");
+    assert_eq!(
+        fs::read(fixture.target.join("index/nested/z")).unwrap(),
+        b"replacement"
+    );
     let unrelated = tempfile::tempdir().unwrap();
     let wrong_owner = same_file::Handle::from_path(unrelated.path()).unwrap();
-    assert!(plan.remove(&fixture.target, false, &wrong_owner, &mut budget).is_err());
+    assert!(
+        plan.remove(&fixture.target, false, &wrong_owner, &mut budget)
+            .is_err()
+    );
     assert_eq!(budget.removal_entries, 0);
 }
 
@@ -133,12 +160,21 @@ fn exhausted_budget_and_deadline_never_start_an_unlink() {
     let fixture = Fixture::new();
     let (plan, mut budget) = fixture.capture();
     budget.removal_entries = budget.limits.tree_entries;
-    assert!(fixture.remove(&plan, &mut budget).unwrap_err().to_string().contains("removal-entry"));
+    assert!(
+        fixture
+            .remove(&plan, &mut budget)
+            .unwrap_err()
+            .to_string()
+            .contains("removal-entry")
+    );
     budget.removal_entries = 0;
     budget.limits.timeout = Duration::ZERO;
     assert!(fixture.remove(&plan, &mut budget).is_err());
     assert_eq!(budget.removal_entries, 0);
-    assert_eq!(fs::read(fixture.target.join("index/nested/z")).unwrap(), b"last");
+    assert_eq!(
+        fs::read(fixture.target.join("index/nested/z")).unwrap(),
+        b"last"
+    );
 }
 
 #[test]
@@ -146,14 +182,26 @@ fn removal_budget_is_shared_and_partial_work_requires_a_fresh_observation() {
     let fixture = Fixture::new();
     let (plan, mut budget) = fixture.capture();
     budget.removal_entries = budget.limits.tree_entries - 1;
-    assert!(fixture.remove(&plan, &mut budget).unwrap_err().to_string().contains("removal-entry"));
+    assert!(
+        fixture
+            .remove(&plan, &mut budget)
+            .unwrap_err()
+            .to_string()
+            .contains("removal-entry")
+    );
     assert!(!fixture.target.join("index/nested/z").exists());
     assert!(fixture.target.join("index/nested").exists());
     // The spent sweep allowance is not reset for another call.
     assert!(fixture.remove(&plan, &mut budget).is_err());
     assert_eq!(budget.removal_entries, budget.limits.tree_entries);
     let (fresh, mut fresh_budget) = fixture.capture();
-    assert!(fixture.remove(&fresh, &mut budget).unwrap_err().to_string().contains("removal-entry"));
+    assert!(
+        fixture
+            .remove(&fresh, &mut budget)
+            .unwrap_err()
+            .to_string()
+            .contains("removal-entry")
+    );
     assert!(fixture.target.join("index/a").exists());
     fixture.remove(&fresh, &mut fresh_budget).unwrap();
     assert!(!fixture.target.exists());
