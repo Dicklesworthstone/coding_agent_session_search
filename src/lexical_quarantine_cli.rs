@@ -2,6 +2,9 @@
 //! Ordinary invocation remains read-only, including when the archive cannot open.
 
 mod cleanup;
+mod doctor;
+
+pub use doctor::is_invocation as is_doctor_quarantine;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -41,6 +44,7 @@ pub fn clap_commands() -> Vec<clap::Command> {
     Cli::command()
         .find_subcommand("lexical-quarantine")
         .cloned()
+        .map(|command| command.after_help("Also available as: cass doctor quarantine [OPTIONS]."))
         .into_iter()
         .collect()
 }
@@ -137,6 +141,9 @@ fn render(inventory: &Inventory, json: bool, output: &mut impl Write) -> io::Res
 }
 
 pub fn run(args: Vec<String>) -> CliResult<()> {
+    if is_doctor_quarantine(&args) {
+        return doctor::run(args);
+    }
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -155,6 +162,11 @@ pub fn run(args: Vec<String>) -> CliResult<()> {
         plan,
         apply,
     } = cli.command;
+    execute(data_dir, json, plan, apply)
+}
+
+// Both command spellings use this executor and the same inventory/approval API.
+fn execute(data_dir: PathBuf, json: bool, plan: bool, apply: Option<String>) -> CliResult<()> {
     if let Some(approval) = apply {
         return cleanup::apply(&data_dir, &approval, json, &mut io::stdout().lock());
     }

@@ -328,7 +328,9 @@ fn main() -> anyhow::Result<()> {
             Err(error) => handle_fatal_error(error),
         };
     }
-    if raw_command_name(&raw_args) == Some("lexical-quarantine") {
+    if raw_command_name(&raw_args) == Some("lexical-quarantine")
+        || lexical_quarantine_cli::is_doctor_quarantine(&raw_args)
+    {
         return match lexical_quarantine_cli::run(raw_args) {
             Ok(()) => Ok(()),
             Err(error) => handle_fatal_error(error),
