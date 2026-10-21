@@ -190,6 +190,16 @@ fi
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
 cd "$PROJECT_ROOT" || exit 1
 
+# GitHub Actions is permanently off (owner, 2026-10-09: "NO GH ACTIONS,
+# PERIOD!!! EVER!!! we ONLY ever use /dsr"). A workflow file is never a
+# verification or publication lane: fixes parked in them for a job that never
+# runs sat unapplied on main (bead nqbwq). Refuse to gate a tree carrying one.
+if [ -d .github/workflows ] && [ -n "$(ls -A .github/workflows)" ]; then
+    echo "gate: .github/workflows must stay empty (GitHub Actions is off; verify with scripts/gate.sh, release with dsr):" >&2
+    ls -A .github/workflows >&2
+    exit 2
+fi
+
 LIB_FILTER=""
 RUN_LIB=1
 RUN_INTEGRATION=1
@@ -345,7 +355,7 @@ run_tests() {
 
 run_ubs() {
     local expected actual scanner installed expected_sha expected_contract_sha tool_dir
-    expected="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
+    expected="$(tr -d '[:space:]' < scripts/ubs-version.txt)"
     # The runner verifies its language modules against embedded release hashes.
     # Updating the pin also requires reviewing the new runner digest here.
     if [ "$expected" != v5.4.4 ]; then

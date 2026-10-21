@@ -11,8 +11,8 @@
 //! E2E_INSTALL_TESTS=1 cargo test --test e2e_install_easy
 //! ```
 //!
-//! On CI, these tests run automatically via `.github/workflows/install-test.yml`
-//! which builds a real release binary end-to-end.
+//! GitHub Actions is permanently off, so nothing runs them automatically:
+//! run them on a dsr build host against a real release binary.
 //!
 //! ## Artifact Storage
 //!

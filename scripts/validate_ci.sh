@@ -221,18 +221,7 @@ if [ "$NO_MOCK_ONLY" = true ]; then
     exit 0
 fi
 
-echo "2. Checking workflow syntax..."
-# Requires 'yq' or similar, skipping strict syntax check for now if not present
-if command -v yq &> /dev/null; then
-    for f in .github/workflows/*.yml; do
-        echo "  Validating $f"
-        yq . "$f" > /dev/null || { echo "Invalid YAML: $f"; exit 1; }
-    done
-else
-    echo "  (Skipping YAML syntax check: yq not found)"
-fi
-
-echo "3. Running local CI simulation..."
+echo "2. Running local CI simulation..."
 ensure_rch
 echo "  - Using rch target dir: $RCH_TARGET_DIR"
 echo "  - Using cass features: $CASS_ROUTINE_FEATURES"
@@ -267,7 +256,7 @@ fi
 # ============================================================
 # E2E Logging Compliance Check
 # ============================================================
-echo "4. Checking E2E logging compliance..."
+echo "3. Checking E2E logging compliance..."
 
 E2E_ERRORS=0
 E2E_WARNINGS=0

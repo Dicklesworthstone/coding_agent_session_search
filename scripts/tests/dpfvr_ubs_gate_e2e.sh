@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# dpfvr_ubs_gate_e2e.sh — exercise the ubs-changed-files CI gate logic locally.
+# dpfvr_ubs_gate_e2e.sh — exercise scripts/gate.sh's changed-file UBS logic.
 #
-# Per coding_agent_session_search-dpfvr. The full job runs in GitHub Actions;
-# this script reproduces the gate's diff/filter/invocation logic against
-# representative scenarios so we can verify behavior without pushing a PR.
+# Per coding_agent_session_search-dpfvr. The gate runs through rch (GitHub
+# Actions is permanently off); this script reproduces the gate's
+# diff/filter/invocation logic against representative scenarios locally.
 
 set -euo pipefail
 

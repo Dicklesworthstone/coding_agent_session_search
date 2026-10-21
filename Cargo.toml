@@ -343,9 +343,8 @@ strip = false
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
-# [patch.crates-io] block LOCALLY and DO NOT COMMIT IT — the
-# fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
-# fail if any [patch] block pointing at sibling paths is committed:
+# [patch.crates-io] block LOCALLY and DO NOT COMMIT IT — a committed
+# [patch] block pointing at sibling paths breaks every fresh clone:
 #
 # Add these entries to the committed [patch.crates-io] table above:
 # asupersync = { path = "../asupersync" }
@@ -361,8 +360,8 @@ strip = false
 # are commented out by default so that a clean clone builds without requiring
 # specific directory layout. See build.rs for validation details.
 #
-# A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
-# — if you re-enable any of these sibling-path [patch] blocks, that workflow will fail.
+# Never commit any of these sibling-path [patch] blocks re-enabled: a fresh
+# clone without the sibling checkouts would no longer build.
 #
 # [patch."https://github.com/Dicklesworthstone/frankensqlite"]
 # fsqlite = { path = "../frankensqlite/crates/fsqlite" }
