@@ -835,7 +835,8 @@ fn bool_field(value: &Value, keys: &[&str], fallback: bool) -> bool {
 }
 
 fn display_path(path: &Path) -> String {
-    path.canonicalize()
+    // dunce: no Windows \\?\ verbatim prefix in the report.
+    dunce::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string()

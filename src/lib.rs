@@ -19341,7 +19341,8 @@ fn run_analytics_incidents(
     }
 
     let effective_db_path = analytics_db_path(&common.data_dir, db_path_override);
-    let pointer_db_path = std::fs::canonicalize(&effective_db_path).unwrap_or(effective_db_path);
+    // dunce: the report's suggested `--db` must not carry Windows' \\?\ form.
+    let pointer_db_path = dunce::canonicalize(&effective_db_path).unwrap_or(effective_db_path);
     let caps = crate::incident_discovery::DiscoveryCaps {
         max_files: max_sessions,
         max_lines: max_messages,
@@ -91160,6 +91161,18 @@ mod cli_read_db_tests {
         assert_eq!(target.argv[0], "gemini");
         assert_eq!(target.argv[1], "session");
         assert_eq!(target.argv[2], "restore");
+        // The path is handed to an external tool: absolute, but never in
+        // Windows' \\?\ verbatim form (txc9h; std canonicalize produced it).
+        let expected = dunce::canonicalize(&session_file)
+            .expect("canonical session path")
+            .display()
+            .to_string();
+        assert_eq!(target.argv[3], expected);
+        assert!(
+            !target.argv[3].starts_with(r"\\?\"),
+            "gemini restore argv must not carry the verbatim prefix: {}",
+            target.argv[3]
+        );
     }
 
     #[test]
@@ -112313,8 +112326,9 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "gemini" => {
             // Gemini resumes by path rather than by id. Use the
             // absolute path to avoid cwd ambiguity when `cass resume`
-            // is piped through another process.
-            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            // is piped through another process. dunce keeps Windows' \\?\
+            // verbatim prefix out of the argv handed to gemini.
+            let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let path_str = canonical.display().to_string();
             Ok(ResumeTarget {
                 agent: "gemini",
@@ -126922,7 +126936,7 @@ fn schedule_binary_path() -> CliResult<PathBuf> {
     if exe.is_absolute() {
         Ok(exe)
     } else {
-        Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+        Ok(dunce::canonicalize(&exe).unwrap_or(exe))
     }
 }
 
@@ -126950,7 +126964,7 @@ fn run_schedule_command(subcmd: ScheduleCommand, cli: &Cli) -> CliResult<()> {
                 nightly: !no_nightly,
                 semantic: !no_semantic,
                 binary: schedule_binary_path()?,
-                data_dir: std::fs::canonicalize(&resolved_data_dir).unwrap_or(resolved_data_dir),
+                data_dir: dunce::canonicalize(&resolved_data_dir).unwrap_or(resolved_data_dir),
                 db_path: cli.db.clone(),
             };
             let report = schedule::install(&spec, dry_run).map_err(schedule_error_to_cli)?;
