@@ -125,14 +125,15 @@ impl Candidate {
         while !cause.is_char_boundary(end) {
             end -= 1;
         }
+        let (build_path, live_path) = finalization.diagnostic_paths()?;
         let report = serde_json::json!({
             "version": 1,
             "record_scope": "candidate_first_failure",
             "at_ms": u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?,
             "process_id": std::process::id(),
             "phase": phase,
-            "build_path": finalization.candidate,
-            "live_path": finalization.live,
+            "build_path": build_path,
+            "live_path": live_path,
             "expected_docs": finalization.indexed_docs,
             "processed_conversations": finalization.processed_conversations,
             "error_chain": &cause[..end],
