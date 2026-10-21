@@ -968,6 +968,7 @@ impl SemanticTierMode {
 mod ann_shards;
 #[cfg(test)]
 mod ann_shards_integration;
+mod message_stream;
 mod message_topk;
 #[cfg(test)]
 mod message_topk_integration;
@@ -5497,6 +5498,25 @@ impl SearchClient {
         fetch_limit: usize,
         fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
+        Self::search_exact_semantic_indexes_with_refinement(
+            context,
+            embedding,
+            fetch_limit,
+            fs_filter,
+            true,
+        )
+    }
+
+    // Keep the incumbent for unsupported no-WAL widths and same-invocation
+    // comparisons. The pinned backend repairs WAL-shadowed raw windows itself;
+    // a retained delta alone is not a reason to bypass its proven first window.
+    fn search_exact_semantic_indexes_with_refinement(
+        context: &SemanticCandidateContext,
+        embedding: &[f32],
+        fetch_limit: usize,
+        fs_filter: Option<&dyn FsSearchFilter>,
+        streaming: bool,
+    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         let (initial, retry) = Self::search_exact_semantic_indexes_initial_window(
             context,
             embedding,
@@ -5512,6 +5532,23 @@ impl SearchClient {
                 .saturating_add(artifact.index().wal_record_count())
         });
         let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
+        if streaming
+            && let Some(hits) = message_stream::try_collect_retained_messages(
+                &context.artifacts,
+                embedding,
+                return_limit,
+                fs_filter,
+            )?
+        {
+            let has_more_candidates = hits.len() >= return_limit && return_limit < record_count;
+            return Ok((
+                hits,
+                SemanticCandidateRetryState {
+                    has_more_candidates,
+                    exact_window_may_omit_competitor: false,
+                },
+            ));
+        }
         let mut refills_left = message_topk::MAX_EXACT_MESSAGE_REFILLS;
         let mut rounds = 0usize;
         let mut best_by_message = HashMap::<u64, VectorSearchResult>::new();
