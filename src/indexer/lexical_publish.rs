@@ -516,7 +516,11 @@ mod path_encoding_tests {
             Some(libc::EIO)
         );
         assert!(error.to_string().contains("validate_candidate"));
-        assert!(error.to_string().contains("candidate certification refused"));
+        assert!(
+            error
+                .to_string()
+                .contains("candidate certification refused")
+        );
     }
 
     #[test]

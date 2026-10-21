@@ -6540,7 +6540,8 @@ mod tests {
     }
 
     #[test]
-    fn gh458_contract_replacement_checkpoints_without_revoking_published_generation() -> Result<()> {
+    fn gh458_contract_replacement_checkpoints_without_revoking_published_generation() -> Result<()>
+    {
         let temp = tempdir()?;
         let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
         let agent_id = storage.ensure_agent(&Agent {
@@ -6558,10 +6559,13 @@ mod tests {
         }
 
         let indexer = SemanticIndexer::new("hash", None)?;
-        let db_fingerprint =
-            crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+        let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
         let final_path = vector_index_path(temp.path(), indexer.embedder_id());
-        fs::create_dir_all(final_path.parent().context("semantic index has no parent")?)?;
+        fs::create_dir_all(
+            final_path
+                .parent()
+                .context("semantic index has no parent")?,
+        )?;
         let published_bytes = b"retained published generation sentinel";
         fs::write(&final_path, published_bytes)?;
 
