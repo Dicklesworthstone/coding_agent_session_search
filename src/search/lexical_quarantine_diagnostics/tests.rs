@@ -91,6 +91,38 @@ fn preview_arguments_preserve_spaces_and_shell_characters_without_shell_executio
     assert!(!report.cleanup_apply_allowed);
 }
 
+#[cfg(unix)]
+#[test]
+fn non_utf8_inventory_paths_degrade_to_serializable_incomplete_report() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut bytes = b"cass-data-".to_vec();
+    bytes.push(0xff);
+    let data = root.path().join(OsString::from_vec(bytes));
+    fs::create_dir(&data).unwrap();
+    bundle(&data, "000001", false);
+
+    let report = collect(&data);
+    assert!(!report.complete);
+    assert!(report.inventory.is_none());
+    assert!(report.next_safe_argv.is_none());
+    assert!(!report.cleanup_apply_allowed);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("cannot be represented in structured diagnostics"))
+    );
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(encoded.contains("\"complete\":false"));
+    assert!(!encoded.contains("private failure"));
+    let text = report.human_lines().join("\n");
+    assert!(text.contains("cannot be represented in structured diagnostics"));
+    assert!(!data.join("index-run.lock").exists());
+}
+
 #[test]
 fn legacy_generation_walk_does_not_enter_rebuild_or_interrupted_namespaces() {
     let root = tempfile::tempdir().unwrap();

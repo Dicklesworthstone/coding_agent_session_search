@@ -70,7 +70,21 @@ fn project(data_dir: &Path, result: std::io::Result<Inventory>) -> Report {
                         .to_owned(),
                 );
             }
-            report.inventory = Some(inventory);
+            // The diag/doctor envelope later serializes this Report with json!.
+            // serde_json::json! panics when an interpolated Serialize fails, and
+            // Path/PathBuf serialization rejects non-UTF-8 filesystem paths.
+            // Preflight the exact inventory here and degrade to an incomplete,
+            // path-free report rather than allowing diagnostics to panic while
+            // describing a recoverable filesystem condition.
+            match serde_json::to_value(&inventory) {
+                Ok(_) => report.inventory = Some(inventory),
+                Err(error) => {
+                    report.complete = false;
+                    report.warnings.push(format!(
+                        "Rebuild-quarantine inventory cannot be represented in structured diagnostics; retained evidence was not serialized: {error}"
+                    ));
+                }
+            }
         }
         Err(error) => {
             report.warnings.push(format!(
