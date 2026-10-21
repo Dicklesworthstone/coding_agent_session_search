@@ -17,7 +17,10 @@ use crate::TimelineGrouping;
 
 mod ordered;
 
-pub(super) struct Groups<'a>(BTreeMap<String, Group<'a>>, Option<ordered::OrderedGroups<'a>>);
+pub(super) struct Groups<'a>(
+    BTreeMap<String, Group<'a>>,
+    Option<ordered::OrderedGroups<'a>>,
+);
 
 fn granularity(grouping: TimelineGrouping) -> (i64, &'static str) {
     match grouping {
@@ -206,7 +209,10 @@ mod tests {
             .collect();
         assert_equivalent(&sessions);
         let groups = Groups::new(&sessions, TimelineGrouping::Hour);
-        assert!(groups.1.is_some(), "pre-epoch dates still use ordered groups");
+        assert!(
+            groups.1.is_some(),
+            "pre-epoch dates still use ordered groups"
+        );
         let value = serde_json::to_value(&groups).unwrap();
         let prior_hour = value["1969-12-31 23:00"].as_array().unwrap();
         assert_eq!(
@@ -301,9 +307,7 @@ mod tests {
         let mut seed = 0x0521_u64;
         let mut sessions: Vec<_> = (0..2048)
             .map(|id| {
-                seed = seed
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 let time = i64::try_from(seed % (120 * 86_400_000)).unwrap() - 60 * 86_400_000;
                 session(id, time)
             })
@@ -318,7 +322,10 @@ mod tests {
         let sessions: Vec<_> = (0..65_536).map(|id| session(id, 0)).collect();
         for grouping in [TimelineGrouping::Hour, TimelineGrouping::Day] {
             let groups = Groups::new(&sessions, grouping);
-            assert!(groups.0.is_empty(), "ordered input must not retain an index");
+            assert!(
+                groups.0.is_empty(),
+                "ordered input must not retain an index"
+            );
             let ordered = groups.1.as_ref().expect("ordered group admission");
             assert!(std::ptr::eq(ordered.sessions, sessions.as_slice()));
             assert_eq!(ordered.len, 1);
@@ -328,9 +335,7 @@ mod tests {
 
     #[test]
     fn many_distinct_groups_borrow_the_input_without_a_group_index() {
-        let mut sessions: Vec<_> = (0..65_536)
-            .map(|id| session(id, id * 86_400_000))
-            .collect();
+        let mut sessions: Vec<_> = (0..65_536).map(|id| session(id, id * 86_400_000)).collect();
         for descending in [false, true] {
             if descending {
                 sessions.reverse();
@@ -471,7 +476,11 @@ mod tests {
                     .unwrap();
             }
             let peak = peak_kib();
-            println!("GH521_GROUP_RSS {} {}", peak.saturating_sub(baseline), sink.0);
+            println!(
+                "GH521_GROUP_RSS {} {}",
+                peak.saturating_sub(baseline),
+                sink.0
+            );
         }
 
         #[test]
@@ -585,8 +594,13 @@ mod tests {
                 old_kib >= 12 * 1024,
                 "control did not expose its per-session index: {old_kib} KiB"
             );
-            assert!(new_kib <= 8 * 1024, "grouped serializer grew by {new_kib} KiB");
-            eprintln!("GH521 grouping: new={new_kib} KiB, live control={old_kib} KiB, bytes={new_bytes}");
+            assert!(
+                new_kib <= 8 * 1024,
+                "grouped serializer grew by {new_kib} KiB"
+            );
+            eprintln!(
+                "GH521 grouping: new={new_kib} KiB, live control={old_kib} KiB, bytes={new_bytes}"
+            );
         }
     }
 }

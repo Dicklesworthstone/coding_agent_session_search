@@ -77,6 +77,7 @@ pub mod storage;
 pub mod subsystem_coverage_matrix;
 pub mod swarm_replay_fixture;
 pub mod swarm_status;
+mod timeline_json;
 pub mod top_session_summary;
 pub mod topology_budget;
 pub mod tui_asciicast;
@@ -119661,6 +119662,33 @@ fn run_timeline(
             fmt
         }
     });
+
+    // GH#521: serialize borrowed summaries directly, rather than cloning all
+    // selected title/path strings into a second JSON Value tree. Keep the
+    // other robot formats on their existing projection/formatting path.
+    if let Some(fmt) = structured_format
+        && matches!(fmt, RobotFormat::Json | RobotFormat::Compact)
+    {
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::new(stdout.lock());
+        timeline_json::write(
+            &mut writer,
+            &sessions,
+            start_ts,
+            end_ts,
+            group_by,
+            matches!(fmt, RobotFormat::Json),
+        )
+        .and_then(|()| writer.flush())
+        .map_err(|error| CliError {
+            code: 9,
+            kind: CliErrorKind::EncodeJson.kind_str(),
+            message: format!("failed to write structured output: {error}"),
+            hint: None,
+            retryable: false,
+        })?;
+        return Ok(());
+    }
 
     if let Some(fmt) = structured_format {
         let output = match group_by {

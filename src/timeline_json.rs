@@ -41,22 +41,25 @@ impl Serialize for SessionView<'_> {
         let source = normalized_provenance_source_id(source, kind.as_deref(), host.as_deref());
         let kind = normalized_provenance_origin_kind(&source, kind.as_deref());
         let host = normalized_provenance_origin_host(host.as_deref());
-        // Keep the lexicographic key order of the former serde_json::Value
-        // projection, including the flat-only duration_seconds field.
-        let mut map = serializer.serialize_map(Some(if self.include_duration { 11 } else { 10 }))?;
+        // Keep the key order of the former json! projection. cass builds
+        // serde_json with preserve_order (enabled by fsqlite-ext-json and
+        // tru), so that order is the literal's, not lexicographic. The
+        // flat-only duration_seconds field follows ended_at.
+        let mut map =
+            serializer.serialize_map(Some(if self.include_duration { 11 } else { 10 }))?;
+        map.serialize_entry("id", id)?;
         map.serialize_entry("agent", agent)?;
+        map.serialize_entry("title", title)?;
+        map.serialize_entry("started_at", started)?;
+        map.serialize_entry("ended_at", ended)?;
         if self.include_duration {
             map.serialize_entry("duration_seconds", &ended.map(|end| (end - started) / 1000))?;
         }
-        map.serialize_entry("ended_at", ended)?;
-        map.serialize_entry("id", id)?;
-        map.serialize_entry("message_count", count)?;
-        map.serialize_entry("origin_host", &host)?;
-        map.serialize_entry("origin_kind", &kind)?;
-        map.serialize_entry("source_id", &source)?;
         map.serialize_entry("source_path", path)?;
-        map.serialize_entry("started_at", started)?;
-        map.serialize_entry("title", title)?;
+        map.serialize_entry("message_count", count)?;
+        map.serialize_entry("source_id", &source)?;
+        map.serialize_entry("origin_kind", &kind)?;
+        map.serialize_entry("origin_host", &host)?;
         map.end()
     }
 }
@@ -76,11 +79,11 @@ impl Serialize for FlatSessions<'_> {
     }
 }
 
-// Declaration order preserves the old Value object's sorted range keys.
+// Declaration order preserves the old json! literal's range key order.
 #[derive(Serialize)]
 struct Range {
-    end: i64,
     start: i64,
+    end: i64,
 }
 
 struct Timeline<'a> {
@@ -92,14 +95,13 @@ struct Timeline<'a> {
 impl Serialize for Timeline<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("range", &self.range)?;
+        map.serialize_entry("total_sessions", &self.sessions.len())?;
         if let Some(groups) = &self.groups {
             map.serialize_entry("groups", groups)?;
-            map.serialize_entry("range", &self.range)?;
         } else {
-            map.serialize_entry("range", &self.range)?;
             map.serialize_entry("sessions", &FlatSessions(self.sessions))?;
         }
-        map.serialize_entry("total_sessions", &self.sessions.len())?;
         map.end()
     }
 }
@@ -146,33 +148,88 @@ mod tests {
     fn fixture() -> Vec<Session> {
         let start = 1_705_276_800_000_i64;
         vec![
-            (9, "claude_code".into(), Some("quotes \" newline\n λ".into()), start + 86_400_000, None,
-             "/new\\session.jsonl".into(), 0, "backup".into(), Some(" host ".into()), Some("local".into())),
-            (4, "codex".into(), None, start + 3_600_000, Some(start + 3_620_999),
-             "/remote.jsonl".into(), 900_001, "   ".into(), Some(" user@remote ".into()), None),
-            (2, "unknown".into(), Some("older".into()), start, Some(start - 2_000),
-             "/old.jsonl".into(), 3, "local".into(), None, None),
-            (3, "codex".into(), Some("equal start".into()), start, Some(start + 20_000),
-             "/tie.jsonl".into(), 2, "local".into(), Some("   ".into()), Some("local".into())),
+            (
+                9,
+                "claude_code".into(),
+                Some("quotes \" newline\n λ".into()),
+                start + 86_400_000,
+                None,
+                "/new\\session.jsonl".into(),
+                0,
+                "backup".into(),
+                Some(" host ".into()),
+                Some("local".into()),
+            ),
+            (
+                4,
+                "codex".into(),
+                None,
+                start + 3_600_000,
+                Some(start + 3_620_999),
+                "/remote.jsonl".into(),
+                900_001,
+                "   ".into(),
+                Some(" user@remote ".into()),
+                None,
+            ),
+            (
+                2,
+                "unknown".into(),
+                Some("older".into()),
+                start,
+                Some(start - 2_000),
+                "/old.jsonl".into(),
+                3,
+                "local".into(),
+                None,
+                None,
+            ),
+            (
+                3,
+                "codex".into(),
+                Some("equal start".into()),
+                start,
+                Some(start + 20_000),
+                "/tie.jsonl".into(),
+                2,
+                "local".into(),
+                Some("   ".into()),
+                Some("local".into()),
+            ),
         ]
     }
 
     // Independent reproduction of the pre-streaming Value projection: the
     // expected bytes are NOT derived by serializing our custom view types.
+    // The literals copy run_timeline's former json! calls; with serde_json's
+    // preserve_order (on in cass builds) their key order is the output order.
+    // The former grouped map was a HashMap, whose order was unspecified; the
+    // reproduction and the stream both use ascending bucket keys.
     fn legacy(sessions: &[Session], grouping: TimelineGrouping) -> Value {
         let item = |s: &Session| {
             let source = normalized_provenance_source_id(&s.7, s.9.as_deref(), s.8.as_deref());
             let kind = normalized_provenance_origin_kind(&source, s.9.as_deref());
-            let mut value = json!({
-                "id": s.0, "agent": s.1, "title": s.2,
-                "started_at": s.3, "ended_at": s.4, "source_path": s.5,
-                "message_count": s.6, "source_id": source, "origin_kind": kind,
-                "origin_host": normalized_provenance_origin_host(s.8.as_deref()),
-            });
+            let host = normalized_provenance_origin_host(s.8.as_deref());
             if grouping == TimelineGrouping::None {
-                value["duration_seconds"] = json!(s.4.map(|end| (end - s.3) / 1000));
+                json!({
+                    "id": s.0, "agent": s.1, "title": s.2,
+                    "started_at": s.3, "ended_at": s.4,
+                    "duration_seconds": s.4.map(|end| (end - s.3) / 1000), "source_path": s.5,
+                    "message_count": s.6,
+                    "source_id": source,
+                    "origin_kind": kind,
+                    "origin_host": host,
+                })
+            } else {
+                json!({
+                    "id": s.0, "agent": s.1, "title": s.2,
+                    "started_at": s.3, "ended_at": s.4,
+                    "source_path": s.5, "message_count": s.6,
+                    "source_id": source,
+                    "origin_kind": kind,
+                    "origin_host": host,
+                })
             }
-            value
         };
         if grouping == TimelineGrouping::None {
             json!({"range": {"start": 10, "end": 20}, "total_sessions": sessions.len(),
@@ -181,17 +238,39 @@ mod tests {
             let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
             for session in sessions {
                 let date = Utc.timestamp_millis_opt(session.3).single().unwrap();
-                let format = if grouping == TimelineGrouping::Hour { "%Y-%m-%d %H:00" } else { "%Y-%m-%d" };
-                groups.entry(date.format(format).to_string()).or_default().push(item(session));
+                let format = if grouping == TimelineGrouping::Hour {
+                    "%Y-%m-%d %H:00"
+                } else {
+                    "%Y-%m-%d"
+                };
+                groups
+                    .entry(date.format(format).to_string())
+                    .or_default()
+                    .push(item(session));
             }
             json!({"range": {"start": 10, "end": 20}, "total_sessions": sessions.len(), "groups": groups})
         }
     }
 
+    // The reproduction above relies on json! keeping literal key order. If a
+    // dependency change turns preserve_order off, this fails first and names
+    // the premise instead of a byte mismatch.
+    #[test]
+    fn serde_json_preserve_order_premise_holds() {
+        assert_eq!(
+            serde_json::to_string(&json!({"b": 1, "a": 2})).unwrap(),
+            r#"{"b":1,"a":2}"#
+        );
+    }
+
     #[test]
     fn output_is_byte_identical_to_the_previous_projection() {
         for sessions in [fixture(), Vec::new()] {
-            for grouping in [TimelineGrouping::None, TimelineGrouping::Hour, TimelineGrouping::Day] {
+            for grouping in [
+                TimelineGrouping::None,
+                TimelineGrouping::Hour,
+                TimelineGrouping::Day,
+            ] {
                 let expected = legacy(&sessions, grouping);
                 for pretty in [false, true] {
                     let mut actual = Vec::new();
@@ -221,7 +300,12 @@ mod tests {
         assert!(new["ended_at"].is_null());
         assert!(new.get("duration_seconds").is_none());
         let old = value["groups"]["2024-01-15"].as_array().unwrap();
-        assert_eq!(old.iter().map(|row| row["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![4, 2, 3]);
+        assert_eq!(
+            old.iter()
+                .map(|row| row["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![4, 2, 3]
+        );
         assert_eq!(old[0]["source_id"], "user@remote");
         assert_eq!(old[0]["origin_kind"], "remote");
         assert!(old[0]["title"].is_null());
@@ -234,23 +318,40 @@ mod tests {
     impl Write for FailingWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if self.remaining == 0 {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "test sink closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test sink closed",
+                ));
             }
             let count = bytes.len().min(self.remaining);
             self.remaining -= count;
             Ok(count)
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
     fn serialization_and_trailing_newline_failures_are_reported() {
-        for grouping in [TimelineGrouping::None, TimelineGrouping::Hour, TimelineGrouping::Day] {
+        for grouping in [
+            TimelineGrouping::None,
+            TimelineGrouping::Hour,
+            TimelineGrouping::Day,
+        ] {
             let sessions = fixture();
             let mut bytes = Vec::new();
             write(&mut bytes, &sessions, 10, 20, grouping, false).unwrap();
             for remaining in [0, bytes.len() / 2, bytes.len() - 1] {
-                let error = write(&mut FailingWriter { remaining }, &sessions, 10, 20, grouping, false).unwrap_err();
+                let error = write(
+                    &mut FailingWriter { remaining },
+                    &sessions,
+                    10,
+                    20,
+                    grouping,
+                    false,
+                )
+                .unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
             }
         }
@@ -266,7 +367,9 @@ mod tests {
             self.bytes += bytes.len();
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
