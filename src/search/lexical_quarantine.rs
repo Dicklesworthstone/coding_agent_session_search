@@ -17,6 +17,8 @@ pub mod cleanup;
 mod evidence;
 mod mounts;
 pub use evidence::{EvidenceKind, FailureEvidence};
+#[cfg(target_os = "linux")]
+mod reclaim_tree;
 mod retention;
 mod survivor;
 pub(crate) use retention::reclaim_under_index_run_lock;
@@ -107,6 +109,8 @@ struct Budget {
     path_bytes: usize,
     #[cfg(target_os = "linux")]
     mount_bytes: usize,
+    #[cfg(target_os = "linux")]
+    removal_entries: usize,
 }
 
 impl Budget {
@@ -119,6 +123,8 @@ impl Budget {
             path_bytes: 0,
             #[cfg(target_os = "linux")]
             mount_bytes: 0,
+            #[cfg(target_os = "linux")]
+            removal_entries: 0,
         }
     }
 
@@ -257,6 +263,19 @@ fn observe_with_mount_check(
     budget: &mut Budget,
     check_mounts: impl FnOnce(&Path, &mut Budget) -> io::Result<()>,
 ) -> io::Result<Artifact> {
+    observe_recording(path, pending, now, budget, check_mounts, |_, _| Ok(()))
+}
+
+// The deletion plan records exactly this observation, using the same metadata,
+// layout checks and work budget. Read-only inventory does not retain a plan.
+fn observe_recording(
+    path: &Path,
+    pending: bool,
+    now: SystemTime,
+    budget: &mut Budget,
+    check_mounts: impl FnOnce(&Path, &mut Budget) -> io::Result<()>,
+    mut record: impl FnMut(&Path, &fs::Metadata) -> io::Result<()>,
+) -> io::Result<Artifact> {
     let root = real_directory(path)?;
     check_mounts(path, budget)?;
     let mut latest = root.modified()?;
@@ -330,6 +349,7 @@ fn observe_with_mount_check(
         if let Some(evidence) = evidence::observe_file(relative, pending, &metadata) {
             failure_evidence.push(evidence);
         }
+        record(relative, &metadata)?;
         nodes.push((relative.to_owned(), stamp(relative, &metadata)?));
     }
     // Empty reservations can remain after a failed rename, or after interrupted

@@ -56,9 +56,9 @@ fn reclaim(data_dir: &Path, now: SystemTime, enabled: bool, limits: Limits) -> R
         };
     }
     let mut report = Report::default();
-    // One additional metadata budget across ALL candidate rechecks, not one
-    // renewed allowance per bundle. remove_dir_all itself is synchronous and
-    // cannot be forcibly interrupted by this cooperative metadata deadline.
+    // One additional budget across ALL candidate/survivor rechecks. On Linux
+    // planned per-entry removal shares this deadline and a sweep-wide unlink
+    // limit. Synchronous filesystem calls themselves cannot be preempted.
     let mut budget = Budget::new(limits);
     for artifact in inventory
         .artifacts
@@ -104,6 +104,9 @@ fn reclaim_one_with_mount_check(
     // replacement; the data directory and its ancestors must remain trusted.
     let parent_owner = same_file::Handle::from_path(parent)?;
     let owner = same_file::Handle::from_path(&artifact.path)?;
+    #[cfg(target_os = "linux")]
+    let (current, removal) = reclaim_tree::Plan::observe(artifact, now, budget)?;
+    #[cfg(not(target_os = "linux"))]
     let current = observe(&artifact.path, artifact.interrupted_reclaim, now, budget)?;
     if current.metadata_fingerprint != artifact.metadata_fingerprint
         || current
@@ -150,9 +153,15 @@ fn reclaim_one_with_mount_check(
     real_directory(&doomed)?;
     // A late refusal leaves the recognized reservation intact for a safe retry.
     check_mounts(&doomed, budget)?;
-    // std's recursive removal does not follow links. Observation additionally
-    // refused symlinks, special files, cross-device entries and Unix hard links.
-    // Never delete the live index, source archive, backups or arbitrary prefixes.
+    // Linux removes only the names captured by the locked recheck, using
+    // no-follow directory descriptors. A changed or newly populated directory
+    // leaves an interrupted reservation, never an expanded recursive deletion.
+    #[cfg(target_os = "linux")]
+    {
+        removal.remove(&doomed, !artifact.interrupted_reclaim, &parent_owner, budget)
+    }
+    // Keep the existing no-symlink-following std implementation elsewhere.
+    #[cfg(not(target_os = "linux"))]
     fs::remove_dir_all(&doomed)
 }
 
@@ -349,3 +358,6 @@ mod tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod planned_tests;
