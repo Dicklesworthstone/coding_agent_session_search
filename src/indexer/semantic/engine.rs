@@ -3048,39 +3048,37 @@ impl SemanticIndexer {
         )
         .map_err(|err| anyhow::anyhow!("create fsvi index failed: {err}"))?;
 
+        // The FSVI writer buffers records until finish() publishes its own
+        // temporary file. A rejected row therefore leaves no partial index
+        // at index_path: that path can still own the previous valid generation
+        // and its acknowledged WAL. Drop only the uncommitted writer on error;
+        // never unlink the destination as purported partial-output cleanup.
         let mut records_written = 0_usize;
-        let write_result: Result<()> = (|| {
-            for embedded in embedded_messages {
-                validate_embedding_vector(
-                    &embedded.embedding,
-                    self.embedder_dimension(),
-                    embedded.message_id,
-                )?;
-                let doc_id = semantic_doc_id_for_embedded(&embedded);
-                writer
-                    .write_record(&doc_id, &embedded.embedding)
-                    .map_err(|err| anyhow::anyhow!("write fsvi record failed: {err}"))?;
-                records_written = records_written.saturating_add(1);
-                on_progress(records_written);
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = &write_result {
-            // Clean up partial index file to prevent corruption
-            tracing::warn!("removing partial vector index after write failure: {e}");
-            if let Err(rm_err) = std::fs::remove_file(index_path) {
-                tracing::error!(
-                    "failed to remove partial index file {}: {rm_err}",
-                    index_path.display()
-                );
-            }
-            return Err(anyhow::anyhow!("{e}"));
+        for embedded in embedded_messages {
+            validate_embedding_vector(
+                &embedded.embedding,
+                self.embedder_dimension(),
+                embedded.message_id,
+            )?;
+            let doc_id = semantic_doc_id_for_embedded(&embedded);
+            writer
+                .write_record(&doc_id, &embedded.embedding)
+                .map_err(|err| {
+                    // Preserve both the existing top-level diagnostic and the
+                    // backend's typed cause for callers that inspect the chain.
+                    let message = format!("write fsvi record failed: {err}");
+                    anyhow::Error::new(err).context(message)
+                })?;
+            records_written = records_written.saturating_add(1);
+            on_progress(records_written);
         }
 
-        writer
-            .finish()
-            .map_err(|err| anyhow::anyhow!("finish fsvi index failed: {err}"))?;
+        // Same for publication: callers distinguish a WAL-sidecar refusal
+        // (InvalidConfig { field: "wal_sidecar" }) from an I/O failure.
+        writer.finish().map_err(|err| {
+            let message = format!("finish fsvi index failed: {err}");
+            anyhow::Error::new(err).context(message)
+        })?;
 
         FsVectorIndex::open(index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index failed: {err}"))
