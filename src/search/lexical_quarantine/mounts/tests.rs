@@ -87,6 +87,13 @@ fn empty_truncated_or_malformed_tables_never_mean_no_mounts() {
         b"1 1 8:1 / /data/\0 rw - ext4 disk rw\n",
         b"1 1 8:1 / / rw - ext4 disk\n",
         b"1 1 8:1 / / rw - ext4 disk rw trailing\n",
+        // Only the exact kernel-object root shape `<name>:[<digits>]` is a
+        // non-path root; lookalikes stay malformed.
+        b"1 1 0:5 net:[] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 net:[12a] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 :[1] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 Net:[1] /run/netns/x rw - nsfs nsfs rw\n",
+        b"1 1 0:5 net:[1 /run/netns/x rw - nsfs nsfs rw\n",
     ] {
         let error = check_reader(Cursor::new(invalid_table), root, &mut budget()).unwrap_err();
         assert_eq!(
@@ -95,6 +102,28 @@ fn empty_truncated_or_malformed_tables_never_mean_no_mounts() {
             "{invalid_table:?}"
         );
     }
+}
+
+/// A real Docker host's mountinfo (rch worker vmi1149989, 2026-10-22) has an
+/// nsfs line whose root is a kernel object, not a path. Rejecting it refused
+/// quarantine retention on every Docker or `ip netns` host. The table must
+/// parse, and a bundle that contains the namespace mount is still refused.
+#[test]
+fn kernel_object_roots_such_as_docker_netns_parse_and_still_detect_mount_points() {
+    let mut bytes = b"1 1 8:1 / / rw - ext4 /dev/test rw\n".to_vec();
+    bytes.extend_from_slice(
+        b"297 31 0:5 net:[4026531833] /run/docker/netns/default rw shared:358 - nsfs nsfs rw\n",
+    );
+    check_reader(
+        Cursor::new(&bytes),
+        Path::new("/data/.lexical-rebuild-quarantine-000001"),
+        &mut budget(),
+    )
+    .unwrap();
+    let error =
+        check_reader(Cursor::new(&bytes), Path::new("/run/docker"), &mut budget()).unwrap_err();
+    assert_ne!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert!(error.to_string().contains("mount point"), "{error}");
 }
 
 struct Counted<R> {

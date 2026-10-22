@@ -104,7 +104,12 @@ fn parse_mountpoint(line: &[u8]) -> io::Result<std::path::PathBuf> {
     {
         return Err(bad());
     }
-    if !fields.next().ok_or_else(bad)?.starts_with(b"/") {
+    // The root is a path within the filesystem, except for kernel-object
+    // mounts: nsfs reports e.g. `net:[4026531833]` (Docker and `ip netns`
+    // namespace mounts), and rejecting that line refused retention on every
+    // such host. Accept exactly that shape; other non-path roots stay malformed.
+    let root = fields.next().ok_or_else(bad)?;
+    if !root.starts_with(b"/") && !is_kernel_object_root(root) {
         return Err(bad());
     }
     let encoded = fields.next().ok_or_else(bad)?;
@@ -146,6 +151,24 @@ fn parse_mountpoint(line: &[u8]) -> io::Result<std::path::PathBuf> {
         return Err(bad());
     }
     Ok(path)
+}
+
+/// `<name>:[<digits>]`, the root a kernel-object mount (nsfs) reports in
+/// mountinfo, e.g. `net:[4026531833]`.
+#[cfg(target_os = "linux")]
+fn is_kernel_object_root(root: &[u8]) -> bool {
+    let Some(colon) = root.iter().position(|&byte| byte == b':') else {
+        return false;
+    };
+    let (name, rest) = root.split_at(colon);
+    !name.is_empty()
+        && name
+            .iter()
+            .all(|&byte| byte.is_ascii_lowercase() || byte == b'_')
+        && rest.len() >= 4
+        && rest.starts_with(b":[")
+        && rest.ends_with(b"]")
+        && rest[2..rest.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(all(test, target_os = "linux"))]
