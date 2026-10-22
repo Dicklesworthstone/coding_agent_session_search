@@ -21695,11 +21695,15 @@ pub(crate) fn normalize_path_identity(path: &Path) -> PathBuf {
         }
         normalized
     };
-    std::fs::canonicalize(&lexical).unwrap_or_else(|_| {
+    // dunce: on Windows this identity also reaches error text, lock files and
+    // checkpoints, so keep it out of the \\?\ verbatim form (txc9h). Readers
+    // that compare a saved value re-normalize it (path_identities_match, watch
+    // replay debt), so values saved by an older build still match.
+    dunce::canonicalize(&lexical).unwrap_or_else(|_| {
         let mut suffix = Vec::new();
         let mut cursor = lexical.as_path();
         loop {
-            match std::fs::canonicalize(cursor) {
+            match dunce::canonicalize(cursor) {
                 Ok(prefix) => {
                     let mut resolved = prefix;
                     for component in suffix.iter().rev() {

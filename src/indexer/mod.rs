@@ -32102,7 +32102,9 @@ fn reindex_paths_with_semantic_delta(
                 for debt in pending_lexical_debt
                     .iter()
                     .chain(std::iter::once(&current_debt))
-                    .filter(|debt| debt.path.starts_with(&selected_path))
+                    .filter(|debt| {
+                        crate::normalize_path_identity(&debt.path).starts_with(&selected_path)
+                    })
                 {
                     clear_watch_lexical_replay_debt(&storage, debt)?;
                 }
@@ -32324,9 +32326,14 @@ fn watch_lexical_replay_debt_for_root(
     for row in rows {
         let debt: WatchLexicalReplayDebt =
             serde_json::from_str(&row).context("reading durable watch lexical replay debt")?;
+        // Re-normalize the saved path: an older build (or another alias of the
+        // same root) may have stored a different spelling, e.g. Windows' \\?\
+        // form before txc9h. The debt itself is returned as stored, so clearing
+        // deletes exactly the saved key.
+        let debt_path = crate::normalize_path_identity(&debt.path);
         if debt.connector == kind
             && debt.source_id == root.origin.source_id
-            && (debt.path.starts_with(&selected_path) || selected_path.starts_with(&debt.path))
+            && (debt_path.starts_with(&selected_path) || selected_path.starts_with(&debt_path))
         {
             pending.push(debt);
         }
@@ -66414,6 +66421,94 @@ c.close()
         assert_eq!(
             fs::metadata(&missed).unwrap().modified().unwrap(),
             source_mtime
+        );
+    }
+
+    /// txc9h: a replay debt saved under another spelling of the same root
+    /// (here a symlink alias; on Windows the \\?\ form std::fs::canonicalize
+    /// produced) must still be found and cleared, not stranded by a plain
+    /// prefix comparison. An unrelated sibling root's debt must not match.
+    #[cfg(unix)]
+    #[test]
+    fn watch_lexical_replay_debt_matches_a_saved_alias_spelling_of_the_root() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-root");
+        let sibling = tmp.path().join("real-root-sibling");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let alias = tmp.path().join("alias-root");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("agent_search.db")).unwrap();
+        let root = ScanRoot::local(real.clone());
+        let saved = WatchLexicalReplayDebt {
+            connector: ConnectorKind::Amp,
+            source_id: root.origin.source_id.clone(),
+            path: alias.clone(),
+        };
+        let unrelated = WatchLexicalReplayDebt {
+            connector: ConnectorKind::Amp,
+            source_id: root.origin.source_id.clone(),
+            path: sibling.clone(),
+        };
+        persist_watch_lexical_replay_debt(&storage, &saved).unwrap();
+        persist_watch_lexical_replay_debt(&storage, &unrelated).unwrap();
+        assert!(
+            !alias.starts_with(crate::normalize_path_identity(&real)),
+            "the alias must be a different spelling, or this test proves nothing"
+        );
+
+        let pending =
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root).unwrap();
+        assert_eq!(pending.len(), 1, "alias debt found; sibling debt not");
+        assert_eq!(
+            pending[0].path, alias,
+            "returned as saved, so clearing hits its key"
+        );
+        clear_watch_lexical_replay_debt(&storage, &pending[0]).unwrap();
+        assert!(
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root)
+                .unwrap()
+                .is_empty()
+        );
+        let sibling_root = ScanRoot::local(sibling.clone());
+        assert_eq!(
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &sibling_root)
+                .unwrap()
+                .len(),
+            1,
+            "clearing the alias debt left the sibling's debt in place"
+        );
+    }
+
+    /// txc9h upgrade case: builds before txc9h saved debts with the
+    /// std::fs::canonicalize spelling (\\?\C:\... on Windows); identities are
+    /// now dunce-normalized (C:\...). Such a debt must still match its root.
+    /// On Unix both spellings agree, so this guards Windows.
+    #[test]
+    fn watch_lexical_replay_debt_saved_with_std_canonical_spelling_still_matches() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-root");
+        fs::create_dir_all(&real).unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("agent_search.db")).unwrap();
+        let root = ScanRoot::local(real.clone());
+        let saved = WatchLexicalReplayDebt {
+            connector: ConnectorKind::Amp,
+            source_id: root.origin.source_id.clone(),
+            path: std::fs::canonicalize(&real).unwrap(),
+        };
+        persist_watch_lexical_replay_debt(&storage, &saved).unwrap();
+        let pending =
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a pre-txc9h debt spelling must still match"
+        );
+        clear_watch_lexical_replay_debt(&storage, &pending[0]).unwrap();
+        assert!(
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root)
+                .unwrap()
+                .is_empty()
         );
     }
 
