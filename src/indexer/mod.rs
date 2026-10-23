@@ -22191,6 +22191,80 @@ fn ensure_index_storage_headroom(
     Ok(())
 }
 
+/// Marker the CLI matches to report a rebuild that stopped for disk space
+/// (exit 14, kind `storage`, retryable).
+pub(crate) const LEXICAL_REBUILD_DISK_STOP_MARKER: &str =
+    "lexical rebuild stopped: free disk space fell below the floor";
+
+/// Stop an authoritative lexical rebuild, keeping what it has committed, once
+/// free space where it writes falls below the preflight floor (nw61n). The
+/// preflight sizes the whole run from measurements; this catches a short
+/// projection before the filesystem fills, which is how the July trj rebuild
+/// failed (`disk I/O error (10)` with the root filesystem at 0 bytes). It runs
+/// before each commit, at the progress heartbeat and before the terminal
+/// commit, so one commit can still write past the floor; it is a backstop, not
+/// a reservation. `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` disables it with the
+/// preflight.
+fn ensure_lexical_rebuild_free_space(build_path: &Path) -> Result<()> {
+    if index_disk_headroom_check_disabled() {
+        return Ok(());
+    }
+    let Some(probe_path) = nearest_existing_path(build_path) else {
+        return Ok(());
+    };
+    let available = fs2::available_space(&probe_path).with_context(|| {
+        format!(
+            "checking free disk space for the lexical rebuild at {}",
+            probe_path.display()
+        )
+    })?;
+    lexical_rebuild_free_space_verdict(available, INDEX_MIN_FREE_SPACE_BYTES, &probe_path)
+}
+
+pub(crate) fn lexical_rebuild_free_space_verdict(
+    available: u64,
+    floor: u64,
+    probe_path: &Path,
+) -> Result<()> {
+    if available >= floor {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "{LEXICAL_REBUILD_DISK_STOP_MARKER} at {}: available={available} bytes, floor={floor} bytes. \
+         The live lexical index is unchanged, and what this rebuild committed stays in its staged \
+         generation; free space, then rerun the same cass index command to resume. Run \
+         'cass doctor check --json' for the headroom a rebuild needs.",
+        probe_path.display()
+    ))
+}
+
+/// Whether the post-rebuild fold (one `force_merge` over the staged
+/// generation) fits: it writes about as much as the generation holds while the
+/// inputs stay on disk. When it does not, the rebuild publishes the unmerged
+/// generation, which is what a failed fold already does (#441).
+fn lexical_rebuild_fold_fits(available: u64, generation_bytes: u64, floor: u64) -> bool {
+    available >= generation_bytes.saturating_add(floor)
+}
+
+/// Why the post-rebuild fold of `build_path` does not fit, or `None` when it
+/// does (or the headroom checks are disabled, or space cannot be read).
+fn lexical_rebuild_fold_shortfall(build_path: &Path) -> Option<String> {
+    if index_disk_headroom_check_disabled() {
+        return None;
+    }
+    let probe_path = nearest_existing_path(build_path)?;
+    let available = fs2::available_space(&probe_path).ok()?;
+    let generation_bytes = directory_size_bytes_best_effort(build_path);
+    (!lexical_rebuild_fold_fits(available, generation_bytes, INDEX_MIN_FREE_SPACE_BYTES)).then(
+        || {
+            format!(
+                "available={available} bytes at {}, generation={generation_bytes} bytes, floor={INDEX_MIN_FREE_SPACE_BYTES} bytes",
+                probe_path.display()
+            )
+        },
+    )
+}
+
 /// The raw mirror sits in the data dir and is the one large store there that
 /// cass shrinks on request, so a refusal on the data dir's filesystem names
 /// its size and the prune that retires superseded captures (#522: a 69 GB
@@ -22300,9 +22374,23 @@ fn required_index_headroom_bytes(
 /// `doctor` next to the numbers so an agent can see *why* a rebuild is
 /// blocked. Keep in sync with [`full_rebuild_headroom_projection`].
 /// `lexical_index_bytes` is the LIVE lexical footprint (see
-/// [`LexicalIndexFootprint::live_bytes`]).
-pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
-    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)";
+/// [`LexicalIndexFootprint::live_bytes`]); `migration_copy_bytes` is the db
+/// bundle while the engine's one-time migration repair is pending, else 0.
+pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str = "max(512 MiB, lexical_index_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes)";
+
+/// What a lexical rebuild writes per live lexical byte, as a fraction: the new
+/// generation's segments plus the post-run fold that rewrites them into one
+/// segment while the inputs are still on disk. Measured 2,821 MiB written for
+/// 1,329 MiB live (2.12x) rebuilding a 256k-message archive (nw61n,
+/// 2026-10-23); 9/4 keeps a margin over that.
+const LEXICAL_REBUILD_BYTES_PER_LIVE_BYTE: (u64, u64) = (9, 4);
+
+/// The db bundle's growth a rebuild or full rescan is charged for (WAL and the
+/// rows a rescan inserts), as a divisor of the bundle. The same measurement
+/// saw no growth for `--force-rebuild` or for a `--full` rescan of an
+/// unchanged archive; the July trj rebuild (25 GB db) wrote about 1 GB beyond
+/// twice its lexical index.
+const REBUILD_DB_GROWTH_DIVISOR: u64 = 16;
 
 /// The inputs and result of the full-rebuild headroom rule, so `doctor` can
 /// report the same requirement `index --full` / `--force-rebuild` enforces.
@@ -22335,13 +22423,22 @@ pub(crate) struct FullRebuildHeadroomProjection {
     /// for: they are subtracted from `required_bytes` (GH #496: doubling them
     /// locked a failed large rebuild out of its retry; GH #498 left 32 GB).
     pub(crate) rebuild_staging_bytes: u64,
+    /// The db growth allowance charged (`db_bundle_bytes / 16`).
+    pub(crate) db_growth_allowance_bytes: u64,
+    /// Whether the engine's one-time migration repair is still pending for
+    /// the archive (its `.fsqlite-migration-state` marker is absent or
+    /// incomplete). That repair keeps a `.pre-migration-bak` copy of the
+    /// whole bundle, so only then is the bundle charged a second time.
+    pub(crate) migration_repair_pending: bool,
+    /// `db_bundle_bytes` while `migration_repair_pending`, else 0.
+    pub(crate) migration_copy_bytes: u64,
 }
 
 /// Single source of truth for the authoritative (full) rebuild headroom rule.
 ///
-/// An authoritative rebuild writes a *second* full lexical index (plus staged
-/// shard/merge scratch) while the existing one is still on disk, so the db
-/// bundle alone badly under-projects the requirement.
+/// An authoritative rebuild writes a *second* full lexical index (plus the
+/// fold that rewrites it into one segment) while the existing one is still on
+/// disk, so the db bundle alone badly under-projects the requirement.
 ///
 /// Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
 /// rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
@@ -22349,6 +22446,16 @@ pub(crate) struct FullRebuildHeadroomProjection {
 /// free, then consumed ~115 GB and died on `disk I/O error (10)`.
 /// Counting the lexical index makes that case fail the preflight
 /// instead of failing mid-commit.
+///
+/// The db is charged for what touches it (nw61n). A lexical rebuild of a
+/// migrated archive reads it and writes almost nothing there: rebuilding a
+/// 3.0 GB db / 1.3 GiB-live archive used 2.8 GB, all lexical, while
+/// `db * 2 + lexical * 2` demanded 9.1 GB and refused a `--full` that then
+/// wrote nothing. So the bundle is charged a growth allowance, plus one
+/// whole copy only while the engine's one-time migration repair (which keeps
+/// a `.pre-migration-bak` copy) is pending. The rebuild itself stops at the
+/// free-space floor rather than filling the disk if the projection is short
+/// ([`ensure_lexical_rebuild_free_space`]).
 ///
 /// Only the LIVE lexical bytes count (#453). Merge-retired segment files the
 /// MANIFEST no longer references and prior generations parked under
@@ -22364,16 +22471,38 @@ pub(crate) fn full_rebuild_headroom_projection(
     db_path: &Path,
 ) -> FullRebuildHeadroomProjection {
     let db_bundle_bytes = database_bundle_size_bytes(db_path);
-    let footprint = lexical_index_footprint(data_dir);
+    let migration_repair_pending =
+        db_path.is_file() && !crate::storage::sqlite::index_engine_migration_is_complete(db_path);
+    full_rebuild_headroom_projection_from(
+        db_bundle_bytes,
+        lexical_index_footprint(data_dir),
+        migration_repair_pending,
+    )
+}
+
+/// The rule of [`full_rebuild_headroom_projection`] over measured inputs.
+fn full_rebuild_headroom_projection_from(
+    db_bundle_bytes: u64,
+    footprint: LexicalIndexFootprint,
+    migration_repair_pending: bool,
+) -> FullRebuildHeadroomProjection {
+    let (per_live_num, per_live_den) = LEXICAL_REBUILD_BYTES_PER_LIVE_BYTE;
+    let lexical_rebuild_bytes = footprint.live_bytes.saturating_mul(per_live_num) / per_live_den;
+    let db_growth_allowance_bytes = db_bundle_bytes / REBUILD_DB_GROWTH_DIVISOR;
+    let migration_copy_bytes = if migration_repair_pending {
+        db_bundle_bytes
+    } else {
+        0
+    };
     // A leftover staged generation occupies disk the rebuild gets back: a
     // resume continues writing into it, and a from-zero restart clears it
     // before writing. Either way the new generation's bytes already on disk
     // (or about to be freed) are not needed a second time, so they are
-    // credited against the requirement rather than merely left out of it.
-    let projected = db_bundle_bytes
-        .saturating_mul(2)
-        .saturating_add(footprint.live_bytes.saturating_mul(2))
-        .saturating_sub(footprint.rebuild_staging_bytes);
+    // credited against the lexical charge rather than merely left out of it.
+    let projected = lexical_rebuild_bytes
+        .saturating_sub(footprint.rebuild_staging_bytes)
+        .saturating_add(db_growth_allowance_bytes)
+        .saturating_add(migration_copy_bytes);
     FullRebuildHeadroomProjection {
         required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
         floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
@@ -22383,6 +22512,9 @@ pub(crate) fn full_rebuild_headroom_projection(
         retired_segment_files: footprint.retired_segment_files,
         retained_backup_bytes: footprint.retained_backup_bytes,
         rebuild_staging_bytes: footprint.rebuild_staging_bytes,
+        db_growth_allowance_bytes,
+        migration_repair_pending,
+        migration_copy_bytes,
     }
 }
 
@@ -27412,6 +27544,7 @@ fn rebuild_tantivy_from_db_once(
                     commit_interval_messages,
                     commit_interval_message_bytes,
                 ) {
+                    ensure_lexical_rebuild_free_space(&build_path)?;
                     flush_streamed_lexical_rebuild_batch(
                         &mut pending_batch,
                         &mut pending_batch_message_count,
@@ -27527,6 +27660,7 @@ fn rebuild_tantivy_from_db_once(
                             pending_batch_message_bytes,
                         ),
                     );
+                    ensure_lexical_rebuild_free_space(&build_path)?;
                     persist_pending_lexical_rebuild_progress(
                         &index_path,
                         &build_path,
@@ -27863,6 +27997,7 @@ fn rebuild_tantivy_from_db_once(
     // one. The merge is a Q1-preserving concat behind an atomic MANIFEST
     // publish, so a failure leaves the (valid, merely unmerged) generation in
     // place and is logged rather than failing a completed rebuild.
+    ensure_lexical_rebuild_free_space(&build_path)?;
     let publication = lexical_publish::Finalization::new(
         &index_path,
         &build_path,
@@ -27878,6 +28013,15 @@ fn rebuild_tantivy_from_db_once(
         tracing::warn!(
             segments = t_index.segment_count(),
             "post-rebuild segment merge skipped by CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE (test hook)"
+        );
+    } else if let Some(shortfall) = lexical_rebuild_fold_shortfall(&build_path) {
+        // nw61n: the fold rewrites the whole generation while its inputs stay
+        // on disk. Without room for that, publish the unmerged generation, as
+        // a failed fold already does, instead of filling the filesystem.
+        tracing::warn!(
+            segments = t_index.segment_count(),
+            shortfall = %shortfall,
+            "skipping the post-rebuild segment fold for lack of disk space; publishing the unmerged generation (#441)"
         );
     } else {
         match t_index.force_merge() {
@@ -56083,10 +56227,11 @@ mod tests {
         let db_path = data_dir.join("agent_search.db");
         // Fixtures must clear INDEX_MIN_FREE_SPACE_BYTES (512 MiB), otherwise the
         // floor dominates both sides and the lexical contribution is invisible.
-        // Sparse `set_len` keeps this cheap.
+        // An unmigrated 640 MiB db is charged 640 + 40 MiB. Sparse `set_len`
+        // keeps this cheap.
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
 
         let without_index = required_index_headroom_bytes(
@@ -56114,9 +56259,9 @@ mod tests {
             "lexical index size must raise the rebuild headroom requirement \
              (without={without_index}, with={with_index})"
         );
-        // db(300 MiB)*2 = 600 MiB already clears the 512 MiB floor, so the whole
-        // delta is attributable to the lexical index being counted twice.
-        assert_eq!(with_index - without_index, 2 * 200 * 1024 * 1024);
+        // The db charge already clears the 512 MiB floor, so the whole delta is
+        // the lexical rebuild charge: 9/4 of the live index (nw61n).
+        assert_eq!(with_index - without_index, 200 * 1024 * 1024 * 9 / 4);
     }
 
     #[test]
@@ -56256,7 +56401,28 @@ mod tests {
         assert_eq!(t_index.doc_count().expect("doc count"), 6);
     }
 
-    /// #453: the headroom projection doubles only the live lexical bytes.
+    /// The full-rebuild rule written out independently of the implementation:
+    /// max(512 MiB, live * 9/4 - staging (not below 0) + db / 16 + db while the
+    /// migration repair is pending).
+    fn expected_rebuild_requirement(
+        db_bundle_bytes: u64,
+        live_bytes: u64,
+        staging_bytes: u64,
+        migration_pending: bool,
+    ) -> u64 {
+        let lexical = (u128::from(live_bytes) * 9 / 4).saturating_sub(u128::from(staging_bytes));
+        let db = u128::from(db_bundle_bytes) / 16
+            + if migration_pending {
+                u128::from(db_bundle_bytes)
+            } else {
+                0
+            };
+        u64::try_from(lexical + db)
+            .unwrap_or(u64::MAX)
+            .max(INDEX_MIN_FREE_SPACE_BYTES)
+    }
+
+    /// #453: the headroom projection charges only the live lexical bytes.
     /// Merge-retired segment files and retained publish backups are already
     /// on disk and are not rewritten by a rebuild, so they are reported but
     /// excluded from the requirement.
@@ -56267,7 +56433,7 @@ mod tests {
         let db_path = data_dir.join("agent_search.db");
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         let index_path = plant_merged_quill_index(&data_dir, 4);
 
@@ -56334,16 +56500,33 @@ mod tests {
             projection.retained_backup_bytes,
             with_extras.retained_backup_bytes
         );
-        // db(300 MiB)*2 clears the floor, so the requirement is exactly the
-        // rule over live bytes: the 64 MiB backup and the retired inputs are
-        // not doubled into it.
+        // The planted db file has no engine migration marker, so it is charged
+        // one copy plus the growth allowance, which clears the floor: the
+        // requirement is exactly the rule over live bytes, and the 64 MiB
+        // backup and the retired inputs are not charged.
+        assert!(projection.migration_repair_pending);
+        assert_eq!(projection.migration_copy_bytes, projection.db_bundle_bytes);
+        assert_eq!(
+            projection.db_growth_allowance_bytes,
+            projection.db_bundle_bytes / 16
+        );
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + with_extras.live_bytes * 2
+            expected_rebuild_requirement(
+                projection.db_bundle_bytes,
+                with_extras.live_bytes,
+                0,
+                true
+            )
         );
         assert!(
             projection.required_bytes
-                < projection.db_bundle_bytes * 2 + with_extras.total_bytes() * 2,
+                < expected_rebuild_requirement(
+                    projection.db_bundle_bytes,
+                    with_extras.total_bytes(),
+                    0,
+                    true
+                ),
             "the recursive size would have demanded more"
         );
     }
@@ -56358,9 +56541,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let db_path = data_dir.join("agent_search.db");
+        // Unmigrated (no marker), so the db charge alone clears the floor and
+        // the lexical credit stays visible in the requirement.
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         let index_path = plant_merged_quill_index(&data_dir, 2);
         let before = lexical_index_footprint(&data_dir);
@@ -56395,27 +56580,119 @@ mod tests {
 
         let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
         assert_eq!(projection.rebuild_staging_bytes, staged);
-        // db(300 MiB)*2 clears the 512 MiB floor even after the 96 MiB credit,
-        // so the requirement is exactly 2*db + 2*live - staging.
+        assert_eq!(
+            projection_before.required_bytes,
+            expected_rebuild_requirement(projection.db_bundle_bytes, before.live_bytes, 0, true)
+        );
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + after.live_bytes * 2 - staged
+            expected_rebuild_requirement(
+                projection.db_bundle_bytes,
+                after.live_bytes,
+                staged,
+                true
+            )
         );
+        let lexical_charge = after.live_bytes * 9 / 4;
         assert_eq!(
-            projection.required_bytes + staged,
-            projection_before.required_bytes,
-            "the staged bytes are credited one-for-one against the requirement"
+            projection_before.required_bytes - projection.required_bytes,
+            staged.min(lexical_charge),
+            "the staged bytes are credited one-for-one against the lexical charge, never beyond it"
         );
 
-        // The credit never takes the requirement below the absolute floor.
+        // A staged generation larger than the lexical charge pays that charge
+        // and nothing more: the db terms stay.
         let huge = staging.join("seg-00000000000001ff.fslx");
         std::fs::File::create(&huge)
             .unwrap()
             .set_len(4 * 1024 * 1024 * 1024)
             .unwrap();
-        let floored = full_rebuild_headroom_projection(&data_dir, &db_path);
-        assert!(floored.rebuild_staging_bytes > floored.db_bundle_bytes * 2);
-        assert_eq!(floored.required_bytes, INDEX_MIN_FREE_SPACE_BYTES);
+        let capped = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert!(capped.rebuild_staging_bytes > capped.lexical_index_bytes * 9 / 4);
+        assert_eq!(
+            capped.required_bytes,
+            capped.db_growth_allowance_bytes + capped.migration_copy_bytes
+        );
+    }
+
+    /// nw61n, on the measured fixture (256k messages: db bundle 3,161,862,224
+    /// bytes, live lexical 1,393,617,850 bytes; `--force-rebuild` wrote 2,821
+    /// MiB). The db is charged only its growth allowance once migrated, so the
+    /// requirement covers the measured rebuild with margin and falls well
+    /// below the old `2*db + 2*live` (9,110,960,148 bytes, which refused a
+    /// `--full` that wrote nothing). Negative: with the engine's migration
+    /// repair pending the whole bundle is charged on top.
+    #[test]
+    fn full_rebuild_headroom_charges_the_db_only_for_what_touches_it() {
+        let footprint = LexicalIndexFootprint {
+            live_bytes: 1_393_617_850,
+            retired_segment_bytes: 1_563_884_292,
+            retired_segment_files: 150,
+            retained_backup_bytes: 2_937_502_205,
+            rebuild_staging_bytes: 0,
+        };
+        let db = 3_161_862_224;
+        let migrated = full_rebuild_headroom_projection_from(db, footprint, false);
+        assert_eq!(
+            migrated.required_bytes,
+            expected_rebuild_requirement(db, footprint.live_bytes, 0, false)
+        );
+        assert!(!migrated.migration_repair_pending);
+        assert_eq!(migrated.migration_copy_bytes, 0);
+        let measured_force_rebuild_peak = 2_821 * 1024 * 1024;
+        assert!(migrated.required_bytes >= measured_force_rebuild_peak);
+        assert!(migrated.required_bytes < 9_110_960_148 / 2);
+
+        let pending = full_rebuild_headroom_projection_from(db, footprint, true);
+        assert!(pending.migration_repair_pending);
+        assert_eq!(pending.migration_copy_bytes, db);
+        assert_eq!(pending.required_bytes, migrated.required_bytes + db);
+
+        // Small archives sit on the floor; a staged generation never takes
+        // the requirement below it.
+        let small = LexicalIndexFootprint {
+            live_bytes: 8 * 1024 * 1024,
+            rebuild_staging_bytes: 64 * 1024 * 1024,
+            ..LexicalIndexFootprint::default()
+        };
+        assert_eq!(
+            full_rebuild_headroom_projection_from(16 * 1024 * 1024, small, false).required_bytes,
+            INDEX_MIN_FREE_SPACE_BYTES
+        );
+    }
+
+    /// The rebuild's runtime backstop: below the floor it stops with the marker
+    /// the CLI maps to exit 14, naming the resume; at or above it, it runs on.
+    /// The fold runs only with room for a second copy of the generation plus
+    /// the floor.
+    #[test]
+    fn lexical_rebuild_free_space_backstop_stops_below_the_floor() {
+        let probe = Path::new("/data/cass/index");
+        let floor = INDEX_MIN_FREE_SPACE_BYTES;
+        assert!(lexical_rebuild_free_space_verdict(floor, floor, probe).is_ok());
+        assert!(lexical_rebuild_free_space_verdict(u64::MAX, floor, probe).is_ok());
+        let stopped = lexical_rebuild_free_space_verdict(floor - 1, floor, probe)
+            .expect_err("one byte below the floor stops the rebuild");
+        let message = format!("{stopped:#}");
+        assert!(
+            message.contains(LEXICAL_REBUILD_DISK_STOP_MARKER),
+            "{message}"
+        );
+        assert!(message.contains("/data/cass/index"), "{message}");
+        assert!(message.contains("resume"), "{message}");
+
+        let generation = 3 * 1024 * 1024 * 1024;
+        assert!(lexical_rebuild_fold_fits(
+            generation + floor,
+            generation,
+            floor
+        ));
+        assert!(!lexical_rebuild_fold_fits(
+            generation + floor - 1,
+            generation,
+            floor
+        ));
+        assert!(!lexical_rebuild_fold_fits(u64::MAX - 1, u64::MAX, floor));
     }
 
     /// An unreadable MANIFEST must make the walk conservative: every byte in
@@ -56615,20 +56892,27 @@ mod tests {
         );
     }
 
+    /// `--full` and `--force-rebuild` take the full-rebuild requirement. With no
+    /// lexical index the projection is the db charge: a whole copy of the
+    /// bundle while the engine's one-time migration repair is pending (it keeps
+    /// a `.pre-migration-bak`), plus the 1/16 growth allowance. Neither path
+    /// clones the canonical archive otherwise (a `--full` that would need to
+    /// replace it is refused), so once the migration marker is complete only
+    /// the allowance remains (nw61n).
     #[test]
-    fn full_and_force_rebuild_startup_headroom_keep_archive_clone_requirement() {
+    fn full_and_force_rebuild_startup_headroom_charge_the_archive_copy_only_while_migration_is_pending()
+     {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-wal"), vec![0_u8; 256]).unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-shm"), vec![0_u8; 512]).unwrap();
-        // No lexical index exists in this fixture, so the rebuild projection is
-        // still just the archive-clone requirement.
-        let clone_requirement =
-            INDEX_MIN_FREE_SPACE_BYTES.max(database_bundle_size_bytes(&db_path).saturating_mul(2));
+        let bundle = database_bundle_size_bytes(&db_path);
+        let pending_requirement = INDEX_MIN_FREE_SPACE_BYTES.max(bundle + bundle / 16);
+        assert!(pending_requirement > INDEX_MIN_FREE_SPACE_BYTES);
 
         assert_eq!(
             index_startup_storage_headroom_requirement(true, false),
@@ -56644,8 +56928,28 @@ mod tests {
                 &db_path,
                 IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
             ),
-            clone_requirement,
-            "full/force rebuilds still need enough scratch for atomic publish safety"
+            pending_requirement,
+            "an unmigrated archive is charged the migration repair's whole copy"
+        );
+
+        // A completed engine migration marker removes the copy; the growth
+        // allowance (40 MiB here) sits under the floor.
+        std::fs::write(
+            database_path_with_suffix(&db_path, ".fsqlite-migration-state"),
+            br#"{"last_upgrade_version":1,"last_run_at":0,"repairs_applied":[]}"#,
+        )
+        .unwrap();
+        assert!(crate::storage::sqlite::index_engine_migration_is_complete(
+            &db_path
+        ));
+        assert_eq!(
+            required_index_headroom_bytes(
+                tmp.path(),
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            ),
+            INDEX_MIN_FREE_SPACE_BYTES,
+            "a migrated archive is charged only the growth allowance"
         );
     }
 

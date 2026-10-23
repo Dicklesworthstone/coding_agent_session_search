@@ -1440,6 +1440,15 @@
             "rebuild_staging_bytes": {
               "type": "integer"
             },
+            "db_growth_allowance_bytes": {
+              "type": "integer"
+            },
+            "migration_repair_pending": {
+              "type": "boolean"
+            },
+            "migration_copy_bytes": {
+              "type": "integer"
+            },
             "available_bytes": {
               "type": "integer"
             },

@@ -21786,6 +21786,10 @@ fn error_chain_indicates_index_disk_headroom_blocked(chain: &str) -> bool {
     chain.contains("canonical archive disk headroom check failed")
 }
 
+fn error_chain_indicates_lexical_rebuild_disk_stop(chain: &str) -> bool {
+    chain.contains(crate::indexer::LEXICAL_REBUILD_DISK_STOP_MARKER)
+}
+
 fn error_chain_indicates_orphan_fk_cleanup_blocked(chain: &str) -> bool {
     chain.contains("orphan FK self-heal failed for canonical cass archive")
 }
@@ -21831,6 +21835,22 @@ fn index_disk_headroom_cli_error(chain: &str) -> CliError {
         message: format!("index refused to start because disk headroom is too low: {chain}"),
         hint: Some(
             "Free space on the filesystem that holds the cass data directory, then retry indexing. Run 'cass doctor check --json' for a read-only health report."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+/// nw61n: a lexical rebuild that started and then stopped at the free-space
+/// floor. Same exit and kind as the start refusal, its own wording: the
+/// rebuild ran, kept what it committed, and the rerun resumes it.
+fn lexical_rebuild_disk_stop_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 14,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index stopped the lexical rebuild because free disk space ran low: {chain}"),
+        hint: Some(
+            "Free space on the filesystem that holds the cass data directory, then rerun the same cass index command; it resumes from what this run committed. Run 'cass doctor check --json' for the headroom a rebuild needs."
                 .to_string(),
         ),
         retryable: true,
@@ -22080,6 +22100,36 @@ mod index_error_mapping_tests {
         assert_eq!(err.code, 14);
         assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
         assert!(err.retryable);
+    }
+
+    /// nw61n: the indexer's own mid-rebuild stop maps to the same retryable
+    /// exit 14 / `storage` as the start refusal, with resume wording, and is
+    /// not mistaken for the start refusal (or the reverse).
+    #[test]
+    fn lexical_rebuild_disk_stop_is_retryable_and_names_the_resume() {
+        let stop = crate::indexer::lexical_rebuild_free_space_verdict(
+            1,
+            512 * 1024 * 1024,
+            Path::new("/data/cass/index"),
+        )
+        .expect_err("below the floor");
+        let chain = format!("lexical rebuild failed | {stop:#}");
+        assert!(error_chain_indicates_lexical_rebuild_disk_stop(&chain));
+        assert!(!error_chain_indicates_index_disk_headroom_blocked(&chain));
+        assert!(!error_chain_indicates_lexical_rebuild_disk_stop(
+            "canonical archive disk headroom check failed for /data: available=1 bytes, required=2 bytes"
+        ));
+        let err = lexical_rebuild_disk_stop_cli_error(&chain);
+        assert_eq!(err.code, 14);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(err.retryable);
+        assert!(err.message.contains("/data/cass/index"), "{err:?}");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("resumes")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -27250,7 +27300,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_INDEX_FINALIZE_ABORT_SECS=<N>       abort grace in seconds during finalize WAL-checkpoint / rebuild-tail windows (default 1800; 0 report-only)".to_string(),
             "  CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS=<N>  wall-clock budget in seconds for final wal_checkpoint(TRUNCATE) during index (default 900; 0 keeps default)".to_string(),
             "  CASS_INDEX_REDACTION=full|off            index-time secret redaction mode (default full)".to_string(),
-            "  CASS_INDEX_SKIP_DISK_HEADROOM_CHECK=1    skip free-space preflight before `cass index --full` / `--force-rebuild`".to_string(),
+            "  CASS_INDEX_SKIP_DISK_HEADROOM_CHECK=1    skip the free-space preflight before `cass index --full` / `--force-rebuild` and the rebuild's free-space floor".to_string(),
             "  CASS_INDEX_STALL_ABORT_ALL_PHASES=1      promote stall watchdog warnings to hard abort (exit 70) in all phases".to_string(),
             "  CASS_INDEX_STALL_ABORT_SECS=<N>          seconds without progress before abort-eligible lexical stall exits 70 (default 300; 0 report-only)".to_string(),
             "  CASS_INDEX_STALL_DETECT_SECS=<N>         seconds without phase progress before emitting stall diagnostics (default 120; 0 disables)".to_string(),
@@ -46071,7 +46121,7 @@ struct DoctorFullRebuildReadinessReport {
     floor_bytes: u64,
     db_bundle_bytes: u64,
     /// Live lexical bytes: what the current MANIFEST references plus the
-    /// index's own bookkeeping files. This is the figure the formula doubles.
+    /// index's own bookkeeping files. The formula charges 9/4 of it.
     lexical_index_bytes: u64,
     /// #453: merge-retired segment files still under the lexical index. The
     /// engine's writer-open sweep reclaims them once they have been
@@ -46088,6 +46138,14 @@ struct DoctorFullRebuildReadinessReport {
     /// `index/.<name>.rebuild-staging/`. The next rebuild resumes into it or
     /// clears it first, so it is excluded from `required_bytes`.
     rebuild_staging_bytes: u64,
+    /// nw61n: the db growth allowance charged (`db_bundle_bytes / 16`).
+    db_growth_allowance_bytes: u64,
+    /// nw61n: whether the engine's one-time migration repair is still
+    /// pending (its `.fsqlite-migration-state` marker absent or incomplete).
+    /// Only then is the whole db bundle charged again, for the repair's
+    /// `.pre-migration-bak` copy (`migration_copy_bytes`).
+    migration_repair_pending: bool,
+    migration_copy_bytes: u64,
     /// Free bytes at the most constrained probe path (`None` when unknown).
     available_bytes: Option<u64>,
     /// `required_bytes - available_bytes` when blocked, else 0.
@@ -46198,15 +46256,24 @@ fn build_doctor_full_rebuild_readiness(
         ),
     };
     notes.push(format!(
-        "Requirement is {}: db bundle {} bytes, lexical index {} bytes, floor {} bytes.",
+        "Requirement is {}: lexical index {} bytes, db bundle {} bytes (growth allowance {} bytes{}), floor {} bytes.",
         crate::indexer::FULL_REBUILD_HEADROOM_FORMULA,
-        projection.db_bundle_bytes,
         projection.lexical_index_bytes,
+        projection.db_bundle_bytes,
+        projection.db_growth_allowance_bytes,
+        if projection.migration_repair_pending {
+            format!(
+                "; the engine's one-time migration repair is pending and keeps a copy of the whole bundle, so migration copy {} bytes",
+                projection.migration_copy_bytes
+            )
+        } else {
+            String::new()
+        },
         projection.floor_bytes
     ));
     if projection.retired_segment_bytes > 0 {
         notes.push(format!(
-            "The lexical figure counts only bytes the current MANIFEST references; {} merge-retired segment file(s) totalling {} bytes sit next to it and are not doubled. The engine unlinks them at the next `cass index` open once they have been unreferenced for its {}-second grace period (`cass index --gc` runs that sweep on its own).",
+            "The lexical figure counts only bytes the current MANIFEST references; {} merge-retired segment file(s) totalling {} bytes sit next to it and are not charged. The engine unlinks them at the next `cass index` open once they have been unreferenced for its {}-second grace period (`cass index --gc` runs that sweep on its own).",
             projection.retired_segment_files,
             projection.retired_segment_bytes,
             frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs()
@@ -46214,7 +46281,7 @@ fn build_doctor_full_rebuild_readiness(
     }
     if projection.retained_backup_bytes > 0 {
         notes.push(format!(
-            "{} bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not doubled either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier.",
+            "{} bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not charged either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier.",
             projection.retained_backup_bytes
         ));
     }
@@ -46243,6 +46310,9 @@ fn build_doctor_full_rebuild_readiness(
         retired_segment_files: projection.retired_segment_files,
         retained_publish_backup_bytes: projection.retained_backup_bytes,
         rebuild_staging_bytes: projection.rebuild_staging_bytes,
+        db_growth_allowance_bytes: projection.db_growth_allowance_bytes,
+        migration_repair_pending: projection.migration_repair_pending,
+        migration_copy_bytes: projection.migration_copy_bytes,
         available_bytes,
         shortfall_bytes,
         probe_path,
@@ -105314,10 +105384,11 @@ mod response_schema_tests {
         );
     }
 
-    /// GH#442 reproduction shape: a 100 GiB (sparse) archive projects a
-    /// 200 GiB requirement, and doctor reports it blocked against the free
-    /// space the indexer's refusal named, even though the 1 GiB general
-    /// pressure floor is satisfied.
+    /// GH#442 reproduction shape: a 100 GiB (sparse) archive with no engine
+    /// migration marker projects a 106.25 GiB requirement (one copy for the
+    /// pending migration repair plus the 1/16 growth allowance; nw61n), and
+    /// doctor reports it blocked against the free space the indexer's refusal
+    /// named, even though the 1 GiB general pressure floor is satisfied.
     #[test]
     fn doctor_full_rebuild_readiness_reports_the_indexer_refusal_numbers() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -105329,7 +105400,8 @@ mod response_schema_tests {
         drop(db);
 
         let projection = crate::indexer::full_rebuild_headroom_projection(root, &db_path);
-        assert_eq!(projection.required_bytes, 214_748_364_800);
+        assert!(projection.migration_repair_pending);
+        assert_eq!(projection.required_bytes, 114_085_068_800);
 
         let available = 45_252_415_488_u64;
         let report = build_doctor_storage_pressure_report(
@@ -105347,9 +105419,9 @@ mod response_schema_tests {
         assert_eq!(report.low_disk_risk, "none");
         let readiness = &report.full_rebuild_readiness;
         assert_eq!(readiness.status, "blocked");
-        assert_eq!(readiness.required_bytes, 214_748_364_800);
+        assert_eq!(readiness.required_bytes, 114_085_068_800);
         assert_eq!(readiness.available_bytes, Some(available));
-        assert_eq!(readiness.shortfall_bytes, 214_748_364_800 - available);
+        assert_eq!(readiness.shortfall_bytes, 114_085_068_800 - available);
 
         let json = serde_json::to_value(&report).expect("serialize storage pressure");
         assert_eq!(json["schema_version"], 3);
@@ -105359,7 +105431,7 @@ mod response_schema_tests {
         );
         assert_eq!(
             json["full_rebuild_readiness"]["required_bytes"].as_u64(),
-            Some(214_748_364_800)
+            Some(114_085_068_800)
         );
         assert_eq!(
             json["full_rebuild_readiness"]["formula"].as_str(),
@@ -105381,6 +105453,9 @@ mod response_schema_tests {
             retired_segment_files: 1_642,
             retained_backup_bytes: 6_400_000_000,
             rebuild_staging_bytes: 32_000_000_000,
+            db_growth_allowance_bytes: 11_900_000_000 / 16,
+            migration_repair_pending: false,
+            migration_copy_bytes: 0,
         };
         let root = PathBuf::from("/probe");
         let blocked = build_doctor_full_rebuild_readiness(
@@ -110574,6 +110649,9 @@ fn run_index_with_data(
             }
             if error_chain_indicates_index_disk_headroom_blocked(&chain) {
                 return index_disk_headroom_cli_error(&chain);
+            }
+            if error_chain_indicates_lexical_rebuild_disk_stop(&chain) {
+                return lexical_rebuild_disk_stop_cli_error(&chain);
             }
             if error_chain_indicates_orphan_fk_cleanup_blocked(&chain) {
                 return index_orphan_fk_cleanup_cli_error(&chain);
