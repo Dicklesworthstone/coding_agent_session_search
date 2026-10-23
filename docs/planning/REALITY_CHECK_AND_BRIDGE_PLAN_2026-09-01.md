@@ -1,4 +1,141 @@
-# Reality Check and Bridge Plan — refreshed 2026-10-14
+# Reality Check and Bridge Plan — refreshed 2026-10-22
+
+## Assessment: 2026-10-22 (RainyBluff)
+
+Scope: `origin/main` `9988ceec` (701 commits after the `v0.10.0` tag, Cargo version still
+0.10.0). Read all 1,380 lines of `AGENTS.md` and all 3,867 lines of `README.md` on that
+commit, the 10-14 section below, and the open bead and GitHub ledgers (2,446 beads; 34 open
+issues). Evidence is from this session: rch gates b108j, b111, b113b, b115, b116 and b117e,
+native Windows runs on wlap, and read-only `cass` 0.10.0 probes of this host's own archive
+(`health`, `status`, `storage`, `schedule status`). Nothing in the live archive was written.
+
+### Headline
+
+The code on `main` is far ahead of what users run, and the gap is widening. Seven hundred
+commits of fixes have not shipped: the fsqlite 0.4.12 b-tree corruption fix (bd-obwsy;
+shipped v0.10.0 runs the affected 0.4.6), the truthful freshness model, raw-mirror growth
+and quarantine retention, query fuel, timeline OOM, and the Windows OpenCode export abort.
+The release is not blocked by one bug. It is blocked by a dependency graph that cannot
+converge: `yrjna` waits on a strict UBS pass over ~720K lines (`5v57k`), and `2l1b0.25`
+waits on about fifteen "prove X end to end at scale" beads, including repairing the owner's
+damaged archive (`scohn`). crates.io is further behind still: it serves 0.7.0 from
+2026-08-25, and cass cannot publish there while FAD is a git dependency (`zztql`).
+
+The clearest evidence is this host. Installed cass 0.10.0 reports the archive `healthy`,
+`fresh: true`, `stale: false`, while `last_indexed_at` is 2026-10-07: 15.8 days old against a
+30-minute threshold. Every agent search here has silently missed two weeks of sessions. No
+scheduler is installed. The last background catch-up (2026-10-13) refused to start because a
+full lexical rebuild required 196.5 GB free and 37 GB was available. After that, the
+freshness bug (fixed on main as `2l1b0.81`, unreleased) reported `fresh`, so stale-on-read
+never tried again. The data dir is 220 GB: canonical DB 42.7 GB, lexical index 81.1 GB (live
+generation 41 GB, plus 34 GB in four failed-rebuild quarantine bundles that 0.10.0 never
+retired), raw mirror 86.5 GB. Releasing `main` alone would not heal this host. Main's rule
+still charges `2 x DB + 2 x live lexical` (about 167 GB) for a lexical-only repair of an
+unchanged archive. Only 81 GB is free, or 115 GB after pruning the quarantines.
+
+### Vision checklist (README/AGENTS promises against `main`, with the shipped 0.10.0 where it differs)
+
+| # | Promise | Status | Evidence |
+|---|---|---|---|
+| 1 | Discover and ingest 34 connectors, never modify sources | WORKING | capabilities golden lists 34; connector suites green in b100/b104b |
+| 2 | SQLite is a durable source of truth | PARTIAL | main pins fsqlite 0.4.12 (bd-obwsy fix); shipped 0.10.0 runs the affected 0.4.6; #391 recurring b-tree damage open (`2l1b0.2` blocked); owner archive integrity open (`scohn`, `2l1b0.73`) |
+| 3 | Lexical search is fast, required and self-healing | WORKING small/medium; BROKEN at scale | gates green on fixtures; on a 9.7M-document archive the only repair path cannot start (headroom rule, quarantine growth); about two thirds of the 34 open issues are large-archive wedges, OOM, fragmentation or corruption |
+| 4 | Hybrid default with opt-in local semantic, truthful fail-open | PARTIAL | fail-open and metadata work; two-tier progressive is inactive (README now says so); native ANN admission over WAL updates red (`ds7uy.3.3`, 2 lib tests); 2,000-char prefix regression red (gh470 vs #458, `962e8`) |
+| 5 | Index stays fresh automatically, freshness surfaces are truthful | REGRESSED on 0.10.0; PARTIAL on main | host above; on main the daemon timer was silently throttled to the 300 s read-path cadence and disabled entirely by `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS=0` (107fabfa); two #515 daemon tests red on plain main (b115). Fixed in this pass, see below. Active-writer deferrals were silent in `index --json` (fixed in this pass) |
+| 6 | Stable robot contracts, no silent substitution | WORKING | goldens 68/0, cli_robot 329/0, search_metamorphic green |
+| 7 | Responsive TUI at scale | UNPROVEN at scale | `2l1b0.22` open; snapshot suites only |
+| 8 | Multi-machine sources with provenance | WORKING in fixtures; UNPROVEN live | e2e_sources 121/0; live harness exists, `2l1b0.24` and `av59c` open |
+| 9 | HTML/Markdown/Pages/archive export with encryption | WORKING in Rust; browser side UNPROVEN | html_export_integration 28/0, pages_bundle green; the Playwright suites have had no runner since the GitHub Actions removal (no bead until this pass) |
+| 10 | Archive-first doctor and recovery | WORKING on fixtures | cli_doctor 117/0; a real damaged archive (owner's) is still unrepaired |
+| 11 | Linux, macOS and Windows | PARTIAL | Windows: 26 native lib/integration failures (`if17v`), publish blocked by an open reader (`lndgg`), `v107y`; macOS: proof host's disk is 98% full, `d32jo` and `2l1b0.36` open |
+| 12 | Installer, Homebrew, Scoop, GitHub releases, crates.io, self-update | STALLED | last release v0.10.0 (2026-10-02); crates.io 0.7.0; dsr release path works (`yviq2`'s cass part) but the release beads cannot close |
+| 13 | Local-only, index-time secret redaction | WORKING | redaction suites green |
+| 14 | Analytics, timeline, pack, bookmarks, swarm | WORKING | timeline OOM fixed on main (unreleased) |
+| 15 | Truthful README | PARTIAL | glibc floor stated as 2.38 at line 592 (installer and line 2987 say 2.28); 21 migrations documented, code has 22 (`forgotten_sources`); a CI pipeline section and Codecov badge describe Actions jobs that no longer exist; crates.io paragraph says `cargo install` builds the current line (it builds 0.7.0); connector diagrams show 20 of 34 |
+
+### The five questions
+
+1. **What works now.** On Linux, small and medium archives, the core loop works end to end:
+   discovery across 34 connectors, canonical SQLite, Quill lexical search, robot contracts,
+   view/expand/pack, export, doctor on fixtures, multi-machine sync on fixtures. The
+   release-qualification sweeps this week (gates b100, b104b, b108j, b113b and b117e) ran
+   fmt, clippy, the full lib suite and 40 distinct integration targets of about 320. Remaining
+   reds on main: the two ANN `wal_tests` (`ds7uy.3.3`),
+   `gh470_prefix_checkpoint` (`962e8`), and four #515 daemon process tests (two fixed in this
+   pass).
+2. **What does not work.** (a) Users run a 20-day-old release that lacks a data-integrity fix
+   and reports a stale index as fresh. (b) Self-healing fails on large archives: repair needs
+   more free disk than such hosts have, quarantine bundles accumulate, and most open GitHub
+   issues are scale failures. (c) Semantic acceleration is partial (ANN admission, the gh470
+   prefix regression, two-tier inactive). (d) Windows and macOS proof is incomplete, and the
+   browser suites never run.
+3. **What blocks.** (1) Release governance: the release depends on beads that cannot finish
+   on any short horizon (strict UBS over the monoliths, at-scale proof beads, owner-archive
+   repair). This is an owner decision. (2) Two owner design calls hold red tests on main: ANN
+   admission (`ds7uy.3.3`) and gh470 versus #458 retention (`962e8`). (3) Proof
+   infrastructure: rch workers refill their disks within a day (the rch GC never collects
+   staging source copies; 427 GB reclaimed by hand on 10-21 and 10-22), the macOS host is
+   full, and there is no browser lane. (4) The FAD git pin blocks crates.io.
+4. **Would finishing every open and in-progress bead close the gap? No.** The 10-14 answer
+   ("YES") does not hold. The set is not finishable as written: 58 of 71 in-progress beads
+   have not been touched since before 2026-10-01, and some are obsolete (`90y8u` upgrade to
+   fsqlite 0.3.18, `91njy` release v0.8.0, `hyydu` adopt 0.4.4). Others are unbounded (strict
+   UBS on 720K lines, `scohn`). Finishing them also would not ship anything, because no bead
+   owns cutting a release from the current main under a bar it can meet. And four gaps found
+   in this pass had no bead.
+5. **Goals no bead covered (beads filed in this pass, children of `2l1b0`, label
+   `reality-check-20261022`):**
+   - `lexical-repair-headroom-nw61n` (P1): the preflight charges `2 x DB` even when the DB is
+     unchanged, so self-healing cannot start on large archives. The `lexical x 2` term is
+     real (trj consumed about 115 GB for a 25 GB DB in July,
+     `index-rebuild-headroom-underestimate-2mm1t`), so the bead measures the real peak per
+     path before changing the rule.
+   - `release-bar-decision-hutyl` (P0, question for the owner): ship 0.11.0 under a "no
+     worse than 0.10.0" bar with a known-issues list, and move certification beads off the
+     release path. Related to `yrjna`.
+   - `browser-e2e-lane-bnueb` (P2): a runner for the Playwright HTML-export and Pages suites
+     on a dsr host. `2l1b0.23` now depends on it.
+   - `readme-truth-20261022-9h3pj` (P2): the README claims in row 15.
+
+### Bridge plan (ordered by user value per unit of work)
+
+1. **Ship what is done.** Land the fixes from this pass. The owner decides the release bar.
+   Then cut 0.11.0 through dsr with a known-issues list, then a scheduled release train.
+   Every week without a release leaves the fixes on main undelivered and users on known-bad
+   code.
+2. **Make self-healing possible at scale.** Measure the real peak disk of a lexical-only
+   rebuild (staged shards plus merge output) on a fixture large enough to show it. Charge
+   that for a lexical-only repair of an unchanged archive. Keep the DB term for paths that
+   rewrite the DB (migration repair, `--full` rescans). Count retained quarantine bundles
+   and retire superseded ones. Negative test: a `--full` rescan still charges the DB term.
+   Longer term, repair the broken generation segment by segment instead of rebuilding it,
+   which removes the 2x requirement altogether.
+3. **Settle the owner calls that hold reds on main:** `ds7uy.3.3` (proposal posted) and
+   `962e8`.
+4. **Truth surfaces:** freshness (in the release), active-writer deferral reporting (this
+   pass), README truth pass (this pass).
+5. **Proof lanes:** a browser runner on a dsr host; the Windows baseline (`if17v`, `lndgg`);
+   room on the macOS host; an rch staging-copy retention policy for the fleet (an infra
+   change outside this repo, owner call).
+6. **Ledger hygiene (`2l1b0.30`):** release stale claims and close obsolete beads with
+   evidence, so `br ready` and `bv` point at real work.
+
+### What this pass changed on main (receipts in the commits)
+
+- `cass index --json` reports `indexing_stats.deferred_active_sources` and a sample when a
+  writer kept sources from being read (h3jnv / #530). It also adds the reporter's exact
+  timer sequence as a regression test: on current main, `--full --force-rebuild`, then
+  `--watch-once` over 11 new sessions, then a plain index appends without rebuilding.
+- The archive lease path drops std's `\\?\` spelling on Windows (txc9h; native Windows red
+  then green on wlap).
+- The resident daemon's periodic index runs at its own interval again (#514/#515: two red
+  daemon process tests go green).
+- The `franken_sync` regression test shows that a cancelled `BEGIN IMMEDIATE` waiting on
+  another writer returns `Abort` promptly. This rules out the engine as the cause of the
+  remaining #515 migration-shutdown failure.
+
+Limits: no macOS run (the host is full), no browser run, no run on a damaged archive, no
+full 320-target sweep (fleet disks), and the host archive was observed, not repaired.
 
 ## Assessment: 2026-10-14 (Antigravity)
 
