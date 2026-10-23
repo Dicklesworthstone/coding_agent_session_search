@@ -298,13 +298,33 @@ pub fn source_scan_is_due(completed_at_ms: Option<i64>, now_ms: i64, threshold: 
     Duration::from_millis(u64::try_from(elapsed_ms).unwrap_or(u64::MAX)) >= threshold
 }
 
-/// Daemon/read-path helper using the same configurable source-scan cadence as
-/// the freshness policy. This is a metadata read only; it performs no scan.
-pub fn source_scan_due_for_db(db_path: &Path) -> bool {
+/// How recent another source scan must be for the resident daemon to skip a
+/// periodic index tick. The read-path cadence caps it, but the daemon's own
+/// `CASS_DAEMON_INDEX_INTERVAL_SECS` bounds it too: a 60 s interval must not
+/// silently become the 300 s read-path cadence, and
+/// `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS=0`, which disables only the read-path
+/// cadence, must not stop the daemon. Half the interval leaves room for the
+/// daemon's own previous child to finish without its scan making the next
+/// tick look redundant.
+pub fn daemon_source_scan_freshness_window(
+    daemon_interval: Duration,
+    source_scan_interval: Duration,
+) -> Duration {
+    let own = daemon_interval / 2;
+    if source_scan_interval.is_zero() {
+        own
+    } else {
+        source_scan_interval.min(own)
+    }
+}
+
+/// Daemon helper: is a periodic index pass due, given the canonical
+/// source-scan watermark? This is a metadata read only; it performs no scan.
+pub fn source_scan_due_for_daemon(db_path: &Path, daemon_interval: Duration) -> bool {
     source_scan_is_due(
         source_scan_completed_at_ms_from_db(db_path),
         now_ms(),
-        source_scan_interval_from_env(),
+        daemon_source_scan_freshness_window(daemon_interval, source_scan_interval_from_env()),
     )
 }
 

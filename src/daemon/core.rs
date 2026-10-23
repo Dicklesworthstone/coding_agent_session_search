@@ -433,7 +433,7 @@ impl ModelDaemon {
         // A foreground/scheduled/no-op scan may have completed since the
         // daemon's last tick without publishing a new lexical generation. The
         // canonical last_scan_ts is the authority for source-discovery age.
-        if !background_refresh::source_scan_due_for_db(&db_path) {
+        if !background_refresh::source_scan_due_for_daemon(&db_path, self.config.index_interval) {
             info!("daemon periodic index skipped: source scan is still fresh");
             return;
         }
