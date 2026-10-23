@@ -11,6 +11,11 @@ use anyhow::{Context, Result, ensure};
 pub(super) const MAX_ROWS: usize = 64;
 pub(super) const MAX_CONTENT_BYTES: usize = 1024 * 1024;
 
+/// Admission reads only identities, order keys and sizes.
+const IDENTITY_COLUMNS: &str = "id, idx, length(CAST(content AS BLOB))";
+/// Admitted rows are then read whole, in the shape [`decode`] expects.
+const BODY_COLUMNS: &str = "id, idx, role, author, created_at, content";
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Limits {
     pub(super) rows: usize,
@@ -64,24 +69,73 @@ pub(super) fn decode(row: &Row) -> Result<Message, FrankenError> {
 }
 
 fn query(cursor: Option<Cursor>, indexed: bool, projection: &str) -> String {
-    let hint = if indexed {
-        " INDEXED BY sqlite_autoindex_messages_1"
-    } else {
-        ""
-    };
-    // idx >= provides the composite-index lower bound. The second predicate
-    // keeps a stable id tie-break for permissive legacy schemas. No cursor+1
+    // The hinted index is UNIQUE(conversation_id, idx), so idx alone orders a
+    // conversation and `idx > ?2` resumes after the cursor. Keep it that way:
+    // FrankenSQLite 0.4.12 plans this hint with `ORDER BY idx, id` as a scan of
+    // the whole table plus a sort (GH #534: ~2 GB read per conversation; 80 ms
+    // instead of 1.3 ms per page on a 10k-row table). Permissive legacy
+    // schemas without the index keep the id tie-break: idx >= gives the lower
+    // bound and the second predicate orders duplicate idx values. No cursor+1
     // arithmetic, OFFSET, or conversation-wide body collection is needed.
-    let after = if cursor.is_some() {
-        " AND idx >= ?2 AND (idx > ?2 OR id > ?3)"
-    } else {
-        ""
+    let (hint, order, after, limit) = match (indexed, cursor.is_some()) {
+        (true, false) => (" INDEXED BY sqlite_autoindex_messages_1", "idx", "", "?2"),
+        (true, true) => (
+            " INDEXED BY sqlite_autoindex_messages_1",
+            "idx",
+            " AND idx > ?2",
+            "?3",
+        ),
+        (false, false) => ("", "idx, id", "", "?2"),
+        (false, true) => (
+            "",
+            "idx, id",
+            " AND idx >= ?2 AND (idx > ?2 OR id > ?3)",
+            "?4",
+        ),
     };
-    let limit = if cursor.is_some() { "?4" } else { "?2" };
     format!(
         "SELECT {projection} FROM messages{hint}
-         WHERE conversation_id = ?1{after} ORDER BY idx, id LIMIT {limit}"
+         WHERE conversation_id = ?1{after} ORDER BY {order} LIMIT {limit}"
     )
+}
+
+/// Whether `messages` carries the UNIQUE(conversation_id, idx) autoindex the
+/// indexed page shape relies on. Read from the schema rather than inferred
+/// from an `INDEXED BY` error: FrankenSQLite 0.4.12 rejects a missing hinted
+/// index for `ORDER BY idx, id` but silently scans for `ORDER BY idx`, and on a
+/// table without the constraint the indexed shape's `idx > ?2` cursor would
+/// skip rows that share an idx. A failed lookup takes the legacy shape, which
+/// is correct on any schema.
+fn unique_conversation_index(connection: &Connection) -> bool {
+    let mut columns: Vec<String> = Vec::new();
+    connection
+        .query_with_params_for_each(
+            "PRAGMA index_info(sqlite_autoindex_messages_1)",
+            &[],
+            |row| {
+                columns.push(row.get_typed(2)?);
+                Ok(())
+            },
+        )
+        .is_ok_and(|()| columns == ["conversation_id", "idx"])
+}
+
+/// The values [`query`] binds for the same `cursor` and `indexed`.
+fn bound_values(
+    conversation_id: i64,
+    cursor: Option<Cursor>,
+    indexed: bool,
+    limit: usize,
+) -> Vec<SqliteValue> {
+    let mut params = vec![SqliteValue::from(conversation_id)];
+    if let Some(cursor) = cursor {
+        params.push(SqliteValue::from(cursor.idx));
+        if !indexed {
+            params.push(SqliteValue::from(cursor.id));
+        }
+    }
+    params.push(SqliteValue::from(limit as i64));
+    params
 }
 
 fn read_page(
@@ -99,18 +153,14 @@ fn read_page(
         (1..=MAX_CONTENT_BYTES).contains(&limits.content_bytes),
         "invalid semantic replay content budget"
     );
-    let mut params = vec![SqliteValue::from(conversation_id)];
-    if let Some(cursor) = cursor {
-        params.extend([SqliteValue::from(cursor.idx), SqliteValue::from(cursor.id)]);
-    }
-    params.push(SqliteValue::from(limits.rows as i64));
     // The byte count is UTF-8 bytes, not Unicode code points. Only IDs, order
     // keys and sizes leave SQLite during admission, not rejected message text.
     let identities = loop {
         let mut identities = Vec::with_capacity(limits.rows);
         let mut last = cursor;
         let mut saw_row = false;
-        let sql = query(cursor, *indexed, "id, idx, length(CAST(content AS BLOB))");
+        let sql = query(cursor, *indexed, IDENTITY_COLUMNS);
+        let params = bound_values(conversation_id, cursor, *indexed, limits.rows);
         let result = connection.query_with_params_for_each(&sql, &params, |row| {
             saw_row = true;
             if identities.len() >= limits.rows {
@@ -173,16 +223,10 @@ fn read_page(
     }
     let exhausted = count == identities.len() && identities.len() < limits.rows;
     let mut messages = Vec::with_capacity(count);
-    let limit_index = params.len() - 1;
-    params[limit_index] = SqliteValue::from(count as i64);
     connection
         .query_with_params_for_each(
-            &query(
-                cursor,
-                *indexed,
-                "id, idx, role, author, created_at, content",
-            ),
-            &params,
+            &query(cursor, *indexed, BODY_COLUMNS),
+            &bound_values(conversation_id, cursor, *indexed, count),
             |row| {
                 if messages.len() >= count {
                     return Err(FrankenError::Internal(
@@ -238,7 +282,7 @@ fn messages_with_limits(
     consume: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
     let mut cursor = None;
-    let mut indexed = true;
+    let mut indexed = unique_conversation_index(connection);
     loop {
         let Page {
             messages,

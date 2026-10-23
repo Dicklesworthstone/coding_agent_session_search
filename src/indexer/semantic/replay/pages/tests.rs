@@ -47,7 +47,8 @@ fn body_admission_uses_utf8_bytes_and_keeps_one_oversized_message_whole() -> Res
             content_bytes: 8,
         };
         let mut cursor = None;
-        let mut use_index = true;
+        let mut use_index = unique_conversation_index(&connection);
+        assert_eq!(use_index, indexed);
         let mut admitted = Vec::new();
         let mut all = Vec::new();
         loop {
@@ -160,7 +161,8 @@ fn malformed_unadmitted_body_is_not_read_and_later_sql_errors_remain_typed() -> 
         insert(&connection, 1, 0, "four")?;
         insert(&connection, 2, 1, "eightxxx")?;
         connection.execute("UPDATE messages SET role = X'00' WHERE id = 2")?;
-        let mut use_index = true;
+        let mut use_index = unique_conversation_index(&connection);
+        assert_eq!(use_index, indexed);
         let first = read_page(
             &connection,
             7,
@@ -327,6 +329,108 @@ fn empty_data_limits_and_errors_never_turn_into_successful_partial_replay() -> R
     connection.execute("ALTER TABLE messages RENAME TO retained_messages")?;
     let error = messages(&connection, 7, &mut |_| Ok(())).unwrap_err();
     assert!(error.downcast_ref::<FrankenError>().is_some());
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+/// GH #534: on the cass schema every replay page query is a seek on the
+/// (conversation_id, idx) key. FrankenSQLite 0.4.12 planned the previous
+/// hinted `ORDER BY idx, id` shape as `SCAN messages` plus a temp B-tree and
+/// read the whole table for every page (10k rows: 80 ms per page against
+/// 1.3 ms for the seek; about 2 GB per conversation on the reporter's
+/// archive). Any page shape that scans or sorts fails here. Paging over one
+/// conversation of a populated table still returns exactly its messages in
+/// idx order across cursor pages. The indexed shape is chosen from the schema:
+/// only an autoindex on exactly (conversation_id, idx) qualifies, because the
+/// engine does not reject the hint for a missing index in this shape and its
+/// `idx >` cursor is wrong without the uniqueness.
+#[test]
+fn gh534_replay_page_queries_seek_the_conversation_key() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let unindexed = database(&temp.path().join("unindexed.db"), false)?;
+    assert!(!unique_conversation_index(&unindexed));
+    unindexed.close_without_checkpoint()?;
+    let reversed = Connection::open(
+        temp.path()
+            .join("reversed.db")
+            .to_string_lossy()
+            .into_owned(),
+    )?;
+    reversed.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER,
+         idx INTEGER, role TEXT, author TEXT, created_at INTEGER, content TEXT,
+         UNIQUE(idx, conversation_id))",
+    )?;
+    assert!(!unique_conversation_index(&reversed));
+    reversed.close_without_checkpoint()?;
+
+    let connection = database(&temp.path().join("gh534.db"), true)?;
+    assert!(unique_conversation_index(&connection));
+    connection.execute("BEGIN")?;
+    let mut id = 1i64;
+    for conversation in 1..=40i64 {
+        for idx in 0..8i64 {
+            connection.execute_compat(
+                "INSERT INTO messages VALUES (?1, ?2, ?3, 'user', NULL, 1, 'body')",
+                &[
+                    ParamValue::from(id),
+                    ParamValue::from(conversation),
+                    ParamValue::from(idx),
+                ],
+            )?;
+            id += 1;
+        }
+    }
+    connection.execute("COMMIT")?;
+    // Conversation 21 holds ids 161..=168 at idx 0..=7.
+    let cursor = Some(Cursor { idx: 3, id: 164 });
+    for (label, cursor, projection) in [
+        ("identity, first page", None, IDENTITY_COLUMNS),
+        ("identity, cursor page", cursor, IDENTITY_COLUMNS),
+        ("body, first page", None, BODY_COLUMNS),
+        ("body, cursor page", cursor, BODY_COLUMNS),
+    ] {
+        let mut plan: Vec<String> = Vec::new();
+        connection.query_with_params_for_each(
+            &format!("EXPLAIN QUERY PLAN {}", query(cursor, true, projection)),
+            &bound_values(21, cursor, true, MAX_ROWS),
+            |row| {
+                plan.push(row.get_typed(3)?);
+                Ok(())
+            },
+        )?;
+        assert!(
+            plan.iter().any(|detail| detail.starts_with(
+                "SEARCH messages USING INDEX sqlite_autoindex_messages_1 (conversation_id=?"
+            )),
+            "{label}: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.starts_with("SCAN") || detail.contains("TEMP B-TREE")),
+            "{label}: {plan:?}"
+        );
+    }
+    let mut seen = Vec::new();
+    messages_with_limits(
+        &connection,
+        21,
+        Limits {
+            rows: 3,
+            content_bytes: MAX_CONTENT_BYTES,
+        },
+        &mut |message| {
+            seen.push((message.id, message.idx));
+            Ok(())
+        },
+    )?;
+    assert_eq!(
+        seen,
+        (0..8i64)
+            .map(|idx| (Some(161 + idx), idx))
+            .collect::<Vec<_>>()
+    );
     connection.close_without_checkpoint()?;
     Ok(())
 }
