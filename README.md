@@ -7,7 +7,6 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
 ![Rust](https://img.shields.io/badge/Rust-pinned%20nightly-orange.svg)
 ![Status](https://img.shields.io/badge/status-alpha-purple.svg)
-[![Coverage](https://codecov.io/gh/Dicklesworthstone/coding_agent_session_search/branch/main/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/coding_agent_session_search)
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
@@ -579,17 +578,19 @@ When the wizard installs `cass` on remote machines, it tries every viable method
 | 3 | **cargo install** | ~5min | Rust toolchain, 1GB disk, 2GB RAM |
 | 4 | **Full bootstrap** | ~10min | curl, 1GB disk, 2GB RAM (installs rustup) |
 
-> **crates.io publishing resumed at 0.7.0 (GH#416):** the long-stale
-> registry gap (0.6.13, published before the Quill/OMP era) is closed — the
-> entire dependency chain now resolves from crates.io (`frankensearch
-> 0.4.0`, the `frankentorch-*` family, `frankenhnsw`), so
-> `cargo install coding-agent-search` builds the current line again. The
-> installer and GitHub Release binaries remain the fastest paths.
+> **crates.io lags the releases:** the newest version on crates.io is 0.7.0
+> (2026-08-25), so `cargo install coding-agent-search` builds 0.7.0. Later
+> versions depend on `franken-agent-detection` at a git revision, and crates.io
+> does not accept git dependencies, so they cannot be published there until FAD
+> is (bead zztql). Use the installer or the GitHub Release binaries for a
+> current version. The same gap affects the wizard's methods 1, 3 and 4: each
+> asks crates.io for the exact local version (`coding-agent-search@<version>`),
+> so for a version newer than 0.7.0 only the pre-built binary method can succeed.
 
 **Resource Requirements**:
 - Minimum 1GB disk space for installation
 - Recommended 2GB RAM for compilation
-- Linux pre-built binaries require glibc 2.38+ on conventional FHS-style distributions; older glibc, musl-only, and NixOS hosts fall back to source installation when possible.
+- Linux pre-built binaries require glibc 2.28+ on conventional FHS-style distributions (see *System Requirements*); older glibc, musl-only, and NixOS hosts fall back to source installation when possible.
 - SSH access with key-based authentication
 
 **What Gets Installed**:
@@ -2456,47 +2457,15 @@ classDiagram
  +messages Vec~NormalizedMessage~
  }
 
- Connector <|-- CodexConnector
- Connector <|-- ClineConnector
  Connector <|-- ClaudeCodeConnector
- Connector <|-- GeminiConnector
- Connector <|-- ClawdbotConnector
- Connector <|-- VibeConnector
- Connector <|-- OpenCodeConnector
- Connector <|-- AmpConnector
+ Connector <|-- CodexConnector
  Connector <|-- CursorConnector
- Connector <|-- ChatGptConnector
- Connector <|-- AiderConnector
- Connector <|-- PiAgentConnector
- Connector <|-- FactoryConnector
- Connector <|-- CopilotConnector
- Connector <|-- CopilotCliConnector
- Connector <|-- OpenClawConnector
- Connector <|-- CrushConnector
- Connector <|-- HermesConnector
- Connector <|-- KimiConnector
- Connector <|-- QwenConnector
 
- CodexConnector ..> NormalizedConversation : emits
- ClineConnector ..> NormalizedConversation : emits
  ClaudeCodeConnector ..> NormalizedConversation : emits
- GeminiConnector ..> NormalizedConversation : emits
- ClawdbotConnector ..> NormalizedConversation : emits
- VibeConnector ..> NormalizedConversation : emits
- OpenCodeConnector ..> NormalizedConversation : emits
- AmpConnector ..> NormalizedConversation : emits
+ CodexConnector ..> NormalizedConversation : emits
  CursorConnector ..> NormalizedConversation : emits
- ChatGptConnector ..> NormalizedConversation : emits
- AiderConnector ..> NormalizedConversation : emits
- PiAgentConnector ..> NormalizedConversation : emits
- FactoryConnector ..> NormalizedConversation : emits
- CopilotConnector ..> NormalizedConversation : emits
- CopilotCliConnector ..> NormalizedConversation : emits
- OpenClawConnector ..> NormalizedConversation : emits
- CrushConnector ..> NormalizedConversation : emits
- HermesConnector ..> NormalizedConversation : emits
- KimiConnector ..> NormalizedConversation : emits
- QwenConnector ..> NormalizedConversation : emits
+
+ note "34 connectors are registered at runtime; cass capabilities --json lists them"
 ```
 
 - **Polymorphic Scanning**: The indexer runs connector factories in parallel via rayon, creating fresh `Box<dyn Connector>` instances that are unaware of each other's underlying file formats (JSONL, SQLite, specialized JSON).
@@ -2524,27 +2493,12 @@ flowchart LR
  classDef pastel4 fill:#fff7e6,stroke:#f2c27f,color:#4d350f;
  classDef pastel5 fill:#ffeef2,stroke:#f5b0c2,color:#4d1f2c;
 
- subgraph Sources["Local Sources"]
- A1[Codex]:::pastel
- A2[Cline]:::pastel
- A3[Gemini]:::pastel
- A4[Claude]:::pastel
- A5[OpenCode]:::pastel
- A6[Amp]:::pastel
- A7[Cursor]:::pastel
- A8[ChatGPT]:::pastel
- A9[Aider]:::pastel
- A10[Pi-Agent]:::pastel
- A11[Factory]:::pastel
- A12[Copilot Chat]:::pastel
- A13[Copilot CLI]:::pastel
- A14[OpenClaw]:::pastel
- A15[Clawdbot]:::pastel
- A16[Vibe]:::pastel
- A17[Crush]:::pastel
- A18[Hermes]:::pastel
- A19[Kimi]:::pastel
- A20[Qwen]:::pastel
+ subgraph Sources["Local Sources (34 connectors)"]
+ A1[Claude Code]:::pastel
+ A2[Codex]:::pastel
+ A3[Cursor]:::pastel
+ A4[Gemini]:::pastel
+ A5["… 30 more\n(cass capabilities --json)"]:::pastel
  end
 
  subgraph Remote["Remote Sources"]
@@ -2572,21 +2526,6 @@ flowchart LR
  A3 --> C1
  A4 --> C1
  A5 --> C1
- A6 --> C1
- A7 --> C1
- A8 --> C1
- A9 --> C1
- A10 --> C1
- A11 --> C1
- A12 --> C1
- A13 --> C1
- A14 --> C1
- A15 --> C1
- A16 --> C1
- A17 --> C1
- A18 --> C1
- A19 --> C1
- A20 --> C1
  R1 --> R2
  R2 --> R3
  R3 --> C1
@@ -2735,7 +2674,7 @@ Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sql
   - Conversation rows are updated as they grow: end time, last message index, token summaries, title and metadata.
   - Deduplication, `forget` and purge delete rows.
 - **Deduplication**: messages are keyed by `UNIQUE(conversation_id, idx)`. New conversations are written with batched plain `INSERT`s, with the unique index as the backstop. Appends to a known conversation use `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice. BLAKE3 content hashes are used only in memory, as merge fingerprints.
-- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v21, so a new database records versions 13–21. The v1–v12 SQL is compiled only into tests.
+- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v22, so a new database records versions 13–22. The v1–v12 SQL is compiled only into tests.
 
 ---
 
@@ -2815,7 +2754,7 @@ This means corrupted lexical data is a repairable derivative-state problem. Oper
 
 ### Database Schema Migrations
 
-The SQLite database uses 21 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 21` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
+The SQLite database uses 22 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 22` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
 
 | Version | Migration | Version | Migration |
 |---------|-----------|---------|-----------|
@@ -2828,8 +2767,8 @@ The SQLite database uses 21 versioned schema migrations, tracked in the `_schema
 | 7 | `msgpack_columns` | 18 | `conversation_tail_state_hot_table` |
 | 8 | `daily_stats` | 19 | `conversation_external_lookup` |
 | 9 | `embedding_jobs` | 20 | `conversation_external_tail_lookup` |
-| 10 | `token_analytics` | 21 | `conversation_context_index` (current) |
-| 11 | `message_metrics` | | |
+| 10 | `token_analytics` | 21 | `conversation_context_index` |
+| 11 | `message_metrics` | 22 | `forgotten_sources` (current) |
 
 **Migration Process**:
 1. On startup, `cass` checks `_schema_migrations` in the database (older databases that still record `schema_version` in the `meta` table are transitioned automatically)
@@ -3831,25 +3770,11 @@ opt-level = 3           # Maximum runtime optimization
 - LTO and a single codegen unit prioritize runtime optimization at the cost of build time
 - No stack traces on panic (use debug builds for development)
 
-### CI Pipeline & Artifacts
+### Verification and Release Pipeline
 
-**Note:** GitHub Actions workflows under `.github/workflows/` are permanently disabled (`NO GH ACTIONS, PERIOD!`); verification runs through `rch` via `scripts/gate.sh` (fmt, clippy `-D warnings`, lib and integration tests, goldens, and UBS scan), and cross-platform builds and releases run through `/dsr` (`dsr health all`, `dsr build`, `dsr release`, `dsr fallback`):
+This repository has no GitHub Actions: `.github/workflows/` stays empty, `scripts/gate.sh` refuses to run on a tree that carries a workflow file, and `tests/no_github_actions.rs` fails on one. Verification runs on the `rch` build fleet through `scripts/gate.sh`, in one fleet admission. Its stages are source identity and freshness, `cargo fmt --check`, `clippy --all-targets -D warnings`, the lib build and tests, the selected integration targets, the `cass` binary's own tests, the golden-file contracts and a UBS scan of the changed files. Each stage prints a `STAGE=<name> EXIT=<code>` receipt line, and commits and bead closures cite those lines. `--lib-filter`, `--integration name:filter,...`, `--no-lib` and `--no-bin` narrow a run.
 
-| Job | Purpose | Artifacts |
-|-----|---------|-----------|
-| `check` | fmt, clippy, tests, benches, UBS scan | None |
-| `e2e` | Integration tests (install, index, filters) | `test-artifacts-e2e` (traces, logs) |
-| `coverage` | Code coverage with llvm-cov | `coverage-report` (lcov.info, summary) |
-
-**Coverage Reports:**
-- `lcov.info` - LCOV format for tools like codecov
-- `coverage-summary.txt` - Human-readable summary
-- Coverage % shown in GitHub Actions step summary
-
-**Test Artifacts:**
-- Trace files from `--trace-file` runs
-- Test run summary logs
-- Retained for 7 days (e2e) / 30 days (coverage)
+Cross-platform builds and releases run through `dsr` (`dsr health all`, `dsr build`, `dsr release`, `dsr fallback`); native Windows and macOS checks run on its build hosts. No coverage report is published; generate one locally:
 
 ```bash
 # Generate coverage through rch
