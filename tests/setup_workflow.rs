@@ -573,20 +573,22 @@ mod retry {
                     system_info: Some(SystemInfo {
                         os: "linux".into(),
                         arch: "x86_64".into(),
-                        distro: Some("Ubuntu 22.04".into()),
+                        // glibc 2.27 gets no pre-built binary (no checksum
+                        // request) and wget without curl gets no bootstrap: the
+                        // only install candidate is the source build over the
+                        // refusing SSH.
+                        distro: Some("Ubuntu 18.04".into()),
                         has_cargo: true,
                         has_cargo_binstall: false,
-                        // No checksum HTTP requests or bootstrap downloads: the
-                        // only install candidate is cargo over the refusing SSH.
                         has_curl: false,
-                        has_wget: false,
+                        has_wget: true,
                         remote_home: "/home/developer".into(),
                         machine_id: None,
                     }),
                     resources: Some(ResourceInfo {
-                        disk_available_mb: 8192,
-                        memory_total_mb: 8192,
-                        memory_available_mb: 4096,
+                        disk_available_mb: 16384,
+                        memory_total_mb: 16384,
+                        memory_available_mb: 8192,
                         can_compile: true,
                     }),
                     error: None,

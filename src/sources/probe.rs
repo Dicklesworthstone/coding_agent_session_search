@@ -201,11 +201,26 @@ pub struct ResourceInfo {
 }
 
 impl ResourceInfo {
-    /// Minimum disk space (MB) recommended for cass installation.
+    /// Minimum free home-directory disk (MB) for any installation; the
+    /// pre-built binary is about 100 MB.
     pub const MIN_DISK_MB: u64 = 1024; // 1 GB
 
-    /// Minimum memory (MB) recommended for compilation.
-    pub const MIN_MEMORY_MB: u64 = 2048; // 2 GB
+    /// Minimum free home-directory disk (MB) for a source build. Building
+    /// v0.10.0 from its tag on a fresh host (2026-10-23, hz4) used 1.5 GB for
+    /// the pinned toolchain, 0.8 GB for cargo's registry, git checkouts and the
+    /// binary, and a 2.6 GB peak build tree: 4.9 GB.
+    pub const MIN_COMPILE_DISK_MB: u64 = 6 * 1024;
+
+    /// Minimum total memory (MB) for a source build. The same build peaked at
+    /// 8.6 GB of rustc RSS with the thin LTO the installer uses (10.9 GB with
+    /// the release profile's fat LTO).
+    pub const MIN_MEMORY_MB: u64 = 10 * 1024;
+
+    /// Whether a host with this much free home-directory disk and total
+    /// memory can run the source build.
+    pub fn fits_source_build(disk_available_mb: u64, memory_total_mb: u64) -> bool {
+        disk_available_mb >= Self::MIN_COMPILE_DISK_MB && memory_total_mb >= Self::MIN_MEMORY_MB
+    }
 }
 
 fn shell_single_quote_arg(value: &str) -> String {
@@ -636,8 +651,7 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
                 disk_available_mb: disk_mb,
                 memory_total_mb: mem_total_mb,
                 memory_available_mb: mem_avail_mb,
-                can_compile: disk_mb >= ResourceInfo::MIN_DISK_MB
-                    && mem_total_mb >= ResourceInfo::MIN_MEMORY_MB,
+                can_compile: ResourceInfo::fits_source_build(disk_mb, mem_total_mb),
             })
         } else {
             None
@@ -1489,7 +1503,7 @@ CASS_VERSION=0.4.2
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
         let res = result.resources.as_ref().expect("resources");
-        let expected = res.disk_available_mb >= ResourceInfo::MIN_DISK_MB
+        let expected = res.disk_available_mb >= ResourceInfo::MIN_COMPILE_DISK_MB
             && res.memory_total_mb >= ResourceInfo::MIN_MEMORY_MB;
         assert_eq!(
             res.can_compile, expected,

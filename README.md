@@ -573,23 +573,32 @@ When the wizard installs `cass` on remote machines, it tries every viable method
 
 | Priority | Method | Speed | Requirements |
 |----------|--------|-------|--------------|
-| 1 | **cargo-binstall** | ~30s | `cargo-binstall` pre-installed, compatible release binary |
-| 2 | **Pre-built binary** | ~10s | curl/wget, GitHub access, compatible release binary |
-| 3 | **cargo install** | ~5min | Rust toolchain, 1GB disk, 2GB RAM |
-| 4 | **Full bootstrap** | ~10min | curl, 1GB disk, 2GB RAM (installs rustup) |
+| 1 | **Pre-built binary** | ~10s | curl/wget, GitHub access, compatible release binary |
+| 2 | **Source build** | ~30 min | rustup and cargo, curl/wget, 6GB free disk in `$HOME`, 10GB RAM |
+| 3 | **Full bootstrap** | ~30 min | curl, 6GB free disk in `$HOME`, 10GB RAM (installs rustup, then builds as in 2) |
+
+The source build does what `install.sh --from-source` does: it downloads the
+release tag's source archive into `$HOME`, installs the Rust toolchain that
+tag's `rust-toolchain.toml` pins (a dated nightly; cass does not build on
+stable), and runs `cargo install --locked --path . --bin cass` inside it, so the
+binary lands in `~/.cargo/bin/cass`. The unpacked tree is removed afterwards. It
+does not use crates.io. It builds with thin LTO instead of the release
+profile's fat LTO, so the binary is somewhat larger and slower than the
+published one. Measured building v0.10.0 on a fresh account (two build jobs):
+28 minutes, 8.6 GB peak compiler memory (10.9 GB and 36 minutes with fat LTO),
+1.5 GB toolchain, 0.8 GB cargo cache and a 2.6 GB build tree. The wizard
+offers it only to hosts above those floors.
 
 > **crates.io lags the releases:** the newest version on crates.io is 0.7.0
 > (2026-08-25), so `cargo install coding-agent-search` builds 0.7.0. Later
 > versions depend on `franken-agent-detection` at a git revision, and crates.io
 > does not accept git dependencies, so they cannot be published there until FAD
 > is (bead zztql). Use the installer or the GitHub Release binaries for a
-> current version. The same gap affects the wizard's methods 1, 3 and 4: each
-> asks crates.io for the exact local version (`coding-agent-search@<version>`),
-> so for a version newer than 0.7.0 only the pre-built binary method can succeed.
+> current version.
 
 **Resource Requirements**:
-- Minimum 1GB disk space for installation
-- Recommended 2GB RAM for compilation
+- Minimum 1GB free disk in `$HOME` for the pre-built binary
+- 6GB free disk in `$HOME` and 10GB RAM for a source build
 - Linux pre-built binaries require glibc 2.28+ on conventional FHS-style distributions (see *System Requirements*); older glibc, musl-only, and NixOS hosts fall back to source installation when possible.
 - SSH access with key-based authentication
 
