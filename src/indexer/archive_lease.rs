@@ -59,7 +59,11 @@ fn resolve_database_path(db_path: &Path, create_parents: bool) -> io::Result<Pat
         if create_parents {
             fs::create_dir_all(parent)?;
         }
-        match fs::canonicalize(&unresolved) {
+        // dunce, not std: this path also names the index-run lock's db_path
+        // and the IndexRunBusy error, and std spells it `\\?\C:\...` on
+        // Windows (txc9h). Both spellings name the same lease file, and lock
+        // readers compare through path_identities_match.
+        match dunce::canonicalize(&unresolved) {
             Ok(resolved) => return Ok(resolved),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -73,9 +77,9 @@ fn resolve_database_path(db_path: &Path, create_parents: bool) -> io::Result<Pat
                     parent.join(target)
                 };
             }
-            Ok(_) => return Ok(fs::canonicalize(parent)?.join(name)),
+            Ok(_) => return Ok(dunce::canonicalize(parent)?.join(name)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(fs::canonicalize(parent)?.join(name));
+                return Ok(dunce::canonicalize(parent)?.join(name));
             }
             Err(error) => return Err(error),
         }
@@ -128,6 +132,46 @@ impl ArchiveWriteLease {
             Err(std::fs::TryLockError::WouldBlock) => Ok(ArchiveLeaseAttempt::Busy(path)),
             Err(std::fs::TryLockError::Error(error)) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod path_spelling_tests {
+    use super::*;
+
+    /// txc9h: the resolved archive path is what the index-run lock records as
+    /// db_path and what IndexRunBusy prints, so on Windows it must not carry
+    /// std's verbatim `\\?\` prefix, for a new or an existing archive.
+    #[test]
+    fn archive_paths_use_the_plain_spelling_for_new_and_existing_archives() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing = temp.path().join("nested").join("archive.db");
+        let existing = temp.path().join("existing.db");
+        fs::write(&existing, b"")?;
+        for db_path in [&missing, &existing] {
+            let resolved = resolve_database_path(db_path, true)?;
+            assert!(
+                !resolved.as_os_str().to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                resolved.display()
+            );
+            let (Some(parent), Some(name)) = (db_path.parent(), db_path.file_name()) else {
+                return Err(io::Error::other("test archive path has no parent or name"));
+            };
+            assert_eq!(resolved, dunce::canonicalize(parent)?.join(name));
+            match ArchiveWriteLease::try_acquire(db_path)? {
+                ArchiveLeaseAttempt::Acquired(lease) => {
+                    assert_eq!(lease.database_path(), resolved.as_path());
+                }
+                ArchiveLeaseAttempt::Busy(path) => {
+                    return Err(io::Error::other(format!(
+                        "an uncontended archive lease reported busy at {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
