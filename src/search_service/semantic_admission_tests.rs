@@ -1,7 +1,7 @@
 //! Exercise semantic invalidation against real canonical/vector readers and
 //! the actual one-slot OS-lock pool. No model download or HTTP server is needed.
 
-use super::super::admission::{Pool, Refusal as PoolRefusal};
+use super::super::admission::{Pool, Refusal as PoolRefusal, acquire_after_release};
 use super::*;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::tantivy::TantivyIndex;
@@ -171,7 +171,7 @@ fn invalidated_semantic_only_worker_hands_capacity_to_a_peer_without_unload() ->
     assert_eq!(session.semantic.queries_attempted, 1);
     assert_eq!(session.semantic.admission_retry.failures, 0);
     peer.unload();
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     Ok(())
 }
 
@@ -185,7 +185,7 @@ fn failed_hybrid_fallback_releases_capacity_after_both_readers_are_gone() -> Res
     assert!(session.semantic.client.is_none());
     assert!(session.client.is_none());
     assert!(session.reader_lease.is_none());
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     assert!(
         !session.index.exists(),
         "failure must not create a lexical index"
@@ -209,7 +209,7 @@ fn successful_hybrid_fallback_keeps_its_lexical_owner_admitted() -> Result<()> {
     assert_eq!(result["snapshot"]["reader_admission"]["lease_held"], true);
     assert!(matches!(pool.acquire(), Err(PoolRefusal::Busy)));
     session.unload();
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     Ok(())
 }
 
@@ -230,7 +230,7 @@ fn semantic_refusal_does_not_release_a_preexisting_lexical_reader_slot() -> Resu
     assert!(matches!(pool.acquire(), Err(PoolRefusal::Busy)));
     assert!(lexical_query(&mut session).ok);
     session.unload();
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     Ok(())
 }
 
@@ -246,7 +246,7 @@ fn cold_semantic_admission_failure_leaves_no_reader_slot_reserved() -> Result<()
     assert!(session.semantic.client.is_none());
     assert!(session.client.is_none());
     assert!(session.reader_lease.is_none());
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     assert!(!session.archive.as_ref().unwrap().exists());
     Ok(())
 }
@@ -323,7 +323,7 @@ fn failed_cold_admission_backs_off_before_pool_access_and_unload_clears_it() -> 
     assert!(!semantic_query(&mut session, "semantic").ok);
     assert_eq!(session.semantic.load_attempts, 2);
     assert_eq!(session.semantic.admission_retry.failures, 1);
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     assert!(!session.archive.as_ref().unwrap().exists());
     Ok(())
 }
@@ -337,7 +337,7 @@ fn expired_admission_retry_loads_repaired_vectors_and_clears_the_failure() -> Re
     assert!(!semantic_query(&mut session, "semantic").ok);
     assert_eq!(session.semantic.admission_retry.failures, 1);
     assert_eq!(session.semantic.load_attempts, 1);
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     std::fs::rename(&retained, &vector)?;
     session.semantic.admission_retry.failed_at = Some(
         Instant::now()
@@ -353,7 +353,7 @@ fn expired_admission_retry_loads_repaired_vectors_and_clears_the_failure() -> Re
     assert!(session.semantic.last_failure.is_none());
     assert!(matches!(pool.acquire(), Err(PoolRefusal::Busy)));
     session.unload();
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     Ok(())
 }
 
@@ -384,6 +384,6 @@ fn hybrid_uses_retained_lexical_results_during_semantic_admission_backoff() -> R
     assert_eq!(session.semantic.last_failure.as_ref(), Some(&original));
     assert!(matches!(pool.acquire(), Err(PoolRefusal::Busy)));
     session.unload();
-    drop(pool.acquire()?);
+    drop(acquire_after_release(&pool)?);
     Ok(())
 }

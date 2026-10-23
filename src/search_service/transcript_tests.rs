@@ -337,7 +337,7 @@ fn transcript_service_releases_its_temporary_admission_after_success_and_failure
     assert_eq!(session.canonical_read_attempts, 0);
     drop(held);
     assert!(session.handle(wire(None, 1)?).0.ok);
-    drop(pool.acquire()?);
+    drop(admission::acquire_after_release(&pool)?);
     let cursor = Cursor {
         message_id: 99,
         message_index: 1,
@@ -349,7 +349,7 @@ fn transcript_service_releases_its_temporary_admission_after_success_and_failure
         failed.error.context("error")?.kind,
         "canonical_cursor_changed"
     );
-    drop(pool.acquire()?);
+    drop(admission::acquire_after_release(&pool)?);
     assert_eq!(session.canonical_read_attempts, 2);
     assert_eq!(session.canonical_reads_completed, 1);
     assert_eq!(session.open_attempts, 0);

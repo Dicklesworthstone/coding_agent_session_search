@@ -463,7 +463,7 @@ fn semantic_service_shares_one_admission_slot_with_hybrid_and_canonical_view() -
     assert!(pool.acquire().is_err());
     session.unload();
     assert!(
-        pool.acquire().is_ok(),
+        admission::acquire_after_release(&pool).is_ok(),
         "unload must release every native owner before the slot"
     );
     Ok(())
@@ -756,7 +756,7 @@ fn failed_index_admission_releases_the_reserved_slot() -> Result<()> {
             .as_bool()
             .unwrap()
     );
-    drop(pool.acquire()?);
+    drop(admission::acquire_after_release(&pool)?);
     assert!(!session.index.exists());
     Ok(())
 }
