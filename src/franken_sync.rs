@@ -1141,6 +1141,60 @@ mod tests {
         })
     }
 
+    /// GH #515: a CASS migration opens with `BEGIN IMMEDIATE` under a 5 s
+    /// busy timeout. A stop requested while another writer holds the archive
+    /// must end that wait, as it ends an INSERT's (test above).
+    #[test]
+    fn cancellation_stops_begin_immediate_waiting_for_another_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("begin-immediate.db");
+        let blocker = Connection::open(path.to_string_lossy().into_owned())?;
+        blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+        blocker.execute("CREATE TABLE writes(value INTEGER)")?;
+        blocker.execute("BEGIN IMMEDIATE")?;
+        blocker.execute("INSERT INTO writes VALUES(1)")?;
+        let handle = CancellationHandle::default();
+        let worker_handle = handle.clone();
+        let worker_path = path.clone();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || -> Result<(Duration, String), String> {
+            let conn = Connection::open(worker_path.to_string_lossy().into_owned())
+                .map_err(|error| error.to_string())?;
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
+                .map_err(|error| error.to_string())?;
+            conn.execute("PRAGMA busy_timeout = 10000")
+                .map_err(|error| error.to_string())?;
+            let _scope = worker_handle.enter();
+            let started = Instant::now();
+            let _ = waiting_tx.send(());
+            let result = conn.execute("BEGIN IMMEDIATE");
+            let elapsed = started.elapsed();
+            if result.is_ok() {
+                let _ = conn.execute("ROLLBACK");
+            }
+            Ok((elapsed, format!("{result:?}")))
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(10))?;
+        std::thread::sleep(Duration::from_millis(300));
+        handle.cancel();
+        let joined = worker
+            .join()
+            .map_err(|_| "BEGIN IMMEDIATE owner thread panicked")?;
+        blocker.execute("COMMIT")?;
+        blocker.close()?;
+        let (elapsed, result) = joined?;
+        assert!(
+            result.contains("Abort") && elapsed < Duration::from_secs(3),
+            "BEGIN IMMEDIATE must end on cancellation, not at the busy timeout: \
+             {result} after {elapsed:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn nested_sql_bridge_restores_full_and_restricted_callers()
     -> Result<(), Box<dyn std::error::Error>> {
