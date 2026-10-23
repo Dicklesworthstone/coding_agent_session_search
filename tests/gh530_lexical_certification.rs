@@ -872,6 +872,135 @@ fn gh530_watch_once_then_plain_index_does_not_rebuild_a_certified_generation() {
     assert_eq!(checkpoint_at(&live)["completed"], true);
 }
 
+fn publish_backups(live: &Path) -> Vec<PathBuf> {
+    let root = live.parent().unwrap().join(".lexical-publish-backups");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut backups: Vec<PathBuf> = entries.map(|entry| entry.unwrap().path()).collect();
+    backups.sort();
+    backups
+}
+
+/// The reporter's timer sequence (2026-10-16): a certified
+/// `index --full --force-rebuild`, then `--watch-once` over NEW session files,
+/// then a plain `cass index`. On 0.10.0 that plain pass started a full lexical
+/// rebuild, which the timer window killed, leaving the checkpoint pending and
+/// search maintenance-required. New conversations must be appended to the
+/// certified generation: no rebuild commit and no new publication.
+#[test]
+fn gh530_force_rebuild_then_watch_once_new_sessions_then_plain_index_appends() {
+    const NEW_SESSIONS: usize = 11;
+    let home = tempfile::tempdir().unwrap();
+    initialize_sessions(home.path());
+    let mut rebuild = cass(home.path());
+    rebuild.args(["index", "--full", "--force-rebuild", "--json"]);
+    Process::spawn(&mut rebuild, home.path(), "force-rebuild").success();
+    let live = index_dir(&home.path().join("data")).unwrap();
+    assert_committed_count(&live, SESSIONS * INITIAL_MESSAGES);
+    assert_eq!(checkpoint_at(&live)["completed"], true);
+
+    let new_sources: Vec<PathBuf> = (SESSIONS..SESSIONS + NEW_SESSIONS)
+        .map(|session| {
+            let path = session_path(home.path(), session);
+            let rows: String = (0..INITIAL_MESSAGES)
+                .map(|message| source_row(session, message))
+                .collect();
+            fs::write(&path, rows).unwrap();
+            path
+        })
+        .collect();
+    let mut watch = cass(home.path());
+    watch
+        .args(["index", "--watch-once"])
+        .args(&new_sources)
+        .arg("--json");
+    let mut watched = Process::spawn(&mut watch, home.path(), "watch-once-new");
+    watched.success();
+    let expected = (SESSIONS + NEW_SESSIONS) * INITIAL_MESSAGES;
+    assert_committed_count(&live, expected);
+    let backups_before = publish_backups(&live);
+
+    let unexpected_rebuild = home.path().join("unexpected-rebuild.json");
+    let mut incremental = cass(home.path());
+    incremental
+        .args(["index", "--json"])
+        .env(
+            "CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SENTINEL",
+            &unexpected_rebuild,
+        )
+        .env("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SLEEP_MS", "1");
+    let mut process = Process::spawn(&mut incremental, home.path(), "after-watch-once-new");
+    process.success();
+    let diagnostics = format!(
+        "watch-once:\n{}\nplain index:\n{}\ncheckpoint: {}",
+        watched.diagnostics(),
+        process.diagnostics(),
+        checkpoint_at(&live)
+    );
+    assert!(
+        !unexpected_rebuild.exists(),
+        "the plain index after watch-once rebuilt the archive: {diagnostics}"
+    );
+    assert_eq!(
+        publish_backups(&live),
+        backups_before,
+        "the plain index after watch-once published a new generation: {diagnostics}"
+    );
+    assert_committed_count(&live, expected);
+    assert_eq!(checkpoint_at(&live)["completed"], true, "{diagnostics}");
+}
+
+/// A source an active writer holds is skipped with its scan watermark kept,
+/// and the run still exits 0 (the owner's 2026-10-17 probe on GH #530). The
+/// run must say what it skipped; once the writer lets go, the next run reads
+/// the source and reports nothing deferred.
+#[test]
+fn gh530_index_json_reports_sources_deferred_for_an_active_writer() {
+    let home = tempfile::tempdir().unwrap();
+    initialize_sessions(home.path());
+    let live = index_dir(&home.path().join("data")).unwrap();
+    let source = session_path(home.path(), 0);
+    let mut file = OpenOptions::new().append(true).open(&source).unwrap();
+    file.write_all(source_row(0, INITIAL_MESSAGES).as_bytes())
+        .unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+
+    // An advisory lock is the writer signal every platform probes.
+    let writer = fs::File::open(&source).unwrap();
+    writer.lock().unwrap();
+    let mut held = cass(home.path());
+    held.args(["index", "--json"]);
+    let mut process = Process::spawn(&mut held, home.path(), "writer-held");
+    process.success();
+    let report: Value = serde_json::from_slice(&fs::read(&process.stdout).unwrap()).unwrap();
+    let stats = &report["indexing_stats"];
+    assert_eq!(stats["deferred_active_sources"], 1, "{report}");
+    let sample = stats["deferred_active_source_sample"].as_array().unwrap();
+    assert_eq!(sample.len(), 1, "{report}");
+    assert!(
+        sample[0].as_str().unwrap().ends_with("session-0.jsonl"),
+        "{report}"
+    );
+    assert_committed_count(&live, SESSIONS * INITIAL_MESSAGES);
+
+    writer.unlock().unwrap();
+    drop(writer);
+    let mut released = cass(home.path());
+    released.args(["index", "--json"]);
+    let mut process = Process::spawn(&mut released, home.path(), "writer-released");
+    process.success();
+    let report: Value = serde_json::from_slice(&fs::read(&process.stdout).unwrap()).unwrap();
+    let stats = &report["indexing_stats"];
+    assert_eq!(stats["deferred_active_sources"], 0, "{report}");
+    assert!(
+        stats.get("deferred_active_source_sample").is_none(),
+        "{report}"
+    );
+    assert_committed_count(&live, SESSIONS * INITIAL_MESSAGES + 1);
+}
+
 #[test]
 #[ignore = "larger performance fixture; run explicitly with --ignored --exact"]
 fn gh530_cli_scale_rebuild_progresses_with_twenty_active_writers() {

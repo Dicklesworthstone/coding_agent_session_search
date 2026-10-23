@@ -979,6 +979,45 @@ pub struct IndexingStats {
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
+    /// Local session files this run did not read because a process was still
+    /// writing them (an open writable descriptor, an advisory lock or, in
+    /// watch mode, a recent write). Their scan watermark is held, so a later
+    /// run reads them once the writer lets go; until then their newest
+    /// messages are not searchable, and a run that exits 0 says so here
+    /// (GH #530).
+    pub deferred_active_sources: usize,
+    /// The first `DEFERRED_ACTIVE_SOURCE_SAMPLE` of those paths, sorted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deferred_active_source_sample: Vec<String>,
+    #[serde(skip)]
+    deferred_active_source_paths: BTreeSet<PathBuf>,
+}
+
+const DEFERRED_ACTIVE_SOURCE_SAMPLE: usize = 20;
+
+fn record_deferred_active_sources(
+    progress: Option<&Arc<IndexingProgress>>,
+    sources: &BTreeSet<PathBuf>,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if sources.is_empty() {
+        return;
+    }
+    let Ok(mut stats) = progress.stats.lock() else {
+        return;
+    };
+    stats
+        .deferred_active_source_paths
+        .extend(sources.iter().cloned());
+    stats.deferred_active_sources = stats.deferred_active_source_paths.len();
+    stats.deferred_active_source_sample = stats
+        .deferred_active_source_paths
+        .iter()
+        .take(DEFERRED_ACTIVE_SOURCE_SAMPLE)
+        .map(|path| path.display().to_string())
+        .collect();
 }
 
 fn record_connector_ingest_report(
@@ -16158,9 +16197,9 @@ where
         Ok(result) => result,
         Err(_) => unreachable!("handled above"),
     };
-    ingest_outcome
-        .deferred_sources
-        .extend(producer_config.active_source_filter.take_deferred_sources());
+    let active_deferred = producer_config.active_source_filter.take_deferred_sources();
+    record_deferred_active_sources(opts.progress.as_ref(), &active_deferred);
+    ingest_outcome.deferred_sources.extend(active_deferred);
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -16778,9 +16817,9 @@ where
 
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
     ingest_outcome.scan_had_errors |= scan_had_errors;
-    ingest_outcome
-        .deferred_sources
-        .extend(active_source_filter.take_deferred_sources());
+    let active_deferred = active_source_filter.take_deferred_sources();
+    record_deferred_active_sources(opts.progress.as_ref(), &active_deferred);
+    ingest_outcome.deferred_sources.extend(active_deferred);
 
     Ok(ingest_outcome)
 }
@@ -20135,6 +20174,11 @@ fn run_index_with_storage_ownership(
                 }
 
                 let mut deferred = active_source_filter.take_deferred_sources();
+                // A long-lived watch retries these itself; a single
+                // `--watch-once` cycle ends here, so its report must name them.
+                if watch_once_mode {
+                    record_deferred_active_sources(opts_clone.progress.as_ref(), &deferred);
+                }
                 deferred.extend(semantic_maintenance.borrow().pending_paths.iter().cloned());
                 Ok(deferred)
             },
