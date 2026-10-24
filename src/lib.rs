@@ -45131,6 +45131,11 @@ struct DoctorCoverageSummary {
     db_without_raw_mirror_count: usize,
     db_projection_only_count: usize,
     mirror_without_db_link_count: usize,
+    /// Unlinked verified manifests whose exact source bytes, at the same path
+    /// and source identity, are DB-linked through another manifest: a second
+    /// capture under a different provider slug (f3grf). Not counted in
+    /// `mirror_without_db_link_count`.
+    mirror_alias_of_linked_count: usize,
     missing_current_source_count: usize,
     sole_copy_candidate_count: usize,
     current_source_newer_than_archive_count: usize,
@@ -53397,12 +53402,39 @@ fn build_doctor_coverage_summary(
         .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
         .map(|manifest| manifest.db_link_count)
         .sum::<usize>();
-    let mirror_without_db_link_count = raw_mirror
+    // f3grf: pre-parse capture once filed Claude sources under the registry
+    // name `claude` while the parsed conversation used `claude_code`, leaving
+    // one unlinked manifest per Claude source in every existing archive. An
+    // unlinked manifest whose exact bytes at the same path and source are
+    // linked through another manifest preserves nothing the archive lacks.
+    let alias_key = |manifest: &DoctorRawMirrorManifestReport| {
+        (
+            manifest.source_id.clone(),
+            manifest.origin_kind.clone(),
+            manifest.origin_host.clone(),
+            manifest.original_path_blake3.clone(),
+            manifest.source_content_blake3.clone(),
+        )
+    };
+    let linked_captures: HashSet<_> = raw_mirror
+        .manifests
+        .iter()
+        .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
+        .filter(|manifest| manifest.db_link_count > 0)
+        .map(alias_key)
+        .collect();
+    let (mirror_alias_of_linked_count, mirror_without_db_link_count) = raw_mirror
         .manifests
         .iter()
         .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
         .filter(|manifest| manifest.db_link_count == 0)
-        .count();
+        .fold((0usize, 0usize), |(aliases, unlinked), manifest| {
+            if linked_captures.contains(&alias_key(manifest)) {
+                (aliases + 1, unlinked)
+            } else {
+                (aliases, unlinked + 1)
+            }
+        });
     let archived_message_count = backfill
         .receipts
         .iter()
@@ -53486,6 +53518,7 @@ fn build_doctor_coverage_summary(
         db_without_raw_mirror_count,
         db_projection_only_count: backfill.db_projection_only_count,
         mirror_without_db_link_count,
+        mirror_alias_of_linked_count,
         missing_current_source_count: backfill.source_missing_count,
         sole_copy_candidate_count: sole_copy_warnings.len(),
         current_source_newer_than_archive_count,
@@ -53499,6 +53532,7 @@ fn build_doctor_coverage_summary(
             "coverage_summary compares the archive DB, verified raw mirror manifests, and currently visible upstream source files without reading raw session text into robot output.".to_string(),
             "db_without_raw_mirror_count is a repair-risk signal: rebuilding only from current source files could shrink the archive.".to_string(),
             "sole_copy_candidate_count means cass-controlled storage may be the only remaining copy for those upstream-pruned conversations.".to_string(),
+            "mirror_alias_of_linked_count counts unlinked manifests whose exact source bytes at the same path are DB-linked through another manifest; they are kept and are not counted as unlinked.".to_string(),
         ],
     }
 }
@@ -80767,6 +80801,63 @@ paths = ["~/.claude/projects"]
         assert_eq!(full_meta["full_details_command"], serde_json::Value::Null);
     }
 
+    /// f3grf: archives indexed before the fix hold, for every Claude source, a
+    /// pre-parse manifest under provider `claude` beside the linked
+    /// `claude_code` one. Same bytes at the same path are not unlinked
+    /// evidence; a different file, or the same path with other bytes, is.
+    #[test]
+    fn f3grf_coverage_counts_alias_captures_apart_from_unlinked_manifests() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let sessions_dir = data_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let claude_source = sessions_dir.join("claude-session.jsonl");
+        let claude_bytes = b"{\"type\":\"user\",\"text\":\"claude\"}\n";
+        let link = DoctorRawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(2),
+            source_path: Some(claude_source.display().to_string()),
+            started_at_ms: Some(1_700_000_000_000),
+        };
+        let write = |provider: &str, path: &Path, bytes: &[u8], links| {
+            let manifest =
+                raw_mirror_test_manifest(&data_dir, provider, "local", path, bytes, links);
+            write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+        };
+        write("claude_code", &claude_source, claude_bytes, vec![link]);
+        write("claude", &claude_source, claude_bytes, Vec::new());
+        // Unlinked evidence that must still count: the same path with older
+        // bytes, and a file no archive row names.
+        write(
+            "claude",
+            &claude_source,
+            b"{\"type\":\"user\",\"text\":\"earlier\"}\n",
+            Vec::new(),
+        );
+        write(
+            "codex",
+            &sessions_dir.join("orphan.jsonl"),
+            b"{\"type\":\"message\",\"text\":\"orphan\"}\n",
+            Vec::new(),
+        );
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        assert_eq!(raw_mirror.manifests.len(), 4);
+        let source_inventory =
+            build_doctor_source_inventory_report(&data_dir, true, None, Vec::new(), Vec::new());
+
+        let summary = build_doctor_coverage_summary(
+            &source_inventory,
+            &raw_mirror,
+            &DoctorRawMirrorBackfillReport::default(),
+            &[],
+        );
+
+        assert_eq!(summary.raw_mirror_db_link_count, 1);
+        assert_eq!(summary.mirror_alias_of_linked_count, 1);
+        assert_eq!(summary.mirror_without_db_link_count, 2);
+        assert!(summary.coverage_reducing_live_source_rebuild_refused);
+    }
+
     #[test]
     fn doctor_coverage_summary_classifies_ledger_gaps_and_confidence_tiers() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -101421,6 +101512,7 @@ fn response_schema_doctor_coverage_summary() -> serde_json::Value {
             "db_without_raw_mirror_count": { "type": "integer" },
             "db_projection_only_count": { "type": "integer" },
             "mirror_without_db_link_count": { "type": "integer" },
+            "mirror_alias_of_linked_count": { "type": "integer" },
             "missing_current_source_count": { "type": "integer" },
             "sole_copy_candidate_count": { "type": "integer" },
             "current_source_newer_than_archive_count": { "type": "integer" },

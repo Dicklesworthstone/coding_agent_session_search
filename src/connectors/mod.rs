@@ -396,5 +396,17 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
         .collect()
 }
 
+/// The provider slug a registered connector's conversations carry, which the
+/// raw mirror records as its manifest provider (and hashes into the manifest
+/// id). It is the registry name except where the archive slug differs:
+/// `claude` registers, its conversations are `claude_code`. An unregistered
+/// name maps to itself.
+pub(crate) fn archive_provider_slug(connector_name: &str) -> &str {
+    get_connector_registrations()
+        .into_iter()
+        .find(|registration| registration.name == connector_name)
+        .map_or(connector_name, |registration| registration.source_slug)
+}
+
 #[cfg(test)]
 mod preflight_tests;

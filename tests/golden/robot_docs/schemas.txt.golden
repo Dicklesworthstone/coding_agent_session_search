@@ -241,6 +241,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - earliest_started_at_ms: ?
       - latest_started_at_ms: ?
+      - mirror_alias_of_linked_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
       - notes: array
@@ -923,6 +924,7 @@ schemas: (auto-generated from contract)
       - db_without_raw_mirror_count: integer
       - earliest_started_at_ms: ?
       - latest_started_at_ms: ?
+      - mirror_alias_of_linked_count: integer
       - mirror_without_db_link_count: integer
       - missing_current_source_count: integer
       - notes: array

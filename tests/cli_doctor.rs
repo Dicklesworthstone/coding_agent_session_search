@@ -8752,3 +8752,135 @@ fn recover_from_archive_reports_quarantined_and_coerced_rows() {
         "{stdout}"
     );
 }
+
+/// f3grf: indexing one Claude Code session leaves exactly one raw-mirror
+/// manifest, linked to its conversation, so a fresh install's doctor has no
+/// unlinked evidence to warn about. On main 387ff6bf the pre-parse capture
+/// filed a second manifest under the registry name `claude`, and doctor
+/// reported source_coverage `warn` plus a critical `coverage_shrink_refusal`
+/// for an archive with nothing wrong (macOS RC smoke, 2026-10-24).
+#[test]
+fn f3grf_indexing_a_claude_session_leaves_one_linked_raw_mirror_manifest() {
+    let tracker = PhaseTracker::new(
+        "cli_doctor",
+        "f3grf_indexing_a_claude_session_leaves_one_linked_raw_mirror_manifest",
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    fs::create_dir_all(test_home.join(".git")).expect("create repo boundary");
+    let data_dir = test_home.join("cass-data");
+
+    tracker.phase("fixture", "one Claude Code session on disk", || {
+        let session = test_home.join(".claude/projects/f3grf/session-f3grf.jsonl");
+        fs::create_dir_all(session.parent().expect("session parent")).expect("session dir");
+        let user = json!({
+            "type": "user", "sessionId": "f3grf", "uuid": "f3grf-u1",
+            "timestamp": "2026-10-24T01:00:01Z", "cwd": "/work/f3grf",
+            "message": {"role": "user", "content": "f3grf raw mirror fixture"}
+        });
+        let assistant = json!({
+            "type": "assistant", "sessionId": "f3grf", "uuid": "f3grf-a1",
+            "parentUuid": "f3grf-u1", "timestamp": "2026-10-24T01:00:02Z", "cwd": "/work/f3grf",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "mirrored once"}]}
+        });
+        fs::write(&session, format!("{user}\n{assistant}\n")).expect("write session");
+    });
+
+    let phase = tracker.start("index", Some("real binary indexes the session"));
+    let out = cass_cmd(test_home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass index");
+    assert!(
+        out.status.success(),
+        "index failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tracker.end("index", Some("real binary indexes the session"), phase);
+
+    let phase = tracker.start("doctor", Some("coverage ledger has no unlinked manifest"));
+    let payload = doctor_check_payload(test_home, &data_dir);
+    let coverage = &payload["coverage_summary"];
+    assert_eq!(
+        coverage["archive_conversation_count"].as_u64(),
+        Some(1),
+        "{coverage:#}"
+    );
+    assert_eq!(
+        coverage["raw_mirror_manifest_count"].as_u64(),
+        Some(1),
+        "one Claude source must leave one manifest: {coverage:#}"
+    );
+    assert_eq!(
+        coverage["raw_mirror_db_link_count"].as_u64(),
+        Some(1),
+        "{coverage:#}"
+    );
+    assert_eq!(
+        coverage["mirror_without_db_link_count"].as_u64(),
+        Some(0),
+        "{coverage:#}"
+    );
+    assert_eq!(
+        coverage["mirror_alias_of_linked_count"].as_u64(),
+        Some(0),
+        "{coverage:#}"
+    );
+    assert_eq!(
+        coverage["coverage_reducing_live_source_rebuild_refused"].as_bool(),
+        Some(false),
+        "{coverage:#}"
+    );
+    let source_coverage = payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("source_coverage"))
+        .expect("source_coverage check");
+    assert_eq!(
+        source_coverage["status"].as_str(),
+        Some("pass"),
+        "{source_coverage:#}"
+    );
+    tracker.end(
+        "doctor",
+        Some("coverage ledger has no unlinked manifest"),
+        phase,
+    );
+
+    let phase = tracker.start("archive_scan", Some("no coverage_shrink_refusal finding"));
+    let out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive-scan",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor archive-scan --json");
+    let scan: Value = serde_json::from_slice(&out.stdout).expect("archive-scan json");
+    let findings = scan["archive_scan"]["findings"]
+        .as_array()
+        .expect("archive findings");
+    let shrink_refusals: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding["finding_kind"].as_str() == Some("coverage_shrink_refusal"))
+        .collect();
+    assert!(
+        shrink_refusals.is_empty(),
+        "a healthy one-session archive must not raise coverage_shrink_refusal: {shrink_refusals:#?}"
+    );
+    tracker.end(
+        "archive_scan",
+        Some("no coverage_shrink_refusal finding"),
+        phase,
+    );
+}

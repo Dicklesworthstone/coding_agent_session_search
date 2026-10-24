@@ -34025,6 +34025,11 @@ fn capture_connector_sources_before_parse(
     since_ts: Option<i64>,
     active_source_filter: &ActiveSessionSourceFilter,
 ) -> (ConnectorIngestRun, bool) {
+    // f3grf: raw-mirror captures use the slug the parsed conversations carry
+    // (the manifest id hashes the provider). Under the registry name, `claude`
+    // sources got a second manifest that no DB link ever reached. Diagnostics
+    // keep the registry name.
+    let mirror_provider = crate::connectors::archive_provider_slug(provider);
     let mut active_source_skipped = false;
     let (observed_sources, discovery_error) = match connector.discover_source_files(ctx) {
         Ok(sources) if !sources.is_empty() => {
@@ -34060,7 +34065,7 @@ fn capture_connector_sources_before_parse(
                     observed_sources.push(source);
                     continue;
                 }
-                capture_discovered_source_file_before_parse(data_dir, provider, &source);
+                capture_discovered_source_file_before_parse(data_dir, mirror_provider, &source);
                 observed_sources.push(source);
             }
             (observed_sources, None)
@@ -34069,7 +34074,7 @@ fn capture_connector_sources_before_parse(
             for root in fallback_roots {
                 active_source_skipped |= capture_scan_sources_before_parse(
                     data_dir,
-                    provider,
+                    mirror_provider,
                     root,
                     since_ts,
                     active_source_filter,
@@ -34086,7 +34091,7 @@ fn capture_connector_sources_before_parse(
             for root in fallback_roots {
                 active_source_skipped |= capture_scan_sources_before_parse(
                     data_dir,
-                    provider,
+                    mirror_provider,
                     root,
                     since_ts,
                     active_source_filter,
@@ -42063,6 +42068,69 @@ mod tests {
         assert_eq!(
             std::fs::read(&source_path).expect("source remains untouched"),
             source_bytes
+        );
+    }
+
+    /// f3grf: the Claude connector registers as `claude` and its conversations
+    /// are `claude_code`. Pre-parse capture under the registry name filed a
+    /// second manifest for every Claude source, which no DB link reached, and
+    /// doctor reported a critical coverage finding on a fresh install.
+    #[test]
+    fn f3grf_claude_preparse_and_parsed_captures_share_one_manifest() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("projects");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let source_path = provider_root.join("session.jsonl");
+        std::fs::write(&source_path, b"{\"type\":\"user\"}\n").expect("write source");
+        let root = ScanRoot::local(provider_root);
+        let connector = FailingDiscoveryConnector {
+            sources: vec![discovered_test_source(
+                &root,
+                source_path.clone(),
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            )],
+        };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "claude",
+            &[],
+            None,
+            &ActiveSessionSourceFilter::default(),
+        );
+
+        let mut conv = NormalizedConversation {
+            agent_slug: "claude_code".to_string(),
+            external_id: Some("f3grf-session".to_string()),
+            title: None,
+            workspace: None,
+            source_path: source_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_000_100),
+            metadata: serde_json::json!({}),
+            messages: Vec::new(),
+        };
+        inject_provenance(&mut conv, &Origin::local());
+        attach_raw_mirror_capture(&data_dir, &mut conv);
+
+        let manifests = raw_mirror_manifest_values(&data_dir);
+        let providers: Vec<_> = manifests
+            .iter()
+            .map(|manifest| manifest["provider"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["claude_code"],
+            "one Claude source must leave one manifest, under the archive slug"
+        );
+        assert_eq!(
+            conv.metadata["cass"]["raw_mirror"]["manifest_id"].as_str(),
+            manifests[0]["manifest_id"].as_str(),
+            "the parsed conversation must reuse the pre-parse manifest that DB links will reach"
         );
     }
 

@@ -2827,6 +2827,7 @@
     "db_without_raw_mirror_count": 0,
     "db_projection_only_count": 0,
     "mirror_without_db_link_count": 0,
+    "mirror_alias_of_linked_count": 0,
     "missing_current_source_count": 0,
     "sole_copy_candidate_count": 0,
     "current_source_newer_than_archive_count": 0,
@@ -2839,7 +2840,8 @@
     "notes": [
       "coverage_summary compares the archive DB, verified raw mirror manifests, and currently visible upstream source files without reading raw session text into robot output.",
       "db_without_raw_mirror_count is a repair-risk signal: rebuilding only from current source files could shrink the archive.",
-      "sole_copy_candidate_count means cass-controlled storage may be the only remaining copy for those upstream-pruned conversations."
+      "sole_copy_candidate_count means cass-controlled storage may be the only remaining copy for those upstream-pruned conversations.",
+      "mirror_alias_of_linked_count counts unlinked manifests whose exact source bytes at the same path are DB-linked through another manifest; they are kept and are not counted as unlinked."
     ]
   },
   "sole_copy_warnings": [],

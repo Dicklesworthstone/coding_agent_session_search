@@ -141,6 +141,19 @@ pub(crate) fn can_reuse_with_path_exclusions(connector_name: &str, source_slug: 
 mod tests {
     use super::*;
 
+    /// f3grf: the raw mirror files a connector's sources under the slug its
+    /// conversations carry, so a pre-parse capture and the parsed
+    /// conversation's capture of the same file share one manifest.
+    #[test]
+    fn f3grf_archive_provider_slug_is_the_registration_source_slug() {
+        assert_eq!(super::super::archive_provider_slug("claude"), "claude_code");
+        assert_eq!(super::super::archive_provider_slug("codex"), "codex");
+        assert_eq!(
+            super::super::archive_provider_slug("future-connector"),
+            "future-connector"
+        );
+    }
+
     #[test]
     fn gh512_capabilities_follow_the_runtime_registry_and_default_closed() {
         for slug in ["claude", "claude_code", "codex"] {

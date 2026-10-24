@@ -8549,6 +8549,9 @@
             "mirror_without_db_link_count": {
               "type": "integer"
             },
+            "mirror_alias_of_linked_count": {
+              "type": "integer"
+            },
             "missing_current_source_count": {
               "type": "integer"
             },
@@ -13115,6 +13118,9 @@
               "type": "integer"
             },
             "mirror_without_db_link_count": {
+              "type": "integer"
+            },
+            "mirror_alias_of_linked_count": {
               "type": "integer"
             },
             "missing_current_source_count": {
